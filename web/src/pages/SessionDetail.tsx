@@ -7,6 +7,7 @@ import { SessionThread } from '../components/session-thread/SessionThread';
 import { TabRow } from '../components/TabRow';
 import { TerminalPane } from '../components/TerminalPane';
 import { SessionCowState } from '../components/CowState';
+import { DurabilityTimeline } from '../components/DurabilityTimeline';
 import { relativeTime } from './sessions/session-format';
 import { Sidebar, SidebarContent, SidebarProvider } from '@/components/ui/sidebar';
 import type { Session } from '../types';
@@ -144,13 +145,17 @@ function SessionMeta({
         </div>
       </dl>
 
-      {/* ADR 0016 Phase A: per-session COW state — "is my work durable yet",
-          visible regardless of which tab is open. */}
+      {/* ADR 0016 Phase A + ADR 0028 A.log: per-session durability — "is my
+          work durable yet" (CowState) and "what coherent points can I
+          recover/fork to" (the checkpoint chain), visible across every tab. */}
       <div className="border-t pt-4">
         <div className="mb-2.5 font-mono text-[0.65rem] uppercase tracking-[0.14em] text-muted-foreground">
           durability
         </div>
         <SessionCowState sessionId={sessionId} />
+        <div className="mt-3">
+          <DurabilityTimeline sessionId={sessionId} />
+        </div>
       </div>
     </div>
   );

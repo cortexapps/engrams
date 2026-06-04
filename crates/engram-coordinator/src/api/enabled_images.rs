@@ -42,7 +42,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
-use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{EnabledImage, EnabledImageSummary, ImageManifest};
 use engram_core::MetaError;
@@ -71,38 +70,101 @@ pub struct ListEnabledImagesResponse {
     pub images: Vec<EnabledImageSummary>,
 }
 
+/// ADR 0036: enabling is asynchronous. The handler validates the URI
+/// with a cheap metadata pull (KBs — manifest layer descriptors, no
+/// chunk bytes), records an `enable_jobs` row, and returns **202**
+/// with the job. The coordinator's [`crate::enable_scanner`] drives
+/// the heavy pipeline (chunk materialize → capture-VM boot +
+/// snapshot → enabled_images upsert) off the request path — the old
+/// synchronous shape took minutes for a 10 GB image and was killed
+/// by the external LB at ~30 s.
+///
+/// Re-POSTing while a job is in flight returns the existing job
+/// (resume/no-op, enforced by a partial unique index).
 pub async fn enable_image(
     State(state): State<SharedState>,
     Json(req): Json<EnableImageRequest>,
-) -> Result<(StatusCode, Json<EnabledImageSummary>), ApiError> {
+) -> Result<impl axum::response::IntoResponse, ApiError> {
     if req.image_uri.trim().is_empty() {
         return Err(ApiError::BadRequest("image_uri must not be empty".into()));
     }
 
-    let (mut row, manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
-    // ADR 0016 Phase C commit 3a: stamp the bake's ManifestRef on
-    // the row so the GC pin-set can read it back without re-pulling
-    // bundle.json from OCI on every sweep. `None` for harness-only.
-    row.disk_manifest = materialize_disk_chunks(&state, &req.image_uri, &artifacts).await?;
-    // ADR 0020 P1: an image is not enabled unless its per-image base
-    // snapshot was captured + recorded. This blocks on a host-side
-    // capture; on failure we return before writing the enabled_images
-    // row, so a failed snapshot leaves zero rows (the NOT NULL FK on
-    // base_snapshot_id makes that a schema invariant, not just a
-    // convention).
-    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
-        capture_and_record_base_snapshot(&state, &row, &manifest).await?;
-    row.base_snapshot_id = Some(base_snapshot_id);
-    row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
-    // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
-    row.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
-    state
+    // Cheap validation pull: bad URI / missing credential / malformed
+    // manifest fail synchronously with a 4xx — the operator gets
+    // immediate feedback rather than a job that fails on first tick.
+    let (_row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
+
+    let job = state
         .services
         .meta
-        .upsert_enabled_image(row.clone())
+        .create_or_get_enable_job(&req.image_uri, Some(artifacts.manifest_digest.as_str()))
         .await?;
 
-    Ok((StatusCode::CREATED, Json(EnabledImageSummary::from(row))))
+    tracing::info!(
+        image_uri = %req.image_uri,
+        job_id = %job.id,
+        state = job.state.as_str(),
+        "enable job recorded; scanner will drive the pipeline",
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        [(
+            axum::http::header::LOCATION,
+            format!("/api/v1/enable-jobs/{}", job.id),
+        )],
+        Json(job),
+    ))
+}
+
+/// `GET /api/v1/enable-jobs/:id` — poll an enable job. The
+/// `chunks_done/chunks_total` counters are the progress bar.
+pub async fn get_enable_job(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<engram_core::types::EnableJob>, ApiError> {
+    let job = state
+        .services
+        .meta
+        .get_enable_job(id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("enable job {id} not found")))?;
+    Ok(Json(job))
+}
+
+#[derive(Serialize)]
+pub struct ListEnableJobsResponse {
+    pub jobs: Vec<engram_core::types::EnableJob>,
+}
+
+/// `GET /api/v1/enable-jobs` — recent jobs, newest first. The
+/// dashboard's images panel reads this so an in-flight enable
+/// survives a page reload.
+pub async fn list_enable_jobs(
+    State(state): State<SharedState>,
+) -> Result<Json<ListEnableJobsResponse>, ApiError> {
+    let jobs = state.services.meta.list_enable_jobs(50).await?;
+    Ok(Json(ListEnableJobsResponse { jobs }))
+}
+
+/// `POST /api/v1/enable-jobs/:id/retry` (admin) — re-queue a
+/// `failed` job to `pending`. The explicit trigger pairing for the
+/// scanner's implicit retry budget.
+pub async fn retry_enable_job(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<engram_core::types::EnableJob>, ApiError> {
+    let job = state
+        .services
+        .meta
+        .retry_enable_job(id)
+        .await
+        .map_err(|e| match e {
+            MetaError::NotFound => ApiError::NotFound(format!("enable job {id} not found")),
+            MetaError::Conflict(msg) => ApiError::Conflict(msg),
+            other => other.into(),
+        })?;
+    tracing::info!(job_id = %id, image_uri = %job.image_uri, "enable job re-queued by admin");
+    Ok(Json(job))
 }
 
 pub async fn list_enabled_images(
@@ -113,19 +175,21 @@ pub async fn list_enabled_images(
     Ok(Json(ListEnabledImagesResponse { images }))
 }
 
+/// ADR 0036: refresh is asynchronous too — it runs the identical
+/// pipeline (the enabled_images upsert preserves `id`/`created_at`
+/// via ON CONFLICT, so "refresh" and "enable" converge). The only
+/// difference is the guard: the URI must already be enabled, so an
+/// operator can't accidentally enable something via /refresh that
+/// they didn't enable via the auditable POST path.
 pub async fn refresh_enabled_image(
     State(state): State<SharedState>,
     Json(req): Json<ImageUriRequest>,
-) -> Result<Json<EnabledImageSummary>, ApiError> {
+) -> Result<impl axum::response::IntoResponse, ApiError> {
     if req.image_uri.trim().is_empty() {
         return Err(ApiError::BadRequest("image_uri must not be empty".into()));
     }
 
-    // Refresh = "this URI must already be enabled, re-pull and update."
-    // We require the row to exist so an operator can't accidentally
-    // enable something via /refresh that they didn't enable via the
-    // explicit POST path (which is the place that's auditable).
-    let existing = state
+    state
         .services
         .meta
         .get_enabled_image(&req.image_uri)
@@ -137,28 +201,25 @@ pub async fn refresh_enabled_image(
             ))
         })?;
 
-    let (mut refreshed, manifest, artifacts) =
-        fetch_and_seal_manifest(&state, &req.image_uri).await?;
-    refreshed.id = existing.id;
-    refreshed.created_at = existing.created_at;
-    refreshed.updated_at = Some(Utc::now());
-
-    refreshed.disk_manifest = materialize_disk_chunks(&state, &req.image_uri, &artifacts).await?;
-    // ADR 0020 P1: a moved tag is new content — capture a fresh base
-    // snapshot for the new digest before the refreshed row goes live.
-    let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
-        capture_and_record_base_snapshot(&state, &refreshed, &manifest).await?;
-    refreshed.base_snapshot_id = Some(base_snapshot_id);
-    refreshed.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
-    // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
-    refreshed.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
-    state
+    let (_row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
+    let job = state
         .services
         .meta
-        .upsert_enabled_image(refreshed.clone())
+        .create_or_get_enable_job(&req.image_uri, Some(artifacts.manifest_digest.as_str()))
         .await?;
-
-    Ok(Json(EnabledImageSummary::from(refreshed)))
+    tracing::info!(
+        image_uri = %req.image_uri,
+        job_id = %job.id,
+        "refresh recorded as enable job",
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        [(
+            axum::http::header::LOCATION,
+            format!("/api/v1/enable-jobs/{}", job.id),
+        )],
+        Json(job),
+    ))
 }
 
 /// ADR 0021 P1.8: response body for a refused disable.
@@ -245,7 +306,7 @@ pub async fn disable_enabled_image(
 /// Returns the `EnabledImage` row ready to upsert, the parsed
 /// `ImageManifest`, and the full `TemplateArtifacts` (so the
 /// caller can push chunked-rootfs layers into BlobStorage).
-async fn fetch_and_seal_manifest(
+pub(crate) async fn fetch_and_seal_manifest(
     state: &SharedState,
     image_uri: &str,
 ) -> Result<(EnabledImage, ImageManifest, engram_oci::TemplateArtifacts), ApiError> {
@@ -308,17 +369,17 @@ async fn fetch_and_seal_manifest(
 /// `Manifest` at the disk `ManifestRef`. Hosts' prefetch loop reads
 /// from BlobStorage; nothing else feeds it.
 ///
-/// Bundle without disk chunks (`disk_bootstrap_json` /
-/// `disk_chunks_blob_digest` both `None`) is silently accepted — that's
-/// the harness-builder pattern (bake produced just a manifest layer).
-async fn materialize_disk_chunks(
+/// Bundle without disk chunks (`disk_bootstrap_json` and
+/// `bundle_json` both `None`) is silently accepted — that's the
+/// harness-builder pattern (bake produced just a manifest layer).
+pub(crate) async fn materialize_disk_chunks(
     state: &SharedState,
     image_uri: &str,
     artifacts: &engram_oci::TemplateArtifacts,
+    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 ) -> Result<Option<engram_core::types::manifest::ManifestRef>, ApiError> {
-    let (Some(boot), Some(blob_digest), Some(bundle_json)) = (
+    let (Some(boot), Some(bundle_json)) = (
         artifacts.disk_bootstrap_json.as_deref(),
-        artifacts.disk_chunks_blob_digest.as_deref(),
         artifacts.bundle_json.as_deref(),
     ) else {
         // Harness-only image: no chunked-disk artifact to materialize,
@@ -328,6 +389,15 @@ async fn materialize_disk_chunks(
     };
     let bootstrap: engram_chunk_store::Bootstrap = serde_json::from_slice(boot)
         .map_err(|e| ApiError::Internal(format!("parse disk bootstrap json: {e}")))?;
+    // ADR 0036 clean break: the materializer only speaks the
+    // per-chunk-blob shape. A v1 (monolithic chunks blob) artifact
+    // can't be enabled — its blob layer no longer has a consumer.
+    if !bootstrap.is_per_chunk() {
+        return Err(ApiError::BadRequest(format!(
+            "`{image_uri}` carries a pre-ADR-0036 monolithic chunk-blob artifact; \
+             re-bake the image with a current `engram image build` and push again"
+        )));
+    }
     let manifest = bootstrap.to_manifest();
     // The bake wrote bundle.json with the disk_manifest ref it used
     // against its LOCAL chunk store. Hosts re-read that ref on
@@ -342,10 +412,9 @@ async fn materialize_disk_chunks(
                 .into(),
         )
     })?;
-    let source = ChunkSource::OciRange {
+    let source = ChunkSource::Oci {
         oci: state.services.oci.as_ref(),
         image_uri,
-        blob_digest,
     };
     let (wrote, deduped) = materialize_chunk_blob(
         state.services.blob.as_ref(),
@@ -354,6 +423,7 @@ async fn materialize_disk_chunks(
         &bootstrap,
         &manifest,
         &source,
+        progress,
     )
     .await?;
     tracing::info!(
@@ -380,7 +450,7 @@ async fn materialize_disk_chunks(
 /// portability — ADR 0020). The host attaches its local stub harness,
 /// boots to agentd-ready, snapshots (chunked memory + uploaded
 /// state/sidecar), and tears the capture VM down.
-async fn capture_and_record_base_snapshot(
+pub(crate) async fn capture_and_record_base_snapshot(
     state: &SharedState,
     row: &EnabledImage,
     manifest: &ImageManifest,
@@ -395,9 +465,53 @@ async fn capture_and_record_base_snapshot(
     ),
     ApiError,
 > {
-    // Idempotency: if this image is already enabled at the same content
-    // digest and carries a base snapshot, reuse it — re-enabling
-    // shouldn't re-boot a capture VM.
+    // ADR 0036 P4: content-keyed reuse. A base snapshot is a function
+    // of (rootfs bytes, manifest.toml) — the bundle generations it
+    // embeds are only the fallback pin, because session-create swaps
+    // aux drives to the host's CURRENT staged generation (ADR 0035
+    // Invariant 2; `restore_in_jail`'s `swap_aux_to_current`). So if
+    // ANY enabled image (soft-deleted included — its snapshot stays
+    // GC-pinned) was captured from the same disk content with the
+    // same manifest.toml, that snapshot is equivalent to what a fresh
+    // capture would produce: reuse it instead of booting a capture
+    // VM. With deterministic bakes + content-derived ManifestRefs,
+    // this is what makes a no-op re-bake's enable near-instant — and
+    // hosts already hold the reused snapshot's chunks on NVMe, so no
+    // fleet-wide re-prefetch either.
+    if let Some(disk_ref) = row.disk_manifest {
+        if let Some(existing) = state
+            .services
+            .meta
+            .find_enabled_image_by_content(disk_ref, &row.manifest_toml)
+            .await?
+        {
+            if let Some(id) = existing.base_snapshot_id {
+                tracing::info!(
+                    image_uri = %row.image_uri,
+                    reused_from = %existing.image_uri,
+                    disk_manifest = %disk_ref,
+                    snapshot_id = %id,
+                    "content-identical image already captured; reusing base snapshot",
+                );
+                let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "enabled image `{}` reuses base snapshot {id} but carries no \
+                         base_snapshot_disk_manifest (NOT NULL since migration 0042); \
+                         refresh the image to re-stamp it",
+                        existing.image_uri
+                    ))
+                })?;
+                // Memory manifest is nullable since migration 0049 — `None`
+                // for cold-boot backends (VZ). Reuse whatever the row carries.
+                let memory_manifest = existing.base_snapshot_memory_manifest;
+                return Ok((id, disk_manifest, memory_manifest));
+            }
+        }
+    }
+
+    // Legacy idempotency for rows without a chunked-disk manifest
+    // (harness-only images): same URI at the same OCI digest with a
+    // recorded snapshot — re-enabling shouldn't re-boot a capture VM.
     if let Some(existing) = state
         .services
         .meta
@@ -428,45 +542,13 @@ async fn capture_and_record_base_snapshot(
         }
     }
 
-    let vcpus = manifest
-        .resources
-        .suggested_vcpus
-        .unwrap_or(crate::api::sessions::DEFAULT_VCPUS);
-    // ADR 0027: floor memory for browser-enabled images (the headless
-    // browser needs ~250-400 MB). Shared helper so capture + restore agree.
-    let memory_mib = crate::api::sessions::resolved_memory_mib(manifest);
-    let disk_gib = manifest
-        .resources
-        .suggested_disk_gib
-        .unwrap_or(crate::api::sessions::DEFAULT_DISK_GIB);
-
-    // ADR 0027: attach the read-only bundles as aux virtio-blk drives so
-    // they're embedded in the base snapshot (the only cold boot per image)
-    // and re-anchor on every restore. The `skills` bundle is universal;
-    // `playwright` rides only when the image opted in.
-    let mut aux_ro_drives = vec![AuxRoDrive::skills()];
-    if manifest.browser_enabled() {
-        aux_ro_drives.push(AuxRoDrive::playwright());
-    }
-
     // Anonymous capture spec — no session env, no harness pack (the
     // host substitutes its stub harness so the snapshot carries a
-    // harness drive slot for per-session swap at restore).
-    let spec = SandboxSpec {
-        image: row.image_uri.clone(),
-        rootfs_source: None,
-        image_uri: Some(row.image_uri.clone()),
-        cpu: CpuLimit { vcpus },
-        memory: MemoryLimit {
-            max_mib: memory_mib,
-        },
-        disk: DiskLimit { max_gib: disk_gib },
-        ttl: None,
-        env: manifest.env.clone(),
-        workdir: None,
-        network: manifest.network.clone(),
-        aux_ro_drives,
-    };
+    // harness drive slot for per-session swap at restore). ADR 0027
+    // bundles + ADR 0027 memory floor live inside the shared helper;
+    // capture + restore MUST agree on `mem_size_mib` (FC requires it),
+    // and ADR 0028's disk-only recovery boots the same shape.
+    let spec = crate::api::sessions::cold_boot_spec(&row.image_uri, manifest, None);
 
     let (host_id, host) = state.host_registry.pick_capture_host().ok_or_else(|| {
         ApiError::Unavailable(
@@ -522,9 +604,13 @@ async fn capture_and_record_base_snapshot(
             size_bytes: meta.size_bytes,
             created_at: meta.created_at,
             last_accessed_at: now,
+            // ADR 0035: pin the capture's bundle generations.
+            aux_bundles: meta.aux_bundles.clone(),
             disk_manifest: meta.disk_manifest,
             memory_manifest: meta.memory_manifest,
             recoverable,
+            // Template artifact — no session, no event log.
+            events_cursor: None,
         })
         .await?;
 
@@ -562,19 +648,18 @@ fn parse_disk_manifest_ref(
 
 /// Where `materialize_chunk_blob` reads each chunk's bytes from.
 ///
-/// `Slice` keeps the whole blob in memory (tests / small artifacts).
-/// `OciRange` Range-GETs each chunk from the registry on demand, so the
+/// `Map` serves chunks from memory (tests only). `Oci` pulls each
+/// chunk's own blob from the registry on demand (ADR 0036), so the
 /// coord never holds more than `CONCURRENCY` chunks at once — the bound
 /// that stops a multi-GiB image from OOM-killing the coord on enable.
 enum ChunkSource<'a> {
-    /// In-memory blob — only the materialize unit test constructs this;
-    /// prod always uses `OciRange`.
+    /// In-memory chunk map — only the materialize unit test constructs
+    /// this; prod always uses `Oci`.
     #[cfg(test)]
-    Slice(&'a [u8]),
-    OciRange {
+    Map(&'a std::collections::HashMap<engram_chunk_store::ChunkHash, bytes::Bytes>),
+    Oci {
         oci: &'a engram_oci::OciClient,
         image_uri: &'a str,
-        blob_digest: &'a str,
     },
 }
 
@@ -584,58 +669,44 @@ impl ChunkSource<'_> {
         entry: &engram_chunk_store::BootstrapEntry,
     ) -> Result<bytes::Bytes, ApiError> {
         // `*self` copies the Copy ref-fields out (they're all `&_`), so
-        // the OciRange arm gets `&str`/`&OciClient` rather than the
+        // the Oci arm gets `&str`/`&OciClient` rather than the
         // double-refs match-ergonomics would bind on `match self`.
         match *self {
             #[cfg(test)]
-            ChunkSource::Slice(blob) => {
-                let start = entry.blob_offset as usize;
-                let end = start
-                    .checked_add(entry.length as usize)
-                    .ok_or_else(|| ApiError::Internal("chunk offset+length overflow".into()))?;
-                if end > blob.len() {
-                    return Err(ApiError::Internal(format!(
-                        "chunks blob too short for entry {}: end={end}, blob_len={}",
-                        entry.sha256,
-                        blob.len()
-                    )));
-                }
-                Ok(bytes::Bytes::copy_from_slice(&blob[start..end]))
-            }
-            ChunkSource::OciRange {
-                oci,
-                image_uri,
-                blob_digest,
-            } => {
-                // Streaming does one Range GET per chunk, so a single
-                // transient registry hiccup (connection reset / partial
-                // body — "error decoding response body") would otherwise
-                // fail the whole enable. Retry with backoff; the old
-                // whole-blob pull only had one request to get wrong.
+            ChunkSource::Map(map) => map.get(&entry.sha256).cloned().ok_or_else(|| {
+                ApiError::Internal(format!("test chunk map missing {}", entry.sha256))
+            }),
+            ChunkSource::Oci { oci, image_uri } => {
+                let digest = entry.blob_digest.as_deref().ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "bootstrap entry {} missing per-chunk blob digest (pre-ADR-0036 \
+                         artifact slipped past the is_per_chunk gate?)",
+                        entry.sha256
+                    ))
+                })?;
+                // One blob GET per chunk; a single transient registry
+                // hiccup (connection reset / partial body) shouldn't
+                // fail the whole enable. Retry with backoff — and back
+                // off much harder on 429s, which want a politer pause
+                // than connection blips (Retry-After is typically
+                // seconds-to-minutes).
                 const MAX_ATTEMPTS: u32 = 5;
                 let mut attempt = 1u32;
                 loop {
-                    match oci
-                        .fetch_blob_range(
-                            image_uri,
-                            blob_digest,
-                            entry.blob_offset,
-                            entry.length as u64,
-                        )
-                        .await
-                    {
+                    match oci.pull_chunk(image_uri, digest, entry.length as u64).await {
                         Ok(b) => break Ok(b),
                         Err(e) if attempt < MAX_ATTEMPTS => {
+                            let rate_limited = e.to_string().contains("429");
+                            let backoff_ms =
+                                if rate_limited { 5_000 } else { 200 } * attempt as u64;
                             tracing::warn!(
                                 chunk = %entry.sha256,
                                 attempt,
+                                rate_limited,
                                 error = %e,
-                                "chunk Range GET failed; retrying with backoff"
+                                "chunk pull failed; retrying with backoff"
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                200 * attempt as u64,
-                            ))
-                            .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                             attempt += 1;
                         }
                         Err(e) => {
@@ -651,12 +722,14 @@ impl ChunkSource<'_> {
     }
 }
 
-/// Push a chunk-blob into BlobStorage at the content-addressed key for
-/// each chunk in `bootstrap`, plus the reconstructed `Manifest` at
+/// Push each chunk in `bootstrap` into BlobStorage at its
+/// content-addressed key, plus the reconstructed `Manifest` at
 /// `manifest_ref`. Content-addressing means chunks already present (a
-/// prior bake / re-enable) are skipped — and with an `OciRange` source
-/// they aren't even fetched. Bounded-parallel exists?-fetch-put keeps
-/// the wire busy without a thousand-deep sequential round-trip.
+/// prior bake / re-enable / deterministic re-bake sharing chunks) are
+/// skipped — and with an `Oci` source they aren't even fetched, so a
+/// delta re-enable moves only delta bytes (ADR 0036). Bounded-parallel
+/// exists?-fetch-put keeps the wire busy without a thousand-deep
+/// sequential round-trip.
 ///
 /// Returns (wrote, deduped) chunk counts.
 async fn materialize_chunk_blob(
@@ -666,6 +739,7 @@ async fn materialize_chunk_blob(
     bootstrap: &engram_chunk_store::Bootstrap,
     manifest: &engram_chunk_store::Manifest,
     source: &ChunkSource<'_>,
+    progress: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
 ) -> Result<(usize, usize), ApiError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut tasks = FuturesUnordered::new();
@@ -710,6 +784,12 @@ async fn materialize_chunk_blob(
         match res? {
             true => written += 1,
             false => deduped += 1,
+        }
+        // ADR 0036: progress counter for the enable job's
+        // chunks_done — counts every settled chunk (fetched or
+        // dedup-skipped); the scanner's checkpoint task persists it.
+        if let Some(p) = &progress {
+            p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(entry) = iter.next() {
             tasks.push(process_one(blob, source, entry.clone()));
@@ -767,10 +847,15 @@ mod tests {
         c1.resize(chunk_size_u32 as usize, 0);
         let h0 = engram_chunk_store::ChunkHash::of(&c0);
         let h1 = engram_chunk_store::ChunkHash::of(&c1);
-        let mut chunks_blob = Vec::new();
-        chunks_blob.extend_from_slice(&c0);
-        chunks_blob.extend_from_slice(&c1);
+        let chunk_map: std::collections::HashMap<_, _> = [
+            (h0, bytes::Bytes::from(c0.clone())),
+            (h1, bytes::Bytes::from(c1.clone())),
+        ]
+        .into_iter()
+        .collect();
 
+        // ADR 0036 per-chunk shape: each entry addresses its own
+        // blob (digest == chunk hash), blob_offset always 0.
         let bootstrap = Bootstrap {
             schema_version: engram_chunk_store::BOOTSTRAP_SCHEMA_VERSION,
             kind: ManifestKind::Memory,
@@ -779,20 +864,21 @@ mod tests {
             entries: vec![
                 BootstrapEntry {
                     file_offset: 0,
-                    blob_digest: None,
+                    blob_digest: Some(format!("sha256:{}", h0.to_hex())),
                     blob_offset: 0,
                     length: c0.len() as u32,
                     sha256: h0,
                 },
                 BootstrapEntry {
                     file_offset: c0.len() as u64,
-                    blob_digest: None,
-                    blob_offset: c0.len() as u64,
+                    blob_digest: Some(format!("sha256:{}", h1.to_hex())),
+                    blob_offset: 0,
                     length: c1.len() as u32,
                     sha256: h1,
                 },
             ],
         };
+        assert!(bootstrap.is_per_chunk());
         let manifest = bootstrap.to_manifest();
         let manifest_ref = ManifestRef::new();
 
@@ -802,7 +888,8 @@ mod tests {
             manifest_ref,
             &bootstrap,
             &manifest,
-            &ChunkSource::Slice(&chunks_blob),
+            &ChunkSource::Map(&chunk_map),
+            None,
         )
         .await
         .expect("materialize");
@@ -833,7 +920,8 @@ mod tests {
             manifest_ref,
             &bootstrap,
             &manifest,
-            &ChunkSource::Slice(&chunks_blob),
+            &ChunkSource::Map(&chunk_map),
+            None,
         )
         .await
         .expect("materialize again");

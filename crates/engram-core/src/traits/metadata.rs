@@ -5,7 +5,9 @@ use crate::types::event::{ArtifactRow, PersistedEvent};
 use crate::types::host::{HostCapacity, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::manifest::ManifestRef;
-use crate::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
+use crate::types::registry::{
+    EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
+};
 use crate::types::session::{Session, SessionSpec, SessionState};
 use crate::types::snapshot::SnapshotRecord;
 
@@ -83,6 +85,15 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), MetaError>;
 
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
+
+    /// Every live (non-terminal, non-`host_lost`) session: `pending`,
+    /// `created`, `guest_ready`, `active`, `idle`, `evacuating`,
+    /// `evicting`. This is the rehydration source for the coord's
+    /// in-memory routing maps (`repopulate_routing`) — every state
+    /// that can carry a live `sandbox_id` binding (`evicting`
+    /// included: the sandbox stays bound while the eviction pipeline
+    /// runs) MUST be listed here, or a coord restart strands the
+    /// session with an unroutable sandbox.
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
 
     /// ADR 0009 reconcile pass: enumerate the `(session_id,
@@ -294,6 +305,36 @@ pub trait MetadataStore: Send + Sync {
         &self,
         sid: SessionId,
     ) -> Result<Option<SnapshotRecord>, MetaError>;
+    /// ADR 0028 A.log: the session's `session_events.idx`
+    /// high-water-mark at or before `at` — the event-log leg of a
+    /// checkpoint's (memory, disk, event-log) coherence triple,
+    /// resolved against the capture's pause instant. `None` when the
+    /// session has no events yet (a cursor of "before everything").
+    ///
+    /// Default `Ok(None)` so mocks without an event log degrade to
+    /// "no rewind information" rather than forcing every test double
+    /// to model events.
+    async fn latest_event_idx_at_or_before(
+        &self,
+        _sid: SessionId,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<i64>, MetaError> {
+        Ok(None)
+    }
+    /// ADR 0028 Fix A: delete session-bound snapshot rows older than
+    /// `retention`, EXCEPT each session's latest (the rung-1 recovery
+    /// anchor — never collectible while the session row exists).
+    /// Template snapshots (`session_id IS NULL`) are exempt. Returns
+    /// the number of rows deleted; chunks they exclusively referenced
+    /// become GC candidates via the existing pin-set machinery.
+    ///
+    /// Default `Ok(0)` so mocks without a snapshots table skip it.
+    async fn prune_session_snapshots(
+        &self,
+        _retention: chrono::Duration,
+    ) -> Result<u64, MetaError> {
+        Ok(0)
+    }
     /// ADR 0014 M1.11: fetch a single snapshot row by id. Used by
     /// the heartbeat-ack template enrichment path to surface the
     /// snapshot's persisted `disk_manifest` + `memory_manifest`
@@ -390,6 +431,24 @@ pub trait MetadataStore: Send + Sync {
         since: i64,
         limit: i64,
     ) -> Result<Vec<PersistedEvent>, MetaError>;
+
+    /// ADR 0028 A.log: rung-1 recovery rewind. Tombstone every live
+    /// event with `idx > events_cursor` (set `rewound_at = now()`),
+    /// bump the session's `recovery_epoch`, and return a
+    /// [`RewindSummary`] (rolled-back count + the surviving
+    /// outside-world side-effects detected in that span). Idempotent
+    /// in spirit: if nothing is past the cursor, returns
+    /// `rolled_back == 0` and the caller emits no boundary.
+    ///
+    /// Default `Ok(RewindSummary::default())` so mocks without an
+    /// event log are a clean no-op.
+    async fn rewind_session_to_cursor(
+        &self,
+        _session_id: SessionId,
+        _events_cursor: i64,
+    ) -> Result<crate::types::event::RewindSummary, MetaError> {
+        Ok(crate::types::event::RewindSummary::default())
+    }
 
     // ---- file artifacts (ADR 0026) ----
 
@@ -497,6 +556,141 @@ pub trait MetadataStore: Send + Sync {
     /// row's chunks have been confirmed unreferenced and removed
     /// from BlobStorage.
     async fn delete_enabled_image(&self, image_uri: &str) -> Result<(), MetaError>;
+
+    /// ADR 0036 P4: content-keyed base-snapshot reuse. Find an
+    /// enabled image (INCLUDING soft-deleted rows — their snapshots
+    /// stay GC-pinned and restorable) whose bake produced the same
+    /// disk content (`disk_manifest_*`, content-derived since ADR
+    /// 0036) AND the same `manifest_toml`, and which carries a base
+    /// snapshot. The enable pipeline reuses that snapshot instead of
+    /// booting a capture VM: with both inputs equal, a fresh capture
+    /// is equivalent for every session created from it (bundle
+    /// generations are swapped to the host's current staging at
+    /// session create — ADR 0035 Invariant 2 — so reuse does not
+    /// freeze bundle freshness).
+    ///
+    /// Default `None`: stores without the query surface (test mocks)
+    /// simply never reuse.
+    async fn find_enabled_image_by_content(
+        &self,
+        disk_manifest: ManifestRef,
+        manifest_toml: &str,
+    ) -> Result<Option<EnabledImage>, MetaError> {
+        let _ = (disk_manifest, manifest_toml);
+        Ok(None)
+    }
+
+    // ---- enable jobs (ADR 0036) ----
+    //
+    // Async image-enable state machine: `POST /api/enabled-images`
+    // records a row and returns 202; the coordinator's
+    // `enable_scanner` claims jobs via a lease and drives
+    // `pending → materializing → capturing → ready | failed`.
+    // Default implementations error — only the Postgres store (the
+    // one the scanner runs against) supports jobs; the many test
+    // mocks of this trait don't need to stub them out.
+
+    /// Insert a `pending` job for `image_uri`, or — when a
+    /// non-terminal job for the same URI already exists (the partial
+    /// unique index) — return that job instead. Re-POSTing an
+    /// in-flight enable is a resume/no-op, never duplicate work.
+    async fn create_or_get_enable_job(
+        &self,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
+    ) -> Result<EnableJob, MetaError> {
+        let _ = (image_uri, manifest_digest);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    async fn get_enable_job(&self, id: uuid::Uuid) -> Result<Option<EnableJob>, MetaError> {
+        let _ = id;
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Most-recent-first, bounded. The dashboard's images panel reads
+    /// this to surface in-flight + recently-finished enables.
+    async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
+        let _ = limit;
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Atomically claim up to `limit` non-terminal jobs whose lease
+    /// is free or expired (`claimed_at < now() - lease_secs`),
+    /// stamping `(claimed_by, claimed_at)`. Multi-coordinator safety:
+    /// one pod owns a job at a time; a crashed pod's claim expires
+    /// and a peer re-claims. Progress checkpoints renew the claim.
+    async fn claim_enable_jobs(
+        &self,
+        claimant: &str,
+        lease_secs: u32,
+        limit: u32,
+    ) -> Result<Vec<EnableJob>, MetaError> {
+        let _ = (claimant, lease_secs, limit);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Checkpoint materialize progress. Also renews the claim
+    /// (`claimed_at = NOW()`) so a long materialize isn't stolen by
+    /// a peer mid-run. `chunks_total` is stamped on first call.
+    async fn update_enable_job_progress(
+        &self,
+        id: uuid::Uuid,
+        chunks_done: u32,
+        chunks_total: Option<u32>,
+    ) -> Result<(), MetaError> {
+        let _ = (id, chunks_done, chunks_total);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Move the job's state forward (also renews the claim, clears
+    /// `error` on non-failed targets, and releases the claim on
+    /// terminal states).
+    async fn set_enable_job_state(
+        &self,
+        id: uuid::Uuid,
+        state: EnableJobState,
+    ) -> Result<(), MetaError> {
+        let _ = (id, state);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Record a pipeline failure: bump `attempts`, store `error`,
+    /// release the claim (so any pod's next tick can retry), keep
+    /// the current state. Returns the post-bump attempt count — the
+    /// scanner flips to `failed` once it exceeds the budget.
+    async fn record_enable_job_failure(
+        &self,
+        id: uuid::Uuid,
+        error: &str,
+    ) -> Result<u32, MetaError> {
+        let _ = (id, error);
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
+
+    /// Admin retry: `failed → pending`, resetting attempts/error/
+    /// claim. Errors `NotFound` for unknown ids; `Conflict` when the
+    /// job isn't in `failed`.
+    async fn retry_enable_job(&self, id: uuid::Uuid) -> Result<EnableJob, MetaError> {
+        let _ = id;
+        Err(MetaError::Migration(
+            "enable jobs unsupported by this store".into(),
+        ))
+    }
 
     // ---- session secrets ----
     //
@@ -625,6 +819,39 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// ADR 0022 Option A: pin-set source #5 — every enabled image's
+    /// **base-snapshot memory manifest** (the per-template base memfile's
+    /// backing chunks). The memfile is a shared, immutable artifact that
+    /// every same-template base `session.create` sibling `MAP_PRIVATE`s;
+    /// its chunks must stay pinned for the template's *enabled* lifetime,
+    /// **independent of the base snapshot row's `recoverable` flag** —
+    /// exactly as source #1 pins the rootfs disk manifest independent of
+    /// any snapshot. Reads the existing `enabled_images
+    /// .base_snapshot_memory_manifest_*` columns (migrations 0043/0049);
+    /// `NULL` for cold-boot backends (VZ) drops out via `IS NOT NULL`. No
+    /// `soft_deleted_at` filter (mirrors source #1, ADR 0021 P1.8): a
+    /// disabled-but-present image with live sharers keeps its memfile
+    /// pinned. Default `Ok(vec![])` for non-PG mocks.
+    async fn list_enabled_image_base_snapshot_memory_manifests(
+        &self,
+    ) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0022 Option A: pin-set source #6 — the disk companion to #5.
+    /// Pins every enabled image's **base-snapshot disk manifest** (the
+    /// rootfs a base `session.create` restores from, migration 0042),
+    /// again independent of the base snapshot row's `recoverable` flag, so
+    /// an enabled template is fully self-pinned (memory + disk) without
+    /// relying on the snapshot row's state. Reads
+    /// `enabled_images.base_snapshot_disk_manifest_*`. Default
+    /// `Ok(vec![])` for non-PG mocks.
+    async fn list_enabled_image_base_snapshot_disk_manifests(
+        &self,
+    ) -> Result<Vec<ManifestRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// ADR 0016 Phase C: enumerate every `(live_disk_manifest_id,
     /// live_disk_manifest_version)` pair currently advertised by a
     /// session row. Pin-set source #2 (the other two are
@@ -694,6 +921,39 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ----------------------------------------------------------------
+    // ADR 0035 — bundle-generation GC (mirrors the chunk GC trio).
+
+    /// ADR 0035 §5: the bundle pin set — every `(drive_id, sha256)`
+    /// some `snapshots.aux_bundles` row references. The union (plus
+    /// the hosts' reported current generations) is what the GC keeps
+    /// and what heartbeat acks advertise as `live_bundles`.
+    async fn bundle_pin_set(&self) -> Result<Vec<crate::types::sandbox::AuxBundleRef>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0035 §5: idempotent candidate upsert; `first_seen_at`
+    /// sticky, same grace semantics as the chunk variant. `sha256`
+    /// is the 64-hex digest (text — bundle counts are tiny).
+    async fn upsert_bundle_gc_candidate(&self, _sha256: &str) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// ADR 0035 §5 promote-pass query (oldest first, batched).
+    async fn list_expired_bundle_gc_candidates(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+        _limit: i64,
+    ) -> Result<Vec<String>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0035 §5: batch-delete candidate rows after the blob
+    /// delete succeeded. Idempotent.
+    async fn delete_bundle_gc_candidates(&self, _sha256s: &[String]) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
     // ADR 0018 commit 12b — evac_resumer scanner support.
     //
     // The scanner polls `Evacuating` sessions, picks a peer host,
@@ -720,6 +980,54 @@ pub trait MetadataStore: Send + Sync {
     /// observe the bump without persisting state.
     async fn bump_evac_attempts(&self, _session_id: SessionId) -> Result<u32, MetaError> {
         Ok(1)
+    }
+
+    // ----------------------------------------------------------------
+    // ADR 0034 — eviction scanner + idle-detection backstop support.
+    //
+    // Mirrors the 12b evac shape above: `Evicting` rows carry a
+    // side-car retry counter (column `evict_attempts`, migration
+    // 0050) that `transition_session(Evicting)` resets in the same
+    // UPDATE, and the coord-side eviction scanner sweeps the state on
+    // a 10s tick. The backstop query is the L3 detector: it asks PG —
+    // not the host's in-memory hub — which Active sessions have gone
+    // silent, catching harness-detach / host-amnesia classes the hub
+    // structurally cannot see.
+    // ----------------------------------------------------------------
+
+    /// Sessions currently in `Evicting`, paired with their current
+    /// `evict_attempts` count. The eviction scanner uses this on
+    /// every tick (and on its first tick after coord startup, which
+    /// is what recovers rows wedged across a deploy). Default
+    /// `Ok(vec![])` keeps in-memory mocks quiet; PG impl runs the
+    /// partial-indexed `WHERE status = 'evicting'` query.
+    async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically `evict_attempts = evict_attempts + 1 RETURNING
+    /// evict_attempts`. The eviction scanner calls this before each
+    /// pipeline attempt; past the budget it falls back to HostLost
+    /// (see ADR 0034 for why not Active/Idle/Dead). Default returns 1
+    /// so test mocks can observe the bump without persisting state.
+    async fn bump_evict_attempts(&self, _session_id: SessionId) -> Result<u32, MetaError> {
+        Ok(1)
+    }
+
+    /// ADR 0034 L3 backstop: `Active` sessions with a bound sandbox
+    /// whose newest `session_events` row is older than
+    /// `idle_for_secs` (falling back to the session's `created_at`
+    /// when no events exist yet). These are sessions the host-side
+    /// idle detector has gone blind to — harness detached, host-agent
+    /// restarted, hub bookkeeping lost — and they would otherwise sit
+    /// Active forever. Returns `(session_id, sandbox_id,
+    /// last_event_at)`; the caller nominates them into the Evicting
+    /// lane. Default empty for non-PG mocks.
+    async fn list_active_sessions_idle_past(
+        &self,
+        _idle_for_secs: i64,
+    ) -> Result<Vec<(SessionId, SandboxId, chrono::DateTime<chrono::Utc>)>, MetaError> {
+        Ok(Vec::new())
     }
 
     /// ADR 0029: fleet-wide snapshot totals for the Storage surface —

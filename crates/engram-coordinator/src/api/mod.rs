@@ -6,7 +6,7 @@ use crate::state::SharedState;
 
 mod admin;
 pub mod auth;
-mod enabled_images;
+pub(crate) mod enabled_images;
 mod events;
 mod exec;
 pub(crate) mod forge;
@@ -21,7 +21,9 @@ pub mod principal;
 mod prompt;
 mod registries;
 pub(crate) mod session_auth;
-mod sessions;
+// `pub(crate)`: `evacuation::resolve_cold_boot_spec` (ADR 0028 Fix B)
+// reuses `cold_boot_spec` / the resource helpers from outside `api`.
+pub(crate) mod sessions;
 mod sessions_inspect;
 mod shell;
 pub mod snapshot;
@@ -63,6 +65,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
         .route("/sessions/:id/cow-state", get(sessions_inspect::cow_state))
+        .route(
+            "/sessions/:id/checkpoints",
+            get(sessions_inspect::checkpoints),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             principal::require_session_owner,
@@ -80,6 +86,10 @@ pub fn router(state: SharedState) -> Router {
         .merge(session_scoped)
         // Read-only list of enabled images — members pick one to launch.
         .route("/enabled-images", get(enabled_images::list_enabled_images))
+        // ADR 0036: enable-job polling (progress bars). Read-only —
+        // mutations (POST enable / retry) live on the admin router.
+        .route("/enable-jobs", get(enabled_images::list_enable_jobs))
+        .route("/enable-jobs/:id", get(enabled_images::get_enable_job))
         // ADR 0031 self-service.
         .route("/me", get(principal::me))
         .route("/me/claude-token", post(principal::save_claude_token))
@@ -112,6 +122,11 @@ pub fn router(state: SharedState) -> Router {
             "/enabled-images/disable",
             post(enabled_images::disable_enabled_image),
         )
+        // ADR 0036: re-queue a failed enable job.
+        .route(
+            "/enable-jobs/:id/retry",
+            post(enabled_images::retry_enable_job),
+        )
         // Operator admin triggers.
         .route(
             "/admin/reap-materialize-dir",
@@ -127,6 +142,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/admin/hosts/:id/drain", post(admin::drain_host))
         .route("/admin/chunk-gc/dry-run", post(admin::chunk_gc_dry_run))
         .route("/admin/chunk-gc/sweep", post(admin::chunk_gc_sweep))
+        .route("/admin/bundle-gc/dry-run", post(admin::bundle_gc_dry_run))
+        .route("/admin/bundle-gc/sweep", post(admin::bundle_gc_sweep))
         .route(
             "/admin/chunk-gc/candidates",
             get(admin::chunk_gc_candidates),

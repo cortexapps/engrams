@@ -72,9 +72,22 @@ export const Thread: FC = () => {
 
 const ThreadMessage: FC = () => {
   const role = useAuiState((s) => s.message.role);
-  if (role === "system") return <SystemMessage />;
-  if (role === "user") return <UserMessage />;
-  return <AssistantMessage />;
+  // ADR 0028 A.log: messages tombstoned by a rung-1 rewind stay viewable but
+  // greyed behind a left rule — the recovery is honest, not a silent deletion.
+  const rewound = useAuiState((s) => s.message.metadata.custom?.rewound === true);
+  const inner =
+    role === "system" ? <SystemMessage /> : role === "user" ? <UserMessage /> : <AssistantMessage />;
+  if (rewound) {
+    return (
+      <div
+        className="border-l-2 border-muted-foreground/40 pl-3 opacity-45"
+        title="Rolled back by a checkpoint recovery"
+      >
+        {inner}
+      </div>
+    );
+  }
+  return inner;
 };
 
 const ThreadEmpty: FC = () => {

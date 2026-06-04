@@ -8,8 +8,12 @@ import {
   useEnabledImages,
   useRefreshEnabledImage,
 } from '../../hooks/useEnabledImages';
-import { useEnableProgress } from '../../hooks/useEnableProgress';
-import type { EnabledImageSummary } from '../../types';
+import {
+  isJobActive,
+  useEnableJobs,
+  useRetryEnableJob,
+} from '../../hooks/useEnableJobs';
+import type { EnableJob, EnabledImageSummary } from '../../types';
 import { PageHeading } from '../page-heading';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -20,6 +24,7 @@ import {
 } from '@/components/ui/dialog';
 import { Field, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
+import { Progress } from '@/components/ui/progress';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -29,13 +34,25 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table';
 
-// Enabled-images panel — operators curate the OCI URIs sessions may reference.
-// The list reads `GET /api/enabled-images` (Postgres-backed); enable hits the
-// registry to fetch + cache the manifest.toml, so session-create has zero
-// registry I/O on the hot path.
+// Enabled-images panel — Stage D + ADR 0036. Operators curate the OCI URIs
+// sessions may reference. The list reads `GET /api/enabled-images`
+// (Postgres-backed); enabling POSTs a job (202) and the panel polls
+// `GET /api/enable-jobs` to render REAL pipeline progress
+// (materializing chunks → capturing snapshot → ready), replacing the old
+// wall-clock-driven stage guesser.
 export function ImagesPanel() {
   const { data, isLoading, error } = useEnabledImages();
   const rows = data ?? [];
+  const { data: jobs } = useEnableJobs();
+
+  // ADR 0036: in-flight enables (and fresh failures, kept visible
+  // for an hour so the error + retry affordance doesn't vanish).
+  const visibleJobs = (jobs ?? []).filter(
+    (j) =>
+      isJobActive(j) ||
+      (j.state === 'failed' &&
+        Date.now() - new Date(j.updated_at).getTime() < 60 * 60 * 1000),
+  );
 
   return (
     <div className="space-y-6">
@@ -44,6 +61,14 @@ export function ImagesPanel() {
         description="OCI URIs sessions may reference. The manifest is cached on enable; refresh when tags move."
         actions={<EnableImageDialog />}
       />
+
+      {visibleJobs.length > 0 && (
+        <ul className="space-y-2 mb-6">
+          {visibleJobs.map((job) => (
+            <EnableJobRow key={job.id} job={job} />
+          ))}
+        </ul>
+      )}
 
       {error && (
         <p className="text-sm text-destructive">could not load enabled images — {String(error)}</p>
@@ -134,7 +159,6 @@ type EnableImageValues = z.infer<typeof enableImageSchema>;
 function EnableImageDialog() {
   const [open, setOpen] = useState(false);
   const enable = useEnableImage();
-  const progress = useEnableProgress(enable.isPending);
   const form = useForm<EnableImageValues>({
     resolver: zodResolver(enableImageSchema),
     defaultValues: { imageUri: '' },
@@ -158,7 +182,8 @@ function EnableImageDialog() {
           <DialogTitle>Enable a new image</DialogTitle>
           <DialogDescription>
             Full OCI reference: <code className="font-mono">&lt;host&gt;[:port]/&lt;repo&gt;:&lt;tag&gt;</code>.
-            The coordinator pulls the manifest layer on enable.
+            The coordinator queues an enable job — materialization progress shows
+            in the list above.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={form.handleSubmit(onSubmit)}>
@@ -186,9 +211,6 @@ function EnableImageDialog() {
             {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
           </FieldGroup>
           <DialogFooter className="mt-4 sm:items-center">
-            {progress && (
-              <span className="mr-auto text-xs text-muted-foreground">{progress.label}…</span>
-            )}
             <Button type="button" variant="ghost" onClick={() => setOpen(false)} disabled={enable.isPending}>Cancel</Button>
             <Button type="submit" disabled={enable.isPending}>
               {enable.isPending ? 'Enabling…' : 'Enable'}
@@ -197,6 +219,65 @@ function EnableImageDialog() {
         </form>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// ---------- Enable-job progress (ADR 0036) ---------------------------
+//
+// Real progress from the server: the coordinator's scanner drives the
+// job through pending → materializing → capturing → ready, updating
+// chunks_done/chunks_total as it materializes. We render a thin bar +
+// the state label; failed jobs keep their error visible with a retry
+// affordance.
+
+const JOB_STATE_LABEL: Record<EnableJob['state'], string> = {
+  pending: 'queued',
+  materializing: 'materializing chunks',
+  capturing: 'capturing canonical snapshot',
+  ready: 'ready',
+  failed: 'failed',
+};
+
+function EnableJobRow({ job }: { job: EnableJob }) {
+  const retry = useRetryEnableJob();
+  const failed = job.state === 'failed';
+  const pct =
+    job.chunks_total && job.chunks_total > 0
+      ? Math.min(100, Math.round((job.chunks_done / job.chunks_total) * 100))
+      : null;
+
+  return (
+    <li>
+      <Card className={failed ? 'border-destructive/40' : undefined}>
+        <CardContent className="space-y-2 py-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-mono text-sm whitespace-nowrap">{job.image_uri}</span>
+            <Badge variant={failed ? 'destructive' : 'secondary'} className="font-normal">
+              {JOB_STATE_LABEL[job.state]}
+              {job.state === 'materializing' && job.chunks_total
+                ? ` · ${job.chunks_done}/${job.chunks_total} chunks`
+                : ''}
+            </Badge>
+            {!failed && (
+              <span className="text-xs text-muted-foreground italic animate-pulse">working…</span>
+            )}
+            {failed && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-auto"
+                onClick={() => retry.mutate(job.id)}
+                disabled={retry.isPending}
+              >
+                {retry.isPending ? 'Retrying…' : 'Retry'}
+              </Button>
+            )}
+          </div>
+          {pct !== null && !failed && <Progress value={pct} className="h-1 max-w-md" />}
+          {failed && job.error && <p className="text-xs text-destructive">{job.error}</p>}
+        </CardContent>
+      </Card>
+    </li>
   );
 }
 

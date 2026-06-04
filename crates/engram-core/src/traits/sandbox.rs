@@ -62,6 +62,25 @@ pub type UploadSink = Arc<dyn Fn(HarnessByteStream) + Send + Sync>;
 /// an in-memory [`ExecHandle`]; it's a convenience for short commands
 /// and unit tests. Backend implementations only need to provide
 /// `exec_stream`.
+/// ADR 0022 Option A: a point-in-time sample of guest memory across a
+/// backend's live sandboxes on one host, summed. `pss_bytes` (proportional
+/// set size) charges each shared clean page to a fraction of the sandboxes
+/// mapping it, so `pss/rss` is the **density ratio**: ≈1.0 when every
+/// sandbox holds a private copy (UFFD `UFFDIO_COPY`), and well below 1.0
+/// when same-template siblings `MAP_PRIVATE`-share one base memfile (File
+/// backend). The productized substrate for the density measurement — and
+/// the metric a later UI ADR reads. Host-aggregate (not per-template) for
+/// now: low cardinality, no stale series, and exact in the common
+/// single-template-per-host case.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuestMemoryStats {
+    pub pss_bytes: u64,
+    pub rss_bytes: u64,
+    /// How many sandboxes were successfully sampled (a dead/unreadable
+    /// process is skipped, never fatal).
+    pub sampled: u32,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
@@ -191,6 +210,41 @@ pub trait SandboxBackend: Send + Sync {
     /// coord persists to the `snapshots` row.
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
 
+    /// ADR 0028 Fix A: diff-flavored sibling of [`Self::snapshot`].
+    /// Same snapshot-dir + sidecar + vmstate contract, but the memory
+    /// artifact is `memory.diff` — a sparse file holding ONLY the
+    /// pages dirtied since the last capture (KVM dirty bitmap, which
+    /// resets on capture, so successive calls chain). The checkpoint
+    /// pipeline overlays it onto a rolling full memory image and
+    /// re-chunks incrementally; the returned metadata's
+    /// `memory_manifest` is patched by that pipeline, exactly like
+    /// `snapshot()`'s.
+    ///
+    /// Requires dirty tracking armed (`track_dirty_pages` at boot /
+    /// `enable_diff_snapshots` at load). Default impl returns
+    /// `InvalidSpec` for backends with no diff concept (Process, VZ,
+    /// mocks); callers treat that as "diff checkpointing unsupported
+    /// here" and fall back to full captures, mirroring the
+    /// `wait_agent_ready` convention.
+    async fn snapshot_diff(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend has no diff-snapshot support".into(),
+        ))
+    }
+
+    /// ADR 0028 Fix A: does this backend produce coherent, O(dirty-set)
+    /// memory checkpoints worth running the periodic checkpoint driver
+    /// against? Only Firecracker with `track_dirty_pages` armed does —
+    /// VZ has no working guest-memory snapshot (Apple arm64
+    /// save/restore is broken, ADR 0003; it clone-snapshots disk +
+    /// cold-boots), and Process has no snapshots at all. The driver
+    /// gates on this so a split-mode VZ / Process host never pauses
+    /// its VMs every cadence interval for a memory-less snapshot that
+    /// seeds no chain and writes no record. Default `false`.
+    fn supports_diff_checkpoints(&self) -> bool {
+        false
+    }
+
     /// ADR 0018 commit 12m: pause the VM without taking a snapshot.
     /// Idempotent — calling on an already-paused VM is a no-op
     /// success. Used by [`crate::traits::host_client`]-side
@@ -224,7 +278,23 @@ pub trait SandboxBackend: Send + Sync {
     /// refs + snapshot id) rather than a host-local path — the
     /// backend looks up its own staging dir for `metadata.id` and
     /// rehydrates from chunks if local files are missing.
+    ///
+    /// ADR 0035: this is the *resume* flavor — aux RO bundles stay on
+    /// the generation the snapshot pinned (live guest processes may
+    /// hold fds into them). Fresh session creates go through
+    /// [`Self::restore_fresh`].
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
+
+    /// ADR 0035: restore for a *fresh* session (the base-snapshot
+    /// path, incl. warm-pool refill) — identical to [`Self::restore`]
+    /// except aux RO bundles are swapped to the host's current
+    /// generation while the VM is load-paused, so new sessions always
+    /// run the latest fleet bundles (skills) without re-enabling the
+    /// image. Default delegates to `restore` for backends without
+    /// aux-drive support (VZ, Process, mocks); the FC backend overrides.
+    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        self.restore(metadata).await
+    }
 
     /// ADR 0020 P1: block until the guest's agentd has dialled its
     /// ready port — i.e. the kernel booted, the rootfs mounted, and
@@ -260,6 +330,30 @@ pub trait SandboxBackend: Send + Sync {
     /// (File mode: memory.bin is required before `load_snapshot`).
     fn restore_memory_is_lazy(&self) -> bool {
         false
+    }
+
+    /// ADR 0022 Option A: per-restore-flavor variant of
+    /// [`Self::restore_memory_is_lazy`]. `fresh == true` is a base
+    /// `session.create` (the `restore_fresh` flavor), which can use the
+    /// File backend against the resident per-template memfile even when
+    /// idle-resume (`fresh == false`) serves memory lazily via UFFD. The
+    /// `PooledBackend` calls this so it materializes the contiguous
+    /// `memory.bin` for base-create (File) and skips it for resume
+    /// (UFFD). Default delegates to the flavor-agnostic method so
+    /// backends that don't bifurcate (VZ, Process) need not implement it.
+    fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
+        self.restore_memory_is_lazy()
+    }
+
+    /// ADR 0022 Option A: sample summed guest memory (PSS/RSS) across this
+    /// backend's live sandboxes — the density signal. `None` for backends
+    /// that can't measure it (VZ/Process, or non-Linux where there's no
+    /// `/proc/<pid>/smaps_rollup`); the host then emits no density gauge.
+    /// Must be cheap + error-tolerant: it runs on the periodic heartbeat
+    /// tick and must never block or fail the workload
+    /// ([reliability_and_latency_first] / telemetry-must-not-gate-workload).
+    async fn guest_memory_stats(&self) -> Option<GuestMemoryStats> {
+        None
     }
 
     /// ADR 0020 P1: boot `spec` to agentd-ready with the stub harness

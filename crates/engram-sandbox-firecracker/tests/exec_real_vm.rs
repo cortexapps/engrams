@@ -98,8 +98,6 @@ async fn exec_runs_inside_baked_microvm() {
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
             }),
-            parent_disk_bootstrap_path: None,
-            parent_disk_chunks_blob_digest: None,
         })
         .await
         .expect("ext4 bake with agent injection");
@@ -124,6 +122,7 @@ async fn exec_runs_inside_baked_microvm() {
         image: "engram-agent-vm-test".into(),
         rootfs_source: Some(outcome.rootfs_path),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         // 256 MiB: enough for debian-slim's kernel-mounted FS + the
         // agent. Smaller VMs OOM in early boot.

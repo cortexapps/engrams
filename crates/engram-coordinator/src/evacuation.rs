@@ -42,10 +42,31 @@ pub enum EvacError {
     /// this when both `snapshot` and `session.live_disk_manifest` are
     /// `None`. Caller routes to `HostLost → Dead`.
     NoRecoverableState,
+    /// ADR 0028 Fix B: the session is disk-only recoverable (a live
+    /// disk manifest exists but no usable snapshot) and the caller
+    /// couldn't supply a cold-boot spec — typically because the
+    /// session's image is no longer enabled, so there's no manifest
+    /// to derive boot resources from. Structural: retrying won't fix
+    /// it; the caller routes to `Idle` (re-enable the image, then
+    /// `/resume` recovers via the same cold-boot path).
+    ColdBootUnavailable(String),
     /// No host could accept the relocate (no capacity, or no host
     /// with the image prefetched). Caller logs + retries later or
     /// routes to `HostLost → Dead`.
     NoTargetAvailable(PickError),
+}
+
+impl EvacError {
+    /// ADR 0028 Fix B fail-fast guard: structural errors can never be
+    /// fixed by retrying — burning the resumer's 20-attempt budget on
+    /// them (the `cf4d4afd` incident's ~3 min of `RestoreFailed`
+    /// churn) just delays the honest terminal state.
+    pub fn is_structural(&self) -> bool {
+        matches!(
+            self,
+            Self::NoRecoverableState | Self::ColdBootUnavailable(_)
+        )
+    }
 }
 
 impl std::fmt::Display for EvacError {
@@ -59,6 +80,12 @@ impl std::fmt::Display for EvacError {
                     "no snapshot or live disk manifest — session cannot be evacuated"
                 )
             }
+            Self::ColdBootUnavailable(reason) => {
+                write!(
+                    f,
+                    "disk-only recoverable but no cold-boot spec available: {reason}"
+                )
+            }
             Self::NoTargetAvailable(e) => write!(f, "no host could accept the relocate: {e:?}"),
         }
     }
@@ -67,11 +94,63 @@ impl std::fmt::Display for EvacError {
 impl std::error::Error for EvacError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::NoRecoverableState | Self::NoTargetAvailable(_) => None,
+            Self::NoRecoverableState
+            | Self::ColdBootUnavailable(_)
+            | Self::NoTargetAvailable(_) => None,
             Self::RestoreFailed(e) => Some(e),
             Self::Rebind(e) => Some(e),
         }
     }
+}
+
+/// ADR 0028 Fix B: derive the disk-only recovery's cold-boot
+/// `SandboxSpec` from the session's enabled image (manifest-derived
+/// resources, env, bundles — `api::sessions::cold_boot_spec`).
+/// `None` when the image row is gone/unreadable or its manifest
+/// doesn't parse — callers pass that through and
+/// `evacuate_dead_source` fails structurally (`ColdBootUnavailable`)
+/// only if the recovery actually needed it.
+pub async fn resolve_cold_boot_spec(
+    meta: &Arc<dyn MetadataStore>,
+    session: &Session,
+) -> Option<engram_core::types::sandbox::SandboxSpec> {
+    let enabled = match meta.get_enabled_image(&session.image).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::warn!(
+                session_id = %session.id,
+                image = %session.image,
+                "cold-boot spec: image is not enabled; disk-only recovery unavailable",
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session.id,
+                image = %session.image,
+                error = %e,
+                "cold-boot spec: enabled-image lookup failed",
+            );
+            return None;
+        }
+    };
+    let manifest: engram_core::types::ImageManifest = match toml::from_str(&enabled.manifest_toml) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session.id,
+                image = %session.image,
+                error = %e,
+                "cold-boot spec: manifest_toml parse failed",
+            );
+            return None;
+        }
+    };
+    Some(crate::api::sessions::cold_boot_spec(
+        &session.image,
+        &manifest,
+        None,
+    ))
 }
 
 /// Pick the disk manifest the target should restore from. Mirrors the
@@ -103,15 +182,20 @@ fn pick_evac_disk_manifest(
 /// backend is unreachable, so a fresh source-side snapshot isn't
 /// possible.
 ///
-/// Restores from existing artifacts:
+/// Restores from existing artifacts, rung-aware (ADR 0028 recovery
+/// ladder):
 ///
-/// - **Disk**: `pick_evac_disk_manifest(session.live_disk_manifest,
-///   snapshot.disk_manifest)`. Live wins when newer (continuous-sync
-///   captured a flush after the snapshot). Snapshot wins on different
-///   lineage or older live.
-/// - **Memory**: from `snapshot.memory_manifest` when a snapshot
-///   exists. Memory loss is accepted when only the live disk manifest
-///   is available — `EvacLoss::Memory { reason: "source-dead-no-snapshot" }`.
+/// - **Rung 1 — coherent checkpoint** (`snapshot.memory_manifest`
+///   present): restore memory + the checkpoint's OWN
+///   `snapshot.disk_manifest`. Deliberately NOT the newer
+///   `live_disk_manifest`: the restored RAM describes the checkpoint's
+///   disk, so pairing it with a later disk version is incoherent. This
+///   IS the "rewind the disk to the checkpoint" step — post-checkpoint
+///   continuous-sync deltas are discarded for coherence. `EvacLoss::None`.
+/// - **Rung 2 — cold boot** (no memory): a fresh kernel mounts the
+///   `pick_evac_disk_manifest(live, snapshot)` disk (live-wins-when-
+///   newer — newest files, no coherence constraint since there's no
+///   RAM to disagree). `EvacLoss::Memory { reason: "source-dead-no-snapshot" }`.
 ///
 /// Failure modes:
 ///
@@ -132,15 +216,32 @@ pub async fn evacuate_dead_source(
     meta: &Arc<dyn MetadataStore>,
     session: Session,
     snapshot: Option<SnapshotRecord>,
+    // ADR 0028 Fix B: the disk-only recovery's boot shape (from
+    // `api::sessions::cold_boot_spec`, manifest-derived resources).
+    // `None` is fine when a memory snapshot exists; when the session
+    // is disk-only recoverable and this is `None`, the call fails
+    // structurally with `ColdBootUnavailable`.
+    cold_boot_spec: Option<engram_core::types::sandbox::SandboxSpec>,
 ) -> Result<EvacReceipt, EvacError> {
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
 
-    let disk_manifest = pick_evac_disk_manifest(
-        session.live_disk_manifest,
-        snapshot.as_ref().and_then(|s| s.disk_manifest),
-    );
     let memory_manifest = snapshot.as_ref().and_then(|s| s.memory_manifest);
+    let snapshot_disk = snapshot.as_ref().and_then(|s| s.disk_manifest);
+
+    // ADR 0028 rung-aware disk pick — the coherence rule. With a
+    // coherent memory snapshot (rung 1), the restored RAM's page
+    // cache + mounted-fs metadata describe the checkpoint's OWN disk;
+    // pairing it with the newer continuous-sync `live_disk_manifest`
+    // is incoherent (corruption — Defect B in miniature). So rung 1
+    // uses the snapshot's disk verbatim. Only rung 2 (cold boot, no
+    // memory — a fresh kernel mounts whatever it's given) takes the
+    // live-wins preference.
+    let disk_manifest = if memory_manifest.is_some() {
+        snapshot_disk
+    } else {
+        pick_evac_disk_manifest(session.live_disk_manifest, snapshot_disk)
+    };
 
     if disk_manifest.is_none() && memory_manifest.is_none() {
         return Err(EvacError::NoRecoverableState);
@@ -158,50 +259,24 @@ pub async fn evacuate_dead_source(
     };
     let _ = reason; // structured-log placeholder; metric label lives on `loss.as_str()`.
 
-    // Build the SnapshotMetadata. When we have a snapshot row, lift
-    // its fields verbatim (id, size, image_version, source_sandbox_id)
-    // and DERIVE the portable blob keys from the snapshot_id. The keys
-    // are deterministic functions of the id
-    // (`snapshots/<id>/{state.bin,sidecar.json}`), so we can rebuild
-    // them at restore time without needing dedicated columns on the
-    // snapshot row.
-    //
-    // ADR 0018 commit 12 (async evac): the source records the snapshot
-    // in PG before the scanner picks the session up, which loses the
-    // `state_blob_key` / `sidecar_blob_key` that
-    // `PooledBackend::snapshot` populated on the in-memory metadata.
-    // Deriving them here is the canonical fix — same shape as the
-    // matching `materialize_state_if_missing` helper that consumes
-    // them on the target. Without these, the target host's FC
-    // `restore()` errors with "manifest.json: No such file or
-    // directory" because nothing materialised the sidecar.
-    let metadata = match snapshot.as_ref() {
-        Some(s) => SnapshotMetadata {
-            id: s.id,
-            size_bytes: s.size_bytes,
-            created_at: s.created_at,
-            image_version: s.image_version.clone(),
-            disk_manifest,
-            memory_manifest,
-            source_sandbox_id: None,
-            state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(s.id)),
-            sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(s.id)),
-            rootfs_blob_key: None,
-            working_set_blob_key: None,
-        },
-        None => SnapshotMetadata {
-            id: engram_core::SnapshotId::new(),
-            size_bytes: 0,
-            created_at: chrono::Utc::now(),
-            image_version: String::new(),
-            disk_manifest,
-            memory_manifest: None,
-            source_sandbox_id: None,
-            state_blob_key: None,
-            sidecar_blob_key: None,
-            rootfs_blob_key: None,
-            working_set_blob_key: None,
-        },
+    // ADR 0028 Fix B: validate the disk-only branch's prerequisites
+    // BEFORE the host pick. Structural failures (no cold-boot spec)
+    // must not hide behind transient ones (`NoTargetAvailable`) —
+    // otherwise a capacity blip masks an unrecoverable session and
+    // the resumer retries something retrying can't fix.
+    let cold_boot = if memory_manifest.is_some() {
+        None
+    } else {
+        let disk = disk_manifest
+            .expect("disk-only branch requires a disk manifest (NoRecoverableState guards above)");
+        let mut spec = cold_boot_spec.ok_or_else(|| {
+            EvacError::ColdBootUnavailable(format!(
+                "session {session_id} has a live disk manifest ({disk}) but no \
+                 cold-boot spec — is its image still enabled?"
+            ))
+        })?;
+        spec.rootfs_manifest = Some(disk);
+        Some(spec)
     };
 
     let (image_repo, image_tag) = engram_core::types::session::split_image_ref(&session.image);
@@ -230,10 +305,68 @@ pub async fn evacuate_dead_source(
     let (target_host, target_backend) = registry
         .pick_for_session(&ctx)
         .map_err(EvacError::NoTargetAvailable)?;
-    let new_sandbox_id = target_backend
-        .restore(metadata)
-        .await
-        .map_err(EvacError::RestoreFailed)?;
+
+    let new_sandbox_id = match cold_boot {
+        // ADR 0028 Fix B — rung 2: no coherent memory snapshot, but
+        // the continuous-sync disk manifest is current. A full-FC
+        // restore is structurally impossible here (no state.bin, no
+        // sidecar — the pre-Fix-B code minted a nil-blob-key
+        // SnapshotId and burned the resumer's whole budget on
+        // "manifest.json: No such file or directory"). And pairing
+        // the image's BASE memory with this *evolved* disk would be
+        // incoherent (restored RAM's page cache + mounted-fs metadata
+        // describe the base disk → corruption). The coherent recovery
+        // is a FRESH KERNEL BOOT mounting the recovered rootfs: the
+        // live manifest is a full rootfs lineage, so the host
+        // NBD-attaches it and boots clean. On-disk work survives;
+        // in-RAM context does not (`EvacLoss::Memory`).
+        Some(spec) => target_backend
+            .create(spec)
+            .await
+            .map_err(EvacError::RestoreFailed)?,
+        // Rung-1-shaped recovery: a coherent memory snapshot exists.
+        // Lift the snapshot row's fields verbatim (id, size,
+        // image_version) and DERIVE the portable blob keys from the
+        // snapshot_id. The keys are deterministic functions of the id
+        // (`snapshots/<id>/{state.bin,sidecar.json}`), so we can
+        // rebuild them at restore time without needing dedicated
+        // columns on the snapshot row.
+        //
+        // ADR 0018 commit 12 (async evac): the source records the
+        // snapshot in PG before the scanner picks the session up,
+        // which loses the `state_blob_key` / `sidecar_blob_key` that
+        // `PooledBackend::snapshot` populated on the in-memory
+        // metadata. Deriving them here is the canonical fix — same
+        // shape as the matching `materialize_state_if_missing` helper
+        // that consumes them on the target. Without these, the target
+        // host's FC `restore()` errors with "manifest.json: No such
+        // file or directory" because nothing materialised the sidecar.
+        None => {
+            let s = snapshot
+                .as_ref()
+                .expect("memory_manifest implies a snapshot row");
+            let metadata = SnapshotMetadata {
+                id: s.id,
+                size_bytes: s.size_bytes,
+                created_at: s.created_at,
+                image_version: s.image_version.clone(),
+                disk_manifest,
+                memory_manifest,
+                source_sandbox_id: None,
+                state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(s.id)),
+                sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(s.id)),
+                rootfs_blob_key: None,
+                working_set_blob_key: None,
+                // ADR 0035: evac-dest restore is resume-flavored — keep the
+                // pinned generations; the target host materializes them.
+                aux_bundles: s.aux_bundles.clone(),
+            };
+            target_backend
+                .restore(metadata)
+                .await
+                .map_err(EvacError::RestoreFailed)?
+        }
+    };
 
     // Routing cache: invalidate the stale source binding (the source
     // host is dead, so this is usually already gone from
@@ -285,18 +418,40 @@ mod tests {
         next_restore_id: PlMutex<Option<SandboxId>>,
         fail_snapshot: AtomicUsize, // 0=ok, 1=fail
         fail_restore: AtomicUsize,
+        /// ADR 0028 Fix B: the spec the disk-only cold-boot branch
+        /// passed to `create()`, for assertions.
+        last_create_spec: PlMutex<Option<SandboxSpec>>,
+        /// ADR 0028 rung-1: the metadata the warm branch passed to
+        /// `restore()`, for the coherence-rule assertions.
+        last_restore_metadata: PlMutex<Option<SnapshotMetadata>>,
     }
 
     impl FakeBackend {
         fn set_restore_id(&self, id: SandboxId) {
             *self.next_restore_id.lock() = Some(id);
         }
+
+        fn last_restore_metadata(&self) -> Option<SnapshotMetadata> {
+            self.last_restore_metadata.lock().clone()
+        }
+
+        fn last_create_spec(&self) -> Option<SandboxSpec> {
+            self.last_create_spec.lock().clone()
+        }
     }
 
     #[async_trait]
     impl HostClient for FakeBackend {
-        async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-            Ok(SandboxId::new())
+        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            *self.last_create_spec.lock() = Some(spec);
+            // Reuse the restore-id knob so disk-only tests can pin
+            // the expected sandbox id; fresh id otherwise (match-based
+            // to dodge the unwrap_or_default lint — a nil-UUID default
+            // would mask test bugs).
+            Ok(match *self.next_restore_id.lock() {
+                Some(id) => id,
+                None => SandboxId::new(),
+            })
         }
         async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
             Ok(())
@@ -329,6 +484,7 @@ mod tests {
                 sidecar_blob_key: None,
                 rootfs_blob_key: None,
                 working_set_blob_key: None,
+                aux_bundles: vec![],
             })
         }
         async fn commit_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
@@ -337,7 +493,8 @@ mod tests {
         async fn abort_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
             Ok(())
         }
-        async fn restore(&self, _md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(&self, md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            *self.last_restore_metadata.lock() = Some(md);
             if self.fail_restore.load(Ordering::SeqCst) > 0 {
                 return Err(SandboxError::Vm(Box::new(SimpleErr(
                     "restore failed".into(),
@@ -688,6 +845,8 @@ mod tests {
             disk_manifest: disk,
             memory_manifest: memory,
             recoverable: true,
+            aux_bundles: vec![],
+            events_cursor: None,
         }
     }
 
@@ -713,23 +872,29 @@ mod tests {
         (registry, target_host, target_be)
     }
 
-    /// Arm 1: snapshot present + live_disk fresher (same lineage, higher
-    /// version) → restore uses the live manifest as disk, snapshot's
-    /// memory_manifest as memory. Loss=None.
+    /// ADR 0028 rung-1 COHERENCE RULE: a coherent memory snapshot is
+    /// present AND the live disk manifest is strictly newer (same
+    /// lineage). The restore MUST use the checkpoint's OWN disk — NOT
+    /// the newer live one — because the restored RAM describes the
+    /// checkpoint's disk; pairing it with later disk deltas corrupts.
+    /// This is the "rewind the disk to the checkpoint" step.
+    ///
+    /// (Pre-Fix-A this arm used live-wins and was named
+    /// `..._uses_live_disk_when_newer` — that encoded the bug.)
     #[tokio::test]
-    async fn evac_dead_source_uses_live_disk_when_newer() {
+    async fn evac_dead_source_rung1_uses_checkpoint_disk_not_newer_live() {
         let meta = Arc::new(FakeMeta::default());
         let lineage = 0xABCD;
         let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        // Live disk is a strictly-newer version of the SAME lineage —
+        // exactly the case pick_evac_disk_manifest would prefer.
         session.live_disk_manifest = Some(fake_manifest(lineage, 5));
         let session_id = session.id;
         meta.install_session(session.clone());
 
-        let snapshot = make_snapshot_for(
-            session_id,
-            Some(fake_manifest(lineage, 3)),
-            Some(fake_manifest(lineage + 1, 1)),
-        );
+        let checkpoint_disk = fake_manifest(lineage, 3);
+        let memory = fake_manifest(lineage + 1, 1);
+        let snapshot = make_snapshot_for(session_id, Some(checkpoint_disk), Some(memory));
 
         let (registry, target_host, target_be) = build_registry_with_target(meta.clone());
         let new_sandbox = SandboxId::new();
@@ -740,12 +905,30 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             Some(snapshot),
+            None,
         )
         .await
-        .expect("happy path");
+        .expect("rung-1 happy path");
         assert_eq!(receipt.new_host_id, target_host);
         assert_eq!(receipt.new_sandbox_id, new_sandbox);
         assert_eq!(receipt.loss, EvacLoss::None);
+
+        // The coherence assertion: warm restore, checkpoint's own disk,
+        // checkpoint's memory — the newer live disk (v5) is ignored.
+        let md = target_be
+            .last_restore_metadata()
+            .expect("rung-1 must go through restore(), not create()");
+        assert_eq!(
+            md.disk_manifest,
+            Some(checkpoint_disk),
+            "rung-1 must pair memory with the checkpoint's OWN disk (v3), \
+             not the newer live disk (v5)",
+        );
+        assert_eq!(md.memory_manifest, Some(memory));
+        assert!(
+            target_be.last_create_spec().is_none(),
+            "rung-1 is a restore, never a cold-boot create",
+        );
 
         let updated = meta.session(session_id);
         assert_eq!(updated.status, SessionState::Created);
@@ -777,43 +960,105 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             Some(snapshot),
+            None,
         )
         .await
         .expect("snapshot-only happy path");
         assert_eq!(receipt.loss, EvacLoss::None);
     }
 
-    /// Arm 3: no snapshot, live_disk present → disk-only restore.
-    /// Loss=Memory{reason}.
+    /// A plausible cold-boot spec, the shape `resolve_cold_boot_spec`
+    /// would derive from an enabled image.
+    fn test_cold_boot_spec() -> SandboxSpec {
+        SandboxSpec {
+            image: "ghcr.io/test/img:t".into(),
+            rootfs_source: None,
+            image_uri: Some("ghcr.io/test/img:t".into()),
+            rootfs_manifest: None,
+            cpu: engram_core::types::sandbox::CpuLimit { vcpus: 2 },
+            memory: engram_core::types::sandbox::MemoryLimit { max_mib: 4096 },
+            disk: engram_core::types::sandbox::DiskLimit { max_gib: 20 },
+            ttl: None,
+            env: Default::default(),
+            workdir: None,
+            network: Default::default(),
+            aux_ro_drives: Vec::new(),
+        }
+    }
+
+    /// Arm 3 (ADR 0028 Fix B): no snapshot, live_disk present →
+    /// disk-only COLD BOOT — `create()` with the session's live
+    /// manifest as the rootfs override, NOT a structurally-impossible
+    /// `restore()`. Loss=Memory{reason}.
     #[tokio::test]
-    async fn evac_dead_source_disk_only_records_memory_loss() {
+    async fn evac_dead_source_disk_only_cold_boots_with_memory_loss() {
         let meta = Arc::new(FakeMeta::default());
+        let live = fake_manifest(0xCAFE, 9);
         let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
-        session.live_disk_manifest = Some(fake_manifest(0xCAFE, 9));
+        session.live_disk_manifest = Some(live);
         let session_id = session.id;
         meta.install_session(session.clone());
 
         let (registry, _target_host, target_be) = build_registry_with_target(meta.clone());
-        target_be.set_restore_id(SandboxId::new());
+        let new_sandbox = SandboxId::new();
+        target_be.set_restore_id(new_sandbox);
 
         let receipt = evacuate_dead_source(
             &registry,
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             None,
+            Some(test_cold_boot_spec()),
         )
         .await
-        .expect("disk-only happy path");
+        .expect("disk-only cold-boot happy path");
         match &receipt.loss {
             EvacLoss::Memory { reason } => {
                 assert_eq!(reason, "source-dead-no-snapshot");
             }
             other => panic!("expected Memory loss, got {other:?}"),
         }
+        assert_eq!(receipt.new_sandbox_id, new_sandbox);
+
+        // The recovery went through create() with the live manifest as
+        // the rootfs override — the fresh-kernel-boot shape.
+        let spec = target_be
+            .last_create_spec()
+            .expect("disk-only recovery must call create(), not restore()");
+        assert_eq!(spec.rootfs_manifest, Some(live));
 
         // PG was rebound through HostLost → Created.
         let updated = meta.session(session_id);
         assert_eq!(updated.status, SessionState::Created);
+    }
+
+    /// Arm 3b (ADR 0028 Fix B): disk-only recoverable but no cold-boot
+    /// spec (image no longer enabled) → structural ColdBootUnavailable,
+    /// PG untouched. The resumer fail-fasts this to Idle instead of
+    /// burning its budget.
+    #[tokio::test]
+    async fn evac_dead_source_disk_only_without_spec_is_structural() {
+        let meta = Arc::new(FakeMeta::default());
+        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        session.live_disk_manifest = Some(fake_manifest(0xCAFE, 9));
+        let session_id = session.id;
+        meta.install_session(session.clone());
+
+        let (registry, _target_host, _target_be) = build_registry_with_target(meta.clone());
+
+        let result = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            None,
+            None,
+        )
+        .await;
+        match &result {
+            Err(e @ EvacError::ColdBootUnavailable(_)) => assert!(e.is_structural()),
+            other => panic!("expected ColdBootUnavailable, got {other:?}"),
+        }
+        assert_eq!(meta.session(session_id).status, SessionState::HostLost);
     }
 
     /// Arm 4: no snapshot, no live_disk → NoRecoverableState. Caller
@@ -832,6 +1077,7 @@ mod tests {
             &registry,
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
+            None,
             None,
         )
         .await;
@@ -859,6 +1105,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             None,
+            Some(test_cold_boot_spec()),
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoTargetAvailable(_))));

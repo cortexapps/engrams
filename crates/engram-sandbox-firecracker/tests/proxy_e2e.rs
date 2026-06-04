@@ -273,8 +273,6 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
                 transport: Transport::Vsock,
                 init_script: None,
             }),
-            parent_disk_bootstrap_path: None,
-            parent_disk_chunks_blob_digest: None,
         })
         .await
         .expect("ext4 bake");
@@ -299,6 +297,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         image: "engram-proxy-e2e".into(),
         rootfs_source: Some(outcome.rootfs_path),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

@@ -85,6 +85,8 @@ impl ReconcileMeta {
             }),
             memory_manifest: None,
             recoverable,
+            aux_bundles: vec![],
+            events_cursor: None,
         };
         self.snapshots.lock().entry(session).or_default().push(snap);
     }
@@ -131,12 +133,7 @@ impl MetadataStore for ReconcileMeta {
             .sessions
             .lock()
             .values()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    SessionState::Pending | SessionState::Active | SessionState::Idle
-                )
-            })
+            .filter(|s| s.status.is_live())
             .cloned()
             .collect())
     }

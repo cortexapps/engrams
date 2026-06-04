@@ -182,6 +182,14 @@ async fn main() -> Result<(), HostAgentError> {
     // spans on shutdown (ADR 0019).
     let _telemetry = init_tracing();
 
+    // ADR 0022 cold-restore mitigation: raise RLIMIT_MEMLOCK so the image
+    // prefetcher can `mlock` per-template base memfiles resident (the
+    // host-agent runs as root in prod, so it can raise its own hard limit).
+    // Best-effort: a failure just degrades the later mlock attempts to
+    // leaving memfiles evictable.
+    #[cfg(target_os = "linux")]
+    raise_memlock_rlimit();
+
     let cli = Cli::parse();
 
     // Bind the metrics port first. It doubles as the GCE MIG
@@ -251,6 +259,14 @@ async fn main() -> Result<(), HostAgentError> {
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
             fc_cfg.host_id = Some(host_id);
+            // ADR 0028 Fix A: arm KVM dirty tracking fleet-wide so every
+            // capture after the chain's first can be a Diff (O(dirty)
+            // pause). Tied to the same env knob as the checkpoint driver —
+            // tracking has a steady-state write-protect cost that's only
+            // worth paying when diffs are actually taken.
+            fc_cfg.track_dirty_pages = engram_host_agent::checkpoint::CheckpointConfig::from_env()
+                .interval
+                .is_some();
             // ADR 0019: a guest-reachable OTLP collector endpoint (e.g. the
             // TAP gateway IP : the collector's port). When set, cold-boot
             // boot_args carry `engram_otel=<this>` so the in-guest agentd
@@ -282,6 +298,12 @@ async fn main() -> Result<(), HostAgentError> {
             // to the chunk-native UFFD handler (lazy memory, no memory.bin
             // materialize). Defaults to File.
             fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
+            // ADR 0022 Option A: ENGRAM_FC_BASE_RESTORE_MODE=file flips
+            // *base session.create* restores to the File backend against
+            // the per-template resident memfile (density + faster boot),
+            // leaving idle-resume on `restore_mode`. Unset ⇒ base-create
+            // inherits `restore_mode` (behaviour-preserving).
+            fc_cfg.base_restore_mode = engram_sandbox_firecracker::base_restore_mode_from_env();
             // Point the UFFD handler at the SAME chunk cache the
             // PooledBackend's restore-prefetch warms (`chunk-cache`,
             // see below) — not the FC backend's separate default — so
@@ -634,6 +656,28 @@ async fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Op
 ///
 /// The returned guard must be held for the lifetime of `main` so spans
 /// flush on shutdown (`TelemetryGuard` is itself `#[must_use]`).
+/// ADR 0022: raise `RLIMIT_MEMLOCK` to unlimited so the image prefetcher can
+/// pin (`mlock`) per-template base memfiles resident. Root can raise its own
+/// hard limit; best-effort — a failure is logged and the mlock attempts in
+/// `image_prefetch` simply fall back to leaving the memfile evictable.
+#[cfg(target_os = "linux")]
+fn raise_memlock_rlimit() {
+    let lim = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: `setrlimit` with a valid, fully-initialized `rlimit`.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "ADR 0022: could not raise RLIMIT_MEMLOCK; base-memfile mlock may hit the cap",
+        );
+    } else {
+        tracing::debug!("ADR 0022: RLIMIT_MEMLOCK raised for base-memfile pinning");
+    }
+}
+
 fn init_tracing() -> engram_telemetry::TelemetryGuard {
     engram_telemetry::init(engram_telemetry::Config {
         service_name: "engram-host-agent",

@@ -13,15 +13,19 @@ use engram_core::traits::{
 
 pub mod api;
 pub mod blob;
+pub mod bundle_gc;
+pub mod checkpoint_retention;
 pub mod chunk_gc;
 pub mod config;
 pub mod cow_state;
 pub mod dead_host;
+pub mod enable_scanner;
 pub mod error;
 pub mod evac_resumer;
 pub mod evacuation;
 pub mod harness_paths;
 pub mod host_registry;
+pub mod idle_detect_backstop;
 pub mod idle_evictor;
 pub mod metrics;
 pub mod nbd_loss_trigger;
@@ -201,6 +205,24 @@ pub async fn run_with_registry_and_local(
     let _evac_resumer =
         evac_resumer::spawn(evac_resumer::EvacResumerConfig::default(), state.clone());
 
+    // ADR 0028 Fix A: prune aged-out per-session checkpoint rows
+    // (latest-per-session always kept; the window doubles as the
+    // forkable history). Without it, periodic checkpoints grow
+    // `snapshots` one row per session per cadence interval forever.
+    let _checkpoint_retention = checkpoint_retention::spawn(
+        checkpoint_retention::CheckpointRetentionConfig::default(),
+        state.clone(),
+    );
+
+    // ADR 0036: the enable-job scanner drives async image enables
+    // (pending → materializing → capturing → ready) recorded by
+    // POST /api/enabled-images. Lease-claimed per job, so multiple
+    // coord pods cooperate instead of duplicating pipelines.
+    let _enable_scanner = enable_scanner::spawn(
+        enable_scanner::EnableScannerConfig::default(),
+        state.clone(),
+    );
+
     // ADR 0016 §A.1.5c: stale-lease reaper for the
     // `session_lease` PG table. Any lease whose RAII Drop was
     // skipped (panic, OOM, pod terminated mid-pipeline) becomes
@@ -214,12 +236,32 @@ pub async fn run_with_registry_and_local(
         std::time::Duration::from_secs(30),
     );
 
-    // ADR 0013 + ADR 0011 #2: the idle-eviction *driver* runs on
-    // each host-agent (its local HarnessHub is authoritative for
-    // "is this sandbox idle?"). The host POSTs candidates to
-    // `/api/hosts/:id/idle-eviction-candidates`; the receiving
-    // coord pod runs the pipeline (`evict_idle_session` below).
-    // No background task lives here anymore.
+    // ADR 0013 + ADR 0011 #2: the idle-eviction *detection driver*
+    // runs on each host-agent (its local HarnessHub is authoritative
+    // for "is this sandbox idle?"). The host POSTs candidates to
+    // `/api/hosts/:id/idle-eviction-candidates`.
+    //
+    // ADR 0034: the receiving handler only flips Active → Evicting;
+    // this scanner sweeps `status='evicting'` and runs the snapshot
+    // pipeline detached from any request lifetime (the pre-0034
+    // inline pipeline died by cancellation at the host's POST
+    // timeout). Its first tick after startup also recovers rows
+    // wedged across a coord deploy.
+    let _eviction_scanner = idle_evictor::spawn_eviction_scanner(
+        idle_evictor::EvictionScannerConfig::default(),
+        state.clone(),
+    );
+
+    // ADR 0034 L3: PG-derived idle-detection backstop. Catches
+    // Active sessions whose harness the host has gone blind to
+    // (vsock detach wipes the hub's tracking; `idle_sandboxes` only
+    // nominates attached harnesses) by reading the durable activity
+    // record — session_events — instead. Hard-TTL only; nominates
+    // into the same Evicting lane the host path uses.
+    let _idle_backstop = idle_detect_backstop::spawn(
+        idle_detect_backstop::BackstopConfig::from_env(),
+        state.clone(),
+    );
 
     // Phase 4 Track D: preemption best-effort drain. Subscribes to
     // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE

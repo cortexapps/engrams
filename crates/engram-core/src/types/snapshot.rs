@@ -75,6 +75,14 @@ pub struct SnapshotMetadata {
     /// pre-seed.)
     #[serde(default)]
     pub working_set_blob_key: Option<String>,
+    /// ADR 0035: bundle generations this snapshot's device model
+    /// references (resolved `aux_ro_drives`), filled by the host at
+    /// snapshot time — base captures AND eviction snapshots, since a
+    /// chained restore reopens the same generation. The coord persists
+    /// this in `snapshots.aux_bundles`; the union across all rows is the
+    /// bundle-GC pin set. Empty for snapshots without aux drives.
+    #[serde(default)]
+    pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
 }
 
 /// Persisted row in the `snapshots` table.
@@ -130,4 +138,19 @@ pub struct SnapshotRecord {
     /// promising an Idle/resume path that can't be delivered.
     #[serde(default)]
     pub recoverable: bool,
+    /// ADR 0035: bundle generations this snapshot's device model
+    /// references (from `SnapshotMetadata::aux_bundles`). Persisted as
+    /// jsonb; the union across all rows is the bundle-GC pin set.
+    #[serde(default)]
+    pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
+    /// ADR 0028 A.log: the `session_events.idx` high-water-mark at
+    /// the checkpoint's pause instant — the third leg of the
+    /// (memory, disk, event-log) coherence triple. A rung-1 rewind
+    /// tombstones events past this cursor. `None` on pre-0053 rows,
+    /// template snapshots, and eviction captures recorded by a coord
+    /// that died before resolving it; rung-1 treats `None` as "no
+    /// rewind information — surface the boundary without
+    /// tombstoning".
+    #[serde(default)]
+    pub events_cursor: Option<i64>,
 }

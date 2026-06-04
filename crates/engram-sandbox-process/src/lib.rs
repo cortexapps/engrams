@@ -402,6 +402,7 @@ impl SandboxBackend for ProcessBackend {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         })
     }
 
@@ -438,6 +439,7 @@ impl SandboxBackend for ProcessBackend {
                     image: metadata.image_version.clone(),
                     rootfs_source: None,
                     image_uri: None,
+                    rootfs_manifest: None,
                     cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
                     memory: engram_core::types::sandbox::MemoryLimit { max_mib: 0 },
                     disk: engram_core::types::sandbox::DiskLimit { max_gib: 0 },
@@ -488,6 +490,7 @@ impl SandboxBackend for ProcessBackend {
             image: manifest.image_version,
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
             memory: engram_core::types::sandbox::MemoryLimit { max_mib: 0 },
             disk: engram_core::types::sandbox::DiskLimit { max_gib: 0 },
@@ -778,6 +781,7 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
             memory: engram_core::types::sandbox::MemoryLimit { max_mib: 256 },
             disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },
@@ -1091,6 +1095,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         let res = b.restore(meta).await;
         assert!(matches!(res, Err(SandboxError::Snapshot(_))));

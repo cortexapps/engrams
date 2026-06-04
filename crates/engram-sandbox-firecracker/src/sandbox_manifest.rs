@@ -297,6 +297,7 @@ mod tests {
                 image: "test:1".into(),
                 rootfs_source: None,
                 image_uri: None,
+                rootfs_manifest: None,
                 cpu: CpuLimit { vcpus: 1 },
                 memory: MemoryLimit { max_mib: 64 },
                 disk: DiskLimit { max_gib: 1 },

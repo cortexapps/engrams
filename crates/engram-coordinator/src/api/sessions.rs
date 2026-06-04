@@ -43,6 +43,56 @@ pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) 
         })
 }
 
+/// The system's cold-boot `SandboxSpec` shape — a fresh kernel boot
+/// (not a snapshot restore) with manifest-derived resources, env, and
+/// the ADR 0027 aux bundles (current generations: a fresh boot has no
+/// snapshot device model to pin against).
+///
+/// Two callers, by design the SAME shape (ADR 0028):
+/// - base-snapshot capture at image enable (`enabled_images.rs`),
+///   `rootfs_manifest = None` — the image's own rootfs;
+/// - disk-only cold-boot recovery (`evacuation.rs` Fix B),
+///   `rootfs_manifest = Some(live_disk_manifest)` — a fresh kernel
+///   mounting the session's evolved rootfs lineage.
+pub(crate) fn cold_boot_spec(
+    image_uri: &str,
+    manifest: &engram_core::types::ImageManifest,
+    rootfs_manifest: Option<engram_core::types::manifest::ManifestRef>,
+) -> engram_core::types::sandbox::SandboxSpec {
+    use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+
+    let vcpus = manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS);
+    let memory_mib = resolved_memory_mib(manifest);
+    let disk_gib = manifest
+        .resources
+        .suggested_disk_gib
+        .unwrap_or(DEFAULT_DISK_GIB);
+
+    // ADR 0027: the `skills` bundle is universal; `playwright` rides
+    // only when the image opted in.
+    let mut aux_ro_drives = vec![AuxRoDrive::skills()];
+    if manifest.browser_enabled() {
+        aux_ro_drives.push(AuxRoDrive::playwright());
+    }
+
+    SandboxSpec {
+        image: image_uri.to_string(),
+        rootfs_source: None,
+        image_uri: Some(image_uri.to_string()),
+        rootfs_manifest,
+        cpu: CpuLimit { vcpus },
+        memory: MemoryLimit {
+            max_mib: memory_mib,
+        },
+        disk: DiskLimit { max_gib: disk_gib },
+        ttl: None,
+        env: manifest.env.clone(),
+        workdir: None,
+        network: manifest.network.clone(),
+        aux_ro_drives,
+    }
+}
+
 /// Inject resolved secrets into the sandbox env according to the
 /// manifest's `secret_mode`.
 ///
@@ -709,10 +759,7 @@ async fn create_session_inner(
     // session_env). dev_vm sessions have no harness; their `/exec` path
     // mints the token per request instead.
     if let Some(agent) = agent_for_session.as_mut() {
-        inject_forge_env(&state, session_id, manifest.git.as_ref(), &mut agent.env);
-        // ADR 0026: artifact-upload token, injected for every image
-        // (not git-gated) so the baked `engram-share` skill always works.
-        inject_upload_env(&state, session_id, &mut agent.env);
+        inject_harness_env(&state, session_id, manifest.git.as_ref(), &mut agent.env);
     }
 
     // Network policy: image manifest's `[network]` block, verbatim.
@@ -1066,6 +1113,10 @@ async fn try_restore_base_snapshot(
         // P1 leaves working-set prefetch off; P2 (ADR 0020) publishes the
         // bake-time trace and points UFFD prefetch at it.
         working_set_blob_key: None,
+        // ADR 0035: the generations this base snapshot pins; the host
+        // materializes any it's missing and (fresh flavor) swaps to
+        // its current generation post-load.
+        aux_bundles: record.aux_bundles,
     };
     let ctx = ScheduleContext {
         repo: image_repo,
@@ -1157,8 +1208,8 @@ pub struct ListSessionsParams {
 
 /// `GET /sessions` — owner-scoped (ADR 0031). A member sees only their own
 /// sessions; an admin sees their own (`scope=mine`, default) or everyone's
-/// (`scope=all`). Returns only `pending`/`active`/`idle` rows (what
-/// `list_active_sessions` selects).
+/// (`scope=all`). Returns only live rows — terminal states and
+/// `host_lost` are excluded (what `list_active_sessions` selects).
 pub async fn list_sessions(
     State(state): State<SharedState>,
     crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
@@ -1253,6 +1304,12 @@ pub async fn delete_session(
     // If a sibling path (preemption drain, dead-host detector) flipped
     // the row first, our transition fails with Conflict — treat that
     // as idempotent success, the session is already on its way out.
+    //
+    // ADR 0034: deleting mid-eviction works the same way —
+    // Evicting → Completed is legal, and the eviction scanner's
+    // racing pipeline then fails its own transition_session(Idle)
+    // against the terminal row, fires abort_inflight_snapshot, and
+    // releases the session lease. No special-casing needed here.
     match state
         .services
         .meta
@@ -1357,6 +1414,28 @@ fn loopback_endpoint(state: &SharedState) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Every env a freshly-spawned harness needs beyond `session_env`:
+/// the forge broker token (git-gated) and the artifact-upload token
+/// (universal — the `engram-share` skill is baked into every image).
+///
+/// This is THE injector for both harness-spawn paths — session
+/// create and resume's harness rebuild. They diverged once (resume
+/// missed the upload env, so `engram-share` broke after every
+/// idle→resume hop until the next cold create — prod session
+/// 5cfb90b8); a single shared entry point makes that class of skew
+/// impossible. If you add an env here, both paths get it.
+pub(crate) fn inject_harness_env(
+    state: &SharedState,
+    session_id: SessionId,
+    git: Option<&engram_core::types::image::GitConfig>,
+    env: &mut HashMap<String, String>,
+) {
+    inject_forge_env(state, session_id, git, env);
+    // ADR 0026: artifact-upload token, injected for every image
+    // (not git-gated) so the baked `engram-share` skill always works.
+    inject_upload_env(state, session_id, env);
 }
 
 pub(crate) fn inject_forge_env(

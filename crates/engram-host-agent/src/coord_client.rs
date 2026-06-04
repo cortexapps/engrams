@@ -300,15 +300,15 @@ impl CoordClient {
     ) -> Result<IdleEvictionCandidatesResponse, CoordClientError> {
         let url = self.endpoint(&format!("/hosts/{host_id}/idle-eviction-candidates"));
         let body = IdleEvictionCandidatesRequest { candidates };
-        // ADR 0016 §A.1.5a: per-request 120s timeout overrides the
-        // shared client's 30s default. Coord-side `evict_idle_session`
-        // can legitimately take 60-90s on a fat session (FC memory
-        // dump + state.bin upload + chunked memory upload + PG
-        // inserts). The 30s default produced the prod retry storm on
-        // 2026-05-24. 120s covers worst-case pipeline duration with
-        // a 30s margin; the host-side in-flight gate keeps the storm
-        // suppressed even if a POST does time out.
-        let builder = self.http.post(&url).timeout(Duration::from_secs(120));
+        // ADR 0034 retired ADR 0016 §A.1.5a's per-request 120s
+        // override: the handler is a fast Active→Evicting nomination
+        // now (one PG UPDATE per candidate) — the snapshot pipeline
+        // runs on the coord's eviction scanner, detached from this
+        // request. The shared client's 30s default is ample. (The
+        // 120s override was also the cancellation fuse in the
+        // 0782bea5 incident: the timeout aborted the then-inline
+        // pipeline mid-snapshot.)
+        let builder = self.http.post(&url);
         let resp = match self.auth(builder, &body).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -452,6 +452,18 @@ pub struct HeartbeatRequest {
     /// upgrade.
     #[serde(default)]
     pub nbd_unhealthy: Vec<engram_core::SandboxId>,
+    /// ADR 0035: the bake stamp's `drive_id` → sha256 set — which
+    /// bundle generation this host image carries as *current*. Ops
+    /// visibility (fleet skew mid-roll) + a defensive member of the
+    /// coord's bundle-GC pin set.
+    #[serde(default)]
+    pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// ADR 0028 Fix A: un-acked durable checkpoint records — see
+    /// [`engram_protocol::heartbeat::CheckpointAdvert`]. Re-advertised
+    /// every heartbeat until the ack's `acked_checkpoints` clears
+    /// them.
+    #[serde(default)]
+    pub checkpoints: Vec<engram_protocol::heartbeat::CheckpointAdvert>,
 }
 
 #[derive(Deserialize)]
@@ -464,6 +476,18 @@ pub struct HeartbeatResponse {
     /// ready.
     #[serde(default)]
     pub enabled_images: Vec<engram_protocol::heartbeat::EnabledImageRef>,
+    /// ADR 0035 §5: the coord's bundle pin set (every generation some
+    /// snapshot row references). The host's bundle supervisor
+    /// prefetches missing pinned generations and sweeps staged files
+    /// outside pin-set ∪ bake-stamp. Deliberately NOT
+    /// `serde(default)`: an old coord's ack must fail decode (heartbeat
+    /// retries until the coord roll completes) rather than read as an
+    /// empty pin set and sweep generations resumes still need.
+    pub live_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// ADR 0028 Fix A: adverts from this heartbeat the coord recorded
+    /// into PG. The host deletes the matching durable record files.
+    #[serde(default)]
+    pub acked_checkpoints: Vec<engram_core::types::SnapshotId>,
 }
 
 #[derive(Serialize)]
@@ -561,5 +585,61 @@ impl RegistryAuthResolver for HttpAuthResolver {
             })),
             Err(e) => Err(OciError::Distribution(format!("HttpAuthResolver: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR 0035 §5: `live_bundles` is deliberately NOT
+    /// `serde(default)`. An old coord's ack (mid-deploy) must fail
+    /// decode — the heartbeat retries next tick — because treating
+    /// "field absent" as "empty pin set" would instruct the host's
+    /// bundle supervisor to sweep generations resumes still need.
+    /// This test is the contract; if you're here because you added
+    /// `#[serde(default)]` to make a test pass, that's the bug.
+    #[test]
+    fn heartbeat_response_rejects_missing_live_bundles() {
+        let old_coord_ack = serde_json::json!({
+            "server_time": "2026-06-03T00:00:00Z",
+            "revoked_sessions": [],
+            "enabled_images": [],
+        });
+        let res = serde_json::from_value::<HeartbeatResponse>(old_coord_ack);
+        assert!(res.is_err(), "ack without live_bundles must fail decode");
+
+        let new_coord_ack = serde_json::json!({
+            "server_time": "2026-06-03T00:00:00Z",
+            "revoked_sessions": [],
+            "enabled_images": [],
+            "live_bundles": [{"drive_id": "skills", "sha256": "ab12"}],
+        });
+        let ack: HeartbeatResponse = serde_json::from_value(new_coord_ack).unwrap();
+        assert_eq!(ack.live_bundles.len(), 1);
+        assert_eq!(ack.live_bundles[0].drive_id, "skills");
+    }
+
+    /// The request side IS `serde(default)`: coord rolls before the
+    /// host MIG, so a new coord must accept old hosts' heartbeats
+    /// (they simply report no current bundles).
+    #[test]
+    fn heartbeat_request_current_bundles_serializes() {
+        let req = HeartbeatRequest {
+            capacity: HostCapacityReport::default(),
+            local_snapshots: vec![],
+            running_sandboxes: vec![],
+            draining: false,
+            host_addr: None,
+            ready_images: vec![],
+            nbd_unhealthy: vec![],
+            checkpoints: vec![],
+            current_bundles: vec![engram_core::types::sandbox::AuxBundleRef {
+                drive_id: "skills".into(),
+                sha256: "ff00".into(),
+            }],
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["current_bundles"][0]["sha256"], "ff00");
     }
 }

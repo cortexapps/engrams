@@ -67,6 +67,11 @@ pub struct HostState {
     /// freshly-registered host until its prefetch supervisor finishes
     /// pulling the first enabled image.
     pub ready_images: std::collections::HashSet<engram_protocol::heartbeat::ManifestDigest>,
+    /// ADR 0035: the bake stamp this host reported — which bundle
+    /// generation it carries as *current*. Operator visibility into
+    /// fleet skew mid-roll; capture resolution itself happens
+    /// host-side against the same stamp.
+    pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
 }
 
 /// Inputs the scheduler considers when picking a host. [`SandboxBackend`]
@@ -1100,6 +1105,7 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
@@ -1200,6 +1206,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
         reg.update_state(
@@ -1219,6 +1226,7 @@ mod tests {
                 }],
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
 
@@ -1258,6 +1266,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
         reg.update_state(
@@ -1271,6 +1280,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
 
@@ -1308,6 +1318,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: true,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
         reg.update_state(
@@ -1321,6 +1332,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
 
@@ -1363,6 +1375,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
         reg.update_state(
@@ -1376,6 +1389,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
 
@@ -1415,6 +1429,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
 
@@ -1541,6 +1556,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: Default::default(),
+                current_bundles: Vec::new(),
             },
         );
         reg.update_state(
@@ -1554,6 +1570,7 @@ mod tests {
                 local_snapshots: Vec::new(),
                 draining: false,
                 ready_images: ready_set,
+                current_bundles: Vec::new(),
             },
         );
 

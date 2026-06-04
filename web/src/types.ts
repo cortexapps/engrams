@@ -24,6 +24,12 @@
  *   host_lost   — heartbeat-loss against the bound host. The
  *                 reconciler resolves this to `idle` (if a
  *                 recoverable snapshot exists) or `dead`.
+ *   evacuating  — mid-relocation to a peer host (ADR 0018); the
+ *                 evac_resumer scanner drives it back to active.
+ *   evicting    — idle-eviction in flight (ADR 0034); the eviction
+ *                 scanner snapshots + suspends it to `idle` within
+ *                 a couple of minutes. /prompt and /resume 409
+ *                 (retryable) while here.
  *   completed   — terminal (user-deleted)
  *   failed      — terminal (create failed mid-flight)
  *   dead        — terminal (chunked manifests gone or never were)
@@ -35,6 +41,8 @@ export type SessionState =
   | 'active'
   | 'idle'
   | 'host_lost'
+  | 'evacuating'
+  | 'evicting'
   | 'completed'
   | 'failed'
   | 'dead';
@@ -320,14 +328,56 @@ export type SessionEvent =
       size_bytes: number;
       caption: string | null;
       at: string;
+    }
+  // ADR 0028 A.log: a rung-1 recovery rewound the live transcript to a
+  // checkpoint. The boundary the transcript renders ("↩ Recovered from
+  // a checkpoint…"); `rolled_back` events with idx > through_idx are
+  // tombstoned (rendered collapsed/greyed). `surviving_side_effects`
+  // are outside-world actions in the rolled-back span the platform
+  // can't undo (opened PRs, shared files) — surfaced, not hidden.
+  | {
+      type: 'recovered_from_checkpoint';
+      recovery_epoch: number;
+      through_idx: number;
+      rolled_back: number;
+      surviving_side_effects: string[];
+      at: string;
     };
 
 export type SessionEventKind = SessionEvent['type'];
 
-/** An event together with its monotonic per-session index (the SSE id). */
+// ADR 0028 A.log: one checkpoint in a session's chain.
+export interface CheckpointSummary {
+  snapshot_id: string;
+  created_at: string;
+  size_bytes: number;
+  /** The transcript cursor a rung-1 rewind / fork would cut at. */
+  events_cursor: number | null;
+  /** HEAD-verified durable in object storage (rung-1-eligible). */
+  recoverable: boolean;
+  /** The newest checkpoint — the always-pinned rung-1 recovery anchor. */
+  is_latest: boolean;
+}
+
+export interface CheckpointsResponse {
+  session_id: string;
+  /** Newest first; bounded to the forkable-history retention window. */
+  checkpoints: CheckpointSummary[];
+}
+
+/**
+ * An event together with its monotonic per-session index (the SSE id).
+ *
+ * ADR 0028 A.log: `rewound` marks events tombstoned by a rung-1
+ * recovery (kept for audit, rendered collapsed/greyed). `recoveryEpoch`
+ * segments the transcript across recoveries. Both default to
+ * not-rewound / epoch 0 for the common no-recovery case.
+ */
 export interface IndexedEvent {
   idx: number;
   event: SessionEvent;
+  rewound?: boolean;
+  recoveryEpoch?: number;
 }
 
 // ---- Settings · Registries ---------------------------------------------
@@ -409,6 +459,34 @@ export interface EnabledImageSummary {
   harness_name: string | null;
   last_refreshed_at: string;
   created_at: string;
+}
+
+/** ADR 0036: state of an async image-enable job. */
+export type EnableJobState =
+  | 'pending'
+  | 'materializing'
+  | 'capturing'
+  | 'ready'
+  | 'failed';
+
+/** ADR 0036: one row of `GET /api/enable-jobs` — an asynchronous
+ * image enable in flight (or terminal). `chunks_done/chunks_total`
+ * drive the progress bar. */
+export interface EnableJob {
+  id: string;
+  image_uri: string;
+  manifest_digest: string | null;
+  state: EnableJobState;
+  chunks_total: number | null;
+  chunks_done: number;
+  attempts: number;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ListEnableJobsResponse {
+  jobs: EnableJob[];
 }
 
 export interface ListEnabledImagesResponse {

@@ -1,12 +1,83 @@
 # ADR 0022: Runtime guest-memory sharing & forking — File backend vs direct-mem
 
-Status: 2026-05-29 — **Proposed (parked).** ADR 0021 took the substrate to FC-floor-bound
-(~516 ms warm / ~618 ms cold) and made each enabled template's base memory **resident on
-NVMe**. This ADR scopes the *next* lever it deliberately deferred: sharing that resident
-base memory **across live sessions of the same template** (density) and the closely-
-related ability to **fork** sessions. It is parked — no implementation yet — to keep the
-decision (and its fork-vs-no-fork trade) out of 0021 and let us pick it up measure-first.
-Nothing here is on the critical path for the latency wins already shipped.
+Status: 2026-06-03 — **Proposed; Option A density+boot arc IMPLEMENTED + dev-vm-validated
+(lab)**; prod-canary measurement + Accepted-flip pending (branch
+`worktree-adr-0022-file-backend-density`); Option B rejected-for-now. ADR 0021 took the
+substrate to FC-floor-bound (~516 ms warm / ~618 ms cold) and made each enabled template's
+base memory **resident on NVMe**. This ADR scopes the *next* lever it deliberately deferred:
+sharing that resident base memory **across live sessions of the same template** — for
+**density** (more microVMs/host) **and faster session boot** (File-backend restore against a
+resident, page-cache-warm memfile skips the UFFD handler spawn and the per-page userspace
+fault round-trips) — plus the closely-related ability to **fork** sessions. The Option A
+density+boot arc is now being implemented; **fork stays a later ADR** (needs session
+re-identity, below). [ADR 0028](0028-eviction-durability-under-host-roll.md)
+shipped the diff-first checkpoint substrate and its dev-vm spike measured this ADR's
+load-bearing assumptions, which **settles the Option-A-vs-B decision** (below) and builds
+several of Option A's prerequisites. The remaining Option A work and the fork API are sized
+in "Decision (updated 2026-06-03)".
+
+### Decision (updated 2026-06-03, post-ADR-0028)
+
+- **Lead with Option A; Option B is rejected for now.** ADR 0028's review eroded Option B's
+  case from two directions: (1) **diff snapshots took its dirty-tracking pitch** — stock FC's
+  KVM dirty-log + `SnapshotType::Diff` + the content-addressed chunk store deliver
+  O(dirty-set) checkpoints with no FC fork (measured: **38 ms diff pause vs 2,090 ms full**,
+  diff **3–4%** of guest RAM); (2) **checkpoint-anchored snapshot-fork took most of its fork
+  pitch** — with 0028's continuous checkpoint chain, "fork session X" is a restore off X's
+  latest (or an on-demand) checkpoint: zero-disturbance at ≤ one cadence interval staleness,
+  or ~tens-of-ms parent pause at zero staleness. **Option B's only residual exclusive is
+  zero-pause AND zero-staleness live fork simultaneously** — revisit only if that becomes a
+  hard product requirement, and if so build/measure E2B's public `firecracker-v1.14-direct-mem`
+  rather than patching from scratch.
+- **Option A go/no-go: YES (measured).** The spike (`engram-sandbox-firecracker/tests/
+  file_restore_shared_rss.rs`, now a permanent CI gate) restored **3 sandboxes File-backend
+  off one `memory.bin`**: each RSS 87.8 MiB with **Shared_Clean 84.7 MiB**, **Σpss/Σrss = 35%**
+  vs the perfect-3-way floor of 33% — plain page-cache sharing of one `MAP_PRIVATE` inode,
+  no KSM. Restores 56–66 ms. Density holds on real hardware.
+- **What ADR 0028 already built that Option A consumes:**
+  - the **rolling per-session `memory.bin`** (`PooledBackend` checkpoint chain) — the
+    fork/File-restore source is already materialized + maintained on NVMe;
+  - **full-image chunk manifests per checkpoint** (`update_for_dirty_ranges`) — any checkpoint
+    materializes to a contiguous memfile with no chain replay, which is exactly the
+    File-backend `backend_path`;
+  - the **`File` `RestoreMode`** + `track_dirty_pages` plumbing (`client.rs`,
+    `FirecrackerConfig`);
+  - **`events_cursor`** as the fork transcript cut-point and the **retention window** as the
+    forkable-history window (ADR 0028 A.log + `checkpoint_retention`);
+  - GC that already pins the latest checkpoint per live session — memfile-granularity pinning
+    is the same pin-set extended.
+- **Remaining Option A scope** (this arc — density + boot latency, no fork API):
+  1. **Per-restore `RestoreMode` bifurcation** — base `session.create` (the `restore_fresh`
+     flavor) restores `RestoreMode::File`; idle-resume keeps UFFD/chunked (per-session
+     divergent, content-dedup at rest). Today a host is statically all-File or all-UFFD
+     (`FirecrackerConfig.restore_mode`); the choice becomes per-restore, behind a per-restore
+     env kill-switch (`ENGRAM_FC_BASE_RESTORE_MODE`).
+  2. **Per-template base memfile materialized at residency** — the prefetch supervisor
+     assembles the contiguous `memory.bin` once per enabled image per host (at
+     `snapshot_path_for(base_snapshot_id)/memory.bin`, the path restore already reads) and
+     gates readiness on it, so siblings `MAP_PRIVATE` one warm inode. Today the contiguous
+     file is built lazily on first restore (and not at all under UFFD).
+  3. **GC pin to memfile granularity** — an explicit pin source over every enabled image's
+     base-snapshot memory manifest, so the shared memfile's backing chunks stay pinned for the
+     template's enabled lifetime independent of the base snapshot row's `recoverable` flag.
+  4. **Measure prod density AND boot latency** — Σpss/Σrss across same-template siblings (via a
+     new productized `engram_sandbox_guest_pss_bytes` gauge + dev-vm smaps) and File-vs-UFFD
+     `session.create` latency. **Both** a density win and a measured boot-latency reduction
+     gate the Accepted flip. (Surfacing density in the web UI is a deliberate *later*-ADR
+     follow-up; this arc lands only the metric substrate.)
+- **Fork is its own later ADR.** The substrate is ready (checkpoint chain + cut-point + memfile),
+  but a user-facing fork needs **session re-identity** — agentd bind / `session_env` re-stamp
+  so the child wakes as a *different* session, per-child network identity, and the mid-run
+  duplicate-external-side-effect semantics (the doubled version of ADR 0028 A.log's
+  surviving-side-effect problem). That's a product-capability ADR, not infra.
+
+---
+
+#### Original framing (2026-05-29, retained for context)
+
+It was parked — no implementation yet — to keep the decision (and its fork-vs-no-fork trade)
+out of 0021 and let us pick it up measure-first. Nothing here is on the critical path for the
+latency wins already shipped.
 
 ## Context
 
@@ -159,6 +230,54 @@ measure **shared RSS across siblings** (the density number) + restore latency vs
    `direct-mem` branch; the per-release rebase burden; build-from-source pipeline.
 4. Interaction with P3 warm snapshots (ADR 0021): a warm per-template snapshot is the
    ideal shared base memfile — these compose.
+
+## Status / commit chain (Option A density + boot-latency arc)
+
+Flip Status → **Accepted** once the prod-canary density + boot-latency numbers land (the
+dev-vm lab half is done — see below).
+
+- [x] **1** — per-restore `RestoreMode` bifurcation in the FC backend (`base_restore_mode` +
+      `ENGRAM_FC_BASE_RESTORE_MODE` kill-switch; `restore_in_jail` honors a per-call mode;
+      base-create→File, resume→config/UFFD).
+- [x] **2** — `PooledBackend` materializes the contiguous memfile per-restore-mode-aware
+      (`restore_memory_is_lazy_for(fresh)`), idempotent no-op once residency wrote it.
+- [x] **3** — per-template base memfile materialized at residency (`base_snapshot_id` on the
+      `EnabledImageRef` heartbeat wire + `image_prefetch` assembles `memory.bin` once per
+      template per host; readiness gated on it; VZ no-ops; reclaim-on-disable).
+- [x] **4** — GC pin to memfile granularity (`list_enabled_image_base_snapshot_{memory,disk}_manifests`
+      pin sources #5/#6; no migration; live-PG regression with `recoverable=false`).
+- [x] **5** — productized `engram_sandbox_guest_{pss,rss}_bytes` gauges (heartbeat-sampled
+      smaps; telemetry-must-not-gate-workload; web UI surfacing deferred to a later ADR).
+- [x] **6** — FC density + latency test (extended `file_restore_shared_rss.rs`: residency
+      materialize → File-mode base-create siblings share + latency; resume-stays-UFFD covered
+      by the `effective_restore_mode` unit test + `snapshot_uffd.rs`).
+- [ ] **Measure + Accept** — prod-canary density (Σpss/Σrss) AND boot-latency reduction
+      (File vs UFFD `session.create`); flip Status to Accepted.
+
+#### Lab validation (dev-vm, real KVM/FC) — DONE
+
+`just check` + `clippy --workspace --all-targets -D warnings` (Linux) + the FC integration
+tests all green. `file_restore_shared_rss.rs` (2 tests, real microVMs):
+
+- **Density holds through the production path.** Three siblings restored via the File-mode
+  *base-create* bifurcation (`restore_fresh`, `base_restore_mode=File` while
+  `restore_mode=Uffd`) off a memfile **reconstructed from a chunk manifest** (the residency
+  step) measured **Σpss/Σrss = 35%** (3-way; perfect-share floor 33%) — identical to restoring
+  the snapshot's own `memory.bin` (also 35%). Per sibling: RSS ~86.5 MiB, PSS ~30.8 MiB.
+- **Faster boot.** File base-create restored in **~57–60 ms/sibling** (median 60 ms) off the
+  page-cache-warm resident memfile, with **no UFFD handler spawn and no per-page fault
+  round-trips** — at/under the snapshot-native restore (~59–64 ms).
+- **Residency cost** (off the session hot path): materializing the contiguous 256 MiB memfile
+  from chunks took ~17.9 s once per template per host; it folds into "time to ready".
+- **Finding:** a *freshly* materialized memfile's page-cache pages are `Shared_Dirty` (pending
+  writeback) when the first siblings fault them — density is identical (PSS is the signal), and
+  in prod the memfile is materialized at residency well before the first session, so writeback
+  has run and the pages show as `Shared_Clean` (as the snapshot-native path already does). The
+  test therefore asserts on PSS≪RSS, not the clean/dirty bucket.
+
+Prod-canary (the remaining gate): flip `ENGRAM_FC_BASE_RESTORE_MODE=file` on a canary host,
+compare same-template Σpss/Σrss (via the new `engram_sandbox_guest_*` gauges) and
+`session.create` p50/p95 (File vs the UFFD fleet) before flipping Status to Accepted.
 
 ## References
 

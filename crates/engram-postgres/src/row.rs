@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use engram_core::types::session::SessionMode;
 use engram_core::types::user::{Role, RoleSource, User, UserToken, WebSession};
 use engram_core::types::{
-    EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionSecrets, SessionState, SnapshotRecord,
+    EnableJob, EnableJobState, EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus,
+    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId, UserId};
 use sqlx::postgres::PgRow;
@@ -133,6 +133,14 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         _ => None,
     };
     let recoverable: bool = row.try_get("recoverable").map_err(col_err)?;
+    // ADR 0035: jsonb [{"drive_id", "sha256"}] — the bundle-GC pin
+    // entries this snapshot contributes.
+    let aux_bundles_json: serde_json::Value = row.try_get("aux_bundles").map_err(col_err)?;
+    let aux_bundles = serde_json::from_value(aux_bundles_json)
+        .map_err(|e| MetaError::Serialization(format!("snapshots.aux_bundles decode: {e}")))?;
+    // ADR 0028 A.log (migration 0053): the event-log leg of the
+    // coherence triple. NULL on pre-0053 rows + template snapshots.
+    let events_cursor: Option<i64> = row.try_get("events_cursor").map_err(col_err)?;
     Ok(SnapshotRecord {
         id: SnapshotId(id),
         session_id: session_id.map(SessionId),
@@ -144,6 +152,8 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         disk_manifest,
         memory_manifest,
         recoverable,
+        aux_bundles,
+        events_cursor,
     })
 }
 
@@ -152,11 +162,18 @@ pub(crate) fn persisted_event_from_row(row: &PgRow) -> Result<PersistedEvent, Me
     let kind: String = row.try_get("kind").map_err(col_err)?;
     let payload: serde_json::Value = row.try_get("payload").map_err(col_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(col_err)?;
+    // ADR 0028 A.log (migration 0054). `recovery_epoch` is NOT NULL
+    // DEFAULT 0; `rewound_at` is nullable (set on tombstone). i32 in
+    // PG → i64 on the wire.
+    let recovery_epoch: i32 = row.try_get("recovery_epoch").map_err(col_err)?;
+    let rewound_at: Option<DateTime<Utc>> = row.try_get("rewound_at").map_err(col_err)?;
     Ok(PersistedEvent {
         idx,
         kind,
         payload,
         created_at,
+        recovery_epoch: recovery_epoch as i64,
+        rewound_at,
     })
 }
 
@@ -370,6 +387,7 @@ fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
         "idle" => SessionState::Idle,
         "host_lost" => SessionState::HostLost,
         "evacuating" => SessionState::Evacuating,
+        "evicting" => SessionState::Evicting,
         "dead" => SessionState::Dead,
         "completed" => SessionState::Completed,
         "failed" => SessionState::Failed,
@@ -378,6 +396,44 @@ fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
                 "unknown session state: {other}"
             )));
         }
+    })
+}
+
+/// ADR 0036: enable_jobs.state column ↔ `EnableJobState`. Exhaustive
+/// — an unknown string is a hard `Serialization` error, never a
+/// silent default (defaulting would resurrect terminal jobs into the
+/// scanner's sweep).
+pub(crate) fn parse_enable_job_state(s: &str) -> Result<EnableJobState, MetaError> {
+    Ok(match s {
+        "pending" => EnableJobState::Pending,
+        "materializing" => EnableJobState::Materializing,
+        "capturing" => EnableJobState::Capturing,
+        "ready" => EnableJobState::Ready,
+        "failed" => EnableJobState::Failed,
+        other => {
+            return Err(MetaError::Serialization(format!(
+                "unknown enable job state: {other}"
+            )));
+        }
+    })
+}
+
+pub(crate) fn enable_job_from_row(row: &PgRow) -> Result<EnableJob, MetaError> {
+    let state: String = row.try_get("state").map_err(col_err)?;
+    let chunks_total: Option<i32> = row.try_get("chunks_total").map_err(col_err)?;
+    let chunks_done: i32 = row.try_get("chunks_done").map_err(col_err)?;
+    let attempts: i32 = row.try_get("attempts").map_err(col_err)?;
+    Ok(EnableJob {
+        id: row.try_get("id").map_err(col_err)?,
+        image_uri: row.try_get("image_uri").map_err(col_err)?,
+        manifest_digest: row.try_get("manifest_digest").map_err(col_err)?,
+        state: parse_enable_job_state(&state)?,
+        chunks_total: chunks_total.map(|v| v.max(0) as u32),
+        chunks_done: chunks_done.max(0) as u32,
+        attempts: attempts.max(0) as u32,
+        error: row.try_get("error").map_err(col_err)?,
+        created_at: row.try_get("created_at").map_err(col_err)?,
+        updated_at: row.try_get("updated_at").map_err(col_err)?,
     })
 }
 
@@ -442,6 +498,36 @@ mod tests {
         match parse_session_state("running") {
             Err(MetaError::Serialization(msg)) => {
                 assert!(msg.contains("running"), "error must echo the bad value");
+            }
+            other => panic!("expected Serialization error, got {other:?}"),
+        }
+    }
+
+    /// ADR 0036: every `EnableJobState` variant round-trips through
+    /// the wire string, and unknown strings error rather than
+    /// defaulting — a silent default would resurrect terminal jobs
+    /// into the scanner's sweep. Extend this test and
+    /// `parse_enable_job_state` together when adding variants.
+    #[test]
+    fn enable_job_state_parses_every_variant() {
+        let variants = [
+            ("pending", EnableJobState::Pending),
+            ("materializing", EnableJobState::Materializing),
+            ("capturing", EnableJobState::Capturing),
+            ("ready", EnableJobState::Ready),
+            ("failed", EnableJobState::Failed),
+        ];
+        for (s, expected) in variants {
+            assert_eq!(parse_enable_job_state(s).unwrap(), expected);
+            assert_eq!(parse_enable_job_state(expected.as_str()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_enable_job_state_returns_serialization_error() {
+        match parse_enable_job_state("enabling") {
+            Err(MetaError::Serialization(msg)) => {
+                assert!(msg.contains("enabling"), "error must echo the bad value");
             }
             other => panic!("expected Serialization error, got {other:?}"),
         }

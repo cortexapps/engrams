@@ -12,8 +12,9 @@ use chrono::{DateTime, Utc};
 use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore, UserStore, WebSessionStore};
 use engram_core::types::user::{Role, RoleSource, User, UserToken, WebSession};
 use engram_core::types::{
-    ArtifactRow, EnabledImage, HostCapacity, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
+    ArtifactRow, EnableJob, EnableJobState, EnabledImage, HostCapacity, HostRecord, HostStatus,
+    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState,
+    SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, UserId};
 use row::col_err;
@@ -149,6 +150,16 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        // Every non-terminal state except `host_lost` (limbo pending the
+        // reconciler; its bindings are stale by definition).
+        // `evicting` matters most: it keeps `sandbox_id` BOUND
+        // while the pipeline runs, and startup's `repopulate_routing`
+        // rebuilds the in-memory SandboxRegistry from this query — when
+        // `evicting` was missing, a coord roll mid-eviction left the new
+        // pod's registry empty for that session, every scanner attempt
+        // no-op'd on the "sandbox no longer bound" guard, and the budget
+        // exhausted into a spurious HostLost with the VM still running
+        // (prod session 5cfb90b8, 2026-06-03).
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,
@@ -156,7 +167,8 @@ impl MetadataStore for PostgresStore {
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
-            WHERE status IN ('pending','active','idle')
+            WHERE status IN ('pending','created','guest_ready','active',
+                             'idle','evacuating','evicting')
             "#,
         )
         .fetch_all(&self.pool)
@@ -348,15 +360,17 @@ impl MetadataStore for PostgresStore {
         // ADR 0018 commit 12b: entering Evacuating resets
         // `evac_attempts` to 0 so a fresh drain (operator or
         // dead-host detector) starts the scanner's retry budget
-        // clean. Folded into the same UPDATE that commits the state
-        // flip so the counter and the state are always consistent.
+        // clean. ADR 0034 mirrors this for Evicting/`evict_attempts`.
+        // Folded into the same UPDATE that commits the state flip so
+        // the counters and the state are always consistent.
         sqlx::query(
             r#"
             UPDATE sessions
                SET status = $2,
                    last_active_at = NOW(),
                    updated_at = NOW(),
-                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END
+                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
+                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END
              WHERE id = $1
             "#,
         )
@@ -420,6 +434,101 @@ impl MetadataStore for PostgresStore {
             .try_get("evac_attempts")
             .map_err(|e| MetaError::Serialization(format!("bump_evac_attempts: {e}")))?;
         Ok(attempts.max(0) as u32)
+    }
+
+    /// ADR 0034: eviction-scanner sweep query. Indexed via the
+    /// partial `idx_sessions_evicting` from migration 0050 so the
+    /// cost stays flat as the global session row count grows.
+    async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, status, host_id, sandbox_id,
+                   image_uri, mode,
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   evict_attempts
+            FROM sessions
+            WHERE status = 'evicting'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let session = row::session_from_row(r)?;
+            let attempts: i32 = r
+                .try_get("evict_attempts")
+                .map_err(|e| MetaError::Serialization(format!("evict_attempts: {e}")))?;
+            out.push((session, attempts.max(0) as u32));
+        }
+        Ok(out)
+    }
+
+    /// ADR 0034: atomic `+= 1 RETURNING`. The eviction scanner calls
+    /// this before each pipeline attempt; when the returned count
+    /// crosses the budget it falls back to HostLost.
+    async fn bump_evict_attempts(&self, session_id: SessionId) -> Result<u32, MetaError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET evict_attempts = evict_attempts + 1
+             WHERE id = $1
+             RETURNING evict_attempts
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        let attempts: i32 = row
+            .try_get("evict_attempts")
+            .map_err(|e| MetaError::Serialization(format!("bump_evict_attempts: {e}")))?;
+        Ok(attempts.max(0) as u32)
+    }
+
+    /// ADR 0034 L3 backstop: Active sessions whose newest
+    /// session_events row is older than `idle_for_secs`. COALESCE to
+    /// the session's own `created_at` covers a freshly-created Active
+    /// session that has not emitted events yet (it still gets the
+    /// full TTL before the backstop will touch it). The per-session
+    /// MAX is served by `idx_session_events_session_created`
+    /// (migration 0050).
+    async fn list_active_sessions_idle_past(
+        &self,
+        idle_for_secs: i64,
+    ) -> Result<Vec<(SessionId, SandboxId, chrono::DateTime<chrono::Utc>)>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT s.id, s.sandbox_id,
+                   COALESCE(MAX(e.created_at), s.created_at) AS last_event_at
+            FROM sessions s
+            LEFT JOIN session_events e ON e.session_id = s.id
+            WHERE s.status = 'active' AND s.sandbox_id IS NOT NULL
+            GROUP BY s.id, s.sandbox_id, s.created_at
+            HAVING COALESCE(MAX(e.created_at), s.created_at)
+                   < NOW() - ($1::bigint * INTERVAL '1 second')
+            "#,
+        )
+        .bind(idle_for_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let id: uuid::Uuid = r
+                .try_get("id")
+                .map_err(|e| MetaError::Serialization(format!("backstop id: {e}")))?;
+            let sandbox: uuid::Uuid = r
+                .try_get("sandbox_id")
+                .map_err(|e| MetaError::Serialization(format!("backstop sandbox_id: {e}")))?;
+            let last_event_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("last_event_at")
+                .map_err(|e| MetaError::Serialization(format!("backstop last_event_at: {e}")))?;
+            out.push((SessionId::from(id), SandboxId::from(sandbox), last_event_at));
+        }
+        Ok(out)
     }
 
     async fn assign_session_host(
@@ -763,8 +872,8 @@ impl MetadataStore for PostgresStore {
                  image_version, size_bytes, created_at, last_accessed_at,
                  disk_manifest_id, disk_manifest_version,
                  memory_manifest_id, memory_manifest_version,
-                 recoverable)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 recoverable, aux_bundles, events_cursor)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
@@ -772,6 +881,12 @@ impl MetadataStore for PostgresStore {
                 memory_manifest_id      = EXCLUDED.memory_manifest_id,
                 memory_manifest_version = EXCLUDED.memory_manifest_version,
                 recoverable             = EXCLUDED.recoverable,
+                aux_bundles             = EXCLUDED.aux_bundles,
+                -- ADR 0028 A.log: never clobber a resolved cursor with
+                -- NULL on an idempotent re-record (the reconciler may
+                -- re-ingest a checkpoint the eviction pipeline already
+                -- recorded with a cursor, or vice versa).
+                events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
                 updated_at              = NOW()
             "#,
         )
@@ -787,6 +902,11 @@ impl MetadataStore for PostgresStore {
         .bind(snap.memory_manifest.map(|m| m.manifest_id))
         .bind(snap.memory_manifest.map(|m| m.version as i64))
         .bind(snap.recoverable)
+        .bind(
+            serde_json::to_value(&snap.aux_bundles)
+                .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
+        )
+        .bind(snap.events_cursor)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -796,6 +916,63 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn prune_session_snapshots(&self, retention: chrono::Duration) -> Result<u64, MetaError> {
+        // ADR 0028 Fix A retention: keep each session's latest row
+        // unconditionally (DISTINCT ON newest-first); delete the rest
+        // past the window. Same-TX chunk_generation bump keeps the GC
+        // barrier semantics symmetric with record_snapshot — a sweep
+        // that read the pin set mid-prune restarts and re-classifies.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let res = sqlx::query(
+            r#"
+            DELETE FROM snapshots s
+            WHERE s.session_id IS NOT NULL
+              AND s.created_at < NOW() - $1::interval
+              AND s.id NOT IN (
+                  SELECT DISTINCT ON (session_id) id
+                  FROM snapshots
+                  WHERE session_id IS NOT NULL
+                  ORDER BY session_id, created_at DESC
+              )
+            "#,
+        )
+        .bind(sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
+        })
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    async fn latest_event_idx_at_or_before(
+        &self,
+        sid: SessionId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<i64>, MetaError> {
+        // ADR 0028 A.log: the checkpoint pause instant freezes the
+        // guest, so events it caused can't land in the captured state
+        // after `at`. (Events emitted just before pause but written
+        // just after are a sub-second edge we accept — they survive a
+        // rewind the agent technically remembers.)
+        let row: (Option<i64>,) = sqlx::query_as(
+            "SELECT MAX(idx) FROM session_events WHERE session_id = $1 AND created_at <= $2",
+        )
+        .bind(sid.as_uuid())
+        .bind(at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.0)
     }
 
     async fn list_snapshots_for_session(
@@ -809,7 +986,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -831,7 +1008,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -854,7 +1031,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE id = $1
             "#,
         )
@@ -932,6 +1109,10 @@ impl MetadataStore for PostgresStore {
         // that LISTEN before this statement runs see the notification;
         // replicas that subscribe later catch up via the persistent
         // log + `?since=N`.
+        // ADR 0028 A.log: stamp the session's current `recovery_epoch`
+        // on the new event (read in the same CTE as the idx bump, so
+        // it reflects any rewind that already committed). Pre-rewind
+        // sessions stay epoch 0.
         let row = sqlx::query(
             r#"
             WITH next AS (
@@ -939,11 +1120,11 @@ impl MetadataStore for PostgresStore {
                    SET next_event_idx = next_event_idx + 1,
                        updated_at = NOW()
                  WHERE id = $1
-             RETURNING next_event_idx - 1 AS allocated_idx
+             RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
             ),
             inserted AS (
-                INSERT INTO session_events (session_id, idx, kind, payload)
-                SELECT $1, allocated_idx, $2, $3 FROM next
+                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch)
+                SELECT $1, allocated_idx, $2, $3, recovery_epoch FROM next
                 RETURNING idx
             )
             SELECT i.idx,
@@ -971,9 +1152,13 @@ impl MetadataStore for PostgresStore {
         since: i64,
         limit: i64,
     ) -> Result<Vec<PersistedEvent>, MetaError> {
+        // ADR 0028 A.log: replay ALL events (incl. tombstoned), each
+        // carrying its `recovery_epoch` + `rewound_at`. The transcript
+        // renders rewound rows collapsed/greyed and segments by epoch —
+        // honest history, not a silent deletion.
         let rows = sqlx::query(
             r#"
-            SELECT idx, kind, payload, created_at
+            SELECT idx, kind, payload, created_at, recovery_epoch, rewound_at
               FROM session_events
              WHERE session_id = $1 AND idx > $2
              ORDER BY idx
@@ -987,6 +1172,99 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         rows.iter().map(row::persisted_event_from_row).collect()
+    }
+
+    async fn rewind_session_to_cursor(
+        &self,
+        session_id: SessionId,
+        events_cursor: i64,
+    ) -> Result<engram_core::types::event::RewindSummary, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        // Surviving side-effects: outside-world actions in the
+        // rolled-back span that the rewind CANNOT undo. We surface
+        // them rather than hide them (the deliberate at-least-once
+        // posture). Detect the kinds that touched the world.
+        let side_effect_rows = sqlx::query(
+            r#"
+            SELECT kind, payload FROM session_events
+             WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
+               AND kind IN ('pull_request_opened', 'file_shared')
+             ORDER BY idx
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(events_cursor)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let surviving_side_effects = side_effect_rows
+            .iter()
+            .filter_map(|r| {
+                let kind: String = sqlx::Row::try_get(r, "kind").ok()?;
+                let payload: serde_json::Value = sqlx::Row::try_get(r, "payload").ok()?;
+                Some(match kind.as_str() {
+                    "pull_request_opened" => format!(
+                        "A pull request was opened and still exists: {}",
+                        payload
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("(url unknown)"),
+                    ),
+                    "file_shared" => format!(
+                        "A file was shared and still exists: {}",
+                        payload
+                            .get("caption")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| payload.get("artifact_id").and_then(|v| v.as_str()))
+                            .unwrap_or("(artifact)"),
+                    ),
+                    _ => return None,
+                })
+            })
+            .collect();
+
+        // Tombstone the rolled-back span (audit-preserving) and count it.
+        let tombstoned = sqlx::query(
+            r#"
+            UPDATE session_events
+               SET rewound_at = NOW()
+             WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(events_cursor)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+
+        if tombstoned == 0 {
+            // Checkpoint was already the head — no rewind. Don't bump
+            // the epoch (keeps the no-op clean); caller emits nothing.
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(engram_core::types::event::RewindSummary::default());
+        }
+
+        // Bump the epoch so events appended after this segment cleanly.
+        let epoch_row = sqlx::query(
+            "UPDATE sessions SET recovery_epoch = recovery_epoch + 1, updated_at = NOW() \
+             WHERE id = $1 RETURNING recovery_epoch",
+        )
+        .bind(session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let recovery_epoch: i32 =
+            sqlx::Row::try_get(&epoch_row, "recovery_epoch").map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(engram_core::types::event::RewindSummary {
+            rolled_back: tombstoned,
+            recovery_epoch: recovery_epoch as i64,
+            through_idx: events_cursor,
+            surviving_side_effects,
+        })
     }
 
     // ---------- file artifacts (ADR 0026) ----------
@@ -1396,6 +1674,273 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn find_enabled_image_by_content(
+        &self,
+        disk_manifest: engram_core::types::manifest::ManifestRef,
+        manifest_toml: &str,
+    ) -> Result<Option<EnabledImage>, MetaError> {
+        // Soft-deleted rows are deliberately INCLUDED: their base
+        // snapshots remain GC-pinned and restorable, and content
+        // equality is what makes the reuse sound — liveness of the
+        // *row* is irrelevant to the snapshot's validity.
+        let row = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_toml, manifest_digest,
+                   disk_manifest_id, disk_manifest_version, base_snapshot_id,
+                   base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version,
+                   base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version,
+                   last_refreshed_at, created_at, updated_at, soft_deleted_at
+              FROM enabled_images
+             WHERE disk_manifest_id = $1
+               AND disk_manifest_version = $2
+               AND manifest_toml = $3
+               AND base_snapshot_id IS NOT NULL
+             ORDER BY COALESCE(updated_at, created_at) DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(disk_manifest.manifest_id)
+        .bind(disk_manifest.version as i64)
+        .bind(manifest_toml)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::enabled_image_from_row(&r)).transpose()
+    }
+
+    // ---- enable jobs (ADR 0036) ----
+
+    async fn create_or_get_enable_job(
+        &self,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
+    ) -> Result<EnableJob, MetaError> {
+        // INSERT guarded by the partial unique index (one non-terminal
+        // job per image_uri); on conflict fall through to SELECTing
+        // the in-flight job. Re-POST = resume, never duplicate work.
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO enable_jobs (id, image_uri, manifest_digest)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
+            DO NOTHING
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(image_uri)
+        .bind(manifest_digest)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if let Some(row) = inserted {
+            return row::enable_job_from_row(&row);
+        }
+        let existing = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+              FROM enable_jobs
+             WHERE image_uri = $1 AND state NOT IN ('ready', 'failed')
+            "#,
+        )
+        .bind(image_uri)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match existing {
+            Some(row) => row::enable_job_from_row(&row),
+            // Raced with the active job reaching a terminal state
+            // between INSERT and SELECT — retry the insert once.
+            None => {
+                let row = sqlx::query(
+                    r#"
+                    INSERT INTO enable_jobs (id, image_uri, manifest_digest)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (image_uri) WHERE state NOT IN ('ready', 'failed')
+                    DO NOTHING
+                    RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+                    "#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(image_uri)
+                .bind(manifest_digest)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    MetaError::Conflict(format!(
+                        "enable job for `{image_uri}` raced two creates; retry"
+                    ))
+                })?;
+                row::enable_job_from_row(&row)
+            }
+        }
+    }
+
+    async fn get_enable_job(&self, id: Uuid) -> Result<Option<EnableJob>, MetaError> {
+        let row = sqlx::query(
+            r#"SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at FROM enable_jobs WHERE id = $1"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| row::enable_job_from_row(&r)).transpose()
+    }
+
+    async fn list_enable_jobs(&self, limit: u32) -> Result<Vec<EnableJob>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+              FROM enable_jobs
+             ORDER BY created_at DESC
+             LIMIT $1
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::enable_job_from_row).collect()
+    }
+
+    async fn claim_enable_jobs(
+        &self,
+        claimant: &str,
+        lease_secs: u32,
+        limit: u32,
+    ) -> Result<Vec<EnableJob>, MetaError> {
+        // Atomic claim: stamp (claimed_by, claimed_at) on non-terminal
+        // jobs whose lease is free or expired. The inner SELECT ...
+        // FOR UPDATE SKIP LOCKED keeps two pods' simultaneous sweeps
+        // from blocking on each other — each claims a disjoint set.
+        let rows = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW()
+             WHERE id IN (
+                   SELECT id FROM enable_jobs
+                    WHERE state NOT IN ('ready', 'failed')
+                      AND (claimed_at IS NULL OR claimed_at < NOW() - make_interval(secs => $2))
+                    ORDER BY created_at
+                    LIMIT $3
+                      FOR UPDATE SKIP LOCKED
+             )
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+            "#,
+        )
+        .bind(claimant)
+        .bind(lease_secs as f64)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::enable_job_from_row).collect()
+    }
+
+    async fn update_enable_job_progress(
+        &self,
+        id: Uuid,
+        chunks_done: u32,
+        chunks_total: Option<u32>,
+    ) -> Result<(), MetaError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET chunks_done = $2,
+                   chunks_total = COALESCE($3, chunks_total),
+                   claimed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(chunks_done as i32)
+        .bind(chunks_total.map(|v| v as i32))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn set_enable_job_state(&self, id: Uuid, state: EnableJobState) -> Result<(), MetaError> {
+        // Terminal states release the claim; non-failed targets clear
+        // any stale error from a prior retried attempt.
+        let res = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET state = $2,
+                   error = CASE WHEN $2 = 'failed' THEN error ELSE NULL END,
+                   claimed_by = CASE WHEN $2 IN ('ready', 'failed') THEN NULL ELSE claimed_by END,
+                   claimed_at = CASE WHEN $2 IN ('ready', 'failed') THEN NULL ELSE NOW() END,
+                   updated_at = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(state.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn record_enable_job_failure(&self, id: Uuid, error: &str) -> Result<u32, MetaError> {
+        // Release the claim so ANY pod's next tick can retry — the
+        // failing pod holds no special ownership of the retry.
+        let attempts: i32 = sqlx::query_scalar(
+            r#"
+            UPDATE enable_jobs
+               SET attempts = attempts + 1,
+                   error = $2,
+                   claimed_by = NULL,
+                   claimed_at = NULL,
+                   updated_at = NOW()
+             WHERE id = $1
+            RETURNING attempts
+            "#,
+        )
+        .bind(id)
+        .bind(error)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        Ok(attempts.max(0) as u32)
+    }
+
+    async fn retry_enable_job(&self, id: Uuid) -> Result<EnableJob, MetaError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE enable_jobs
+               SET state = 'pending', attempts = 0, error = NULL,
+                   claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
+             WHERE id = $1 AND state = 'failed'
+            RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            Some(r) => row::enable_job_from_row(&r),
+            None => match self.get_enable_job(id).await? {
+                Some(job) => Err(MetaError::Conflict(format!(
+                    "enable job {id} is `{}`, not `failed`; only failed jobs can be retried",
+                    job.state.as_str()
+                ))),
+                None => Err(MetaError::NotFound),
+            },
+        }
+    }
+
     async fn upsert_session_secrets(&self, secrets: SessionSecrets) -> Result<(), MetaError> {
         sqlx::query(
             r#"
@@ -1692,6 +2237,57 @@ impl MetadataStore for PostgresStore {
             .collect())
     }
 
+    /// ADR 0022 Option A: pin-set source #5 — every enabled image's
+    /// base-snapshot MEMORY manifest (the per-template base memfile's
+    /// backing). Pins independent of the base snapshot row's `recoverable`
+    /// flag and of `soft_deleted_at` (mirrors source #1). `enabled_images`
+    /// is tens of rows per deployment, so a plain DISTINCT scan is well
+    /// under a millisecond — no index needed (cf. migration 0041).
+    async fn list_enabled_image_base_snapshot_memory_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT DISTINCT base_snapshot_memory_manifest_id, base_snapshot_memory_manifest_version
+               FROM enabled_images
+              WHERE base_snapshot_memory_manifest_id IS NOT NULL
+                AND base_snapshot_memory_manifest_version IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id: id,
+                version: version as u64,
+            })
+            .collect())
+    }
+
+    /// ADR 0022 Option A: pin-set source #6 — the disk companion to #5
+    /// (every enabled image's base-snapshot DISK manifest, migration
+    /// 0042). Same recoverable/soft-delete-independent semantics.
+    async fn list_enabled_image_base_snapshot_disk_manifests(
+        &self,
+    ) -> Result<Vec<engram_core::types::manifest::ManifestRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT DISTINCT base_snapshot_disk_manifest_id, base_snapshot_disk_manifest_version
+               FROM enabled_images
+              WHERE base_snapshot_disk_manifest_id IS NOT NULL
+                AND base_snapshot_disk_manifest_version IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, version)| engram_core::types::manifest::ManifestRef {
+                manifest_id: id,
+                version: version as u64,
+            })
+            .collect())
+    }
+
     /// ADR 0016 Phase C: pin-set source #2 — every session that has
     /// published a live disk manifest. The partial index
     /// `idx_sessions_live_disk_manifest` (migration 0034) covers the
@@ -1847,6 +2443,77 @@ impl MetadataStore for PostgresStore {
         let as_vecs: Vec<&[u8]> = hashes.iter().map(|h| h.as_slice()).collect();
         sqlx::query("DELETE FROM chunk_gc_candidates WHERE content_hash = ANY($1::bytea[])")
             .bind(&as_vecs)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// ADR 0035 §5: distinct bundle generations referenced by any
+    /// snapshot row. jsonb unnest in SQL so the coord never pages the
+    /// whole table; the result is at most a handful of refs.
+    async fn bundle_pin_set(
+        &self,
+    ) -> Result<Vec<engram_core::types::sandbox::AuxBundleRef>, MetaError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT DISTINCT b->>'drive_id', b->>'sha256'
+               FROM snapshots, jsonb_array_elements(aux_bundles) AS b",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out: Vec<_> = rows
+            .into_iter()
+            .map(
+                |(drive_id, sha256)| engram_core::types::sandbox::AuxBundleRef { drive_id, sha256 },
+            )
+            .collect();
+        out.sort_by(|a, b| (&a.drive_id, &a.sha256).cmp(&(&b.drive_id, &b.sha256)));
+        Ok(out)
+    }
+
+    /// ADR 0035 §5: sticky-first-seen candidate upsert (bundle
+    /// flavor of `upsert_chunk_gc_candidate`).
+    async fn upsert_bundle_gc_candidate(&self, sha256: &str) -> Result<(), MetaError> {
+        sqlx::query(
+            "INSERT INTO bundle_gc_candidates (sha256)
+             VALUES ($1)
+             ON CONFLICT (sha256) DO UPDATE SET last_seen_at = now()",
+        )
+        .bind(sha256)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// ADR 0035 §5 promote-pass query.
+    async fn list_expired_bundle_gc_candidates(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<String>, MetaError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT sha256
+               FROM bundle_gc_candidates
+              WHERE first_seen_at < $1
+              ORDER BY first_seen_at
+              LIMIT $2",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    /// ADR 0035 §5: batch-delete candidate rows.
+    async fn delete_bundle_gc_candidates(&self, sha256s: &[String]) -> Result<(), MetaError> {
+        if sha256s.is_empty() {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM bundle_gc_candidates WHERE sha256 = ANY($1::text[])")
+            .bind(sha256s)
             .execute(&self.pool)
             .await
             .map_err(db_err)?;

@@ -122,6 +122,29 @@ impl HarnessSupervisor {
         // a harness, but their exec/shell processes still inherit it.
         *self.session_env.write().expect("session_env lock poisoned") = req.session_env.clone();
 
+        // ADR 0035 §3: re-mount the bundle mounts BEFORE activation. On a
+        // fresh create the host may have patch_drive'd an aux bundle to a
+        // newer generation while load-paused; the guest's captured squashfs
+        // superblock predates the swap, so reads (including activate()'s
+        // probes below) would EIO until a umount/mount re-parses the device.
+        // EBUSY = resume path (drive unswapped, mount still correct) — kept.
+        for (target, outcome) in crate::remount::remount_bundle_mounts() {
+            match outcome {
+                crate::remount::RemountOutcome::Remounted => {
+                    tracing::info!(%target, "ADR 0035: bundle mount re-parsed");
+                }
+                crate::remount::RemountOutcome::KeptBusy => {
+                    tracing::debug!(%target, "ADR 0035: bundle mount in use (resume); kept");
+                }
+                crate::remount::RemountOutcome::Failed(e) => {
+                    // Loud: a swapped device under a stale mount is the
+                    // 2026-06-03 incident class — the session will come up
+                    // with broken skills if this fires after a swap.
+                    tracing::error!(%target, error = %e, "ADR 0035: bundle remount FAILED");
+                }
+            }
+        }
+
         // ADR 0027: wire whatever RO bundles the init shim mounted (the
         // skills / playwright squashfs) into the harness's skill
         // discovery paths, gated by the session env. Done before the

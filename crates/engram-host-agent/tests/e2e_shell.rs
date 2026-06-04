@@ -241,8 +241,6 @@ async fn bake_shell_rootfs(repo: &str) -> PathBuf {
                 transport: Transport::Vsock,
                 init_script: None,
             }),
-            parent_disk_bootstrap_path: None,
-            parent_disk_chunks_blob_digest: None,
         })
         .await
         .expect("bake ext4");
@@ -467,6 +465,7 @@ async fn e2e_shell_cold_via_pooled_backend() {
         image: "engram-e2e-shell-cold".into(),
         rootfs_source: Some(rootfs_path),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -521,6 +520,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
         image: "engram-e2e-shell-warm".into(),
         rootfs_source: Some(rootfs_path),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

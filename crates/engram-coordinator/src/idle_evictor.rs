@@ -1,15 +1,22 @@
-//! Idle-session eviction *pipeline* — the snapshot+destroy+mark-Idle
-//! primitive that runs when a sandbox has been quiet past its TTL.
+//! Idle-session eviction: the snapshot+destroy+mark-Idle *pipeline*
+//! plus (ADR 0034) the *eviction scanner* that drives it.
 //!
 //! ADR 0013 + ADR 0011 follow-up #2 retired the polling driver that
 //! lived here. In a stateless coord, no single pod's local
 //! `HarnessHub` is authoritative for "is this sandbox idle?" — the
-//! host owns that view. The host now scans its local hub on a tick
-//! and POSTs candidates to `/api/hosts/:id/idle-eviction-candidates`;
-//! the receiving coord pod runs `evict_idle_session` on each. The
-//! pipeline is idempotent (registry guard at the top short-circuits
-//! if another pod already evicted the sandbox), so the same
-//! candidate landing twice is safe.
+//! host owns that view. The host scans its local hub on a tick and
+//! POSTs candidates to `/api/hosts/:id/idle-eviction-candidates`.
+//!
+//! ADR 0034 split nomination from execution. The receiving handler
+//! only flips `Active → Evicting` (the pre-0034 inline pipeline died
+//! by cancellation whenever an eviction outlived the host's POST
+//! timeout — prod session 0782bea5). [`spawn_eviction_scanner`]
+//! sweeps `status='evicting'` on a 10s tick and runs
+//! [`evict_idle_session`] to completion outside any request
+//! lifetime; its first tick after coord startup is also what
+//! recovers rows wedged across a deploy. The pipeline is idempotent
+//! (registry guard at the top short-circuits if another pod already
+//! evicted the sandbox), so re-entry is safe.
 //!
 //! Auto-resume on next request is wired separately (`api/sessions.rs`
 //! exec/exec_stream/SSE handlers): if status is `Idle`, call the
@@ -152,6 +159,17 @@ pub async fn evict_session_to_state(
 
     let host_id = state.host_registry.host_of(sandbox_id);
     let now = Utc::now();
+    // ADR 0028 A.log: the event-log leg of the coherence triple. The
+    // guest paused (then gets destroyed) during the capture, so "the
+    // newest event as of now" is the cursor at the pause instant up
+    // to a sub-second skew. Best-effort: a lookup failure degrades to
+    // NULL ("no rewind information"), never fails the eviction.
+    let events_cursor = state
+        .services
+        .meta
+        .latest_event_idx_at_or_before(session_id, now)
+        .await
+        .unwrap_or_default();
     let record = SnapshotRecord {
         id: metadata.id,
         session_id: Some(session_id),
@@ -172,10 +190,37 @@ pub async fn evict_session_to_state(
             metadata.memory_manifest.as_ref(),
         )
         .await,
+        // ADR 0035: pin the generations this snapshot references.
+        aux_bundles: metadata.aux_bundles.clone(),
+        events_cursor,
     };
     if let Err(e) = state.services.meta.record_snapshot(record.clone()).await {
         abort_inflight_snapshot(state, session_id, sandbox_id, "record_snapshot").await;
         return Err(EvictError::Meta(e.to_string()));
+    }
+
+    // ADR 0034 durability: commit the host's in-flight snapshot NOW —
+    // while the sandbox is still bound and its owner resolvable, and
+    // BEFORE `unbind`/`destroy` below or the racing periodic-checkpoint
+    // driver can `abort_prior_inflight_snapshot` the artifacts out from
+    // under the `recoverable = true` row we just wrote. The old
+    // placement (after destroy()) could NEVER succeed: destroy() plus
+    // the `sandbox_id = NULL` transition below make `resolve_owner`
+    // return NotFound, so commit no-op'd, the host kept the snapshot
+    // "in-flight", and the next checkpoint tick deleted
+    // state.bin/sidecar from BlobStorage while PG still advertised the
+    // snapshot as recoverable — bricking the resume. Prod incident
+    // 89f7984d (2026-06-04). Best-effort: a genuine host RPC failure
+    // here is rare and backstopped by resume-time blob verification
+    // (see `api::snapshot::resume_from_idle`).
+    if let Err(e) = state.services.host.commit_snapshot(sandbox_id).await {
+        tracing::warn!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            error = %e,
+            "idle eviction: commit_snapshot failed; host in-flight tracking not \
+             cleared (resume-time verification will catch a deleted snapshot)",
+        );
     }
 
     // ADR 0016 §A.1.6: PG-side transitions happen BEFORE
@@ -282,21 +327,6 @@ pub async fn evict_session_to_state(
     {
         abort_inflight_snapshot(state, session_id, sandbox_id, "emit StatusChanged").await;
         return Err(EvictError::Emit(e.to_string()));
-    }
-
-    // Full pipeline succeeded — commit the snapshot. Failure here is
-    // unusual (host RPC error) and means the host's in-flight tracking
-    // wasn't cleared, but the artifacts are still consistent. Log and
-    // let it ride; the next snapshot() for this sandbox will overwrite
-    // anyway, and the PG row still references the durable artifacts.
-    if let Err(e) = state.services.host.commit_snapshot(sandbox_id).await {
-        tracing::warn!(
-            session_id = %session_id,
-            sandbox_id = %sandbox_id,
-            error = %e,
-            "idle eviction: commit_snapshot failed after full pipeline success \
-             (host-side in-flight tracking may be stale until next retry overwrites)",
-        );
     }
 
     // ADR 0016 A.1.1: success log. Pairs with the entry log so a
@@ -470,10 +500,180 @@ impl std::error::Error for EvictError {
     }
 }
 
-// The TTL env helpers + polling driver live on the host-agent now
-// (`engram_host_agent::idle_evictor`). The coord only owns the
-// `evict_idle_session` pipeline above, invoked by the
-// `/api/hosts/:id/idle-eviction-candidates` POST handler.
+// The TTL env helpers + the soft/hard-TTL detection driver live on
+// the host-agent (`engram_host_agent::idle_evictor`). The coord owns
+// the `evict_idle_session` pipeline above and (ADR 0034) the
+// eviction scanner below that drives it for `Evicting` rows.
+
+// ─── ADR 0034: eviction scanner ──────────────────────────────────
+//
+// Same shape as `evac_resumer`: spawn loop → per-tick list-by-status
+// → per-session attempt-bump + budget → primitive. The nomination
+// side (handler / detection backstop) only flips Active → Evicting;
+// everything heavy happens here, detached from any request lifetime.
+
+#[derive(Clone, Debug)]
+pub struct EvictionScannerConfig {
+    /// How often to sweep for Evicting sessions. 10s matches
+    /// `EvacResumerConfig::poll_interval` — same operational cadence
+    /// for all session-lifecycle scanners.
+    pub poll_interval: std::time::Duration,
+    /// Retry budget per session before falling back to `HostLost`.
+    /// At the 10s cadence, 20 attempts is ~3 minutes of continuous
+    /// pipeline failure (blob-store flake, host gRPC errors). The
+    /// fallback is HostLost — NOT Active (would re-nominate forever),
+    /// NOT Idle (lies: no durable snapshot exists and the sandbox is
+    /// still running), NOT Dead (destroys a healthy runtime over a
+    /// coord-side failure). See ADR 0034.
+    pub max_attempts: u32,
+}
+
+impl Default for EvictionScannerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: std::time::Duration::from_secs(10),
+            max_attempts: 20,
+        }
+    }
+}
+
+/// Spawn the eviction scanner as a background task. Caller holds the
+/// JoinHandle for the process lifetime; dropping aborts the loop.
+/// Mirrors [`crate::evac_resumer::spawn`].
+///
+/// The first sweep after coord startup is the deploy-recovery story:
+/// a row left `Evicting` by a pod that died mid-pipeline is picked
+/// up here and re-driven (the pipeline is idempotent; the session
+/// lease serializes against any surviving peer pod).
+pub fn spawn_eviction_scanner(
+    cfg: EvictionScannerConfig,
+    state: SharedState,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(cfg.poll_interval);
+        loop {
+            tick.tick().await;
+            if let Err(e) = scanner_run_once(&cfg, &state).await {
+                tracing::warn!(error = %e, "eviction scanner tick failed; will retry");
+            }
+        }
+    })
+}
+
+/// Single scanner tick. `pub(crate)` so tests can drive the scanner
+/// deterministically without `tokio::spawn`-ing the loop.
+pub(crate) async fn scanner_run_once(
+    cfg: &EvictionScannerConfig,
+    state: &SharedState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let candidates = state.services.meta.list_evicting_sessions().await?;
+    // Queue-depth gauge even when 0 — a flatline at 0 is the healthy
+    // signal; a climbing value means evictions arrive faster than
+    // pipelines complete.
+    ::metrics::gauge!(crate::metrics::EVICTION_SCANNER_QUEUE).set(candidates.len() as f64);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    tracing::debug!(
+        count = candidates.len(),
+        "eviction scanner found Evicting sessions"
+    );
+    for (session, attempts) in candidates {
+        if let Err(e) = scanner_advance_one(cfg, state, session, attempts).await {
+            // Keep going — one wedged session shouldn't stall the
+            // sweep.
+            tracing::warn!(error = %e, "eviction scanner per-session advance failed");
+        }
+    }
+    Ok(())
+}
+
+async fn scanner_advance_one(
+    cfg: &EvictionScannerConfig,
+    state: &SharedState,
+    session: engram_core::types::Session,
+    attempts: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let session_id = session.id;
+
+    // Budget exhausted, or an inconsistent row (Evicting without a
+    // bound sandbox — nothing to evict): fall back to HostLost. The
+    // existing HostLost machinery (dead-host second stage, host-side
+    // orphan reap, manual /resume) owns recovery from there, and
+    // HostLost is not Active so neither detector re-nominates — the
+    // loop is broken by construction.
+    let fallback_reason = if attempts >= cfg.max_attempts {
+        Some("retry budget exhausted")
+    } else if session.sandbox_id.is_none() {
+        Some("Evicting row has no bound sandbox")
+    } else {
+        None
+    };
+    if let Some(reason) = fallback_reason {
+        match state
+            .services
+            .meta
+            .transition_session(session_id, SessionState::HostLost)
+            .await
+        {
+            Ok(prev) => {
+                ::metrics::counter!(crate::metrics::EVICTION_BUDGET_EXHAUSTED_TOTAL).increment(1);
+                tracing::warn!(
+                    %session_id,
+                    attempts,
+                    max_attempts = cfg.max_attempts,
+                    reason,
+                    "eviction scanner gave up; session falls back to HostLost",
+                );
+                let _ = state
+                    .emit(
+                        session_id,
+                        SessionEvent::StatusChanged {
+                            from: prev,
+                            to: SessionState::HostLost,
+                            at: Utc::now(),
+                        },
+                    )
+                    .await;
+            }
+            Err(e) => {
+                // Already moved (delete raced us, host died) — fine;
+                // anything else logs and retries next tick.
+                tracing::warn!(
+                    %session_id,
+                    error = %e,
+                    "eviction scanner fallback transition Evicting→HostLost failed",
+                );
+            }
+        }
+        return Ok(());
+    }
+    // Checked Some() above via fallback_reason.
+    let sandbox_id = session.sandbox_id.expect("checked above");
+
+    // Bump pre-pipeline: a failure leaves the counter incremented and
+    // the session at Evicting — next tick retries until the budget
+    // runs out. `transition_session(Evicting)` resets the counter on
+    // every (re-)entry per migration 0050's CASE expression.
+    let new_attempts = state.services.meta.bump_evict_attempts(session_id).await?;
+    tracing::info!(
+        %session_id,
+        %sandbox_id,
+        attempt = new_attempts,
+        max_attempts = cfg.max_attempts,
+        "eviction scanner: starting pipeline attempt",
+    );
+
+    let started = std::time::Instant::now();
+    evict_idle_session(state, session_id, sandbox_id).await?;
+    // Only successful runs are recorded — the histogram answers "how
+    // long does a completed eviction take" (the pre-0034 bug would
+    // reappear as nominations without completions, not as a latency
+    // shift).
+    ::metrics::histogram!(crate::metrics::EVICTION_PIPELINE_SECONDS)
+        .record(started.elapsed().as_secs_f64());
+    Ok(())
+}
 
 /// Marker that this module exists so unused-arg checkers don't
 /// flag the `Arc<dyn SandboxBackend>` we explicitly take below.
@@ -499,6 +699,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn build_state_with_session(session: Session, sandbox_root: &Path) -> SharedState {
+        build_state_and_meta(session, sandbox_root).0
+    }
+
+    /// Variant that also hands back the MiniMeta so tests can reach
+    /// its failure-injection toggles (`fail_next_record_snapshot`).
+    fn build_state_and_meta(session: Session, sandbox_root: &Path) -> (SharedState, Arc<MiniMeta>) {
         let local_path = sandbox_root.join("local");
         std::fs::create_dir_all(&local_path).unwrap();
         let backend: Arc<dyn SandboxBackend> =
@@ -540,7 +746,10 @@ mod tests {
             local_path,
             ..CoordinatorConfig::default()
         };
-        Arc::new(AppState::new_with_registry(cfg, services, host_registry))
+        (
+            Arc::new(AppState::new_with_registry(cfg, services, host_registry)),
+            meta,
+        )
     }
 
     fn process_spec() -> SandboxSpec {
@@ -548,6 +757,7 @@ mod tests {
             image: "evict-test".into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
@@ -1067,6 +1277,238 @@ mod tests {
         );
     }
 
+    /// ADR 0034 durability regression guard. `commit_snapshot` MUST run
+    /// while the sandbox is still bound — BEFORE `unbind`/`destroy`.
+    /// With the old ordering (commit after destroy), `resolve_owner`
+    /// returned NotFound, the host never cleared its in-flight tracking,
+    /// and the racing periodic-checkpoint driver
+    /// `abort_prior_inflight_snapshot`-ed the committed blobs out of
+    /// BlobStorage while PG still advertised the snapshot as
+    /// `recoverable=true` — bricking the resume (prod incident
+    /// 89f7984d). Asserts the call order snapshot → commit → destroy.
+    #[tokio::test]
+    async fn evict_idle_session_commits_before_destroy() {
+        use std::sync::Arc as StdArc;
+        use std::sync::Mutex as StdMutex;
+
+        // Spy that records the order of the lifecycle calls we care
+        // about; everything else passes straight through to inner.
+        struct OrderSpyHost {
+            inner: StdArc<dyn engram_core::traits::HostClient>,
+            seq: StdArc<StdMutex<Vec<&'static str>>>,
+        }
+        #[async_trait::async_trait]
+        impl engram_core::traits::HostClient for OrderSpyHost {
+            async fn create(
+                &self,
+                spec: SandboxSpec,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.create(spec).await
+            }
+            async fn destroy(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.seq.lock().unwrap().push("destroy");
+                self.inner.destroy(id).await
+            }
+            async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
+                self.inner.list().await
+            }
+            async fn exec_stream(
+                &self,
+                id: engram_core::SandboxId,
+                cmd: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                self.inner.exec_stream(id, cmd).await
+            }
+            async fn snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
+            {
+                self.seq.lock().unwrap().push("snapshot");
+                self.inner.snapshot(id).await
+            }
+            async fn commit_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.seq.lock().unwrap().push("commit");
+                self.inner.commit_snapshot(id).await
+            }
+            async fn abort_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.seq.lock().unwrap().push("abort");
+                self.inner.abort_snapshot(id).await
+            }
+            async fn restore(
+                &self,
+                metadata: engram_core::types::snapshot::SnapshotMetadata,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.restore(metadata).await
+            }
+            async fn start_agent(
+                &self,
+                id: engram_core::SandboxId,
+                agent: engram_core::types::sandbox::AgentSpec,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.start_agent(id, agent, policy).await
+            }
+            async fn apply_egress_policy(
+                &self,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.apply_egress_policy(policy).await
+            }
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<String> {
+                self.inner.guest_ip(id).await
+            }
+            async fn bind_session(
+                &self,
+                session_id: engram_core::SessionId,
+                sandbox_id: engram_core::SandboxId,
+            ) {
+                self.inner.bind_session(session_id, sandbox_id).await
+            }
+            async fn unbind_session(&self, session_id: engram_core::SessionId) {
+                self.inner.unbind_session(session_id).await
+            }
+            async fn send_prompt(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+                text: String,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.send_prompt(sandbox_id, text).await
+            }
+            async fn acquire_shell(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.acquire_shell(sandbox_id).await
+            }
+            async fn release_shell(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.release_shell(sandbox_id).await
+            }
+        }
+
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:evict-order".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+
+        let sandbox_root = TempDir::new().unwrap();
+        let local_path = sandbox_root.path().join("local");
+        std::fs::create_dir_all(&local_path).unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let meta = Arc::new(MiniMeta::new(session));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
+
+        let seq = StdArc::new(StdMutex::new(Vec::new()));
+        let spy: Arc<dyn engram_core::traits::HostClient> = Arc::new(OrderSpyHost {
+            inner: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            seq: seq.clone(),
+        });
+
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: spy,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-evict-order-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-evict-order-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = crate::config::CoordinatorConfig {
+            local_path,
+            ..crate::config::CoordinatorConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new_with_registry(
+            cfg,
+            services,
+            host_registry,
+        ));
+
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        evict_idle_session(&state, session_id, sandbox_id)
+            .await
+            .expect("full pipeline must succeed");
+
+        let seq = seq.lock().unwrap().clone();
+        let snapshot_pos = seq
+            .iter()
+            .position(|&s| s == "snapshot")
+            .expect("snapshot must be called");
+        let commit_pos = seq
+            .iter()
+            .position(|&s| s == "commit")
+            .expect("commit_snapshot must be called");
+        let destroy_pos = seq
+            .iter()
+            .position(|&s| s == "destroy")
+            .expect("destroy must be called");
+        assert!(
+            snapshot_pos < commit_pos,
+            "snapshot must precede commit; seq={seq:?}",
+        );
+        assert!(
+            commit_pos < destroy_pos,
+            "commit_snapshot must run BEFORE destroy (else resolve_owner NotFound \
+             → committed blobs aborted while recoverable=true); seq={seq:?}",
+        );
+        assert!(
+            !seq.contains(&"abort"),
+            "no abort on the happy path; seq={seq:?}",
+        );
+    }
+
     /// ADR 0016 §A.1.5c regression guard. With a peer pod's lease
     /// pre-installed in the `session_lease` table (simulated
     /// via MiniMeta's in-memory mirror), a fresh
@@ -1536,5 +1978,162 @@ mod tests {
         // Session stays Active (no eviction happened).
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Active);
+    }
+
+    // ─── ADR 0034: eviction scanner tests ─────────────────────────
+
+    fn evicting_session(id: engram_core::SessionId) -> Session {
+        Session {
+            id,
+            user_id: None,
+            status: SessionState::Evicting,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:evict-scanner".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        }
+    }
+
+    /// Happy path: the scanner sweeps an Evicting row and drives the
+    /// full pipeline — session lands Idle with a recorded snapshot,
+    /// sandbox unbound. This is the nomination handler's other half.
+    #[tokio::test]
+    async fn scanner_drives_evicting_to_idle() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let state = build_state_with_session(evicting_session(session_id), sandbox_root.path());
+
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        scanner_run_once(&EvictionScannerConfig::default(), &state)
+            .await
+            .expect("scanner tick");
+
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.status, SessionState::Idle);
+        assert_eq!(after.sandbox_id, None);
+        assert_eq!(state.registry.get(session_id), None);
+        let snaps = state
+            .services
+            .meta
+            .list_snapshots_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(snaps.len(), 1, "pipeline recorded its snapshot");
+    }
+
+    /// A failed pipeline attempt leaves the row Evicting with the
+    /// attempt counter bumped — the next tick retries. (This is the
+    /// crash-/flake-tolerant replacement for the pre-0034 silent
+    /// cancellation.)
+    #[tokio::test]
+    async fn scanner_failure_stays_evicting_and_bumps_attempts() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, mini) = build_state_and_meta(evicting_session(session_id), sandbox_root.path());
+
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // Force the pipeline's record_snapshot step to fail once.
+        *mini.fail_next_record_snapshot.lock() = true;
+
+        scanner_run_once(&EvictionScannerConfig::default(), &state)
+            .await
+            .expect("tick itself succeeds; per-session failure is swallowed");
+
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Evicting,
+            "stays in lane for retry"
+        );
+        let listed = state.services.meta.list_evicting_sessions().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1, 1, "attempt counter bumped pre-pipeline");
+    }
+
+    /// Budget exhaustion falls back to HostLost (not Active — would
+    /// re-nominate forever; not Idle — no durable snapshot exists;
+    /// not Dead — the runtime is healthy). max_attempts=0 trips the
+    /// arm immediately.
+    #[tokio::test]
+    async fn scanner_budget_exhaustion_falls_back_to_host_lost() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.sandbox_id = Some(engram_core::SandboxId::new());
+        let state = build_state_with_session(session, sandbox_root.path());
+
+        let mut sub = state.events.subscribe(session_id);
+        let cfg = EvictionScannerConfig {
+            max_attempts: 0,
+            ..EvictionScannerConfig::default()
+        };
+        scanner_run_once(&cfg, &state).await.expect("tick");
+
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.status, SessionState::HostLost);
+        // StatusChanged(Evicting → HostLost) emitted for the timeline.
+        let indexed = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .expect("event within 1s")
+            .expect("bus open");
+        match indexed.event {
+            SessionEvent::StatusChanged { from, to, .. } => {
+                assert_eq!(from, SessionState::Evicting);
+                assert_eq!(to, SessionState::HostLost);
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+    }
+
+    /// An Evicting row with no bound sandbox is structurally
+    /// inconsistent — nothing to evict. Falls back to HostLost
+    /// rather than burning 20 attempts on a guaranteed failure.
+    #[tokio::test]
+    async fn scanner_no_sandbox_falls_back_to_host_lost() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let state = build_state_with_session(evicting_session(session_id), sandbox_root.path());
+
+        scanner_run_once(&EvictionScannerConfig::default(), &state)
+            .await
+            .expect("tick");
+
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.status, SessionState::HostLost);
+    }
+
+    /// No Evicting rows → the tick is a cheap no-op.
+    #[tokio::test]
+    async fn scanner_empty_sweep_is_noop() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Active;
+        let state = build_state_with_session(session, sandbox_root.path());
+
+        scanner_run_once(&EvictionScannerConfig::default(), &state)
+            .await
+            .expect("tick");
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.status, SessionState::Active, "untouched");
     }
 }

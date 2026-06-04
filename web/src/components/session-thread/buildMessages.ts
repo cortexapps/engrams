@@ -60,7 +60,17 @@ export type SystemMarker =
       caption: string | null;
       at: string;
     }
-  | { kind: 'note'; role: AgentRole; at: string };
+  | { kind: 'note'; role: AgentRole; at: string }
+  // ADR 0028 A.log: a rung-1 recovery rewound the live transcript to a
+  // checkpoint. The boundary itself is live; the rolled-back events above
+  // it render greyed (see `rewound` tagging below). Outside-world side
+  // effects in the rolled-back span survived and are surfaced, not hidden.
+  | {
+      kind: 'recovery';
+      rolledBack: number;
+      survivingSideEffects: string[];
+      at: string;
+    };
 
 /** Footer carried in an assistant message's `metadata.custom.run` — the
  *  per-run receipt (`↳ read N · edited N · ran N`). */
@@ -175,7 +185,16 @@ export function buildMessages(
     });
   };
 
-  for (const { idx, event: ev } of events) {
+  // ADR 0028 A.log: stamp `rewound` into the custom metadata of every draft
+  // an event touched, so the rolled-back span renders greyed. Preserves any
+  // existing custom payload (run footer, marker).
+  const markRewound = (d: Draft) => {
+    d.metadata = { custom: { ...(d.metadata?.custom ?? {}), rewound: true } };
+  };
+
+  for (const indexed of events) {
+    const { idx, event: ev } = indexed;
+    const lenBefore = out.length;
     switch (ev.type) {
       case 'run_started': {
         tally = { reads: 0, edits: 0, ran: 0, other: 0 };
@@ -356,6 +375,15 @@ export function buildMessages(
         });
         break;
 
+      case 'recovered_from_checkpoint':
+        pushSystem(`rec:${idx}`, '↩ recovered from a checkpoint', {
+          kind: 'recovery',
+          rolledBack: ev.rolled_back,
+          survivingSideEffects: ev.surviving_side_effects,
+          at: ev.at,
+        });
+        break;
+
       case 'harness_idle':
         active = null;
         break;
@@ -364,6 +392,16 @@ export function buildMessages(
         // status_changed, evicted, checkpoint_* — not surfaced; the RAW
         // tab shows them.
         break;
+    }
+
+    // ADR 0028 A.log: events tombstoned by a rung-1 rewind stay viewable but
+    // greyed. Tag both any draft this event pushed and the assistant draft it
+    // appended to (tool/message events accrue into `active` without pushing).
+    // The recovery boundary itself is live (not flagged rewound), so it stays
+    // full-opacity below the greyed span.
+    if (indexed.rewound) {
+      for (let i = lenBefore; i < out.length; i++) markRewound(out[i]!);
+      if (active) markRewound(active);
     }
   }
 

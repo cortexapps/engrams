@@ -3,13 +3,13 @@
 //! End-to-end exercise of the tiered chunk-resolution path:
 //! `local NVMe → BlobStorage → OCI registry`. The test spins up a
 //! small loopback HTTP server that speaks just enough of the OCI
-//! Distribution Spec (`GET /v2/`, `GET /v2/<repo>/blobs/<digest>`
-//! with `Range` support) for `OciChunkResolver` to fault chunks
-//! against, then:
+//! Distribution Spec (`GET /v2/`, `GET /v2/<repo>/blobs/<digest>`)
+//! for `OciChunkResolver` to fault chunks against — ADR 0036: each
+//! chunk is its own blob, digest == chunk hash — then:
 //!
 //! 1. **Cold path** — `materialize_to_file` on a manifest whose
 //!    chunks are *not* in BlobStorage. The tiered resolver falls
-//!    through to the fake registry, Range-GETs each chunk's bytes,
+//!    through to the fake registry, GETs each chunk's own blob,
 //!    verifies the per-chunk sha256, and tees back into
 //!    BlobStorage (CDN-fill).
 //! 2. **Warm path** — the same materialize re-issued after the cold
@@ -157,30 +157,31 @@ async fn spawn_fake_registry(
 // Test helpers — chunk layout, manifest fixture, ChunkStore setup.
 // ---------------------------------------------------------------
 
-/// Three chunks with deterministic content. Returned along with the
-/// raw chunk-blob bytes (concatenation) and the parsed bootstrap.
-fn fixture_chunks() -> (Vec<&'static [u8]>, Vec<u8>, Bootstrap) {
+/// Three chunks with deterministic content. ADR 0036: each chunk is
+/// its own registry blob, addressed by `sha256:<chunk-hash>`.
+/// Returns the raw chunks, the registry blob map, and the parsed
+/// bootstrap.
+fn fixture_chunks() -> (Vec<&'static [u8]>, HashMap<String, Bytes>, Bootstrap) {
     let chunks: Vec<&'static [u8]> = vec![
         b"AAAAAAAA" as &[u8], // 8 bytes
         b"BBBBBBBBBBBBBBBB",  // 16 bytes
         b"CCCC",              // 4 bytes
     ];
-    let mut concat = Vec::new();
+    let mut registry_blobs = HashMap::new();
     let mut entries = Vec::with_capacity(chunks.len());
-    let mut blob_offset = 0u64;
     let mut file_offset = 0u64;
     let chunk_size = 16u64;
     for c in &chunks {
         let h = ChunkHash::of(c);
+        let digest = format!("sha256:{}", h.to_hex());
+        registry_blobs.insert(digest.clone(), Bytes::from_static(c));
         entries.push(BootstrapEntry {
             file_offset,
-            blob_digest: None,
-            blob_offset,
+            blob_digest: Some(digest),
+            blob_offset: 0,
             length: c.len() as u32,
             sha256: h,
         });
-        concat.extend_from_slice(c);
-        blob_offset += c.len() as u64;
         file_offset += chunk_size;
     }
     let total_bytes = file_offset;
@@ -191,7 +192,7 @@ fn fixture_chunks() -> (Vec<&'static [u8]>, Vec<u8>, Bootstrap) {
         chunk_size: ChunkSize::bytes(chunk_size),
         entries,
     };
-    (chunks, concat, bootstrap)
+    (chunks, registry_blobs, bootstrap)
 }
 
 /// Build an empty BlobStorage in a tempdir.
@@ -211,14 +212,7 @@ fn fresh_blob_storage() -> (Arc<dyn BlobStorage>, tempfile::TempDir) {
 /// tier exclusively (no additional origin fetches).
 #[tokio::test]
 async fn tiered_resolver_faults_chunks_from_oci_then_serves_from_blob_cache() {
-    let (raw_chunks, concat, bootstrap) = fixture_chunks();
-    let blob_digest = format!(
-        "sha256:{:x}",
-        <sha2::Sha256 as sha2::Digest>::digest(&concat)
-    );
-
-    let mut registry_blobs = HashMap::new();
-    registry_blobs.insert(blob_digest.clone(), Bytes::from(concat.clone()));
+    let (raw_chunks, registry_blobs, bootstrap) = fixture_chunks();
 
     let (addr, registry, _shutdown) = spawn_fake_registry(registry_blobs).await;
     let image_uri = format!("127.0.0.1:{}/chunked:v1", addr.port());
@@ -232,8 +226,7 @@ async fn tiered_resolver_faults_chunks_from_oci_then_serves_from_blob_cache() {
         index.insert(
             entry.sha256,
             OciBlobLocator {
-                blob_digest: blob_digest.clone(),
-                offset: entry.blob_offset,
+                blob_digest: entry.blob_digest.clone().expect("per-chunk digest"),
                 length: entry.length as u64,
             },
         );
@@ -302,10 +295,9 @@ async fn tiered_resolver_faults_chunks_from_oci_then_serves_from_blob_cache() {
     }
     assert_eq!(cold_bytes, expected, "cold materialize bytes mismatch");
 
-    // Registry was consulted for each chunk (3 chunks → 3 Range GETs).
-    // Note: oci-client also probes `/v2/` for auth before each
-    // pull_blob_stream_partial; that's a separate handler so the
-    // blob-fetch count is independent.
+    // Registry was consulted for each chunk (3 chunks → 3 blob
+    // GETs; the `/v2/` auth probe is a separate handler so the
+    // blob-fetch count is independent).
     let cold_fetches = registry.fetches.load(Ordering::Relaxed);
     assert_eq!(
         cold_fetches,
@@ -365,7 +357,6 @@ async fn tiered_resolver_fails_loudly_when_chunk_missing_from_all_tiers() {
         ChunkHash::of(b"placeholder"),
         OciBlobLocator {
             blob_digest: "sha256:none".into(),
-            offset: 0,
             length: 0,
         },
     );
@@ -401,20 +392,15 @@ async fn materialize_to_file_cached_uses_caller_supplied_store() {
         ManifestKind, ManifestRef,
     };
 
-    // Real registry serving a chunk blob; empty BlobStorage.
+    // Real registry serving per-chunk blobs; empty BlobStorage.
     let bodies: [&[u8]; 2] = [b"DELTA___", b"EPSILON_"];
-    let mut concat = Vec::new();
+    let mut blobs = HashMap::new();
     let mut hashes = Vec::new();
     for b in &bodies {
-        concat.extend_from_slice(b);
-        hashes.push(ChunkHash::of(b));
+        let h = ChunkHash::of(b);
+        blobs.insert(format!("sha256:{}", h.to_hex()), Bytes::from_static(b));
+        hashes.push(h);
     }
-    let blob_digest = format!(
-        "sha256:{:x}",
-        <sha2::Sha256 as sha2::Digest>::digest(&concat)
-    );
-    let mut blobs = HashMap::new();
-    blobs.insert(blob_digest.clone(), Bytes::from(concat));
     let (addr, registry, _shutdown) = spawn_fake_registry(blobs).await;
     let image_uri = format!("127.0.0.1:{}/cached:v1", addr.port());
 
@@ -451,12 +437,11 @@ async fn materialize_to_file_cached_uses_caller_supplied_store() {
     // Build the tiered store (what upgrade_chunk_store_for_chunked_oci
     // produces in production).
     let mut index = OciChunkIndex::new();
-    for (i, h) in hashes.iter().enumerate() {
+    for h in hashes.iter() {
         index.insert(
             *h,
             OciBlobLocator {
-                blob_digest: blob_digest.clone(),
-                offset: (i * 8) as u64,
+                blob_digest: format!("sha256:{}", h.to_hex()),
                 length: 8,
             },
         );
@@ -575,11 +560,10 @@ async fn manifest_synthesis_from_bootstrap_unblocks_materialize_when_blob_empty(
         chunk_size: ChunkSize::bytes(8),
         entries: chunks
             .iter()
-            .enumerate()
-            .map(|(i, c)| BootstrapEntry {
+            .map(|c| BootstrapEntry {
                 file_offset: c.offset,
-                blob_digest: None,
-                blob_offset: (i * 8) as u64,
+                blob_digest: Some(format!("sha256:{}", c.hash.to_hex())),
+                blob_offset: 0,
                 length: 8,
                 sha256: c.hash,
             })
@@ -616,7 +600,6 @@ async fn manifest_synthesis_from_bootstrap_unblocks_materialize_when_blob_empty(
             bootstrap_disk_available: true,
         }),
         disk_bootstrap_path: Some(bs_path),
-        disk_chunks_blob_digest: Some("sha256:notused_in_this_test".into()),
         digest: "sha256:bug_repro".into(),
     };
 
@@ -667,19 +650,11 @@ async fn cached_image_chunked_oci_drives_tiered_materialize_end_to_end() {
     // Same setup as the first test, but instead of constructing
     // the resolver chain by hand, we go through CachedImage's
     // Phase 5 helpers. This proves the discovery path
-    // (bootstrap.disk.json + chunks.disk.blob.digest sidecars →
-    // OciChunkIndex) is consistent with what hand-built setups
-    // exercise.
+    // (bootstrap.disk.json sidecar → OciChunkIndex) is consistent
+    // with what hand-built setups exercise.
     use engram_host_agent::image_cache::CachedImage;
 
-    let (raw_chunks, concat, bootstrap) = fixture_chunks();
-    let blob_digest = format!(
-        "sha256:{:x}",
-        <sha2::Sha256 as sha2::Digest>::digest(&concat)
-    );
-
-    let mut registry_blobs = HashMap::new();
-    registry_blobs.insert(blob_digest.clone(), Bytes::from(concat));
+    let (raw_chunks, registry_blobs, bootstrap) = fixture_chunks();
     let (addr, registry, _shutdown) = spawn_fake_registry(registry_blobs).await;
     let image_uri = format!("127.0.0.1:{}/chunked:v1", addr.port());
 
@@ -694,7 +669,6 @@ async fn cached_image_chunked_oci_drives_tiered_materialize_end_to_end() {
         rootfs_path: None,
         bundle: None,
         disk_bootstrap_path: Some(bs_path),
-        disk_chunks_blob_digest: Some(blob_digest),
         digest: "sha256:test_cached".into(),
     };
     assert!(cached.is_disk_chunked_oci());

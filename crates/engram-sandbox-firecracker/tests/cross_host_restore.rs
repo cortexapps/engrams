@@ -72,6 +72,7 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
         image: "fc-cross-host-test".into(),
         rootfs_source: Some(local_rootfs.clone()),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 128 },
         disk: DiskLimit { max_gib: 1 },

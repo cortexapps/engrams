@@ -32,6 +32,17 @@ pub struct SandboxSpec {
     /// dev workflows that pre-bake images into `<local_path>/images/`.
     #[serde(default)]
     pub image_uri: Option<String>,
+    /// ADR 0028 Fix B: chunked-manifest override for the root disk.
+    /// When set, the host serves the rootfs from THIS manifest's
+    /// chunks (NBD-attached, continuous-flush continues the same
+    /// lineage) instead of resolving it from `image_uri` — the
+    /// disk-only cold-boot recovery shape: a fresh kernel boot
+    /// mounting a session's evolved `live_disk_manifest`. Wire note:
+    /// `SandboxSpec` is bincode-framed coord→host, so a mixed-version
+    /// fleet mid-deploy can't decode creates — acceptable per the
+    /// clean-break norm (coord + host MIG roll together on push).
+    #[serde(default)]
+    pub rootfs_manifest: Option<super::manifest::ManifestRef>,
     // ADR 0021 P1.5b retired `harness_pack_uri` + `harness_substrate`.
     // The harness now lives in the image rootfs at the manifest-
     // declared `[harness] exec` path — there's no separate registry
@@ -54,13 +65,15 @@ pub struct SandboxSpec {
     pub network: NetworkPolicy,
     /// ADR 0027: extra read-only host-mounted bundles attached as
     /// virtio-blk drives — the RO-mount skills/browser engine ADR 0023
-    /// deferred. Each entry is a fleet-wide, content-addressed host
-    /// asset at a canonical path identical on every host (a stable
-    /// symlink), so a snapshot that embeds the path re-anchors on
-    /// restore by mere presence — no `patch_drive`. First two
-    /// consumers: the always-attached `skills` bundle (the relocated
-    /// built-in skill helpers) and the opt-in `playwright` bundle
-    /// (chromium-headless-shell + `@playwright/cli`).
+    /// deferred. First two consumers: the always-attached `skills`
+    /// bundle (the relocated built-in skill helpers) and the opt-in
+    /// `playwright` bundle (chromium-headless-shell + `@playwright/cli`).
+    ///
+    /// ADR 0035: entries from the coord are *symbolic* (`sha256 = None`,
+    /// "attach whatever generation this host currently stages"); the FC
+    /// backend resolves them against the host's staged-bundle stamp at
+    /// capture, and the sandbox manifest records the resolved form so a
+    /// restore re-anchors against the exact immutable generation.
     ///
     /// `#[serde(default)]` covers the legacy-snapshot JSON path (older
     /// sidecars predate this field); the coord ↔ host-agent bincode
@@ -77,25 +90,38 @@ pub struct SandboxSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuxRoDrive {
     /// Firecracker `drive_id` (e.g. `"skills"`, `"playwright"`). Stable
-    /// across snapshot/restore — embedded in `state.bin`.
+    /// across snapshot/restore — embedded in `state.bin`. Doubles as the
+    /// bundle name in the staged filename and the blob-storage key space.
     pub drive_id: String,
-    /// Canonical fleet-wide host path, a stable symlink (e.g.
-    /// `/var/lib/engram/shared/playwright.squashfs`). Identical on every
-    /// host so the snapshot-embedded path re-anchors on restore.
-    pub path_on_host: PathBuf,
     /// Fixed guest mount point the init shim mounts the drive at (e.g.
     /// `/opt/engram/browser`).
     pub guest_mount: PathBuf,
     /// Filesystem type for the guest mount (`"squashfs"` | `"erofs"`).
     pub fs_type: String,
+    /// ADR 0035: content identity of the attached generation. `None` on
+    /// the symbolic coord→host request ("attach whatever generation this
+    /// host currently stages"); `Some` once the FC backend resolves it at
+    /// capture against the host's staged-bundle stamp. The host path is
+    /// *derived* from `(drive_id, sha256)` via [`Self::staged_path`] — path
+    /// and content can never disagree, which is the whole point: the
+    /// 2026-06-03 incident was a snapshot re-anchoring a fixed path whose
+    /// bytes a host roll had swapped underneath it.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 impl AuxRoDrive {
-    /// Fleet-canonical directory where the FC-host image stages the RO
-    /// bundles (stable symlinks → content-addressed `<name>-<sha>.squashfs`).
-    /// Identical on every host so a snapshot-embedded path re-anchors on
-    /// restore by presence.
+    /// Fleet-canonical directory where bundle generations are staged
+    /// (`<drive_id>-<sha256>.squashfs`, baked by the FC-host image or
+    /// materialized from BlobStorage on demand). Identical on every host
+    /// so a snapshot-embedded path re-anchors on restore.
     pub const SHARED_DIR: &'static str = "/var/lib/engram/shared";
+
+    /// The bake-time stamp file mapping `drive_id` → sha256 of the
+    /// generation this host image carries. Written by the Packer
+    /// provisioner; read by the FC backend to resolve symbolic drives at
+    /// capture and by the host-agent to report `current_bundles`.
+    pub const CURRENT_STAMP: &'static str = "current.json";
 
     /// The always-attached `skills` bundle: the relocated built-in skill
     /// helpers (`engram-share` / `engram-pr` / `git-askpass` + SKILL.md).
@@ -103,9 +129,9 @@ impl AuxRoDrive {
     pub fn skills() -> Self {
         Self {
             drive_id: "skills".into(),
-            path_on_host: PathBuf::from(Self::SHARED_DIR).join("skills.squashfs"),
             guest_mount: PathBuf::from("/opt/engram/skills"),
             fs_type: "squashfs".into(),
+            sha256: None,
         }
     }
 
@@ -116,11 +142,41 @@ impl AuxRoDrive {
     pub fn playwright() -> Self {
         Self {
             drive_id: "playwright".into(),
-            path_on_host: PathBuf::from(Self::SHARED_DIR).join("playwright.squashfs"),
             guest_mount: PathBuf::from("/opt/engram/browser"),
             fs_type: "squashfs".into(),
+            sha256: None,
         }
     }
+
+    /// Staged filename for one bundle generation.
+    pub fn staged_file_name(drive_id: &str, sha256: &str) -> String {
+        format!("{drive_id}-{sha256}.squashfs")
+    }
+
+    /// BlobStorage key for one bundle generation (publish at capture,
+    /// materialize at restore, GC by pin set).
+    pub fn blob_key(sha256: &str) -> String {
+        format!("bundles/sha256/{sha256}")
+    }
+
+    /// Host path of the resolved generation, or `None` while the drive is
+    /// still symbolic.
+    pub fn staged_path(&self) -> Option<PathBuf> {
+        self.sha256.as_ref().map(|sha| {
+            PathBuf::from(Self::SHARED_DIR).join(Self::staged_file_name(&self.drive_id, sha))
+        })
+    }
+}
+
+/// ADR 0035: identity of one bundle generation a snapshot references —
+/// the GC pin unit. Stamped onto [`SnapshotMetadata`](super::snapshot::SnapshotMetadata)
+/// by the host (base capture *and* eviction snapshots: an evicted VM's
+/// device model still points at the same generation) and persisted by the
+/// coord in `snapshots.aux_bundles`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuxBundleRef {
+    pub drive_id: String,
+    pub sha256: String,
 }
 
 /// Argv + env for the long-running "agent" process (Claude Code,
@@ -324,6 +380,7 @@ mod tests {
             image: "warm-1".into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 2 },
             memory: MemoryLimit { max_mib: 4096 },
             disk: DiskLimit { max_gib: 8 },
@@ -342,17 +399,12 @@ mod tests {
     #[test]
     fn sandbox_spec_aux_ro_drives_round_trip_bincode_and_json() {
         let spec = spec_with_aux_drives(vec![
+            // Symbolic (coord request) and resolved (recorded manifest)
+            // forms both cross the wire — pin both.
+            AuxRoDrive::skills(),
             AuxRoDrive {
-                drive_id: "skills".into(),
-                path_on_host: "/var/lib/engram/shared/skills.squashfs".into(),
-                guest_mount: "/opt/engram/skills".into(),
-                fs_type: "squashfs".into(),
-            },
-            AuxRoDrive {
-                drive_id: "playwright".into(),
-                path_on_host: "/var/lib/engram/shared/playwright.squashfs".into(),
-                guest_mount: "/opt/engram/browser".into(),
-                fs_type: "squashfs".into(),
+                sha256: Some("a".repeat(64)),
+                ..AuxRoDrive::playwright()
             },
         ]);
 

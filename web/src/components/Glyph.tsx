@@ -8,6 +8,8 @@ import type { SessionState } from '../types';
 //   ◌  idle              ○  pending
 //   ⚠  host_lost         ✓  completed
 //   ✕  dead              !  failed
+//   ◑  evicting / evacuating (transitional: suspend/relocate in
+//      flight — the half-moon mirrors the starting states' ◐)
 //
 // Active sessions get a slow opacity heartbeat. Active renders in the
 // theme ring (racing green on paper, lime on the dark ground) to read as
@@ -53,6 +55,9 @@ function glyphFor(status: SessionState): string {
       return '●';
     case 'idle':
       return '◌';
+    case 'evicting':
+    case 'evacuating':
+      return '◑';
     case 'host_lost':
       return '⚠';
     case 'completed':
@@ -72,6 +77,10 @@ function toneFor(status: SessionState): string {
     case 'pending':
     case 'created':
     case 'guest_ready':
+    // Transitional suspend/relocate: faded like idle — on their way there
+    // (or back to active), not in trouble.
+    case 'evicting':
+    case 'evacuating':
     case 'completed':
     case 'dead':
       return 'var(--muted-foreground)';

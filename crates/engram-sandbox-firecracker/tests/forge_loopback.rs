@@ -98,8 +98,6 @@ async fn forge_credential_round_trips_over_vsock() {
                 transport: engram_image_builder::Transport::Vsock,
                 init_script: None,
             }),
-            parent_disk_bootstrap_path: None,
-            parent_disk_chunks_blob_digest: None,
         })
         .await
         .expect("ext4 bake with agent injection");
@@ -140,6 +138,7 @@ async fn forge_credential_round_trips_over_vsock() {
         image: "forge-loopback-test".into(),
         rootfs_source: Some(outcome.rootfs_path),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

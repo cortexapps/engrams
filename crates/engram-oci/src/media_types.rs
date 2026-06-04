@@ -27,19 +27,26 @@ pub const ENGRAM_HARNESS_CONFIG_MEDIA_TYPE: &str = "application/vnd.engram.harne
 /// Harness pack layer — gzip'd tar of the pack directory.
 pub const ENGRAM_HARNESS_TAR_MEDIA_TYPE: &str = "application/vnd.engram.harness.tar.v1+gzip";
 
-// ---- ADR 0008 Phase 3: Nydus-shaped chunked image layers ----
+// ---- ADR 0008 Phase 3 / ADR 0036: chunked image layers ----
 //
-// A chunked image artifact carries (bootstrap, chunk_blob) per
-// kind (disk, memory). The bootstrap is a small JSON index from
-// `ChunkHash` to `(blob_offset, length)`; the chunk blob is the
-// concatenation of all chunks in bootstrap-entry order, pulled
-// lazily via Range GET at fault time.
+// A chunked image artifact carries a small bootstrap JSON index
+// plus one OCI blob **per chunk** (ADR 0036). Each chunk layer's
+// OCI digest is `sha256:<chunk-hash>` — the same sha256 the chunk
+// is addressed by in BlobStorage and in every `ChunkResolver` — so
+// the registry's content addressing and ours coincide. Push skips
+// blobs the registry already has (delta upload); pull fetches each
+// missing chunk as a plain blob GET (delta download).
+//
+// ADR 0036 retired the monolithic `chunks.disk.v1` layer (one
+// concatenated multi-GB blob): a single upload session for ~10 GB
+// failed un-resumably, sat at GHCR's 10 GB layer ceiling, and made
+// cross-bake dedup impossible at the registry.
 
 /// Bootstrap layer for the disk side. JSON content; see
 /// `engram_chunk_store::Bootstrap`.
 pub const ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE: &str = "application/vnd.engram.bootstrap.disk.v1+json";
 
-/// Chunk-blob layer for the disk side. Opaque concatenation of
-/// 16 MiB chunks; consumers do Range GET against the OCI registry's
-/// `/v2/<repo>/blobs/<digest>` endpoint to pull individual chunks.
-pub const ENGRAM_CHUNKS_DISK_MEDIA_TYPE: &str = "application/vnd.engram.chunks.disk.v1";
+/// A single chunk of a chunked image (ADR 0036). Layer digest is
+/// `sha256:<chunk-hash>`; nominal size 16 MiB for disk chunks (the
+/// final chunk of an image may be shorter).
+pub const ENGRAM_CHUNK_MEDIA_TYPE: &str = "application/vnd.engram.chunk.v1";

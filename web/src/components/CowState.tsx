@@ -63,7 +63,10 @@ export function SessionCowState({ sessionId }: { sessionId: string }) {
         ? 'disk-tier diagnostic unavailable.'
         : status === 'active'
           ? 'no chunked-disk tracking for this Active session — the host hasn’t wired the NBD pipeline, or its tracking didn’t survive the last restart.'
-          : status === 'idle' || status === 'host_lost'
+          : status === 'idle' ||
+              status === 'host_lost' ||
+              status === 'evacuating' ||
+              status === 'evicting'
             ? `session is ${status.replace('_', ' ')}; durability lives on the latest snapshot row.`
             : `session is ${status.replace('_', ' ')} (terminal) — no live disk tier.`;
     return <p className="text-sm text-muted-foreground italic">{message}</p>;

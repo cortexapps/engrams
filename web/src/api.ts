@@ -3,14 +3,16 @@ import type {
   AddRegistryResponse,
   AdminUser,
   CreateSessionResponse,
-  EnabledImageSummary,
+  EnableJob,
   ImageRef,
+  ListEnableJobsResponse,
   ListEnabledImagesResponse,
   ListHostsResponse,
   ListRegistriesResponse,
   ListSessionsResponse,
   Principal,
   Role,
+  CheckpointsResponse,
   Session,
   SessionCowStateResponse,
   SessionMode,
@@ -185,6 +187,11 @@ export const fetchSession = (id: string) =>
 export const fetchSessionCowState = (sessionId: string) =>
   getJSON<SessionCowStateResponse>(`/sessions/${sessionId}/cow-state`);
 
+// ADR 0028 A.log: the session's checkpoint chain (durability timeline
+// + the future fork-point picker).
+export const fetchSessionCheckpoints = (sessionId: string) =>
+  getJSON<CheckpointsResponse>(`/sessions/${sessionId}/checkpoints`);
+
 // ---- ADR 0029: Storage surface ---------------------------------------
 
 /** Fleet-wide COW/chunk rollups + the per-sandbox durability ledger. */
@@ -250,8 +257,11 @@ export const fetchEnabledImages = () =>
     (r) => r.images,
   );
 
+// ADR 0036: enable/refresh are asynchronous — both return 202 with an
+// EnableJob; the coordinator's scanner drives the pipeline and the
+// panel polls `/enable-jobs` for real progress.
 export const enableImage = (imageUri: string) =>
-  postJSON<EnabledImageSummary>('/enabled-images', {
+  postJSON<EnableJob>('/enabled-images', {
     image_uri: imageUri,
   });
 
@@ -259,6 +269,12 @@ export const disableImage = (imageUri: string) =>
   postJSON<void>('/enabled-images/disable', { image_uri: imageUri });
 
 export const refreshEnabledImage = (imageUri: string) =>
-  postJSON<EnabledImageSummary>('/enabled-images/refresh', {
+  postJSON<EnableJob>('/enabled-images/refresh', {
     image_uri: imageUri,
   });
+
+export const fetchEnableJobs = () =>
+  getJSON<ListEnableJobsResponse>('/enable-jobs').then((r) => r.jobs);
+
+export const retryEnableJob = (jobId: string) =>
+  postJSON<EnableJob>(`/enable-jobs/${jobId}/retry`, {});

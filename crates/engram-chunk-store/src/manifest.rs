@@ -249,6 +249,50 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// ADR 0036 P4: a `ManifestRef` derived from this manifest's
+    /// *content* — a pure function of (kind, chunk_size, total_bytes,
+    /// ordered chunk offsets + hashes). Two bakes that produce
+    /// byte-identical images get the **same** manifest identity, which
+    /// is what makes "this re-bake is content-identical to an already
+    /// enabled image" recognizable downstream: the enable pipeline can
+    /// reuse the existing base snapshot (skipping the capture VM) by
+    /// comparing `enabled_images.disk_manifest_*` columns instead of
+    /// OCI tags/digests.
+    ///
+    /// Contrast `ManifestRef::new()` (random UUID): right for
+    /// *snapshot* manifests, whose content is nondeterministic per
+    /// capture; wrong for bake outputs, where the random id polluted
+    /// `bundle.json` and made even deterministic re-bakes look like
+    /// new content at every layer above.
+    ///
+    /// The UUID is the first 16 bytes of sha256 over the canonical
+    /// fields, with RFC 4122 version (8 = custom) and variant bits set
+    /// so it round-trips as a well-formed UUID everywhere a random one
+    /// would. Version is always 1 — content-derived ids never tick.
+    pub fn content_ref(&self) -> ManifestRef {
+        let mut h = Sha256::new();
+        h.update(b"engram-manifest-content-v1");
+        h.update([match self.kind {
+            ManifestKind::Disk => 0u8,
+            ManifestKind::Memory => 1u8,
+        }]);
+        h.update(self.chunk_size.as_u64().to_le_bytes());
+        h.update(self.total_bytes.to_le_bytes());
+        for c in &self.chunks {
+            h.update(c.offset.to_le_bytes());
+            h.update(c.hash.as_bytes());
+        }
+        let digest = h.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0F) | 0x80; // version 8 (custom)
+        bytes[8] = (bytes[8] & 0x3F) | 0x80; // RFC 4122 variant
+        ManifestRef {
+            manifest_id: uuid::Uuid::from_bytes(bytes),
+            version: 1,
+        }
+    }
+
     /// Construct an empty manifest for a fresh disk or memory
     /// image. `chunk_size` defaults to the per-kind default.
     pub fn empty(kind: ManifestKind, total_bytes: u64) -> Self {
@@ -514,5 +558,43 @@ mod tests {
         assert!(m.chunk_at(16 * 1024 * 1024).is_none());
         assert!(m.chunk_at(0).is_some());
         assert!(m.chunk_at(32 * 1024 * 1024).is_some());
+    }
+
+    /// ADR 0036 P4: the content ref is a pure function of the
+    /// manifest's chunk layout — identical content gets an identical
+    /// (well-formed) UUID; any chunk perturbation changes it.
+    #[test]
+    fn content_ref_is_deterministic_and_content_sensitive() {
+        let mut m = Manifest::empty(ManifestKind::Disk, 32 * 1024 * 1024);
+        m.chunks.push(ChunkRef {
+            offset: 0,
+            hash: ChunkHash::of(b"chunk-a"),
+        });
+        m.chunks.push(ChunkRef {
+            offset: 16 * 1024 * 1024,
+            hash: ChunkHash::of(b"chunk-b"),
+        });
+
+        let r1 = m.content_ref();
+        let r2 = m.clone().content_ref();
+        assert_eq!(r1, r2, "same content must derive the same ref");
+        assert_eq!(r1.version, 1);
+        // Well-formed RFC 4122 UUID (version + variant bits set).
+        assert_eq!(r1.manifest_id.get_version_num(), 8);
+
+        // Different chunk bytes → different ref.
+        let mut other = m.clone();
+        other.chunks[1].hash = ChunkHash::of(b"chunk-b-changed");
+        assert_ne!(m.content_ref(), other.content_ref());
+
+        // Same chunks at a different offset → different ref.
+        let mut moved = m.clone();
+        moved.chunks[1].offset = 0;
+        assert_ne!(m.content_ref(), moved.content_ref());
+
+        // Disk vs memory kinds never collide.
+        let mut mem = m.clone();
+        mem.kind = ManifestKind::Memory;
+        assert_ne!(m.content_ref(), mem.content_ref());
     }
 }

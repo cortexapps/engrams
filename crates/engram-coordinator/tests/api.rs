@@ -128,12 +128,7 @@ impl MetadataStore for MockMetadataStore {
             .sessions
             .lock()
             .values()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    SessionState::Pending | SessionState::Active | SessionState::Idle
-                )
-            })
+            .filter(|s| s.status.is_live())
             .cloned()
             .collect())
     }
@@ -314,6 +309,8 @@ impl MetadataStore for MockMetadataStore {
             kind: kind.to_string(),
             payload,
             created_at: Utc::now(),
+            recovery_epoch: 0,
+            rewound_at: None,
         };
         self.events
             .lock()
@@ -831,6 +828,8 @@ fn seed_enabled(
             disk_manifest: None,
             memory_manifest: None,
             recoverable: true,
+            aux_bundles: vec![],
+            events_cursor: None,
         },
     );
     store.enabled.lock().insert(
@@ -926,6 +925,7 @@ async fn seed_to(store: &MockMetadataStore, id: SessionId, target: SessionState)
         (Pending, Failed) => &[Failed],
         (Pending, Completed) => &[Created, Active, Completed],
         (Pending, Dead) => &[Created, Active, Dead],
+        (Pending, Evicting) => &[Created, Active, Evicting],
         // From Active (post-create test that wants a later state).
         (Active, Idle) => &[Idle],
         (Active, HostLost) => &[HostLost],
@@ -1376,11 +1376,15 @@ async fn storage_summary_zeros_on_empty_fleet() {
 }
 
 #[tokio::test]
-async fn list_sessions_returns_pending_active_and_idle_only() {
-    // The endpoint mirrors `list_active_sessions` semantics: pending /
-    // active / idle rows show up; completed / failed / evicted rows
-    // are filtered out. Filtering at the surface keeps the default
-    // `engram session list` view focused on live work.
+async fn list_sessions_returns_live_rows_only() {
+    // The endpoint mirrors `list_active_sessions` semantics
+    // (`SessionState::is_live`): live rows — including mid-pipeline
+    // states like `evicting` — show up; terminal rows are filtered
+    // out. Filtering at the surface keeps the default
+    // `engram session list` view focused on live work. `evicting`
+    // is the regression case: it was missing from the live set, so
+    // mid-eviction sessions vanished from the list (and, worse, from
+    // startup routing rehydration — prod session 5cfb90b8).
     let store = MockMetadataStore::arc();
 
     async fn mk(store: &MockMetadataStore, repo: &str) -> SessionId {
@@ -1397,6 +1401,8 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
     seed_to(&store, active_id, SessionState::Active).await;
     let idle_id = mk(&store, "idle-too").await;
     seed_to(&store, idle_id, SessionState::Idle).await;
+    let evicting_id = mk(&store, "mid-evict").await;
+    seed_to(&store, evicting_id, SessionState::Evicting).await;
     let dead_id = mk(&store, "done").await;
     seed_to(&store, dead_id, SessionState::Completed).await;
 
@@ -1421,6 +1427,10 @@ async fn list_sessions_returns_pending_active_and_idle_only() {
         .collect();
     assert!(ids.contains(&active_id.to_string()), "active row missing");
     assert!(ids.contains(&idle_id.to_string()), "idle row missing");
+    assert!(
+        ids.contains(&evicting_id.to_string()),
+        "evicting row missing — mid-eviction sessions must stay listed",
+    );
     assert!(
         !ids.contains(&dead_id.to_string()),
         "completed sessions must be filtered out",

@@ -269,6 +269,8 @@ mod tests {
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
+            base_restore_mode: None,
+            track_dirty_pages: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,
@@ -278,6 +280,7 @@ mod tests {
             working_set_trace_output: None,
             uffd_blob_root: None,
             cpu_template: None,
+            bundle_dir: work_dir.join("bundles"),
         };
         Arc::new(FirecrackerBackend::new(work_dir, cfg))
     }
@@ -328,6 +331,7 @@ mod tests {
                 image: "test".into(),
                 rootfs_source: None,
                 image_uri: None,
+                rootfs_manifest: None,
                 cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
                 memory: engram_core::types::sandbox::MemoryLimit { max_mib: 64 },
                 disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },

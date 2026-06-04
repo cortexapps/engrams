@@ -28,7 +28,7 @@ use tokio::fs;
 use tokio::sync::Mutex;
 
 use crate::egress::HostEgress;
-use crate::image_cache::{CachedImage, ImageBundle, ImageCache};
+use crate::image_cache::{CachedImage, ImageCache};
 
 /// Cross-platform optional NBD state slot. Linux carries the real
 /// state; non-Linux is `()` so the `resolve_rootfs` return signature
@@ -121,6 +121,11 @@ pub struct PooledBackend {
     /// manifest share the materialized file (and VZ's per-sandbox
     /// APFS clonefile / FC's NBD-on-the-shared-path work on top).
     materialize_dir: Option<PathBuf>,
+    /// ADR 0035: fleet-canonical staged-bundle dir
+    /// (`<drive_id>-<sha256>.squashfs` + the bake's `current.json`).
+    /// Defaults to `AuxRoDrive::SHARED_DIR`; tests inject a tempdir
+    /// via `with_bundle_dir`.
+    bundle_dir: PathBuf,
     /// Optional NVMe-backed LRU cache fronting the chunk store.
     /// When wired, chunk reads during materialization go through
     /// the cache — chunks shared across manifests (canonical-base
@@ -192,9 +197,249 @@ pub struct PooledBackend {
     /// PooledBackend's lifetime. `None` for the no-op publisher (no
     /// task to abort).
     live_manifest_publisher_handle: Option<crate::disk_daemon::LiveManifestPublisherHandle>,
+    /// ADR 0028 Fix A: root for checkpoint state — `rolling/` (the
+    /// per-sandbox rolling memory images, diff-apply targets) and
+    /// `records/` (durable per-checkpoint records awaiting coord
+    /// ack). `None` disables checkpoint chains entirely: `snapshot()`
+    /// stays pure-Full and the periodic driver no-ops — the rollout
+    /// gate, and the natural state for non-FC backends.
+    checkpoint_dir: Option<PathBuf>,
+    /// ADR 0028 Fix A: per-sandbox rolling chain state. Present once
+    /// the first (Full, seeding) checkpoint completed; every
+    /// subsequent `snapshot()` on that sandbox — periodic checkpoint
+    /// OR eviction/drain/SIGTERM capture — rides the O(dirty) diff
+    /// path against it. Cleared on `destroy`.
+    checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
+    /// ADR 0028 Fix A: serializes captures per sandbox — a periodic
+    /// checkpoint must never interleave with an eviction snapshot
+    /// (double-pause is idempotent but concurrent NBD flushes +
+    /// chain advances are not).
+    capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl PooledBackend {
+    /// Shared body of `restore` (resume flavor) and `restore_fresh`
+    /// (fresh-create flavor) — see ADR 0035 §3 for the split.
+    async fn restore_with(
+        &self,
+        metadata: SnapshotMetadata,
+        fresh: bool,
+    ) -> Result<SandboxId, SandboxError> {
+        // ADR 0014 M1.13: eager parallel prefetch of memory chunks
+        // into local NVMe BEFORE we hand off to materialize +
+        // inner.restore. Without this, materialize_to_file_cached's
+        // serial chunk iteration pays N×GCS-RTT (~300 ms each) on
+        // a cold-cache host — a 512 MiB template's 32 chunks come
+        // out as ~10 s of serial fetch. Parallel prefetch with
+        // bounded concurrency reduces that to roughly ~2 s.
+        // Subsequent restores against the same template hit NVMe
+        // and the prefetch is a no-op.
+        // ADR 0020 P3: span the pre-`restore_in_jail` prep legs (memory
+        // prefetch / state materialize / NBD attach) alongside the
+        // `fc.restore_in_jail` legs, so one trace shows where the whole
+        // `host.restore_base_for_session` window goes. Pure observability.
+        let prefetch_start = std::time::Instant::now();
+        let prefetched_chunks = tracing::Instrument::instrument(
+            self.prefetch_memory_chunks(&metadata),
+            tracing::info_span!("restore.prefetch_memory"),
+        )
+        .await;
+        if let Err(e) = prefetched_chunks.as_ref() {
+            tracing::warn!(
+                error = %e,
+                snapshot_id = %metadata.id,
+                "chunked restore memory chunk prefetch failed; falling back to serial fault path",
+            );
+        }
+        let _ = (prefetched_chunks, prefetch_start);
+
+        // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
+        // The backend owns its staging dir layout (Phase 6); we ask
+        // it where this snapshot would live, then ensure the
+        // memory.bin file is present before delegating to inner —
+        // either because we're on the same host where it was
+        // written, or because we need to rebuild it from chunks
+        // (cross-host migration). With M1.13's prefetch above, the
+        // serial materialize loop now hits the NVMe-warm cache for
+        // every chunk.
+        let src = self.inner.snapshot_path_for(metadata.id);
+
+        // ADR 0014: cross-host materialization is order-sensitive.
+        // `materialize_memory_if_missing` reads the local FC sidecar
+        // (`manifest.json`) to find the memory_manifest ref before
+        // it can rebuild memory.bin from chunks. On a cross-host
+        // restore that sidecar is in BlobStorage, not on disk, so
+        // the sidecar download (`materialize_state_if_missing`)
+        // MUST run first — otherwise memory.bin materialization
+        // silently no-ops and FC restore then errors with
+        // "snapshot memory.bin missing".
+        if let Some(chunk_store) = self.chunk_store.as_ref() {
+            let blob = chunk_store.blob_storage();
+            if let Err(e) = tracing::Instrument::instrument(
+                materialize_state_if_missing(
+                    blob.as_ref(),
+                    &src,
+                    metadata.state_blob_key.as_deref(),
+                    metadata.sidecar_blob_key.as_deref(),
+                ),
+                tracing::info_span!("restore.materialize_state"),
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    src = %src.display(),
+                    "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
+                );
+            }
+        }
+
+        // ADR 0016 Phase B commit 5: rebuild chunked-disk tracking
+        // for the resumed sandbox.
+        //
+        // Branching mirrors the cold-create path's `resolve_rootfs`:
+        //
+        // - Linux + nbd_pool + chunk_store + chunk_cache + a
+        //   chunked `disk_manifest` on the snapshot row → take the
+        //   NBD attach path. ChunkedDiskBackend is rebased on the
+        //   manifest, an NBD daemon serves it at /dev/nbdN, and FC's
+        //   restore reads its rootfs through that block device. The
+        //   resumed sandbox enters `nbd_sandboxes` after
+        //   `inner.restore` returns the new sandbox_id; the
+        //   FlushScheduler spawns immediately. Closes ADR 0016 §
+        //   "Phase B failure mode to close" — both the COW-diagnostic-
+        //   silent symptom and the second-eviction-can't-snapshot
+        //   symptom.
+        //
+        // - Other configurations (macOS dev, hosts without NBD wired,
+        //   legacy snapshots whose `disk_manifest` is None) → fall
+        //   back to `materialize_disk_if_missing`, which writes the
+        //   bytes to a flat file and patches the sidecar. This path
+        //   doesn't enter `nbd_sandboxes` and doesn't get a
+        //   scheduler; it's the pre-Phase-B behaviour kept for
+        //   backwards compatibility on non-NBD configurations.
+        //
+        // The pending state is captured here (pre-restore) so the
+        // sidecar's `spec.rootfs_source` is patched to /dev/nbdN
+        // BEFORE `inner.restore` reads the sidecar to install the
+        // canonical-rootfs symlinks.
+        #[cfg(target_os = "linux")]
+        let pending_nbd_state = tracing::Instrument::instrument(
+            self.prepare_resume_nbd_attach(&metadata, &src),
+            tracing::info_span!("restore.prepare_nbd"),
+        )
+        .await?;
+
+        // Non-NBD fallback runs only when the NBD path didn't take.
+        // On macOS this is the only path; on Linux it covers hosts
+        // without nbd_pool/chunk_store/chunk_cache wired or
+        // snapshots with disk_manifest=None.
+        let took_nbd_path: bool;
+        #[cfg(target_os = "linux")]
+        {
+            took_nbd_path = pending_nbd_state.is_some();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            took_nbd_path = false;
+        }
+        if !took_nbd_path {
+            if let Some(chunk_store) = self.chunk_store.as_ref() {
+                if let Err(e) = materialize_disk_if_missing(
+                    chunk_store,
+                    self.chunk_cache.as_ref(),
+                    &src,
+                    metadata.disk_manifest,
+                    &self.materialize_lock,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        src = %src.display(),
+                        "rootfs materialization failed; inner.restore will see whatever's there",
+                    );
+                }
+            }
+        }
+
+        // ADR 0020 Route B / ADR 0022 Option A: whether to rebuild the
+        // contiguous memory.bin is now a per-restore-flavor decision.
+        // Resume under UFFD (`fresh == false`) serves memory lazily from
+        // chunks — the handler faults straight from the cache the prefetch
+        // above just warmed, so materializing would be pure overhead.
+        // Base-create under File (`fresh == true`) needs the memfile
+        // present for `load_snapshot`; `materialize_memory_if_missing` is
+        // an idempotent no-op once the residency prefetch (image_prefetch)
+        // wrote the *per-template* file at this same snapshot-id-keyed
+        // path — which is exactly what keeps siblings sharing one inode
+        // rather than each rebuilding a divergent copy.
+        if self.inner.restore_memory_is_lazy_for(fresh) {
+            tracing::debug!(
+                snapshot_id = %metadata.id,
+                "lazy memory restore (UFFD); skipping memory.bin materialization",
+            );
+        } else if let Err(e) = self.materialize_memory_if_missing(&src).await {
+            tracing::warn!(
+                error = %e,
+                src = %src.display(),
+                "memory.bin materialization failed; inner.restore will see whatever's there",
+            );
+        }
+
+        // ADR 0035 §4: every generation the snapshot pins must be staged
+        // before FC's `load_snapshot` opens the embedded path. Cross-host
+        // (post-roll) restores materialize from BlobStorage here; the
+        // common case is a no-op (baked or prefetched).
+        if !metadata.aux_bundles.is_empty() {
+            if let Some(cs) = self.chunk_store.as_ref() {
+                crate::bundles::BundleStore::new(
+                    cs.blob_storage().clone(),
+                    self.bundle_dir.clone(),
+                )
+                .materialize_if_missing(&metadata.aux_bundles)
+                .await?;
+            } else {
+                tracing::debug!(
+                    "snapshot pins aux bundles but no chunk store is wired; \
+                     relying on locally staged generations"
+                );
+            }
+        }
+        // ADR 0035 §3: fresh creates swap aux bundles to the host's
+        // current generation inside the backend; resumes keep the pin.
+        let new_id = if fresh {
+            self.inner.restore_fresh(metadata).await?
+        } else {
+            self.inner.restore(metadata).await?
+        };
+
+        // ADR 0016 Phase B commit 5: post-restore wiring. The new
+        // sandbox_id is only known here; install it into
+        // `nbd_sandboxes` together with the FlushScheduler so the
+        // resumed sandbox is first-class in the COW diagnostic and
+        // in the continuous-flush pipeline. Field-ordered Drop
+        // ensures scheduler-cancel → NBD-disconnect → slot-release
+        // on subsequent destroy.
+        #[cfg(target_os = "linux")]
+        if let Some(mut state) = pending_nbd_state {
+            state.install_flush_scheduler(
+                new_id,
+                self.live_manifest_publisher.clone(),
+                self.flush_config.clone(),
+            );
+            // ADR 0019: open the resume operation window — restore-time disk
+            // reads (load_snapshot + the resumed guest's working set) attach
+            // `chunk.fetch` spans to this trace. Covers idle→resume AND
+            // evac-dest; the coord parent trace distinguishes them. Closed by
+            // `start_agent` (finish_resume_to_active calls it). Memory page-in
+            // is the UFFD side, on the spawn-TRACEPARENT path.
+            state.backend.operation_scope().begin("resume");
+            self.nbd_sandboxes.insert(new_id, state);
+        }
+        Ok(new_id)
+    }
+
     pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
         Self {
             inner,
@@ -203,6 +448,7 @@ impl PooledBackend {
             session_bindings: Arc::new(DashMap::new()),
             chunk_store: None,
             materialize_dir: None,
+            bundle_dir: PathBuf::from(engram_core::types::sandbox::AuxRoDrive::SHARED_DIR),
             chunk_cache: None,
             materialize_lock: Mutex::new(()),
             oci_client: None,
@@ -217,7 +463,218 @@ impl PooledBackend {
             flush_config: crate::disk_daemon::FlushSchedulerConfig::from_env(),
             live_manifest_publisher: Arc::new(crate::disk_daemon::NoOpLiveManifestPublisher),
             live_manifest_publisher_handle: None,
+            checkpoint_dir: None,
+            checkpoint_chains: Arc::new(DashMap::new()),
+            capture_locks: Arc::new(DashMap::new()),
         }
+    }
+
+    /// ADR 0028 Fix A: enable checkpoint chains, rooted at `dir`
+    /// (`rolling/` + `records/` subdirs are created lazily). Without
+    /// this, `snapshot()` stays pure-Full and the periodic driver
+    /// no-ops.
+    pub fn with_checkpoint_dir(mut self, dir: PathBuf) -> Self {
+        self.checkpoint_dir = Some(dir);
+        self
+    }
+
+    /// Record the sandbox→session binding directly. Production
+    /// populates the map via `notify_session_policy` / registration
+    /// rehydration; host-local flows with no egress policy to deliver
+    /// (the checkpoint integration tests) use this.
+    pub fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId) {
+        self.session_bindings.insert(sandbox_id, session_id);
+    }
+
+    /// The per-sandbox capture serialization lock (periodic
+    /// checkpoint vs eviction/drain/SIGTERM snapshot).
+    fn capture_lock(&self, id: SandboxId) -> Arc<tokio::sync::Mutex<()>> {
+        self.capture_locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// ADR 0028 Fix A: where un-acked durable checkpoint records live.
+    pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
+        self.checkpoint_dir.as_ref().map(|d| d.join("records"))
+    }
+
+    fn checkpoint_rolling_path(&self, id: SandboxId) -> Option<PathBuf> {
+        self.checkpoint_dir
+            .as_ref()
+            .map(|d| d.join("rolling").join(format!("{id}.memory.bin")))
+    }
+
+    /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
+    /// host-owned record. Runs at the tail of every successful
+    /// `snapshot()` (periodic checkpoint, eviction, drain, SIGTERM —
+    /// they're all chain entries now). Never fails the capture: the
+    /// snapshot's own durability (chunks + blobs in GCS) is already
+    /// settled; everything here is acceleration (chain) or
+    /// reconciliation insurance (record).
+    async fn advance_checkpoint_state(
+        &self,
+        id: SandboxId,
+        metadata: &SnapshotMetadata,
+        paused_at: chrono::DateTime<chrono::Utc>,
+        next_manifest: Option<engram_chunk_store::Manifest>,
+    ) {
+        if self.checkpoint_dir.is_none() {
+            return;
+        }
+        let Some(memory_ref) = metadata.memory_manifest else {
+            // No chunked memory (no chunk store / non-FC backend):
+            // nothing to chain, and a record without a memory
+            // manifest adds nothing over the live disk manifest.
+            return;
+        };
+
+        match next_manifest {
+            // Diff capture: the rolling file was already overlaid in
+            // the post block; just advance the chain's manifest.
+            Some(next) => {
+                if let Some(mut chain) = self.checkpoint_chains.get_mut(&id) {
+                    chain.manifest_ref = memory_ref;
+                    chain.manifest = next;
+                }
+            }
+            // Full capture: seed the chain — copy the freshly-written
+            // memory.bin as the rolling diff-apply target and fetch
+            // the manifest we just published.
+            None => {
+                if let Err(e) = self.seed_checkpoint_chain(id, metadata, memory_ref).await {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        error = %e,
+                        "checkpoint chain seed failed; next capture will be Full again",
+                    );
+                }
+            }
+        }
+
+        // Durable record — only for session-bound sandboxes (anonymous
+        // base-snapshot captures have no session to reconcile).
+        let Some(session_id) = self.session_bindings.get(&id).map(|s| *s) else {
+            return;
+        };
+        let Some(records_dir) = self.checkpoint_records_dir() else {
+            return;
+        };
+        let record = crate::checkpoint::CheckpointRecord {
+            snapshot_id: metadata.id,
+            session_id,
+            sandbox_id: id,
+            image_version: metadata.image_version.clone(),
+            size_bytes: metadata.size_bytes,
+            disk_manifest: metadata.disk_manifest,
+            memory_manifest: metadata.memory_manifest,
+            aux_bundles: metadata.aux_bundles.clone(),
+            paused_at,
+            captured_at: metadata.created_at,
+        };
+        if let Err(e) = record.persist(&records_dir).await {
+            tracing::warn!(
+                sandbox_id = %id,
+                snapshot_id = %metadata.id,
+                error = %e,
+                "durable checkpoint record write failed; PG row (if the caller's \
+                 pipeline survives) is the only reference",
+            );
+        }
+    }
+
+    async fn seed_checkpoint_chain(
+        &self,
+        id: SandboxId,
+        metadata: &SnapshotMetadata,
+        memory_ref: engram_core::types::manifest::ManifestRef,
+    ) -> Result<(), SandboxError> {
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(rolling) = self.checkpoint_rolling_path(id) else {
+            return Ok(());
+        };
+        let src = self.inner.snapshot_path_for(metadata.id).join("memory.bin");
+        if tokio::fs::metadata(&src).await.is_err() {
+            return Ok(());
+        }
+        if let Some(parent) = rolling.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("rolling dir: {e}")))?;
+        }
+        // GiB-scale copy off the hot path (the guest already resumed);
+        // copy to a temp + rename so a crash never leaves a torn
+        // rolling file masquerading as a baseline.
+        let tmp = rolling.with_extension("partial");
+        let (src_c, tmp_c) = (src.clone(), tmp.clone());
+        tokio::task::spawn_blocking(move || std::fs::copy(&src_c, &tmp_c))
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("seed copy join: {e}")))?
+            .map_err(|e| SandboxError::Snapshot(format!("seed copy: {e}")))?;
+        tokio::fs::rename(&tmp, &rolling)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("seed rename: {e}")))?;
+        let manifest = chunk_store
+            .get_manifest(memory_ref)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("fetch seeded manifest: {e}")))?;
+        self.checkpoint_chains.insert(
+            id,
+            crate::checkpoint::CheckpointChain {
+                manifest_ref: memory_ref,
+                manifest,
+                rolling_memfile: rolling,
+            },
+        );
+        tracing::info!(
+            sandbox_id = %id,
+            manifest = %memory_ref,
+            "checkpoint chain seeded; subsequent captures ride the diff path",
+        );
+        Ok(())
+    }
+
+    /// Sandboxes due for a periodic checkpoint: session-bound, and no
+    /// successful capture (of any flavor) within `interval`. Empty
+    /// when checkpointing is disabled.
+    pub fn checkpoint_candidates(
+        &self,
+        interval: std::time::Duration,
+    ) -> Vec<(SandboxId, SessionId)> {
+        if self.checkpoint_dir.is_none() {
+            return Vec::new();
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let interval_ms = interval.as_millis() as i64;
+        self.session_bindings
+            .iter()
+            .filter_map(|e| {
+                let id = *e.key();
+                let last = self.last_snapshot_unix_ms.get(&id).map(|v| *v).unwrap_or(0);
+                (now_ms - last >= interval_ms).then_some((id, *e.value()))
+            })
+            .collect()
+    }
+
+    /// ADR 0028 Fix A: one periodic checkpoint — the same capture
+    /// `snapshot()` runs for evictions (diff-flavored once the chain
+    /// is seeded), self-committed because the durable record +
+    /// heartbeat re-advertise own the reference, not a coord
+    /// commit/abort pipeline.
+    pub async fn checkpoint_sandbox(
+        &self,
+        id: SandboxId,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        use engram_core::traits::SandboxBackend as _;
+        let metadata = self.snapshot(id).await?;
+        let _ = self.commit_snapshot(id).await;
+        Ok(metadata)
     }
 
     /// Override the default Phase B flush scheduler config. The
@@ -295,6 +752,13 @@ impl PooledBackend {
     pub fn with_chunk_store(mut self, chunk_store: ChunkStore, materialize_dir: PathBuf) -> Self {
         self.chunk_store = Some(chunk_store);
         self.materialize_dir = Some(materialize_dir);
+        self
+    }
+
+    /// ADR 0035: override the staged-bundle dir (tests). Production
+    /// keeps the fleet-canonical default.
+    pub fn with_bundle_dir(mut self, dir: PathBuf) -> Self {
+        self.bundle_dir = dir;
         self
     }
 
@@ -441,7 +905,71 @@ impl PooledBackend {
             self.chunk_cache.as_ref(),
             materialize_dir,
             uri,
-            bundle,
+            bundle.disk_manifest,
+            &self.materialize_lock,
+        )
+        .await?;
+        Ok((path, nbd_state_none()))
+    }
+
+    /// ADR 0028 Fix B: resolve the root disk from an explicit chunked
+    /// manifest (`spec.rootfs_manifest`) instead of an image — the
+    /// disk-only cold-boot recovery shape, where a fresh kernel mounts
+    /// a session's evolved `live_disk_manifest`. NBD-attached when the
+    /// host has the prereqs (prod FC hosts always do), so the
+    /// continuous-flush scheduler continues the SAME manifest lineage
+    /// the recovery booted from; materialize-to-file otherwise
+    /// (dev/VZ parity — those hosts don't track flushes for any
+    /// sandbox, so the recovered session degrades identically).
+    async fn resolve_rootfs_from_manifest(
+        &self,
+        manifest_ref: engram_core::types::manifest::ManifestRef,
+    ) -> Result<(PathBuf, NbdStateSlot), SandboxError> {
+        #[cfg(target_os = "linux")]
+        if let (Some(pool), Some(store), Some(cache)) = (
+            self.nbd_pool.as_ref(),
+            self.chunk_store.as_ref(),
+            self.chunk_cache.as_ref(),
+        ) {
+            let store_arc = Arc::new(store.clone());
+            let state = crate::disk_daemon::attach_manifest(
+                manifest_ref,
+                cache.clone(),
+                store_arc,
+                pool,
+                self.flush_config.dirty_threshold_bytes,
+            )
+            .await
+            .map_err(|e| SandboxError::Vm(format!("rootfs-manifest NBD attach: {e}").into()))?;
+            tracing::info!(
+                manifest = %manifest_ref,
+                device = %state.device_path().display(),
+                "rootfs branch: NBD daemon (explicit manifest override)",
+            );
+            return Ok((state.device_path().to_path_buf(), Some(state)));
+        }
+
+        let (chunk_store, materialize_dir) =
+            match (self.chunk_store.as_ref(), self.materialize_dir.as_ref()) {
+                (Some(cs), Some(dir)) => (cs, dir),
+                _ => {
+                    return Err(SandboxError::InvalidSpec(
+                        "spec.rootfs_manifest is set but this host has neither an NBD \
+                     pool nor a chunk store + materialize dir wired"
+                            .into(),
+                    ));
+                }
+            };
+        tracing::info!(
+            manifest = %manifest_ref,
+            "rootfs branch: materialize-to-file (explicit manifest override)",
+        );
+        let path = materialize_chunked_rootfs(
+            chunk_store,
+            self.chunk_cache.as_ref(),
+            materialize_dir,
+            "rootfs-manifest-override",
+            manifest_ref,
             &self.materialize_lock,
         )
         .await?;
@@ -1111,7 +1639,7 @@ async fn materialize_chunked_rootfs(
     chunk_cache: Option<&ChunkCache>,
     materialize_dir: &std::path::Path,
     uri: &str,
-    bundle: &ImageBundle,
+    manifest_ref: engram_core::types::manifest::ManifestRef,
     materialize_lock: &Mutex<()>,
 ) -> Result<PathBuf, SandboxError> {
     fs::create_dir_all(materialize_dir).await.map_err(|e| {
@@ -1122,7 +1650,6 @@ async fn materialize_chunked_rootfs(
         );
         SandboxError::Vm(format!("materialize dir: {e}").into())
     })?;
-    let manifest_ref = bundle.disk_manifest;
     let dest = materialize_dir.join(format!(
         "{}-v{}.ext4",
         manifest_ref.manifest_id, manifest_ref.version,
@@ -1297,6 +1824,14 @@ impl SandboxBackend for PooledBackend {
         self.inner.restore_memory_is_lazy()
     }
 
+    fn restore_memory_is_lazy_for(&self, fresh: bool) -> bool {
+        self.inner.restore_memory_is_lazy_for(fresh)
+    }
+
+    async fn guest_memory_stats(&self) -> Option<engram_core::traits::sandbox::GuestMemoryStats> {
+        self.inner.guest_memory_stats().await
+    }
+
     async fn create(&self, mut spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         // Phase 5+: resolve OCI image_uri / harness_pack_uri to local
         // cached paths before warm-pool key derivation. Both paths
@@ -1320,7 +1855,21 @@ impl SandboxBackend for PooledBackend {
         let mut image_resolve = std::time::Duration::ZERO;
         let mut materialize = std::time::Duration::ZERO;
         let result: Result<SandboxId, SandboxError> = async {
-            if let Some(cache) = &self.image_cache {
+            // ADR 0028 Fix B: explicit rootfs-manifest override wins
+            // over image resolution — the disk-only cold-boot recovery
+            // boots a fresh kernel against a session's evolved rootfs
+            // lineage, so the image's own disk (and its pull) is
+            // irrelevant; `spec.image_uri` stays as record-keeping.
+            if let Some(manifest_ref) = spec.rootfs_manifest {
+                let t = std::time::Instant::now();
+                let (path, _state) = self.resolve_rootfs_from_manifest(manifest_ref).await?;
+                materialize += t.elapsed();
+                spec.rootfs_source = Some(path);
+                #[cfg(target_os = "linux")]
+                {
+                    pending_nbd_state = _state;
+                }
+            } else if let Some(cache) = &self.image_cache {
                 if let Some(uri) = spec.image_uri.clone() {
                     let t = std::time::Instant::now();
                     let cached = cache.ensure_image(&uri).await.map_err(|e| {
@@ -1418,6 +1967,26 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        // ADR 0028 Fix A: serialize captures per sandbox — a periodic
+        // checkpoint and an eviction/drain/SIGTERM snapshot must never
+        // interleave (the pause is idempotent, but concurrent NBD
+        // flushes + chain advances are not).
+        let capture_lock = self.capture_lock(id);
+        let _capture_guard = capture_lock.lock().await;
+        // Diff-mode when a rolling chain exists: same coherent
+        // (memory, disk) capture contract, O(dirty set) cost. The
+        // chain seeds on the first (Full) capture below — so an
+        // eviction on a long-running session is just the final diff
+        // in its checkpoint chain, collapsing the multi-GiB-dump
+        // window the cf4d4afd incident sat in.
+        let chain_prev = self.checkpoint_chains.get(&id).map(|c| {
+            (
+                c.manifest_ref,
+                c.manifest.clone(),
+                c.rolling_memfile.clone(),
+            )
+        });
+
         // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
         // was produced but never committed (caller's downstream
         // pipeline failed or the coord pod crashed between snapshot
@@ -1488,6 +2057,12 @@ impl SandboxBackend for PooledBackend {
         // queued between flush and pause landed in memory but not
         // the published manifest — the cross-host evac canary md5
         // mismatch on dev-vm validation was exactly this race.
+        //
+        // ADR 0028 A.log: the pause instant is the coherence cut for
+        // the (memory, disk, event-log) triple — the coord resolves
+        // the session_events cursor as "last event at or before this"
+        // when it records the checkpoint.
+        let paused_at = chrono::Utc::now();
         self.inner
             .pause(id)
             .await
@@ -1526,11 +2101,20 @@ impl SandboxBackend for PooledBackend {
         // ADR 0007 Phase 6: backend owns its staging dir; we look
         // it up via snapshot_path_for after the inner call so we
         // can read/patch the on-disk artifacts the inner backend
-        // wrote (memory.bin, manifest.json). inner.snapshot's
-        // pause-create-resume cycle is idempotent against our
-        // earlier pause and brings the VM back to running on exit.
-        let mut metadata = self.inner.snapshot(id).await?;
+        // wrote (memory.bin / memory.diff, manifest.json). The inner
+        // call's pause-create-resume cycle is idempotent against our
+        // earlier pause and brings the VM back to running on exit —
+        // for the diff flavor that resume lands after O(dirty set),
+        // not O(guest RAM).
+        let mut metadata = if chain_prev.is_some() {
+            self.inner.snapshot_diff(id).await?
+        } else {
+            self.inner.snapshot(id).await?
+        };
         let dest = self.inner.snapshot_path_for(metadata.id);
+        // Filled by the diff branch below; consumed by the chain
+        // advance after the post-processing block succeeds.
+        let mut next_manifest_for_chain: Option<engram_chunk_store::Manifest> = None;
 
         // ADR 0014 cleanup hygiene: from here on, FC has materialised
         // state.bin + memory.bin in `dest` (4+ GiB). Any failure in
@@ -1558,11 +2142,54 @@ impl SandboxBackend for PooledBackend {
             let Some(chunk_store) = self.chunk_store.as_ref() else {
                 return Ok(metadata);
             };
-            let mem_path = dest.join("memory.bin");
-            if fs::metadata(&mem_path).await.is_err() {
-                return Ok(metadata);
-            }
-            let manifest_ref = chunk_memory_to_store(chunk_store, &mem_path).await?;
+            let manifest_ref = if let Some((prev_ref, prev_manifest, rolling)) = chain_prev.as_ref()
+            {
+                // ADR 0028 Fix A diff path: overlay the sparse diff
+                // onto the rolling full image, then re-chunk ONLY the
+                // chunks the dirty extents touched — the previous
+                // manifest's hashes carry over for everything else,
+                // so CPU + upload stay O(dirty set). The manifest id
+                // is stable for the chain's lifetime; only `version`
+                // ticks.
+                let diff_path = dest.join("memory.diff");
+                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+                    .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
+                crate::checkpoint::overlay_sparse(&diff_path, rolling)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("overlay diff: {e}")))?;
+                let next = chunk_store
+                    .update_for_dirty_ranges(prev_manifest, rolling, &ranges)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("incremental re-chunk: {e}")))?;
+                let next_ref = prev_ref.next_version();
+                chunk_store
+                    .put_manifest(next_ref, &next)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
+                // The sparse diff did its job; drop it so the local
+                // snapshot dir stays state.bin + sidecar sized.
+                let _ = fs::remove_file(&diff_path).await;
+                next_manifest_for_chain = Some(next);
+                tracing::info!(
+                    session_sandbox = %id,
+                    manifest = %next_ref,
+                    dirty_ranges = ranges.len(),
+                    "diff checkpoint re-chunked incrementally",
+                );
+                next_ref
+            } else {
+                let mem_path = dest.join("memory.bin");
+                if fs::metadata(&mem_path).await.is_err() {
+                    return Ok(metadata);
+                }
+                let mref = chunk_memory_to_store(chunk_store, &mem_path).await?;
+                tracing::info!(
+                    session_sandbox = %id,
+                    manifest = %mref,
+                    "chunked FC memory.bin → chunk store",
+                );
+                mref
+            };
             // Patch the FC sidecar JSON (`manifest.json`) so its
             // `memory_manifest` field carries the ref the UFFD handler
             // needs at restore time. The FC backend deserializes via
@@ -1572,11 +2199,6 @@ impl SandboxBackend for PooledBackend {
             let manifest_json = dest.join("manifest.json");
             patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
             metadata.memory_manifest = Some(manifest_ref);
-            tracing::info!(
-                session_sandbox = %id,
-                manifest = %manifest_ref,
-                "chunked FC memory.bin → chunk store",
-            );
 
             // ADR 0014: upload state.bin + sidecar to BlobStorage so a
             // sibling host can restore from this snapshot. memory.bin
@@ -1617,6 +2239,16 @@ impl SandboxBackend for PooledBackend {
                     "portable snapshot artifacts uploaded to BlobStorage",
                 );
             }
+            // ADR 0035 §2: idempotently publish the pinned bundle
+            // generations. Runs on every snapshot flavor — an eviction
+            // snapshot can pin a swapped-in generation no base capture
+            // ever published. Failure fails the snapshot (a pin nothing
+            // can satisfy is worse than a retried eviction).
+            if !metadata.aux_bundles.is_empty() {
+                crate::bundles::BundleStore::new(blob.clone(), self.bundle_dir.clone())
+                    .publish(&metadata.aux_bundles)
+                    .await?;
+            }
             Ok::<_, SandboxError>(metadata)
         }
         .await;
@@ -1642,6 +2274,14 @@ impl SandboxBackend for PooledBackend {
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
                 self.last_snapshot_unix_ms.insert(id, now_ms);
+                // ADR 0028 Fix A: seed/advance the rolling chain +
+                // persist the durable host-owned record. Best-effort
+                // beyond the capture: a seed failure means the next
+                // capture is Full again; a record failure means only
+                // PG (if the caller's pipeline survives) knows this
+                // checkpoint. Both safe, both logged inside.
+                self.advance_checkpoint_state(id, &m, paused_at, next_manifest_for_chain)
+                    .await;
                 Ok(m)
             }
             Err(e) => {
@@ -1702,6 +2342,12 @@ impl SandboxBackend for PooledBackend {
         self.inner.snapshot_path_for(snapshot_id)
     }
 
+    // ADR 0028 Fix A: defer to the wrapped backend — a PooledBackend
+    // over FC checkpoints, over VZ/Process doesn't.
+    fn supports_diff_checkpoints(&self) -> bool {
+        self.inner.supports_diff_checkpoints()
+    }
+
     /// ADR 0018 commit 12m: forward pause to the wrapped backend.
     /// PooledBackend doesn't have its own pause concept — it just
     /// delegates to whatever VMM is underneath. Used by our own
@@ -1717,189 +2363,11 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        // ADR 0014 M1.13: eager parallel prefetch of memory chunks
-        // into local NVMe BEFORE we hand off to materialize +
-        // inner.restore. Without this, materialize_to_file_cached's
-        // serial chunk iteration pays N×GCS-RTT (~300 ms each) on
-        // a cold-cache host — a 512 MiB template's 32 chunks come
-        // out as ~10 s of serial fetch. Parallel prefetch with
-        // bounded concurrency reduces that to roughly ~2 s.
-        // Subsequent restores against the same template hit NVMe
-        // and the prefetch is a no-op.
-        // ADR 0020 P3: span the pre-`restore_in_jail` prep legs (memory
-        // prefetch / state materialize / NBD attach) alongside the
-        // `fc.restore_in_jail` legs, so one trace shows where the whole
-        // `host.restore_base_for_session` window goes. Pure observability.
-        let prefetch_start = std::time::Instant::now();
-        let prefetched_chunks = tracing::Instrument::instrument(
-            self.prefetch_memory_chunks(&metadata),
-            tracing::info_span!("restore.prefetch_memory"),
-        )
-        .await;
-        if let Err(e) = prefetched_chunks.as_ref() {
-            tracing::warn!(
-                error = %e,
-                snapshot_id = %metadata.id,
-                "chunked restore memory chunk prefetch failed; falling back to serial fault path",
-            );
-        }
-        let _ = (prefetched_chunks, prefetch_start);
+        self.restore_with(metadata, /*fresh=*/ false).await
+    }
 
-        // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
-        // The backend owns its staging dir layout (Phase 6); we ask
-        // it where this snapshot would live, then ensure the
-        // memory.bin file is present before delegating to inner —
-        // either because we're on the same host where it was
-        // written, or because we need to rebuild it from chunks
-        // (cross-host migration). With M1.13's prefetch above, the
-        // serial materialize loop now hits the NVMe-warm cache for
-        // every chunk.
-        let src = self.inner.snapshot_path_for(metadata.id);
-
-        // ADR 0014: cross-host materialization is order-sensitive.
-        // `materialize_memory_if_missing` reads the local FC sidecar
-        // (`manifest.json`) to find the memory_manifest ref before
-        // it can rebuild memory.bin from chunks. On a cross-host
-        // restore that sidecar is in BlobStorage, not on disk, so
-        // the sidecar download (`materialize_state_if_missing`)
-        // MUST run first — otherwise memory.bin materialization
-        // silently no-ops and FC restore then errors with
-        // "snapshot memory.bin missing".
-        if let Some(chunk_store) = self.chunk_store.as_ref() {
-            let blob = chunk_store.blob_storage();
-            if let Err(e) = tracing::Instrument::instrument(
-                materialize_state_if_missing(
-                    blob.as_ref(),
-                    &src,
-                    metadata.state_blob_key.as_deref(),
-                    metadata.sidecar_blob_key.as_deref(),
-                ),
-                tracing::info_span!("restore.materialize_state"),
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    src = %src.display(),
-                    "state.bin/sidecar materialization failed; inner.restore will see whatever's there",
-                );
-            }
-        }
-
-        // ADR 0016 Phase B commit 5: rebuild chunked-disk tracking
-        // for the resumed sandbox.
-        //
-        // Branching mirrors the cold-create path's `resolve_rootfs`:
-        //
-        // - Linux + nbd_pool + chunk_store + chunk_cache + a
-        //   chunked `disk_manifest` on the snapshot row → take the
-        //   NBD attach path. ChunkedDiskBackend is rebased on the
-        //   manifest, an NBD daemon serves it at /dev/nbdN, and FC's
-        //   restore reads its rootfs through that block device. The
-        //   resumed sandbox enters `nbd_sandboxes` after
-        //   `inner.restore` returns the new sandbox_id; the
-        //   FlushScheduler spawns immediately. Closes ADR 0016 §
-        //   "Phase B failure mode to close" — both the COW-diagnostic-
-        //   silent symptom and the second-eviction-can't-snapshot
-        //   symptom.
-        //
-        // - Other configurations (macOS dev, hosts without NBD wired,
-        //   legacy snapshots whose `disk_manifest` is None) → fall
-        //   back to `materialize_disk_if_missing`, which writes the
-        //   bytes to a flat file and patches the sidecar. This path
-        //   doesn't enter `nbd_sandboxes` and doesn't get a
-        //   scheduler; it's the pre-Phase-B behaviour kept for
-        //   backwards compatibility on non-NBD configurations.
-        //
-        // The pending state is captured here (pre-restore) so the
-        // sidecar's `spec.rootfs_source` is patched to /dev/nbdN
-        // BEFORE `inner.restore` reads the sidecar to install the
-        // canonical-rootfs symlinks.
-        #[cfg(target_os = "linux")]
-        let pending_nbd_state = tracing::Instrument::instrument(
-            self.prepare_resume_nbd_attach(&metadata, &src),
-            tracing::info_span!("restore.prepare_nbd"),
-        )
-        .await?;
-
-        // Non-NBD fallback runs only when the NBD path didn't take.
-        // On macOS this is the only path; on Linux it covers hosts
-        // without nbd_pool/chunk_store/chunk_cache wired or
-        // snapshots with disk_manifest=None.
-        let took_nbd_path: bool;
-        #[cfg(target_os = "linux")]
-        {
-            took_nbd_path = pending_nbd_state.is_some();
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            took_nbd_path = false;
-        }
-        if !took_nbd_path {
-            if let Some(chunk_store) = self.chunk_store.as_ref() {
-                if let Err(e) = materialize_disk_if_missing(
-                    chunk_store,
-                    self.chunk_cache.as_ref(),
-                    &src,
-                    metadata.disk_manifest,
-                    &self.materialize_lock,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        src = %src.display(),
-                        "rootfs materialization failed; inner.restore will see whatever's there",
-                    );
-                }
-            }
-        }
-
-        // ADR 0020 Route B: when the backend serves memory lazily from
-        // chunks (UFFD), there is no memory.bin to rebuild — the handler
-        // faults chunks straight from the cache the prefetch above just
-        // warmed. Materializing the contiguous file would be pure
-        // overhead (the dominant restore cost we're removing). The
-        // prefetch still ran, so the cache is warm for the fault path.
-        if self.inner.restore_memory_is_lazy() {
-            tracing::debug!(
-                snapshot_id = %metadata.id,
-                "lazy memory restore (UFFD); skipping memory.bin materialization",
-            );
-        } else if let Err(e) = self.materialize_memory_if_missing(&src).await {
-            tracing::warn!(
-                error = %e,
-                src = %src.display(),
-                "memory.bin materialization failed; inner.restore will see whatever's there",
-            );
-        }
-
-        let new_id = self.inner.restore(metadata).await?;
-
-        // ADR 0016 Phase B commit 5: post-restore wiring. The new
-        // sandbox_id is only known here; install it into
-        // `nbd_sandboxes` together with the FlushScheduler so the
-        // resumed sandbox is first-class in the COW diagnostic and
-        // in the continuous-flush pipeline. Field-ordered Drop
-        // ensures scheduler-cancel → NBD-disconnect → slot-release
-        // on subsequent destroy.
-        #[cfg(target_os = "linux")]
-        if let Some(mut state) = pending_nbd_state {
-            state.install_flush_scheduler(
-                new_id,
-                self.live_manifest_publisher.clone(),
-                self.flush_config.clone(),
-            );
-            // ADR 0019: open the resume operation window — restore-time disk
-            // reads (load_snapshot + the resumed guest's working set) attach
-            // `chunk.fetch` spans to this trace. Covers idle→resume AND
-            // evac-dest; the coord parent trace distinguishes them. Closed by
-            // `start_agent` (finish_resume_to_active calls it). Memory page-in
-            // is the UFFD side, on the spawn-TRACEPARENT path.
-            state.backend.operation_scope().begin("resume");
-            self.nbd_sandboxes.insert(new_id, state);
-        }
-        Ok(new_id)
+    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        self.restore_with(metadata, /*fresh=*/ true).await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -1940,6 +2408,16 @@ impl SandboxBackend for PooledBackend {
         // snapshot timestamp) — same shape as a brand-new
         // sandbox.
         let _ = self.last_snapshot_unix_ms.remove(&id);
+        // ADR 0028 Fix A: tear down the checkpoint chain + its rolling
+        // memory image. Durable RECORDS deliberately survive destroy —
+        // an eviction's final checkpoint must stay re-advertisable
+        // until the coord acks it (that's the whole reconciliation
+        // point). GCS chunks are the durable truth; the rolling file
+        // is just the local diff-apply accelerator.
+        if let Some((_, chain)) = self.checkpoint_chains.remove(&id) {
+            let _ = tokio::fs::remove_file(&chain.rolling_memfile).await;
+        }
+        let _ = self.capture_locks.remove(&id);
         result
     }
 
@@ -2024,7 +2502,9 @@ impl SandboxBackend for PooledBackend {
         // 1. Restore the base snapshot (cross-host materialize +
         //    load_snapshot). The VM comes up running with the bake-time
         //    harness baked into the rootfs at /opt/engram/harness/.
-        let id = self.restore(metadata).await?;
+        //    Fresh flavor (ADR 0035 §3): aux bundles swap to the host's
+        //    current generation so new sessions run the latest skills.
+        let id = self.restore_with(metadata, /*fresh=*/ true).await?;
 
         // Inject the per-session env (manifest env + secrets + session
         // id). The base snapshot is shared, so per-session values can't
@@ -2479,6 +2959,7 @@ impl PooledBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
 
@@ -2487,6 +2968,7 @@ mod tests {
             image: image.into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 64 },
             disk: DiskLimit { max_gib: 1 },
@@ -2533,10 +3015,16 @@ mod tests {
         let materialize_dir = tmp.path().join("materialized");
         let lock = Mutex::new(());
 
-        let path1 =
-            materialize_chunked_rootfs(&cs, None, &materialize_dir, "img:1", &bundle, &lock)
-                .await
-                .unwrap();
+        let path1 = materialize_chunked_rootfs(
+            &cs,
+            None,
+            &materialize_dir,
+            "img:1",
+            bundle.disk_manifest,
+            &lock,
+        )
+        .await
+        .unwrap();
         let restored = tokio::fs::read(&path1).await.unwrap();
         assert_eq!(restored, bytes, "byte-for-byte mismatch");
 
@@ -2544,10 +3032,16 @@ mod tests {
         // no rewrite.
         let mtime_before = std::fs::metadata(&path1).unwrap().modified().unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let path2 =
-            materialize_chunked_rootfs(&cs, None, &materialize_dir, "img:1", &bundle, &lock)
-                .await
-                .unwrap();
+        let path2 = materialize_chunked_rootfs(
+            &cs,
+            None,
+            &materialize_dir,
+            "img:1",
+            bundle.disk_manifest,
+            &lock,
+        )
+        .await
+        .unwrap();
         assert_eq!(path1, path2);
         let mtime_after = std::fs::metadata(&path2).unwrap().modified().unwrap();
         assert_eq!(
@@ -2657,6 +3151,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -2793,6 +3288,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -2929,6 +3425,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -3158,6 +3655,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         pooled.restore(metadata.clone()).await.unwrap();
 
@@ -3284,6 +3782,7 @@ mod tests {
             sidecar_blob_key: None,
             rootfs_blob_key: None,
             working_set_blob_key: None,
+            aux_bundles: vec![],
         };
         let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
@@ -3331,7 +3830,7 @@ mod tests {
             Some(&cache),
             &materialize_dir,
             "img:cached",
-            &bundle,
+            bundle.disk_manifest,
             &lock,
         )
         .await
@@ -3352,7 +3851,7 @@ mod tests {
             Some(&cache),
             &materialize_dir,
             "img:cached",
-            &bundle,
+            bundle.disk_manifest,
             &lock,
         )
         .await
@@ -3501,6 +4000,7 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: Some("test:1".into()),
+            rootfs_manifest: None,
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 64 },
             disk: DiskLimit { max_gib: 1 },
@@ -3768,6 +4268,7 @@ mod tests {
                     sidecar_blob_key: None,
                     rootfs_blob_key: None,
                     working_set_blob_key: None,
+                    aux_bundles: vec![],
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {

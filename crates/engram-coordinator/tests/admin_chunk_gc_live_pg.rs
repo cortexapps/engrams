@@ -15,7 +15,8 @@
 //!
 //! Coverage:
 //! - `pin_set_covers_all_three_sources_and_dry_run_is_pure` —
-//!   enabled image + live session manifest + recoverable snapshot
+//!   enabled image (rootfs + base-snapshot disk/memory, ADR 0022
+//!   sources #5/#6) + live session manifest + recoverable snapshot
 //!   all pin their chunks; a planted orphan ends up in the
 //!   dry-run candidate count without any DB or blob mutation.
 //! - `full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned`
@@ -26,6 +27,10 @@
 //!   the same sweep when grace>0.
 //! - `non_recoverable_snapshots_do_not_pin` — a snapshot with
 //!   `recoverable=false` does not protect its chunks from GC.
+//! - `base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable`
+//!   — ADR 0022 sources #5/#6 pin the per-template memfile + rootfs
+//!   via the enabled_images row independent of the base snapshot
+//!   row's `recoverable` flag.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -183,6 +188,12 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
 
     // ---- enabled image with chunked-disk manifest ----
     let img_disk = seed_manifest(&rig.chunk_store, &[b"img-a", b"img-b"], ManifestKind::Disk).await;
+    // ADR 0022 sources #5/#6: the base snapshot's own memory + disk
+    // manifests, pinned via enabled_images.base_snapshot_*. Real chunks so
+    // PinSet::collect can fetch them (seeding random unbacked refs here was
+    // a latent bug that became live once #5/#6 fetch these columns).
+    let base_disk = seed_manifest(&rig.chunk_store, &[b"base-d"], ManifestKind::Disk).await;
+    let base_mem = seed_manifest(&rig.chunk_store, &[b"base-m"], ManifestKind::Memory).await;
     let image_uri = format!("phase-c-pin-test:warm-{}", Uuid::new_v4());
     // ADR 0020: enabled_images.base_snapshot_id is NOT NULL + FK to
     // snapshots(id) (migration 0038); seed a throwaway template snapshot.
@@ -199,6 +210,8 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             disk_manifest: None,
             memory_manifest: None,
             recoverable: true,
+            aux_bundles: vec![],
+            events_cursor: None,
         })
         .await
         .expect("seed base snapshot");
@@ -210,14 +223,8 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             manifest_digest: format!("sha256:{:064x}", 1u32),
             disk_manifest: Some(img_disk),
             base_snapshot_id: Some(base_snap),
-            base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
-                manifest_id: uuid::Uuid::new_v4(),
-                version: 1,
-            }),
-            base_snapshot_memory_manifest: Some(engram_core::types::manifest::ManifestRef {
-                manifest_id: uuid::Uuid::new_v4(),
-                version: 1,
-            }),
+            base_snapshot_disk_manifest: Some(base_disk),
+            base_snapshot_memory_manifest: Some(base_mem),
             last_refreshed_at: Utc::now(),
             created_at: Utc::now(),
             updated_at: None,
@@ -267,6 +274,8 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
             disk_manifest: Some(snap_disk),
             memory_manifest: Some(snap_mem),
             recoverable: true,
+            aux_bundles: vec![],
+            events_cursor: None,
         })
         .await
         .expect("record snapshot");
@@ -292,12 +301,13 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
     .await
     .expect("dry-run sweep");
 
-    // Assertions: pin set covers all four manifests' chunks (2 + 2
-    // + 1 + 1 = 6 distinct ChunkHashes). The orphan is the lone
-    // candidate. Dry-run promotes nothing.
+    // Assertions: pin set covers all six sources' chunks: image disk (2)
+    // + base-snapshot disk #6 (1) + base-snapshot memory #5 (1) + session
+    // live (2) + recoverable snapshot disk (1) + memory (1) = 8 distinct
+    // ChunkHashes. The orphan is the lone candidate. Dry-run promotes nothing.
     assert_eq!(
-        report.pin_set_size, 6,
-        "pin set should cover all 4 manifests' chunks"
+        report.pin_set_size, 8,
+        "pin set should cover all 6 manifests' chunks"
     );
     assert_eq!(
         report.candidates_marked, 1,
@@ -340,6 +350,11 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
         ManifestKind::Disk,
     )
     .await;
+    // ADR 0022 sources #5/#6: real base-snapshot manifests (not random
+    // unbacked refs) so PinSet::collect can fetch them.
+    let base_disk = seed_manifest(&rig.chunk_store, &[b"promote-base-d"], ManifestKind::Disk).await;
+    let base_mem =
+        seed_manifest(&rig.chunk_store, &[b"promote-base-m"], ManifestKind::Memory).await;
     let image_uri = format!("phase-c-promote-test:warm-{}", Uuid::new_v4());
     // ADR 0020: enabled_images.base_snapshot_id is NOT NULL + FK to
     // snapshots(id) (migration 0038); seed a throwaway template snapshot.
@@ -356,6 +371,8 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             disk_manifest: None,
             memory_manifest: None,
             recoverable: true,
+            aux_bundles: vec![],
+            events_cursor: None,
         })
         .await
         .expect("seed base snapshot");
@@ -367,14 +384,8 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
             manifest_digest: format!("sha256:{:064x}", 2u32),
             disk_manifest: Some(pinned_mref),
             base_snapshot_id: Some(base_snap),
-            base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
-                manifest_id: uuid::Uuid::new_v4(),
-                version: 1,
-            }),
-            base_snapshot_memory_manifest: Some(engram_core::types::manifest::ManifestRef {
-                manifest_id: uuid::Uuid::new_v4(),
-                version: 1,
-            }),
+            base_snapshot_disk_manifest: Some(base_disk),
+            base_snapshot_memory_manifest: Some(base_mem),
             last_refreshed_at: Utc::now(),
             created_at: Utc::now(),
             updated_at: None,
@@ -570,6 +581,8 @@ async fn non_recoverable_snapshots_do_not_pin() {
             disk_manifest: Some(unrec_mref),
             memory_manifest: None,
             recoverable: false, // ← the load-bearing field
+            aux_bundles: vec![],
+            events_cursor: None,
         })
         .await
         .expect("record snapshot");
@@ -606,4 +619,103 @@ async fn non_recoverable_snapshots_do_not_pin() {
         !still_present,
         "chunk pinned only by a non-recoverable snapshot must be deleted",
     );
+}
+
+/// ADR 0022 Option A: the per-template base memfile (+ its rootfs) must
+/// stay pinned via the enabled_images row even when the base snapshot it
+/// came from is NOT recoverable — i.e. sources #5/#6 are independent of
+/// the `recoverable` flag, exactly as source #1 is. This is the inverse
+/// of `non_recoverable_snapshots_do_not_pin`: there the only reference was
+/// a non-recoverable snapshot (→ deleted); here the enabled_images
+/// base_snapshot_* columns also reference the manifests (→ pinned).
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
+    let Some(rig) = rig().await else { return };
+
+    // The memfile backing (memory) + rootfs (disk) of the base snapshot.
+    let memfile_mref =
+        seed_manifest(&rig.chunk_store, &[b"memfile-chunk"], ManifestKind::Memory).await;
+    let rootfs_mref = seed_manifest(&rig.chunk_store, &[b"rootfs-chunk"], ManifestKind::Disk).await;
+    let memfile_hash = rig
+        .chunk_store
+        .get_manifest(memfile_mref)
+        .await
+        .expect("read memfile manifest")
+        .chunks[0]
+        .hash;
+    let rootfs_hash = rig
+        .chunk_store
+        .get_manifest(rootfs_mref)
+        .await
+        .expect("read rootfs manifest")
+        .chunks[0]
+        .hash;
+
+    // Base snapshot recorded NON-recoverable, with no manifests of its own,
+    // so sources #3/#4 cannot pin memfile/rootfs.
+    let base_snap = SnapshotId::new();
+    rig.meta
+        .record_snapshot(SnapshotRecord {
+            id: base_snap,
+            session_id: None,
+            host_id: None,
+            image_version: "base-snapshot-nonrec".into(),
+            size_bytes: 0,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            disk_manifest: None,
+            memory_manifest: None,
+            recoverable: false, // ← the load-bearing field
+            aux_bundles: vec![],
+            events_cursor: None,
+        })
+        .await
+        .expect("seed non-recoverable base snapshot");
+
+    // The enabled image references the memfile/rootfs ONLY via the
+    // base_snapshot_* columns (disk_manifest = None → source #1 pins
+    // nothing). So the only pin path is sources #5/#6.
+    rig.meta
+        .upsert_enabled_image(EnabledImage {
+            id: Uuid::new_v4(),
+            image_uri: format!("adr-0022-memfile-pin:warm-{}", Uuid::new_v4()),
+            manifest_toml: "image = { uri = \"adr-0022\" }\n".into(),
+            manifest_digest: format!("sha256:{:064x}", 22u32),
+            disk_manifest: None,
+            base_snapshot_id: Some(base_snap),
+            base_snapshot_disk_manifest: Some(rootfs_mref),
+            base_snapshot_memory_manifest: Some(memfile_mref),
+            last_refreshed_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: None,
+            soft_deleted_at: None,
+        })
+        .await
+        .expect("upsert enabled image");
+
+    let cfg = ChunkGcConfig {
+        grace_period: Duration::from_secs(0),
+        ..ChunkGcConfig::default()
+    };
+    run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &cfg,
+        SweepMode::Full,
+    )
+    .await
+    .expect("sweep");
+
+    // Both survive: pinned via enabled_images base_snapshot_* (sources
+    // #5/#6) despite the base snapshot being non-recoverable.
+    for (h, what) in [(memfile_hash, "memfile"), (rootfs_hash, "rootfs")] {
+        let present = rig.blob.exists(&h.storage_key()).await.expect("exists");
+        assert!(
+            present,
+            "{what} chunk must stay pinned via enabled_images base_snapshot_* \
+             even though its base snapshot is non-recoverable",
+        );
+    }
 }

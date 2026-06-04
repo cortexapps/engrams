@@ -21,6 +21,8 @@ use crate::image_cache::ImageCache;
 
 pub mod admin_handler;
 pub mod blob;
+pub mod bundles;
+pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
 pub mod disk_daemon;
@@ -289,7 +291,33 @@ impl HostAgent {
                     self.cfg.coordinator_token.clone(),
                 );
                 p = p.with_live_manifest_coord_publisher(publisher_coord, host_id);
+                // ADR 0028 Fix A: checkpoint chains (rolling memory
+                // images + durable records) live under the work dir.
+                // Gated on (a) a chunk store being wired — nothing
+                // durable to chain without it — AND (b) the backend
+                // actually producing coherent memory checkpoints (FC
+                // with dirty tracking). The latter keeps a split-mode
+                // VZ / Process host (which the Tilt local setup runs)
+                // from ever engaging the chain or the periodic driver
+                // below — VZ has no guest-memory snapshot, so a
+                // checkpoint there is just a wasteful VM pause.
+                let checkpoints_supported = self.sandbox.supports_diff_checkpoints();
+                if self.chunk_store.is_some() && checkpoints_supported {
+                    p = p.with_checkpoint_dir(self.cfg.work_dir.join("checkpoints"));
+                }
                 Arc::new(p)
+            };
+            // ADR 0028 Fix A: the periodic checkpoint driver. No-ops
+            // when ENGRAM_CHECKPOINT_INTERVAL_SECS=0, the backend has
+            // no checkpoint dir, or the backend can't do diff
+            // checkpoints (VZ / Process — never pauses their VMs).
+            let _checkpoint_driver = if self.sandbox.supports_diff_checkpoints() {
+                checkpoint::spawn_checkpoint_driver(
+                    pooled.clone(),
+                    checkpoint::CheckpointConfig::from_env(),
+                )
+            } else {
+                None
             };
             // ADR 0013: every harness event POSTs to the coord via
             // HTTP. Any coord pod can serve the POST (the
@@ -578,10 +606,29 @@ impl HostAgent {
                 self.chunk_cache.clone(),
             ) {
                 (Some(chunk_store), Some(chunk_cache)) => {
+                    // ADR 0022 Option A: when base-create is on the File
+                    // backend (ENGRAM_FC_BASE_RESTORE_MODE=file), have the
+                    // supervisor materialize each enabled image's contiguous
+                    // per-template base memfile at residency — at the SAME
+                    // path a base session.create restore reads
+                    // (`pooled.snapshot_path_for(base_snapshot_id)`), so they
+                    // agree by construction. One coherent switch: the env
+                    // that flips base-create to File also turns this on.
+                    let base_memfile_dir: Option<image_prefetch::SnapshotDirResolver> = matches!(
+                        engram_sandbox_firecracker::base_restore_mode_from_env(),
+                        Some(engram_sandbox_firecracker::RestoreMode::File)
+                    )
+                    .then(|| {
+                        let p = pooled.clone();
+                        let resolver: image_prefetch::SnapshotDirResolver =
+                            std::sync::Arc::new(move |id| p.snapshot_path_for(id));
+                        resolver
+                    });
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
                         chunk_store,
                         chunk_cache,
                         readiness.clone(),
+                        base_memfile_dir,
                     );
                     Some(tx)
                 }
@@ -593,6 +640,19 @@ impl HostAgent {
                     None
                 }
             };
+
+            // ADR 0035: bundle store + supervisor. The stamp is read once
+            // (hosts are immutable; only a MIG roll changes it). The
+            // supervisor consumes the ack's `live_bundles` pin set:
+            // prefetch missing pinned generations, sweep unpinned ones.
+            let bundle_dir = bundles::bundle_dir_from_env();
+            let current_bundles = bundles::read_stamp(&bundle_dir).await;
+            let live_bundles_tx = self.chunk_store.as_ref().map(|(cs, _)| {
+                bundles::spawn_supervisor(
+                    bundles::BundleStore::new(cs.blob_storage().clone(), bundle_dir.clone()),
+                    current_bundles.clone(),
+                )
+            });
 
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
@@ -624,6 +684,42 @@ impl HostAgent {
                         }
                     };
                     let running_count = running_sandboxes.len() as u32;
+                    // ADR 0022 Option A: sample summed guest PSS/RSS across
+                    // this host's live FC sandboxes — the density signal
+                    // (Σpss/Σrss → ~1.0 under UFFD private copies, < 1.0 as
+                    // File-backend siblings share one base memfile). Set
+                    // both gauges every tick so a drained host reports 0,
+                    // never a stale value. Error-tolerant + non-blocking
+                    // (telemetry must not gate the workload); absent on
+                    // VZ/non-Linux (guest_memory_stats → None).
+                    if let Some(mem) = pooled_for_heartbeat.guest_memory_stats().await {
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PSS_BYTES)
+                            .set(mem.pss_bytes as f64);
+                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
+                            .set(mem.rss_bytes as f64);
+                    }
+                    // ADR 0028 Fix A: re-advertise every un-acked
+                    // durable checkpoint record until a coord acks it
+                    // into PG. Empty when checkpointing is disabled.
+                    let checkpoint_records = match pooled_for_heartbeat.checkpoint_records_dir() {
+                        Some(dir) => checkpoint::CheckpointRecord::load_all(&dir).await,
+                        None => Vec::new(),
+                    };
+                    let checkpoints = checkpoint_records
+                        .iter()
+                        .map(|r| engram_protocol::heartbeat::CheckpointAdvert {
+                            snapshot_id: r.snapshot_id,
+                            session_id: r.session_id,
+                            sandbox_id: r.sandbox_id,
+                            image_version: r.image_version.clone(),
+                            size_bytes: r.size_bytes,
+                            disk_manifest: r.disk_manifest,
+                            memory_manifest: r.memory_manifest,
+                            aux_bundles: r.aux_bundles.clone(),
+                            paused_at: r.paused_at,
+                            captured_at: r.captured_at,
+                        })
+                        .collect();
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -636,6 +732,8 @@ impl HostAgent {
                         host_addr: host_addr_for_heartbeat.clone(),
                         ready_images: readiness_for_heartbeat.snapshot(),
                         nbd_unhealthy: nbd_health_for_heartbeat.snapshot(),
+                        current_bundles: current_bundles.clone(),
+                        checkpoints,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
@@ -650,6 +748,31 @@ impl HostAgent {
                                         true
                                     }
                                 });
+                            }
+                            // ADR 0035 §5: hand the pin set to the
+                            // bundle supervisor (same no-op dedup).
+                            if let Some(tx) = live_bundles_tx.as_ref() {
+                                tx.send_if_modified(|cur| {
+                                    if *cur == resp.live_bundles {
+                                        false
+                                    } else {
+                                        *cur = resp.live_bundles;
+                                        true
+                                    }
+                                });
+                            }
+                            // ADR 0028 Fix A: the coord recorded these
+                            // checkpoints into PG — drop the durable
+                            // record files (the PG rows own the
+                            // references now).
+                            if !resp.acked_checkpoints.is_empty() {
+                                if let Some(dir) = pooled_for_heartbeat.checkpoint_records_dir() {
+                                    checkpoint::CheckpointRecord::delete_acked(
+                                        &dir,
+                                        &resp.acked_checkpoints,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -745,13 +868,14 @@ impl HostAgent {
                         eviction_hub.mark_eviction_inflight(*sb);
                     }
                     // Fire-and-forget: don't block the tick loop on
-                    // the POST. Coord-side `evict_idle_session` can
-                    // legitimately take 60-90s for a fat session
-                    // (FC memory dump + state.bin upload + chunked
-                    // memory upload). Waiting inline made the host
-                    // retry-stormy when the POST hit its old 30s
-                    // timeout (ADR 0016 §A.1.5a, prod incident
-                    // 2026-05-24).
+                    // the POST. Since ADR 0034 the POST is a fast
+                    // nomination (coord flips Active→Evicting and
+                    // returns; its eviction scanner runs the
+                    // pipeline), so the marker clears in seconds and
+                    // re-nomination dedup comes from the coord side
+                    // (non-Active candidate → accepted no-op). The
+                    // marker + 180s stale sweep stay as the
+                    // within-tick guard (ADR 0016 §A.1.5a).
                     //
                     // Shutdown caveat: `eviction_task.abort()` on
                     // process exit will not wait for these spawned
@@ -814,6 +938,76 @@ impl HostAgent {
             // (case C', graceful host reboot).
             let scfg = crate::shutdown::ShutdownConfig::from_env();
             let _ = crate::shutdown::run(&scfg, pooled.clone(), self.cfg.work_dir.clone()).await;
+
+            // ADR 0028 Fix C (OSS half): the SIGTERM checkpoint above
+            // wrote durable records via Fix A (it runs through the
+            // PooledBackend). Steady-state heartbeats already
+            // reconciled every PRIOR checkpoint into PG; fire ONE
+            // final heartbeat carrying the just-written records so the
+            // SIGTERM checkpoint itself reaches PG before the MIG can
+            // delete this host. Best-effort + bounded: if the coord is
+            // mid-roll, the worst case is the session warm-recovers to
+            // the last periodic checkpoint (≤ one cadence interval)
+            // instead of the SIGTERM instant — still memory-preserving.
+            if let Some(dir) = pooled.checkpoint_records_dir() {
+                let records = crate::checkpoint::CheckpointRecord::load_all(&dir).await;
+                if !records.is_empty() {
+                    let checkpoints = records
+                        .iter()
+                        .map(|r| engram_protocol::heartbeat::CheckpointAdvert {
+                            snapshot_id: r.snapshot_id,
+                            session_id: r.session_id,
+                            sandbox_id: r.sandbox_id,
+                            image_version: r.image_version.clone(),
+                            size_bytes: r.size_bytes,
+                            disk_manifest: r.disk_manifest,
+                            memory_manifest: r.memory_manifest,
+                            aux_bundles: r.aux_bundles.clone(),
+                            paused_at: r.paused_at,
+                            captured_at: r.captured_at,
+                        })
+                        .collect();
+                    let req = coord_client::HeartbeatRequest {
+                        capacity: engram_protocol::heartbeat::HostCapacityReport {
+                            total_mib: host_total_mib,
+                            used_mib: 0,
+                            running_sandboxes: 0,
+                        },
+                        local_snapshots: Vec::new(),
+                        running_sandboxes: Vec::new(),
+                        draining: true,
+                        host_addr: self.cfg.grpc_advertise_addr.clone(),
+                        ready_images: Vec::new(),
+                        nbd_unhealthy: Vec::new(),
+                        current_bundles: Vec::new(),
+                        checkpoints,
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        coord_client.heartbeat(host_id, &req),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) => {
+                            crate::checkpoint::CheckpointRecord::delete_acked(
+                                &dir,
+                                &resp.acked_checkpoints,
+                            )
+                            .await;
+                            tracing::info!(
+                                acked = resp.acked_checkpoints.len(),
+                                "shutdown: final heartbeat reconciled SIGTERM checkpoints into PG",
+                            );
+                        }
+                        Ok(Err(e)) => tracing::warn!(error = %e,
+                            "shutdown: final checkpoint-flush heartbeat failed; \
+                             session falls back to the last periodic checkpoint"),
+                        Err(_) => {
+                            tracing::warn!("shutdown: final checkpoint-flush heartbeat timed out")
+                        }
+                    }
+                }
+            }
         } else {
             tracing::info!("no coordinator_endpoint set; standalone dev mode (ctrl-c to exit)");
             shutdown_signal().await;
