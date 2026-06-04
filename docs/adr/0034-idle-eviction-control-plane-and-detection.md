@@ -278,8 +278,9 @@ Three compounding bugs, none in the state machine itself:
 Separately, the upstream trigger (`harness_idle` while the screenshot
 showed work in flight) was the in-VM `claude` child exiting mid-turn:
 `harness_idle` is emitted only on the child's stdout EOF, and the harness
-discarded the exit status, so a crash was indistinguishable from a clean
-turn-end. The harness now captures the `ExitStatus`, and an unsolicited
-abnormal exit (non-zero / fatal signal — `137` = OOM-kill) is surfaced as
-a `System` transcript message, i.e. a durable `session_event` in PG that
-survives VM teardown (`engram-harness-claude`).
+discards the exit status, so a crash is today indistinguishable from a
+clean turn-end. The most likely cause was the Anthropic bearer token
+expiring around midday 2026-06-04 (the same 401 the e2e harness
+round-trip then started hitting). Surfacing that exit reason as a durable
+event is deferred to the in-flight Claude-harness rework rather than
+landing here; this ADR's fix is the durability changes only.

@@ -385,23 +385,6 @@ mod adapter {
             // the loop continues to await the next prompt either way —
             // the session stays alive.
             let run_id = outcome.run_id.clone().unwrap_or_else(|| "unknown".into());
-            // Surface an abnormal child exit into the transcript as a
-            // System message — it persists as a session_event in PG, so
-            // "the agent crashed mid-turn" stays diagnosable even after
-            // the VM is gone (the in-guest harness log is not). Emitted
-            // before RunCompleted so the ordering reads cause-then-close.
-            if let Some(reason) = &outcome.abnormal_exit {
-                let _ = write_event(
-                    &writer,
-                    HarnessEvent::AgentMessage {
-                        run_id: run_id.clone(),
-                        message_id: format!("crash-{}", uuid::Uuid::new_v4()),
-                        role: AgentRole::System,
-                        text: format!("agent process ended unexpectedly: {reason}"),
-                    },
-                )
-                .await;
-            }
             let end_event = if outcome.interrupted {
                 HarnessEvent::RunInterrupted { run_id }
             } else {
@@ -438,38 +421,6 @@ mod adapter {
         /// (we SIGINT'd the child). The caller emits `RunInterrupted`
         /// rather than `RunCompleted` for this.
         interrupted: bool,
-        /// Set when the `claude` child exited abnormally on the natural
-        /// EOF path — a non-zero exit code or a fatal signal we did NOT
-        /// send (crash, OOM-kill, panic). Carries a human-readable
-        /// reason. `None` for a clean turn-end (exit 0) or any exit we
-        /// initiated (interrupt / shutdown / max_run_secs). The caller
-        /// surfaces this as a `System` transcript message so "the agent
-        /// died mid-work" lands in the durable event log instead of
-        /// masquerading as a silent `Idle` (prod incident 89f7984d).
-        abnormal_exit: Option<String>,
-    }
-
-    /// Render a non-success `ExitStatus` into a diagnostic string.
-    /// Distinguishes a plain non-zero exit from a fatal signal, and
-    /// calls out `SIGKILL` (commonly the OOM-killer inside the guest).
-    pub fn describe_exit(status: std::process::ExitStatus) -> String {
-        if let Some(code) = status.code() {
-            return format!("claude exited with code {code}");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(sig) = status.signal() {
-                let hint = match sig {
-                    9 => " (SIGKILL — likely the guest OOM-killer; check dmesg / cgroup memory)",
-                    11 => " (SIGSEGV — claude crashed)",
-                    6 => " (SIGABRT — claude panicked/aborted)",
-                    _ => "",
-                };
-                return format!("claude killed by signal {sig}{hint}");
-            }
-        }
-        "claude exited abnormally (no exit code)".to_string()
     }
 
     /// SIGINT a running `claude` child — the graceful "stop the current
@@ -560,17 +511,12 @@ mod adapter {
         let mut queued_prompt: Option<String> = None;
         let mut ok = true;
         let mut interrupted = false;
-        // True once WE signalled the child (interrupt / shutdown /
-        // max_run_secs). Distinguishes an expected non-zero exit from an
-        // unsolicited crash on the EOF path below.
-        let mut killed_by_us = false;
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 tracing::warn!("max_run_secs elapsed; SIGTERM-ing claude");
                 ok = false;
-                killed_by_us = true;
                 let _ = child.start_kill();
                 break;
             }
@@ -599,7 +545,6 @@ mod adapter {
                         Err(_) => {
                             tracing::warn!("max_run_secs elapsed; SIGTERM-ing claude");
                             ok = false;
-                            killed_by_us = true;
                             let _ = child.start_kill();
                             break;
                         }
@@ -618,7 +563,6 @@ mod adapter {
                             tracing::info!("shutdown mid-run; SIGTERM-ing claude");
                             let _ = child.start_kill();
                             ok = false;
-                            killed_by_us = true;
                             break;
                         }
                         Some(HarnessCommand::Interrupt) => {
@@ -635,7 +579,6 @@ mod adapter {
                             sigint_child(&child);
                             ok = false;
                             interrupted = true;
-                            killed_by_us = true;
                             break;
                         }
                         Some(HarnessCommand::Checkpoint { .. }) => {}
@@ -649,48 +592,17 @@ mod adapter {
         // max_run_secs), or EOF paths should all let the child exit
         // promptly. If a signalled child doesn't go within the grace
         // window, escalate to SIGKILL so we never wedge the harness
-        // loop waiting on a stuck process. Capture the ExitStatus — it's
-        // the only signal that tells a clean turn-end (exit 0) apart
-        // from a crash, since both close stdout → EOF.
-        let status = match timeout(Duration::from_secs(5), child.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "wait(claude) failed; exit status unknown");
-                None
-            }
-            Err(_) => {
-                tracing::warn!("claude didn't exit within grace window; SIGKILL");
-                let _ = child.start_kill();
-                child.wait().await.ok()
-            }
-        };
-
-        // Flag an unsolicited abnormal exit. A non-zero status is
-        // expected when WE signalled the child (interrupt / shutdown /
-        // deadline), so only diagnose the EOF path. This is the signal
-        // that the agent died mid-work (the 89f7984d failure mode)
-        // rather than finishing a turn — without it, a crashed child
-        // looks identical to a clean Idle.
-        let abnormal_exit = if killed_by_us {
-            None
-        } else {
-            match status {
-                Some(s) if s.success() => None,
-                Some(s) => Some(describe_exit(s)),
-                None => Some("claude exited but its status could not be read".to_string()),
-            }
-        };
-        if let Some(reason) = &abnormal_exit {
-            tracing::error!(reason = %reason, "claude exited abnormally mid-run");
-            ok = false;
+        // loop waiting on a stuck process.
+        if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+            tracing::warn!("claude didn't exit within grace window; SIGKILL");
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
-
         RunOutcome {
             ok,
             run_id,
             queued_prompt,
             interrupted,
-            abnormal_exit,
         }
     }
 
@@ -975,27 +887,5 @@ mod tests {
         let s = "🦀".repeat(100);
         let t = truncate_str(&s, 10);
         assert!(t.ends_with("…[truncated]"));
-    }
-
-    #[test]
-    fn describe_exit_classifies_code_and_signal() {
-        use std::os::unix::process::ExitStatusExt;
-        // Raw wait status encoding: a plain exit code N is (N << 8).
-        let code1 = std::process::ExitStatus::from_raw(1 << 8);
-        assert!(
-            describe_exit(code1).contains("code 1"),
-            "a non-zero exit code should be reported",
-        );
-        // ...and a fatal signal N is the low 7 bits.
-        let killed = std::process::ExitStatus::from_raw(9);
-        let d = describe_exit(killed);
-        assert!(
-            d.contains("signal 9"),
-            "fatal signal should be reported: {d}"
-        );
-        assert!(
-            d.contains("OOM"),
-            "SIGKILL should hint at the OOM-killer (the most common guest cause): {d}",
-        );
     }
 }
