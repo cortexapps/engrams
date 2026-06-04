@@ -559,3 +559,49 @@ prod-validation numbers recorded here as they arrive:
       fidelity (on-disk md5 identical); checkpoint pause + dirty-
       tracking steady-state overhead; the `Evicting` 409 window now in
       seconds. Watched via the prod-ops skill.
+
+## Addendum 2026-06-04 — cross-host resume materialization gap (found validating #82)
+
+Prod-validating the ADR-0034 self-heal (PR #82) on the bricked session
+`89f7984d` surfaced a second, pre-existing durability bug in the recovery
+ladder itself. The self-heal worked — it demoted the artifact-less
+eviction snapshot and fell back to the prior intact checkpoint — but the
+resume still failed: `read fc manifest.json …/<id>/manifest.json: No such
+file`. The resume had landed on a host that did **not** capture the
+checkpoint (both hosts idle; affinity didn't prefer the capturing one),
+and the host-side restore prefetched the memory chunks but **skipped
+`materialize_state`** entirely — it never pulled `state.bin`/`sidecar`
+from BlobStorage, so the local `manifest.json` was never written.
+
+Root cause: `resume_from_fc_snapshot` reconstructed the `SnapshotMetadata`
+from the PG row with `state_blob_key`/`sidecar_blob_key` **hardcoded
+`None`** ("the existing idle-resume path stays same-host"), so
+`materialize_state_if_missing` short-circuited. The dead-host evac path
+(`evacuate_dead_source`) and the auto-resume path already derived these
+keys from the snapshot id — the manual/self-heal `/resume` path was the
+one that didn't. **Fix:** derive the portable `state.bin`/`sidecar` keys
+from the snapshot id for memory-bearing FC snapshots (the only ones that
+upload them — `materialize_state_if_missing` hard-errors on a missing
+blob, so disk-only/legacy records stay `None`). A relocated resume now
+materializes from GCS, mirroring evac. This is what makes a snapshot
+genuinely host-portable — the whole point of the durable artifacts.
+
+**GC corollary (also fixed):** the `snapshots/<id>/` portable blobs
+(`state.bin`/`sidecar`) live *outside* the chunk-GC pin-set namespace, so
+the chunk GC neither reaps them (good — a recoverable snapshot's
+state/sidecar can't be deleted out from under a resume) nor cleans them
+when a row is pruned (bad — they orphaned forever).
+`prune_session_snapshots` now `RETURNING`s the deleted ids and the
+checkpoint-retention sweeper deletes their portable blobs after the rows
+(and any resume that could reference them) are gone.
+
+**Test gap that let #82's class ship + this one:** nothing exercised a
+session resume on a *non-capturing* host — the integration tests use a
+single in-process `ProcessBackend`, and the FC e2e tests are single-host
+harness round-trips, so a restore always had the local dir and
+materialization was never on the critical path. Added unit coverage for
+the id-derived key gating + the prune-returns-ids contract (live-PG). The
+load-bearing regression — an FC test that snapshots, **removes the local
+snapshot dir**, then restores from BlobStorage — is the follow-up to wire
+into the `test-firecracker` CI job (needs KVM; authored/validated on the
+dev-vm).
