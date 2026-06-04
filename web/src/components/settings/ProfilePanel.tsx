@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { Link } from '@tanstack/react-router';
 import { Check, X } from 'lucide-react';
 import { useAuth } from '../../auth/AuthProvider';
+import { PageHeading } from '../page-heading';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -19,7 +20,7 @@ export function ProfilePanel() {
 
   return (
     <div className="max-w-2xl space-y-6">
-      <h1 className="text-2xl font-semibold tracking-tight">Profile</h1>
+      <PageHeading title="Profile" />
 
       <Card>
         <CardHeader className="flex flex-row items-center gap-3 space-y-0">

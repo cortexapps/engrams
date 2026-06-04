@@ -10,6 +10,7 @@ import {
 } from '../../hooks/useEnabledImages';
 import { useEnableProgress } from '../../hooks/useEnableProgress';
 import type { EnabledImageSummary } from '../../types';
+import { PageHeading } from '../page-heading';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -38,15 +39,11 @@ export function ImagesPanel() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Images</h1>
-          <p className="text-sm text-muted-foreground">
-            OCI URIs sessions may reference. The manifest is cached on enable; refresh when tags move.
-          </p>
-        </div>
-        <EnableImageDialog />
-      </div>
+      <PageHeading
+        title="Images"
+        description="OCI URIs sessions may reference. The manifest is cached on enable; refresh when tags move."
+        actions={<EnableImageDialog />}
+      />
 
       {error && (
         <p className="text-sm text-destructive">could not load enabled images — {String(error)}</p>

@@ -1,4 +1,4 @@
-import { Link } from '@tanstack/react-router';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { Badge } from '@/components/ui/badge';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import {
@@ -51,20 +51,30 @@ export function SessionsTable({
 function GroupBlock({ group, rows, showOwner }: {
   group: Lifecycle; rows: SessionListItem[]; showOwner: boolean;
 }) {
+  const navigate = useNavigate();
   const cols = showOwner ? 5 : 4;
   return (
     <>
       <TableRow className="hover:bg-transparent">
-        <TableCell colSpan={cols} className="bg-muted/40 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          {group} · {rows.length}
+        <TableCell colSpan={cols} className="border-y bg-muted/30 py-1.5 font-mono text-[0.65rem] uppercase tracking-[0.14em] text-muted-foreground">
+          {group} <span className="text-muted-foreground/60">·</span> {rows.length}
         </TableCell>
       </TableRow>
       {rows.length === 0 ? (
-        <TableRow><TableCell colSpan={cols} className="text-sm text-muted-foreground">none</TableCell></TableRow>
+        <TableRow className="hover:bg-transparent"><TableCell colSpan={cols} className="text-sm italic text-muted-foreground">none</TableCell></TableRow>
       ) : rows.map((s) => (
-        <TableRow key={s.id} className="cursor-pointer">
+        <TableRow
+          key={s.id}
+          className="cursor-pointer hover:bg-accent/60"
+          onClick={() => navigate({ to: '/sessions/$id', params: { id: s.id } })}
+        >
           <TableCell className="font-mono text-sm">
-            <Link to="/sessions/$id" params={{ id: s.id }} className="hover:underline">
+            <Link
+              to="/sessions/$id"
+              params={{ id: s.id }}
+              className="hover:underline"
+              onClick={(e) => e.stopPropagation()}
+            >
               {shortId(s.id)}
             </Link>
           </TableCell>

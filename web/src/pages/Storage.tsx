@@ -1,6 +1,7 @@
 import { useStorageSummary } from '../hooks/useStorageSummary';
 import { fmtAgo, fmtBytes, secondsSince, shortId } from '../format';
-import { Card, CardContent } from '@/components/ui/card';
+import { PageHeading } from '../components/page-heading';
+import { StatReadout } from '../components/stat-readout';
 import { Progress } from '@/components/ui/progress';
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
@@ -10,36 +11,27 @@ import type { DurabilityRow } from '../types';
 export function Storage() {
   const { data, isPending, error } = useStorageSummary();
   const rows = data?.rows ?? [];
-  const rollups: [string, string | number][] = [
-    ['Snapshots', data?.snapshots ?? 0],
-    ['Snapshot bytes', fmtBytes(data?.snapshot_bytes ?? 0)],
-    ['Tracked sandboxes', data?.tracked_sandboxes ?? 0],
-    ['Unflushed', fmtBytes(data?.unflushed_bytes ?? 0)],
-    ['Avg locality', `${data?.avg_locality_pct ?? 0}%`],
-    ['GC pending', data?.gc_pending ?? 0],
+  const rollups = [
+    { label: 'Snapshots', value: data?.snapshots ?? 0 },
+    { label: 'Snapshot bytes', value: fmtBytes(data?.snapshot_bytes ?? 0) },
+    { label: 'Tracked sandboxes', value: data?.tracked_sandboxes ?? 0 },
+    { label: 'Unflushed', value: fmtBytes(data?.unflushed_bytes ?? 0) },
+    { label: 'Avg locality', value: `${data?.avg_locality_pct ?? 0}%` },
+    { label: 'GC pending', value: data?.gc_pending ?? 0 },
   ];
 
   return (
     <div className="space-y-6 p-4 md:p-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Storage</h1>
-        <p className="text-sm text-muted-foreground">
-          Content-addressed chunk store, snapshots, and copy-on-write durability.
-        </p>
-      </div>
+      <PageHeading
+        title="Storage"
+        description="Content-addressed chunk store, snapshots, and copy-on-write durability."
+      />
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        {rollups.map(([label, value]) => (
-          <Card key={label}><CardContent className="py-4">
-            <div className="font-mono text-xl tabular-nums">{value}</div>
-            <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
-          </CardContent></Card>
-        ))}
-      </div>
+      <StatReadout className="sm:grid-cols-3 lg:grid-cols-6" items={rollups} />
 
       <div>
         <div className="mb-2 flex items-baseline justify-between">
-          <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          <h2 className="font-mono text-[0.7rem] font-medium uppercase tracking-[0.12em] text-muted-foreground">
             Durability ledger · per-sandbox copy-on-write
           </h2>
           <span className="font-mono text-xs tabular-nums text-muted-foreground">{rows.length}</span>

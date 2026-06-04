@@ -1,70 +1,92 @@
 @import "tailwindcss";
 @import "tw-animate-css";
-/* Lab-Notebook partial — tokens + component classes for the still-old
-   SessionDetail transcript subtree. Imported here so Tailwind is pulled in
-   exactly once (theme.css must not re-import it). */
-@import "./theme.css";
 
 @custom-variant dark (&:is(.dark *));
 
+/* ------------------------------------------------------------------
+ * "Lab Notebook" — engineering-logbook identity.
+ *
+ *   Light is the primary brand voice: aged engineering paper (cream
+ *   with real chroma, NOT a timid warm-white) under genuinely dark
+ *   ink, with a faint ruled grid doing the structural work. Committed,
+ *   not Restrained — the paper carries the surface.
+ *
+ *   Dark is the equal twin: the notebook closed at night — a cool
+ *   graphite ground, cream ink, the same grid, the accent gone
+ *   luminous. Contrast is verified AA in both themes.
+ *
+ *   The ink accent (blue-black fountain pen) carries primary actions,
+ *   selection, and focus only. Correction-pen red is destructive.
+ *   Resist adding hues; reach for type or a hairline rule first.
+ * ------------------------------------------------------------------ */
 :root {
-  --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.141 0.005 285.823);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.141 0.005 285.823);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.141 0.005 285.823);
-  --primary: oklch(0.21 0.006 285.885);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.967 0.001 286.375);
-  --secondary-foreground: oklch(0.21 0.006 285.885);
-  --muted: oklch(0.967 0.001 286.375);
-  --muted-foreground: oklch(0.552 0.016 285.938);
-  --accent: oklch(0.967 0.001 286.375);
-  --accent-foreground: oklch(0.21 0.006 285.885);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.92 0.004 286.32);
-  --input: oklch(0.92 0.004 286.32);
-  --ring: oklch(0.705 0.015 286.067);
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.141 0.005 285.823);
-  --sidebar-primary: oklch(0.21 0.006 285.885);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.967 0.001 286.375);
-  --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
-  --sidebar-border: oklch(0.92 0.004 286.32);
-  --sidebar-ring: oklch(0.705 0.015 286.067);
-  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --radius: 0.3rem; /* squarer than stock — logbook blocks, not pills */
+
+  --background: oklch(0.941 0.024 84);          /* engineering paper */
+  --foreground: oklch(0.23 0.012 62);           /* ink */
+  --card: oklch(0.967 0.016 88);                /* a cleaner sheet laid on the paper */
+  --card-foreground: oklch(0.23 0.012 62);
+  --popover: oklch(0.967 0.016 88);
+  --popover-foreground: oklch(0.23 0.012 62);
+  --primary: oklch(0.42 0.10 250);              /* blue-black ink */
+  --primary-foreground: oklch(0.975 0.012 90);
+  --secondary: oklch(0.905 0.022 85);           /* warm paper, raised */
+  --secondary-foreground: oklch(0.27 0.012 60);
+  --muted: oklch(0.905 0.022 85);
+  --muted-foreground: oklch(0.44 0.014 66);     /* ink-faded — AA on paper */
+  --accent: oklch(0.91 0.025 85);               /* faint hover wash */
+  --accent-foreground: oklch(0.27 0.012 60);
+  --destructive: oklch(0.515 0.198 27);         /* correction-pen red */
+  --border: oklch(0.852 0.024 82);              /* hairline rule */
+  --input: oklch(0.852 0.024 82);
+  --ring: oklch(0.55 0.11 250);                 /* ink, focus */
+
+  --sidebar: oklch(0.915 0.021 83);             /* the notebook's margin/cover — recedes */
+  --sidebar-foreground: oklch(0.23 0.012 62);
+  --sidebar-primary: oklch(0.42 0.10 250);
+  --sidebar-primary-foreground: oklch(0.975 0.012 90);
+  --sidebar-accent: oklch(0.89 0.025 84);
+  --sidebar-accent-foreground: oklch(0.27 0.012 60);
+  --sidebar-border: oklch(0.85 0.024 82);
+  --sidebar-ring: oklch(0.55 0.11 250);
+
+  /* Graph-paper rules — used as a masthead texture that fades out, not a
+     full-bleed field. Faint ink on paper. */
+  --grid-line: oklch(0.23 0.012 62 / 0.10);
+  --grid-size: 1.25rem;
 }
 
 .dark {
-  --background: oklch(0.141 0.005 285.823);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.21 0.006 285.885);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.21 0.006 285.885);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.92 0.004 286.32);
-  --primary-foreground: oklch(0.21 0.006 285.885);
-  --secondary: oklch(0.274 0.006 286.033);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.274 0.006 286.033);
-  --muted-foreground: oklch(0.705 0.015 286.067);
-  --accent: oklch(0.274 0.006 286.033);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
+  --background: oklch(0.202 0.008 264);         /* graphite */
+  --foreground: oklch(0.92 0.014 88);           /* cream ink */
+  --card: oklch(0.242 0.008 264);
+  --card-foreground: oklch(0.92 0.014 88);
+  --popover: oklch(0.242 0.008 264);
+  --popover-foreground: oklch(0.92 0.014 88);
+  --primary: oklch(0.70 0.13 245);              /* sky-ink — luminous */
+  --primary-foreground: oklch(0.20 0.012 264);
+  --secondary: oklch(0.27 0.009 264);
+  --secondary-foreground: oklch(0.92 0.014 88);
+  --muted: oklch(0.27 0.009 264);
+  --muted-foreground: oklch(0.715 0.013 86);    /* cream-gray — AA on graphite */
+  --accent: oklch(0.285 0.01 264);
+  --accent-foreground: oklch(0.92 0.014 88);
+  --destructive: oklch(0.62 0.19 25);
+  --border: oklch(1 0 0 / 11%);
   --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.552 0.016 285.938);
-  --sidebar: oklch(0.21 0.006 285.885);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.274 0.006 286.033);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.552 0.016 285.938);
+  --ring: oklch(0.62 0.12 245);
+
+  --sidebar: oklch(0.172 0.008 264);            /* notebook cover — darker than content */
+  --sidebar-foreground: oklch(0.92 0.014 88);
+  --sidebar-primary: oklch(0.70 0.13 245);
+  --sidebar-primary-foreground: oklch(0.20 0.012 264);
+  --sidebar-accent: oklch(0.27 0.009 264);
+  --sidebar-accent-foreground: oklch(0.92 0.014 88);
+  --sidebar-border: oklch(1 0 0 / 9%);
+  --sidebar-ring: oklch(0.62 0.12 245);
+
+  --grid-line: oklch(0.92 0.014 88 / 0.08);
+  --grid-size: 1.25rem;
 }
 
 @theme inline {
@@ -94,7 +116,18 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
-  --font-mono: var(--font-mono);
+
+  /* Three-font system. Sans is the invisible workhorse (chrome, labels,
+     buttons); serif is the identity voice (page/section titles, prose);
+     mono is the lab readout (IDs, digests, timestamps, code, micro-labels). */
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+  --font-serif:
+    "IBM Plex Serif", Georgia, "Iowan Old Style", "Source Serif 4", serif;
+  --font-mono:
+    "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -103,5 +136,31 @@
 
 @layer base {
   * { @apply border-border outline-ring/50; }
-  body { @apply bg-background text-foreground; }
+  html,
+  body,
+  #root { height: 100%; }
+  body {
+    @apply bg-background text-foreground font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  /* These are tables and IDs, not prose — keep digits aligned. */
+  .font-mono,
+  code,
+  kbd,
+  samp,
+  pre { font-variant-numeric: tabular-nums; }
+}
+
+@utility bg-grid-fade {
+  /* Engineering graph-paper rules, densest at the bottom edge and
+     dissolving upward — anchored at the foot of the left sidebar as a
+     quiet logbook texture. Lives on a pointer-events-none layer behind
+     the sidebar's content (the mask would otherwise fade the controls). */
+  background-image:
+    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+  background-size: var(--grid-size) var(--grid-size);
+  -webkit-mask-image: linear-gradient(to top, black, transparent);
+  mask-image: linear-gradient(to top, black, transparent);
 }

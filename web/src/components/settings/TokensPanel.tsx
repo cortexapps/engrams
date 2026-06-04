@@ -5,6 +5,7 @@ import { Controller, useForm } from 'react-hook-form';
 import * as z from 'zod';
 import { saveClaudeToken } from '../../api';
 import { useAuth } from '../../auth/AuthProvider';
+import { PageHeading } from '../page-heading';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -24,7 +25,7 @@ export function TokensPanel() {
 
   return (
     <div className="max-w-2xl space-y-6">
-      <h1 className="text-2xl font-semibold tracking-tight">Tokens</h1>
+      <PageHeading title="Tokens" />
       <Card>
         <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">
           <div>

@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { MoreHorizontal } from 'lucide-react';
 import { fetchUsers, updateUser } from '../api';
 import { useAuth } from '../auth/AuthProvider';
+import { PageHeading } from '../components/page-heading';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -31,12 +32,10 @@ export function Members() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Members</h1>
-        <p className="text-sm text-muted-foreground">
-          {users.length} people · {admins} admins · {disabled} disabled
-        </p>
-      </div>
+      <PageHeading
+        title="Members"
+        description={`${users.length} people · ${admins} admins · ${disabled} disabled`}
+      />
       <Table>
         <TableHeader><TableRow>
           <TableHead>Person</TableHead><TableHead>Role</TableHead>

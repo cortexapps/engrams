@@ -3,6 +3,13 @@
 // available to anything using `--font-mono` (code, IDs, tabular numbers).
 import '@fontsource-variable/jetbrains-mono/wght.css';
 import '@fontsource-variable/jetbrains-mono/wght-italic.css';
+// IBM Plex Serif is the serif identity voice (page/section titles, prose) —
+// a transitional/slab register that reads "engineering instrument", not
+// "magazine". Static weights: 400 for prose, 500 for titles (font-medium),
+// plus 400 italic for the logbook register on notes.
+import '@fontsource/ibm-plex-serif/400.css';
+import '@fontsource/ibm-plex-serif/500.css';
+import '@fontsource/ibm-plex-serif/400-italic.css';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { ThemeProvider } from './components/theme-provider';

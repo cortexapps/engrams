@@ -12,6 +12,7 @@ import type {
   RegistryAuthKind,
   RegistryCredentialSummary,
 } from '../../types';
+import { PageHeading } from '../page-heading';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -44,15 +45,11 @@ export function RegistriesPanel() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Registries</h1>
-          <p className="text-sm text-muted-foreground">
-            Docker registries for image pulls. Passwords are sealed at rest, never returned to the browser.
-          </p>
-        </div>
-        <AddRegistryDialog />
-      </div>
+      <PageHeading
+        title="Registries"
+        description="Docker registries for image pulls. Passwords are sealed at rest, never returned to the browser."
+        actions={<AddRegistryDialog />}
+      />
 
       {error && (
         <p className="text-sm text-destructive">could not load registries — {String(error)}</p>
