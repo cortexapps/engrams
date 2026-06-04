@@ -31,6 +31,10 @@ export function MainSidebar() {
 
   return (
     <Sidebar collapsible="icon">
+      <div
+        aria-hidden
+        className="bg-grid-fade pointer-events-none absolute inset-x-0 bottom-0 -z-10 h-64"
+      />
       <SidebarHeader>
         <SidebarMenu>
           <SidebarMenuItem>

@@ -2,6 +2,8 @@ import { useHosts } from '../hooks/useHosts';
 import { useSessions } from '../hooks/useSessions';
 import { useDrainHost } from '../hooks/useDrainHost';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { PageHeading } from '../components/page-heading';
+import { StatReadout } from '../components/stat-readout';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
@@ -30,20 +32,16 @@ export function Fleet() {
 
   return (
     <div className="space-y-6 p-4 md:p-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Fleet</h1>
-        <p className="text-sm text-muted-foreground">Firecracker hosts and capacity.</p>
-      </div>
+      <PageHeading title="Fleet" description="Firecracker hosts and capacity." />
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        {([['Hosts', h.length], ['Sandboxes', totalSb], ['GiB used', `${usedGiB}/${totGiB}`]] as const).map(
-          ([label, value]) => (
-            <Card key={label}><CardContent className="py-4">
-              <div className="font-mono text-2xl tabular-nums">{value}</div>
-              <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
-            </CardContent></Card>
-          ))}
-      </div>
+      <StatReadout
+        className="sm:grid-cols-3"
+        items={[
+          { label: 'Hosts', value: h.length },
+          { label: 'Sandboxes', value: totalSb },
+          { label: 'GiB used', value: `${usedGiB}/${totGiB}` },
+        ]}
+      />
 
       {h.length === 0 ? (
         <p className="text-sm text-muted-foreground">
