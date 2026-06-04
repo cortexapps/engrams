@@ -79,6 +79,11 @@ fn legacy_rootfs_path(cached: &CachedImage) -> Result<PathBuf, SandboxError> {
 /// - **FC, legacy bake**: ~500-700 ms full cold boot.
 /// - **VZ**: ~1 s full cold boot. No memory-snapshot primitive
 ///   available on macOS arm64 Linux (Apple-side bug).
+// ADR 0037: how long a warm capture waits for the spawned harness to reach
+// warm+idle before falling back to a cold capture. Generous: claude (Bun)
+// cold-boots in roughly 7-9s, plus margin for a loaded capture host.
+const WARM_CAPTURE_TIMEOUT_SECS: u64 = 60;
+
 pub struct PooledBackend {
     inner: Arc<dyn SandboxBackend>,
     /// Phase 5+: if `Some`, `create()` resolves `spec.image_uri`
@@ -215,6 +220,11 @@ pub struct PooledBackend {
     /// (double-pause is idempotent but concurrent NBD flushes +
     /// chain advances are not).
     capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
+    /// ADR 0037: the host's `HarnessHub`, injected post-construction (the
+    /// hub is built alongside this backend in `lib.rs`). `build_base_snapshot`
+    /// reads it to wait for the warm capture harness to reach warm+idle;
+    /// `None` (tests / mode=all glue without warm-capture) ⇒ cold capture.
+    warm_capture_hub: parking_lot::Mutex<Option<Arc<crate::harness::HarnessHub>>>,
 }
 
 impl PooledBackend {
@@ -466,7 +476,84 @@ impl PooledBackend {
             checkpoint_dir: None,
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_locks: Arc::new(DashMap::new()),
+            warm_capture_hub: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// ADR 0037: inject the host's `HarnessHub` so `build_base_snapshot`
+    /// can wait for a warm-capture harness to reach warm+idle. Called once
+    /// at host-agent startup, right after the hub is built (mirrors
+    /// `set_harness_sink`). Without it, warm-capture falls back to cold.
+    pub fn set_warm_capture_hub(&self, hub: Arc<crate::harness::HarnessHub>) {
+        *self.warm_capture_hub.lock() = Some(hub);
+    }
+
+    /// ADR 0037 warm-capture: spawn the generic, prompt-less
+    /// `warm_harness_spec` and block until it reaches warm+idle, so
+    /// `build_base_snapshot` snapshots a ready agent. Returns `true` only
+    /// when actually captured warm; `false` (⇒ cold capture) when opted
+    /// out, no spec, no hub, or warming failed/timed out. Best-effort by
+    /// construction — every failure path returns `false` and the caller
+    /// proceeds with a normal cold snapshot. If a harness was spawned but
+    /// never went idle, it's left running: a cold restore's `SpawnHarness`
+    /// kill+respawn cleanly replaces it.
+    async fn maybe_warm_capture(
+        &self,
+        id: SandboxId,
+        warm_harness_spec: Option<AgentSpec>,
+    ) -> bool {
+        // Kill-switch: opt-in only (default off ⇒ today's cold capture).
+        if !matches!(
+            std::env::var("ENGRAM_WARM_HARNESS_CAPTURE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        ) {
+            return false;
+        }
+        let Some(agent) = warm_harness_spec else {
+            return false; // harness-less image — nothing to warm
+        };
+        let Some(hub) = self.warm_capture_hub.lock().clone() else {
+            tracing::warn!("warm-capture requested but no harness hub wired; capturing cold");
+            return false;
+        };
+        // The warm harness attaches with the sentinel session id baked into
+        // its env; register sentinel→sandbox so the hub accepts that attach.
+        let Some(sentinel) = agent
+            .session_env
+            .get("ENGRAM_SESSION_ID")
+            .and_then(|s| s.parse::<SessionId>().ok())
+        else {
+            tracing::warn!(
+                "warm-capture: warm spec has no parseable sentinel ENGRAM_SESSION_ID; capturing cold"
+            );
+            return false;
+        };
+        hub.bind_session(sentinel, id);
+        if let Err(e) = self.start_agent(id, agent).await {
+            tracing::warn!(error = %e, "warm-capture: start_agent failed; capturing cold");
+            hub.unbind_session(sentinel);
+            return false;
+        }
+        let warm = hub
+            .wait_harness_warm(
+                id,
+                std::time::Duration::from_secs(WARM_CAPTURE_TIMEOUT_SECS),
+            )
+            .await;
+        // The sentinel binding was only needed for the initial attach; drop
+        // it (the captured harness re-attaches under its real id via `Bind`
+        // at restore). The pause/flush below freezes the guest, so nothing
+        // reconnects to race this.
+        hub.unbind_session(sentinel);
+        if warm {
+            tracing::info!(sandbox_id = %id, "warm-capture: harness warm+idle; capturing warm");
+        } else {
+            tracing::warn!(
+                sandbox_id = %id,
+                "warm-capture: harness did not reach warm+idle before deadline; capturing cold",
+            );
+        }
+        warm
     }
 
     /// ADR 0028 Fix A: enable checkpoint chains, rooted at `dir`
@@ -2431,6 +2518,7 @@ impl SandboxBackend for PooledBackend {
     async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
+        warm_harness_spec: Option<AgentSpec>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0021 P1.5: no stub-harness attach — the harness lives
         // in the rootfs of the image being captured, so the snapshot
@@ -2456,10 +2544,18 @@ impl SandboxBackend for PooledBackend {
             if let Some(state) = self.nbd_sandboxes.get(&id) {
                 state.backend.operation_scope().end();
             }
+            // ADR 0037: optionally spawn a warm, prompt-less harness and
+            // wait for it to go warm+idle, so the snapshot captures a ready
+            // agent. Gated host-side; any failure ⇒ cold (the harness, if
+            // spawned, is left running — a cold restore's SpawnHarness
+            // kill+respawn cleanly replaces it).
+            let warm = self.maybe_warm_capture(id, warm_harness_spec).await;
             // Capture: pause → flush disk → chunk memory + upload
             // state.bin/sidecar to BlobStorage. This is the portable
             // artifact `create_session` restores from.
-            self.snapshot(id).await
+            let mut meta = self.snapshot(id).await?;
+            meta.warm_harness = warm;
+            Ok(meta)
         }
         .await;
 

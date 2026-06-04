@@ -199,9 +199,17 @@ impl GrpcHostClient {
     pub async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
+        warm_harness_spec: Option<AgentSpec>,
     ) -> Result<SnapshotMetadata, SandboxError> {
+        // ADR 0037: empty bytes ⇒ None (cold capture); a non-empty payload
+        // is the bincode `AgentSpec` of the warm harness to capture.
+        let warm_harness_spec_bincode = match warm_harness_spec {
+            Some(s) => encode_bincode(&s, "AgentSpec")?,
+            None => Vec::new(),
+        };
         let req = BuildBaseSnapshotRequest {
             spec_bincode: encode_bincode(&spec, "SandboxSpec")?,
+            warm_harness_spec_bincode,
         };
         let resp = self
             .inner
@@ -745,8 +753,9 @@ impl HostClient for GrpcHostClient {
     async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
+        warm_harness_spec: Option<AgentSpec>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        Self::build_base_snapshot(self, spec).await
+        Self::build_base_snapshot(self, spec, warm_harness_spec).await
     }
 
     async fn restore_base_for_session(

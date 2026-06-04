@@ -434,6 +434,32 @@ impl HarnessHub {
         self.inner.connections.lock().len()
     }
 
+    /// ADR 0037 warm-capture: block until `sandbox_id`'s harness is
+    /// **warm + idle** — attached AND its last event was `Idle` (claude
+    /// booted its Bun/V8 runtime and is quiescent, holding no in-flight
+    /// turn / live socket). That's the connection-clean state a base
+    /// snapshot wants to capture. Returns `true` when reached, `false`
+    /// on timeout (caller falls back to a cold capture). `last_idle_at`
+    /// is present only while the last event was `Idle` (any other event
+    /// clears it — see `reader_loop`), so its presence is exactly the
+    /// "attached and quiet since Idle" predicate.
+    pub async fn wait_harness_warm(&self, sandbox_id: SandboxId, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let attached = self.inner.connections.lock().contains_key(&sandbox_id);
+                let idle = self.inner.last_idle_at.lock().contains_key(&sandbox_id);
+                if attached && idle {
+                    return true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Sandboxes due for idle eviction under the two-tier policy.
     ///
     /// Returns `(SessionId, SandboxId)` pairs that satisfy EITHER:
@@ -1159,6 +1185,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HarnessError::NotAttached));
+    }
+
+    #[tokio::test]
+    async fn wait_harness_warm_true_after_idle() {
+        // ADR 0037: a harness that attached AND emitted Idle is warm.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let driver = tokio::spawn(drive_harness(
+            harness_side,
+            session_id,
+            |_r, mut w| async move {
+                write_msg(&mut w, &HarnessFrame::Event(HarnessEvent::Idle))
+                    .await
+                    .unwrap();
+                // Hold the connection open while the host processes Idle and
+                // wait_harness_warm observes it.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            },
+        ));
+
+        assert!(
+            hub.wait_harness_warm(sandbox_id, Duration::from_secs(2))
+                .await,
+            "attached + Idle should read as warm",
+        );
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_harness_warm_false_without_idle() {
+        // Attached but never Idle (e.g. mid-tool-call) is NOT warm — the
+        // capture must not snapshot a still-booting agent.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let driver = tokio::spawn(drive_harness(
+            harness_side,
+            session_id,
+            |_r, mut w| async move {
+                write_msg(
+                    &mut w,
+                    &HarnessFrame::Event(HarnessEvent::RunStarted {
+                        run_id: "r1".into(),
+                        prompt_summary: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            },
+        ));
+
+        assert!(
+            !hub.wait_harness_warm(sandbox_id, Duration::from_millis(250))
+                .await,
+            "attached without Idle should time out (not warm)",
+        );
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_harness_warm_false_for_unattached() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        assert!(
+            !hub.wait_harness_warm(SandboxId::new(), Duration::from_millis(100))
+                .await
+        );
     }
 
     #[tokio::test]

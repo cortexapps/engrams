@@ -563,12 +563,19 @@ pub(crate) async fn capture_and_record_base_snapshot(
         host_id = %host_id,
         "capturing base snapshot for image enable",
     );
-    let meta = host.build_base_snapshot(spec).await.map_err(|e| {
-        ApiError::Internal(format!(
-            "base snapshot capture for `{}` failed on host {host_id}: {e}",
-            row.image_uri
-        ))
-    })?;
+    // ADR 0037: always send a generic warm-harness AgentSpec; the host
+    // honours it only under ENGRAM_WARM_HARNESS_CAPTURE (else captures
+    // cold). `None` for harness-less images.
+    let warm_harness_spec = crate::api::sessions::build_warm_capture_agent_spec(state, manifest);
+    let meta = host
+        .build_base_snapshot(spec, warm_harness_spec)
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "base snapshot capture for `{}` failed on host {host_id}: {e}",
+                row.image_uri
+            ))
+        })?;
 
     // A base snapshot is only useful if its chunked manifests are
     // durable in BlobStorage — verify before recording, so an

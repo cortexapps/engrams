@@ -110,8 +110,11 @@ impl HostClient for LocalHostClient {
     async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
+        warm_harness_spec: Option<AgentSpec>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        self.sandbox.build_base_snapshot(spec).await
+        self.sandbox
+            .build_base_snapshot(spec, warm_harness_spec)
+            .await
     }
 
     async fn restore_base_for_session(

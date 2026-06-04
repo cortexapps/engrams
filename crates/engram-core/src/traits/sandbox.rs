@@ -366,9 +366,16 @@ pub trait SandboxBackend: Send + Sync {
     /// Implemented on `PooledBackend` (which owns the chunk-store +
     /// state/sidecar upload that make the snapshot portable). Default
     /// errors so non-pooled backends opt out cleanly.
+    /// `warm_harness_spec` (ADR 0037): when `Some` *and* the host opts in
+    /// via `ENGRAM_WARM_HARNESS_CAPTURE`, the capture spawns this generic
+    /// prompt-less harness and waits for it to go warm+idle before the
+    /// snapshot, stamping `SnapshotMetadata::warm_harness = true`. On any
+    /// warming failure — or when `None` / opted out — it captures cold
+    /// (today's behaviour), so this is always a safe no-op by default.
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
+        _warm_harness_spec: Option<AgentSpec>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `build_base_snapshot` (needs the pooled chunk-store wrapper)".into(),

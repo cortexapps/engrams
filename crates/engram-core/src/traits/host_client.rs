@@ -90,9 +90,13 @@ pub trait HostClient: Send + Sync {
     /// the per-image base snapshot `create_session` restores from.
     /// Default errors so mocks / non-FC hosts opt out; the local +
     /// gRPC clients delegate to the backend's `build_base_snapshot`.
+    /// `warm_harness_spec` (ADR 0037): an optional generic prompt-less
+    /// harness to capture warm into the base (honoured host-side only
+    /// under `ENGRAM_WARM_HARNESS_CAPTURE`; `None`/failure ⇒ cold).
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
+        _warm_harness_spec: Option<AgentSpec>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `build_base_snapshot`".into(),

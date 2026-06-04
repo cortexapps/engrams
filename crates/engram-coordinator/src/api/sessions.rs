@@ -1671,6 +1671,54 @@ pub(crate) fn resolve_harness(
     }))
 }
 
+/// ADR 0037 warm-capture: the session-INDEPENDENT placeholder baked into a
+/// warm harness's env for an HTTP-egress broker secret. Unlike
+/// [`broker_secret`]'s per-session placeholder, this is constant so it can
+/// be captured once into the shared base snapshot; at restore the
+/// per-session egress proxy maps it → the session owner's real value by
+/// guest IP on the wire (the warm `claude` is never re-env'd — no respawn).
+/// Currently only the Claude OAuth token.
+pub(crate) const WARM_CLAUDE_OAUTH_PLACEHOLDER: &str = "engram_warm_ph_claude_oauth";
+
+/// ADR 0037: build the generic, prompt-less, secret-free `AgentSpec` the
+/// host spawns to capture a *warm* harness into a base snapshot. `None`
+/// when the image has no harness (nothing to warm) — the host then
+/// captures cold. The env is deliberately template-only: the image `[env]`,
+/// a sentinel `ENGRAM_SESSION_ID` (used solely for the capture-time
+/// `HarnessAttach`; the real id arrives via `Bind` at restore), and a
+/// constant broker placeholder for the harness credential. NO real
+/// secrets, NO forge/upload tokens — the base snapshot is shared across
+/// sessions, so per-session identity is delivered later by the restore
+/// fork (P4d).
+pub(crate) fn build_warm_capture_agent_spec(
+    state: &SharedState,
+    manifest: &engram_core::types::ImageManifest,
+) -> Option<engram_core::types::sandbox::AgentSpec> {
+    let harness = manifest.harness.as_ref()?;
+    let sentinel = SessionId::new();
+    let mut session_env: HashMap<String, String> = manifest.env.clone();
+    session_env.insert("ENGRAM_SESSION_ID".into(), sentinel.to_string());
+    if harness.name.as_deref() == Some("claude") {
+        session_env.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            WARM_CLAUDE_OAUTH_PLACEHOLDER.to_string(),
+        );
+    }
+    // SessionMode::Agent (not DevVm) so resolve_harness produces a real
+    // harness argv; no initial prompt so the warm child boots idle.
+    resolve_harness(
+        state,
+        Some(harness),
+        SessionMode::Agent,
+        sentinel,
+        None,
+        session_env,
+        manifest.workdir.clone(),
+    )
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

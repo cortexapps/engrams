@@ -275,6 +275,7 @@ impl HostClient for FakeCaptureHost {
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
+        _warm_harness_spec: Option<engram_core::types::sandbox::AgentSpec>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
         Ok(SnapshotMetadata {

@@ -359,6 +359,9 @@ impl HostAgent {
             let sink: engram_core::traits::HarnessSink =
                 std::sync::Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
             pooled.set_harness_sink(sink);
+            // ADR 0037: give the backend the hub so `build_base_snapshot`
+            // can wait for a warm-capture harness to reach warm+idle.
+            pooled.set_warm_capture_hub(harness_hub.clone());
 
             // ADR 0023 split-mode forge forwarding. The forge sink can't
             // live on the host (it needs the coord's GitForge + broker

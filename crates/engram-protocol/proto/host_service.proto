@@ -178,6 +178,14 @@ message BuildBaseSnapshotRequest {
   // block now lives in the rootfs, so the snapshot captures it
   // directly — no separate stub-harness drive to swap.
   bytes spec_bincode = 1;
+  // ADR 0037: bincode-encoded `engram_core::types::sandbox::AgentSpec`
+  // for a generic, prompt-less warm harness to spawn *into* the capture
+  // before the snapshot (constant OAuth placeholder env, sentinel
+  // session id). The coord always sends it; the host honours it only
+  // when `ENGRAM_WARM_HARNESS_CAPTURE` is set, else captures cold.
+  // Empty bytes = none (the coord couldn't resolve a harness, e.g. a
+  // harness-less image) — the host captures cold.
+  bytes warm_harness_spec_bincode = 2;
 }
 message BuildBaseSnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.

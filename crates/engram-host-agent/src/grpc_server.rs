@@ -214,10 +214,21 @@ impl HostService for HostServiceImpl {
         let span = tracing::info_span!("host.build_base_snapshot");
         link_remote_parent(&span, &req);
         async move {
-            let spec = decode_bincode(&req.into_inner().spec_bincode, "SandboxSpec")?;
+            let inner = req.into_inner();
+            let spec = decode_bincode(&inner.spec_bincode, "SandboxSpec")?;
+            // ADR 0037: empty bytes ⇒ None (cold). A non-empty payload is
+            // a bincode `AgentSpec` for the warm harness to capture.
+            let warm_harness_spec = if inner.warm_harness_spec_bincode.is_empty() {
+                None
+            } else {
+                Some(decode_bincode::<engram_core::types::sandbox::AgentSpec>(
+                    &inner.warm_harness_spec_bincode,
+                    "AgentSpec",
+                )?)
+            };
             let metadata = self
                 .inner
-                .build_base_snapshot(spec)
+                .build_base_snapshot(spec, warm_harness_spec)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(BuildBaseSnapshotResponse {
