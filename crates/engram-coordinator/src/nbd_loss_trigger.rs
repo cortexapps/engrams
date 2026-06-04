@@ -196,7 +196,11 @@ pub async fn process_unhealthy(
             }
         };
 
-        match evacuate_dead_source(registry, meta, session, snapshot).await {
+        // ADR 0028 Fix B: pre-resolve the disk-only cold-boot spec so
+        // a snapshot-less session relocates via a fresh kernel boot on
+        // its evolved rootfs instead of an impossible full-FC restore.
+        let cold_boot_spec = crate::evacuation::resolve_cold_boot_spec(meta, &session).await;
+        match evacuate_dead_source(registry, meta, session, snapshot, cold_boot_spec).await {
             Ok(receipt) => {
                 tracing::info!(
                     %session_id,

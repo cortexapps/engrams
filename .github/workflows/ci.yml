@@ -293,6 +293,7 @@ jobs:
             --test admin_evac_live_pg \
             --test users_live_pg \
             --test eviction_live_pg \
+            --test checkpoint_reconcile_live_pg \
             --test enable_jobs_live_pg \
             --test enable_reuse_live_pg \
             --run-ignored ignored-only \
@@ -583,6 +584,17 @@ jobs:
             --test cross_host_restore \
             --test restore_chain \
             --test aux_ro_drive \
+            --test diff_snapshot \
+            --test file_restore_shared_rss \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+          # ADR 0028 Fix A: the checkpoint-chain pipeline test lives in
+          # engram-host-agent (it exercises PooledBackend), same gating
+          # as the FC tests above (KVM + Docker + musl agentd).
+          cargo nextest run \
+            -p engram-host-agent \
+            --test checkpoint_chain \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

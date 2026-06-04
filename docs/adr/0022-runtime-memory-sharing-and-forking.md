@@ -1,12 +1,64 @@
 # ADR 0022: Runtime guest-memory sharing & forking — File backend vs direct-mem
 
-Status: 2026-05-29 — **Proposed (parked).** ADR 0021 took the substrate to FC-floor-bound
-(~516 ms warm / ~618 ms cold) and made each enabled template's base memory **resident on
-NVMe**. This ADR scopes the *next* lever it deliberately deferred: sharing that resident
-base memory **across live sessions of the same template** (density) and the closely-
-related ability to **fork** sessions. It is parked — no implementation yet — to keep the
-decision (and its fork-vs-no-fork trade) out of 0021 and let us pick it up measure-first.
-Nothing here is on the critical path for the latency wins already shipped.
+Status: 2026-06-03 — **Proposed (parked); Option A confirmed as the direction, Option B
+rejected-for-now.** ADR 0021 took the substrate to FC-floor-bound (~516 ms warm / ~618 ms
+cold) and made each enabled template's base memory **resident on NVMe**. This ADR scopes the
+*next* lever it deliberately deferred: sharing that resident base memory **across live
+sessions of the same template** (density) and the closely-related ability to **fork**
+sessions. Still parked (no Option A implementation yet) — but [ADR 0028](0028-eviction-durability-under-host-roll.md)
+shipped the diff-first checkpoint substrate and its dev-vm spike measured this ADR's
+load-bearing assumptions, which **settles the Option-A-vs-B decision** (below) and builds
+several of Option A's prerequisites. The remaining Option A work and the fork API are sized
+in "Decision (updated 2026-06-03)".
+
+### Decision (updated 2026-06-03, post-ADR-0028)
+
+- **Lead with Option A; Option B is rejected for now.** ADR 0028's review eroded Option B's
+  case from two directions: (1) **diff snapshots took its dirty-tracking pitch** — stock FC's
+  KVM dirty-log + `SnapshotType::Diff` + the content-addressed chunk store deliver
+  O(dirty-set) checkpoints with no FC fork (measured: **38 ms diff pause vs 2,090 ms full**,
+  diff **3–4%** of guest RAM); (2) **checkpoint-anchored snapshot-fork took most of its fork
+  pitch** — with 0028's continuous checkpoint chain, "fork session X" is a restore off X's
+  latest (or an on-demand) checkpoint: zero-disturbance at ≤ one cadence interval staleness,
+  or ~tens-of-ms parent pause at zero staleness. **Option B's only residual exclusive is
+  zero-pause AND zero-staleness live fork simultaneously** — revisit only if that becomes a
+  hard product requirement, and if so build/measure E2B's public `firecracker-v1.14-direct-mem`
+  rather than patching from scratch.
+- **Option A go/no-go: YES (measured).** The spike (`engram-sandbox-firecracker/tests/
+  file_restore_shared_rss.rs`, now a permanent CI gate) restored **3 sandboxes File-backend
+  off one `memory.bin`**: each RSS 87.8 MiB with **Shared_Clean 84.7 MiB**, **Σpss/Σrss = 35%**
+  vs the perfect-3-way floor of 33% — plain page-cache sharing of one `MAP_PRIVATE` inode,
+  no KSM. Restores 56–66 ms. Density holds on real hardware.
+- **What ADR 0028 already built that Option A consumes:**
+  - the **rolling per-session `memory.bin`** (`PooledBackend` checkpoint chain) — the
+    fork/File-restore source is already materialized + maintained on NVMe;
+  - **full-image chunk manifests per checkpoint** (`update_for_dirty_ranges`) — any checkpoint
+    materializes to a contiguous memfile with no chain replay, which is exactly the
+    File-backend `backend_path`;
+  - the **`File` `RestoreMode`** + `track_dirty_pages` plumbing (`client.rs`,
+    `FirecrackerConfig`);
+  - **`events_cursor`** as the fork transcript cut-point and the **retention window** as the
+    forkable-history window (ADR 0028 A.log + `checkpoint_retention`);
+  - GC that already pins the latest checkpoint per live session — memfile-granularity pinning
+    is the same pin-set extended.
+- **Remaining Option A scope** (a follow-on arc, when density pressure is real): flip base
+  `session.create` restores to `RestoreMode::File` against a **per-template** memfile
+  materialized at prefetch (today each session restores its own); extend the chunk-GC pin set
+  to that template memfile; measure prod shared-RSS + restore latency. Density only — no fork
+  API in this arc.
+- **Fork is its own later ADR.** The substrate is ready (checkpoint chain + cut-point + memfile),
+  but a user-facing fork needs **session re-identity** — agentd bind / `session_env` re-stamp
+  so the child wakes as a *different* session, per-child network identity, and the mid-run
+  duplicate-external-side-effect semantics (the doubled version of ADR 0028 A.log's
+  surviving-side-effect problem). That's a product-capability ADR, not infra.
+
+---
+
+#### Original framing (2026-05-29, retained for context)
+
+It was parked — no implementation yet — to keep the decision (and its fork-vs-no-fork trade)
+out of 0021 and let us pick it up measure-first. Nothing here is on the critical path for the
+latency wins already shipped.
 
 ## Context
 

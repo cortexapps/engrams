@@ -89,6 +89,7 @@ fn spec(rootfs: &Path) -> SandboxSpec {
         image: "engram-e2e-vz".into(),
         rootfs_source: Some(rootfs.to_path_buf()),
         image_uri: None,
+        rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 2 },
         memory: MemoryLimit { max_mib: 1024 },
         disk: DiskLimit { max_gib: 4 },

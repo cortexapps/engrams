@@ -86,6 +86,7 @@ impl ReconcileMeta {
             memory_manifest: None,
             recoverable,
             aux_bundles: vec![],
+            events_cursor: None,
         };
         self.snapshots.lock().entry(session).or_default().push(snap);
     }

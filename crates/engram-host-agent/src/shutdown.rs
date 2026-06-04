@@ -34,10 +34,18 @@ use engram_core::traits::SandboxBackend;
 use engram_core::SandboxId;
 use tokio::sync::Semaphore;
 
-/// Default deadline for the full SIGTERM-to-exit window. Matches
-/// systemd's default `TimeoutStopSec=90s` minus margin, and fits
-/// inside the 25 s GCE Spot preemption notice. Override via
-/// `--shutdown-deadline-secs` / `ENGRAM_SHUTDOWN_DEADLINE_SECS`.
+/// Default deadline for the SIGTERM-to-exit checkpoint window.
+///
+/// ADR 0028 Fix A made this comfortably generous: checkpoints are now
+/// O(dirty-set) Diff captures (~100 ms pause + async staging) rather
+/// than the full multi-GiB memory dumps this 25 s was originally sized
+/// for, so even a host packed with sandboxes drains well inside it.
+/// After this window, `lib.rs` fires one final heartbeat (≤10 s) to
+/// reconcile the SIGTERM checkpoints into PG before the host dies —
+/// so the operator-facing requirement (Fix C, engrams-internal) is a
+/// GCE shutdown grace ≥ ~35 s (deadline + final-flush), well under the
+/// MIG's configurable termination timeout. Override via
+/// `ENGRAM_SHUTDOWN_DEADLINE_SECS`.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(25);
 
 /// Default time to wait for in-flight `exec_stream` / `snapshot` /

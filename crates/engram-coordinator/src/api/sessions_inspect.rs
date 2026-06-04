@@ -154,6 +154,60 @@ pub async fn cow_state(
     }))
 }
 
+/// ADR 0028 A.log: one checkpoint in a session's chain — the data
+/// behind the durability timeline + the (future) fork-point picker.
+#[derive(Serialize)]
+pub struct CheckpointSummary {
+    pub snapshot_id: String,
+    pub created_at: chrono::DateTime<Utc>,
+    pub size_bytes: u64,
+    /// The (memory, disk, event-log) coherence triple's third leg —
+    /// the transcript cursor a rung-1 rewind / fork would cut at.
+    pub events_cursor: Option<i64>,
+    /// HEAD-verified durable in BlobStorage (rung-1-eligible).
+    pub recoverable: bool,
+    /// True for the newest checkpoint — the always-pinned rung-1
+    /// recovery anchor.
+    pub is_latest: bool,
+}
+
+#[derive(Serialize)]
+pub struct CheckpointsResponse {
+    pub session_id: SessionId,
+    /// Newest first. The retention sweeper bounds this to the
+    /// forkable-history window (latest always kept).
+    pub checkpoints: Vec<CheckpointSummary>,
+}
+
+/// `GET /sessions/:id/checkpoints`. ADR 0028 A.log: the session's
+/// recorded checkpoint chain (newest first) — the durability
+/// timeline's data source and the fork-point list (ADR 0022 horizon).
+pub async fn checkpoints(
+    State(state): State<SharedState>,
+    Path(id): Path<SessionId>,
+) -> Result<Json<CheckpointsResponse>, ApiError> {
+    state.services.meta.get_session(id).await?;
+    let rows = state.services.meta.list_snapshots_for_session(id).await?;
+    let checkpoints = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| CheckpointSummary {
+            snapshot_id: r.id.to_string(),
+            created_at: r.created_at,
+            size_bytes: r.size_bytes,
+            events_cursor: r.events_cursor,
+            recoverable: r.recoverable,
+            // list_snapshots_for_session is ORDER BY created_at DESC,
+            // so index 0 is the latest = the rung-1 anchor.
+            is_latest: i == 0,
+        })
+        .collect();
+    Ok(Json(CheckpointsResponse {
+        session_id: id,
+        checkpoints,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

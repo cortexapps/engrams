@@ -872,8 +872,8 @@ impl MetadataStore for PostgresStore {
                  image_version, size_bytes, created_at, last_accessed_at,
                  disk_manifest_id, disk_manifest_version,
                  memory_manifest_id, memory_manifest_version,
-                 recoverable, aux_bundles)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 recoverable, aux_bundles, events_cursor)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
@@ -882,6 +882,11 @@ impl MetadataStore for PostgresStore {
                 memory_manifest_version = EXCLUDED.memory_manifest_version,
                 recoverable             = EXCLUDED.recoverable,
                 aux_bundles             = EXCLUDED.aux_bundles,
+                -- ADR 0028 A.log: never clobber a resolved cursor with
+                -- NULL on an idempotent re-record (the reconciler may
+                -- re-ingest a checkpoint the eviction pipeline already
+                -- recorded with a cursor, or vice versa).
+                events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
                 updated_at              = NOW()
             "#,
         )
@@ -901,6 +906,7 @@ impl MetadataStore for PostgresStore {
             serde_json::to_value(&snap.aux_bundles)
                 .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
         )
+        .bind(snap.events_cursor)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -910,6 +916,63 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn prune_session_snapshots(&self, retention: chrono::Duration) -> Result<u64, MetaError> {
+        // ADR 0028 Fix A retention: keep each session's latest row
+        // unconditionally (DISTINCT ON newest-first); delete the rest
+        // past the window. Same-TX chunk_generation bump keeps the GC
+        // barrier semantics symmetric with record_snapshot — a sweep
+        // that read the pin set mid-prune restarts and re-classifies.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let res = sqlx::query(
+            r#"
+            DELETE FROM snapshots s
+            WHERE s.session_id IS NOT NULL
+              AND s.created_at < NOW() - $1::interval
+              AND s.id NOT IN (
+                  SELECT DISTINCT ON (session_id) id
+                  FROM snapshots
+                  WHERE session_id IS NOT NULL
+                  ORDER BY session_id, created_at DESC
+              )
+            "#,
+        )
+        .bind(sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
+        })
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    async fn latest_event_idx_at_or_before(
+        &self,
+        sid: SessionId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<i64>, MetaError> {
+        // ADR 0028 A.log: the checkpoint pause instant freezes the
+        // guest, so events it caused can't land in the captured state
+        // after `at`. (Events emitted just before pause but written
+        // just after are a sub-second edge we accept — they survive a
+        // rewind the agent technically remembers.)
+        let row: (Option<i64>,) = sqlx::query_as(
+            "SELECT MAX(idx) FROM session_events WHERE session_id = $1 AND created_at <= $2",
+        )
+        .bind(sid.as_uuid())
+        .bind(at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.0)
     }
 
     async fn list_snapshots_for_session(
@@ -923,7 +986,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -945,7 +1008,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -968,7 +1031,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles
+                   recoverable, aux_bundles, events_cursor
             FROM snapshots WHERE id = $1
             "#,
         )
@@ -1046,6 +1109,10 @@ impl MetadataStore for PostgresStore {
         // that LISTEN before this statement runs see the notification;
         // replicas that subscribe later catch up via the persistent
         // log + `?since=N`.
+        // ADR 0028 A.log: stamp the session's current `recovery_epoch`
+        // on the new event (read in the same CTE as the idx bump, so
+        // it reflects any rewind that already committed). Pre-rewind
+        // sessions stay epoch 0.
         let row = sqlx::query(
             r#"
             WITH next AS (
@@ -1053,11 +1120,11 @@ impl MetadataStore for PostgresStore {
                    SET next_event_idx = next_event_idx + 1,
                        updated_at = NOW()
                  WHERE id = $1
-             RETURNING next_event_idx - 1 AS allocated_idx
+             RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
             ),
             inserted AS (
-                INSERT INTO session_events (session_id, idx, kind, payload)
-                SELECT $1, allocated_idx, $2, $3 FROM next
+                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch)
+                SELECT $1, allocated_idx, $2, $3, recovery_epoch FROM next
                 RETURNING idx
             )
             SELECT i.idx,
@@ -1085,9 +1152,13 @@ impl MetadataStore for PostgresStore {
         since: i64,
         limit: i64,
     ) -> Result<Vec<PersistedEvent>, MetaError> {
+        // ADR 0028 A.log: replay ALL events (incl. tombstoned), each
+        // carrying its `recovery_epoch` + `rewound_at`. The transcript
+        // renders rewound rows collapsed/greyed and segments by epoch —
+        // honest history, not a silent deletion.
         let rows = sqlx::query(
             r#"
-            SELECT idx, kind, payload, created_at
+            SELECT idx, kind, payload, created_at, recovery_epoch, rewound_at
               FROM session_events
              WHERE session_id = $1 AND idx > $2
              ORDER BY idx
@@ -1101,6 +1172,99 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         rows.iter().map(row::persisted_event_from_row).collect()
+    }
+
+    async fn rewind_session_to_cursor(
+        &self,
+        session_id: SessionId,
+        events_cursor: i64,
+    ) -> Result<engram_core::types::event::RewindSummary, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        // Surviving side-effects: outside-world actions in the
+        // rolled-back span that the rewind CANNOT undo. We surface
+        // them rather than hide them (the deliberate at-least-once
+        // posture). Detect the kinds that touched the world.
+        let side_effect_rows = sqlx::query(
+            r#"
+            SELECT kind, payload FROM session_events
+             WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
+               AND kind IN ('pull_request_opened', 'file_shared')
+             ORDER BY idx
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(events_cursor)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let surviving_side_effects = side_effect_rows
+            .iter()
+            .filter_map(|r| {
+                let kind: String = sqlx::Row::try_get(r, "kind").ok()?;
+                let payload: serde_json::Value = sqlx::Row::try_get(r, "payload").ok()?;
+                Some(match kind.as_str() {
+                    "pull_request_opened" => format!(
+                        "A pull request was opened and still exists: {}",
+                        payload
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("(url unknown)"),
+                    ),
+                    "file_shared" => format!(
+                        "A file was shared and still exists: {}",
+                        payload
+                            .get("caption")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| payload.get("artifact_id").and_then(|v| v.as_str()))
+                            .unwrap_or("(artifact)"),
+                    ),
+                    _ => return None,
+                })
+            })
+            .collect();
+
+        // Tombstone the rolled-back span (audit-preserving) and count it.
+        let tombstoned = sqlx::query(
+            r#"
+            UPDATE session_events
+               SET rewound_at = NOW()
+             WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(events_cursor)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+
+        if tombstoned == 0 {
+            // Checkpoint was already the head — no rewind. Don't bump
+            // the epoch (keeps the no-op clean); caller emits nothing.
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(engram_core::types::event::RewindSummary::default());
+        }
+
+        // Bump the epoch so events appended after this segment cleanly.
+        let epoch_row = sqlx::query(
+            "UPDATE sessions SET recovery_epoch = recovery_epoch + 1, updated_at = NOW() \
+             WHERE id = $1 RETURNING recovery_epoch",
+        )
+        .bind(session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let recovery_epoch: i32 =
+            sqlx::Row::try_get(&epoch_row, "recovery_epoch").map_err(db_err)?;
+
+        tx.commit().await.map_err(db_err)?;
+        Ok(engram_core::types::event::RewindSummary {
+            rolled_back: tombstoned,
+            recovery_epoch: recovery_epoch as i64,
+            through_idx: events_cursor,
+            surviving_side_effects,
+        })
     }
 
     // ---------- file artifacts (ADR 0026) ----------

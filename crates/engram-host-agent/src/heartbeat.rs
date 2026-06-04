@@ -97,6 +97,7 @@ pub fn build_heartbeat(
         draining,
         ready_images: Vec::new(),
         nbd_unhealthy: nbd_health.snapshot(),
+        checkpoints: Vec::new(),
     }
 }
 

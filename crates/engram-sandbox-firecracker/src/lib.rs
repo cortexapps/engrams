@@ -211,6 +211,15 @@ pub struct FirecrackerConfig {
     /// spawns engram-uffd-handler and serves pages on demand (fast,
     /// requires Linux + the handler binary on the host).
     pub restore_mode: RestoreMode,
+    /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
+    /// creates via `MachineConfig.track_dirty_pages`, restores via
+    /// `enable_diff_snapshots` at `snapshot/load` — so periodic
+    /// checkpoints can use `SnapshotType::Diff` (capture cost
+    /// O(dirty set), not O(guest RAM)). Default `false` until the
+    /// checkpoint pipeline lands; tracking has a steady-state KVM
+    /// write-protect cost that's only worth paying when diffs are
+    /// actually taken.
+    pub track_dirty_pages: bool,
     /// Engram CIDR pool — every sandbox gets a unique /30 carved out
     /// of this. `Some(10.200.0.0)` (the default) provisions per-VM
     /// TAPs + iptables rules; production deployments always want
@@ -444,6 +453,7 @@ impl FirecrackerConfig {
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             restore_mode: RestoreMode::File,
+            track_dirty_pages: false,
             host_id: None,
             uffd_cache_root: None,
             stub_harness_path: None,
@@ -1501,6 +1511,7 @@ impl FirecrackerBackend {
             })?,
             mem_size_mib: spec.memory.max_mib,
             smt: false,
+            track_dirty_pages: self.config.track_dirty_pages,
             cpu_template: self.config.cpu_template.clone(),
         })
         .await?;
@@ -2302,11 +2313,15 @@ impl FirecrackerBackend {
                     };
                     tracing::Instrument::instrument(
                         async {
-                            if aux_swap_plan.is_empty() {
-                                api.load_snapshot(&paths).await
-                            } else {
-                                api.load_snapshot_paused(&paths).await
-                            }
+                            // ADR 0028: restored VMs re-arm dirty
+                            // tracking here (no machine-config PUT on
+                            // the restore path).
+                            api.load_snapshot_opts(
+                                &paths,
+                                /*resume_vm=*/ aux_swap_plan.is_empty(),
+                                self.config.track_dirty_pages,
+                            )
+                            .await
                         },
                         tracing::info_span!("fc.load_snapshot", mode = "file"),
                     )
@@ -2315,11 +2330,13 @@ impl FirecrackerBackend {
                 Some((_handler, uffd_uds)) => {
                     tracing::Instrument::instrument(
                         async {
-                            if aux_swap_plan.is_empty() {
-                                api.load_snapshot_uffd(&state_path, uffd_uds).await
-                            } else {
-                                api.load_snapshot_uffd_paused(&state_path, uffd_uds).await
-                            }
+                            api.load_snapshot_uffd_opts(
+                                &state_path,
+                                uffd_uds,
+                                /*resume_vm=*/ aux_swap_plan.is_empty(),
+                                self.config.track_dirty_pages,
+                            )
+                            .await
                         },
                         tracing::info_span!("fc.load_snapshot", mode = "uffd"),
                     )
@@ -2999,186 +3016,25 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        // Read sandbox state under the dashmap guard, drop guard before
-        // any await so we don't hold the read lock across an HTTP call.
-        let (socket, spec, net_snapshot, live_rootfs_canonical, live_vsock_uds) = {
-            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            // Cold-path sandboxes carry `net`; M1.16 warm-restored
-            // sandboxes carry `netns` with the same TAP name + CIDR
-            // recreated inside the netns. Either way, the manifest's
-            // `net` field must echo what `state.bin` references — a
-            // future restore (warm or cross-host) re-creates a TAP
-            // with this exact name inside its own per-VM netns.
-            let net_snapshot = live
-                .net
-                .as_ref()
-                .map(|setup| FcNetSnapshot {
-                    tap_name: setup.tap_name.clone(),
-                    cidr_network: setup.vm_cidr.network(),
-                })
-                .or_else(|| {
-                    live.netns.as_ref().map(|ns| FcNetSnapshot {
-                        tap_name: ns.tap_name.clone(),
-                        cidr_network: ns.vm_cidr.network(),
-                    })
-                });
-            (
-                live.state.firecracker_socket.clone(),
-                live.state.spec.clone(),
-                net_snapshot,
-                live.state.rootfs_canonical.clone(),
-                live.state.vsock_uds_path.clone(),
-            )
-        };
-
-        // ADR 0014: refuse to snapshot a sandbox whose canonical
-        // rootfs symlink is missing or dangling. FC's `state.bin`
-        // embeds `<work_dir>/rootfs/<sandbox_id>.dev` as
-        // `path_on_host`; capture-time validation prevents shipping
-        // a blob that fails opaquely at restore on a sibling host.
-        paths::assert_rootfs_canonical(&self.work_dir, id)
+        self.snapshot_with_type(id, client::SnapshotType::Full)
             .await
-            .map_err(|e| SandboxError::Snapshot(format!("non-canonical jail layout: {e}")))?;
+    }
 
-        // ADR 0007 Phase 6: allocate the snapshot id first, derive
-        // the staging dir from it. Coord no longer dictates layout.
-        let snapshot_id = SnapshotId::new();
-        let dest = self.snapshot_dir_for(snapshot_id);
-        tokio::fs::create_dir_all(&dest).await.map_err(|e| {
-            SandboxError::Snapshot(format!("create snapshot dir {}: {e}", dest.display()))
-        })?;
-
-        // pause → PUT /snapshot/create → resume happens inside the
-        // client; a failure mid-sequence still tries to resume the
-        // VM rather than leaving it stuck Paused.
-        // Snapshot duration scales with guest memory (every dirty page
-        // is flushed to memory.bin synchronously). The default 10s
-        // client timeout fits a 64 MiB VM but trips on larger ones —
-        // give the snapshot path 60s explicitly. Tune up for huge VMs.
-        let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
-        let paths = api.create_snapshot(&dest).await?;
-
-        let created_at = Utc::now();
-        // ADR 0018 commit 12o: stamp the canonical paths from what the
-        // LIVE sandbox actually has open (tracked in `SandboxState`),
-        // NOT recomputed from `id`. The two diverge after a restore: FC
-        // inherits the snapshot's embedded `path_on_host` and we never
-        // re-point the root drive, so a restored sandbox runs with its
-        // ANCESTOR's id-keyed path while `id` is a fresh routing handle.
-        // Recomputing off `id` stamped a path nobody recreates on the
-        // next restore → ENOENT (rootfs) / EADDRINUSE (vsock). Anchoring
-        // to the embedded path keeps the whole snapshot lineage
-        // consistent across arbitrarily many chained restores. Vsock
-        // can't be re-pointed (PUT /vsock 400 post-load), so this
-        // carry-forward is the ONLY correct option there — rootfs uses
-        // the same mechanism for uniformity.
-        let source_rootfs_canonical = if spec.rootfs_source.is_some() {
-            Some(live_rootfs_canonical)
-        } else {
-            None
-        };
-        // The harness drive IS re-pointed onto the live id's canonical
-        // at restore — `repoint_harness_drive` (PATCH /drives) runs on
-        // BOTH the warm-lease swap and every idle→active / evac resume
-        // (ADR 0018 §12p) — so its embedded `path_on_host` tracks the
-        // ADR 0021 P1.5: harness drive retired — nothing to anchor.
-        let source_harness_canonical: Option<PathBuf> = None;
-        let source_vsock_canonical = Some(live_vsock_uds);
-        // ADR 0014 sec-hardening: `spec.env` carries session secrets
-        // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, etc.) verbatim
-        // — keeping them in the on-disk sidecar would leak them to
-        // any operator with read access to /var/lib/engram. Restore
-        // doesn't replay env (the running VM's process state already
-        // baked it in), so we clear values before serialize. Keys
-        // stay for diagnostic value (operators can see "this snapshot
-        // had ANTHROPIC_API_KEY set" without the secret itself).
-        let mut redacted_spec = spec.clone();
-        for (_k, v) in redacted_spec.env.iter_mut() {
-            *v = "<redacted>".into();
-        }
-        let manifest = FcSnapshotManifest {
-            sandbox_id: id,
-            created_at,
-            spec: redacted_spec,
-            net: net_snapshot,
-            format: MANIFEST_FORMAT_FC.into(),
-            // PooledBackend::snapshot patches `memory_manifest`
-            // in-place after FC returns (the bare backend can't
-            // chunk memory.bin without a chunk-store wiring).
-            memory_manifest: None,
-            // ADR 0007 Phase 5: snapshotting host's id, so cross-
-            // host restore can request this host's recorded
-            // trace via `--prefault-trace <hint>`. Set from FC
-            // config; falls back to None when not wired.
-            trace_host_hint: self.config.host_id,
-            // ADR 0014 M1.11: canonical paths embedded in FC's
-            // state.bin. Cross-host restore reads these to recreate
-            // the EXACT path FC tries to open at load_snapshot
-            // time (state.bin has the bake's absolute path baked
-            // in; the receiver's own work_dir is a different
-            // location and wouldn't satisfy FC).
-            source_rootfs_canonical,
-            source_harness_canonical,
-            source_vsock_canonical,
-        };
-        let manifest_path = dest.join("manifest.json");
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|e| SandboxError::Snapshot(format!("manifest serialize: {e}")))?;
-        tokio::fs::write(&manifest_path, manifest_bytes)
+    /// ADR 0028 Fix A: diff-flavored capture — same snapshot dir +
+    /// sidecar + vmstate contract as `snapshot()`, but the memory
+    /// artifact is `memory.diff` (sparse, dirty-pages-only; the KVM
+    /// dirty bitmap resets on capture so successive calls chain).
+    /// Requires `FirecrackerConfig::track_dirty_pages`.
+    async fn snapshot_diff(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        self.snapshot_with_type(id, client::SnapshotType::Diff)
             .await
-            .map_err(|e| SandboxError::Snapshot(format!("write manifest: {e}")))?;
+    }
 
-        // Sum the three artefacts so callers know the size_bytes that
-        // landed in `dest`. memory.bin dominates (= guest RAM size).
-        let mut size_bytes = 0u64;
-        for p in [&paths.state_path, &paths.mem_path, &manifest_path] {
-            size_bytes += tokio::fs::metadata(p)
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("stat {}: {e}", p.display())))?
-                .len();
-        }
-
-        Ok(SnapshotMetadata {
-            id: snapshot_id,
-            size_bytes,
-            created_at,
-            image_version: spec.image,
-            // FC snapshots capture VM state + memory only; disk state
-            // lives on the per-sandbox rootfs file. Phase 4's NBD work
-            // produces a disk_manifest here when it lands.
-            disk_manifest: None,
-            // FC backend's bare snapshot writes memory.bin to disk
-            // and stops there. `PooledBackend::snapshot` is the
-            // integration point that chunks memory.bin into the
-            // chunk store and patches this field afterward — that
-            // way the FC backend stays chunk-store-agnostic and
-            // dev/test paths don't need a chunk-store wiring.
-            memory_manifest: None,
-            // ADR 0014: portable-snapshot fields are populated by
-            // `PooledBackend::snapshot` after the inner backend
-            // returns. Bare FC stays BlobStorage-agnostic.
-            source_sandbox_id: None,
-            state_blob_key: None,
-            sidecar_blob_key: None,
-            rootfs_blob_key: None,
-            working_set_blob_key: None,
-            // ADR 0035: pin the bundle generations this VM's device
-            // model references — the live spec reflects any fresh-create
-            // swap, so this is what `load_snapshot` will reopen on the
-            // next restore. The coord persists it to
-            // `snapshots.aux_bundles` (the GC pin set); PooledBackend
-            // publishes the bytes to BlobStorage.
-            aux_bundles: spec
-                .aux_ro_drives
-                .iter()
-                .filter_map(|d| {
-                    d.sha256.as_ref().map(|sha| AuxBundleRef {
-                        drive_id: d.drive_id.clone(),
-                        sha256: sha.clone(),
-                    })
-                })
-                .collect(),
-        })
+    /// ADR 0028 Fix A: FC supports diff checkpoints exactly when KVM
+    /// dirty tracking is armed. Gates the periodic checkpoint driver
+    /// so non-dirty-tracking hosts never run it.
+    fn supports_diff_checkpoints(&self) -> bool {
+        self.config.track_dirty_pages
     }
 
     fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {
@@ -3801,6 +3657,209 @@ impl SandboxBackend for FirecrackerBackend {
     }
 }
 
+/// ADR 0028 Fix A: shared body of `SandboxBackend::snapshot` (Full →
+/// `memory.bin`) and `snapshot_diff` (Diff → sparse `memory.diff`).
+/// Identical sidecar/vmstate/dir contract either way; only the memory
+/// artifact's name + capture type differ.
+impl FirecrackerBackend {
+    async fn snapshot_with_type(
+        &self,
+        id: SandboxId,
+        snapshot_type: client::SnapshotType,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        // Read sandbox state under the dashmap guard, drop guard before
+        // any await so we don't hold the read lock across an HTTP call.
+        let (socket, spec, net_snapshot, live_rootfs_canonical, live_vsock_uds) = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            // Cold-path sandboxes carry `net`; M1.16 warm-restored
+            // sandboxes carry `netns` with the same TAP name + CIDR
+            // recreated inside the netns. Either way, the manifest's
+            // `net` field must echo what `state.bin` references — a
+            // future restore (warm or cross-host) re-creates a TAP
+            // with this exact name inside its own per-VM netns.
+            let net_snapshot = live
+                .net
+                .as_ref()
+                .map(|setup| FcNetSnapshot {
+                    tap_name: setup.tap_name.clone(),
+                    cidr_network: setup.vm_cidr.network(),
+                })
+                .or_else(|| {
+                    live.netns.as_ref().map(|ns| FcNetSnapshot {
+                        tap_name: ns.tap_name.clone(),
+                        cidr_network: ns.vm_cidr.network(),
+                    })
+                });
+            (
+                live.state.firecracker_socket.clone(),
+                live.state.spec.clone(),
+                net_snapshot,
+                live.state.rootfs_canonical.clone(),
+                live.state.vsock_uds_path.clone(),
+            )
+        };
+
+        // ADR 0014: refuse to snapshot a sandbox whose canonical
+        // rootfs symlink is missing or dangling. FC's `state.bin`
+        // embeds `<work_dir>/rootfs/<sandbox_id>.dev` as
+        // `path_on_host`; capture-time validation prevents shipping
+        // a blob that fails opaquely at restore on a sibling host.
+        paths::assert_rootfs_canonical(&self.work_dir, id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("non-canonical jail layout: {e}")))?;
+
+        // ADR 0007 Phase 6: allocate the snapshot id first, derive
+        // the staging dir from it. Coord no longer dictates layout.
+        let snapshot_id = SnapshotId::new();
+        let dest = self.snapshot_dir_for(snapshot_id);
+        tokio::fs::create_dir_all(&dest).await.map_err(|e| {
+            SandboxError::Snapshot(format!("create snapshot dir {}: {e}", dest.display()))
+        })?;
+
+        // pause → PUT /snapshot/create → resume happens inside the
+        // client; a failure mid-sequence still tries to resume the
+        // VM rather than leaving it stuck Paused.
+        // Snapshot duration scales with guest memory (every dirty page
+        // is flushed to memory.bin synchronously). The default 10s
+        // client timeout fits a 64 MiB VM but trips on larger ones —
+        // give the snapshot path 60s explicitly. Tune up for huge VMs.
+        let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
+        let paths = match snapshot_type {
+            client::SnapshotType::Full => api.create_snapshot(&dest).await?,
+            client::SnapshotType::Diff => {
+                api.create_snapshot_at(
+                    dest.join("state.bin"),
+                    dest.join("memory.diff"),
+                    client::SnapshotType::Diff,
+                )
+                .await?
+            }
+        };
+
+        let created_at = Utc::now();
+        // ADR 0018 commit 12o: stamp the canonical paths from what the
+        // LIVE sandbox actually has open (tracked in `SandboxState`),
+        // NOT recomputed from `id`. The two diverge after a restore: FC
+        // inherits the snapshot's embedded `path_on_host` and we never
+        // re-point the root drive, so a restored sandbox runs with its
+        // ANCESTOR's id-keyed path while `id` is a fresh routing handle.
+        // Recomputing off `id` stamped a path nobody recreates on the
+        // next restore → ENOENT (rootfs) / EADDRINUSE (vsock). Anchoring
+        // to the embedded path keeps the whole snapshot lineage
+        // consistent across arbitrarily many chained restores. Vsock
+        // can't be re-pointed (PUT /vsock 400 post-load), so this
+        // carry-forward is the ONLY correct option there — rootfs uses
+        // the same mechanism for uniformity.
+        let source_rootfs_canonical = if spec.rootfs_source.is_some() {
+            Some(live_rootfs_canonical)
+        } else {
+            None
+        };
+        // The harness drive IS re-pointed onto the live id's canonical
+        // at restore — `repoint_harness_drive` (PATCH /drives) runs on
+        // BOTH the warm-lease swap and every idle→active / evac resume
+        // (ADR 0018 §12p) — so its embedded `path_on_host` tracks the
+        // ADR 0021 P1.5: harness drive retired — nothing to anchor.
+        let source_harness_canonical: Option<PathBuf> = None;
+        let source_vsock_canonical = Some(live_vsock_uds);
+        // ADR 0014 sec-hardening: `spec.env` carries session secrets
+        // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, etc.) verbatim
+        // — keeping them in the on-disk sidecar would leak them to
+        // any operator with read access to /var/lib/engram. Restore
+        // doesn't replay env (the running VM's process state already
+        // baked it in), so we clear values before serialize. Keys
+        // stay for diagnostic value (operators can see "this snapshot
+        // had ANTHROPIC_API_KEY set" without the secret itself).
+        let mut redacted_spec = spec.clone();
+        for (_k, v) in redacted_spec.env.iter_mut() {
+            *v = "<redacted>".into();
+        }
+        let manifest = FcSnapshotManifest {
+            sandbox_id: id,
+            created_at,
+            spec: redacted_spec,
+            net: net_snapshot,
+            format: MANIFEST_FORMAT_FC.into(),
+            // PooledBackend::snapshot patches `memory_manifest`
+            // in-place after FC returns (the bare backend can't
+            // chunk memory.bin without a chunk-store wiring).
+            memory_manifest: None,
+            // ADR 0007 Phase 5: snapshotting host's id, so cross-
+            // host restore can request this host's recorded
+            // trace via `--prefault-trace <hint>`. Set from FC
+            // config; falls back to None when not wired.
+            trace_host_hint: self.config.host_id,
+            // ADR 0014 M1.11: canonical paths embedded in FC's
+            // state.bin. Cross-host restore reads these to recreate
+            // the EXACT path FC tries to open at load_snapshot
+            // time (state.bin has the bake's absolute path baked
+            // in; the receiver's own work_dir is a different
+            // location and wouldn't satisfy FC).
+            source_rootfs_canonical,
+            source_harness_canonical,
+            source_vsock_canonical,
+        };
+        let manifest_path = dest.join("manifest.json");
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| SandboxError::Snapshot(format!("manifest serialize: {e}")))?;
+        tokio::fs::write(&manifest_path, manifest_bytes)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("write manifest: {e}")))?;
+
+        // Sum the three artefacts so callers know the size_bytes that
+        // landed in `dest`. memory.bin dominates (= guest RAM size).
+        let mut size_bytes = 0u64;
+        for p in [&paths.state_path, &paths.mem_path, &manifest_path] {
+            size_bytes += tokio::fs::metadata(p)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("stat {}: {e}", p.display())))?
+                .len();
+        }
+
+        Ok(SnapshotMetadata {
+            id: snapshot_id,
+            size_bytes,
+            created_at,
+            image_version: spec.image,
+            // FC snapshots capture VM state + memory only; disk state
+            // lives on the per-sandbox rootfs file. Phase 4's NBD work
+            // produces a disk_manifest here when it lands.
+            disk_manifest: None,
+            // FC backend's bare snapshot writes memory.bin to disk
+            // and stops there. `PooledBackend::snapshot` is the
+            // integration point that chunks memory.bin into the
+            // chunk store and patches this field afterward — that
+            // way the FC backend stays chunk-store-agnostic and
+            // dev/test paths don't need a chunk-store wiring.
+            memory_manifest: None,
+            // ADR 0014: portable-snapshot fields are populated by
+            // `PooledBackend::snapshot` after the inner backend
+            // returns. Bare FC stays BlobStorage-agnostic.
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
+            working_set_blob_key: None,
+            // ADR 0035: pin the bundle generations this VM's device
+            // model references — the live spec reflects any fresh-create
+            // swap, so this is what `load_snapshot` will reopen on the
+            // next restore. The coord persists it to
+            // `snapshots.aux_bundles` (the GC pin set); PooledBackend
+            // publishes the bytes to BlobStorage.
+            aux_bundles: spec
+                .aux_ro_drives
+                .iter()
+                .filter_map(|d| {
+                    d.sha256.as_ref().map(|sha| AuxBundleRef {
+                        drive_id: d.drive_id.clone(),
+                        sha256: sha.clone(),
+                    })
+                })
+                .collect(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3819,6 +3878,7 @@ mod tests {
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             restore_mode: RestoreMode::File,
+            track_dirty_pages: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,
@@ -3838,6 +3898,7 @@ mod tests {
             image: "warm-test".into(),
             rootfs_source: None,
             image_uri: None,
+            rootfs_manifest: None,
             cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
             memory: engram_core::types::sandbox::MemoryLimit { max_mib: 256 },
             disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },

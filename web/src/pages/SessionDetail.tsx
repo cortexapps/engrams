@@ -10,6 +10,7 @@ import { TabRow } from '../components/TabRow';
 import { TerminalPane } from '../components/TerminalPane';
 import { relativeTime } from '../components/SessionManifest';
 import { SessionCowState } from '../components/CowState';
+import { DurabilityTimeline } from '../components/DurabilityTimeline';
 
 type ViewTab = 'transcript' | 'shell' | 'raw';
 
@@ -88,6 +89,16 @@ export function SessionDetail() {
         {id && (
           <div className="mt-4">
             <SessionCowState sessionId={id} />
+          </div>
+        )}
+
+        {/* ADR 0028 A.log: the checkpoint chain — the recovery ladder
+            made legible (rung-1 anchor + forkable history window). Sits
+            beside the COW state: "is my disk durable yet" (CowState) +
+            "what coherent points can I recover/fork to" (here). */}
+        {id && (
+          <div className="mt-3">
+            <DurabilityTimeline sessionId={id} />
           </div>
         )}
 

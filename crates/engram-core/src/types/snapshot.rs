@@ -143,4 +143,14 @@ pub struct SnapshotRecord {
     /// jsonb; the union across all rows is the bundle-GC pin set.
     #[serde(default)]
     pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
+    /// ADR 0028 A.log: the `session_events.idx` high-water-mark at
+    /// the checkpoint's pause instant — the third leg of the
+    /// (memory, disk, event-log) coherence triple. A rung-1 rewind
+    /// tombstones events past this cursor. `None` on pre-0053 rows,
+    /// template snapshots, and eviction captures recorded by a coord
+    /// that died before resolving it; rung-1 treats `None` as "no
+    /// rewind information — surface the boundary without
+    /// tombstoning".
+    #[serde(default)]
+    pub events_cursor: Option<i64>,
 }

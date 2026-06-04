@@ -309,6 +309,8 @@ impl MetadataStore for MockMetadataStore {
             kind: kind.to_string(),
             payload,
             created_at: Utc::now(),
+            recovery_epoch: 0,
+            rewound_at: None,
         };
         self.events
             .lock()
@@ -827,6 +829,7 @@ fn seed_enabled(
             memory_manifest: None,
             recoverable: true,
             aux_bundles: vec![],
+            events_cursor: None,
         },
     );
     store.enabled.lock().insert(

@@ -117,6 +117,15 @@ pub async fn snapshot(
         // ADR 0035: pin the generations this snapshot's device model
         // references (host-reported; reflects any fresh-create swap).
         aux_bundles: metadata.aux_bundles.clone(),
+        // ADR 0028 A.log: best-effort cursor at the capture instant
+        // (the guest pauses inside the snapshot RPC; sub-second skew
+        // accepted, documented on `latest_event_idx_at_or_before`).
+        events_cursor: state
+            .services
+            .meta
+            .latest_event_idx_at_or_before(id, now)
+            .await
+            .unwrap_or_default(),
     };
     state.services.meta.record_snapshot(record).await?;
 
@@ -319,24 +328,106 @@ async fn resume_from_idle(
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
-    let record = state
-        .services
-        .meta
-        .latest_snapshot_for_session(id)
-        .await?
-        .ok_or_else(|| {
-            tracing::warn!(
-                session_id = %id,
-                "resume requested but no snapshot row found — marking Dead",
-            );
-            ApiError::Gone(
-                "snapshot_invalidated: session can't be revived; \
-                 use `engram session fork <id>` to continue"
-                    .into(),
-            )
-        })?;
-    let _ = transition_to_dead_if_no_snapshot(&state, id).await;
+    let Some(record) = state.services.meta.latest_snapshot_for_session(id).await? else {
+        // ADR 0028 Fix B: no snapshot row, but a continuous-sync disk
+        // manifest → recover via the disk-only cold boot (rung 2)
+        // instead of declaring the session dead. This is also the
+        // documented recovery path for `ColdBootUnavailable` Idle
+        // fallbacks: re-enable the image, then /resume lands here.
+        if session.live_disk_manifest.is_some() {
+            return resume_disk_only_cold_boot(state, session).await;
+        }
+        tracing::warn!(
+            session_id = %id,
+            "resume requested but no snapshot row found — marking Dead",
+        );
+        let _ = transition_to_dead_if_no_snapshot(&state, id).await;
+        return Err(ApiError::Gone(
+            "snapshot_invalidated: session can't be revived; \
+             use `engram session fork <id>` to continue"
+                .into(),
+        ));
+    };
     resume_from_fc_snapshot(state, session, record).await
+}
+
+/// ADR 0028 Fix B — manual-resume flavor of the disk-only cold boot:
+/// fresh kernel boot mounting the session's `live_disk_manifest` on
+/// whichever host can take it, fresh harness. On-disk work survives;
+/// in-RAM context does not (this path only exists because no coherent
+/// memory snapshot was ever recorded).
+async fn resume_disk_only_cold_boot(
+    state: SharedState,
+    session: Session,
+) -> Result<SnapshotResponse, ApiError> {
+    use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
+
+    let id = session.id;
+    let Some(spec) = resolve_cold_boot_spec(&state.services.meta, &session).await else {
+        return Err(ApiError::Conflict(format!(
+            "session {id} has only a live disk manifest and its image `{}` is no \
+             longer enabled — re-enable it (POST /api/enabled-images), then retry /resume",
+            session.image,
+        )));
+    };
+
+    // The previous host isn't dead here (Idle = the sandbox was
+    // destroyed); clearing host_id disables `exclude_host` so a
+    // single-host deployment can recover onto itself.
+    let mut relocatable = session.clone();
+    relocatable.host_id = None;
+
+    let receipt = evacuate_dead_source(
+        &state.host_registry,
+        &state.services.meta,
+        relocatable,
+        None,
+        Some(spec),
+    )
+    .await
+    .map_err(|e| match &e {
+        EvacError::NoTargetAvailable(_) => ApiError::Unavailable(format!(
+            "no host can take the disk-only cold-boot recovery right now: {e}. \
+             Retry shortly.",
+        )),
+        _ => ApiError::Internal(format!("disk-only cold-boot recovery failed: {e}")),
+    })?;
+
+    tracing::info!(
+        session_id = %id,
+        new_host = %receipt.new_host_id,
+        new_sandbox = %receipt.new_sandbox_id,
+        loss = receipt.loss.as_str(),
+        "resume: disk-only cold boot relocated session to Created — finishing harness rebuild",
+    );
+    let _ = state
+        .emit(
+            id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Idle,
+                to: SessionState::Created,
+                at: Utc::now(),
+            },
+        )
+        .await;
+
+    bind_session_routing(&state, id, receipt.new_sandbox_id).await;
+    let refreshed = state.services.meta.get_session(id).await?;
+    let outcome = finish_resume_to_active(&state, &refreshed, receipt.new_sandbox_id).await?;
+    let note = match outcome {
+        FinishResumeOutcome::Active => {
+            "resumed via disk-only cold boot (fresh kernel on latest disk; in-RAM context lost)"
+        }
+        FinishResumeOutcome::CreatedHarnessFailed => {
+            "disk-only cold boot relocated the session; harness spawn failed — still Created"
+        }
+    };
+    Ok(SnapshotResponse {
+        session_id: id,
+        snapshot_id: None,
+        size_bytes: None,
+        note,
+    })
 }
 
 /// Look up the session's snapshot one more time and, if there's
@@ -445,6 +536,76 @@ fn effective_resume_disk_manifest(
 pub enum FinishResumeOutcome {
     Active,
     CreatedHarnessFailed,
+}
+
+/// ADR 0028 A.log: rung-1 recovery rewind. Called after a coherent
+/// (memory, disk) checkpoint was restored — the restored guest has no
+/// memory of events in `(events_cursor, crash]`, so we rewind the
+/// live transcript head to the cursor (tombstoning that span, not
+/// deleting it) and emit an honest, legible boundary the web renders.
+///
+/// No-op when the record carries no `events_cursor` (pre-0053 / never
+/// resolved) or when nothing is past it (the checkpoint was already
+/// the head). Best-effort: a rewind failure logs and leaves the
+/// transcript as-is rather than blocking the resume — the guest is
+/// already coherent; the worst case is a confusing-but-intact log.
+///
+/// Shared by [`resume_from_fc_snapshot`] (manual `/resume`) and
+/// `evac_resumer::run_resume_pipeline` (dead-host warm recovery) — the
+/// two rung-1 entry points.
+pub async fn apply_rung1_rewind(
+    state: &SharedState,
+    session_id: SessionId,
+    events_cursor: Option<i64>,
+) {
+    // Only coherent checkpoints (memory present) rewind; a disk-only
+    // record never reaches here (rung 2 cold-boots fresh, no rewind).
+    // `events_cursor` is the checkpoint's resolved cursor (None =
+    // pre-0053 / unresolved → no rewind information).
+    let Some(cursor) = events_cursor else {
+        return;
+    };
+    let summary = match state
+        .services
+        .meta
+        .rewind_session_to_cursor(session_id, cursor)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                %session_id,
+                error = %e,
+                "rung-1 transcript rewind failed; resume proceeds with the unrewound log",
+            );
+            return;
+        }
+    };
+    if summary.rolled_back == 0 {
+        return; // checkpoint was the head — nothing rolled back.
+    }
+    tracing::info!(
+        %session_id,
+        rolled_back = summary.rolled_back,
+        recovery_epoch = summary.recovery_epoch,
+        surviving_side_effects = summary.surviving_side_effects.len(),
+        "rung-1 recovery rewound the transcript to the checkpoint cursor",
+    );
+    // The boundary event is the first of the new epoch — it appends
+    // AFTER the tombstoned span (higher idx) and carries the new
+    // epoch (append_session_event reads the just-bumped value).
+    let _ = state
+        .emit(
+            session_id,
+            SessionEvent::RecoveredFromCheckpoint {
+                recovery_epoch: summary.recovery_epoch,
+                through_idx: summary.through_idx,
+                rolled_back: summary.rolled_back,
+                surviving_side_effects: summary.surviving_side_effects,
+                at: Utc::now(),
+            },
+        )
+        .await;
 }
 
 /// ADR 0018 commit 10 — the "session is bound on a new host at
@@ -637,15 +798,37 @@ async fn resume_from_fc_snapshot(
     //
     // In both `None` cases the resolver falls back to the
     // snapshot's manifest, preserving the pre-Phase-B behaviour.
-    let effective_disk_manifest =
-        effective_resume_disk_manifest(session.live_disk_manifest, record.disk_manifest);
+    //
+    // ADR 0028 rung-1 coherence rule: a record with a
+    // `memory_manifest` is a COHERENT (memory, disk) checkpoint — its
+    // restored RAM describes ITS OWN disk version. Pairing that memory
+    // with a newer `live_disk_manifest` corrupts (the same Defect-B
+    // incoherence the evac path guards). So when memory is present we
+    // restore the checkpoint's own disk — which IS the "rewind to the
+    // checkpoint" the recovery ladder prescribes; the post-checkpoint
+    // flushes are deliberately discarded for coherence.
+    //
+    // Why this is newly load-bearing (it wasn't pre-Fix-A): without
+    // periodic checkpoints the only snapshot was the eviction one,
+    // whose disk == live at the pause instant — live-wins was a no-op.
+    // With checkpoints, the latest *recorded* snapshot can be an
+    // earlier checkpoint while live advanced (e.g. the cf4d4afd
+    // eviction snapshot never recorded), so live-wins would now
+    // actively mis-pair. The live-wins branch survives only for the
+    // memory-less record (VZ / disk-only), where there's no RAM to be
+    // incoherent with.
+    let effective_disk_manifest = if record.memory_manifest.is_some() {
+        record.disk_manifest
+    } else {
+        effective_resume_disk_manifest(session.live_disk_manifest, record.disk_manifest)
+    };
     if effective_disk_manifest != record.disk_manifest {
         tracing::info!(
             session_id = %id,
             snapshot_disk_manifest = ?record.disk_manifest,
             live_disk_manifest = ?session.live_disk_manifest,
             effective_disk_manifest = ?effective_disk_manifest,
-            "resume: preferred live_disk_manifest over snapshot's stale lineage",
+            "resume: preferred live_disk_manifest over snapshot's stale lineage (memory-less record)",
         );
     }
     // Build the SnapshotMetadata the trait now takes. The record
@@ -724,6 +907,12 @@ async fn resume_from_fc_snapshot(
             },
         )
         .await?;
+    // ADR 0028 A.log: this is a rung-1 restore (coherent memory
+    // checkpoint) — rewind the transcript to the checkpoint's cursor
+    // before the harness comes back, so the resumed agent's first
+    // events append after an honest recovery boundary, not after
+    // messages it never made. No-op for a checkpoint that was the head.
+    apply_rung1_rewind(&state, id, record.events_cursor).await;
     // Refresh the session row so finish_resume_to_active sees the
     // freshly-bound host_id + sandbox_id (the caller might've raced
     // a concurrent writer between bind_resumed_session and now).

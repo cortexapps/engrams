@@ -43,6 +43,56 @@ pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) 
         })
 }
 
+/// The system's cold-boot `SandboxSpec` shape — a fresh kernel boot
+/// (not a snapshot restore) with manifest-derived resources, env, and
+/// the ADR 0027 aux bundles (current generations: a fresh boot has no
+/// snapshot device model to pin against).
+///
+/// Two callers, by design the SAME shape (ADR 0028):
+/// - base-snapshot capture at image enable (`enabled_images.rs`),
+///   `rootfs_manifest = None` — the image's own rootfs;
+/// - disk-only cold-boot recovery (`evacuation.rs` Fix B),
+///   `rootfs_manifest = Some(live_disk_manifest)` — a fresh kernel
+///   mounting the session's evolved rootfs lineage.
+pub(crate) fn cold_boot_spec(
+    image_uri: &str,
+    manifest: &engram_core::types::ImageManifest,
+    rootfs_manifest: Option<engram_core::types::manifest::ManifestRef>,
+) -> engram_core::types::sandbox::SandboxSpec {
+    use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+
+    let vcpus = manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS);
+    let memory_mib = resolved_memory_mib(manifest);
+    let disk_gib = manifest
+        .resources
+        .suggested_disk_gib
+        .unwrap_or(DEFAULT_DISK_GIB);
+
+    // ADR 0027: the `skills` bundle is universal; `playwright` rides
+    // only when the image opted in.
+    let mut aux_ro_drives = vec![AuxRoDrive::skills()];
+    if manifest.browser_enabled() {
+        aux_ro_drives.push(AuxRoDrive::playwright());
+    }
+
+    SandboxSpec {
+        image: image_uri.to_string(),
+        rootfs_source: None,
+        image_uri: Some(image_uri.to_string()),
+        rootfs_manifest,
+        cpu: CpuLimit { vcpus },
+        memory: MemoryLimit {
+            max_mib: memory_mib,
+        },
+        disk: DiskLimit { max_gib: disk_gib },
+        ttl: None,
+        env: manifest.env.clone(),
+        workdir: None,
+        network: manifest.network.clone(),
+        aux_ro_drives,
+    }
+}
+
 /// Inject resolved secrets into the sandbox env according to the
 /// manifest's `secret_mode`.
 ///

@@ -111,16 +111,40 @@ fn build_event_stream(
 }
 
 fn persisted_to_sse(ev: engram_core::types::PersistedEvent) -> Event {
+    // ADR 0028 A.log: fold the rewind metadata into the data object so
+    // the transcript can grey/collapse tombstoned events and segment by
+    // recovery epoch. Underscore-prefixed to never collide with a
+    // SessionEvent field. `_rewound` true → this event was rolled back
+    // by a rung-1 recovery (kept for audit, not the live head).
+    let rewound = ev.rewound_at.is_some();
+    let data = with_rewind_meta(ev.payload, ev.recovery_epoch, rewound);
     Event::default()
         .id(ev.idx.to_string())
         .event(ev.kind)
-        .data(ev.payload.to_string())
+        .data(data)
 }
 
 fn indexed_to_sse(indexed: IndexedEvent) -> Event {
-    let payload = serde_json::to_string(&indexed.event).unwrap_or_else(|_| "{}".into());
+    // Live events are, by construction, never tombstoned (they were
+    // just emitted). They carry the session's current epoch — but the
+    // boundary `recovered_from_checkpoint` event itself carries the
+    // new epoch in its payload, so the web tracks "current epoch" from
+    // that and live events ride along as not-rewound.
+    let payload = serde_json::to_value(&indexed.event).unwrap_or(serde_json::Value::Null);
+    let data = with_rewind_meta(payload, 0, false);
     Event::default()
         .id(indexed.idx.to_string())
         .event(indexed.event.kind())
-        .data(payload)
+        .data(data)
+}
+
+/// Merge ADR 0028 A.log rewind metadata into an event's data object.
+/// Non-object payloads (shouldn't happen for our typed events) pass
+/// through unchanged.
+fn with_rewind_meta(mut payload: serde_json::Value, recovery_epoch: i64, rewound: bool) -> String {
+    if let serde_json::Value::Object(map) = &mut payload {
+        map.insert("_recovery_epoch".into(), recovery_epoch.into());
+        map.insert("_rewound".into(), rewound.into());
+    }
+    payload.to_string()
 }

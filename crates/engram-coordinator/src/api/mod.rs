@@ -21,7 +21,9 @@ pub mod principal;
 mod prompt;
 mod registries;
 pub(crate) mod session_auth;
-mod sessions;
+// `pub(crate)`: `evacuation::resolve_cold_boot_spec` (ADR 0028 Fix B)
+// reuses `cold_boot_spec` / the resource helpers from outside `api`.
+pub(crate) mod sessions;
 mod sessions_inspect;
 mod shell;
 pub mod snapshot;
@@ -63,6 +65,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/sessions/:id/shell", get(shell::shell))
         .route("/sessions/:id/log", get(sessions_inspect::log))
         .route("/sessions/:id/cow-state", get(sessions_inspect::cow_state))
+        .route(
+            "/sessions/:id/checkpoints",
+            get(sessions_inspect::checkpoints),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             principal::require_session_owner,

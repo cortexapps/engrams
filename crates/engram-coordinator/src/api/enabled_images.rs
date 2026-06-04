@@ -42,7 +42,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
-use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{EnabledImage, EnabledImageSummary, ImageManifest};
 use engram_core::MetaError;
@@ -543,45 +542,13 @@ pub(crate) async fn capture_and_record_base_snapshot(
         }
     }
 
-    let vcpus = manifest
-        .resources
-        .suggested_vcpus
-        .unwrap_or(crate::api::sessions::DEFAULT_VCPUS);
-    // ADR 0027: floor memory for browser-enabled images (the headless
-    // browser needs ~250-400 MB). Shared helper so capture + restore agree.
-    let memory_mib = crate::api::sessions::resolved_memory_mib(manifest);
-    let disk_gib = manifest
-        .resources
-        .suggested_disk_gib
-        .unwrap_or(crate::api::sessions::DEFAULT_DISK_GIB);
-
-    // ADR 0027: attach the read-only bundles as aux virtio-blk drives so
-    // they're embedded in the base snapshot (the only cold boot per image)
-    // and re-anchor on every restore. The `skills` bundle is universal;
-    // `playwright` rides only when the image opted in.
-    let mut aux_ro_drives = vec![AuxRoDrive::skills()];
-    if manifest.browser_enabled() {
-        aux_ro_drives.push(AuxRoDrive::playwright());
-    }
-
     // Anonymous capture spec — no session env, no harness pack (the
     // host substitutes its stub harness so the snapshot carries a
-    // harness drive slot for per-session swap at restore).
-    let spec = SandboxSpec {
-        image: row.image_uri.clone(),
-        rootfs_source: None,
-        image_uri: Some(row.image_uri.clone()),
-        cpu: CpuLimit { vcpus },
-        memory: MemoryLimit {
-            max_mib: memory_mib,
-        },
-        disk: DiskLimit { max_gib: disk_gib },
-        ttl: None,
-        env: manifest.env.clone(),
-        workdir: None,
-        network: manifest.network.clone(),
-        aux_ro_drives,
-    };
+    // harness drive slot for per-session swap at restore). ADR 0027
+    // bundles + ADR 0027 memory floor live inside the shared helper;
+    // capture + restore MUST agree on `mem_size_mib` (FC requires it),
+    // and ADR 0028's disk-only recovery boots the same shape.
+    let spec = crate::api::sessions::cold_boot_spec(&row.image_uri, manifest, None);
 
     let (host_id, host) = state.host_registry.pick_capture_host().ok_or_else(|| {
         ApiError::Unavailable(
@@ -642,6 +609,8 @@ pub(crate) async fn capture_and_record_base_snapshot(
             disk_manifest: meta.disk_manifest,
             memory_manifest: meta.memory_manifest,
             recoverable,
+            // Template artifact — no session, no event log.
+            events_cursor: None,
         })
         .await?;
 

@@ -251,6 +251,14 @@ async fn main() -> Result<(), HostAgentError> {
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
             fc_cfg.host_id = Some(host_id);
+            // ADR 0028 Fix A: arm KVM dirty tracking fleet-wide so every
+            // capture after the chain's first can be a Diff (O(dirty)
+            // pause). Tied to the same env knob as the checkpoint driver —
+            // tracking has a steady-state write-protect cost that's only
+            // worth paying when diffs are actually taken.
+            fc_cfg.track_dirty_pages = engram_host_agent::checkpoint::CheckpointConfig::from_env()
+                .interval
+                .is_some();
             // ADR 0019: a guest-reachable OTLP collector endpoint (e.g. the
             // TAP gateway IP : the collector's port). When set, cold-boot
             // boot_args carry `engram_otel=<this>` so the in-guest agentd
