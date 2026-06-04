@@ -709,7 +709,7 @@ pub async fn finish_resume_to_active(
     // a second SecretStore round-trip on the resume hot path.
     // `resolve_session_env` folds the manifest env + secrets + the
     // per-request overrides identically to the `/exec` path.
-    let (resume_bundle, resume_base_env) =
+    let (resume_bundle, resume_base_env, harness_broker_secret) =
         crate::api::sessions::resolve_session_env(state, session).await;
     // ADR 0021 P1.3: resolve_harness reads the image manifest's
     // [harness] block + the session's mode, not a per-session
@@ -759,6 +759,7 @@ pub async fn finish_resume_to_active(
                 &b.bundle,
                 &b.manifest,
                 &b.env,
+                harness_broker_secret.as_ref(),
             )
             .await
             .unwrap_or_else(|| placeholder_egress_policy(id, new_sandbox_id)),

@@ -100,9 +100,15 @@ dials only on the first user message), so the base capture is connection-clean.
   session id. `Interrupt` becomes SIGINT-the-turn-but-keep-the-process-alive. A mid-turn vsock
   drop drains the turn to its boundary (so claude never wedges on a full stdout pipe) before
   reconnecting.
-- **P2 Claude token → Broker.** Rework `inject_user_claude_token` to inject a placeholder + a
-  per-session `SessionEgressPolicy` secret (placeholder→real, allow `api.anthropic.com`); set
-  `secret_mode = broker` on the Claude images; route the web-form token through the broker path.
+- **P2 harness credential → Broker.** A generic `broker_secret(env, session, name, real,
+  allow_hosts)` primitive injects a deterministic placeholder into the guest env and returns an
+  `EgressSecretEntry`; `inject_harness_broker_secret` dispatches per harness (today: the built-in
+  Claude harness's per-user OAuth token → `CLAUDE_CODE_OAUTH_TOKEN`, allow `api.anthropic.com`).
+  The entry is folded into the create + resume `SessionEgressPolicy`. **No `secret_mode` flip
+  needed** — the proxy's `decide()` MITMs/substitutes purely on a matching `SecretEntry`, ignoring
+  `secret_mode` — so this is independent of the image's declared-secret mode and brokers
+  unconditionally for builtin-claude sessions. (The substitution chain was already wired via
+  ADR 0006; the prior "broker not wired" comments were stale.)
 - **P3 Late-bind.** New `HarnessCommand::Bind { session_env, first_prompt, claude_session_id }`;
   the harness stores `session_env` and layers it onto each `claude` child's env, and sets the
   first prompt. `HarnessHub::bind()` sends it over the existing vsock channel.
@@ -131,6 +137,15 @@ dials only on the first user message), so the base capture is connection-clean.
   cold automatically. Content-keyed reuse means enabling warm-capture requires a fresh capture.
 - **Follow-up (separate ADR):** host-side egress-proxy **upstream connection pooling** would kill
   the network-handshake half of resume/turn latency, harness-agnostic. Out of scope here.
+- **Follow-up (separate ADR): manifest-declared harness broker credentials.** P2's
+  `inject_harness_broker_secret` dispatches in code (`match harness.name { "claude" => … }`) with the
+  env-var name + allow-hosts hardcoded per harness. The clean end state is to declare the broker
+  credential as **data in the harness manifest** — `(env var, allow_hosts, source)`, where `source`
+  is e.g. "the session owner's saved OAuth token of kind K" — and have the coord resolve + broker it
+  generically with no per-harness code. That needs a harness-manifest schema addition + a per-user-
+  token secret *source* in the SecretStore resolver (which must learn the session owner/principal).
+  Deferred to keep this ADR scoped; the `broker_secret` primitive is already harness-agnostic, so
+  this is purely about moving the credential *spec* from code to manifest.
 
 ## Risks
 

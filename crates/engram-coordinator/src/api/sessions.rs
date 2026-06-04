@@ -99,11 +99,14 @@ pub(crate) fn cold_boot_spec(
 /// In `Literal` mode, real values land as env vars — fine for the dev
 /// loop, never use in production.
 ///
-/// In `Broker` mode, *placeholder* env vars land — the per-session
-/// network proxy substitutes the real value only on outbound HTTPS
-/// requests to the secret's `allow_hosts`. Today the proxy isn't
-/// wired yet, so Broker mode results in placeholders that don't
-/// authenticate anything; documented as next-round work in DESIGN.md.
+/// In `Broker` mode, *placeholder* env vars land — the per-session egress
+/// proxy substitutes the real value only on outbound HTTPS requests to the
+/// secret's `allow_hosts`. The substitution IS wired: the create/resume
+/// handlers build a [`SessionEgressPolicy`] (placeholder→real per secret)
+/// and ship it to the host-agent's proxy registry via `start_agent` /
+/// `apply_egress_policy` (ADR 0006). This function only sets the in-guest
+/// placeholders; the policy build folds the same secrets into the
+/// registered keyring.
 fn apply_secrets_to_env(
     env: &mut HashMap<String, String>,
     bundle: &SecretBundle,
@@ -130,17 +133,16 @@ fn apply_secrets_to_env(
                 );
                 env.insert(name.clone(), placeholder);
             }
-            // TODO(secrets-broker): register the keyring with the
-            // per-session proxy here, and have the proxy substitute
-            // placeholders on outbound HTTPS requests whose host
-            // matches `schema.allow_hosts` / `schema.allow_host_patterns`.
-            // Until that lands, Broker-mode images will see
-            // unsubstituted placeholders and any real-API calls fail.
-            tracing::warn!(
+            // The real value reaches the proxy via the SessionEgressPolicy
+            // the create/resume handlers register (placeholder→real per
+            // secret, keyed on guest IP); the proxy substitutes on outbound
+            // requests whose host matches `schema.allow_hosts` /
+            // `allow_host_patterns`. See `build_resume_egress_policy` and the
+            // create-path policy build.
+            tracing::debug!(
                 %session,
                 secret_count = bundle.secrets.len(),
-                "secret broker proxy is not yet implemented; \
-                 placeholders will not be substituted on outbound traffic",
+                "broker-mode placeholders injected; proxy substitutes per the session egress policy",
             );
         }
     }
@@ -284,7 +286,11 @@ pub(crate) async fn resume_manifest_bundle(
 pub(crate) async fn resolve_session_env(
     state: &SharedState,
     session: &Session,
-) -> (Option<ResumeManifestBundle>, HashMap<String, String>) {
+) -> (
+    Option<ResumeManifestBundle>,
+    HashMap<String, String>,
+    Option<engram_core::types::egress::EgressSecretEntry>,
+) {
     let bundle = match resume_manifest_bundle(state, session).await {
         Ok(b) => Some(b),
         Err(e) => {
@@ -318,6 +324,12 @@ pub(crate) async fn resolve_session_env(
     // needs these in its env again). Keyed on the session's stored owner;
     // best-effort — an unparseable/legacy user_id or missing auth runtime just
     // skips it.
+    //
+    // ADR 0037: the harness credential is brokered — `inject_harness_broker_secret`
+    // puts a (deterministic, so it matches the create-time one) placeholder in
+    // `env` and hands back the `EgressSecretEntry`; we bubble it up so the
+    // caller folds it into the rebuilt resume egress policy.
+    let mut harness_broker_secret = None;
     if let (Some(rt), Some(uid_str)) = (state.auth.as_ref(), session.user_id.as_ref()) {
         if let Ok(uuid) = uid_str.parse::<uuid::Uuid>() {
             match rt.users.get_user(engram_core::UserId(uuid)).await {
@@ -326,8 +338,15 @@ pub(crate) async fn resolve_session_env(
                     env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
                     env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
                     let harness = bundle.as_ref().and_then(|b| b.manifest.harness.as_ref());
-                    inject_user_claude_token(state, &principal, harness, session.mode, &mut env)
-                        .await;
+                    harness_broker_secret = inject_harness_broker_secret(
+                        state,
+                        &principal,
+                        harness,
+                        session.mode,
+                        &mut env,
+                        session.id,
+                    )
+                    .await;
                 }
                 Err(e) => tracing::warn!(
                     session_id = %session.id,
@@ -338,7 +357,7 @@ pub(crate) async fn resolve_session_env(
         }
     }
 
-    (bundle, env)
+    (bundle, env, harness_broker_secret)
 }
 
 /// ADR 0016 §A.1.7: rebuild the post-resume [`SessionEgressPolicy`]
@@ -358,6 +377,7 @@ pub(crate) async fn build_resume_egress_policy(
     bundle: &SecretBundle,
     manifest: &ImageManifest,
     env_with_placeholders: &HashMap<String, String>,
+    harness_broker_secret: Option<&engram_core::types::egress::EgressSecretEntry>,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
     let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
@@ -368,6 +388,7 @@ pub(crate) async fn build_resume_egress_policy(
         bundle,
         manifest,
         env_with_placeholders,
+        harness_broker_secret,
     ))
 }
 
@@ -384,6 +405,7 @@ pub(crate) fn assemble_resume_egress_policy(
     bundle: &SecretBundle,
     manifest: &ImageManifest,
     env_with_placeholders: &HashMap<String, String>,
+    harness_broker_secret: Option<&engram_core::types::egress::EgressSecretEntry>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     let mut secrets = Vec::new();
     for (name, resolved) in &bundle.secrets {
@@ -401,6 +423,12 @@ pub(crate) fn assemble_resume_egress_policy(
             allow_hosts: resolved.schema.allow_hosts.clone(),
             allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
         });
+    }
+    // ADR 0037: the brokered harness credential isn't a manifest secret, so
+    // fold it in explicitly (its placeholder already rode into env via
+    // resolve_session_env → inject_harness_broker_secret).
+    if let Some(s) = harness_broker_secret {
+        secrets.push(s.clone());
     }
     engram_core::types::egress::SessionEgressPolicy {
         session_id,
@@ -736,12 +764,16 @@ async fn create_session_inner(
     // Claude Code OAuth token — we never prompt per-session. Best-effort: a
     // missing/unopenable token must not fail create (the harness then falls
     // back to its own login path; the web gates create on a saved token).
-    inject_user_claude_token(
+    // ADR 0037: the harness credential (if any) is brokered — `session_env`
+    // gets a placeholder; the real value rides the egress policy (below) so
+    // the proxy substitutes it on the wire.
+    let harness_broker_secret = inject_harness_broker_secret(
         &state,
         &principal,
         manifest.harness.as_ref(),
         req.mode,
         &mut session_env,
+        session_id,
     )
     .await;
 
@@ -902,6 +934,12 @@ async fn create_session_inner(
                     allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
                 });
             }
+            // ADR 0037: fold in the brokered harness credential (its
+            // placeholder is what `inject_harness_broker_secret` put in
+            // session_env) so the proxy substitutes the real value.
+            if let Some(s) = &harness_broker_secret {
+                secrets.push(s.clone());
+            }
             Some(engram_core::types::egress::SessionEgressPolicy {
                 session_id,
                 sandbox_id,
@@ -959,7 +997,9 @@ async fn create_session_inner(
             guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
             network_allow_hosts: network_for_proxy.allow_hosts.clone(),
             network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
-            secrets: Vec::new(),
+            // Keep the brokered harness credential even in the no-guest-IP
+            // fallback policy (refined later via apply_egress_policy).
+            secrets: harness_broker_secret.clone().into_iter().collect(),
             secret_mode: manifest.secret_mode,
         }
     });
@@ -1139,37 +1179,88 @@ async fn try_restore_base_snapshot(
 /// the session drives it (agent mode). Best-effort — a missing or unopenable
 /// token is logged, never fatal, so the harness can still fall back to its own
 /// login path. Shared by the create and resume paths.
-async fn inject_user_claude_token(
+/// ADR 0037: broker a secret — generic, harness-agnostic. Puts a
+/// deterministic placeholder into the guest env under `name` and returns
+/// the [`EgressSecretEntry`] the caller folds into the session's egress
+/// policy, so the proxy substitutes `real_value` on the wire only for
+/// `allow_hosts`. The real value never enters guest RAM (or a snapshot of
+/// it). The placeholder is deterministic in `(session, name)` — same shape
+/// as `apply_secrets_to_env`'s — so create and resume, which resolve it
+/// independently, agree and the proxy's table stays valid across an
+/// idle→resume.
+fn broker_secret(
+    session_env: &mut HashMap<String, String>,
+    session_id: SessionId,
+    name: &str,
+    real_value: String,
+    allow_hosts: Vec<String>,
+) -> engram_core::types::egress::EgressSecretEntry {
+    let placeholder = format!(
+        "engram_ph_{}_{}",
+        session_id.as_uuid().simple(),
+        short_hash(name),
+    );
+    session_env.insert(name.to_string(), placeholder.clone());
+    engram_core::types::egress::EgressSecretEntry {
+        placeholder,
+        real_value,
+        allow_hosts,
+        allow_host_patterns: Vec::new(),
+    }
+}
+
+/// Resolve and broker the *harness's* credential into `session_env`,
+/// returning the policy entry (or `None` if there's nothing to broker).
+/// The brokering itself is generic ([`broker_secret`]); the only
+/// per-harness knowledge is which credential the harness needs and where
+/// it may be sent — currently the built-in Claude harness's per-user
+/// OAuth token (ADR 0031), bound to `api.anthropic.com`. New built-in
+/// harnesses add a match arm here; the cleaner end state is declaring
+/// `(env var, allow_hosts, source)` in the harness manifest so this is
+/// pure data (follow-up).
+///
+/// Best-effort: a missing/unopenable credential returns `None` (harness
+/// falls back to its own login); never fails create.
+async fn inject_harness_broker_secret(
     state: &SharedState,
     principal: &engram_core::types::user::Principal,
     harness: Option<&engram_core::types::image::HarnessManifest>,
     mode: SessionMode,
-    session_env: &mut std::collections::HashMap<String, String>,
-) {
-    let is_builtin_claude =
-        harness.and_then(|h| h.name.as_deref()) == Some("claude") && !mode.is_dev_vm();
-    if !is_builtin_claude {
-        return;
+    session_env: &mut HashMap<String, String>,
+    session_id: SessionId,
+) -> Option<engram_core::types::egress::EgressSecretEntry> {
+    if mode.is_dev_vm() {
+        return None;
     }
-    let Some(rt) = state.auth.as_ref() else {
-        return;
-    };
-    let kind = engram_core::types::user::UserToken::KIND_CLAUDE_OAUTH;
-    match rt.users.get_user_token(principal.user_id, kind).await {
-        Ok(Some(tok)) => {
-            match engram_auth::open_user_token(state.services.kek.as_ref(), &tok).await {
-                Ok(plain) => {
-                    session_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), plain);
+    match harness.and_then(|h| h.name.as_deref()) {
+        Some("claude") => {
+            let rt = state.auth.as_ref()?;
+            let kind = engram_core::types::user::UserToken::KIND_CLAUDE_OAUTH;
+            let plain = match rt.users.get_user_token(principal.user_id, kind).await {
+                Ok(Some(tok)) => {
+                    match engram_auth::open_user_token(state.services.kek.as_ref(), &tok).await {
+                        Ok(plain) => plain,
+                        Err(e) => {
+                            tracing::warn!(user_id = %principal.user_id, error = %e, "could not open saved Claude token");
+                            return None;
+                        }
+                    }
                 }
+                Ok(None) => return None,
                 Err(e) => {
-                    tracing::warn!(user_id = %principal.user_id, error = %e, "could not open saved Claude token")
+                    tracing::warn!(user_id = %principal.user_id, error = %e, "could not load saved Claude token");
+                    return None;
                 }
-            }
+            };
+            Some(broker_secret(
+                session_env,
+                session_id,
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                plain,
+                vec!["api.anthropic.com".to_string()],
+            ))
         }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(user_id = %principal.user_id, error = %e, "could not load saved Claude token")
-        }
+        _ => None,
     }
 }
 
@@ -1618,6 +1709,78 @@ mod tests {
         assert_eq!(resolved_memory_mib(&mk(true, None)), DEFAULT_MEMORY_MIB);
     }
 
+    /// ADR 0037: the generic brokering primitive puts a *placeholder* in
+    /// the guest env (never the real value) and returns the policy entry;
+    /// the placeholder is deterministic in (session, name) so create and
+    /// resume agree across an idle→resume.
+    #[test]
+    fn broker_secret_injects_placeholder_not_real_value() {
+        let sid = SessionId::new();
+        let mut env = HashMap::new();
+        let entry = broker_secret(
+            &mut env,
+            sid,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "sk-real-do-not-leak".to_string(),
+            vec!["api.anthropic.com".to_string()],
+        );
+        let ph = env
+            .get("CLAUDE_CODE_OAUTH_TOKEN")
+            .expect("placeholder injected into env");
+        assert!(ph.starts_with("engram_ph_"), "placeholder shape: {ph}");
+        assert_ne!(ph, "sk-real-do-not-leak", "real value must never be in env");
+        assert_eq!(&entry.placeholder, ph);
+        assert_eq!(entry.real_value, "sk-real-do-not-leak");
+        assert_eq!(entry.allow_hosts, vec!["api.anthropic.com".to_string()]);
+        // Deterministic in (session, name): the resume-time call reproduces it.
+        let mut env2 = HashMap::new();
+        let entry2 = broker_secret(
+            &mut env2,
+            sid,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "other".into(),
+            vec![],
+        );
+        assert_eq!(entry.placeholder, entry2.placeholder);
+    }
+
+    /// ADR 0037: the brokered harness credential (which is NOT a manifest
+    /// `[secrets]` entry) is folded into the resume egress policy so the
+    /// proxy substitutes it.
+    #[test]
+    fn assemble_resume_egress_policy_folds_harness_broker_secret() {
+        let manifest = ImageManifest {
+            name: "test".into(),
+            secret_mode: SecretMode::Literal,
+            ..Default::default()
+        };
+        let bundle = SecretBundle {
+            secrets: HashMap::new(),
+        };
+        let harness_secret = engram_core::types::egress::EgressSecretEntry {
+            placeholder: "engram_ph_x_y".into(),
+            real_value: "sk-real".into(),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            allow_host_patterns: vec![],
+        };
+        let policy = assemble_resume_egress_policy(
+            SessionId::new(),
+            SandboxId::new(),
+            "10.200.0.7".parse().unwrap(),
+            &bundle,
+            &manifest,
+            &HashMap::new(),
+            Some(&harness_secret),
+        );
+        assert_eq!(policy.secrets.len(), 1, "harness broker secret folded in");
+        assert_eq!(policy.secrets[0].placeholder, "engram_ph_x_y");
+        assert_eq!(policy.secrets[0].real_value, "sk-real");
+        assert_eq!(
+            policy.secrets[0].allow_hosts,
+            vec!["api.anthropic.com".to_string()]
+        );
+    }
+
     /// ADR 0016 §A.1.7 regression guard. The pure assembly path
     /// must:
     ///
@@ -1706,6 +1869,7 @@ mod tests {
             &bundle,
             &manifest,
             &env_with_ph,
+            None,
         );
 
         // 1. Real IP, not UNSPECIFIED.
@@ -1780,6 +1944,7 @@ mod tests {
             &bundle,
             &manifest,
             &env_with_ph,
+            None,
         );
 
         assert_eq!(policy.guest_ip, guest_ip);

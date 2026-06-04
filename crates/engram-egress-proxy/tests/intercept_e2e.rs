@@ -275,3 +275,123 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
         "upstream should not see any bytes when violation fires",
     );
 }
+
+/// Drive one MITM round-trip: a client trusting the engram CA sends
+/// `request` to `sni`; the proxy holds `secret`. Returns the proxy's
+/// outcome + the bytes the fake upstream captured. Consolidates the
+/// per-test boilerplate above.
+async fn intercept_roundtrip(
+    sni: &'static str,
+    secret: SecretEntry,
+    request: &[u8],
+) -> (Result<(), InterceptError>, Vec<u8>) {
+    let ca = ca();
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+    let resolver = Arc::new(StaticResolver::new().with(sni, upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let secrets: Vec<&SecretEntry> = vec![&secret];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            sni,
+            upstream_addr.port(),
+            resolver,
+            &secrets,
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let cert_pem = ca.cert_pem.clone();
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(
+            rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let cli_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(cli_cfg));
+    let server_name: rustls::pki_types::ServerName<'static> = sni.try_into().unwrap();
+    let mut tls_client = connector
+        .connect(server_name, client_to_proxy)
+        .await
+        .unwrap();
+    tls_client.write_all(request).await.unwrap();
+    tls_client.flush().await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut buf = [0u8; 1024];
+        let _ = tls_client.read(&mut buf).await;
+    })
+    .await;
+    let _ = tls_client.shutdown().await;
+    drop(tls_client);
+
+    let outcome = proxy_task.await.unwrap();
+    let bytes = captured.lock().clone();
+    (outcome, bytes)
+}
+
+/// ADR 0037: the brokered Claude OAuth token — the guest holds a
+/// placeholder in `CLAUDE_CODE_OAUTH_TOKEN`; the proxy substitutes the
+/// real value on the wire to api.anthropic.com so the credential never
+/// enters guest RAM (or a snapshot of it).
+#[tokio::test]
+async fn brokers_claude_oauth_token_to_anthropic_api() {
+    let ph = "engram_ph_deadbeefcafef00d_c1a0de01";
+    let secret = entry(ph, "sk-ant-oauth-REAL", &["api.anthropic.com"]);
+    let req = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer {ph}\r\nContent-Length: 0\r\n\r\n"
+    );
+    let (outcome, body) = intercept_roundtrip("api.anthropic.com", secret, req.as_bytes()).await;
+    if let Err(e) = &outcome {
+        let m = format!("{e}");
+        assert!(
+            m.contains("close_notify") || m.contains("UnexpectedEof"),
+            "unexpected proxy error: {e}",
+        );
+    }
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("Authorization: Bearer sk-ant-oauth-REAL"),
+        "the real OAuth token must reach api.anthropic.com after substitution; got: {body}",
+    );
+    assert!(
+        !body.contains(ph),
+        "the placeholder must not survive into the upstream payload",
+    );
+}
+
+/// ADR 0037 scopes the brokered token's allow-list to api.anthropic.com,
+/// so the placeholder reaching statsig telemetry is a *violation* (the
+/// connection is dropped) — never a silent substitution. The token can't
+/// leak off the API path.
+#[tokio::test]
+async fn claude_token_placeholder_to_statsig_is_a_violation() {
+    let ph = "engram_ph_deadbeefcafef00d_c1a0de01";
+    let secret = entry(ph, "sk-ant-oauth-REAL", &["api.anthropic.com"]);
+    let req = format!(
+        "POST /v1/log HTTP/1.1\r\nHost: statsig.anthropic.com\r\nAuthorization: Bearer {ph}\r\nContent-Length: 0\r\n\r\n"
+    );
+    let (outcome, body) =
+        intercept_roundtrip("statsig.anthropic.com", secret, req.as_bytes()).await;
+    assert!(
+        matches!(outcome, Err(InterceptError::Violation { .. })),
+        "placeholder to a non-allowed host must be a Violation; got: {outcome:?}",
+    );
+    assert!(
+        body.is_empty(),
+        "no bytes (and certainly not the token) may reach a disallowed upstream",
+    );
+}
