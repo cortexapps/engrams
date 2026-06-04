@@ -956,10 +956,12 @@ async fn e2e_persistent_claude_socket_across_resume() {
     }
     cleanup_host_state();
 
+    // Default short so this is a reasonable CI citizen; bump via
+    // ENGRAM_SPIKE_IDLE_SECS for a longer real-world idle when probing.
     let idle_secs: u64 = std::env::var("ENGRAM_SPIKE_IDLE_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(75);
+        .unwrap_or(15);
 
     let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
     let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
@@ -1111,4 +1113,278 @@ async fn e2e_persistent_claude_socket_across_resume() {
 
     pooled.destroy(sandbox_id).await.expect("destroy");
     cleanup_host_state();
+
+    // CI gate: a persistent claude must survive the freeze and round-trip
+    // all three turns (1 pre-freeze + 2 post-resume). <3 results or a dead
+    // process means the connection didn't recover across idle->resume.
+    assert!(
+        results >= 3,
+        "expected 3 result events (all turns round-tripped across pause/resume), got {results}\n{c3}",
+    );
+    assert_eq!(
+        alive_final, "ALIVE",
+        "persistent claude did not survive the freeze",
+    );
+}
+
+// ====================================================================
+// ADR 0037 P1 e2e: the REWRITTEN harness drives a PERSISTENT claude
+// across MULTIPLE turns and an FC pause/resume — the load-bearing new
+// behavior nothing else covers (the cold/warm tests above are
+// single-turn). Runs in CI via the test-firecracker job's
+// `--test e2e_harness --run-ignored ignored-only`.
+//
+// Unlike `drive_harness` (one prompt via ENGRAM_INITIAL_PROMPT), this
+// sends a SECOND prompt over the harness command channel after turn 1
+// completes, with an FC pause/resume in between, and asserts TWO
+// RunCompleted events on ONE persistent harness/claude (no respawn, no
+// reconnect — pause/resume freezes the guest but keeps the host vsock).
+// Bogus token → each turn 401s, which is fine: we're testing the
+// harness turn-loop + persistence, not API semantics.
+// ====================================================================
+
+/// Like `capture_sink` but also returns a sender the test can use to
+/// push `HarnessCommand`s (e.g. a follow-up `Prompt`) down the harness
+/// connection. The sink task multiplexes reading events + forwarding
+/// commands on the one stream. The command receiver is taken on the
+/// first connection (pause/resume keeps a single connection, so there's
+/// no reconnect to contend with).
+fn capture_sink_with_sender() -> (
+    engram_core::traits::HarnessSink,
+    Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>>,
+    tokio::sync::mpsc::Sender<engram_harness_proto::HarnessCommand>,
+) {
+    let collected: Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<engram_harness_proto::HarnessCommand>(8);
+    let cmd_rx_slot = Arc::new(Mutex::new(Some(cmd_rx)));
+    let collected_for_sink = collected.clone();
+    let cmd_rx_for_sink = cmd_rx_slot.clone();
+    let sink: engram_core::traits::HarnessSink = Arc::new(move |mut stream| {
+        let collected = collected_for_sink.clone();
+        let mut cmd_rx = cmd_rx_for_sink.lock().take();
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(stream.as_mut());
+            let _attach: engram_harness_proto::HarnessAttach =
+                match engram_harness_proto::read_msg(&mut reader).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("--- sink handshake read failed: {e} ---");
+                        return;
+                    }
+                };
+            if let Err(e) = engram_harness_proto::write_msg(
+                &mut writer,
+                &engram_harness_proto::HarnessAttachAck {
+                    ok: true,
+                    message: None,
+                },
+            )
+            .await
+            {
+                eprintln!("--- sink ack write failed: {e} ---");
+                return;
+            }
+            loop {
+                tokio::select! {
+                    frame = engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(&mut reader) => {
+                        match frame {
+                            Ok(engram_harness_proto::HarnessFrame::Event(ev)) => {
+                                eprintln!("--- captured HarnessEvent: {ev:?} ---");
+                                collected.lock().push(ev);
+                            }
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    cmd = async {
+                        match cmd_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending::<Option<engram_harness_proto::HarnessCommand>>().await,
+                        }
+                    } => {
+                        match cmd {
+                            Some(c) => {
+                                let _ = engram_harness_proto::write_msg(
+                                    &mut writer,
+                                    &engram_harness_proto::HarnessFrame::Command(c),
+                                )
+                                .await;
+                            }
+                            None => cmd_rx = None,
+                        }
+                    }
+                }
+            }
+        });
+    });
+    (sink, collected, cmd_tx)
+}
+
+/// Count `RunCompleted` events in the capture buffer, polling until
+/// `want` is reached or `budget` elapses. Returns the final count.
+async fn wait_run_completed(
+    captured: &Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>>,
+    want: usize,
+    budget: Duration,
+) -> usize {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let n = captured
+            .lock()
+            .iter()
+            .filter(|e| matches!(e, engram_harness_proto::HarnessEvent::RunCompleted { .. }))
+            .count();
+        if n >= want || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + KVM + FC + Docker + sudo + internet egress to api.anthropic.com"]
+async fn e2e_harness_multiturn_across_resume() {
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !require_root() {
+        return;
+    }
+    cleanup_host_state();
+
+    let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
+    let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
+    let rootfs_path =
+        bake_harness_rootfs("engram-e2e-harness-multiturn", &harness_bin, &claude_bin).await;
+
+    let work = tempfile::tempdir().expect("work");
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg.net_pool = Some("10.200.0.0".parse().unwrap());
+    cfg.egress_proxy_port = Some(proxy_port);
+    let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
+    fc.host_startup().await.expect("host_startup");
+    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+
+    let (sink, captured, cmd_tx) = capture_sink_with_sender();
+    fc.set_harness_sink(sink);
+
+    let spec = SandboxSpec {
+        image: "engram-e2e-harness-multiturn".into(),
+        rootfs_source: Some(rootfs_path),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 2 },
+        memory: MemoryLimit { max_mib: 512 },
+        disk: DiskLimit { max_gib: 2 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let sandbox_id = pooled.create(spec).await.expect("create");
+    let guest_ip: std::net::Ipv4Addr = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30))
+        .await
+        .parse()
+        .unwrap();
+
+    let session_id = engram_core::SessionId::new();
+    let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
+    let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
+    registry.register(engram_egress_proxy::SessionState {
+        session_id,
+        guest_ip,
+        network_allow,
+        secrets: Vec::new(),
+    });
+
+    // ---- Turn 1 via the harness (ENGRAM_INITIAL_PROMPT) ----
+    let port = engram_harness_proto::HARNESS_VSOCK_PORT.to_string();
+    let argv = vec![
+        "/opt/engram/harness/harness".to_string(),
+        "--vsock-host".into(),
+        port,
+        "--session-id".into(),
+        session_id.to_string(),
+    ];
+    let mut env_map: HashMap<String, String> = HashMap::new();
+    env_map.insert("ENGRAM_INITIAL_PROMPT".into(), "turn one — say hi".into());
+    env_map.insert(
+        "CLAUDE_CODE_OAUTH_TOKEN".into(),
+        "sk-bogus-multiturn-test".into(),
+    );
+    env_map.insert("CLAUDE_CODE_MAX_RETRIES".into(), "0".into());
+    env_map.insert(
+        "PATH".into(),
+        "/opt/engram/harness:/usr/local/bin:/usr/bin:/bin".into(),
+    );
+    pooled
+        .start_agent(
+            sandbox_id,
+            AgentSpec {
+                argv,
+                env: env_map,
+                session_env: HashMap::new(),
+                host_ca_pem: Some(ca_pem.clone()),
+            },
+        )
+        .await
+        .expect("start_agent");
+
+    let n1 = wait_run_completed(&captured, 1, Duration::from_secs(90)).await;
+    assert!(n1 >= 1, "turn 1 never completed (got {n1} RunCompleted)");
+    eprintln!("MULTITURN: turn 1 complete ({n1} RunCompleted)");
+
+    // ---- FC pause/resume: freeze the guest (harness + its persistent
+    //      claude child) and thaw it. The host vsock connection
+    //      persists (pause is a vCPU freeze, not a teardown), so the
+    //      harness stays attached — no reconnect. ----
+    let st = fc.snapshot_state(sandbox_id).expect("snapshot_state");
+    let api = FirecrackerClient::new(&st.firecracker_socket);
+    api.pause().await.expect("pause");
+    eprintln!("MULTITURN: paused; idling 5s");
+    sleep(Duration::from_secs(5)).await;
+    api.resume().await.expect("resume");
+    eprintln!("MULTITURN: resumed");
+
+    // ---- Turn 2 over the command channel: must run on the SAME
+    //      persistent claude child (no respawn). ----
+    cmd_tx
+        .send(engram_harness_proto::HarnessCommand::Prompt {
+            text: "turn two — say bye".into(),
+        })
+        .await
+        .expect("send turn-2 prompt");
+
+    let n2 = wait_run_completed(&captured, 2, Duration::from_secs(90)).await;
+
+    // Diagnostics before asserting.
+    let events = captured.lock().clone();
+    let started = events
+        .iter()
+        .filter(|e| matches!(e, engram_harness_proto::HarnessEvent::RunStarted { .. }))
+        .count();
+    let completed = events
+        .iter()
+        .filter(|e| matches!(e, engram_harness_proto::HarnessEvent::RunCompleted { .. }))
+        .count();
+    eprintln!("MULTITURN: after turn 2 — RunStarted={started} RunCompleted={completed}");
+
+    pooled.destroy(sandbox_id).await.expect("destroy");
+    cleanup_host_state();
+
+    // The load-bearing assertion: TWO turns round-tripped on ONE
+    // persistent harness across a pause/resume. If the rewrite spawned
+    // a fresh claude per prompt, or the child didn't survive the freeze,
+    // or the `result`-frame turn boundary mis-fired, we'd see < 2.
+    assert!(
+        n2 >= 2,
+        "expected >=2 RunCompleted (two turns on one persistent child across pause/resume), got {n2}",
+    );
+    assert!(
+        started >= 2,
+        "expected >=2 RunStarted (one per turn), got {started}",
+    );
 }
