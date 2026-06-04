@@ -6,7 +6,7 @@ import { ModeToggle } from './mode-toggle';
 import { UserMenu } from './user-menu';
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent,
-  SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem,
+  SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarTrigger,
 } from '@/components/ui/sidebar';
 
 interface Dest {
@@ -30,10 +30,10 @@ export function MainSidebar() {
   const dests = DESTS.filter((d) => !d.adminOnly || isAdmin);
 
   return (
-    <Sidebar collapsible="icon">
+    <Sidebar collapsible="icon" className="border-r-sidebar">
       <div
         aria-hidden
-        className="bg-grid-fade pointer-events-none absolute inset-x-0 bottom-0 -z-10 h-64"
+        className="bg-carbon-fade pointer-events-none absolute inset-0 -z-10"
       />
       <SidebarHeader>
         <SidebarMenu>
@@ -69,9 +69,10 @@ export function MainSidebar() {
         </SidebarGroup>
       </SidebarContent>
 
-      <SidebarFooter>
+      <SidebarFooter className="bg-sidebar">
         <div className="flex items-center justify-between gap-2 px-1 group-data-[collapsible=icon]:flex-col">
           <ModeToggle />
+          <SidebarTrigger className="text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground" />
         </div>
         <UserMenu />
       </SidebarFooter>

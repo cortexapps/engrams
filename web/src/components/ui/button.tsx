@@ -9,16 +9,21 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        default: "bg-primary text-primary-foreground hover:bg-primary/90",
+        // Filled action buttons wear the racing voice: Saira in tracked caps.
+        // The primary is the lime "NEW SESSION" chip; destructive matches the
+        // family in signal red. Subtle variants stay quiet sans.
+        default:
+          "bg-primary text-primary-foreground hover:bg-primary/90 font-display uppercase tracking-[0.08em]",
         destructive:
-          "bg-destructive text-white hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:bg-destructive/60 dark:focus-visible:ring-destructive/40",
+          "bg-destructive text-white hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:bg-destructive/60 dark:focus-visible:ring-destructive/40 font-display uppercase tracking-[0.08em]",
         outline:
           "border bg-background shadow-xs hover:bg-accent hover:text-accent-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50",
         secondary:
           "bg-secondary text-secondary-foreground hover:bg-secondary/80",
         ghost:
           "hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent/50",
-        link: "text-primary underline-offset-4 hover:underline",
+        // Lime is invisible as text on the light paper; links read as ink.
+        link: "text-foreground underline underline-offset-4 hover:text-foreground/80",
       },
       size: {
         default: "h-9 px-4 py-2 has-[>svg]:px-3",
