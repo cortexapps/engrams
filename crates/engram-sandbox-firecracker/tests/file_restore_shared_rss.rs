@@ -42,13 +42,16 @@
 mod common;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use engram_chunk_store::{ChunkCache, ChunkCacheConfig, ChunkStore, ManifestKind};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
-use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig};
+use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
+use engram_storage_local::LocalBlobStorage;
+use tempfile::TempDir;
 
 use common::{fc_preflight, require_bin};
 
@@ -94,43 +97,7 @@ async fn file_backend_siblings_share_clean_pages() {
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
     // ---- 1. Bake a self-driving rootfs (init baked in via mke2fs -d) ----
-    // The Dockerfile COPYs the spike init verbatim into the image; the
-    // builder's mke2fs -d turns the image rootfs into ext4 with correct
-    // per-block checksums. No agent injection — the workload is fully
-    // self-driving, so the test never needs host→guest exec.
-    let src = tempfile::tempdir().expect("source dir");
-    std::fs::write(src.path().join("spike-init.sh"), SPIKE_INIT).expect("write init");
-    std::fs::write(
-        src.path().join("Dockerfile"),
-        "FROM debian:bookworm-slim\n\
-         COPY spike-init.sh /spike-init.sh\n\
-         RUN chmod 0755 /spike-init.sh\n",
-    )
-    .expect("write Dockerfile");
-    std::fs::write(
-        src.path().join("engram.toml"),
-        "name = \"fc-shared-rss-test\"\n",
-    )
-    .expect("write engram.toml");
-
-    let images = tempfile::tempdir().expect("images dir");
-    let chunk_root = tempfile::tempdir().expect("chunk store root");
-    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> = std::sync::Arc::new(
-        engram_storage_local::LocalBlobStorage::new(chunk_root.path().to_path_buf()),
-    );
-    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    let baker = Builder::new(DockerCli::new(), chunk_store);
-    let outcome = baker
-        .build(&BuildRequest {
-            source: src.path().to_path_buf(),
-            repo: "engram-shared-rss-test".into(),
-            tag: "warm-1".into(),
-            images_dir: images.path().to_path_buf(),
-            format: Format::Ext4,
-            agent_injection: None,
-        })
-        .await
-        .expect("ext4 bake");
+    let baked = bake_spike_rootfs().await;
 
     // ---- 2. Boot, let the blob fill, snapshot, destroy ----
     let work = tempfile::tempdir().expect("work dir");
@@ -141,7 +108,7 @@ async fn file_backend_siblings_share_clean_pages() {
 
     let spec = SandboxSpec {
         image: "fc-shared-rss-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: Some(baked.rootfs.clone()),
         image_uri: None,
         rootfs_manifest: None,
         cpu: CpuLimit { vcpus: 1 },
@@ -252,6 +219,236 @@ async fn file_backend_siblings_share_clean_pages() {
         "File-backend restores show no meaningful page sharing \
          (Σpss/Σrss = {pct}%) — MAP_PRIVATE page-cache sharing broken?",
     );
+}
+
+/// ADR 0022 Option A: the *production* density path, end to end —
+/// (a) materialize the per-template base memfile **from a chunk manifest**
+/// (the residency step `image_prefetch` runs), and (b) restore N siblings
+/// through the **File-mode base-create** bifurcation (`restore_fresh` with
+/// `base_restore_mode = File` while `restore_mode = Uffd` — exactly prod's
+/// "File for create, UFFD for resume"), asserting both page sharing and
+/// per-sibling restore latency.
+///
+/// Distinct from `file_backend_siblings_share_clean_pages` (which restores
+/// the snapshot's own freshly-written memory.bin via the resume flavor):
+/// here the memory.bin every sibling maps is **reconstructed from chunks**,
+/// proving the residency-materialized file is byte-faithful AND shareable,
+/// and the restore goes through the base-create mode bifurcation, not the
+/// global default. The resume-stays-UFFD half of the invariant is covered
+/// by the `effective_restore_mode_bifurcates_create_vs_resume` unit test +
+/// `snapshot_uffd.rs`.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + Docker + mke2fs; bakes a rootfs and boots microVMs"]
+async fn file_backend_base_create_shares_residency_memfile() {
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !require_bin("docker") || !require_bin("mke2fs") {
+        return;
+    }
+    std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
+
+    let baked = bake_spike_rootfs().await;
+
+    // Prod-shaped config: idle-resume on UFFD, base session.create flipped
+    // to File (ADR 0022). `restore_fresh` must therefore pick File even
+    // though `restore_mode` is Uffd — that's the bifurcation under test.
+    let work = tempfile::tempdir().expect("work dir");
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    cfg.net_pool = None;
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/spike-init.sh".into();
+    cfg.restore_mode = RestoreMode::Uffd;
+    cfg.base_restore_mode = Some(RestoreMode::File);
+    let backend = FirecrackerBackend::new(work.path(), cfg);
+
+    let spec = SandboxSpec {
+        image: "fc-shared-rss-test".into(),
+        rootfs_source: Some(baked.rootfs.clone()),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 256 },
+        disk: DiskLimit { max_gib: 2 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let source = backend.create(spec).await.expect("create");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let metadata = match backend.snapshot(source).await {
+        Ok(m) => m,
+        Err(e) => {
+            dump_fc_logs(work.path());
+            let _ = backend.destroy(source).await;
+            panic!("snapshot failed — source guest did not survive: {e}");
+        }
+    };
+    backend.destroy(source).await.expect("destroy source");
+
+    // ---- Residency materialize: chunk memory.bin, delete it, rebuild it
+    // from the manifest (what image_prefetch does at residency) ----
+    let mem_path = backend.snapshot_path_for(metadata.id).join("memory.bin");
+    let original = std::fs::read(&mem_path).expect("read captured memory.bin");
+
+    let store_root = tempfile::tempdir().expect("store root");
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
+        std::sync::Arc::new(LocalBlobStorage::new(store_root.path().join("blob")));
+    let chunk_store = ChunkStore::new(blob);
+    let cache = ChunkCache::new(ChunkCacheConfig {
+        root: store_root.path().join("cache"),
+        budget_bytes: 4 * 1024 * 1024 * 1024,
+    });
+    let memory_manifest = chunk_store
+        .chunk_file(&mem_path, ManifestKind::Memory, None)
+        .await
+        .expect("chunk memory.bin");
+
+    std::fs::remove_file(&mem_path).expect("delete captured memory.bin");
+    let mat = Instant::now();
+    chunk_store
+        .materialize_to_file_cached(&memory_manifest, &mem_path, &cache)
+        .await
+        .expect("re-materialize memory.bin from manifest");
+    eprintln!(
+        "SPIKE: residency materialize-from-manifest took {} ms",
+        mat.elapsed().as_millis()
+    );
+    assert_eq!(
+        std::fs::read(&mem_path).expect("read rematerialized memory.bin"),
+        original,
+        "residency-materialized memory.bin must be byte-identical to the captured one",
+    );
+
+    // ---- Restore N siblings via File-mode base-create (restore_fresh) ----
+    let mut vms = Vec::new();
+    let mut latencies_ms = Vec::new();
+    for i in 0..SIBLINGS {
+        let t = Instant::now();
+        let id = match backend.restore_fresh(metadata.clone()).await {
+            Ok(id) => id,
+            Err(e) => {
+                dump_fc_logs(work.path());
+                for v in &vms {
+                    let _ = backend.destroy(*v).await;
+                }
+                panic!("sibling {i} failed File-mode base-create off the residency memfile: {e:?}");
+            }
+        };
+        let ms = t.elapsed().as_millis();
+        eprintln!("SPIKE: file-restore sibling {i} = {ms} ms");
+        latencies_ms.push(ms);
+        vms.push(id);
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // ---- Measure density + latency ----
+    let mut total_rss = 0u64;
+    let mut total_pss = 0u64;
+    for (i, id) in vms.iter().enumerate() {
+        let pid = fc_pid_for(work.path(), &id.to_string());
+        let m = smaps_rollup(pid);
+        eprintln!(
+            "SPIKE: sibling {i} pid {pid}: rss {} KiB, pss {} KiB, shared_clean {} KiB, \
+             private_dirty {} KiB",
+            m.rss_kb, m.pss_kb, m.shared_clean_kb, m.private_dirty_kb,
+        );
+        assert!(
+            m.rss_kb > BLOB_MIB * 1024,
+            "sibling {i} rss {} KiB < blob size — in-guest workload didn't run",
+            m.rss_kb,
+        );
+        // Each sibling's Pss sits well below its Rss — the base working
+        // set is one physical copy split across the siblings mapping the
+        // shared memfile inode (≈3-way ⇒ Pss≈Rss/3). We assert on Pss/Rss
+        // (the density signal) rather than Shared_Clean specifically:
+        // because the residency step just *wrote* this memfile, its
+        // page-cache pages are still dirty (pending writeback) when the
+        // guests fault them, so the kernel classifies the shared pages as
+        // Shared_Dirty, not Shared_Clean — identical physical RAM, just a
+        // different smaps bucket. (In prod the memfile is materialized at
+        // residency long before the first session, so writeback has run
+        // and the same pages show up as Shared_Clean.)
+        assert!(
+            m.pss_kb * 2 < m.rss_kb,
+            "sibling {i} Pss {} KiB not << Rss {} KiB — residency memfile not shared?",
+            m.pss_kb,
+            m.rss_kb,
+        );
+        total_rss += m.rss_kb;
+        total_pss += m.pss_kb;
+    }
+    let pct = total_pss * 100 / total_rss.max(1);
+    latencies_ms.sort_unstable();
+    let median = latencies_ms[latencies_ms.len() / 2];
+    eprintln!(
+        "SPIKE: base-create Σpss/Σrss = {total_pss}/{total_rss} KiB = {pct}% \
+         (no sharing ⇒ ~100%; perfect 3-way ⇒ ~33%); restore median {median} ms"
+    );
+
+    for id in &vms {
+        backend.destroy(*id).await.expect("destroy sibling");
+    }
+
+    assert!(
+        pct < 80,
+        "File-mode base-create off the residency memfile shows no page sharing \
+         (Σpss/Σrss = {pct}%)",
+    );
+}
+
+/// Bake the self-driving spike rootfs (init baked in via `mke2fs -d`; see
+/// the module docs for why post-hoc `debugfs write` is avoided). Returns
+/// the ext4 rootfs path plus the tempdirs backing it — the caller must
+/// keep `Baked` alive for as long as the rootfs is in use.
+struct Baked {
+    rootfs: PathBuf,
+    _src: TempDir,
+    _images: TempDir,
+    _chunk_root: TempDir,
+}
+
+async fn bake_spike_rootfs() -> Baked {
+    let src = tempfile::tempdir().expect("source dir");
+    std::fs::write(src.path().join("spike-init.sh"), SPIKE_INIT).expect("write init");
+    std::fs::write(
+        src.path().join("Dockerfile"),
+        "FROM debian:bookworm-slim\n\
+         COPY spike-init.sh /spike-init.sh\n\
+         RUN chmod 0755 /spike-init.sh\n",
+    )
+    .expect("write Dockerfile");
+    std::fs::write(
+        src.path().join("engram.toml"),
+        "name = \"fc-shared-rss-test\"\n",
+    )
+    .expect("write engram.toml");
+
+    let images = tempfile::tempdir().expect("images dir");
+    let chunk_root = tempfile::tempdir().expect("chunk store root");
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
+        std::sync::Arc::new(LocalBlobStorage::new(chunk_root.path().to_path_buf()));
+    let chunk_store = ChunkStore::new(blob);
+    let baker = Builder::new(DockerCli::new(), chunk_store);
+    let outcome = baker
+        .build(&BuildRequest {
+            source: src.path().to_path_buf(),
+            repo: "engram-shared-rss-test".into(),
+            tag: "warm-1".into(),
+            images_dir: images.path().to_path_buf(),
+            format: Format::Ext4,
+            agent_injection: None,
+        })
+        .await
+        .expect("ext4 bake");
+    Baked {
+        rootfs: outcome.rootfs_path,
+        _src: src,
+        _images: images,
+        _chunk_root: chunk_root,
+    }
 }
 
 /// Walk the work dir for every `firecracker.log` and print its tail.
