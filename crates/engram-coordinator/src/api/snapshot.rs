@@ -129,6 +129,27 @@ pub async fn snapshot(
     };
     state.services.meta.record_snapshot(record).await?;
 
+    // ADR 0034 durability: the live sandbox keeps running (see the note
+    // below), so commit the host's in-flight snapshot now — otherwise
+    // the periodic checkpoint driver's next tick calls
+    // `abort_prior_inflight_snapshot` and deletes this snapshot's
+    // state.bin/sidecar from BlobStorage within one interval, leaving
+    // the `recoverable = true` row we just wrote pointing at nothing.
+    // Same defect class as the idle-eviction commit-after-destroy bug,
+    // but here it's deterministic (not a race) because the sandbox
+    // stays alive and the driver is guaranteed to fire. Best-effort:
+    // a host RPC failure is backstopped by resume-time blob
+    // verification (`resume_from_idle`).
+    if let Err(e) = state.services.host.commit_snapshot(sandbox_id).await {
+        tracing::warn!(
+            session_id = %id,
+            sandbox_id = %sandbox_id,
+            error = %e,
+            "snapshot: commit_snapshot failed; periodic checkpoint may abort this \
+             snapshot's artifacts (resume-time verification will catch it)",
+        );
+    }
+
     state
         .emit(
             id,
@@ -328,27 +349,61 @@ async fn resume_from_idle(
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
-    let Some(record) = state.services.meta.latest_snapshot_for_session(id).await? else {
-        // ADR 0028 Fix B: no snapshot row, but a continuous-sync disk
-        // manifest → recover via the disk-only cold boot (rung 2)
-        // instead of declaring the session dead. This is also the
-        // documented recovery path for `ColdBootUnavailable` Idle
-        // fallbacks: re-enable the image, then /resume lands here.
-        if session.live_disk_manifest.is_some() {
-            return resume_disk_only_cold_boot(state, session).await;
+
+    // ADR 0034 durability: walk the session's snapshots newest-first and
+    // resume from the first one whose backing artifacts still exist. The
+    // stored `recoverable` flag is set at capture time and can go stale
+    // — the eviction/checkpoint abort race deletes a committed
+    // snapshot's `state.bin`/`sidecar.json` out from under a
+    // `recoverable = true` row (prod incident 89f7984d). Re-verifying at
+    // the point of use and falling back through the ADR-0028 checkpoint
+    // chain means a single bricked row no longer dooms the session — it
+    // self-heals to the previous good checkpoint. A demoted row is
+    // written back `recoverable = false` so reconcile / GC-pin / future
+    // resumes stop trusting it.
+    let snapshots = state.services.meta.list_snapshots_for_session(id).await?;
+    for record in snapshots {
+        if snapshot_artifacts_present(state.services.blob.as_ref(), &record).await {
+            return resume_from_fc_snapshot(state, session, record).await;
         }
         tracing::warn!(
             session_id = %id,
-            "resume requested but no snapshot row found — marking Dead",
+            snapshot_id = %record.id,
+            "resume: snapshot artifacts missing; demoting recoverable=false and \
+             falling back to the previous checkpoint",
         );
-        let _ = transition_to_dead_if_no_snapshot(&state, id).await;
-        return Err(ApiError::Gone(
-            "snapshot_invalidated: session can't be revived; \
-             use `engram session fork <id>` to continue"
-                .into(),
-        ));
-    };
-    resume_from_fc_snapshot(state, session, record).await
+        if record.recoverable {
+            let mut demoted = record.clone();
+            demoted.recoverable = false;
+            if let Err(e) = state.services.meta.record_snapshot(demoted).await {
+                tracing::warn!(
+                    session_id = %id,
+                    snapshot_id = %record.id,
+                    error = %e,
+                    "resume: failed to demote unrecoverable snapshot row (best-effort)",
+                );
+            }
+        }
+    }
+
+    // No snapshot row had live artifacts. ADR 0028 Fix B: a continuous-
+    // sync disk manifest → recover via the disk-only cold boot (rung 2)
+    // instead of declaring the session dead. This is also the documented
+    // recovery path for `ColdBootUnavailable` Idle fallbacks: re-enable
+    // the image, then /resume lands here.
+    if session.live_disk_manifest.is_some() {
+        return resume_disk_only_cold_boot(state, session).await;
+    }
+    tracing::warn!(
+        session_id = %id,
+        "resume requested but no snapshot row had recoverable artifacts — marking Dead",
+    );
+    let _ = transition_to_dead_if_no_snapshot(&state, id).await;
+    Err(ApiError::Gone(
+        "snapshot_invalidated: session can't be revived; \
+         use `engram session fork <id>` to continue"
+            .into(),
+    ))
 }
 
 /// ADR 0028 Fix B — manual-resume flavor of the disk-only cold boot:
@@ -1127,6 +1182,53 @@ pub async fn verify_snapshot_recoverable(
     any_present
 }
 
+/// ADR 0034 durability: resume-time re-verification that a snapshot's
+/// backing artifacts still exist before we commit to restoring from it.
+/// Distinct from `verify_snapshot_recoverable` (which runs at capture
+/// time and only checks the chunked manifests): this also HEADs the
+/// portable `state.bin` + `sidecar.json` blobs a memory-bearing FC
+/// snapshot restores from — exactly the blobs the eviction/checkpoint
+/// abort path deletes (prod incident 89f7984d), and which the stored
+/// `recoverable` flag does not re-check once it went stale. A few HEADs,
+/// cheap relative to the chunk prefetch a doomed restore would waste.
+async fn snapshot_artifacts_present(
+    blob: &(dyn BlobStorage + 'static),
+    record: &SnapshotRecord,
+) -> bool {
+    // The eviction/checkpoint abort race only deletes a memory-bearing
+    // FC snapshot's portable artifacts (state.bin/sidecar); the chunk
+    // manifests are content-addressed and pin-protected. A capture with
+    // no memory manifest (disk-only VZ, or a Process/local snapshot that
+    // restores from its on-host dir) is not subject to this failure mode
+    // and resumes as it always has — don't second-guess it here, or
+    // we'd wrongly skip a perfectly good local snapshot.
+    let Some(memory) = record.memory_manifest.as_ref() else {
+        return true;
+    };
+    // Memory-bearing FC snapshot: re-verify the chunk manifests AND the
+    // portable state.bin + sidecar blobs the abort path deletes — the
+    // 89f7984d failure was exactly "manifests survived, state/sidecar
+    // did not, but the row still said recoverable=true".
+    if !verify_snapshot_recoverable(blob, record.disk_manifest.as_ref(), Some(memory)).await {
+        return false;
+    }
+    for key in [
+        engram_chunk_store::snapshot_blob::state_blob_key(record.id),
+        engram_chunk_store::snapshot_blob::sidecar_blob_key(record.id),
+    ] {
+        if let Err(e) = blob.head(&key).await {
+            tracing::warn!(
+                snapshot_id = %record.id,
+                key = %key,
+                error = %e,
+                "resume: portable snapshot artifact missing in BlobStorage",
+            );
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod recoverable_tests {
     use super::*;
@@ -1209,6 +1311,104 @@ mod recoverable_tests {
             .unwrap();
         let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None).await;
         assert!(r, "disk-only snapshots are recoverable on cold-boot");
+    }
+
+    fn make_record(
+        id: engram_core::types::SnapshotId,
+        disk: Option<ManifestRef>,
+        memory: Option<ManifestRef>,
+    ) -> SnapshotRecord {
+        SnapshotRecord {
+            id,
+            session_id: None,
+            host_id: None,
+            image_version: "test:v1".into(),
+            size_bytes: 0,
+            created_at: chrono::Utc::now(),
+            last_accessed_at: chrono::Utc::now(),
+            disk_manifest: disk,
+            memory_manifest: memory,
+            recoverable: true,
+            aux_bundles: Vec::new(),
+            events_cursor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn artifacts_present_true_when_manifests_and_state_sidecar_seeded() {
+        let (blob, _g) = make_blob();
+        let id = engram_core::types::SnapshotId::new();
+        let disk = make_ref();
+        let mem = make_ref();
+        blob.put(&disk.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        blob.put(&mem.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        blob.put(
+            &engram_chunk_store::snapshot_blob::state_blob_key(id),
+            b"x".to_vec().into(),
+        )
+        .await
+        .unwrap();
+        blob.put(
+            &engram_chunk_store::snapshot_blob::sidecar_blob_key(id),
+            b"{}".to_vec().into(),
+        )
+        .await
+        .unwrap();
+        let rec = make_record(id, Some(disk), Some(mem));
+        assert!(snapshot_artifacts_present(blob.as_ref(), &rec).await);
+    }
+
+    #[tokio::test]
+    async fn artifacts_present_false_when_sidecar_blob_deleted() {
+        // The 89f7984d failure mode: the chunked manifests survive
+        // (content-addressed, shared), but the abort path deleted the
+        // per-snapshot state.bin/sidecar — so the `recoverable = true`
+        // row is stale and the resume would die reading manifest.json.
+        let (blob, _g) = make_blob();
+        let id = engram_core::types::SnapshotId::new();
+        let disk = make_ref();
+        let mem = make_ref();
+        blob.put(&disk.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        blob.put(&mem.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        // state.bin present but sidecar deliberately NOT seeded.
+        blob.put(
+            &engram_chunk_store::snapshot_blob::state_blob_key(id),
+            b"x".to_vec().into(),
+        )
+        .await
+        .unwrap();
+        let rec = make_record(id, Some(disk), Some(mem));
+        assert!(
+            !snapshot_artifacts_present(blob.as_ref(), &rec).await,
+            "a missing sidecar blob must disqualify the snapshot even though its \
+             manifests survive — this is what lets resume fall back to the prior checkpoint",
+        );
+    }
+
+    #[tokio::test]
+    async fn artifacts_present_skips_state_sidecar_for_disk_only() {
+        // A disk-only snapshot (no memory manifest) takes the cold-boot
+        // path and never materializes the FC state.bin/sidecar, so they
+        // must not be required.
+        let (blob, _g) = make_blob();
+        let id = engram_core::types::SnapshotId::new();
+        let disk = make_ref();
+        blob.put(&disk.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        let rec = make_record(id, Some(disk), None);
+        assert!(
+            snapshot_artifacts_present(blob.as_ref(), &rec).await,
+            "disk-only snapshot must not require FC state/sidecar blobs",
+        );
     }
 }
 
