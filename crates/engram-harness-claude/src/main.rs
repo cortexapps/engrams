@@ -32,7 +32,9 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod adapter {
-    use std::process::{ExitCode, Stdio};
+    use std::collections::VecDeque;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitCode, ExitStatus, Stdio};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -57,6 +59,13 @@ mod adapter {
     pub const MAX_ARGS_SUMMARY_BYTES: usize = 1024;
     pub const MAX_RESULT_SUMMARY_BYTES: usize = 4096;
     pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
+
+    /// Abnormal-exit diagnostics: how much of `claude`'s stderr to retain
+    /// for the crash artifact. Bounded so a chatty child can't grow the
+    /// tail without limit — the drain task always reads the pipe, so it
+    /// never wedges (the reason stderr was historically `inherit`ed).
+    pub const MAX_STDERR_TAIL_LINES: usize = 64;
+    pub const MAX_STDERR_TAIL_BYTES: usize = 4096;
 
     #[derive(Parser, Debug)]
     #[command(
@@ -473,15 +482,16 @@ mod adapter {
             .env("IS_SANDBOX", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            // Inherit stderr rather than piping it: the wrapper never
-            // reads a stderr pipe, so a chatty child (API retry spew,
-            // stack traces) would block on write(2) once the 64KiB
-            // pipe buffer fills and wedge the run forever. agentd
-            // points the wrapper's stderr at the in-guest harness log
-            // (`/var/log/engram/harness.log`, an append handle that
-            // never blocks), so inheriting lands claude's stderr there
-            // — visible via `/exec` for debugging, deadlock-free.
-            .stderr(Stdio::inherit())
+            // Pipe stderr (was `inherit`) so we can retain a tail for the
+            // abnormal-exit diagnostic below. The historical wedge risk —
+            // a chatty child blocking on write(2) once the 64KiB pipe
+            // buffer fills because nobody reads it — is avoided by the
+            // dedicated drain task that ALWAYS reads the pipe. That task
+            // re-echoes each line to our own stderr, which agentd still
+            // points at the in-guest harness log
+            // (`/var/log/engram/harness.log`), so the prior `/exec`-
+            // visible behavior is preserved.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
         {
@@ -505,12 +515,36 @@ mod adapter {
         let stdout = child.stdout.take().unwrap();
         let mut lines = BufReader::new(stdout).lines();
 
+        // Drain claude's stderr into a bounded rolling tail. The task
+        // always reads the pipe (no wedge) and re-echoes each line to our
+        // own stderr so it still lands in the in-guest harness log. On an
+        // abnormal exit we attach this tail to a System message so the
+        // failure cause survives VM teardown (the harness log does not).
+        let stderr = child.stderr.take().unwrap();
+        let stderr_task: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
+            let mut tail: VecDeque<String> = VecDeque::with_capacity(MAX_STDERR_TAIL_LINES + 1);
+            let mut elines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = elines.next_line().await {
+                eprintln!("{line}");
+                if tail.len() >= MAX_STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            tail.into_iter().collect()
+        });
+
         let deadline = Instant::now() + Duration::from_secs(cli.max_run_secs);
         let mut tool_calls = 0u32;
         let mut run_id: Option<String> = None;
         let mut queued_prompt: Option<String> = None;
         let mut ok = true;
         let mut interrupted = false;
+        // The terminal `result` line claude emits at the end of every
+        // completed turn (success OR a handled error like our e2e 401).
+        // Its ABSENCE at stdout EOF is the crash signature — claude died
+        // mid-turn before reporting a result.
+        let mut result_marker: Option<ResultMarker> = None;
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -525,6 +559,9 @@ mod adapter {
                 res = timeout(remaining, lines.next_line()) => {
                     match res {
                         Ok(Ok(Some(line))) => {
+                            if result_marker.is_none() {
+                                result_marker = detect_result_marker(&line);
+                            }
                             if let Some(translated) = translate_jsonl(
                                 &line,
                                 &mut run_id,
@@ -588,16 +625,72 @@ mod adapter {
             }
         }
 
-        // Bounded reap: the SIGINT (interrupt), SIGKILL (shutdown /
-        // max_run_secs), or EOF paths should all let the child exit
-        // promptly. If a signalled child doesn't go within the grace
-        // window, escalate to SIGKILL so we never wedge the harness
-        // loop waiting on a stuck process.
-        if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
-            tracing::warn!("claude didn't exit within grace window; SIGKILL");
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        // Bounded reap. Capture the child's ExitStatus (the signal/code
+        // is the crash signal — SIGKILL ≈ OOM-killer, SIGSEGV ≈ crash)
+        // instead of discarding it. The SIGINT (interrupt), SIGKILL
+        // (shutdown / max_run_secs), or EOF paths should all let the
+        // child exit promptly. If a signalled child doesn't go within the
+        // grace window, escalate to SIGKILL so we never wedge the loop.
+        let exit_status: Option<ExitStatus> =
+            match timeout(Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(status)) => Some(status),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "reaping claude child failed");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!("claude didn't exit within grace window; SIGKILL");
+                    let _ = child.start_kill();
+                    child.wait().await.ok()
+                }
+            };
+
+        // Collect the stderr tail. The drain task ends when the child
+        // closes stderr (the reap above just ensured that for a normal
+        // exit); bound the wait so a still-running child on the grace
+        // path can't hang us.
+        let stderr_tail: Vec<String> = match timeout(Duration::from_secs(2), stderr_task).await {
+            Ok(Ok(tail)) => tail,
+            _ => Vec::new(),
+        };
+
+        // Abnormal exit detection. `ok` is still true ONLY on the clean
+        // stdout-EOF path — every path where WE stopped the child
+        // (shutdown / max_run_secs / interrupt / read error) set
+        // ok=false. So `ok && result_marker.is_none()` means claude
+        // EOF'd on its own WITHOUT emitting its terminal `result` line:
+        // it died mid-turn. Surface the cause (exit signal + stderr tail)
+        // as a System message so it persists into session_events, which
+        // outlives the VM (and its in-guest harness log) on eviction.
+        //
+        // Gating on the missing `result` line — NOT on a non-zero exit
+        // code — is deliberate: the e2e bogus-token test makes claude
+        // 401 and exit non-zero, but claude DOES emit a `result` line
+        // first, so this stays silent there and the test's terminal
+        // AgentMessage remains the 401.
+        if ok && result_marker.is_none() {
+            ok = false;
+            let detail = describe_abnormal_exit(exit_status, &stderr_tail);
+            tracing::error!(detail, "claude exited abnormally mid-turn");
+            let _ = write_event(
+                writer,
+                HarnessEvent::AgentMessage {
+                    run_id: run_id.clone().unwrap_or_else(|| "abnormal-exit".into()),
+                    message_id: format!("abnormal-{}", uuid::Uuid::new_v4()),
+                    role: AgentRole::System,
+                    text: detail,
+                },
+            )
+            .await;
+        } else {
+            tracing::info!(
+                status = ?exit_status,
+                result = ?result_marker,
+                ok,
+                "claude run ended",
+            );
         }
+
         RunOutcome {
             ok,
             run_id,
@@ -653,6 +746,83 @@ mod adapter {
     {
         let mut w = writer.lock().await;
         write_msg(&mut *w, &HarnessFrame::Event(ev)).await
+    }
+
+    /// The terminal `result` line claude emits at the end of every
+    /// completed turn. `subtype` is `success` or a handled-error variant
+    /// (`error_max_turns`, an API error it surfaced, …); `is_error`
+    /// distinguishes the two. We retain only that we saw it (plus those
+    /// fields, for the diagnostic) — its presence means the turn ended in
+    /// an orderly way, even if unhappily.
+    #[derive(Debug, Clone)]
+    pub struct ResultMarker {
+        pub subtype: String,
+        pub is_error: bool,
+    }
+
+    /// Detect claude's terminal `result` line. Substring-gated so we
+    /// don't double-parse every JSONL line — claude's stream-json is
+    /// compact, so `"type":"result"` appears verbatim only on the result
+    /// line (a `tool_result` block lives inside a `type":"user"` line and
+    /// does not match).
+    pub fn detect_result_marker(line: &str) -> Option<ResultMarker> {
+        if !line.contains("\"type\":\"result\"") {
+            return None;
+        }
+        let v: Value = serde_json::from_str(line).ok()?;
+        if v.get("type")?.as_str()? != "result" {
+            return None;
+        }
+        Some(ResultMarker {
+            subtype: v
+                .get("subtype")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            is_error: v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false),
+        })
+    }
+
+    /// Human-readable hint for the common fatal signals, so an operator
+    /// reading session_events doesn't have to remember signal numbers.
+    fn signal_hint(sig: i32) -> &'static str {
+        match sig {
+            9 => " (SIGKILL — typically the in-guest OOM-killer or an external kill)",
+            11 => " (SIGSEGV — segfault)",
+            6 => " (SIGABRT — abort, e.g. a panic or assertion)",
+            15 => " (SIGTERM)",
+            _ => "",
+        }
+    }
+
+    /// Build the System-message body for an abnormal claude exit: the
+    /// exit code/signal plus the tail of claude's stderr. This is the
+    /// durable crash artifact — it rides the event stream into
+    /// `session_events`, surviving the VM teardown that erases the
+    /// in-guest harness log. SIGKILL here is the OOM-killer signature.
+    pub fn describe_abnormal_exit(status: Option<ExitStatus>, stderr_tail: &[String]) -> String {
+        let exit = match status {
+            None => "could not be reaped (status unavailable)".to_string(),
+            Some(s) => {
+                if let Some(code) = s.code() {
+                    format!("exited with code {code}")
+                } else if let Some(sig) = s.signal() {
+                    format!("was killed by signal {sig}{}", signal_hint(sig))
+                } else {
+                    "exited (status unavailable)".to_string()
+                }
+            }
+        };
+        let tail = if stderr_tail.is_empty() {
+            "(no stderr captured)".to_string()
+        } else {
+            truncate_str(&stderr_tail.join("\n"), MAX_STDERR_TAIL_BYTES)
+        };
+        format!(
+            "engram-harness: claude exited abnormally mid-turn — it {exit} without emitting a \
+             terminal `result`, so the turn did not complete. This is a harness/agent crash, \
+             not an engram platform error. claude stderr tail:\n{tail}"
+        )
     }
 
     /// Translate one JSONL line from Claude's `--output-format
@@ -887,5 +1057,56 @@ mod tests {
         let s = "🦀".repeat(100);
         let t = truncate_str(&s, 10);
         assert!(t.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn detects_terminal_result_line() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        let m = detect_result_marker(line).expect("should detect terminal result");
+        assert_eq!(m.subtype, "success");
+        assert!(!m.is_error);
+
+        // A handled error (e.g. the e2e 401) still emits a result line —
+        // it must be detected so we DON'T flag it as an abnormal exit.
+        let err = r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
+        let m = detect_result_marker(err).expect("error result still detected");
+        assert!(m.is_error);
+    }
+
+    #[test]
+    fn non_result_lines_are_not_markers() {
+        // assistant text, and a tool_result nested in a `user` line, must
+        // NOT be mistaken for the terminal result marker.
+        let asst =
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"hi"}]}}"#;
+        let tool = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"out","is_error":false}]}}"#;
+        assert!(detect_result_marker(asst).is_none());
+        assert!(detect_result_marker(tool).is_none());
+    }
+
+    #[test]
+    fn abnormal_exit_detail_flags_oom_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        // raw wait-status `9` == terminated by signal 9 (SIGKILL).
+        let killed = std::process::ExitStatus::from_raw(9);
+        let detail =
+            describe_abnormal_exit(Some(killed), &["fatal: JS heap out of memory".to_string()]);
+        assert!(detail.contains("signal 9"), "got: {detail}");
+        assert!(
+            detail.contains("OOM"),
+            "should hint OOM for SIGKILL: {detail}"
+        );
+        assert!(detail.contains("out of memory"), "should carry stderr tail");
+        assert!(detail.contains("did not complete"));
+    }
+
+    #[test]
+    fn abnormal_exit_detail_reports_nonzero_code() {
+        use std::os::unix::process::ExitStatusExt;
+        // raw status `1 << 8` == exited with code 1.
+        let exited = std::process::ExitStatus::from_raw(1 << 8);
+        let detail = describe_abnormal_exit(Some(exited), &[]);
+        assert!(detail.contains("code 1"), "got: {detail}");
+        assert!(detail.contains("no stderr captured"));
     }
 }
