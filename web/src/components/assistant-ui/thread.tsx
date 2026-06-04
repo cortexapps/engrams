@@ -1,15 +1,22 @@
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
 import { ToolFallback } from "@/components/assistant-ui/tool-fallback";
+import {
+  ToolGroupContent,
+  ToolGroupRoot,
+  ToolGroupTrigger,
+} from "@/components/assistant-ui/tool-group";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import {
   ActionBarPrimitive,
   AuiIf,
   ComposerPrimitive,
   ErrorPrimitive,
+  groupPartByType,
   MessagePrimitive,
   ThreadPrimitive,
   useAuiState,
 } from "@assistant-ui/react";
+import type { ToolCallMessagePartComponent } from "@assistant-ui/react";
 import {
   ArrowDownIcon,
   CheckIcon,
@@ -92,11 +99,11 @@ const ThreadScrollToBottom: FC = () => {
   );
 };
 
-// The trailing "working" indicator — shown only for a running message with no
-// parts yet (the gap between sending a prompt and the first event). Once a
-// tool/exec part exists it renders its own running state, so this stays quiet.
-const WorkingIndicator: FC<{ status: { type: string } }> = ({ status }) => {
-  if (status.type !== "running") return null;
+// The trailing "working" indicator — emitted by GroupedParts (indicator
+// mode "empty") only while a message is running with no parts yet, i.e. the
+// gap between sending a prompt and the first event. Once any part exists it
+// renders its own running state, so this stays quiet.
+const WorkingIndicator: FC = () => {
   return (
     <span className="flex items-center gap-2 text-sm text-muted-foreground">
       <Loader2Icon className="size-3.5 animate-spin" />
@@ -112,18 +119,52 @@ const AssistantMessage: FC = () => {
       className="animate-in fade-in slide-in-from-bottom-1 relative duration-150"
     >
       <div className="leading-relaxed text-foreground wrap-break-word">
-        {/* Flex `gap` (not per-part margins) spaces the parts: it applies
-            only BETWEEN parts, never at the message's outer edges, so a
-            leading tool card doesn't stack its margin on top of the
+        {/* Flex `gap` (not per-part margins) spaces the top-level nodes: it
+            applies only BETWEEN them, never at the message's outer edges, so a
+            leading tool card / group doesn't stack its margin on top of the
             inter-message gap. */}
         <div className="flex flex-col gap-5">
-          <MessagePrimitive.Parts
-            components={{
-              Text: MarkdownText,
-              Empty: WorkingIndicator,
-              tools: { by_name: { [SHELL_TOOL]: ShellToolPart }, Fallback: ToolFallback },
+          <MessagePrimitive.GroupedParts
+            // Coalesce adjacent tool calls into a `group-tool` node; everything
+            // else stays ungrouped and renders in place.
+            groupBy={groupPartByType({ "tool-call": ["group-tool"] })}
+            // Match the previous Empty-slot behaviour: working indicator only
+            // when the running message has no parts yet.
+            indicator="empty"
+          >
+            {({ part, children }) => {
+              switch (part.type) {
+                case "group-tool":
+                  // A single call isn't worth a disclosure — render it inline.
+                  if (part.indices.length === 1) return children;
+                  return (
+                    <ToolGroupRoot>
+                      <ToolGroupTrigger
+                        count={part.indices.length}
+                        active={part.status.type === "running"}
+                      />
+                      <ToolGroupContent>{children}</ToolGroupContent>
+                    </ToolGroupRoot>
+                  );
+                case "text":
+                  return <MarkdownText />;
+                case "tool-call": {
+                  // ShellToolPart declares concrete `ShellArgs` while the
+                  // enriched part carries the generic JSON arg bag; widen to
+                  // the shared component type (the same assignability the old
+                  // `tools.by_name` registration relied on) so neither branch
+                  // needs a value cast. Both renderers read args defensively.
+                  const Tool: ToolCallMessagePartComponent =
+                    part.toolName === SHELL_TOOL ? ShellToolPart : ToolFallback;
+                  return <Tool {...part} />;
+                }
+                case "indicator":
+                  return <WorkingIndicator />;
+                default:
+                  return null;
+              }
             }}
-          />
+          </MessagePrimitive.GroupedParts>
         </div>
         <MessagePrimitive.Error>
           <ErrorPrimitive.Root className="mt-2 rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive dark:bg-destructive/5 dark:text-red-200">
