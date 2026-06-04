@@ -4,89 +4,120 @@
 @custom-variant dark (&:is(.dark *));
 
 /* ------------------------------------------------------------------
- * "Lab Notebook" — engineering-logbook identity.
+ * "Mont Blanc logbook" — engineering-logbook identity, heritage voice.
  *
- *   Light is the primary brand voice: aged engineering paper (cream
- *   with real chroma, NOT a timid warm-white) under genuinely dark
- *   ink, with a faint ruled grid doing the structural work. Committed,
- *   not Restrained — the paper carries the surface.
+ *   A German-precise / British-elegant hybrid. Light is the primary
+ *   brand voice: aged celadon ledger paper (genuine green chroma, NOT
+ *   a timid warm-white) under deep petrol fountain-pen ink, with a
+ *   faint ruled grid doing the structural work. Committed, not
+ *   Restrained — the green sheet carries the surface.
  *
- *   Dark is the equal twin: the notebook closed at night — a cool
- *   graphite ground, cream ink, the same grid, the accent gone
- *   luminous. Contrast is verified AA in both themes.
+ *   Dark is the equal twin: the notebook closed at night — a near-black
+ *   racing-green ground (the ink hue gone deep), pale sage ink, the
+ *   same grid, the accent gone luminous. Contrast is verified AA in
+ *   both themes.
  *
- *   The ink accent (blue-black fountain pen) carries primary actions,
- *   selection, and focus only. Correction-pen red is destructive.
- *   Resist adding hues; reach for type or a hairline rule first.
+ *   The accent is Aston-F1 LIME — but lime is a FILL, not light-mode
+ *   text (chartreuse on celadon is invisible). So it carries primary
+ *   buttons (lime fill + dark-green ink), the active nav item and ring
+ *   on the dark sidebar, and the selection wash. On light grounds the
+ *   focus ring falls back to a visible racing green; links use ink.
+ *   Lime is reserved strictly for interactive accent — never for
+ *   status (lifecycle keeps its glyph+text vocabulary). Destructive is
+ *   the only red now. Corners gently rounded — exact, never pill-like.
  * ------------------------------------------------------------------ */
 :root {
-  --radius: 0.3rem; /* squarer than stock — logbook blocks, not pills */
+  --radius: 0.5rem; /* gently rounded — precise, not hard-cornered, not pill */
 
-  --background: oklch(0.941 0.024 84);          /* engineering paper */
-  --foreground: oklch(0.23 0.012 62);           /* ink */
-  --card: oklch(0.967 0.016 88);                /* a cleaner sheet laid on the paper */
-  --card-foreground: oklch(0.23 0.012 62);
-  --popover: oklch(0.967 0.016 88);
-  --popover-foreground: oklch(0.23 0.012 62);
-  --primary: oklch(0.42 0.10 250);              /* blue-black ink */
-  --primary-foreground: oklch(0.975 0.012 90);
-  --secondary: oklch(0.905 0.022 85);           /* warm paper, raised */
-  --secondary-foreground: oklch(0.27 0.012 60);
-  --muted: oklch(0.905 0.022 85);
-  --muted-foreground: oklch(0.44 0.014 66);     /* ink-faded — AA on paper */
-  --accent: oklch(0.91 0.025 85);               /* faint hover wash */
-  --accent-foreground: oklch(0.27 0.012 60);
-  --destructive: oklch(0.515 0.198 27);         /* correction-pen red */
-  --border: oklch(0.852 0.024 82);              /* hairline rule */
-  --input: oklch(0.852 0.024 82);
-  --ring: oklch(0.55 0.11 250);                 /* ink, focus */
+  --background: oklch(0.897 0.051 128);         /* celadon ledger paper (#d3e4c0) */
+  --foreground: oklch(0.301 0.020 206);         /* petrol ink (#223133) */
+  --card: oklch(0.935 0.040 128);               /* a cleaner sheet laid on the paper */
+  --card-foreground: oklch(0.301 0.020 206);
+  --popover: oklch(0.935 0.040 128);
+  --popover-foreground: oklch(0.301 0.020 206);
+  --primary: oklch(0.878 0.181 121);            /* Aston-F1 lime — a FILL only */
+  --primary-foreground: oklch(0.22 0.040 150);  /* deep racing-green ink on lime */
+  --secondary: oklch(0.855 0.050 128);          /* sage, raised */
+  --secondary-foreground: oklch(0.33 0.018 206);
+  --muted: oklch(0.855 0.050 128);
+  --muted-foreground: oklch(0.44 0.028 200);    /* ink-faded — AA on paper */
+  --accent: oklch(0.865 0.055 128);             /* faint hover wash */
+  --accent-foreground: oklch(0.33 0.018 206);
+  --destructive: oklch(0.52 0.20 27);           /* signal red — now the only red */
+  --border: oklch(0.80 0.045 128);              /* hairline rule */
+  --input: oklch(0.80 0.045 128);
+  --ring: oklch(0.55 0.15 132);                 /* racing green — lime is invisible on paper */
 
-  --sidebar: oklch(0.915 0.021 83);             /* the notebook's margin/cover — recedes */
-  --sidebar-foreground: oklch(0.23 0.012 62);
-  --sidebar-primary: oklch(0.42 0.10 250);
-  --sidebar-primary-foreground: oklch(0.975 0.012 90);
-  --sidebar-accent: oklch(0.89 0.025 84);
-  --sidebar-accent-foreground: oklch(0.27 0.012 60);
-  --sidebar-border: oklch(0.85 0.024 82);
-  --sidebar-ring: oklch(0.55 0.11 250);
+  /* The cover is the drama: a deep bottle-green spine against the celadon
+     content (the Mont Blanc move), not another pale-green panel. Sage ink,
+     claret active marker — the dark sidebar reads like the dark theme even
+     in light mode, which is the point. */
+  --sidebar: oklch(0.32 0.050 190);             /* deep bottle-green spine */
+  --sidebar-foreground: oklch(0.93 0.030 125);  /* sage ink on the cover */
+  --sidebar-primary: oklch(0.878 0.181 121);    /* lime — active nav item on the dark cover */
+  --sidebar-primary-foreground: oklch(0.18 0.020 200);
+  --sidebar-accent: oklch(0.38 0.052 190);      /* raised green — hover/active wash */
+  --sidebar-accent-foreground: oklch(0.95 0.025 120);
+  --sidebar-border: oklch(0.93 0.030 125 / 14%);
+  --sidebar-ring: oklch(0.80 0.16 121);         /* lime — visible on the dark spine */
 
-  /* Graph-paper rules — used as a masthead texture that fades out, not a
-     full-bleed field. Faint ink on paper. */
-  --grid-line: oklch(0.23 0.012 62 / 0.10);
-  --grid-size: 1.25rem;
+  /* Carbon-fibre twill, woven over the green spine and fading upward. Built
+     from translucent threads so the green shows through: a darker warp thread
+     and a faint sheen on the weft. */
+  --carbon-thread: oklch(0 0 0 / 0.14);
+  --carbon-sheen: oklch(1 0 0 / 0.05);
+  --carbon-tile: 11px;
 }
 
 .dark {
-  --background: oklch(0.202 0.008 264);         /* graphite */
-  --foreground: oklch(0.92 0.014 88);           /* cream ink */
-  --card: oklch(0.242 0.008 264);
-  --card-foreground: oklch(0.92 0.014 88);
-  --popover: oklch(0.242 0.008 264);
-  --popover-foreground: oklch(0.92 0.014 88);
-  --primary: oklch(0.70 0.13 245);              /* sky-ink — luminous */
-  --primary-foreground: oklch(0.20 0.012 264);
-  --secondary: oklch(0.27 0.009 264);
-  --secondary-foreground: oklch(0.92 0.014 88);
-  --muted: oklch(0.27 0.009 264);
-  --muted-foreground: oklch(0.715 0.013 86);    /* cream-gray — AA on graphite */
-  --accent: oklch(0.285 0.01 264);
-  --accent-foreground: oklch(0.92 0.014 88);
-  --destructive: oklch(0.62 0.19 25);
-  --border: oklch(1 0 0 / 11%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.62 0.12 245);
+  --background: oklch(0.205 0.024 200);         /* racing-green-black — the ink gone deep */
+  --foreground: oklch(0.90 0.035 125);          /* pale sage ink */
+  --card: oklch(0.242 0.026 200);
+  --card-foreground: oklch(0.90 0.035 125);
+  --popover: oklch(0.242 0.026 200);
+  --popover-foreground: oklch(0.90 0.035 125);
+  --primary: oklch(0.85 0.18 121);              /* Aston-F1 lime — luminous on green-black */
+  --primary-foreground: oklch(0.20 0.030 150);
+  --secondary: oklch(0.27 0.026 200);
+  --secondary-foreground: oklch(0.90 0.035 125);
+  --muted: oklch(0.27 0.026 200);
+  --muted-foreground: oklch(0.73 0.030 125);    /* sage-faded — AA on green-black */
+  --accent: oklch(0.29 0.028 200);
+  --accent-foreground: oklch(0.90 0.035 125);
+  --destructive: oklch(0.65 0.20 25);
+  --border: oklch(0.90 0.035 125 / 12%);
+  --input: oklch(0.90 0.035 125 / 16%);
+  --ring: oklch(0.80 0.16 121);                 /* lime — pops on the dark ground */
 
-  --sidebar: oklch(0.172 0.008 264);            /* notebook cover — darker than content */
-  --sidebar-foreground: oklch(0.92 0.014 88);
-  --sidebar-primary: oklch(0.70 0.13 245);
-  --sidebar-primary-foreground: oklch(0.20 0.012 264);
-  --sidebar-accent: oklch(0.27 0.009 264);
-  --sidebar-accent-foreground: oklch(0.92 0.014 88);
-  --sidebar-border: oklch(1 0 0 / 9%);
-  --sidebar-ring: oklch(0.62 0.12 245);
+  --sidebar: oklch(0.175 0.024 200);            /* notebook cover — darker than content */
+  --sidebar-foreground: oklch(0.90 0.035 125);
+  --sidebar-primary: oklch(0.85 0.18 121);
+  --sidebar-primary-foreground: oklch(0.20 0.030 150);
+  --sidebar-accent: oklch(0.27 0.026 200);
+  --sidebar-accent-foreground: oklch(0.90 0.035 125);
+  --sidebar-border: oklch(0.90 0.035 125 / 9%);
+  --sidebar-ring: oklch(0.80 0.16 121);
 
-  --grid-line: oklch(0.92 0.014 88 / 0.08);
-  --grid-size: 1.25rem;
+  --carbon-thread: oklch(0 0 0 / 0.22);
+  --carbon-sheen: oklch(1 0 0 / 0.05);
+  --carbon-tile: 11px;
+}
+
+/* The section rail (the second sidebar) is one step lighter than the primary
+   spine, so the boundary between them reads as depth, not a seam — which is
+   why the primary rail draws no divider line. Overriding the --sidebar* tokens
+   on this scope re-tones the bg AND its hover/active wash together, so the
+   active item stays legible against the lighter ground. */
+.sidebar-section {
+  --sidebar: oklch(0.385 0.052 190);
+  --sidebar-accent: oklch(0.46 0.055 190);
+  --sidebar-accent-foreground: oklch(0.96 0.025 120);
+  --sidebar-border: oklch(0.93 0.030 125 / 12%);
+}
+.dark .sidebar-section {
+  --sidebar: oklch(0.235 0.026 200);
+  --sidebar-accent: oklch(0.305 0.028 200);
+  --sidebar-border: oklch(0.90 0.035 125 / 10%);
 }
 
 @theme inline {
@@ -117,14 +148,16 @@
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
 
-  /* Three-font system. Sans is the invisible workhorse (chrome, labels,
-     buttons); serif is the identity voice (page/section titles, prose);
-     mono is the lab readout (IDs, digests, timestamps, code, micro-labels). */
+  /* Three-font system. Sans is the invisible workhorse (chrome, labels, body);
+     Saira is the display/identity voice (page titles, the primary action
+     button) — squared and technical, with a racing edge from width + tracked
+     caps; mono is the lab readout (IDs, digests, timestamps, code, labels). */
   --font-sans:
     system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
     "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
-  --font-serif:
-    "IBM Plex Serif", Georgia, "Iowan Old Style", "Source Serif 4", serif;
+  --font-display:
+    "Saira Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: Georgia, "Iowan Old Style", "Source Serif 4", serif;
   --font-mono:
     "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
 
@@ -150,17 +183,30 @@
   kbd,
   samp,
   pre { font-variant-numeric: tabular-nums; }
+  /* The claret ribbon shows up on selection too — a wash of the accent,
+     text keeps its own ink so it stays readable. Adapts per theme. */
+  ::selection { background-color: color-mix(in oklch, var(--primary) 24%, transparent); }
 }
 
-@utility bg-grid-fade {
-  /* Engineering graph-paper rules, densest at the bottom edge and
-     dissolving upward — anchored at the foot of the left sidebar as a
-     quiet logbook texture. Lives on a pointer-events-none layer behind
-     the sidebar's content (the mask would otherwise fade the controls). */
-  background-image:
-    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
-  background-size: var(--grid-size) var(--grid-size);
-  -webkit-mask-image: linear-gradient(to top, black, transparent);
-  mask-image: linear-gradient(to top, black, transparent);
+@utility bg-carbon-fade {
+  /* A 2/2 carbon-fibre twill: two sets of diagonal threads offset to read as
+     a woven lattice, plus a soft vertical sheen. Threads are translucent so
+     the green spine shows through. Densest at the foot and dissolving upward
+     so it clears the nav — lives on a pointer-events-none layer behind the
+     sidebar's content (the mask would otherwise fade the controls). */
+  background:
+    linear-gradient(27deg, var(--carbon-thread) 4px, transparent 4px) 0 4px,
+    linear-gradient(207deg, var(--carbon-thread) 4px, transparent 4px) 8px 0,
+    linear-gradient(27deg, var(--carbon-sheen) 4px, transparent 4px) 0 8px,
+    linear-gradient(207deg, var(--carbon-sheen) 4px, transparent 4px) 8px 4px,
+    linear-gradient(90deg, var(--carbon-thread) 8px, transparent 8px),
+    linear-gradient(
+      var(--carbon-sheen) 25%, var(--carbon-thread) 25%, var(--carbon-thread) 50%,
+      transparent 50%, transparent 75%, var(--carbon-sheen) 75%
+    );
+  background-size: var(--carbon-tile) var(--carbon-tile);
+  /* Clears the footer controls at the foot and dissolves below the nav up top,
+     so the weave reads as a band woven into the lower spine. */
+  -webkit-mask-image: linear-gradient(to top, transparent 10%, oklch(0 0 0 / 0.32) 28%, oklch(0 0 0 / 0.32) 58%, transparent 82%);
+  mask-image: linear-gradient(to top, transparent 10%, oklch(0 0 0 / 0.32) 28%, oklch(0 0 0 / 0.32) 58%, transparent 82%);
 }

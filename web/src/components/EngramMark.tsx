@@ -19,7 +19,10 @@ import { useEffect, useRef } from 'react';
 // and the pulse is a no-op (the static trace stays put).
 
 const COL = {
-  ink: '#1b1612',
+  // The trace + middle nodes + frame inherit the surrounding text colour, so
+  // the mark reads correctly on every ground it lands on: the dark-green
+  // sidebar (sage), the paper content (petrol ink), and either auth theme.
+  ink: 'currentColor',
   amber: '#b85c0a',
   verd: '#3a6b5c',
   rule: '#d9cfb8',

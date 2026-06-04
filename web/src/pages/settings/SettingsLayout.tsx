@@ -44,7 +44,7 @@ export function SettingsLayout() {
   return (
     <SidebarProvider className="min-h-0 flex-1">
       {/* desktop (md+): vertical second sidebar */}
-      <Sidebar collapsible="none" className="hidden border-r md:flex">
+      <Sidebar collapsible="none" className="sidebar-section hidden border-r border-sidebar-border md:flex">
         <SidebarContent>
           {group('You', YOU)}
           {isAdmin && group('Deployment', DEPLOYMENT)}

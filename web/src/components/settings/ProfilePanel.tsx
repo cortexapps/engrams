@@ -56,7 +56,7 @@ export function ProfilePanel() {
           <ul className="space-y-1.5 text-sm">
             {can.map((c) => (
               <li key={c} className="flex items-center gap-2">
-                <Check className="size-4 text-primary" /> {c}
+                <Check className="size-4 text-foreground" /> {c}
               </li>
             ))}
             {cannot.map((c) => (
