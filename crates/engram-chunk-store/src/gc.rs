@@ -1,7 +1,7 @@
 //! ADR 0016 Phase C: chunk-GC pin-set collection.
 //!
 //! [`PinSet`] is the union of every chunk hash currently referenced
-//! by a live row in the metadata store. Four pin-set sources:
+//! by a live row in the metadata store. Six pin-set sources:
 //!
 //! 1. `enabled_images.disk_manifest_*` — every chunked-disk enabled
 //!    image pins its base manifest's chunks.
@@ -11,6 +11,19 @@
 //!    recoverable snapshot pins its captured disk manifest.
 //! 4. `snapshots.memory_manifest_*` WHERE `recoverable=true` —
 //!    memory-side mirror.
+//! 5. `enabled_images.base_snapshot_memory_manifest_*` (ADR 0022) —
+//!    the per-template base memfile's backing chunks. Pinned for the
+//!    template's enabled lifetime, independent of the base snapshot
+//!    row's `recoverable` flag (the memfile is a shared inode every
+//!    same-template `session.create` sibling `MAP_PRIVATE`s).
+//! 6. `enabled_images.base_snapshot_disk_manifest_*` (ADR 0022) —
+//!    the disk companion to #5: the rootfs a base `session.create`
+//!    restores from, also recoverable-flag-independent.
+//!
+//! Sources 5 & 6 frequently dedup against #3/#4 (the base snapshot is
+//! usually still `recoverable`); their distinct value is keeping the
+//! memfile + rootfs pinned even if that flag is ever cleared while an
+//! enabled template still has live sharers.
 //!
 //! Each source returns a `Vec<ManifestRef>`; we dedup at the
 //! `ManifestRef` level (a manifest referenced by both a session and
@@ -186,6 +199,21 @@ async fn collect_manifest_refs(meta: &dyn MetadataStore) -> Result<HashSet<Manif
     for r in meta.list_recoverable_snapshot_memory_manifests().await? {
         refs.insert(r);
     }
+    // ADR 0022 Option A: sources #5 + #6 — the per-template base memfile
+    // (memory) and its rootfs (disk) companion, pinned for the enabled
+    // lifetime independent of the base snapshot row's `recoverable` flag.
+    for r in meta
+        .list_enabled_image_base_snapshot_memory_manifests()
+        .await?
+    {
+        refs.insert(r);
+    }
+    for r in meta
+        .list_enabled_image_base_snapshot_disk_manifests()
+        .await?
+    {
+        refs.insert(r);
+    }
     Ok(refs)
 }
 
@@ -214,6 +242,9 @@ mod tests {
         live: Vec<ManifestRef>,
         snap_disk: Vec<ManifestRef>,
         snap_mem: Vec<ManifestRef>,
+        // ADR 0022 sources #5 + #6.
+        enabled_base_mem: Vec<ManifestRef>,
+        enabled_base_disk: Vec<ManifestRef>,
     }
 
     #[async_trait]
@@ -439,6 +470,16 @@ mod tests {
         ) -> Result<Vec<ManifestRef>, MetaError> {
             Ok(self.snap_mem.clone())
         }
+        async fn list_enabled_image_base_snapshot_memory_manifests(
+            &self,
+        ) -> Result<Vec<ManifestRef>, MetaError> {
+            Ok(self.enabled_base_mem.clone())
+        }
+        async fn list_enabled_image_base_snapshot_disk_manifests(
+            &self,
+        ) -> Result<Vec<ManifestRef>, MetaError> {
+            Ok(self.enabled_base_disk.clone())
+        }
     }
 
     /// Write a manifest containing `chunks_bytes` (each entry =
@@ -503,6 +544,7 @@ mod tests {
             live: vec![mref_a, mref_b],
             snap_disk: vec![mref_b],
             snap_mem: vec![mref_c],
+            ..Default::default()
         };
 
         let pin_set = PinSet::collect(&meta, &store).await.expect("collect");
@@ -517,6 +559,39 @@ mod tests {
 
         let hash_unknown = crate::manifest::ChunkHash::of(b"never-pinned");
         assert!(!pin_set.contains(&hash_unknown));
+    }
+
+    #[tokio::test]
+    async fn base_snapshot_memfile_pinned_via_enabled_image_only() {
+        // ADR 0022 sources #5/#6: a base snapshot's memfile (memory) +
+        // rootfs (disk) manifests must stay pinned via the enabled_images
+        // row even when NO recoverable snapshot references them (i.e. the
+        // base snapshot row's `recoverable` flag was cleared while the
+        // template is still enabled and has live sharers). Here snap_disk
+        // / snap_mem are empty on purpose — the only path to these
+        // manifests is the new enabled-image base-snapshot sources.
+        let (store, _dir) = fresh_store();
+        let base_mem = seed_manifest(&store, &[b"mem-1", b"mem-2"], ManifestKind::Memory).await;
+        let base_disk = seed_manifest(&store, &[b"disk-1", b"disk-2"], ManifestKind::Disk).await;
+
+        let meta = PinSetMockMeta {
+            enabled_base_mem: vec![base_mem],
+            enabled_base_disk: vec![base_disk],
+            ..Default::default()
+        };
+
+        let pin_set = PinSet::collect(&meta, &store).await.expect("collect");
+        assert_eq!(
+            pin_set.len(),
+            4,
+            "both base manifests' chunks must be pinned"
+        );
+        for c in [b"mem-1".as_slice(), b"mem-2", b"disk-1", b"disk-2"] {
+            assert!(
+                pin_set.contains(&crate::manifest::ChunkHash::of(c)),
+                "base-snapshot chunk must be pinned via enabled_images source",
+            );
+        }
     }
 
     #[tokio::test]
