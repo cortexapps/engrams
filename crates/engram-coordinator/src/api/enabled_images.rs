@@ -609,6 +609,11 @@ pub(crate) async fn capture_and_record_base_snapshot(
             disk_manifest: meta.disk_manifest,
             memory_manifest: meta.memory_manifest,
             recoverable,
+            // ADR 0037: propagate the host's warm-capture verdict from the
+            // returned metadata. False today (capture not wired until P4c);
+            // once it is, a warm base capture persists warm_harness=true so
+            // the restore-fork late-Binds instead of SpawnHarness.
+            warm_harness: meta.warm_harness,
             // Template artifact — no session, no event log.
             events_cursor: None,
         })

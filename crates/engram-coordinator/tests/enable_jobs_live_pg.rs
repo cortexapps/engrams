@@ -215,6 +215,7 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_toml() {
 
     let snapshot_id = SnapshotId::new();
     meta.record_snapshot(SnapshotRecord {
+        warm_harness: false,
         id: snapshot_id,
         session_id: None,
         host_id: None,

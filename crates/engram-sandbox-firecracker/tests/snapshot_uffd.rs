@@ -156,6 +156,7 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
     // would persist + replay: same snapshot id, same chunked
     // memory_manifest we just wrote.
     let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
+        warm_harness: false,
         id: metadata.id,
         size_bytes: metadata.size_bytes,
         created_at: metadata.created_at,
@@ -358,6 +359,7 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
     let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
+        warm_harness: false,
         id: metadata.id,
         size_bytes: metadata.size_bytes,
         created_at: metadata.created_at,

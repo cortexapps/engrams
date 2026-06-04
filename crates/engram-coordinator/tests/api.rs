@@ -818,6 +818,7 @@ fn seed_enabled(
     store.snapshots_by_id.lock().insert(
         base_snapshot_id,
         SnapshotRecord {
+            warm_harness: false,
             id: base_snapshot_id,
             session_id: None,
             host_id: None,

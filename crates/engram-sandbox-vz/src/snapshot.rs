@@ -85,6 +85,7 @@ pub(crate) async fn build_metadata(
             .len();
     }
     Ok(SnapshotMetadata {
+        warm_harness: false,
         id: snapshot_id,
         size_bytes,
         created_at: Utc::now(),

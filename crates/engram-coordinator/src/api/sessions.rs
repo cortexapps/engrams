@@ -1136,6 +1136,7 @@ async fn try_restore_base_snapshot(
     // manifests come off the snapshots row. Together this is the full
     // portable metadata the host's cross-host restore path consumes.
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
+        warm_harness: false,
         id: snapshot_id,
         size_bytes: record.size_bytes,
         created_at: record.created_at,

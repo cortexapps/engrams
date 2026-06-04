@@ -49,6 +49,7 @@ async fn connect() -> Option<Arc<dyn MetadataStore>> {
 async fn seed_base_snapshot(meta: &Arc<dyn MetadataStore>) -> SnapshotId {
     let id = SnapshotId::new();
     meta.record_snapshot(SnapshotRecord {
+        warm_harness: false,
         id,
         session_id: None,
         host_id: None,
@@ -262,6 +263,7 @@ async fn record_snapshot_bumps_chunk_generation() {
     // (simpler invariant; over-bumping costs at most a wasted sweep
     // restart, bounded by max_restart_attempts).
     let snap = SnapshotRecord {
+        warm_harness: false,
         id: SnapshotId::new(),
         session_id: Some(session_id),
         host_id: None,
@@ -290,6 +292,7 @@ async fn record_snapshot_bumps_chunk_generation() {
     // INSERT-vs-UPDATE in one TX both end with the
     // chunk_generation bump statement.
     let snap2 = SnapshotRecord {
+        warm_harness: false,
         id: SnapshotId::new(),
         session_id: Some(session_id),
         host_id: None,

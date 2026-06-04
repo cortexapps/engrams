@@ -3123,6 +3123,7 @@ mod tests {
                 .await
                 .unwrap();
                 Ok(SnapshotMetadata {
+                    warm_harness: false,
                     id: snapshot_id,
                     size_bytes: self.payload.len() as u64,
                     created_at: chrono::Utc::now(),
@@ -3260,6 +3261,7 @@ mod tests {
                 .await
                 .unwrap();
                 Ok(SnapshotMetadata {
+                    warm_harness: false,
                     id: snapshot_id,
                     size_bytes: self.payload.len() as u64,
                     created_at: chrono::Utc::now(),
@@ -3397,6 +3399,7 @@ mod tests {
                 .await
                 .unwrap();
                 Ok(SnapshotMetadata {
+                    warm_harness: false,
                     id: snapshot_id,
                     size_bytes: self.payload.len() as u64,
                     created_at: chrono::Utc::now(),
@@ -3627,6 +3630,7 @@ mod tests {
 
         // Restore — should materialise memory.bin then delegate.
         let metadata = SnapshotMetadata {
+            warm_harness: false,
             id: snapshot_id,
             size_bytes: 0,
             created_at: chrono::Utc::now(),
@@ -3754,6 +3758,7 @@ mod tests {
         let pooled =
             PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized"));
         let metadata = SnapshotMetadata {
+            warm_harness: false,
             id: engram_core::SnapshotId::new(),
             size_bytes: 0,
             created_at: chrono::Utc::now(),
@@ -4240,6 +4245,7 @@ mod tests {
                 .await
                 .unwrap();
                 Ok(SnapshotMetadata {
+                    warm_harness: false,
                     id: snapshot_id,
                     size_bytes: 4096,
                     created_at: chrono::Utc::now(),

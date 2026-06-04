@@ -346,6 +346,7 @@ pub async fn evacuate_dead_source(
                 .as_ref()
                 .expect("memory_manifest implies a snapshot row");
             let metadata = SnapshotMetadata {
+                warm_harness: false,
                 id: s.id,
                 size_bytes: s.size_bytes,
                 created_at: s.created_at,
@@ -473,6 +474,7 @@ mod tests {
                 ))));
             }
             Ok(SnapshotMetadata {
+                warm_harness: false,
                 id: engram_core::SnapshotId::new(),
                 size_bytes: 1024,
                 created_at: chrono::Utc::now(),
@@ -835,6 +837,7 @@ mod tests {
         memory: Option<ManifestRef>,
     ) -> SnapshotRecord {
         SnapshotRecord {
+            warm_harness: false,
             id: engram_core::SnapshotId::new(),
             session_id: Some(session_id),
             host_id: None,

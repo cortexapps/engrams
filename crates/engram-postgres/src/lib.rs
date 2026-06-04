@@ -872,8 +872,8 @@ impl MetadataStore for PostgresStore {
                  image_version, size_bytes, created_at, last_accessed_at,
                  disk_manifest_id, disk_manifest_version,
                  memory_manifest_id, memory_manifest_version,
-                 recoverable, aux_bundles, events_cursor)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 recoverable, aux_bundles, events_cursor, warm_harness)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (id) DO UPDATE SET
                 last_accessed_at        = EXCLUDED.last_accessed_at,
                 disk_manifest_id        = EXCLUDED.disk_manifest_id,
@@ -887,6 +887,9 @@ impl MetadataStore for PostgresStore {
                 -- re-ingest a checkpoint the eviction pipeline already
                 -- recorded with a cursor, or vice versa).
                 events_cursor           = COALESCE(EXCLUDED.events_cursor, snapshots.events_cursor),
+                -- ADR 0037: a base capture is warm-or-cold for its life;
+                -- an idempotent re-record carries the same value.
+                warm_harness            = EXCLUDED.warm_harness,
                 updated_at              = NOW()
             "#,
         )
@@ -907,6 +910,7 @@ impl MetadataStore for PostgresStore {
                 .map_err(|e| MetaError::Serialization(format!("aux_bundles encode: {e}")))?,
         )
         .bind(snap.events_cursor)
+        .bind(snap.warm_harness)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -997,7 +1001,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, warm_harness
             FROM snapshots WHERE session_id = $1 ORDER BY created_at DESC
             "#,
         )
@@ -1019,7 +1023,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, warm_harness
             FROM snapshots WHERE session_id = $1
             ORDER BY created_at DESC LIMIT 1
             "#,
@@ -1042,7 +1046,7 @@ impl MetadataStore for PostgresStore {
                    created_at, last_accessed_at,
                    disk_manifest_id, disk_manifest_version,
                    memory_manifest_id, memory_manifest_version,
-                   recoverable, aux_bundles, events_cursor
+                   recoverable, aux_bundles, events_cursor, warm_harness
             FROM snapshots WHERE id = $1
             "#,
         )

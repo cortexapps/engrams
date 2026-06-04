@@ -385,6 +385,7 @@ impl SandboxBackend for ProcessBackend {
         let archive_size = tokio::fs::metadata(&fs_archive).await?.len();
 
         Ok(SnapshotMetadata {
+            warm_harness: false,
             id: snapshot_id,
             size_bytes: manifest_size + archive_size,
             created_at: manifest.created_at,
@@ -1084,6 +1085,7 @@ mod tests {
         fs::write(snap_dir.join("manifest.json"), b"not json").unwrap();
         fs::write(snap_dir.join("fs.tar.gz"), b"").unwrap();
         let meta = SnapshotMetadata {
+            warm_harness: false,
             id: snap_id,
             size_bytes: 0,
             created_at: chrono::Utc::now(),

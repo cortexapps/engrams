@@ -3954,6 +3954,7 @@ impl FirecrackerBackend {
         }
 
         Ok(SnapshotMetadata {
+            warm_harness: false,
             id: snapshot_id,
             size_bytes,
             created_at,
@@ -4214,6 +4215,7 @@ mod tests {
         // with a Snapshot error.
         let (b, _d) = backend();
         let metadata = SnapshotMetadata {
+            warm_harness: false,
             id: SnapshotId::new(),
             size_bytes: 0,
             created_at: Utc::now(),
@@ -4326,6 +4328,7 @@ mod tests {
         .await
         .unwrap();
         let metadata = SnapshotMetadata {
+            warm_harness: false,
             id: snapshot_id,
             size_bytes: 0,
             created_at: Utc::now(),

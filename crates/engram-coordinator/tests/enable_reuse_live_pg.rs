@@ -278,6 +278,7 @@ impl HostClient for FakeCaptureHost {
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
         Ok(SnapshotMetadata {
+            warm_harness: false,
             id: SnapshotId::new(),
             size_bytes: 4096,
             created_at: Utc::now(),

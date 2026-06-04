@@ -114,6 +114,7 @@ impl HostClient for FakeBackend {
     }
     async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         Ok(SnapshotMetadata {
+            warm_harness: false,
             id: SnapshotId::new(),
             size_bytes: 1024,
             created_at: Utc::now(),
@@ -309,6 +310,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
     let disk = seed_manifest(&rig.chunk_store, ManifestKind::Disk, "snap-disk").await;
     let memory = seed_manifest(&rig.chunk_store, ManifestKind::Memory, "snap-mem").await;
     meta.record_snapshot(SnapshotRecord {
+        warm_harness: false,
         id: SnapshotId::new(),
         session_id: Some(session_id),
         host_id: None,

@@ -58,6 +58,7 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
         version: 7,
     };
     let snap_with = SnapshotRecord {
+        warm_harness: false,
         id: SnapshotId::new(),
         session_id: Some(session_id),
         host_id: None,
@@ -78,6 +79,7 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
     // Case 2: snapshot WITHOUT a disk_manifest — legacy / backends
     // that haven't wired chunked snapshot.
     let snap_without = SnapshotRecord {
+        warm_harness: false,
         id: SnapshotId::new(),
         ..snap_with.clone()
     };

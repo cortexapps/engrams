@@ -171,6 +171,7 @@ pub async fn evict_session_to_state(
         .await
         .unwrap_or_default();
     let record = SnapshotRecord {
+        warm_harness: false,
         id: metadata.id,
         session_id: Some(session_id),
         host_id,

@@ -62,6 +62,7 @@ fn checkpoint_row(
     events_cursor: Option<i64>,
 ) -> SnapshotRecord {
     SnapshotRecord {
+        warm_harness: false,
         id: SnapshotId::new(),
         session_id: Some(session_id),
         host_id: None,

@@ -101,6 +101,7 @@ pub async fn snapshot(
     )
     .await;
     let record = SnapshotRecord {
+        warm_harness: false,
         id: metadata.id,
         session_id: Some(id),
         host_id,
@@ -918,6 +919,7 @@ async fn resume_from_fc_snapshot(
     // carries every field we need; we just round-trip it back into
     // the engine type the backend expects.
     let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
+        warm_harness: false,
         id: record.id,
         size_bytes: record.size_bytes,
         created_at: record.created_at,
@@ -1354,6 +1356,7 @@ mod recoverable_tests {
         memory: Option<ManifestRef>,
     ) -> SnapshotRecord {
         SnapshotRecord {
+            warm_harness: false,
             id,
             session_id: None,
             host_id: None,

@@ -72,6 +72,7 @@ impl ReconcileMeta {
 
     fn seed_recoverable_snapshot(&self, session: SessionId, recoverable: bool) {
         let snap = SnapshotRecord {
+            warm_harness: false,
             id: SnapshotId::new(),
             session_id: Some(session),
             host_id: None,

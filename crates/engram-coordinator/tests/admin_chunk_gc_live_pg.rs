@@ -200,6 +200,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
     let base_snap = SnapshotId::new();
     rig.meta
         .record_snapshot(SnapshotRecord {
+            warm_harness: false,
             id: base_snap,
             session_id: None,
             host_id: None,
@@ -264,6 +265,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
     let snap_mem = seed_manifest(&rig.chunk_store, &[b"snap-m-a"], ManifestKind::Memory).await;
     rig.meta
         .record_snapshot(SnapshotRecord {
+            warm_harness: false,
             id: SnapshotId::new(),
             session_id: Some(session_id),
             host_id: None,
@@ -361,6 +363,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
     let base_snap = SnapshotId::new();
     rig.meta
         .record_snapshot(SnapshotRecord {
+            warm_harness: false,
             id: base_snap,
             session_id: None,
             host_id: None,
@@ -571,6 +574,7 @@ async fn non_recoverable_snapshots_do_not_pin() {
 
     rig.meta
         .record_snapshot(SnapshotRecord {
+            warm_harness: false,
             id: SnapshotId::new(),
             session_id: Some(session_id),
             host_id: None,
@@ -657,6 +661,7 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
     let base_snap = SnapshotId::new();
     rig.meta
         .record_snapshot(SnapshotRecord {
+            warm_harness: false,
             id: base_snap,
             session_id: None,
             host_id: None,

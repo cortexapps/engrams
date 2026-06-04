@@ -55,6 +55,7 @@ async fn seed_snapshot_with_bundles(
 ) -> SnapshotId {
     let id = SnapshotId::new();
     meta.record_snapshot(SnapshotRecord {
+        warm_harness: false,
         id,
         session_id: None,
         host_id: None,

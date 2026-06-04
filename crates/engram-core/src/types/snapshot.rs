@@ -83,6 +83,17 @@ pub struct SnapshotMetadata {
     /// bundle-GC pin set. Empty for snapshots without aux drives.
     #[serde(default)]
     pub aux_bundles: Vec<super::sandbox::AuxBundleRef>,
+    /// ADR 0037: TRUE iff a warm, prompt-less persistent harness was
+    /// captured *into* this base snapshot (gated host-side by
+    /// `ENGRAM_WARM_HARNESS_CAPTURE`). Restore reads it to fork:
+    /// `warm_harness` → late-`Bind` the already-running warm child
+    /// instead of `SpawnHarness`. Stamped ONLY on enable-time base
+    /// captures, never on session idle-evict/drain captures (those must
+    /// take the cold path — a warm-bound session's own eviction snapshot
+    /// is cold). `serde(default)=false` ⇒ every pre-0037 snapshot reads
+    /// cold → automatic fallback to today's spawn.
+    #[serde(default)]
+    pub warm_harness: bool,
 }
 
 /// Persisted row in the `snapshots` table.
@@ -153,4 +164,11 @@ pub struct SnapshotRecord {
     /// tombstoning".
     #[serde(default)]
     pub events_cursor: Option<i64>,
+    /// ADR 0037: TRUE iff a warm persistent harness was captured into
+    /// this (base) snapshot — see [`SnapshotMetadata::warm_harness`].
+    /// Persisted in `snapshots.warm_harness` (migration 0055,
+    /// `DEFAULT FALSE`). Read by the restore-fork to decide late-`Bind`
+    /// vs `SpawnHarness`. Always `false` for session captures.
+    #[serde(default)]
+    pub warm_harness: bool,
 }

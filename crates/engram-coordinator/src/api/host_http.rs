@@ -446,6 +446,10 @@ pub async fn heartbeat(
         )
         .await;
         let record = engram_core::types::snapshot::SnapshotRecord {
+            // ADR 0037: session captures (idle-evict / drain / preempt) are
+            // always cold — warm_harness is stamped only on enable-time base
+            // captures (enabled_images), never on session snapshots.
+            warm_harness: false,
             id: adv.snapshot_id,
             session_id: Some(adv.session_id),
             host_id: Some(host_id),
