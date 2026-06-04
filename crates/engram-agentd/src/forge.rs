@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use engram_core::SessionId;
 use engram_harness_proto::{
-    read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse, FORGE_VSOCK_PORT,
+    read_msg, read_session_var, write_msg, ForgeOp, ForgeRequest, ForgeResponse, FORGE_VSOCK_PORT,
 };
 
 /// Entry from `main`: `sub` is `forge-credential` or
@@ -45,12 +45,14 @@ pub fn run(sub: &str, rest: Vec<String>) -> ExitCode {
 
 async fn run_inner(sub: &str, rest: &[String]) -> Result<String, String> {
     let session_id = env_session_id()?;
-    let broker_token = std::env::var("ENGRAM_FORGE_TOKEN")
-        .map_err(|_| "ENGRAM_FORGE_TOKEN not set in the guest env".to_string())?;
+    // ADR 0037: file-first (warm-bind path), env-fallback (cold path). On a
+    // warm-captured harness, claude's inherited env carries no real token.
+    let broker_token = read_session_var("ENGRAM_FORGE_TOKEN")
+        .ok_or_else(|| "ENGRAM_FORGE_TOKEN not set in the guest env".to_string())?;
     let op = match sub {
         "forge-credential" => ForgeOp::FetchCredential {
             host: flag(rest, "--host").unwrap_or_else(|| "github.com".to_string()),
-            owner: flag(rest, "--owner").or_else(|| non_empty_env("ENGRAM_FORGE_OWNER")),
+            owner: flag(rest, "--owner").or_else(|| non_empty_session_var("ENGRAM_FORGE_OWNER")),
         },
         "forge-pull-request" => ForgeOp::CreatePullRequest {
             repo: req_flag(rest, "--repo")?,
@@ -89,14 +91,14 @@ async fn run_inner(sub: &str, rest: &[String]) -> Result<String, String> {
 }
 
 fn env_session_id() -> Result<SessionId, String> {
-    let s = std::env::var("ENGRAM_SESSION_ID")
-        .map_err(|_| "ENGRAM_SESSION_ID not set in the guest env".to_string())?;
+    let s = read_session_var("ENGRAM_SESSION_ID")
+        .ok_or_else(|| "ENGRAM_SESSION_ID not set in the guest env".to_string())?;
     s.parse()
         .map_err(|_| format!("invalid ENGRAM_SESSION_ID: {s}"))
 }
 
-fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|s| !s.is_empty())
+fn non_empty_session_var(name: &str) -> Option<String> {
+    read_session_var(name).filter(|s| !s.is_empty())
 }
 
 /// Value following `name` in `argv`, if present.

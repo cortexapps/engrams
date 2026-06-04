@@ -1114,6 +1114,7 @@ dependencies = [
  "chrono",
  "engram-core",
  "serde",
+ "tempfile",
  "tokio",
  "uuid",
  "workspace-hack",

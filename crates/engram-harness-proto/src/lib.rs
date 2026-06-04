@@ -483,6 +483,71 @@ where
     Ok(())
 }
 
+// ---- Session env file (ADR 0037) ---------------------------------------
+//
+// A warm-captured harness keeps its frozen capture-time process env across
+// a late `Bind` (no respawn — that's what preserves the warm V8 heap). So
+// the in-guest forge/upload helpers — separate `engram-agentd` subcommand
+// processes that read `ENGRAM_*` from the env they inherit (git → claude's
+// Bash → claude → harness) — can't see this session's real per-session
+// capability tokens / id, since claude's env is the generic capture-time
+// one. Those tokens are vsock capability tokens the egress proxy can't
+// substitute (unlike the HTTP-egress OAuth token), so the real value must
+// be delivered into the guest: the harness materializes the bound session
+// env to this file at `Bind`, and the helpers read it first, falling back
+// to the process env (the cold path, where fresh-spawn env inheritance
+// already carries the values, never writes the file).
+//
+// The file lives on the per-session COW disk — written fresh per session
+// from the base (which is captured pre-session, so it has no file), never
+// shared across sessions, discarded with the VM — and is written 0600.
+
+/// Path of the per-session env file the harness writes at `Bind` and the
+/// in-guest forge/upload helpers read (bincode-encoded `{KEY: value}`).
+pub const SESSION_ENV_FILE: &str = "/workspace/.engram/session-env";
+
+/// Write `env` to [`SESSION_ENV_FILE`] (parent dir created, mode 0600).
+/// Called by the harness on `Bind`. Best-effort: a write failure is logged
+/// by the caller and the helpers fall back to the process env.
+pub fn write_session_env_file(
+    env: &std::collections::HashMap<String, String>,
+) -> std::io::Result<()> {
+    write_session_env_to(std::path::Path::new(SESSION_ENV_FILE), env)
+}
+
+/// Resolve a per-session env var: the [`SESSION_ENV_FILE`] entry if present
+/// (warm-bind path), else the process env (cold path / pre-bind). `None`
+/// if neither carries it.
+pub fn read_session_var(key: &str) -> Option<String> {
+    read_session_var_from(std::path::Path::new(SESSION_ENV_FILE), key)
+        .or_else(|| std::env::var(key).ok())
+}
+
+fn write_session_env_to(
+    path: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = bincode::serialize(env)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    std::fs::write(path, &body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// File-only lookup (no env fallback) — the unit-testable core.
+fn read_session_var_from(path: &std::path::Path, key: &str) -> Option<String> {
+    let body = std::fs::read(path).ok()?;
+    let map: std::collections::HashMap<String, String> = bincode::deserialize(&body).ok()?;
+    map.get(key).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +623,30 @@ mod tests {
             run_id: "r1".into(),
         }));
         round_trip(HarnessFrame::Event(HarnessEvent::Idle));
+    }
+
+    #[test]
+    fn session_env_file_round_trips_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-env");
+        let mut env = std::collections::HashMap::new();
+        env.insert("ENGRAM_SESSION_ID".to_string(), "sess-7".to_string());
+        env.insert("ENGRAM_FORGE_TOKEN".to_string(), "tok-real".to_string());
+        write_session_env_to(&path, &env).unwrap();
+
+        // File entry wins.
+        assert_eq!(
+            read_session_var_from(&path, "ENGRAM_FORGE_TOKEN").as_deref(),
+            Some("tok-real")
+        );
+        // A key absent from the file resolves to None at the file layer
+        // (the public `read_session_var` is what adds the env fallback).
+        assert_eq!(read_session_var_from(&path, "ENGRAM_UPLOAD_TOKEN"), None);
+        // Missing file → None (caller falls back to the process env).
+        assert_eq!(
+            read_session_var_from(std::path::Path::new("/nonexistent/session-env"), "X"),
+            None
+        );
     }
 
     #[test]

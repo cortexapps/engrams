@@ -562,27 +562,32 @@ mod adapter {
                             );
                             *bound_session_id = Some(session_id);
                             *bound_env = session_env;
-                            // The warm child booted with only placeholder /
-                            // template env. Respawn it so the per-session
-                            // env (forge + upload tokens, real session id,
-                            // …) is in the agent's process environment.
-                            // NOTE (ADR 0037 P5): a respawn rebuilds the V8
-                            // heap; if measurement shows that erases the
-                            // warm-heap win, deliver the env without a full
-                            // respawn (e.g. claude-side setenv at turn time).
-                            kill_claude(claude).await;
-                            match spawn_persistent_claude(
-                                cli,
-                                bound_env,
-                                read_claude_session_id().await,
-                            )
-                            .await
+                            // Deliver this session's vsock capability tokens
+                            // (forge / upload) + real session id to the
+                            // in-guest helpers via the per-session env file.
+                            // We do NOT respawn the warm child: keeping it
+                            // alive is what preserves the warm V8 heap (the
+                            // whole point of warm-capture). Its frozen
+                            // capture-time env is fine — the HTTP-egress
+                            // OAuth token is a constant placeholder the proxy
+                            // swaps per-session on the wire, and the helpers
+                            // read the real forge/upload tokens from the file.
+                            if let Err(e) = engram_harness_proto::write_session_env_file(bound_env)
                             {
-                                Ok(c) => *claude = Some(c),
-                                Err(e) => tracing::error!(
-                                    error = %e,
-                                    "respawn after bind failed; will retry on first prompt",
-                                ),
+                                tracing::warn!(error = %e, "writing session env file at bind failed");
+                            }
+                            // Adopt the running warm child as-is. Spawn only
+                            // if none is present (warm spawn failed at capture
+                            // / cold-ish fallback) — then it gets the bound
+                            // env layered on.
+                            if claude.is_none() {
+                                *claude = spawn_persistent_claude(
+                                    cli,
+                                    bound_env,
+                                    read_claude_session_id().await,
+                                )
+                                .await
+                                .ok();
                             }
                             // Run the bound first prompt now; otherwise stay
                             // idle and await a later `Prompt`.

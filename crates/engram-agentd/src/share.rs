@@ -18,8 +18,8 @@ use std::process::ExitCode;
 
 use engram_core::SessionId;
 use engram_harness_proto::{
-    read_msg, write_msg, UploadOp, UploadRequest, UploadResponse, MAX_ARTIFACT_BYTES,
-    UPLOAD_VSOCK_PORT,
+    read_msg, read_session_var, write_msg, UploadOp, UploadRequest, UploadResponse,
+    MAX_ARTIFACT_BYTES, UPLOAD_VSOCK_PORT,
 };
 use tokio::io::AsyncReadExt;
 
@@ -60,8 +60,9 @@ pub fn run(rest: Vec<String>) -> ExitCode {
 
 async fn run_inner(rest: &[String]) -> Result<String, String> {
     let session_id = env_session_id()?;
-    let broker_token = std::env::var("ENGRAM_UPLOAD_TOKEN")
-        .map_err(|_| "ENGRAM_UPLOAD_TOKEN not set in the guest env".to_string())?;
+    // ADR 0037: file-first (warm-bind path), env-fallback (cold path).
+    let broker_token = read_session_var("ENGRAM_UPLOAD_TOKEN")
+        .ok_or_else(|| "ENGRAM_UPLOAD_TOKEN not set in the guest env".to_string())?;
     let path = req_flag(rest, "--file")?;
     let caption = flag(rest, "--caption").filter(|s| !s.is_empty());
 
@@ -145,8 +146,8 @@ async fn run_inner(rest: &[String]) -> Result<String, String> {
 }
 
 fn env_session_id() -> Result<SessionId, String> {
-    let s = std::env::var("ENGRAM_SESSION_ID")
-        .map_err(|_| "ENGRAM_SESSION_ID not set in the guest env".to_string())?;
+    let s = read_session_var("ENGRAM_SESSION_ID")
+        .ok_or_else(|| "ENGRAM_SESSION_ID not set in the guest env".to_string())?;
     s.parse()
         .map_err(|_| format!("invalid ENGRAM_SESSION_ID: {s}"))
 }

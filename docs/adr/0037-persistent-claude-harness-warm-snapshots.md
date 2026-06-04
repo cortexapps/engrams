@@ -182,4 +182,27 @@ SHAs are current-as-of-rebase onto `main` #82.)
 - P3 — late-bind protocol: `HarnessCommand::Bind` + harness handler (adopt id, layer env, run first
   prompt) + `HarnessHub::bind()`; proto round-trip + 2 hub unit tests; dev-vm clippy + 5 adapter
   unit tests green. Inert until P4.
-- _P4…P6_ pending
+- P4a — `warm_harness` flag on `SnapshotMetadata` + `SnapshotRecord` + migration 0055
+  (`snapshots.warm_harness`, `serde(default)=false`); persisted via `record_snapshot`, read by
+  `snapshot_from_row`, wired into the base-capture record from the host's metadata. Inert (nothing sets
+  it true until P4c). dev-vm `--workspace --all-targets` check + clippy green.
+- _P4b…P6_ pending
+
+### Per-session identity delivery to a warm (no-respawn) harness — the P4 mechanism
+
+The warm-heap win requires that bind **not** respawn `claude` (P3's respawn-at-bind is the inert
+fallback; P4 replaces it with no-respawn). Two classes of per-session value, by transport:
+
+- **HTTP-egress secrets (Claude OAuth token, future API keys):** ride the egress proxy. Bake a
+  **constant, session-independent placeholder** into the warm capture's env; the per-session proxy
+  policy maps placeholder→real **by guest IP** on the wire. The warm `claude` keeps the placeholder in
+  its frozen env untouched — no respawn. This reconciles P2 (whose `broker_secret` mints a *per-session*
+  placeholder): the warm-claude OAuth placeholder must be constant, and the restore-side policy uses
+  that constant.
+- **vsock capability tokens (`ENGRAM_FORGE_TOKEN`, `ENGRAM_UPLOAD_TOKEN`):** ride a separate guest→host
+  vsock bridge the proxy never sees; the coord validates the *literal* token against
+  `git_broker_tokens[session]`. A placeholder can't be substituted there. So the **real** per-session
+  value is delivered into the guest at bind — written to a **per-session file on the COW disk**; the
+  `engram-agentd` forge/share helpers read file-first, env-fallback (cold path unchanged). The
+  identity-blind global forge/upload sink (`Fn(stream)`, trusts the request's `(session_id, token)`)
+  means host-side auth-by-sandbox-identity would need a cross-backend sink refactor — out of scope.
