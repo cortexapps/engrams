@@ -1,16 +1,13 @@
 import { useParams } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
-import { interruptSession } from '../api';
 import { useSession } from '../hooks/useSessions';
 import { useSessionEvents } from '../hooks/useSessionEvents';
 import { StatusGlyph } from '../components/Glyph';
-import { Transcript } from '../components/Transcript';
-import { PromptComposer } from '../components/PromptComposer';
+import { SessionThread } from '../components/session-thread/SessionThread';
 import { TabRow } from '../components/TabRow';
 import { TerminalPane } from '../components/TerminalPane';
 import { relativeTime } from '../components/SessionManifest';
 import { SessionCowState } from '../components/CowState';
-import { DurabilityTimeline } from '../components/DurabilityTimeline';
 
 type ViewTab = 'transcript' | 'shell' | 'raw';
 
@@ -35,146 +32,118 @@ export function SessionDetail() {
     if (tab === 'shell') setShellEverActive(true);
   }, [tab]);
 
+  // App-like layout: the page fills the inset, the header + tab row are
+  // fixed at the top, and the active tab scrolls internally (the transcript
+  // is an assistant-ui Thread that owns its own scroll + sticky composer).
   return (
-    <main className="book py-12">
-      {/* No `← back` link — the nav spine carries the `↳ <short id>`
-          sub-crumb and keeps the Sessions tab active (ADR 0029). */}
-      <header className="mb-12">
-        <div
-          className="font-mono smallcaps text-[0.7rem]"
-          style={{ color: 'var(--color-ink-quiet)' }}
-        >
-          session
-        </div>
-        <h1
-          className="font-mono"
-          style={{
-            fontSize: '1.4rem',
-            color: 'var(--color-ink)',
-            letterSpacing: '-0.01em',
-          }}
-        >
-          {id}
-        </h1>
-
-        {session && (
+    <main className="flex h-[100svh] flex-col overflow-hidden">
+      <div className="shrink-0 px-6 pt-8">
+        {/* No `← back` link — the nav spine carries the `↳ <short id>`
+            sub-crumb and keeps the Sessions tab active (ADR 0029). */}
+        <header className="mb-6">
           <div
-            className="mt-3 flex items-baseline gap-3 font-display"
-            style={{ color: 'var(--color-ink-faded)' }}
-          >
-            <StatusGlyph status={session.status} />
-            <span
-              className="smallcaps"
-              style={{ fontSize: '0.7rem', color: 'var(--color-ink-quiet)' }}
-            >
-              {session.status}
-            </span>
-          </div>
-        )}
-
-        {session && (
-          <div
-            className="mt-1 font-mono text-[0.78rem]"
+            className="font-mono smallcaps text-[0.7rem]"
             style={{ color: 'var(--color-ink-quiet)' }}
           >
-            image {session.image} · created{' '}
-            {relativeTime(session.created_at)} ago · {events.length} events
+            session
           </div>
-        )}
+          <h1
+            className="font-mono"
+            style={{
+              fontSize: '1.4rem',
+              color: 'var(--color-ink)',
+              letterSpacing: '-0.01em',
+            }}
+          >
+            {id}
+          </h1>
 
-        {/* ADR 0016 Phase A: per-session COW state. Lives in the
-            header so it's visible regardless of which tab the user
-            is on — operators looking at a session usually want to
-            know "is my work durable yet" without hunting for it. */}
-        {id && (
-          <div className="mt-4">
-            <SessionCowState sessionId={id} />
-          </div>
-        )}
-
-        {/* ADR 0028 A.log: the checkpoint chain — the recovery ladder
-            made legible (rung-1 anchor + forkable history window). Sits
-            beside the COW state: "is my disk durable yet" (CowState) +
-            "what coherent points can I recover/fork to" (here). */}
-        {id && (
-          <div className="mt-3">
-            <DurabilityTimeline sessionId={id} />
-          </div>
-        )}
-
-        <hr className="mt-6" />
-      </header>
-
-      <TabRow
-        tabs={TABS}
-        active={tab}
-        onChange={setTab}
-        right={
-          tab === 'transcript' ? `${events.length} events` : undefined
-        }
-      />
-
-      {tab === 'transcript' && (
-        <>
-          <Transcript
-            events={events}
-            sessionId={id ?? ''}
-            onStop={
-              id
-                ? () => {
-                    // Fire-and-forget: the run_interrupted event arrives
-                    // over the SSE stream and updates the transcript. A
-                    // 409 (no live sandbox) is benign — the run already
-                    // ended — so we just log it.
-                    interruptSession(id).catch((err) =>
-                      console.warn('interrupt failed', err),
-                    );
-                  }
-                : undefined
-            }
-          />
-          {id && <PromptComposer sessionId={id} status={session?.status} />}
-        </>
-      )}
-
-      {/* Mount TerminalPane once and keep it mounted across tab
-          switches. Display:none preserves canvas + WS + ghostty-web
-          WASM grid; remounting would restart bash and (because
-          ghostty-web's render loop has cross-mount quirks) ghost the
-          previous session's output into the fresh canvas. */}
-      {shellEverActive && id && (
-        <div style={{ display: tab === 'shell' ? 'block' : 'none' }}>
-          <TerminalPane sessionId={id} />
-        </div>
-      )}
-
-      {tab === 'raw' && (
-        <div
-          className="font-mono text-[0.74rem] space-y-0.5"
-          style={{ color: 'var(--color-ink-faded)' }}
-        >
-          {events.map((e) => (
+          {session && (
             <div
-              key={e.idx}
-              className="grid items-baseline gap-3"
-              style={{ gridTemplateColumns: '4ch min-content 1fr' }}
+              className="mt-3 flex items-baseline gap-3 font-display"
+              style={{ color: 'var(--color-ink-faded)' }}
             >
-              <span data-tabular style={{ color: 'var(--color-ink-quiet)' }}>
-                {e.idx}
-              </span>
-              <span className="smallcaps" style={{ fontSize: '0.66rem' }}>
-                {e.event.type}
-              </span>
+              <StatusGlyph status={session.status} />
               <span
-                className="truncate"
-                title={JSON.stringify(e.event)}
+                className="smallcaps"
+                style={{ fontSize: '0.7rem', color: 'var(--color-ink-quiet)' }}
               >
-                {summarizeRaw(e.event)}
+                {session.status}
               </span>
             </div>
-          ))}
-        </div>
-      )}
+          )}
+
+          {session && (
+            <div
+              className="mt-1 font-mono text-[0.78rem]"
+              style={{ color: 'var(--color-ink-quiet)' }}
+            >
+              image {session.image} · created{' '}
+              {relativeTime(session.created_at)} ago · {events.length} events
+            </div>
+          )}
+
+          {/* ADR 0016 Phase A: per-session COW state. Lives in the
+              header so it's visible regardless of which tab the user
+              is on — operators looking at a session usually want to
+              know "is my work durable yet" without hunting for it. */}
+          {id && (
+            <div className="mt-4">
+              <SessionCowState sessionId={id} />
+            </div>
+          )}
+        </header>
+
+        <TabRow
+          tabs={TABS}
+          active={tab}
+          onChange={setTab}
+          right={tab === 'transcript' ? `${events.length} events` : undefined}
+        />
+      </div>
+
+      {/* The scrolling region. Each tab fills it; only the active one shows. */}
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {tab === 'transcript' && id && (
+          <SessionThread sessionId={id} events={events} status={session?.status} />
+        )}
+
+        {/* Mount TerminalPane once and keep it mounted across tab
+            switches. Display:none preserves canvas + WS + ghostty-web
+            WASM grid; remounting would restart bash and (because
+            ghostty-web's render loop has cross-mount quirks) ghost the
+            previous session's output into the fresh canvas. */}
+        {shellEverActive && id && (
+          <div className="h-full" style={{ display: tab === 'shell' ? 'block' : 'none' }}>
+            <TerminalPane sessionId={id} />
+          </div>
+        )}
+
+        {tab === 'raw' && (
+          <div
+            className="h-full overflow-auto px-6 py-4 font-mono text-[0.74rem] space-y-0.5"
+            style={{ color: 'var(--color-ink-faded)' }}
+          >
+            {events.map((e) => (
+              <div
+                key={e.idx}
+                className="grid items-baseline gap-3"
+                style={{ gridTemplateColumns: '4ch min-content 1fr' }}
+              >
+                <span data-tabular style={{ color: 'var(--color-ink-quiet)' }}>
+                  {e.idx}
+                </span>
+                <span className="smallcaps" style={{ fontSize: '0.66rem' }}>
+                  {e.event.type}
+                </span>
+                <span className="truncate" title={JSON.stringify(e.event)}>
+                  {summarizeRaw(e.event)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </main>
   );
 }
