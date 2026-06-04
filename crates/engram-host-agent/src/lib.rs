@@ -893,6 +893,76 @@ impl HostAgent {
             // (case C', graceful host reboot).
             let scfg = crate::shutdown::ShutdownConfig::from_env();
             let _ = crate::shutdown::run(&scfg, pooled.clone(), self.cfg.work_dir.clone()).await;
+
+            // ADR 0028 Fix C (OSS half): the SIGTERM checkpoint above
+            // wrote durable records via Fix A (it runs through the
+            // PooledBackend). Steady-state heartbeats already
+            // reconciled every PRIOR checkpoint into PG; fire ONE
+            // final heartbeat carrying the just-written records so the
+            // SIGTERM checkpoint itself reaches PG before the MIG can
+            // delete this host. Best-effort + bounded: if the coord is
+            // mid-roll, the worst case is the session warm-recovers to
+            // the last periodic checkpoint (≤ one cadence interval)
+            // instead of the SIGTERM instant — still memory-preserving.
+            if let Some(dir) = pooled.checkpoint_records_dir() {
+                let records = crate::checkpoint::CheckpointRecord::load_all(&dir).await;
+                if !records.is_empty() {
+                    let checkpoints = records
+                        .iter()
+                        .map(|r| engram_protocol::heartbeat::CheckpointAdvert {
+                            snapshot_id: r.snapshot_id,
+                            session_id: r.session_id,
+                            sandbox_id: r.sandbox_id,
+                            image_version: r.image_version.clone(),
+                            size_bytes: r.size_bytes,
+                            disk_manifest: r.disk_manifest,
+                            memory_manifest: r.memory_manifest,
+                            aux_bundles: r.aux_bundles.clone(),
+                            paused_at: r.paused_at,
+                            captured_at: r.captured_at,
+                        })
+                        .collect();
+                    let req = coord_client::HeartbeatRequest {
+                        capacity: engram_protocol::heartbeat::HostCapacityReport {
+                            total_mib: host_total_mib,
+                            used_mib: 0,
+                            running_sandboxes: 0,
+                        },
+                        local_snapshots: Vec::new(),
+                        running_sandboxes: Vec::new(),
+                        draining: true,
+                        host_addr: self.cfg.grpc_advertise_addr.clone(),
+                        ready_images: Vec::new(),
+                        nbd_unhealthy: Vec::new(),
+                        current_bundles: Vec::new(),
+                        checkpoints,
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        coord_client.heartbeat(host_id, &req),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) => {
+                            crate::checkpoint::CheckpointRecord::delete_acked(
+                                &dir,
+                                &resp.acked_checkpoints,
+                            )
+                            .await;
+                            tracing::info!(
+                                acked = resp.acked_checkpoints.len(),
+                                "shutdown: final heartbeat reconciled SIGTERM checkpoints into PG",
+                            );
+                        }
+                        Ok(Err(e)) => tracing::warn!(error = %e,
+                            "shutdown: final checkpoint-flush heartbeat failed; \
+                             session falls back to the last periodic checkpoint"),
+                        Err(_) => {
+                            tracing::warn!("shutdown: final checkpoint-flush heartbeat timed out")
+                        }
+                    }
+                }
+            }
         } else {
             tracing::info!("no coordinator_endpoint set; standalone dev mode (ctrl-c to exit)");
             shutdown_signal().await;
