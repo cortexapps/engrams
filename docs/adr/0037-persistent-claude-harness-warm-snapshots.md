@@ -1,13 +1,12 @@
 # ADR 0037: Persistent Claude harness + warm-captured base snapshots
 
-Status: 2026-06-04 — **Proposed.** Builds on
+Status: 2026-06-04 — **Proposed.** Branches off `main`. Builds on
 [ADR 0022](0022-runtime-memory-sharing-and-forking.md) (File-backend base-memory restore,
-shared across same-template siblings) and stacks on the in-flight
-[ADR 0034](0034-idle-eviction-control-plane-and-detection.md) branch
-(`fix-idle-evict-snapshot-durability`) for its snapshot-durability + idle-evict changes. That
-branch deliberately **reverted** its harness crash-diagnostics ("separate harness rework owns
-it") — this ADR is that rework, so the crash-detection is authored here against the new
-persistent (EOF = crash) semantics. The three load-bearing risks were retired by spikes on the
+shared across same-template siblings) and on the [ADR 0034](0034-idle-eviction-control-plane-and-detection.md)
+snapshot-durability + idle-evict work merged to `main` as **#82** — which deliberately
+**reverted** its harness crash-diagnostics ("separate harness rework owns it"); this ADR is that
+rework, so the crash-detection is authored here against the new persistent (EOF = crash)
+semantics. The three load-bearing risks were retired by spikes on the
 `worktree-adr-0022-warm-harness-spike` branch before proposing (numbers below).
 
 ## Context / problem
@@ -149,8 +148,10 @@ dials only on the first user message), so the base capture is connection-clean.
 
 ## Commit chain
 
-(ADR-bookend — filled as phases land; flip Status → Accepted at the end with measured numbers.)
+(ADR-bookend — filled as phases land; flip Status → Accepted at the end with measured numbers.
+SHAs are current-as-of-rebase onto `main` #82.)
 
-- `95320e0` — carry over the Phase A/B spike tests as reference/regression
-- _P0_ this ADR (Proposed)
-- _P1…P6_ pending
+- P0a — carry over the Phase A/B spike tests as reference/regression
+- P0b — this ADR (Proposed)
+- P1 — persistent harness rewrite (`engram-harness-claude`): compiles + 5 unit tests + clippy green
+- _P2…P6_ pending
