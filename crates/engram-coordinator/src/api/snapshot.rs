@@ -728,15 +728,37 @@ async fn resume_from_fc_snapshot(
     //
     // In both `None` cases the resolver falls back to the
     // snapshot's manifest, preserving the pre-Phase-B behaviour.
-    let effective_disk_manifest =
-        effective_resume_disk_manifest(session.live_disk_manifest, record.disk_manifest);
+    //
+    // ADR 0028 rung-1 coherence rule: a record with a
+    // `memory_manifest` is a COHERENT (memory, disk) checkpoint — its
+    // restored RAM describes ITS OWN disk version. Pairing that memory
+    // with a newer `live_disk_manifest` corrupts (the same Defect-B
+    // incoherence the evac path guards). So when memory is present we
+    // restore the checkpoint's own disk — which IS the "rewind to the
+    // checkpoint" the recovery ladder prescribes; the post-checkpoint
+    // flushes are deliberately discarded for coherence.
+    //
+    // Why this is newly load-bearing (it wasn't pre-Fix-A): without
+    // periodic checkpoints the only snapshot was the eviction one,
+    // whose disk == live at the pause instant — live-wins was a no-op.
+    // With checkpoints, the latest *recorded* snapshot can be an
+    // earlier checkpoint while live advanced (e.g. the cf4d4afd
+    // eviction snapshot never recorded), so live-wins would now
+    // actively mis-pair. The live-wins branch survives only for the
+    // memory-less record (VZ / disk-only), where there's no RAM to be
+    // incoherent with.
+    let effective_disk_manifest = if record.memory_manifest.is_some() {
+        record.disk_manifest
+    } else {
+        effective_resume_disk_manifest(session.live_disk_manifest, record.disk_manifest)
+    };
     if effective_disk_manifest != record.disk_manifest {
         tracing::info!(
             session_id = %id,
             snapshot_disk_manifest = ?record.disk_manifest,
             live_disk_manifest = ?session.live_disk_manifest,
             effective_disk_manifest = ?effective_disk_manifest,
-            "resume: preferred live_disk_manifest over snapshot's stale lineage",
+            "resume: preferred live_disk_manifest over snapshot's stale lineage (memory-less record)",
         );
     }
     // Build the SnapshotMetadata the trait now takes. The record

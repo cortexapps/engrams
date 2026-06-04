@@ -182,15 +182,20 @@ fn pick_evac_disk_manifest(
 /// backend is unreachable, so a fresh source-side snapshot isn't
 /// possible.
 ///
-/// Restores from existing artifacts:
+/// Restores from existing artifacts, rung-aware (ADR 0028 recovery
+/// ladder):
 ///
-/// - **Disk**: `pick_evac_disk_manifest(session.live_disk_manifest,
-///   snapshot.disk_manifest)`. Live wins when newer (continuous-sync
-///   captured a flush after the snapshot). Snapshot wins on different
-///   lineage or older live.
-/// - **Memory**: from `snapshot.memory_manifest` when a snapshot
-///   exists. Memory loss is accepted when only the live disk manifest
-///   is available — `EvacLoss::Memory { reason: "source-dead-no-snapshot" }`.
+/// - **Rung 1 — coherent checkpoint** (`snapshot.memory_manifest`
+///   present): restore memory + the checkpoint's OWN
+///   `snapshot.disk_manifest`. Deliberately NOT the newer
+///   `live_disk_manifest`: the restored RAM describes the checkpoint's
+///   disk, so pairing it with a later disk version is incoherent. This
+///   IS the "rewind the disk to the checkpoint" step — post-checkpoint
+///   continuous-sync deltas are discarded for coherence. `EvacLoss::None`.
+/// - **Rung 2 — cold boot** (no memory): a fresh kernel mounts the
+///   `pick_evac_disk_manifest(live, snapshot)` disk (live-wins-when-
+///   newer — newest files, no coherence constraint since there's no
+///   RAM to disagree). `EvacLoss::Memory { reason: "source-dead-no-snapshot" }`.
 ///
 /// Failure modes:
 ///
@@ -221,11 +226,22 @@ pub async fn evacuate_dead_source(
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
 
-    let disk_manifest = pick_evac_disk_manifest(
-        session.live_disk_manifest,
-        snapshot.as_ref().and_then(|s| s.disk_manifest),
-    );
     let memory_manifest = snapshot.as_ref().and_then(|s| s.memory_manifest);
+    let snapshot_disk = snapshot.as_ref().and_then(|s| s.disk_manifest);
+
+    // ADR 0028 rung-aware disk pick — the coherence rule. With a
+    // coherent memory snapshot (rung 1), the restored RAM's page
+    // cache + mounted-fs metadata describe the checkpoint's OWN disk;
+    // pairing it with the newer continuous-sync `live_disk_manifest`
+    // is incoherent (corruption — Defect B in miniature). So rung 1
+    // uses the snapshot's disk verbatim. Only rung 2 (cold boot, no
+    // memory — a fresh kernel mounts whatever it's given) takes the
+    // live-wins preference.
+    let disk_manifest = if memory_manifest.is_some() {
+        snapshot_disk
+    } else {
+        pick_evac_disk_manifest(session.live_disk_manifest, snapshot_disk)
+    };
 
     if disk_manifest.is_none() && memory_manifest.is_none() {
         return Err(EvacError::NoRecoverableState);
@@ -405,11 +421,18 @@ mod tests {
         /// ADR 0028 Fix B: the spec the disk-only cold-boot branch
         /// passed to `create()`, for assertions.
         last_create_spec: PlMutex<Option<SandboxSpec>>,
+        /// ADR 0028 rung-1: the metadata the warm branch passed to
+        /// `restore()`, for the coherence-rule assertions.
+        last_restore_metadata: PlMutex<Option<SnapshotMetadata>>,
     }
 
     impl FakeBackend {
         fn set_restore_id(&self, id: SandboxId) {
             *self.next_restore_id.lock() = Some(id);
+        }
+
+        fn last_restore_metadata(&self) -> Option<SnapshotMetadata> {
+            self.last_restore_metadata.lock().clone()
         }
 
         fn last_create_spec(&self) -> Option<SandboxSpec> {
@@ -470,7 +493,8 @@ mod tests {
         async fn abort_snapshot(&self, _id: SandboxId) -> Result<(), SandboxError> {
             Ok(())
         }
-        async fn restore(&self, _md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        async fn restore(&self, md: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            *self.last_restore_metadata.lock() = Some(md);
             if self.fail_restore.load(Ordering::SeqCst) > 0 {
                 return Err(SandboxError::Vm(Box::new(SimpleErr(
                     "restore failed".into(),
@@ -848,23 +872,29 @@ mod tests {
         (registry, target_host, target_be)
     }
 
-    /// Arm 1: snapshot present + live_disk fresher (same lineage, higher
-    /// version) → restore uses the live manifest as disk, snapshot's
-    /// memory_manifest as memory. Loss=None.
+    /// ADR 0028 rung-1 COHERENCE RULE: a coherent memory snapshot is
+    /// present AND the live disk manifest is strictly newer (same
+    /// lineage). The restore MUST use the checkpoint's OWN disk — NOT
+    /// the newer live one — because the restored RAM describes the
+    /// checkpoint's disk; pairing it with later disk deltas corrupts.
+    /// This is the "rewind the disk to the checkpoint" step.
+    ///
+    /// (Pre-Fix-A this arm used live-wins and was named
+    /// `..._uses_live_disk_when_newer` — that encoded the bug.)
     #[tokio::test]
-    async fn evac_dead_source_uses_live_disk_when_newer() {
+    async fn evac_dead_source_rung1_uses_checkpoint_disk_not_newer_live() {
         let meta = Arc::new(FakeMeta::default());
         let lineage = 0xABCD;
         let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        // Live disk is a strictly-newer version of the SAME lineage —
+        // exactly the case pick_evac_disk_manifest would prefer.
         session.live_disk_manifest = Some(fake_manifest(lineage, 5));
         let session_id = session.id;
         meta.install_session(session.clone());
 
-        let snapshot = make_snapshot_for(
-            session_id,
-            Some(fake_manifest(lineage, 3)),
-            Some(fake_manifest(lineage + 1, 1)),
-        );
+        let checkpoint_disk = fake_manifest(lineage, 3);
+        let memory = fake_manifest(lineage + 1, 1);
+        let snapshot = make_snapshot_for(session_id, Some(checkpoint_disk), Some(memory));
 
         let (registry, target_host, target_be) = build_registry_with_target(meta.clone());
         let new_sandbox = SandboxId::new();
@@ -878,10 +908,27 @@ mod tests {
             None,
         )
         .await
-        .expect("happy path");
+        .expect("rung-1 happy path");
         assert_eq!(receipt.new_host_id, target_host);
         assert_eq!(receipt.new_sandbox_id, new_sandbox);
         assert_eq!(receipt.loss, EvacLoss::None);
+
+        // The coherence assertion: warm restore, checkpoint's own disk,
+        // checkpoint's memory — the newer live disk (v5) is ignored.
+        let md = target_be
+            .last_restore_metadata()
+            .expect("rung-1 must go through restore(), not create()");
+        assert_eq!(
+            md.disk_manifest,
+            Some(checkpoint_disk),
+            "rung-1 must pair memory with the checkpoint's OWN disk (v3), \
+             not the newer live disk (v5)",
+        );
+        assert_eq!(md.memory_manifest, Some(memory));
+        assert!(
+            target_be.last_create_spec().is_none(),
+            "rung-1 is a restore, never a cold-boot create",
+        );
 
         let updated = meta.session(session_id);
         assert_eq!(updated.status, SessionState::Created);
