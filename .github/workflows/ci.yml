@@ -289,6 +289,7 @@ jobs:
             --test snapshot_disk_manifest_persistence \
             --test chunk_gc_helpers_live_pg \
             --test bundle_gc_live_pg \
+            --test snapshot_blob_gc_live_pg \
             --test admin_chunk_gc_live_pg \
             --test admin_evac_live_pg \
             --test users_live_pg \

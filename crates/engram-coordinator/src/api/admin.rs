@@ -780,6 +780,43 @@ async fn bundle_gc_run(
     Ok(Json(report))
 }
 
+/// ADR 0028 addendum: snapshot-blob GC — dry-run (classify, no delete)
+/// and sweep (`grace_secs=0` drains immediately). Mirrors the chunk +
+/// bundle gc admin seams.
+pub async fn snapshot_blob_gc_dry_run(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
+) -> Result<Json<crate::snapshot_blob_gc::SnapshotBlobSweepReport>, ApiError> {
+    snapshot_blob_gc_run(state, params, crate::chunk_gc::SweepMode::DryRun).await
+}
+
+pub async fn snapshot_blob_gc_sweep(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
+) -> Result<Json<crate::snapshot_blob_gc::SnapshotBlobSweepReport>, ApiError> {
+    snapshot_blob_gc_run(state, params, crate::chunk_gc::SweepMode::Full).await
+}
+
+async fn snapshot_blob_gc_run(
+    state: SharedState,
+    params: ChunkGcSweepParams,
+    mode: crate::chunk_gc::SweepMode,
+) -> Result<Json<crate::snapshot_blob_gc::SnapshotBlobSweepReport>, ApiError> {
+    let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
+    if let Some(secs) = params.grace_secs {
+        cfg.grace_period = std::time::Duration::from_secs(secs);
+    }
+    let report = crate::snapshot_blob_gc::run_one_snapshot_blob_sweep(
+        state.services.meta.clone(),
+        state.services.blob.clone(),
+        &cfg,
+        mode,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("snapshot-blob-gc: {e}")))?;
+    Ok(Json(report))
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct ChunkGcCandidatesParams {
     /// Max rows to return. Default 100, cap 10_000.

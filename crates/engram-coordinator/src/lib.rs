@@ -33,6 +33,7 @@ pub mod pg_listener;
 pub mod preemption_drain;
 pub mod reconcile;
 pub mod scheduler;
+pub mod snapshot_blob_gc;
 pub mod state;
 
 pub use config::CoordinatorConfig;
