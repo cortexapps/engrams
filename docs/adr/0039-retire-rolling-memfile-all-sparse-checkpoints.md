@@ -109,27 +109,28 @@ mismatch. There are two restore workloads, two flags
 - **`ENGRAM_FC_RESTORE_MODE` (idle→active resume) default flipped
   `file → uffd`.** UFFD lazy-fault is the one true resume path: a
   cross-host idle-resume can't rely on a resident image, so File there is
-  a synchronous multi-GB reconstruct. Prod already runs uffd via a Helm
-  override; making it the code default lets the chart drop the override.
-  `file` stays the explicit opt-out (no chunk store / no
-  `/dev/userfaultfd`).
+  a synchronous multi-GB reconstruct. Prod already runs uffd via the OSS
+  `fc-host-mig` TF module (`var.restore_mode` default) — which **this PR
+  removes** so the code default flows through. `file` stays the explicit
+  opt-out (no chunk store / no `/dev/userfaultfd`).
 - **`ENGRAM_FC_BASE_RESTORE_MODE` (base `session.create` / warm-pool)
   default flipped `inherit(None) → file`.** Base templates are locally
   resident, so File restore is a fast local read (ADR 0022 Option A
   density). This **promotes ADR 0022's Option A from canary to default** —
   ADR 0022 should flip to Accepted on the back of this.
 
-**Activation + caveat (deploy coupling):** the OSS code-default flip is
-inert while the Helm chart still sets these envs. Prod behaviour changes
-when the chart drops the overrides (engrams-internal). At that point:
-(a) verify the per-template **resident base memfile** is present on rolled
-hosts before relying on `base=file` (a cold host without it falls back to
-materialize-from-chunks, the serial path); (b) watch cold-boot latency.
-If the chart does **not** currently pin `ENGRAM_FC_BASE_RESTORE_MODE`,
-this flip activates File base-restore on the **next coord roll** (merge
-auto-rolls coord) — confirm the chart state before merge. The struct
-default (`FirecrackerConfig`) stays `File`/`None` for test safety; only
-the env-parser defaults moved.
+**Activation + caveat (deploy coupling):** the restore-mode override lived
+in the OSS **`fc-host-mig` TF module** (`var.restore_mode` default `uffd`,
+hard-set into the host systemd env) — **not** Helm; and
+`ENGRAM_FC_BASE_RESTORE_MODE` was never set anywhere (base was already
+code-default-driven). **This PR removes the module override** (the env line
++ the now-unused `var.restore_mode`), so on merge both resume and base flow
+from the code defaults via the FC-host re-bake + MIG roll. Resume is
+unchanged (`uffd → uffd`); **base flips `uffd → file`** on that roll — so
+verify the per-template **resident base memfile** is present on rolled hosts
+(a cold host without it falls back to materialize-from-chunks, the serial
+path) and watch cold-boot latency. The struct default (`FirecrackerConfig`)
+stays `File`/`None` for test safety; only the env-parser defaults moved.
 
 **Dead-path note (further cleanup):** with the env path always resolving a
 concrete base mode, the `None`-inherit branch in `effective_restore_mode`
