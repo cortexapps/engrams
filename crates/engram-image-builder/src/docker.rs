@@ -9,12 +9,15 @@
 //! supports BuildKit out of the box, and has stable enough behaviour
 //! that `Command`-shelling is the lowest-friction option for v1.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::time::timeout;
 
 #[derive(Clone, Debug)]
 pub struct BuildArgs {
@@ -78,6 +81,17 @@ pub enum DockerError {
         code: Option<i32>,
         stderr: String,
     },
+    /// The command produced no output for the idle-timeout window and was
+    /// killed as wedged. `tail` is the last output we saw before silence —
+    /// the layer/step the build stalled on. This turns the historical
+    /// silent hang (a `docker build` that stalls on a hung network fetch
+    /// and rides the CI job to its wall-clock cap) into a loud, diagnosable
+    /// failure.
+    Timeout {
+        command: String,
+        idle_secs: u64,
+        tail: String,
+    },
     /// `docker` succeeded but its output didn't parse as expected (e.g.
     /// `docker inspect` JSON). Carries a human-readable reason.
     Parse(String),
@@ -95,6 +109,11 @@ impl std::fmt::Display for DockerError {
                 f,
                 "`{command}` exited with {code:?}: {}",
                 stderr.trim()
+            ),
+            Self::Timeout { command, idle_secs, tail } => write!(
+                f,
+                "`{command}` produced no output for {idle_secs}s and was killed as wedged. Last output before the stall:\n{}",
+                tail.trim()
             ),
             Self::Parse(m) => write!(f, "docker output parse error: {m}"),
             Self::Io(e) => write!(f, "spawn: {e}"),
@@ -164,7 +183,17 @@ impl DockerRunner for DockerCli {
             cmd.arg("--build-arg").arg(format!("{k}={v}"));
         }
         cmd.arg(&args.context);
-        run_to_completion(cmd, "docker build").await
+        // Force BuildKit's line-oriented `plain` progress so the streamed
+        // output is complete + parseable. The default `auto` switches to a
+        // TTY renderer that collapses lines and won't stream usefully to a
+        // pipe — which is exactly how a stalled build went *silent* in CI
+        // (nothing reached the log) before this. Honored by BuildKit;
+        // ignored by the legacy builder.
+        cmd.env("BUILDKIT_PROGRESS", "plain");
+        // Stream the build live (was buffered + discarded until exit) and
+        // bound it with an idle-timeout so a wedged build fails loudly
+        // instead of hanging to the CI job's wall-clock cap.
+        run_streaming(cmd, "docker build", build_idle_timeout()).await
     }
 
     async fn create(&self, image_tag: &str) -> Result<String, DockerError> {
@@ -289,6 +318,140 @@ fn shell_escape(s: &str) -> String {
     out
 }
 
+/// How many trailing lines of a streamed command's output to retain for
+/// the error message. The *full* stream is echoed live to our own
+/// stdout/stderr (so CI shows it as it happens); this bounded tail is
+/// only what rides into a returned [`DockerError`].
+const BUILD_TAIL_LINES: usize = 80;
+
+/// Default idle (no-output) timeout for `docker build`. BuildKit streams
+/// continuous progress, so a long *silence* — not total elapsed time — is
+/// the reliable "wedged" signal (a hung network fetch inside a `RUN`, a
+/// BuildKit stall). A genuinely long-but-progressing build keeps emitting
+/// lines and never trips this; only a stall does. The observed prod hang
+/// sat silent for ~24 min before hitting the job cap, so 10 min catches it
+/// with margin. Override (or disable with `0`) via the env var below.
+const DEFAULT_BUILD_IDLE_TIMEOUT_SECS: u64 = 600;
+
+/// Env override for [`DEFAULT_BUILD_IDLE_TIMEOUT_SECS`]. `0` disables the
+/// guard (unbounded). An unparseable value falls back to the default.
+const BUILD_IDLE_TIMEOUT_ENV: &str = "ENGRAM_IMAGE_BUILD_IDLE_TIMEOUT_SECS";
+
+/// Resolve the `docker build` idle timeout from the environment, falling
+/// back to the default. `Some(d)` arms the guard; `None` disables it.
+fn build_idle_timeout() -> Option<Duration> {
+    match std::env::var(BUILD_IDLE_TIMEOUT_ENV) {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(Duration::from_secs(n)),
+            Err(_) => Some(Duration::from_secs(DEFAULT_BUILD_IDLE_TIMEOUT_SECS)),
+        },
+        Err(_) => Some(Duration::from_secs(DEFAULT_BUILD_IDLE_TIMEOUT_SECS)),
+    }
+}
+
+/// Run a child to completion while streaming its stdout+stderr live to our
+/// own stdout/stderr (so the CI log shows progress in real time) and
+/// retaining a bounded tail for diagnostics. If `idle_timeout` is set and
+/// the child emits no output for that long, it's treated as wedged: the
+/// child is killed and a [`DockerError::Timeout`] returned carrying the
+/// last output before the stall.
+///
+/// Contrast with [`run_to_completion`], which uses `Command::output()` —
+/// that buffers all output until the child *exits* and waits with no
+/// timeout, so a stalled `docker build` produced zero CI output and hung
+/// until the job's wall-clock cap. This streamer is the fix.
+async fn run_streaming(
+    mut cmd: Command,
+    name: &str,
+    idle_timeout: Option<Duration>,
+) -> Result<(), DockerError> {
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Backstop: if we bail (e.g. the caller is cancelled) without an
+        // explicit kill, dropping the child still reaps it.
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().expect("stdout piped above");
+    let stderr = child.stderr.take().expect("stderr piped above");
+
+    // Both pipes feed one channel; the bool marks a stderr line (BuildKit
+    // writes its progress to stderr). Each reader task ends at pipe EOF —
+    // which the child closing the pipe on exit guarantees — dropping its
+    // sender, so the recv loop sees `None` once both have finished.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(bool, String)>(256);
+    let tx_err = tx.clone();
+    let out_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tx.send((false, line)).await.is_err() {
+                break;
+            }
+        }
+    });
+    let err_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tx_err.send((true, line)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(BUILD_TAIL_LINES + 1);
+    let stalled = loop {
+        let item = match idle_timeout {
+            // The wait for the *next* line is the silence window — a line
+            // arriving resets it. `Err` means no line within `d`: wedged.
+            Some(d) => match timeout(d, rx.recv()).await {
+                Ok(item) => item,
+                Err(_) => break true,
+            },
+            None => rx.recv().await,
+        };
+        match item {
+            Some((is_err, line)) => {
+                if is_err {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+                if tail.len() >= BUILD_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            // Both pipes hit EOF — the child has closed them, so it's
+            // exiting; reap it below for the status.
+            None => break false,
+        }
+    };
+
+    if stalled {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        out_task.abort();
+        err_task.abort();
+        return Err(DockerError::Timeout {
+            command: name.into(),
+            idle_secs: idle_timeout.map(|d| d.as_secs()).unwrap_or(0),
+            tail: tail.into_iter().collect::<Vec<_>>().join("\n"),
+        });
+    }
+
+    let status = child.wait().await?;
+    let _ = out_task.await;
+    let _ = err_task.await;
+    if !status.success() {
+        return Err(DockerError::NonZeroExit {
+            command: name.into(),
+            code: status.code(),
+            stderr: tail.into_iter().collect::<Vec<_>>().join("\n"),
+        });
+    }
+    Ok(())
+}
+
 async fn run_to_completion(mut cmd: Command, name: &str) -> Result<(), DockerError> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = cmd.output().await?;
@@ -329,6 +492,81 @@ mod tests {
             vec!["PATH=/opt/cargo/bin:/usr/bin", "CARGO_HOME=/opt/cargo"]
         );
         assert_eq!(cfg.working_dir.as_deref(), Some("/workspace"));
+    }
+
+    #[tokio::test]
+    async fn run_streaming_ok_on_quick_command() {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("echo to-stdout; echo to-stderr 1>&2");
+        let r = run_streaming(cmd, "test", Some(Duration::from_secs(10))).await;
+        assert!(r.is_ok(), "expected success, got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn run_streaming_reports_nonzero_exit_with_tail() {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("echo boom 1>&2; exit 3");
+        match run_streaming(cmd, "test", Some(Duration::from_secs(10))).await {
+            Err(DockerError::NonZeroExit { code, stderr, .. }) => {
+                assert_eq!(code, Some(3));
+                assert!(
+                    stderr.contains("boom"),
+                    "tail should carry stderr: {stderr}"
+                );
+            }
+            other => panic!("expected NonZeroExit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_streaming_times_out_on_a_silent_stall() {
+        // Emit one line, then go silent well past the idle window — the
+        // exact signature of the prod hang. The guard must fire and carry
+        // the last line we saw.
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("echo starting-step; sleep 30");
+        match run_streaming(cmd, "test", Some(Duration::from_millis(300))).await {
+            Err(DockerError::Timeout {
+                tail, idle_secs, ..
+            }) => {
+                assert_eq!(idle_secs, 0, "sub-second idle window rounds to 0s");
+                assert!(
+                    tail.contains("starting-step"),
+                    "tail should carry last output: {tail}"
+                );
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_streaming_disabled_timeout_lets_a_brief_silence_pass() {
+        // `None` disables the guard — a short silence must not be a stall.
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("echo a; sleep 0.2; echo b");
+        let r = run_streaming(cmd, "test", None).await;
+        assert!(r.is_ok(), "expected success with guard disabled, got {r:?}");
+    }
+
+    #[test]
+    fn build_idle_timeout_parses_env_overrides() {
+        // Defaults when unset; `0` disables; a number arms; junk → default.
+        let key = BUILD_IDLE_TIMEOUT_ENV;
+        std::env::remove_var(key);
+        assert_eq!(
+            build_idle_timeout(),
+            Some(Duration::from_secs(DEFAULT_BUILD_IDLE_TIMEOUT_SECS))
+        );
+        std::env::set_var(key, "0");
+        assert_eq!(build_idle_timeout(), None);
+        std::env::set_var(key, "42");
+        assert_eq!(build_idle_timeout(), Some(Duration::from_secs(42)));
+        std::env::set_var(key, "not-a-number");
+        assert_eq!(
+            build_idle_timeout(),
+            Some(Duration::from_secs(DEFAULT_BUILD_IDLE_TIMEOUT_SECS))
+        );
+        std::env::remove_var(key);
     }
 
     #[test]
