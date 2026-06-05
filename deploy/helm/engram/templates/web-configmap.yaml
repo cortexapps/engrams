@@ -85,7 +85,7 @@ data:
       # `sandbox` CSP on each artifact response itself (proxied via the
       # /api/ location above, untouched here).
       location / {
-        add_header Content-Security-Policy "default-src 'self'; img-src 'self'; media-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Content-Security-Policy "default-src 'self'; img-src 'self'; media-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
         add_header X-Content-Type-Options "nosniff" always;
         try_files $uri $uri/ /index.html;
       }
