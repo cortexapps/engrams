@@ -35,7 +35,7 @@ mod adapter {
     use std::collections::VecDeque;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitCode, ExitStatus, Stdio};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use clap::Parser;
@@ -49,7 +49,7 @@ mod adapter {
     use serde_json::Value;
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
     use tokio::process::Command;
-    use tokio::sync::{mpsc, Mutex};
+    use tokio::sync::{mpsc, Notify};
     use tokio::time::{timeout, Instant};
 
     pub const CLAUDE_SESSION_ID_FILE: &str = "/workspace/.engram/claude-session-id";
@@ -67,7 +67,7 @@ mod adapter {
     pub const MAX_STDERR_TAIL_LINES: usize = 64;
     pub const MAX_STDERR_TAIL_BYTES: usize = 4096;
 
-    #[derive(Parser, Debug)]
+    #[derive(Parser, Debug, Clone)]
     #[command(
         name = "engram-harness-claude",
         about = "Engram adapter for Claude Code"
@@ -172,33 +172,72 @@ mod adapter {
             return ExitCode::from(2);
         }
 
-        // Outer loop: dial → run one connection → if the connection
-        // dropped (FC snapshot/restore round-trip is the canonical
-        // case), back off briefly and re-dial. State that needs to
-        // survive a reconnect lives here:
-        //   - `next_prompt`: a queued user prompt the previous
-        //     connection died before we could ack/run. We carry it
-        //     forward so the user doesn't have to re-issue.
-        //   - `/workspace/.engram/claude-session-id`: persisted by
-        //     `run_one_claude_prompt`; survives because it's on disk.
-        let mut next_prompt: Option<String> = std::env::var("ENGRAM_INITIAL_PROMPT").ok();
+        // The claude run is decoupled from the host connection. The
+        // engine task owns the `claude` child + the run state and is
+        // spawned ONCE; it outlives every connection. A dropped host
+        // link (FC snapshot/restore, host-agent restart, a slow
+        // checkpoint that severs vsock) must NOT abort an in-flight
+        // run — connections come and go around the engine.
+        //
+        //   cmd_tx/cmd_rx : host commands → engine. `cmd_tx` is held
+        //       here for the whole process and only *cloned* into each
+        //       connection's forwarder, so a connection drop never
+        //       closes the channel — the engine never mistakes a
+        //       disconnect for a "stop". THIS is the core of the fix.
+        //   evt_tx/evt_rx : engine events → the current connection's
+        //       writer. Bounded: while disconnected the engine
+        //       backpressures (claude's stdout pipe fills) so the run
+        //       *pauses* rather than losing events, resuming on reconnect.
+        //   held : the one event a connection pulled but hadn't finished
+        //       writing when it dropped — re-sent first on the next
+        //       connection (at-least-once, no loss).
+        //   reattach : pulsed when a fresh connection attaches; the
+        //       engine re-announces `Idle` iff it's idle (so the host's
+        //       soft idle-TTL stays armed for a genuinely-idle session),
+        //       but a mid-run reconnect emits NO `Idle`.
+        let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(1024);
+        let reattach = Arc::new(Notify::new());
+        let held: HeldEvent = Arc::new(Mutex::new(None));
+        let initial_prompt: Option<String> = std::env::var("ENGRAM_INITIAL_PROMPT").ok();
+
+        let engine = tokio::spawn(run_engine(
+            cli.clone(),
+            cmd_rx,
+            reattach.clone(),
+            evt_tx,
+            initial_prompt,
+        ));
+
+        // Connection loop: dial → handshake → splice (forward host
+        // commands / pump engine events) until the link drops, then
+        // re-dial. The engine drives termination.
         let mut consecutive_failures: u32 = 0;
         const MAX_BACKOFF_SECS: u64 = 30;
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
-        loop {
+        // `None` → the engine finished on its own; await it below for the
+        // real exit code. `Some` → we're bailing for our own reason
+        // (gave up reaching the host / host rejected attach) and must
+        // abort the still-running engine.
+        let our_code: Option<ExitCode> = loop {
+            // The engine owns shutdown: once it returns (Shutdown / all
+            // command senders gone) stop reconnecting and reap its code.
+            if engine.is_finished() {
+                break None;
+            }
             let stream = match dial(&cli).await {
                 Some(s) => s,
                 None => {
-                    // Dial itself failed — distinct from a mid-session
-                    // drop. With no connection, there's nothing to
-                    // reconnect *to*, so back off and retry.
+                    // Couldn't reach the host at all — distinct from a
+                    // mid-session drop. Back off; give up only after a
+                    // run of failures-to-establish.
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     if consecutive_failures > MAX_CONSECUTIVE_FAILURES {
                         tracing::error!(
                             consecutive_failures,
-                            "giving up after repeated dial failures",
+                            "giving up after repeated dial failures"
                         );
-                        return ExitCode::from(1);
+                        break Some(ExitCode::from(1));
                     }
                     let backoff =
                         std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(5));
@@ -206,20 +245,53 @@ mod adapter {
                     continue;
                 }
             };
-            match run_one_connection(stream, &cli, &mut next_prompt).await {
-                Outcome::Exit(code) => return code,
-                Outcome::Reconnect { reason } => {
+            match run_one_connection(stream, &cli, &cmd_tx, &mut evt_rx, &held, &reattach).await {
+                ConnOutcome::EngineDone => break None,
+                ConnOutcome::Rejected => break Some(ExitCode::from(1)),
+                ConnOutcome::HandshakeFailed { reason } => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures > MAX_CONSECUTIVE_FAILURES {
+                        tracing::error!(
+                            consecutive_failures,
+                            "giving up after repeated handshake failures"
+                        );
+                        break Some(ExitCode::from(1));
+                    }
                     let backoff =
                         std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(5));
                     tracing::warn!(
                         reason,
                         consecutive_failures,
                         backoff_secs = backoff,
-                        "harness connection dropped; reconnecting",
+                        "harness handshake failed; reconnecting"
                     );
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
+                ConnOutcome::Dropped { reason } => {
+                    // The connection was established and later dropped —
+                    // progress, not a failure to reach the host. Reset
+                    // the give-up counter so a long-lived session that
+                    // reconnects many times (across checkpoints) never
+                    // exhausts it; settle briefly so a flapping link
+                    // doesn't hot-loop.
+                    consecutive_failures = 0;
+                    tracing::warn!(reason, "harness connection dropped; reconnecting");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+
+        match our_code {
+            // Engine finished — reap its exit code.
+            None => engine.await.unwrap_or_else(|e| {
+                tracing::error!(error = %e, "engine task panicked");
+                ExitCode::from(1)
+            }),
+            // We bailed; stop the still-running engine (process teardown
+            // drops the claude child too, via kill_on_drop).
+            Some(code) => {
+                engine.abort();
+                code
             }
         }
     }
@@ -265,21 +337,137 @@ mod adapter {
         }
     }
 
-    enum Outcome {
-        /// Adapter is done — propagate this exit code up.
-        Exit(ExitCode),
-        /// Connection dropped mid-life; re-dial and continue.
-        Reconnect { reason: &'static str },
+    /// The single event a connection pulled from the engine but hadn't
+    /// finished writing when it dropped. Re-sent first on the next
+    /// connection so a transient drop never loses an event. Only ever
+    /// touched by `pump_events` (one connection at a time), under a sync
+    /// lock so there's no await between pulling an event and parking it.
+    type HeldEvent = Arc<Mutex<Option<HarnessEvent>>>;
+
+    /// Outcome of one host connection's life.
+    enum ConnOutcome {
+        /// The engine finished (Shutdown / all command senders gone).
+        /// Stop reconnecting and reap the engine's exit code.
+        EngineDone,
+        /// Host explicitly rejected the attach — fatal, don't retry.
+        Rejected,
+        /// Handshake didn't complete (transport flake at/ before attach).
+        HandshakeFailed { reason: &'static str },
+        /// An established connection later dropped — re-dial.
+        Dropped { reason: &'static str },
     }
 
+    /// Push an event to the connection pump. Bounded send: while
+    /// disconnected the pump can't drain, so this backpressures —
+    /// pausing the engine (and, transitively, claude via its stdout
+    /// pipe) rather than losing events. The run resumes when a
+    /// connection reattaches. Errors only if the receiver is gone,
+    /// i.e. the process is tearing down; treat as a debug no-op.
+    async fn emit(evt_tx: &mpsc::Sender<HarnessEvent>, ev: HarnessEvent) {
+        if evt_tx.send(ev).await.is_err() {
+            tracing::debug!("event channel closed; dropping event");
+        }
+    }
+
+    /// The long-lived run engine. Owns the `claude` child and the
+    /// idle/running state; spawned once and never torn down by a
+    /// connection drop. Reads host commands off the long-lived
+    /// `cmd_rx`, emits events into `evt_tx`, and re-announces `Idle`
+    /// on `reattach` only while idle.
+    ///
+    /// Because `cmd_rx`'s senders outlive any single connection, a
+    /// dropped link never closes it — so the engine never sees a
+    /// disconnect as a reason to stop a run. This is the heart of the
+    /// fix: a checkpoint pause that severs vsock mid-turn now pauses
+    /// the run (via `emit` backpressure) instead of killing it and
+    /// emitting a spurious `Idle`.
+    async fn run_engine(
+        cli: Cli,
+        mut cmd_rx: mpsc::Receiver<HarnessCommand>,
+        reattach: Arc<Notify>,
+        evt_tx: mpsc::Sender<HarnessEvent>,
+        initial_prompt: Option<String>,
+    ) -> ExitCode {
+        let mut pending_prompt = initial_prompt;
+        loop {
+            // Resolve the next prompt to run: a queued/initial one, or
+            // wait (idle) for the host to send one.
+            let text = match pending_prompt.take() {
+                Some(t) => t,
+                None => {
+                    // Entering idle: announce it so the host's soft TTL
+                    // arms for a genuinely-idle session.
+                    emit(&evt_tx, HarnessEvent::Idle).await;
+                    loop {
+                        tokio::select! {
+                            cmd = cmd_rx.recv() => match cmd {
+                                Some(HarnessCommand::Prompt { text }) => break text,
+                                Some(HarnessCommand::Shutdown { .. }) => {
+                                    tracing::info!("shutdown received while idle; exiting");
+                                    return ExitCode::SUCCESS;
+                                }
+                                // No child to stop; nothing to flush.
+                                Some(HarnessCommand::Interrupt) => {
+                                    tracing::debug!("interrupt while idle; nothing to stop");
+                                }
+                                Some(HarnessCommand::Checkpoint { .. }) => {}
+                                // All senders gone = the connection loop
+                                // exited = process teardown.
+                                None => return ExitCode::SUCCESS,
+                            },
+                            // A fresh connection attached while we're
+                            // idle: re-announce so the host (whose hub
+                            // state may be freshly rebuilt) re-arms the
+                            // soft TTL. A reattach while RUNNING is not
+                            // observed here — so it emits no `Idle`.
+                            _ = reattach.notified() => {
+                                emit(&evt_tx, HarnessEvent::Idle).await;
+                            }
+                        }
+                    }
+                }
+            };
+
+            let outcome = run_one_claude_prompt(&cli, &evt_tx, &text, &mut cmd_rx).await;
+
+            // Close the run: RunInterrupted for an operator stop,
+            // RunCompleted otherwise. The next loop iteration emits the
+            // trailing `Idle` (when there's no queued prompt) — so a
+            // queued prompt runs back-to-back with no idle gap.
+            let run_id = outcome.run_id.clone().unwrap_or_else(|| "unknown".into());
+            let end_event = if outcome.interrupted {
+                HarnessEvent::RunInterrupted { run_id }
+            } else {
+                HarnessEvent::RunCompleted {
+                    run_id,
+                    ok: outcome.ok,
+                }
+            };
+            emit(&evt_tx, end_event).await;
+
+            if let Some(queued) = outcome.queued_prompt {
+                pending_prompt = Some(queued);
+            }
+        }
+    }
+
+    /// Drive one host connection: handshake, then splice the transport
+    /// to the long-lived engine until the link drops. The two halves
+    /// run concurrently and either ending ends the connection. Both are
+    /// cancellation-safe: `forward_commands` only loses an in-flight
+    /// command on a dying link (the host retries), and `pump_events`
+    /// parks its un-acked event in `held` *before* awaiting the write.
     async fn run_one_connection(
         stream: (BoxedReader, BoxedWriter),
         cli: &Cli,
-        next_prompt: &mut Option<String>,
-    ) -> Outcome {
+        cmd_tx: &mpsc::Sender<HarnessCommand>,
+        evt_rx: &mut mpsc::Receiver<HarnessEvent>,
+        held: &HeldEvent,
+        reattach: &Arc<Notify>,
+    ) -> ConnOutcome {
         let (mut reader, mut writer) = stream;
 
-        // Handshake.
+        // Handshake: announce who we are, await the host's ack.
         if let Err(e) = write_msg(
             &mut writer,
             &HarnessAttach {
@@ -290,133 +478,99 @@ mod adapter {
         .await
         {
             tracing::error!(error = %e, "attach write failed");
-            return Outcome::Reconnect {
+            return ConnOutcome::HandshakeFailed {
                 reason: "attach_write",
             };
         }
-        let ack: HarnessAttachAck = match read_msg(&mut reader).await {
-            Ok(a) => a,
+        match read_msg::<_, HarnessAttachAck>(&mut reader).await {
+            Ok(ack) if ack.ok => {}
+            Ok(ack) => {
+                tracing::error!(message = ?ack.message, "host rejected attach");
+                return ConnOutcome::Rejected;
+            }
             Err(e) => {
                 tracing::error!(error = %e, "attach ack read failed");
-                return Outcome::Reconnect { reason: "ack_read" };
+                return ConnOutcome::HandshakeFailed { reason: "ack_read" };
             }
-        };
-        if !ack.ok {
-            // Host explicitly rejected — not transport flakiness, no
-            // amount of retry will fix it. Exit terminally.
-            tracing::error!(message = ?ack.message, "host rejected attach");
-            return Outcome::Exit(ExitCode::from(1));
         }
 
-        // Reader task: shovel HarnessCommands onto an mpsc; the
-        // writer side stays single-threaded so event writes are
-        // serial and ordered. Channel-close (sender dropped) is the
-        // signal that the reader task hit EOF — i.e. the connection
-        // is dead.
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<HarnessCommand>(8);
-        let reader_task = tokio::spawn(async move {
-            loop {
-                match read_msg::<_, HarnessFrame>(&mut reader).await {
-                    Ok(HarnessFrame::Command(c)) => {
-                        if cmd_tx.send(c).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(HarnessFrame::Event(_)) => {} // hosts shouldn't send events
-                    Err(_) => return,
-                }
-            }
-        });
+        // Live. Tell the engine a connection attached so it re-announces
+        // `Idle` if (and only if) it's currently idle.
+        reattach.notify_one();
 
-        let writer = Arc::new(Mutex::new(writer));
-
-        // If we have a pending prompt (initial $ENGRAM_INITIAL_PROMPT,
-        // or a queued one rolled over from a dropped connection),
-        // we'll run it on this turn. Otherwise emit Idle so the host
-        // knows we're waiting.
-        if next_prompt.is_none() && write_event(&writer, HarnessEvent::Idle).await.is_err() {
-            reader_task.abort();
-            return Outcome::Reconnect {
-                reason: "idle_write",
-            };
+        // Splice: forward host→guest commands and pump guest→host
+        // events concurrently. Whichever side dies first ends the
+        // connection; the engine keeps running regardless.
+        tokio::select! {
+            reason = forward_commands(&mut reader, cmd_tx) => ConnOutcome::Dropped { reason },
+            outcome = pump_events(&mut writer, evt_rx, held) => outcome,
         }
+    }
 
+    /// Read host→guest frames and shovel commands onto the engine's
+    /// long-lived command channel. Returns the drop reason when the
+    /// read side dies. A `send` failure means the engine is gone, which
+    /// the pump reports as `EngineDone`; here we just stop reading.
+    async fn forward_commands<R>(
+        reader: &mut R,
+        cmd_tx: &mpsc::Sender<HarnessCommand>,
+    ) -> &'static str
+    where
+        R: AsyncRead + Unpin,
+    {
         loop {
-            let text = match next_prompt.take() {
-                Some(t) => t,
-                None => loop {
-                    match cmd_rx.recv().await {
-                        Some(HarnessCommand::Prompt { text }) => break text,
-                        Some(HarnessCommand::Shutdown { .. }) => {
-                            tracing::info!("shutdown received; exiting");
-                            reader_task.abort();
-                            return Outcome::Exit(ExitCode::SUCCESS);
-                        }
-                        Some(HarnessCommand::Checkpoint { .. }) => {
-                            // Claude writes its conversation file
-                            // synchronously per message — nothing to
-                            // flush.
-                        }
-                        Some(HarnessCommand::Interrupt) => {
-                            // Idle between runs — there's no child to
-                            // SIGINT. Operator stop with nothing in
-                            // flight is a no-op; keep waiting.
-                            tracing::debug!("interrupt while idle; nothing to stop");
-                        }
-                        None => {
-                            // Reader task ended → connection died.
-                            // Reconnect rather than exit.
-                            reader_task.abort();
-                            return Outcome::Reconnect {
-                                reason: "cmd_chan_closed",
-                            };
-                        }
+            match read_msg::<_, HarnessFrame>(reader).await {
+                Ok(HarnessFrame::Command(c)) => {
+                    if cmd_tx.send(c).await.is_err() {
+                        return "engine_gone";
                     }
+                }
+                Ok(HarnessFrame::Event(_)) => {} // hosts don't send events
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return "eof",
+                Err(_) => return "read_error",
+            }
+        }
+    }
+
+    /// Drain engine events to the current connection's writer. The
+    /// event being written is parked in `held` *before* the await, so
+    /// if this future is cancelled (the read half died) or the write
+    /// fails, the event survives and is re-sent on the next connection
+    /// — at-least-once delivery across a reconnect, no loss.
+    async fn pump_events<W>(
+        writer: &mut W,
+        evt_rx: &mut mpsc::Receiver<HarnessEvent>,
+        held: &HeldEvent,
+    ) -> ConnOutcome
+    where
+        W: AsyncWrite + Unpin,
+    {
+        loop {
+            // Prefer an event parked by a prior dropped connection.
+            let parked = held.lock().expect("held poisoned").clone();
+            let ev = match parked {
+                Some(e) => e,
+                None => match evt_rx.recv().await {
+                    // Park BEFORE the write. The lock is synchronous, so
+                    // there is no await between pulling and parking — a
+                    // cancellation here can't drop the event.
+                    Some(e) => {
+                        *held.lock().expect("held poisoned") = Some(e.clone());
+                        e
+                    }
+                    None => return ConnOutcome::EngineDone,
                 },
             };
-
-            // Stash the prompt back into next_prompt so a mid-run
-            // disconnect re-runs it on the next connection. We clear
-            // it on successful RunCompleted+Idle below.
-            *next_prompt = Some(text.clone());
-
-            let outcome = run_one_claude_prompt(cli, &writer, &text, &mut cmd_rx).await;
-
-            // Successful (or at least delivered) run — clear the
-            // pending prompt so we don't re-run it on the next turn.
-            // This also covers the interrupt case: an operator stop
-            // must NOT auto-re-run the interrupted prompt.
-            *next_prompt = None;
-
-            // An operator interrupt closes the run with RunInterrupted
-            // (distinct marker in the transcript); everything else with
-            // RunCompleted. Both are followed by the mandatory Idle, and
-            // the loop continues to await the next prompt either way —
-            // the session stays alive.
-            let run_id = outcome.run_id.clone().unwrap_or_else(|| "unknown".into());
-            let end_event = if outcome.interrupted {
-                HarnessEvent::RunInterrupted { run_id }
-            } else {
-                HarnessEvent::RunCompleted {
-                    run_id,
-                    ok: outcome.ok,
+            match write_msg(writer, &HarnessFrame::Event(ev)).await {
+                Ok(()) => {
+                    *held.lock().expect("held poisoned") = None;
                 }
-            };
-            if write_event(&writer, end_event).await.is_err() {
-                reader_task.abort();
-                return Outcome::Reconnect {
-                    reason: "run_completed_write",
-                };
-            }
-            if write_event(&writer, HarnessEvent::Idle).await.is_err() {
-                reader_task.abort();
-                return Outcome::Reconnect {
-                    reason: "idle_write",
-                };
-            }
-
-            if let Some(queued) = outcome.queued_prompt {
-                *next_prompt = Some(queued);
+                Err(e) => {
+                    tracing::debug!(error = %e, "event write failed; parked for reconnect");
+                    return ConnOutcome::Dropped {
+                        reason: "write_error",
+                    };
+                }
             }
         }
     }
@@ -445,15 +599,12 @@ mod adapter {
         }
     }
 
-    async fn run_one_claude_prompt<W>(
+    async fn run_one_claude_prompt(
         cli: &Cli,
-        writer: &Arc<Mutex<W>>,
+        evt_tx: &mpsc::Sender<HarnessEvent>,
         text: &str,
         cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
-    ) -> RunOutcome
-    where
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
+    ) -> RunOutcome {
         let resume_id = read_claude_session_id().await;
         let argv = build_claude_argv(&resume_id, text);
         tracing::info!(?argv, "spawning claude");
@@ -498,8 +649,8 @@ mod adapter {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, bin = %claude_bin, "spawn claude failed");
-                let _ = write_event(
-                    writer,
+                emit(
+                    evt_tx,
                     HarnessEvent::AgentMessage {
                         run_id: "spawn-failed".into(),
                         message_id: format!("spawn-{}", uuid::Uuid::new_v4()),
@@ -569,7 +720,7 @@ mod adapter {
                                 cli.max_tool_calls,
                             ) {
                                 for ev in translated {
-                                    let _ = write_event(writer, ev).await;
+                                    emit(evt_tx, ev).await;
                                 }
                             }
                         }
@@ -672,8 +823,8 @@ mod adapter {
             ok = false;
             let detail = describe_abnormal_exit(exit_status, &stderr_tail);
             tracing::error!(detail, "claude exited abnormally mid-turn");
-            let _ = write_event(
-                writer,
+            emit(
+                evt_tx,
                 HarnessEvent::AgentMessage {
                     run_id: run_id.clone().unwrap_or_else(|| "abnormal-exit".into()),
                     message_id: format!("abnormal-{}", uuid::Uuid::new_v4()),
@@ -743,14 +894,6 @@ mod adapter {
         if let Err(e) = tokio::fs::write(CLAUDE_SESSION_ID_FILE, id).await {
             tracing::warn!(error = %e, "couldn't persist claude session id");
         }
-    }
-
-    async fn write_event<W>(writer: &Arc<Mutex<W>>, ev: HarnessEvent) -> std::io::Result<()>
-    where
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let mut w = writer.lock().await;
-        write_msg(&mut *w, &HarnessFrame::Event(ev)).await
     }
 
     /// The terminal `result` line claude emits at the end of every
@@ -993,6 +1136,162 @@ mod adapter {
         let mut truncated = s[..end].to_string();
         truncated.push_str("…[truncated]");
         truncated
+    }
+
+    #[cfg(test)]
+    mod engine_tests {
+        use super::*;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// A writer whose every write fails — stands in for a host
+        /// connection that dropped underneath the pump.
+        struct FailingWriter;
+        impl tokio::io::AsyncWrite for FailingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection dropped",
+                )))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // A connection drop mid-write must PARK the event, not lose it.
+        #[tokio::test]
+        async fn pump_parks_event_when_write_fails() {
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(4);
+            let held: HeldEvent = Arc::new(Mutex::new(None));
+            evt_tx.send(HarnessEvent::Idle).await.unwrap();
+
+            let mut w = FailingWriter;
+            let outcome = pump_events(&mut w, &mut evt_rx, &held).await;
+
+            assert!(matches!(outcome, ConnOutcome::Dropped { .. }));
+            assert_eq!(
+                *held.lock().unwrap(),
+                Some(HarnessEvent::Idle),
+                "the un-acked event must be parked for the next connection",
+            );
+        }
+
+        // The next connection re-sends the parked event first (at-least-once).
+        #[tokio::test]
+        async fn pump_resends_parked_event() {
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(4);
+            // Pre-populate `held` as if a prior connection dropped mid-write,
+            // and close the event channel so the pump finishes after the
+            // re-send.
+            let held: HeldEvent = Arc::new(Mutex::new(Some(HarnessEvent::Idle)));
+            drop(evt_tx);
+
+            let (mut w, mut r) = tokio::io::duplex(4096);
+            let outcome = pump_events(&mut w, &mut evt_rx, &held).await;
+
+            assert!(matches!(outcome, ConnOutcome::EngineDone));
+            assert_eq!(
+                *held.lock().unwrap(),
+                None,
+                "delivered event must be cleared"
+            );
+            let frame: HarnessFrame = read_msg(&mut r).await.unwrap();
+            assert!(
+                matches!(frame, HarnessFrame::Event(HarnessEvent::Idle)),
+                "parked event must be the first thing the new connection sees",
+            );
+        }
+
+        async fn write_fake_claude(lines: &[&str]) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let mut body = String::from("#!/bin/sh\n");
+            for l in lines {
+                body.push_str(&format!("printf '%s\\n' '{l}'\n"));
+            }
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        fn test_cli(claude_bin: String) -> Cli {
+            Cli {
+                connect: None,
+                vsock_host: Some(1),
+                session_id: SessionId::new(),
+                max_tool_calls: 100_000,
+                max_tool_call_secs: 600,
+                max_run_secs: 86_400,
+                claude_bin: Some(claude_bin),
+            }
+        }
+
+        // End-to-end (minus real claude): the engine runs the initial
+        // prompt, emits the run's events, then a trailing `Idle`; a
+        // reattach while idle re-announces `Idle`; Shutdown exits.
+        #[tokio::test]
+        async fn engine_runs_prompt_then_idle_and_reannounces_on_reattach() {
+            let script = write_fake_claude(&[
+                r#"{"type":"system","subtype":"init"}"#,
+                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hello"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false}"#,
+            ])
+            .await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                Some("do it".into()),
+            ));
+
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::RunStarted { .. })
+            ));
+            match evt_rx.recv().await {
+                Some(HarnessEvent::AgentMessage { text, .. }) => assert_eq!(text, "hello"),
+                other => panic!("expected AgentMessage, got {other:?}"),
+            }
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::RunCompleted { ok: true, .. })
+            ));
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // A reconnect while idle re-announces Idle so the host's soft
+            // TTL re-arms; a mid-run reattach (covered implicitly above)
+            // emits none.
+            reattach.notify_one();
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 0 })
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit on shutdown");
+            let _ = tokio::fs::remove_file(&script).await;
+        }
     }
 }
 
