@@ -348,42 +348,48 @@ pub fn cpu_template_from_env() -> Option<String> {
     }
 }
 
-/// ADR 0020 Route B: pick the restore memory backend from
-/// `ENGRAM_FC_RESTORE_MODE` (`uffd` | `file`). Defaults to `file`
-/// (the historical behaviour) when unset or unrecognised, so flipping
-/// to UFFD in production is an explicit, reversible env toggle. `uffd`
+/// ADR 0020 Route B / ADR 0039: pick the *idle-resume* memory backend
+/// from `ENGRAM_FC_RESTORE_MODE` (`uffd` | `file`). **Defaults to `uffd`**
+/// (ADR 0039 — UFFD lazy-fault is the one true resume path; cross-host
+/// idle-resume can't rely on a resident image, so File there would be a
+/// synchronous multi-GB reconstruct). `file` is the explicit opt-out
+/// (no chunk store / no `/dev/userfaultfd`). Because this is now the
+/// default, the Helm chart no longer needs to set the env. `uffd`
 /// requires `engram-uffd-handler` on PATH (or `uffd_handler_bin` set)
 /// and `/dev/userfaultfd` accessible to the host-agent.
 pub fn restore_mode_from_env() -> RestoreMode {
     match std::env::var("ENGRAM_FC_RESTORE_MODE") {
-        Ok(s) if s.eq_ignore_ascii_case("uffd") => RestoreMode::Uffd,
-        Ok(s) if !s.is_empty() && !s.eq_ignore_ascii_case("file") => {
-            tracing::warn!(value = %s, "unrecognised ENGRAM_FC_RESTORE_MODE; defaulting to file");
-            RestoreMode::File
+        Ok(s) if s.eq_ignore_ascii_case("file") => RestoreMode::File,
+        Ok(s) if !s.is_empty() && !s.eq_ignore_ascii_case("uffd") => {
+            tracing::warn!(value = %s, "unrecognised ENGRAM_FC_RESTORE_MODE; defaulting to uffd");
+            RestoreMode::Uffd
         }
-        _ => RestoreMode::File,
+        _ => RestoreMode::Uffd,
     }
 }
 
-/// ADR 0022 Option A: pick the *base `session.create`* memory backend
-/// from `ENGRAM_FC_BASE_RESTORE_MODE` (`file` | `uffd`). Unset (or empty)
-/// ⇒ `None`, meaning base-create inherits [`restore_mode_from_env`] — so
-/// shipping the bifurcation is behaviour-preserving until prod opts in.
-/// `file` turns on Option A density + faster base-restore; `uffd` is the
-/// kill-switch. Governs only the `restore_fresh` (base-create) path;
-/// idle-resume always follows `restore_mode`.
+/// ADR 0022 Option A / ADR 0039: pick the *base `session.create`* memory
+/// backend from `ENGRAM_FC_BASE_RESTORE_MODE` (`file` | `uffd`).
+/// **Defaults to `file`** (ADR 0039 — base templates are locally
+/// resident, so File restore is a fast local read; this promotes ADR
+/// 0022's Option A density to the default and lets the Helm chart drop
+/// the override). `uffd` is the kill-switch. Governs only the
+/// `restore_fresh` (base-create) path; idle-resume always follows
+/// `restore_mode`. Returns `Some(_)` for every input now — the
+/// historical `None` ("inherit `restore_mode`") is reachable only via
+/// direct struct construction (tests); the env path always resolves a
+/// concrete mode.
 pub fn base_restore_mode_from_env() -> Option<RestoreMode> {
     match std::env::var("ENGRAM_FC_BASE_RESTORE_MODE") {
-        Ok(s) if s.eq_ignore_ascii_case("file") => Some(RestoreMode::File),
         Ok(s) if s.eq_ignore_ascii_case("uffd") => Some(RestoreMode::Uffd),
-        Ok(s) if !s.is_empty() => {
+        Ok(s) if !s.is_empty() && !s.eq_ignore_ascii_case("file") => {
             tracing::warn!(
                 value = %s,
-                "unrecognised ENGRAM_FC_BASE_RESTORE_MODE; inheriting restore_mode for base-create",
+                "unrecognised ENGRAM_FC_BASE_RESTORE_MODE; defaulting to file",
             );
-            None
+            Some(RestoreMode::File)
         }
-        _ => None,
+        _ => Some(RestoreMode::File),
     }
 }
 
@@ -4559,11 +4565,12 @@ mod tests {
     }
 
     #[test]
-    fn base_restore_mode_from_env_unset_inherits_restore_mode() {
-        // None ⇒ base-create inherits `restore_mode`, so shipping the
-        // bifurcation is behaviour-preserving until prod opts in.
+    fn base_restore_mode_from_env_unset_defaults_to_file() {
+        // ADR 0039: unset ⇒ base-create defaults to File (ADR 0022
+        // Option A density against the resident base memfile); the Helm
+        // chart no longer needs to set ENGRAM_FC_BASE_RESTORE_MODE.
         let _g = BaseRestoreModeEnvGuard::new();
-        assert_eq!(base_restore_mode_from_env(), None);
+        assert_eq!(base_restore_mode_from_env(), Some(RestoreMode::File));
     }
 
     #[test]
@@ -4588,11 +4595,17 @@ mod tests {
     }
 
     #[test]
-    fn base_restore_mode_from_env_garbage_and_empty_inherit() {
+    fn base_restore_mode_from_env_garbage_and_empty_default_to_file() {
+        // ADR 0039: empty/garbage ⇒ File default (the resident base
+        // memfile path), same as unset.
         let g = BaseRestoreModeEnvGuard::new();
         for v in &["", "lazy", "nonsense"] {
             g.set(v);
-            assert_eq!(base_restore_mode_from_env(), None, "input={v}");
+            assert_eq!(
+                base_restore_mode_from_env(),
+                Some(RestoreMode::File),
+                "input={v}"
+            );
         }
     }
 

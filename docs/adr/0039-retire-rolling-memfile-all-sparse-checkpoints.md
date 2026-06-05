@@ -99,6 +99,43 @@ the same diff for free off the warm cache.
 Eliminates both big disk consumers: the 8.1 G rolling (gone) and the
 61 G leaked `memory.bin`s (removed after chunk).
 
+## Feature-flag decisions (restore mode)
+
+The prod-latency investigation (session `0e22a4e9`) settled the
+FILE-vs-UFFD question and the lingering code-default ≠ prod-default
+mismatch. There are two restore workloads, two flags
+(`effective_restore_mode(fresh)` bifurcates):
+
+- **`ENGRAM_FC_RESTORE_MODE` (idle→active resume) default flipped
+  `file → uffd`.** UFFD lazy-fault is the one true resume path: a
+  cross-host idle-resume can't rely on a resident image, so File there is
+  a synchronous multi-GB reconstruct. Prod already runs uffd via a Helm
+  override; making it the code default lets the chart drop the override.
+  `file` stays the explicit opt-out (no chunk store / no
+  `/dev/userfaultfd`).
+- **`ENGRAM_FC_BASE_RESTORE_MODE` (base `session.create` / warm-pool)
+  default flipped `inherit(None) → file`.** Base templates are locally
+  resident, so File restore is a fast local read (ADR 0022 Option A
+  density). This **promotes ADR 0022's Option A from canary to default** —
+  ADR 0022 should flip to Accepted on the back of this.
+
+**Activation + caveat (deploy coupling):** the OSS code-default flip is
+inert while the Helm chart still sets these envs. Prod behaviour changes
+when the chart drops the overrides (engrams-internal). At that point:
+(a) verify the per-template **resident base memfile** is present on rolled
+hosts before relying on `base=file` (a cold host without it falls back to
+materialize-from-chunks, the serial path); (b) watch cold-boot latency.
+If the chart does **not** currently pin `ENGRAM_FC_BASE_RESTORE_MODE`,
+this flip activates File base-restore on the **next coord roll** (merge
+auto-rolls coord) — confirm the chart state before merge. The struct
+default (`FirecrackerConfig`) stays `File`/`None` for test safety; only
+the env-parser defaults moved.
+
+**Dead-path note (further cleanup):** with the env path always resolving a
+concrete base mode, the `None`-inherit branch in `effective_restore_mode`
+is reachable only via direct struct construction (tests). A later pass can
+drop the `Option` / inherit semantics.
+
 ## Alternatives considered (and rejected)
 
 - **Keep the rolling memfile + rename-not-copy the seed + add a
@@ -129,16 +166,57 @@ Eliminates both big disk consumers: the 8.1 G rolling (gone) and the
   guest-visible pause or resume. 0038's `try_lock`-skip (B1) keeps a slow
   capture from gridlocking the fleet.
 
-## Out of scope (follow-ups)
+## Further work (roadmap from the prod-latency investigation)
 
-- **`snapshots/<id>/` directory reaper.** After (2), the leftover
-  per-snapshot dirs hold only tiny `state.bin` + `manifest.json`; they
-  still accumulate with no reaper. A pin-set reaper (mirroring
-  `orphan_reap`'s live-disk-manifest sweep) is a separate, lower-urgency
-  PR.
-- **Chunk-cache LRU** (the 21 G).
-- **Existing on-host 61 G** — needs a one-shot prod-ops cleanup (this code
-  only stops *new* growth, after the FC-host MIG re-bakes + rolls).
+Driving real prod sessions (`0e22a4e9` + others) with the prod-ops tooling
+produced a unified diagnosis: **slow eviction and slow resume are both
+under-parallelized chunk I/O + lost cache locality** — not the FC capture,
+the `capture_lock`, UFFD, or the disk (all measured fast). Roadmap, in
+priority order:
+
+1. **Async, single-flight chunk I/O.**
+   - *Save (eviction):* `update_for_dirty_ranges_sparse`,
+     `chunk_memory_to_store`, and the disk flush walk dirty chunks
+     **serially** — 1,936 chunks → ~32 s, ~11.5 K → ~4 min (measured).
+     Parallelize with bounded `buffer_unordered`.
+   - *Load (resume):* `restore.prefetch_memory` eagerly pulls the **full**
+     memory image (≈16 K × 512 KiB chunks for 8 GiB) at hardcoded
+     **concurrency 8** before resume — **66.5 s of a 69 s cold resume**
+     (traced). Make it async + move it **into the UFFD-handler process**
+     (which already serves faults via the single-flight `ChunkCache.get`),
+     so the VM resumes immediately and faults coalesce on the in-flight
+     prefetch. The in-process NBD disk daemon gets the same treatment.
+   - Close the blind spot: `snapshot_create_seconds` wraps only the FC
+     capture, not the re-chunk/upload, so the slow phase is invisible.
+2. **Cache locality.**
+   - **PIN the enabled images' canonical (memory+disk) manifests** in the
+     cache pin set at host **boot AND on image-enable** — `image_prefetch`
+     currently *puts but does not pin* the base, so the LRU can evict it
+     and a cold resume re-pulls the shared base from GCS. Pinned ⇒ a resume
+     fetches only the **session-divergent** chunks.
+   - **Publish the working-set trace** (the UFFD handler already *records*
+     it via `WorkingSetRecorder`; the gap is the upload —
+     `working_set_blob_key` is never set, so the prefetch narrowing falls
+     back to full-manifest).
+   - **Resume host-affinity** — prefer the original warm host over a cold
+     cross-host node (observed: resume jumped `h31l → hwf1` despite the
+     origin being alive; warm resume ~0.7 s vs 69 s cold).
+3. **Disk-aware chunk-cache budget + thrash metrics.** The LRU exists
+   (`evict_to_budget`, skips the pin set) but the default budget (200 GiB)
+   exceeds the ~98 GiB host disk, so it never evicts before the disk fills.
+   Default to a free-space floor (≈90 % disk, checked dynamically), with an
+   optional absolute ceiling via `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`.
+4. **Resume scheduling.** `ensure_active` 409-bounces a message that races
+   a mid-eviction session instead of holding + auto-resuming; the 30 s
+   `ENGRAM_IDLE_TTL_SECS` evicts sessions mid-think-pause (observed: a
+   resumed session re-nominated for eviction 32 s later, no work done).
+5. **`snapshots/<id>/` reaper** for the residual tiny `state.bin` +
+   `manifest.json` dirs (the GiB `memory.bin` is gone after this ADR).
+6. **Hygiene noticed in passing:** stale host-registry rows (403, mostly
+   dead) + the FC SIGKILL-on-teardown ("firecracker didn't exit in time").
+7. **Existing on-host disk** — a one-shot prod-ops cleanup of leftover
+   pre-ADR-0039 `memory.bin`s (this code only stops *new* growth, after the
+   FC-host MIG re-bakes + rolls).
 
 ## Implementation
 
@@ -152,7 +230,14 @@ Commit chain (this branch, off the ADR-0038 branch):
   `checkpoint_rolling_path`, the copy-variant `seed_checkpoint_chain`,
   `checkpoint::overlay_sparse`, and the chunk-store full-file
   `update_for_dirty_ranges` (+ its unit test). Net −246 LOC.
-- (this commit) ADR → Accepted with the dev-vm validation record.
+- ADR → Accepted with the dev-vm validation record.
+- (flag flip) `restore_mode_from_env` default `file→uffd` +
+  `base_restore_mode_from_env` default `inherit→file`; tests + coordinator
+  comments updated. Added the "Feature-flag decisions" section + this
+  "Further work" roadmap (folding in the prod-latency investigation).
+
+(Early hashes are pre-rebase: the branch was rebased onto `origin/main`
+after #93 merged, so live SHAs differ — see `git log`.)
 
 ## Divergences from this proposal
 
@@ -166,5 +251,7 @@ Commit chain (this branch, off the ADR-0038 branch):
 
 ## Status
 
-Accepted. Stacked on the ADR-0038 branch (`fix/fc-snapshot-create-hang`,
-PR #93); PR base = that branch so the two review + roll back independently.
+Accepted. #93 (ADR 0038) has merged to `main`; this branch was rebased
+onto `origin/main`, so the PR bases on `main`. The chunk-I/O, cache-budget,
+locality, and resume-scheduling items in **Further work** are tracked as
+separate follow-up PRs.
