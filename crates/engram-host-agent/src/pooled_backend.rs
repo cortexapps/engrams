@@ -2025,7 +2025,13 @@ impl SandboxBackend for PooledBackend {
         // interleave (the pause is idempotent, but concurrent NBD
         // flushes + chain advances are not).
         let capture_lock = self.capture_lock(id);
+        // ADR 0038 B0: time the lock wait — the gridlock signal. With
+        // B1 periodic checkpoints skip rather than queue, so a long tail
+        // here is an eviction/drain blocked on an in-flight capture.
+        let lock_wait = std::time::Instant::now();
         let _capture_guard = capture_lock.lock().await;
+        metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
+            .record(lock_wait.elapsed().as_secs_f64());
         // Diff-mode when a rolling chain exists: same coherent
         // (memory, disk) capture contract, O(dirty set) cost. The
         // chain seeds on the first (Full) capture below — so an
@@ -2159,11 +2165,24 @@ impl SandboxBackend for PooledBackend {
         // earlier pause and brings the VM back to running on exit —
         // for the diff flavor that resume lands after O(dirty set),
         // not O(guest RAM).
-        let mut metadata = if chain_prev.is_some() {
-            self.inner.snapshot_diff(id).await?
+        // ADR 0038 B0: time the FC memory capture (`PUT /snapshot/
+        // create`) — the previously-invisible step that hung 60 s on the
+        // cold Full seed. After B2, `type="full"` should vanish on the
+        // resume path (chain seeded → diff).
+        let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
+        let create_start = std::time::Instant::now();
+        let create_res = if chain_prev.is_some() {
+            self.inner.snapshot_diff(id).await
         } else {
-            self.inner.snapshot(id).await?
+            self.inner.snapshot(id).await
         };
+        metrics::histogram!(
+            crate::metrics::SNAPSHOT_CREATE_SECONDS,
+            "type" => snap_type,
+            "outcome" => if create_res.is_ok() { "success" } else { "error" },
+        )
+        .record(create_start.elapsed().as_secs_f64());
+        let mut metadata = create_res?;
         let dest = self.inner.snapshot_path_for(metadata.id);
         // Filled by the diff branch below; consumed by the chain
         // advance after the post-processing block succeeds.

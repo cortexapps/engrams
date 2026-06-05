@@ -115,3 +115,27 @@ pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
 /// metric a later UI ADR reads). Absent on VZ/non-Linux backends.
 pub const SANDBOX_GUEST_PSS_BYTES: &str = "engram_sandbox_guest_pss_bytes";
 pub const SANDBOX_GUEST_RSS_BYTES: &str = "engram_sandbox_guest_rss_bytes";
+
+/// ADR 0038 B0: histogram of the FC memory-capture (`PUT /snapshot/
+/// create`) wall-clock — the previously-invisible step that hung for
+/// 60 s on the cold Full seed (UFFD fault storm). Labels:
+/// - `type`: `full` (chain seed / no prior chain) | `diff` (sparse or
+///   rolling incremental). After B2 the `full` count should fall toward
+///   zero on the resume path; `diff` stays cheap.
+/// - `outcome`: `success` | `error`.
+///
+/// This is the authoritative signal that the 60 s hang is gone.
+pub const SNAPSHOT_CREATE_SECONDS: &str = "engram_snapshot_create_seconds";
+
+/// ADR 0038 B0: histogram of how long a capture waited to acquire the
+/// per-sandbox capture lock. The gridlock signal — the 5fadd364
+/// incident showed 52–151 s waits as captures queued behind a hung
+/// one. With B1 a periodic checkpoint skips rather than waits, so a
+/// long tail here is an eviction/drain blocked on an in-flight capture.
+pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lock_wait_seconds";
+
+/// ADR 0038 B1: counter of periodic checkpoints skipped because a
+/// capture was already in flight for the sandbox. Sustained increments
+/// are expected under load (eviction + periodic contend); a flat zero
+/// after deploy would mean the skip path isn't exercised.
+pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";

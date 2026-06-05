@@ -265,6 +265,7 @@ pub fn spawn_checkpoint_driver(
                 // capture is what let one slow/hung capture gridlock the
                 // fleet. The next tick retries.
                 if backend.capture_in_flight(sandbox_id) {
+                    metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
                     tracing::debug!(
                         %sandbox_id,
                         %session_id,
