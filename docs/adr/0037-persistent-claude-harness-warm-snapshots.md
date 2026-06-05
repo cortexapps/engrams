@@ -202,18 +202,30 @@ SHAs are current-as-of-rebase onto `main` #82.)
   re-dials under the sentinel session id baked at capture) routes correctly without a colliding
   per-session sentinel registration. **Validated on real FC**: `e2e_warm_capture_via_pooled_backend`
   passes (warm claude boots + attaches + Idle → snapshot `warm_harness=true`, ~73s).
-- **P5b OPEN (the new load-bearing risk the spikes missed):** the full warm loop —
-  `e2e_warm_restore_bind_via_pooled_backend` — gets through capture + restore but the **restored warm
-  harness never re-attaches**: after a full snapshot→destroy→restore (a NEW VM / vsock backend, *unlike*
-  the pause/resume Phase A/B validated), its idle vsock connection doesn't cleanly error, so the
-  reconnect loop never fires and the late-bind finds no harness (`NotAttached`, then no re-attach within
-  60s). The Phase A/B spikes proved socket-recovery across *pause/resume* (held connection → RST →
-  reconnect); they did NOT cover restore-into-a-new-VM, where the connection appears to hang rather than
-  RST. **Fix (focused follow-up):** a harness-side liveness probe (carefully not tripping the idle-evict
-  soft TTL) or an agentd restore-nudge to force the reconnect. Test is committed but gated off CI
-  (`ENGRAM_WARM_RESTORE_E2E`).
-- _P5 measurement, P6 (Accepted)_ pending — blocked on P5b (no warm first-prompt number until the
-  restored harness re-attaches) + a prod canary.
+- **P5b RESOLVED — the load-bearing risk the spikes missed (the agentd reconnect nudge).**
+  The full warm loop — `e2e_warm_restore_bind_via_pooled_backend` — got through capture + restore but the
+  restored warm harness never re-attached: after a full snapshot→destroy→restore (a NEW VM / vsock
+  backend, *unlike* the pause/resume Phase A/B validated) the vsock the harness was attached to at
+  capture is **black-holed with no RST/EOF** — so the harness sits on a hung idle read and its
+  read-error-driven reconnect loop never fires (pause/resume gets an RST and recovers on its own).
+  Diagnosed conclusively on the dev-vm: post-restore the harness + claude processes are *alive* (agentd
+  pid 1, harness, claude in `D`), just stuck on the dead read. **Fix = a deliberate reconnect nudge over
+  the existing vsock** (commit `88b65e7`): agentd `SIGUSR1`s the resident harness child (its tokio
+  `Child` handle survives restore, `.id()` == resumed PID) via a new `ReconnectHarness` RPC the host
+  fires inside `late_bind_harness` before the hub's attach-wait; the harness's idle `select!` wakes on
+  the signal, drops the dead connection, and re-dials **immediately** (no backoff — a nudge is a
+  deliberate reconnect, not a failure, which preserves the latency win). A passive keepalive/timeout was
+  rejected: it would re-introduce the multi-second wait warm-capture exists to remove, and risks tripping
+  the idle-evict soft TTL. **Root cause of the first red run:** `PooledBackend` didn't forward
+  `reconnect_harness` to its inner FC backend, so the trait default (`Ok(false)`) silently no-op'd the
+  nudge — the same missing-forward class as the `start_shell` prod incident; the forwarder is the fix.
+  **Validated on real FC** (`ENGRAM_WARM_RESTORE_E2E=1`): warm base → restore → nudge → re-attach →
+  late-bind → first prompt round-trips through the egress proxy in **~3.5s** (bogus token ⇒ a real 401
+  `result` frame). Cold + pause/resume harness e2e unaffected; clippy clean. Test gated off CI (needs a
+  real `claude` binary + proxy + root + Anthropic reachability); runs on the dev-vm.
+- _P5 cross-sibling density (Σpss/Σrss) + P6 (Accepted)_ pending — the connection-recovery accept gate is
+  now met; the remaining gates are the prod canary (first-prompt latency warm vs cold on a real
+  template) and the File-backend density sample.
   **Known follow-up (pitfall #4):** on the warm path agentd's `/exec` + ttyd shell keep the capture-time
   (sentinel) session env — FC `merge_session_env` is a documented no-op for the guest env; the agent
   loop is correct (forge/upload via the P4b file; OAuth via the baked constant placeholder), but
