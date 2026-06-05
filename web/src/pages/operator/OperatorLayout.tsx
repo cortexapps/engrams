@@ -1,6 +1,5 @@
-import { KeyRound, Users, UserCircle } from 'lucide-react';
+import { Gauge, Boxes, HardDrive, Package, Database } from 'lucide-react';
 import { Link, Outlet, useRouterState } from '@tanstack/react-router';
-import { useIsAdmin } from '../../auth/AuthProvider';
 import {
   Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
   SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider,
@@ -8,27 +7,38 @@ import {
 import type { NavItem } from '@/components/nav';
 import { cn } from '@/lib/utils';
 
-// Account scope only. Infrastructure config (images, registries) moved to the
-// Operator section; Settings now holds your own account and org-wide membership.
-const MINE: NavItem[] = [
-  { to: '/settings/profile', label: 'Profile', icon: UserCircle },
-  { to: '/settings/tokens', label: 'Tokens', icon: KeyRound },
+// The /operator section shell: the admin hat. One section gathers everything
+// infrastructure — live telemetry (the Overview cockpit, hosts, storage) and
+// the config that telemetry runs on (images, registries) — behind a single
+// second rail, in the same two-rail pattern Sessions and Settings use. The
+// whole section is admin-gated at the route layer (see router.tsx), so no
+// per-item role filtering happens here.
+interface Item extends NavItem { exact?: boolean }
+
+const TELEMETRY: Item[] = [
+  { to: '/operator', label: 'Overview', icon: Gauge, exact: true },
+  { to: '/operator/fleet', label: 'Fleet', icon: Boxes },
+  { to: '/operator/storage', label: 'Storage', icon: HardDrive },
 ];
-const ORG: NavItem[] = [
-  { to: '/settings/members', label: 'Members', icon: Users },
+const CONFIG: Item[] = [
+  { to: '/operator/images', label: 'Images', icon: Package },
+  { to: '/operator/registries', label: 'Registries', icon: Database },
 ];
 
-export function SettingsLayout() {
-  const isAdmin = useIsAdmin();
+const isActive = (pathname: string, it: Item) =>
+  it.exact ? pathname === it.to || pathname === `${it.to}/` : pathname.startsWith(it.to as string);
+
+export function OperatorLayout() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const group = (label: string, items: NavItem[]) => (
+
+  const group = (label: string, items: Item[]) => (
     <SidebarGroup key={label}>
       <SidebarGroupLabel>{label}</SidebarGroupLabel>
       <SidebarGroupContent>
         <SidebarMenu>
           {items.map((it) => (
             <SidebarMenuItem key={it.label}>
-              <SidebarMenuButton asChild isActive={pathname.startsWith(it.to as string)}>
+              <SidebarMenuButton asChild isActive={isActive(pathname, it)}>
                 <Link to={it.to}><it.icon /><span>{it.label}</span></Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
@@ -38,15 +48,15 @@ export function SettingsLayout() {
     </SidebarGroup>
   );
 
-  const items = [...MINE, ...(isAdmin ? ORG : [])];
+  const items = [...TELEMETRY, ...CONFIG];
 
   return (
     <SidebarProvider className="min-h-0 flex-1">
       {/* desktop (md+): vertical second sidebar */}
       <Sidebar collapsible="none" className="sidebar-section hidden border-r border-sidebar-border md:flex">
         <SidebarContent>
-          {group('My settings', MINE)}
-          {isAdmin && group('Org', ORG)}
+          {group('Telemetry', TELEMETRY)}
+          {group('Config', CONFIG)}
         </SidebarContent>
       </Sidebar>
       <div className="flex flex-1 flex-col overflow-auto">
@@ -55,7 +65,7 @@ export function SettingsLayout() {
           {items.map((it) => (
             <Link key={it.label} to={it.to}
               className={cn('inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm',
-                pathname.startsWith(it.to as string) ? 'bg-accent text-accent-foreground' : 'text-muted-foreground')}>
+                isActive(pathname, it) ? 'bg-accent text-accent-foreground' : 'text-muted-foreground')}>
               <it.icon className="size-4" />{it.label}
             </Link>
           ))}

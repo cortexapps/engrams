@@ -68,6 +68,15 @@
   --carbon-thread: oklch(0 0 0 / 0.14);
   --carbon-sheen: oklch(1 0 0 / 0.05);
   --carbon-tile: 11px;
+
+  /* Instrument status — the Operator cockpit's gauge zones and telltales.
+     A status vocabulary kept strictly apart from the lime accent: lime is
+     interactive-only, so these three never touch its hue (121). Vivid enough
+     to read as arcs and lit dots on the card; status text always pairs a
+     colored dot with ink, never colored body copy, so AA holds. */
+  --instrument-nominal: oklch(0.60 0.15 150);   /* signal green — emerald, not lime */
+  --instrument-caution: oklch(0.70 0.155 71);   /* amber */
+  --instrument-critical: oklch(0.55 0.21 27);   /* instrument red ≈ destructive */
 }
 
 .dark {
@@ -102,6 +111,11 @@
   --carbon-thread: oklch(0 0 0 / 0.22);
   --carbon-sheen: oklch(1 0 0 / 0.05);
   --carbon-tile: 11px;
+
+  /* Instrument status — luminance lifted to sit on the green-black ground. */
+  --instrument-nominal: oklch(0.72 0.16 150);
+  --instrument-caution: oklch(0.80 0.15 75);
+  --instrument-critical: oklch(0.66 0.20 25);
 }
 
 /* The section rail (the second sidebar) is one step lighter than the primary
@@ -149,6 +163,10 @@
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
 
+  --color-instrument-nominal: var(--instrument-nominal);
+  --color-instrument-caution: var(--instrument-caution);
+  --color-instrument-critical: var(--instrument-critical);
+
   /* Three-font system. Sans is the invisible workhorse (chrome, labels, body);
      Saira is the display/identity voice (page titles, the primary action
      button) — squared and technical, with a racing edge from width + tracked
@@ -158,7 +176,6 @@
     "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
   --font-display:
     "Saira Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-serif: Georgia, "Iowan Old Style", "Source Serif 4", serif;
   --font-mono:
     "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
 
@@ -167,6 +184,10 @@
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
 }
+
+/* The instrument-label voice now lives in the Text component's `label`
+   variant (components/ui/text.tsx) — Saira tracked caps, the single source of
+   truth for every label across the app. */
 
 @layer base {
   * { @apply border-border outline-ring/50; }

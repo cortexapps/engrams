@@ -1,8 +1,11 @@
 // Code-based TanStack Router tree for engrams-web. The shell is RootLayout (the
-// primary destinations rail + inset). `/sessions` and `/settings` are nested
-// LAYOUT routes that each render their own second sidebar + <Outlet/>;
-// Fleet/Storage render full-bleed in the inset. SessionDetail lives OUTSIDE the
-// sessions layout (full-bleed, keeps its old transcript styling).
+// primary destinations rail + inset). `/sessions`, `/operator`, and `/settings`
+// are nested LAYOUT routes that each render their own second sidebar + <Outlet/>.
+// `/operator` is the admin hat: one section gathers fleet, storage, images, and
+// registries behind a single rail, landing on a read-only Overview cockpit.
+// SessionDetail is a CHILD of the sessions layout, so the persistent sessions
+// rail stays mounted across the list views and the transcript (the highlight
+// moves; the rail doesn't remount).
 //
 // Admin surfaces guard via a shared `requireAdmin` beforeLoad reading `isAdmin`
 // from typed router context; the context's `auth` is populated at
@@ -22,6 +25,8 @@ import { SessionsLayout } from './pages/sessions/SessionsLayout';
 import { MySessions } from './pages/sessions/MySessions';
 import { AllSessions } from './pages/sessions/AllSessions';
 import { SessionDetail } from './pages/SessionDetail';
+import { OperatorLayout } from './pages/operator/OperatorLayout';
+import { Overview } from './pages/operator/Overview';
 import { Fleet } from './pages/Fleet';
 import { Storage } from './pages/Storage';
 import { SettingsLayout } from './pages/settings/SettingsLayout';
@@ -71,26 +76,28 @@ const allSessionsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: AllSessions,
 });
-// Session detail is OUTSIDE the sessions layout (full-bleed, no 2nd sidebar,
-// keeps its old styling). It is a child of root at /sessions/$id.
+// Session detail is a CHILD of the sessions layout at /sessions/$id, so the
+// persistent sessions rail wraps it too. Static `all` outranks the dynamic
+// `$id`, so /sessions/all still resolves to the fleet list.
 const sessionDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/sessions/$id',
+  getParentRoute: () => sessionsLayoutRoute,
+  path: '$id',
   component: SessionDetail,
 });
 
-const fleetRoute = createRoute({
+// /operator layout route (second sidebar) — the admin hat. The whole section
+// is admin-gated here, so the child telemetry/config routes don't each re-guard.
+const operatorLayoutRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: '/fleet',
+  path: '/operator',
   beforeLoad: requireAdmin,
-  component: Fleet,
+  component: OperatorLayout,
 });
-const storageRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/storage',
-  beforeLoad: requireAdmin,
-  component: Storage,
-});
+const operatorIndexRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: '/', component: Overview });
+const operatorFleetRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: 'fleet', component: Fleet });
+const operatorStorageRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: 'storage', component: Storage });
+const operatorImagesRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: 'images', component: ImagesPanel });
+const operatorRegistriesRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: 'registries', component: RegistriesPanel });
 
 // /settings layout route (second sidebar) ----------------------------------
 const settingsLayoutRoute = createRoute({
@@ -108,17 +115,15 @@ const settingsIndexRoute = createRoute({
 const profileRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'profile', component: ProfilePanel });
 const tokensRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'tokens', component: TokensPanel });
 const membersRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'members', beforeLoad: requireAdmin, component: Members });
-const imagesRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'images', beforeLoad: requireAdmin, component: ImagesPanel });
-const registriesRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'registries', beforeLoad: requireAdmin, component: RegistriesPanel });
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
-  sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute]),
-  sessionDetailRoute,
-  fleetRoute,
-  storageRoute,
+  sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
+  operatorLayoutRoute.addChildren([
+    operatorIndexRoute, operatorFleetRoute, operatorStorageRoute, operatorImagesRoute, operatorRegistriesRoute,
+  ]),
   settingsLayoutRoute.addChildren([
-    settingsIndexRoute, profileRoute, tokensRoute, membersRoute, imagesRoute, registriesRoute,
+    settingsIndexRoute, profileRoute, tokensRoute, membersRoute,
   ]),
 ]);
 

@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { type ComponentProps, useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from '@tanstack/react-router';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Controller, useForm } from 'react-hook-form';
 import * as z from 'zod';
@@ -27,8 +27,29 @@ const newSessionSchema = z.object({
 });
 type NewSessionValues = z.infer<typeof newSessionSchema>;
 
-export function NewSessionDialog({ onCreated }: { onCreated: (id: string) => void }) {
-  const [open, setOpen] = useState(false);
+export function NewSessionDialog({
+  onCreated,
+  variant,
+  className,
+  open: openProp,
+  onOpenChange,
+  showTrigger = true,
+}: {
+  onCreated: (id: string) => void;
+  /** Trigger styling. Defaults to the primary (lime) button; the sessions rail
+   * passes `secondary` + `w-full` so it reads quietly beside the active row. */
+  variant?: ComponentProps<typeof Button>['variant'];
+  className?: string;
+  /** Controlled open state. Omit for the self-contained trigger usage; pass it
+   * (with `showTrigger={false}`) for the global, keyboard/palette-driven mount
+   * in RootLayout. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  showTrigger?: boolean;
+}) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = openProp ?? internalOpen;
+  const setOpen = onOpenChange ?? setInternalOpen;
   const { data: images, isLoading } = useEnabledImages(true);
   const { principal } = useAuth();
   const qc = useQueryClient();
@@ -74,7 +95,9 @@ export function NewSessionDialog({ onCreated }: { onCreated: (id: string) => voi
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild><Button>New session</Button></DialogTrigger>
+      {showTrigger && (
+        <DialogTrigger asChild><Button variant={variant} className={className}>New session</Button></DialogTrigger>
+      )}
       <DialogContent>
         <DialogHeader>
           <DialogTitle>New session</DialogTitle>
@@ -84,7 +107,17 @@ export function NewSessionDialog({ onCreated }: { onCreated: (id: string) => voi
         {isLoading && <p className="text-sm text-muted-foreground">Loading images…</p>}
         {images && images.length === 0 && (
           <p className="text-sm text-muted-foreground">
-            No images enabled. Enable one under Settings → Images.
+            {principal.role === 'admin' ? (
+              <>
+                No images enabled yet. Enable one in{' '}
+                <Link to="/operator/images" className="underline underline-offset-4 hover:text-foreground">
+                  Operator → Images
+                </Link>{' '}
+                before launching a session.
+              </>
+            ) : (
+              'No images enabled yet. Ask an admin to enable one before you can launch a session.'
+            )}
           </p>
         )}
 

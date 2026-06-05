@@ -1,6 +1,7 @@
 import * as React from "react"
 
 import { cn } from "@/lib/utils"
+import { textVariants } from "@/components/ui/text"
 
 function Table({ className, ...props }: React.ComponentProps<"table">) {
   return (
@@ -68,9 +69,11 @@ function TableHead({ className, ...props }: React.ComponentProps<"th">) {
     <th
       data-slot="table-head"
       className={cn(
-        // Ledger column labels: mono small-caps, recessed — the same voice as
-        // the stat readouts and the sessions group rules.
-        "h-9 px-2 text-left align-middle font-mono text-[0.7rem] font-medium uppercase tracking-[0.12em] whitespace-nowrap text-muted-foreground [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
+        // Ledger column labels: the instrument-label voice (Saira tracked
+        // caps), recessed — same role as the stat captions and section
+        // eyebrows, so it shares the Text `label` variant definition.
+        textVariants({ variant: "label", tone: "muted" }),
+        "h-9 px-2 text-left align-middle whitespace-nowrap [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
         className
       )}
       {...props}

@@ -1,6 +1,8 @@
-import { Boxes, HardDrive, Layers, Settings } from 'lucide-react';
-import { Link, useRouterState, type LinkProps } from '@tanstack/react-router';
+import { Server, SquareTerminal } from 'lucide-react';
+import { Link, useRouterState } from '@tanstack/react-router';
 import { useIsAdmin } from '../auth/AuthProvider';
+import { useOperatorHealth } from '../hooks/useOperatorHealth';
+import type { NavItem } from './nav';
 import { EngramMark } from './EngramMark';
 import { ModeToggle } from './mode-toggle';
 import { UserMenu } from './user-menu';
@@ -9,19 +11,24 @@ import {
   SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarTrigger,
 } from '@/components/ui/sidebar';
 
-interface Dest {
-  to: LinkProps['to'];
-  label: string;
-  icon: typeof Boxes;
+interface Dest extends NavItem {
   adminOnly: boolean;
   match: (p: string) => boolean;
 }
 
+// The two hats only: Sessions is the developer surface; Operator gathers the
+// whole admin/infrastructure surface (fleet, storage, images, registries)
+// behind its own rail. Account + org config (Settings) lives in the avatar
+// menu at the foot of the rail, the one canonical entry point.
+//
+// Each hat's glyph is deliberately distinct from its section's landing item
+// (Sessions → "My sessions" = Layers; Operator → "Overview" = Gauge), so the
+// rail and the open section sidebar never show the same icon twice in adjacent
+// columns: the terminal stands for the developer hat, the server for the
+// operator hat.
 const DESTS: Dest[] = [
-  { to: '/sessions', label: 'Sessions', icon: Layers, adminOnly: false, match: (p) => p === '/' || p.startsWith('/sessions') },
-  { to: '/fleet', label: 'Fleet', icon: Boxes, adminOnly: true, match: (p) => p.startsWith('/fleet') },
-  { to: '/storage', label: 'Storage', icon: HardDrive, adminOnly: true, match: (p) => p.startsWith('/storage') },
-  { to: '/settings', label: 'Settings', icon: Settings, adminOnly: false, match: (p) => p.startsWith('/settings') },
+  { to: '/sessions', label: 'Sessions', icon: SquareTerminal, adminOnly: false, match: (p) => p === '/' || p.startsWith('/sessions') },
+  { to: '/operator', label: 'Operator', icon: Server, adminOnly: true, match: (p) => p.startsWith('/operator') },
 ];
 
 export function MainSidebar() {
@@ -29,6 +36,9 @@ export function MainSidebar() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const dests = DESTS.filter((d) => !d.adminOnly || isAdmin);
 
+  // border-r-sidebar is load-bearing: it recolours the Sidebar's default right
+  // border to the spine's own fill, suppressing the divider line that would
+  // otherwise sit between this rail and the section sidebar.
   return (
     <Sidebar collapsible="icon" className="border-r-sidebar">
       <div
@@ -62,6 +72,7 @@ export function MainSidebar() {
                       <span>{d.label}</span>
                     </Link>
                   </SidebarMenuButton>
+                  {d.to === '/operator' && <OperatorRailSignal />}
                 </SidebarMenuItem>
               ))}
             </SidebarMenu>
@@ -77,5 +88,39 @@ export function MainSidebar() {
         <UserMenu />
       </SidebarFooter>
     </Sidebar>
+  );
+}
+
+// A quiet telltale on the Operator rail item: invisible when all-nominal, it
+// lights amber (caution) or red (critical) the instant fleet or storage health
+// slips — so an operator working in Sessions still catches a draining host or a
+// stale flush window without parking on the cockpit. It rides the top-right
+// corner of the item, so it survives the rail collapsing to icons (exactly when
+// the label is gone and the signal matters most). Status colour only — never the
+// lime accent — and the urgent ping is reserved for critical and respects
+// reduced motion. The row still owns the click; the dot is pointer-transparent.
+function OperatorRailSignal() {
+  const { tone, reason } = useOperatorHealth();
+  if (!tone) return null;
+  const color = `var(--color-instrument-${tone})`;
+
+  return (
+    <span
+      role="img"
+      aria-label={`Operator needs attention: ${reason}`}
+      className="pointer-events-none absolute right-1.5 top-1.5 z-10 flex size-2"
+    >
+      {tone === 'critical' && (
+        <span
+          aria-hidden
+          className="absolute inline-flex size-full animate-ping rounded-full opacity-60 [animation-duration:1.8s] motion-reduce:hidden"
+          style={{ backgroundColor: color }}
+        />
+      )}
+      <span
+        className="relative inline-flex size-2 rounded-full"
+        style={{ backgroundColor: color, boxShadow: `0 0 5px 0 ${color}` }}
+      />
+    </span>
   );
 }

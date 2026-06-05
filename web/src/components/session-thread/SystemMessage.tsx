@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { Text } from '@/components/ui/text';
 import { Button } from '@/components/ui/button';
 import { API_BASE } from '../../api';
 import { fmtBytes, hms } from '../transcriptFmt';
@@ -38,9 +39,47 @@ export function SystemMessage() {
       return <PullRequest marker={marker} />;
     case 'artifact':
       return <Artifact marker={marker} />;
+    case 'recovery':
+      return <Recovery marker={marker} />;
     case 'note':
       return <Note text={fallback} />;
   }
+}
+
+// ADR 0028 A.log: the honest recovery boundary. Everything above (greyed)
+// was rolled back by a rung-1 recovery; the thread resumes below. Surviving
+// outside-world side effects are called out — the platform can't undo them.
+function Recovery({
+  marker,
+}: {
+  marker: Extract<SystemMarker, { kind: 'recovery' }>;
+}) {
+  return (
+    <Card className="border-primary/40 bg-primary/5 py-0">
+      <CardContent className="flex flex-col gap-1.5 p-4">
+        <div className="flex items-center gap-2 text-xs text-primary">
+          <RotateCcwIcon className="size-3.5" />
+          <Text as="span" variant="label">
+            recovered from a checkpoint after a host failure
+          </Text>
+          <span className="ml-auto font-mono tabular-nums text-muted-foreground">
+            {hms(marker.at)}
+          </span>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          ~{marker.rolledBack} {marker.rolledBack === 1 ? 'event' : 'events'} after
+          this point were rolled back; the agent resumed from here.
+        </p>
+        {marker.survivingSideEffects.length > 0 && (
+          <ul className="list-disc pl-5 text-sm text-muted-foreground">
+            {marker.survivingSideEffects.map((s, i) => (
+              <li key={i}>{s}</li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 function Durability({
@@ -53,7 +92,7 @@ function Durability({
   return (
     <div className="flex items-center justify-center gap-2 py-1 text-xs text-muted-foreground">
       <Icon className="size-3.5" />
-      <span className="uppercase tracking-wide">{label}</span>
+      <Text as="span" variant="label">{label}</Text>
       {marker.sizeBytes != null && (
         <>
           <span aria-hidden>·</span>
@@ -76,7 +115,7 @@ function PullRequest({
       <CardContent className="flex flex-col gap-1.5 p-4">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <GitPullRequestIcon className="size-3.5 text-primary" />
-          <span className="uppercase tracking-wide">pull request</span>
+          <Text as="span" variant="label">pull request</Text>
           <span aria-hidden>·</span>
           <span className="font-mono">
             {marker.repo} #{marker.number}
@@ -122,7 +161,7 @@ function Artifact({
       <CardContent className="flex flex-col gap-2 p-4">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <DownloadIcon className="size-3.5 text-primary" />
-          <span className="uppercase tracking-wide">shared file</span>
+          <Text as="span" variant="label">shared file</Text>
           <span aria-hidden>·</span>
           <span className="font-mono">{marker.mediaType}</span>
           <span aria-hidden>·</span>

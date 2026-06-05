@@ -1,7 +1,7 @@
-import type { ReactNode } from 'react';
 import { useSessionCowState } from '../hooks/useCowState';
 import { useSession } from '../hooks/useSessions';
 import { fmtAgo, fmtBytes } from '../format';
+import { MetricRow } from './MetricRow';
 
 // ADR 0016 Phase A: per-session COW diagnostic.
 //
@@ -13,23 +13,6 @@ import { fmtAgo, fmtBytes } from '../format';
 // ADR 0029 moved the host-wide / fleet-wide COW view onto the dedicated
 // Storage surface as a first-class durability ledger; only the per-session
 // view lives here.
-
-function MetricRow({
-  label,
-  value,
-  title,
-}: {
-  label: string;
-  value: ReactNode;
-  title?: string;
-}) {
-  return (
-    <div className="flex items-baseline justify-between gap-3" title={title}>
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="font-mono tabular-nums text-foreground">{value}</dd>
-    </div>
-  );
-}
 
 export function SessionCowState({ sessionId }: { sessionId: string }) {
   const query = useSessionCowState(sessionId);

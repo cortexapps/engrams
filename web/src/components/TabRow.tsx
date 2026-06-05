@@ -1,9 +1,10 @@
 import { cn } from '@/lib/utils';
+import { textVariants } from '@/components/ui/text';
 
 // Typeset tab labels with a hairline underline below the active one.
-// Not pill buttons. Not icons. Just mono uppercase labels with a 2px lime
-// rule under whichever is selected (the racing accent's one appearance
-// here). Switching is instant — tabs are state, not motion.
+// Not pill buttons. Not icons. Just the instrument-label voice (Saira tracked
+// caps) with a 2px lime rule under whichever is selected (the racing accent's
+// one appearance here). Switching is instant — tabs are state, not motion.
 
 export interface Tab<T extends string> {
   id: T;
@@ -35,7 +36,8 @@ export function TabRow<T extends string>({
               type="button"
               onClick={() => onChange(t.id)}
               className={cn(
-                'border-b-2 pb-2 font-mono text-[0.7rem] uppercase tracking-[0.18em] transition-colors',
+                textVariants({ variant: 'label' }),
+                'border-b-2 pb-2 transition-colors',
                 isActive
                   ? 'border-primary text-foreground'
                   : 'border-transparent text-muted-foreground hover:text-foreground',
