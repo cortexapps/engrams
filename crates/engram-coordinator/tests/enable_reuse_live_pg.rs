@@ -450,6 +450,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
             used_mib: 0,
             running_sandboxes: 0,
         },
+        utilization: Default::default(),
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
         host_addr: None,

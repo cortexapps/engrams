@@ -674,6 +674,7 @@ mod tests {
             _: HostId,
             _: engram_core::types::host::HostStatus,
             _: engram_core::types::host::HostCapacity,
+            _: engram_core::types::host::HostUtilization,
         ) -> Result<(), MetaError> {
             unreachable!()
         }

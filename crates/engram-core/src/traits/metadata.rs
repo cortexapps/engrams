@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::error::MetaError;
 use crate::types::event::{ArtifactRow, PersistedEvent};
-use crate::types::host::{HostCapacity, HostRecord, HostStatus};
+use crate::types::host::{HostCapacity, HostRecord, HostStatus, HostUtilization};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::manifest::ManifestRef;
 use crate::types::registry::{
@@ -260,6 +260,7 @@ pub trait MetadataStore: Send + Sync {
         id: HostId,
         status: HostStatus,
         capacity: HostCapacity,
+        utilization: HostUtilization,
     ) -> Result<(), MetaError>;
 
     /// List hosts whose `last_heartbeat_at` is older than `threshold_secs`

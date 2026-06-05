@@ -37,6 +37,7 @@ mod tests {
                 used_mib: 0,
                 running_sandboxes: 0,
             },
+            utilization: Default::default(),
             status,
             last_heartbeat_at: Utc::now(),
             host_addr: None,

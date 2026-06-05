@@ -63,12 +63,52 @@ pub struct HostCapacity {
     pub running_sandboxes: u32,
 }
 
+/// Observed host resource utilization, sampled fresh on every
+/// heartbeat. Distinct from [`HostCapacity`], which is the
+/// *reservation* model the scheduler reasons about (committed guest
+/// RAM); this is what the host is *actually* using right now — the
+/// signal the operator-facing fleet view renders. Disk is the one
+/// that bites in practice (the chunk cache + memory dumps fill the
+/// work_dir mount), so it leads.
+///
+/// All fields default to 0, so a heartbeat from a host running an
+/// older build (no probe) deserializes cleanly to "unknown" and the
+/// UI renders an empty bar rather than failing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HostUtilization {
+    /// Total / used bytes (MiB) of the host's work_dir filesystem —
+    /// the mount that holds the chunk cache, jails, and FC memory
+    /// dumps. `statvfs(2)`; available on Linux and macOS.
+    #[serde(default)]
+    pub disk_total_mib: u64,
+    #[serde(default)]
+    pub disk_used_mib: u64,
+    /// Physical RAM: MemTotal and (MemTotal − MemAvailable) from
+    /// `/proc/meminfo`. Zero on non-Linux (no `/proc`).
+    #[serde(default)]
+    pub mem_total_mib: u64,
+    #[serde(default)]
+    pub mem_used_mib: u64,
+    /// Whole-host CPU utilization in percent (0–100), computed from
+    /// the `/proc/stat` aggregate-cpu delta across the heartbeat
+    /// interval. Zero on non-Linux or on the first tick (no prior
+    /// sample to diff against).
+    #[serde(default)]
+    pub cpu_pct: f32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostRecord {
     pub id: HostId,
     pub hostname: String,
     pub cloud_metadata: HostMetadata,
     pub capacity: HostCapacity,
+    /// Observed disk/mem/cpu utilization from the latest heartbeat.
+    /// Persisted to the `hosts` row (migration 0056) so `/api/hosts`
+    /// reads stay consistent across coord replicas, same as
+    /// [`HostCapacity`]. `#[serde(default)]` for pre-0056 rows.
+    #[serde(default)]
+    pub utilization: HostUtilization,
     pub status: HostStatus,
     pub last_heartbeat_at: DateTime<Utc>,
     /// ADR 0013: gRPC dial address (e.g. `http://10.10.0.42:9101`)
