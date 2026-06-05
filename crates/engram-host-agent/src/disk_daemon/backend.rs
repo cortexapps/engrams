@@ -107,6 +107,16 @@ pub struct DiskFlushOutcome {
     pub bytes_uploaded: u64,
 }
 
+/// ADR 0038 B3: handoff from `flush_local` (drain-under-pause) to
+/// `flush_upload` (upload-post-resume). The chunk bytes live in
+/// `pending_uploads` keyed by `chunk_idx`; this carries the
+/// `(chunk_idx, hash, size)` descriptor the upload + manifest rebuild
+/// needs. Empty `new_chunks` = nothing was dirty.
+#[derive(Clone, Debug)]
+pub struct PendingDiskFlush {
+    new_chunks: Vec<(usize, ChunkHash, u64)>,
+}
+
 /// In-memory representation of the manifest, indexed for O(1) chunk
 /// lookup. Identical shape to the memory side's positional manifest
 /// (see `engram-uffd-handler::chunked::PositionalManifest`) but
@@ -185,6 +195,13 @@ pub struct ChunkedDiskBackend {
     /// `chunk_idx -> dirty bytes`. Locked together so a concurrent
     /// read + write of the same chunk doesn't see torn state.
     dirty: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
+    /// ADR 0038 B3: chunks drained from `dirty` by `flush_local` (under
+    /// the FC pause) but not yet uploaded to GCS by `flush_upload`
+    /// (post-resume). `read_chunk` consults this tier between `dirty`
+    /// and `base`, so a just-drained chunk stays readable until its
+    /// upload lands + `base` is rebased — moving the multi-second GCS
+    /// upload off the frozen-guest path. `chunk_idx -> (hash, bytes)`.
+    pending_uploads: Arc<Mutex<HashMap<usize, (ChunkHash, Bytes)>>>,
     /// Unix-millis timestamp of the last successful `flush()`
     /// completion. `0` = never flushed since construction (the
     /// sentinel the diagnostic surface renders as "never").
@@ -391,6 +408,7 @@ impl ChunkedDiskBackend {
                 DISK_CHUNK_MEM_BUDGET_BYTES,
             ))),
             dirty: Arc::new(Mutex::new(HashMap::new())),
+            pending_uploads: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
             threshold_bytes,
@@ -421,6 +439,7 @@ impl ChunkedDiskBackend {
                 DISK_CHUNK_MEM_BUDGET_BYTES,
             ))),
             dirty: Arc::new(Mutex::new(HashMap::new())),
+            pending_uploads: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
             threshold_bytes,
@@ -691,10 +710,60 @@ impl ChunkedDiskBackend {
     /// cache like any other base chunk. The post-flush state is
     /// indistinguishable from "fresh session against the new
     /// manifest version."
+    /// Full synchronous flush = `flush_local` + `flush_upload` back to
+    /// back. Used by the background scheduler + the SIGTERM/drain paths,
+    /// where there's no FC resume to overlap with, so the historical
+    /// drain→upload→rebase behavior is preserved.
     pub async fn flush(&self) -> Result<DiskFlushOutcome, DiskBackendError> {
+        let pending = self.flush_local().await?;
+        self.flush_upload(pending).await
+    }
+
+    /// ADR 0038 B3 — phase 1 (runs under the FC pause on the snapshot
+    /// path): drain the dirty buffer, hash each chunk locally, stash the
+    /// bytes in `pending_uploads`. NO network, NO `base` rebase — those
+    /// happen in `flush_upload` after the guest resumes, moving the
+    /// multi-second GCS upload off the frozen-guest path. The drain
+    /// still captures disk-at-the-pause-instant (ADR 0018 §12m).
+    pub async fn flush_local(&self) -> Result<PendingDiskFlush, DiskBackendError> {
         let mut dirty_guard = self.dirty.lock().await;
-        let chunk_size = self.chunk_size;
         if dirty_guard.is_empty() {
+            return Ok(PendingDiskFlush {
+                new_chunks: Vec::new(),
+            });
+        }
+        let drained: Vec<(usize, Vec<u8>)> = dirty_guard.drain().collect();
+        drop(dirty_guard);
+        let mut new_chunks: Vec<(usize, ChunkHash, u64)> = Vec::with_capacity(drained.len());
+        let mut pending = self.pending_uploads.lock().await;
+        for (chunk_idx, bytes) in drained {
+            let size = bytes.len() as u64;
+            // Local hash — identical to what `put_chunk` computes, so the
+            // manifest `flush_upload` builds is consistent with the
+            // bytes it uploads.
+            let hash = ChunkHash::of(&bytes);
+            pending.insert(chunk_idx, (hash, Bytes::from(bytes)));
+            new_chunks.push((chunk_idx, hash, size));
+        }
+        Ok(PendingDiskFlush { new_chunks })
+    }
+
+    /// ADR 0038 B3 — phase 2 (runs post-resume on the snapshot path):
+    /// upload the stashed chunks to GCS, then rebuild + publish the
+    /// manifest and rebase `base`. Keeping the rebase *after* the upload
+    /// preserves "a manifest someone restores from ⟹ its chunks are
+    /// durable" — the background scheduler reads `base`, so it never
+    /// references a not-yet-uploaded chunk. Uploaded entries are cleared
+    /// from `pending_uploads` on success (reads fall through to the now-
+    /// rebased `base`). A failed upload leaves them in `pending` — reads
+    /// stay correct; they're reclaimed on `destroy`.
+    pub async fn flush_upload(
+        &self,
+        pending: PendingDiskFlush,
+    ) -> Result<DiskFlushOutcome, DiskBackendError> {
+        let chunk_size = self.chunk_size;
+        let new_chunks = pending.new_chunks;
+        if new_chunks.is_empty() {
             let out = DiskFlushOutcome {
                 manifest_ref: self.state.lock().await.manifest_ref,
                 chunks_flushed: 0,
@@ -703,34 +772,37 @@ impl ChunkedDiskBackend {
             self.stamp_flush_completion();
             return Ok(out);
         }
-        let mut new_chunks: Vec<(usize, ChunkHash, u64)> = Vec::new();
-        // Drain into a Vec so we can release the lock while
-        // uploading (uploads are async + bounded by network
-        // latency; holding the lock would serialise unrelated
-        // reads).
-        let drained: Vec<(usize, Vec<u8>)> = dirty_guard.drain().collect();
-        drop(dirty_guard);
-        for (chunk_idx, bytes) in drained {
-            let size = bytes.len() as u64;
-            // ADR 0019: under an active operation (snapshot for idle-evict /
-            // evacuate), span each dirty-chunk upload so the flush — the
-            // evac/evict critical-path cost — shows in the operation's trace.
+        // Upload each stashed chunk to GCS — OFF the frozen-guest path.
+        for (chunk_idx, _hash, size) in &new_chunks {
+            let Some(bytes) = self
+                .pending_uploads
+                .lock()
+                .await
+                .get(chunk_idx)
+                .map(|(_, b)| b.clone())
+            else {
+                continue;
+            };
+            // ADR 0019: span each dirty-chunk upload under an active
+            // operation so this (now post-resume) flush still shows in
+            // the op's trace.
             let put = self.store.put_chunk(&bytes);
-            let hash = match self.operation_scope.current() {
+            match self.operation_scope.current() {
                 Some(op) => {
                     let span = op.span.in_scope(|| {
                         tracing::info_span!(
                             "chunk.flush",
                             op = op.kind,
-                            chunk = chunk_idx,
-                            bytes = size,
+                            chunk = *chunk_idx,
+                            bytes = *size,
                         )
                     });
-                    tracing::Instrument::instrument(put, span).await?
+                    tracing::Instrument::instrument(put, span).await?;
                 }
-                None => put.await?,
-            };
-            new_chunks.push((chunk_idx, hash, size));
+                None => {
+                    put.await?;
+                }
+            }
         }
 
         // Now atomically: rebuild the manifest from the (locked)
@@ -853,6 +925,16 @@ impl ChunkedDiskBackend {
         state.manifest_ref = new_ref;
         drop(state);
 
+        // ADR 0038 B3: chunks are now durable in GCS AND `base` is
+        // rebased to their hashes, so reads resolve through the cache/
+        // store — drop them from the pending tier.
+        {
+            let mut pending = self.pending_uploads.lock().await;
+            for (idx, _, _) in &new_chunks {
+                pending.remove(idx);
+            }
+        }
+
         self.stamp_flush_completion();
 
         Ok(DiskFlushOutcome {
@@ -889,6 +971,18 @@ impl ChunkedDiskBackend {
             let dirty = self.dirty.lock().await;
             if let Some(buf) = dirty.get(&chunk_idx) {
                 return Ok(Bytes::copy_from_slice(buf));
+            }
+        }
+        // ADR 0038 B3: pending tier — a chunk drained by `flush_local`
+        // (under the FC pause) but not yet uploaded by `flush_upload`
+        // (post-resume). `base` isn't rebased until the upload lands, so
+        // without this a post-drain read would resolve the OLD `base`
+        // hash and serve stale bytes. (A post-resume re-write goes to
+        // `dirty`, checked above, so newest-wins ordering holds.)
+        {
+            let pending = self.pending_uploads.lock().await;
+            if let Some((_hash, bytes)) = pending.get(&chunk_idx) {
+                return Ok(bytes.clone());
             }
         }
         // Snapshot the hash under the state lock, then release

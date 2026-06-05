@@ -35,19 +35,27 @@ use engram_core::types::manifest::ManifestRef;
 use serde::{Deserialize, Serialize};
 
 /// Per-sandbox rolling chain state. Lives in
-/// `PooledBackend::checkpoint_chains`; seeded by the first (Full)
-/// checkpoint and advanced by every diff.
+/// `PooledBackend::checkpoint_chains`; seeded either by the first
+/// (Full) checkpoint (File-mode, with a rolling memfile) or
+/// manifest-only on resume (ADR 0038, UFFD "sparse mode"), and
+/// advanced by every diff.
 pub struct CheckpointChain {
     /// The last published memory manifest — same `manifest_id` for the
     /// chain's lifetime, `version` ticking on every checkpoint.
     pub manifest_ref: ManifestRef,
     /// Its full chunk list — the `prev` for the next incremental
-    /// re-chunk (`ChunkStore::update_for_dirty_ranges`).
+    /// re-chunk.
     pub manifest: engram_chunk_store::Manifest,
     /// The rolling full memory image on local NVMe — the diff-apply
-    /// target, and (fork-ready, ADR 0022) the same-host
-    /// File-restore / fork source. Disposable: GCS chunks are truth.
-    pub rolling_memfile: PathBuf,
+    /// target for `update_for_dirty_ranges`, and (fork-ready, ADR 0022)
+    /// the same-host File-restore / fork source. Disposable: GCS chunks
+    /// are truth.
+    ///
+    /// `None` = ADR 0038 "sparse mode": a UFFD-resumed chain seeded
+    /// manifest-only, with no local full image. Diffs re-chunk via
+    /// `update_for_dirty_ranges_sparse` (fetch prev chunks + apply the
+    /// sparse diff) so we never materialize guest RAM just to checkpoint.
+    pub rolling_memfile: Option<PathBuf>,
 }
 
 /// Durable, self-describing record of one completed checkpoint.
@@ -231,9 +239,10 @@ impl CheckpointConfig {
 /// Spawn the periodic checkpoint driver: every `interval`, checkpoint
 /// each session-bound sandbox whose last checkpoint is older than the
 /// interval. Per-sandbox failures are logged and retried next tick —
-/// one wedged guest must not stall the sweep, and the capture lock
-/// inside `checkpoint_sandbox` keeps us from ever stacking on top of
-/// an in-flight eviction snapshot.
+/// one wedged guest must not stall the sweep. ADR 0038 B1: a sandbox
+/// with a capture already in flight (eviction / evac / drain) is
+/// SKIPPED, not queued — a best-effort periodic checkpoint must never
+/// stack behind another capture (that gridlocked the fleet).
 pub fn spawn_checkpoint_driver(
     backend: Arc<crate::pooled_backend::PooledBackend>,
     cfg: CheckpointConfig,
@@ -251,6 +260,19 @@ pub fn spawn_checkpoint_driver(
             tick.tick().await;
             let due = backend.checkpoint_candidates(interval);
             for (sandbox_id, session_id) in due {
+                // ADR 0038 B1: skip if a capture is already in flight —
+                // queuing this best-effort checkpoint behind another
+                // capture is what let one slow/hung capture gridlock the
+                // fleet. The next tick retries.
+                if backend.capture_in_flight(sandbox_id) {
+                    metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
+                    tracing::debug!(
+                        %sandbox_id,
+                        %session_id,
+                        "skipping periodic checkpoint; a capture is already in flight",
+                    );
+                    continue;
+                }
                 match backend.checkpoint_sandbox(sandbox_id).await {
                     Ok(metadata) => {
                         tracing::info!(
