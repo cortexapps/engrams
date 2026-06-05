@@ -163,6 +163,117 @@ impl ChunkStore {
         })
     }
 
+    /// ADR 0038: like [`Self::update_for_dirty_ranges`], but for a
+    /// sandbox with NO local rolling memfile — a UFFD-resumed session
+    /// whose checkpoint chain was seeded manifest-only. Instead of
+    /// reading each dirty chunk from a merged full image, it
+    /// reconstructs the chunk in memory from its PREVIOUS content
+    /// (fetched by hash, served from the warm chunk cache) overlaid
+    /// with the sparse `diff_path`'s dirty bytes. This lets the first
+    /// post-resume checkpoint be a cheap diff instead of a Full re-read
+    /// of guest RAM — which under UFFD would fault the whole working
+    /// set in from the store (the 60 s `PUT /snapshot/create` hang this
+    /// ADR fixes).
+    ///
+    /// Invariants match `update_for_dirty_ranges`: all-zero chunks are
+    /// elided, offsets stay sorted + aligned, and `total_bytes` is
+    /// taken from `prev` — the diff is sparse and its on-disk length is
+    /// not authoritative. A dirty chunk whose offset is *absent* from
+    /// `prev` (elided = all-zero) seeds from zeros (it was
+    /// UFFDIO_ZEROPAGE'd at the prev capture).
+    ///
+    /// Cost: one `get_chunk` per dirty chunk (warm-cache hit for any
+    /// page the guest faulted/wrote), vs `update_for_dirty_ranges`'s
+    /// local file reads — but it needs no GiB-scale rolling memfile.
+    pub async fn update_for_dirty_ranges_sparse(
+        &self,
+        prev: &Manifest,
+        diff_path: &Path,
+        dirty_ranges: &[(u64, u64)],
+    ) -> Result<Manifest> {
+        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
+
+        prev.validate()?;
+        let chunk_size = prev.chunk_size.as_u64();
+        let total_bytes = prev.total_bytes;
+
+        // Which chunk indices does the dirty set touch?
+        let mut dirty_chunks: BTreeSet<u64> = BTreeSet::new();
+        for &(off, len) in dirty_ranges {
+            if len == 0 {
+                continue;
+            }
+            let end = (off + len - 1).min(total_bytes.saturating_sub(1));
+            for idx in (off / chunk_size)..=(end / chunk_size) {
+                dirty_chunks.insert(idx);
+            }
+        }
+
+        let mut by_offset: BTreeMap<u64, ChunkRef> =
+            prev.chunks.iter().map(|c| (c.offset, c.clone())).collect();
+
+        let mut diff = fs::File::open(diff_path).await?;
+        let mut buf = vec![0u8; chunk_size as usize];
+        for idx in dirty_chunks {
+            let offset = idx * chunk_size;
+            if offset >= total_bytes {
+                continue;
+            }
+            let want = chunk_size.min(total_bytes - offset) as usize;
+            let slice = &mut buf[..want];
+
+            // Seed the chunk from its previous content (warm cache) —
+            // or zeros if `prev` elided this offset (all-zero chunk).
+            match by_offset.get(&offset).map(|c| c.hash) {
+                Some(prev_hash) => {
+                    let bytes = self.get_chunk(prev_hash).await?;
+                    let n = bytes.len().min(want);
+                    slice[..n].copy_from_slice(&bytes[..n]);
+                    if n < want {
+                        slice[n..].fill(0);
+                    }
+                }
+                None => slice.fill(0),
+            }
+
+            // Overlay the diff's dirty bytes that fall in this chunk.
+            // `dirty_ranges` are the diff's data extents, so reads land
+            // on real bytes (never a hole).
+            for &(off, len) in dirty_ranges {
+                if len == 0 {
+                    continue;
+                }
+                let lo = off.max(offset);
+                let hi = (off + len).min(offset + want as u64);
+                if lo >= hi {
+                    continue;
+                }
+                diff.seek(std::io::SeekFrom::Start(lo)).await?;
+                diff.read_exact(&mut slice[(lo - offset) as usize..(hi - offset) as usize])
+                    .await?;
+            }
+
+            if is_all_zero(slice) {
+                by_offset.remove(&offset);
+                continue;
+            }
+            let hash = self.put_chunk(slice).await?;
+            by_offset.insert(offset, ChunkRef { offset, hash });
+        }
+
+        Ok(Manifest {
+            schema_version: prev.schema_version,
+            kind: prev.kind,
+            chunk_size: prev.chunk_size,
+            total_bytes,
+            chunks: by_offset.into_values().collect(),
+            parent: prev.parent,
+            working_set_trace: prev.working_set_trace,
+            annotations: prev.annotations.clone(),
+        })
+    }
+
     /// Reconstruct a file from a manifest. Creates `dest` (or
     /// truncates if it exists), writes each chunk at its offset,
     /// seeks past zero-filled gaps (producing real filesystem
@@ -590,5 +701,230 @@ mod tests {
             round, mutated,
             "incremental manifest must reproduce the mutated image"
         );
+    }
+
+    // ---- ADR 0038: sparse re-chunk (no rolling memfile) ----
+
+    fn keys(m: &Manifest) -> Vec<(u64, crate::manifest::ChunkHash)> {
+        m.chunks.iter().map(|c| (c.offset, c.hash)).collect()
+    }
+
+    /// Build an FC-diff-like sparse file: `total` bytes, holes
+    /// everywhere except the supplied data extents.
+    async fn write_sparse_diff(path: &Path, total: u64, extents: &[(u64, Vec<u8>)]) {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .await
+            .unwrap();
+        f.set_len(total).await.unwrap();
+        for (off, bytes) in extents {
+            f.seek(SeekFrom::Start(*off)).await.unwrap();
+            f.write_all(bytes).await.unwrap();
+        }
+        f.flush().await.unwrap();
+    }
+
+    /// The core invariant: a sparse re-chunk (prev chunks + sparse diff,
+    /// no merged full image) yields a manifest byte-identical to a full
+    /// `chunk_file` re-chunk of the post-diff image — including
+    /// hash-identical carryover of untouched chunks and elision of a
+    /// chunk dirtied to all-zero.
+    #[tokio::test]
+    async fn update_for_dirty_ranges_sparse_matches_full_rechunk() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+
+        let mut prev_img = Vec::new();
+        for b in [0xAAu8, 0xBB, 0xCC, 0xDD] {
+            prev_img.extend(std::iter::repeat_n(b, cs as usize));
+        }
+        let p = work.path().join("prev.bin");
+        fs::write(&p, &prev_img).await.unwrap();
+        let prev = s
+            .chunk_file(&p, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        // chunk 1 → 0x11; chunk 3 → all zeros (elided). 0 + 2 clean.
+        let mut cur = prev_img.clone();
+        cur[cs as usize..2 * cs as usize].fill(0x11);
+        cur[3 * cs as usize..].fill(0x00);
+        let cur_path = work.path().join("cur.bin");
+        fs::write(&cur_path, &cur).await.unwrap();
+        let ground = s
+            .chunk_file(&cur_path, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        let diff = work.path().join("mem.diff");
+        write_sparse_diff(
+            &diff,
+            prev.total_bytes,
+            &[
+                (cs, vec![0x11u8; cs as usize]),
+                (3 * cs, vec![0x00u8; cs as usize]),
+            ],
+        )
+        .await;
+        let got = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &[(cs, cs), (3 * cs, cs)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            keys(&got),
+            keys(&ground),
+            "sparse re-chunk must equal a full re-chunk of the post-diff image"
+        );
+        let hash_at =
+            |m: &Manifest, off: u64| m.chunks.iter().find(|c| c.offset == off).map(|c| c.hash);
+        assert_eq!(
+            hash_at(&got, 0),
+            hash_at(&prev, 0),
+            "clean chunk 0 carries over"
+        );
+        assert_eq!(
+            hash_at(&got, 2 * cs),
+            hash_at(&prev, 2 * cs),
+            "clean chunk 2 carries over"
+        );
+        assert_eq!(hash_at(&got, 3 * cs), None, "zeroed chunk 3 elided");
+
+        let out = work.path().join("out.bin");
+        s.materialize_to_file(&got, &out).await.unwrap();
+        assert_eq!(fs::read(&out).await.unwrap(), cur);
+    }
+
+    /// A dirty chunk whose prev offset is ELIDED (all-zero in prev) must
+    /// seed from zeros, then take the partial overlay.
+    #[tokio::test]
+    async fn update_for_dirty_ranges_sparse_zero_prev_chunk() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+
+        let mut prev_img = vec![0u8; 2 * cs as usize];
+        prev_img[cs as usize..].fill(0xBB);
+        let p = work.path().join("prev.bin");
+        fs::write(&p, &prev_img).await.unwrap();
+        let prev = s
+            .chunk_file(&p, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+        assert_eq!(prev.chunks.len(), 1, "chunk 0 is all-zero → elided in prev");
+
+        // 0x33 into the FIRST HALF of chunk 0; second half stays zero.
+        let mut cur = prev_img.clone();
+        cur[0..(cs / 2) as usize].fill(0x33);
+        let cur_path = work.path().join("cur.bin");
+        fs::write(&cur_path, &cur).await.unwrap();
+        let ground = s
+            .chunk_file(&cur_path, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        let diff = work.path().join("mem.diff");
+        write_sparse_diff(
+            &diff,
+            prev.total_bytes,
+            &[(0, vec![0x33u8; (cs / 2) as usize])],
+        )
+        .await;
+        let got = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &[(0, cs / 2)])
+            .await
+            .unwrap();
+
+        assert_eq!(keys(&got), keys(&ground));
+        let out = work.path().join("out.bin");
+        s.materialize_to_file(&got, &out).await.unwrap();
+        assert_eq!(fs::read(&out).await.unwrap(), cur);
+    }
+
+    /// An unaligned interior dirty range over a non-zero prev chunk:
+    /// merged bytes = prev outside the range, diff inside it.
+    #[tokio::test]
+    async fn update_for_dirty_ranges_sparse_partial_unaligned() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+
+        let prev_img = vec![0xCDu8; cs as usize];
+        let p = work.path().join("prev.bin");
+        fs::write(&p, &prev_img).await.unwrap();
+        let prev = s
+            .chunk_file(&p, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        let mut cur = prev_img.clone();
+        cur[100..200].fill(0x77);
+        let cur_path = work.path().join("cur.bin");
+        fs::write(&cur_path, &cur).await.unwrap();
+        let ground = s
+            .chunk_file(&cur_path, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        let diff = work.path().join("mem.diff");
+        write_sparse_diff(&diff, prev.total_bytes, &[(100, vec![0x77u8; 100])]).await;
+        let got = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &[(100, 100)])
+            .await
+            .unwrap();
+
+        assert_eq!(keys(&got), keys(&ground));
+        let out = work.path().join("out.bin");
+        s.materialize_to_file(&got, &out).await.unwrap();
+        assert_eq!(fs::read(&out).await.unwrap(), cur);
+    }
+
+    /// `total_bytes` is taken from `prev`, not the diff file's length:
+    /// a diff truncated to just the dirty extent still reconstructs the
+    /// full image.
+    #[tokio::test]
+    async fn update_for_dirty_ranges_sparse_total_bytes_from_prev_and_short_final() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+        let total = 2 * cs + 13; // short final chunk
+
+        let mut prev_img = vec![0x10u8; total as usize];
+        prev_img[cs as usize..2 * cs as usize].fill(0x20);
+        prev_img[2 * cs as usize..].fill(0x30);
+        let p = work.path().join("prev.bin");
+        fs::write(&p, &prev_img).await.unwrap();
+        let prev = s
+            .chunk_file(&p, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        // dirty the short final chunk only.
+        let mut cur = prev_img.clone();
+        cur[2 * cs as usize..].fill(0x99);
+        let cur_path = work.path().join("cur.bin");
+        fs::write(&cur_path, &cur).await.unwrap();
+        let ground = s
+            .chunk_file(&cur_path, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        // diff file is only 13 bytes past 2*cs — far shorter than `total`.
+        let diff = work.path().join("mem.diff");
+        write_sparse_diff(&diff, 2 * cs + 13, &[(2 * cs, vec![0x99u8; 13])]).await;
+        let got = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &[(2 * cs, 13)])
+            .await
+            .unwrap();
+
+        assert_eq!(got.total_bytes, total);
+        assert_eq!(keys(&got), keys(&ground));
+        let out = work.path().join("out.bin");
+        s.materialize_to_file(&got, &out).await.unwrap();
+        assert_eq!(fs::read(&out).await.unwrap(), cur);
     }
 }

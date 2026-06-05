@@ -223,7 +223,56 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
         "both markers must survive the chain restore byte-identical",
     );
 
+    // ---- 7. ADR 0038 B2: the restored sandbox's chain was seeded
+    // SPARSE on resume (manifest-only, no rolling memfile). Its NEXT
+    // checkpoint must therefore be a DIFF via
+    // `update_for_dirty_ranges_sparse` — NOT a fresh Full. This is the
+    // production path (UFFD idle→active resume → first checkpoint) the
+    // 60 s hang lived on; pre-fix it would have re-Full-seeded (a new
+    // manifest_id) and faulted the whole working set in.
+    let sum3 = plant_marker(&pooled, restored, 3).await;
+    let t = Instant::now();
+    let ckpt3 = pooled
+        .checkpoint_sandbox(restored)
+        .await
+        .expect("checkpoint 3 (post-resume sparse diff)");
+    eprintln!(
+        "CHAIN: checkpoint 3 (post-resume sparse diff) {} ms, manifest {:?}",
+        t.elapsed().as_millis(),
+        ckpt3.memory_manifest,
+    );
+    let m3 = ckpt3
+        .memory_manifest
+        .expect("sparse diff must publish a memory manifest");
+    assert_eq!(
+        m3.manifest_id, m1.manifest_id,
+        "resume-seeded chain keeps the source manifest id — proves it DIFFED (sparse), \
+         not Full-seeded a fresh chain",
+    );
+    assert_eq!(m3.version, m2.version + 1, "sparse diff ticks the version");
+
+    // ---- 8. Restore from the SPARSE-built checkpoint and verify all
+    // three markers survive byte-identical — the end-to-end byte-
+    // fidelity proof for `update_for_dirty_ranges_sparse` against real
+    // guest memory (fetch-prev-chunk + apply-diff == current).
     pooled.destroy(restored).await.expect("destroy restored");
+    let restored2 = pooled
+        .restore(ckpt3.clone())
+        .await
+        .expect("restore from sparse diff checkpoint");
+    let out = exec(
+        &pooled,
+        restored2,
+        "sha256sum /dev/shm/marker1 /dev/shm/marker2 /dev/shm/marker3 | cut -d' ' -f1",
+    )
+    .await;
+    let sums: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(
+        sums,
+        vec![sum1.as_str(), sum2.as_str(), sum3.as_str()],
+        "all three markers survive the sparse-built checkpoint restore",
+    );
+    pooled.destroy(restored2).await.expect("destroy restored2");
 }
 
 async fn plant_marker(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, n: u32) -> String {

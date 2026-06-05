@@ -45,7 +45,8 @@ pub mod slot;
 pub mod runtime;
 
 pub use backend::{
-    ChunkedDiskBackend, DiskBackendError, DiskFlushOutcome, DEFAULT_DIRTY_THRESHOLD_BYTES,
+    ChunkedDiskBackend, DiskBackendError, DiskFlushOutcome, PendingDiskFlush,
+    DEFAULT_DIRTY_THRESHOLD_BYTES,
 };
 pub use flush_scheduler::{
     FlushScheduler, FlushSchedulerConfig, FlushSchedulerHandle, LiveManifestPublisher,
