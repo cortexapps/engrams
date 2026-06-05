@@ -4,7 +4,10 @@ import { deriveHealthMetrics, operatorIssues } from './operator-health';
 
 const host = (status: HostStatus, total = 100, used = 0): HostView => ({
   id: 'h', hostname: 'h', status, capacity_total_mib: total, capacity_used_mib: used,
-  running_sandboxes: 0, local_snapshots: 0, last_heartbeat_at: '',
+  running_sandboxes: 0, local_snapshots: 0,
+  util_disk_total_mib: 0, util_disk_used_mib: 0,
+  util_mem_total_mib: 0, util_mem_used_mib: 0, util_cpu_pct: 0,
+  last_heartbeat_at: '',
 });
 const row = (last_flush_at: string | null): DurabilityRow => ({
   sandbox_id: 's', session_id: null, host_id: 'h', dirty_chunks: 0, dirty_bytes: 0,
