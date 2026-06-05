@@ -243,6 +243,11 @@ SHAs are current-as-of-rebase onto `main` #82.)
 - _P6 (Accepted)_ pending — connection-recovery gate met, density measured (modest, as designed). The
   remaining gate is the **prod canary**: first-prompt latency warm-vs-cold on a real template (the only
   setup that exercises a genuinely-cold base against the warm base), behind the existing kill-switches.
+  **Canary instrument:** the coord now records `engram_first_prompt_seconds{warm_bind}` — first-prompt
+  delivery → first `run_started` — which isolates the Bun-boot collapse (the existing
+  `engram_session_boot_seconds` stops at "harness attached", *above* this boot). The canary compares the
+  `warm_bind="true"` vs `"false"` series; density is the host gauge `engram_sandbox_guest_pss_bytes /
+  _rss_bytes`. Flags are default-on so the rollout populates both.
   **Known follow-up (pitfall #4):** on the warm path agentd's `/exec` + ttyd shell keep the capture-time
   (sentinel) session env — FC `merge_session_env` is a documented no-op for the guest env; the agent
   loop is correct (forge/upload via the P4b file; OAuth via the baked constant placeholder), but

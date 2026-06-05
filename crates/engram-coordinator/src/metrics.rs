@@ -105,6 +105,23 @@ pub fn init(addr: SocketAddr) {
 ///   trending toward sub-1s while `kind="cold"` stays at ~20-25s.
 pub const SESSION_BOOT_SECONDS: &str = "engram_session_boot_seconds";
 
+/// Histogram (ADR 0037). Time from the coord delivering a session's
+/// **first** prompt (the create-flow's initial prompt — `late_bind_harness`
+/// on the warm path, or `start_agent` with `ENGRAM_INITIAL_PROMPT` on the
+/// cold path) to the harness's first `run_started` (claude began the turn).
+/// This is the only metric that isolates warm-capture's payoff: it spans
+/// the Bun-boot the cold path pays before its first turn and the warm path
+/// skips. Distinct from `engram_session_boot_seconds`, which stops at
+/// "harness attached / Active" — *above* this boot. `_seconds` suffix ⇒
+/// inherits the sub-second-to-30s boot buckets.
+///
+/// Label `warm_bind` (`true` / `false`): the canary reads
+/// `engram_first_prompt_seconds_sum{warm_bind="true"}` /
+/// `_count{warm_bind="true"}` vs the `"false"` series and expects the warm
+/// mean well under the cold mean. Only the FIRST prompt of a session is
+/// sampled (subsequent prompts hit an already-warm claude either way).
+pub const FIRST_PROMPT_SECONDS: &str = "engram_first_prompt_seconds";
+
 /// Counter. Sessions that reached `Active`. Labels: `outcome`
 /// (`success` / `scheduling_rejected` / `sandbox_failed` /
 /// `harness_failed`).

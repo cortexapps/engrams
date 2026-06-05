@@ -1048,6 +1048,24 @@ async fn create_session_inner(
             },
         )
         .await?;
+    // ADR 0037: mark the first-prompt clock just before we deliver the
+    // initial prompt (via late-bind on the warm path / ENGRAM_INITIAL_PROMPT
+    // on the cold path). The harness event sink stops it on the first
+    // `run_started`, recording `engram_first_prompt_seconds{warm_bind}` —
+    // the only metric that isolates the warm-capture Bun-boot collapse.
+    // Only when an initial prompt is present (otherwise the first prompt
+    // arrives later, by which point even a cold claude has booted, so there
+    // is no warm-vs-cold signal to capture).
+    if req.prompt.as_deref().is_some_and(|s| !s.is_empty()) {
+        state.first_prompt_starts.insert(
+            session_id,
+            crate::state::FirstPromptStart {
+                at: std::time::Instant::now(),
+                warm_bind,
+            },
+        );
+    }
+
     // ADR 0037 restore-fork. Cold (default): `start_agent` spawns the
     // harness (kill+respawn cleanly replaces any warm child captured in the
     // snapshot). Warm-bind: the harness is already running from the warm
@@ -1091,6 +1109,9 @@ async fn create_session_inner(
             .transition_session(session_id, SessionState::Failed)
             .await;
         state.services.host.unbind_session(session_id).await;
+        // No run_started/run_completed will ever arrive for a failed start —
+        // drop the first-prompt timer so the map doesn't leak the entry.
+        state.first_prompt_starts.remove(&session_id);
         return Err(e.into());
     }
     // ADR 0015 M2: start_agent returned OK, so agentd is reachable

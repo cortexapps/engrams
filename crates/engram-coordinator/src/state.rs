@@ -444,6 +444,25 @@ pub struct AppState {
     /// `Services`) for the same reason as `forge` — the many test `Services`
     /// literals don't need touching.
     pub auth: Option<Arc<crate::api::principal::AuthRuntime>>,
+    /// ADR 0037: per-session first-prompt timing for the
+    /// `engram_first_prompt_seconds` histogram. The create-flow inserts
+    /// `(Instant, warm_bind)` when a session is created WITH an initial
+    /// prompt; [`harness_event_sink`] consumes it on the first
+    /// `run_started` (records the histogram) and clears it on `run_completed`
+    /// (cleanup if claude crashed before starting). Bounded by live
+    /// initial-prompt sessions awaiting their first turn.
+    pub first_prompt_starts: Arc<DashMap<SessionId, FirstPromptStart>>,
+}
+
+/// ADR 0037: start marker for the first-prompt-latency metric. `at` is a
+/// process-local `Instant` (monotonic; the create-flow and the event sink
+/// run in the same coord process), `warm_bind` is the create-flow's
+/// warm-vs-cold decision — the histogram label that lets the canary
+/// compare the two paths.
+#[derive(Clone, Copy)]
+pub struct FirstPromptStart {
+    pub at: std::time::Instant,
+    pub warm_bind: bool,
 }
 
 impl AppState {
@@ -469,9 +488,12 @@ impl AppState {
         host_registry: Arc<HostRegistry>,
     ) -> Self {
         let events = Arc::new(SessionEventBus::default());
+        let first_prompt_starts: Arc<DashMap<SessionId, FirstPromptStart>> =
+            Arc::new(DashMap::new());
         let harness_hub = Arc::new(HarnessHub::new(harness_event_sink(
             events.clone(),
             services.meta.clone(),
+            first_prompt_starts.clone(),
         )));
         let reconciler =
             crate::reconcile::Reconciler::new(crate::reconcile::grace_ticks_from_env());
@@ -489,6 +511,7 @@ impl AppState {
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
             forge: None,
             auth: None,
+            first_prompt_starts,
         }
     }
 
@@ -595,6 +618,7 @@ pub async fn emit_harness_event(
 fn harness_event_sink(
     events: Arc<SessionEventBus>,
     meta: Arc<dyn engram_core::traits::MetadataStore>,
+    first_prompt_starts: Arc<DashMap<SessionId, FirstPromptStart>>,
 ) -> EventSink {
     // Per-session cache of the most-recent forwarded event kind. Used
     // to drop a `harness_idle` that would land back-to-back with
@@ -607,6 +631,7 @@ fn harness_event_sink(
         let events = events.clone();
         let meta = meta.clone();
         let last_kind = last_kind.clone();
+        let first_prompt_starts = first_prompt_starts.clone();
         Box::new(Box::pin(async move {
             // Forward every harness event into session_events for live
             // SSE / Web UI / Slackbot timeline. ADR 0005 retired the
@@ -615,6 +640,29 @@ fn harness_event_sink(
             // not git checkpoints.
             let session_event = SessionEvent::from_harness(ev, Utc::now());
             let kind = session_event.kind();
+
+            // ADR 0037: first-prompt latency. The create-flow recorded a
+            // start when this session was created with an initial prompt;
+            // the first `run_started` means claude began that turn (after
+            // the cold-path Bun boot, or immediately on the warm path), so
+            // the elapsed is the warm-capture-sensitive latency. Sample it
+            // once, then drop the entry. `run_completed` without a prior
+            // `run_started` (claude crashed before starting) just cleans up.
+            match kind {
+                "run_started" => {
+                    if let Some((_, start)) = first_prompt_starts.remove(&session_id) {
+                        ::metrics::histogram!(
+                            crate::metrics::FIRST_PROMPT_SECONDS,
+                            "warm_bind" => if start.warm_bind { "true" } else { "false" },
+                        )
+                        .record(start.at.elapsed().as_secs_f64());
+                    }
+                }
+                "run_completed" => {
+                    first_prompt_starts.remove(&session_id);
+                }
+                _ => {}
+            }
 
             // Drop a back-to-back duplicate `harness_idle`. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
@@ -1357,7 +1405,7 @@ pub(crate) mod tests {
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink = super::harness_event_sink(bus.clone(), meta.clone());
+        let sink = super::harness_event_sink(bus.clone(), meta.clone(), Arc::new(DashMap::new()));
 
         // Three back-to-back idles: only the first should land.
         for _ in 0..3 {
@@ -1391,6 +1439,76 @@ pub(crate) mod tests {
                 "run_started".to_string(),
                 "harness_idle".to_string(),
             ],
+        );
+    }
+
+    #[tokio::test]
+    async fn first_prompt_timer_consumed_on_run_started_and_cleaned_on_completed() {
+        // ADR 0037: the create-flow stamps a first-prompt start; the sink
+        // consumes it on the first run_started (records
+        // engram_first_prompt_seconds) and cleans it up on run_completed if
+        // claude crashed before ever starting the turn.
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: engram_core::types::SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:first-prompt".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let meta: Arc<dyn MetadataStore> = Arc::new(MiniMeta::new(session));
+        let sandbox_id = engram_core::SandboxId::new();
+        let bus = Arc::new(SessionEventBus::default());
+        let starts: Arc<DashMap<SessionId, FirstPromptStart>> = Arc::new(DashMap::new());
+        let sink = super::harness_event_sink(bus.clone(), meta.clone(), starts.clone());
+
+        // run_started consumes a pending start.
+        starts.insert(
+            session_id,
+            FirstPromptStart {
+                at: std::time::Instant::now(),
+                warm_bind: true,
+            },
+        );
+        sink(
+            session_id,
+            sandbox_id,
+            HarnessEvent::RunStarted {
+                run_id: "r1".into(),
+                prompt_summary: None,
+            },
+        )
+        .await;
+        assert!(
+            !starts.contains_key(&session_id),
+            "run_started should consume the first-prompt timer",
+        );
+
+        // run_completed with NO prior run_started (crash-before-start) cleans up.
+        starts.insert(
+            session_id,
+            FirstPromptStart {
+                at: std::time::Instant::now(),
+                warm_bind: false,
+            },
+        );
+        sink(
+            session_id,
+            sandbox_id,
+            HarnessEvent::RunCompleted {
+                run_id: "r2".into(),
+                ok: false,
+            },
+        )
+        .await;
+        assert!(
+            !starts.contains_key(&session_id),
+            "run_completed should clean a stale first-prompt timer",
         );
     }
 
