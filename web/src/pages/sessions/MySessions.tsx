@@ -1,34 +1,23 @@
 import { useNavigate } from '@tanstack/react-router';
-import { useHosts } from '../../hooks/useHosts';
 import { useSessions } from '../../hooks/useSessions';
 import { useAuth } from '../../auth/AuthProvider';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { NewSessionDialog } from '../../components/NewSessionDialog';
 import { PageHeading } from '../../components/page-heading';
-import { StatReadout } from '../../components/stat-readout';
-import { SessionsTable } from './sessions-columns';
+import { SessionsList } from './sessions-list';
 
 export function MySessions() {
   const { principal } = useAuth();
-  const { data: hosts } = useHosts();
-  const { data: sessions } = useSessions('mine');
+  const { data: sessions, isPending, error } = useSessions('mine');
   const navigate = useNavigate();
-  const all = sessions ?? [];
   const showTokenNudge = !principal.is_admin && !principal.has_claude_token;
-
-  const stats = [
-    { label: 'Active', value: all.filter((s) => s.status === 'active').length },
-    { label: 'Idle', value: all.filter((s) => s.status === 'idle').length },
-    { label: 'Hosts', value: (hosts ?? []).length },
-    { label: 'Snapshots', value: (hosts ?? []).reduce((a, h) => a + h.local_snapshots, 0) },
-  ];
 
   return (
     <div className="flex-1 space-y-6 overflow-auto p-4 md:p-6">
       <PageHeading
         title="Sessions"
-        description="Bounded units of agent work — launch, watch, resume."
+        description="Bounded units of agent work: launch, watch, resume."
         actions={
           <NewSessionDialog onCreated={(id) => navigate({ to: '/sessions/$id', params: { id } })} />
         }
@@ -45,10 +34,14 @@ export function MySessions() {
         </Card>
       )}
 
-      <StatReadout items={stats} />
-
-      <SessionsTable sessions={all} showOwner={false}
-        emptyText='No sessions yet — start one with "New session".' />
+      <SessionsList
+        sessions={sessions ?? []}
+        isPending={isPending}
+        error={error}
+        showOwner={false}
+        emptyText="No sessions yet. Start one to launch a sandbox and hand an agent a task."
+        emptyAction={<NewSessionDialog onCreated={(id) => navigate({ to: '/sessions/$id', params: { id } })} />}
+      />
     </div>
   );
 }

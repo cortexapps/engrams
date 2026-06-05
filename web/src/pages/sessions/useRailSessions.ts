@@ -1,7 +1,7 @@
 import { useRouterState } from '@tanstack/react-router';
 import { useSession, useSessions } from '../../hooks/useSessions';
 import type { Session, SessionListItem, SessionState } from '../../types';
-import { lifecycleOf, type Lifecycle } from './session-format';
+import { compareSessions } from './session-format';
 
 // The ordered, capped, open-session-pinned list that backs BOTH the sessions
 // rail and the keyboard jump layer (⌥1–9 / ⌥[ ⌥]). Lifting it here is what
@@ -10,7 +10,6 @@ import { lifecycleOf, type Lifecycle } from './session-format';
 // array. Both consumers share React Query's cache, so there's no extra fetch.
 
 export const RAIL_CAP = 10;
-const ORDER: Lifecycle[] = ['ACTIVE', 'IDLE — RESUMABLE', 'ARCHIVED'];
 
 /** One rail row. Normalises the list shape (`last_active_at`) and the single
  * session shape (`created_at`, used to pin an open session outside the recent
@@ -25,14 +24,11 @@ const fromListItem = (s: SessionListItem): RailRow => ({ id: s.id, status: s.sta
 const fromSession = (s: Session): RailRow => ({ id: s.id, status: s.status, image: s.image, at: s.created_at });
 
 // Stable order so the 1s refetch never reorders rows under the cursor: by
-// lifecycle bucket (active → idle → archived), then most-recently-active.
+// lifecycle bucket (active → idle → archived), then most-recently-active. The
+// full sessions list (SessionsList) shares this exact comparator, so the rail
+// reads as a capped preview of the same order.
 function sortForRail(rows: SessionListItem[]): SessionListItem[] {
-  return [...rows].sort((a, b) => {
-    const la = ORDER.indexOf(lifecycleOf(a.status));
-    const lb = ORDER.indexOf(lifecycleOf(b.status));
-    if (la !== lb) return la - lb;
-    return new Date(b.last_active_at).getTime() - new Date(a.last_active_at).getTime();
-  });
+  return [...rows].sort(compareSessions);
 }
 
 export interface RailSessions {
