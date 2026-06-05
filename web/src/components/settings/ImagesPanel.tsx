@@ -41,6 +41,13 @@ export function ImagesPanel() {
         Date.now() - new Date(j.updated_at).getTime() < 60 * 60 * 1000),
   );
 
+  // While a refresh job is actively in flight, hide the static ImageRow
+  // for that URI — the EnableJobRow above is the live representation.
+  // Failed jobs are excluded so the original row stays visible on failure.
+  const activeJobUris = new Set(
+    (jobs ?? []).filter(isJobActive).map((j) => j.image_uri),
+  );
+
   return (
     <section>
       <SectionHeader />
@@ -66,9 +73,11 @@ export function ImagesPanel() {
 
       {!isLoading && data && data.length > 0 && (
         <ul className="space-y-0">
-          {data.map((row) => (
-            <ImageRow key={row.id} row={row} />
-          ))}
+          {data
+            .filter((row) => !activeJobUris.has(row.image_uri))
+            .map((row) => (
+              <ImageRow key={row.id} row={row} />
+            ))}
         </ul>
       )}
 
