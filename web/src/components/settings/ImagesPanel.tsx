@@ -41,17 +41,26 @@ export function ImagesPanel() {
         Date.now() - new Date(j.updated_at).getTime() < 60 * 60 * 1000),
   );
 
+  // Merge jobs and images into one stable list sorted by image_uri so
+  // that a refresh transitions a row in-place (EnableJobRow ↔ ImageRow)
+  // rather than hopping between two separate sections.
+  // For any URI that has a visible job, the job row takes precedence.
+  const visibleJobsByUri = new Map(visibleJobs.map((j) => [j.image_uri, j]));
+  const imagesByUri = new Map((data ?? []).map((r) => [r.image_uri, r]));
+  const unifiedRows = Array.from(
+    new Set([...visibleJobsByUri.keys(), ...imagesByUri.keys()]),
+  )
+    .sort()
+    .map((uri) => {
+      const job = visibleJobsByUri.get(uri);
+      return job
+        ? ({ kind: 'job' as const, entry: job })
+        : ({ kind: 'image' as const, entry: imagesByUri.get(uri)! });
+    });
+
   return (
     <section>
       <SectionHeader />
-
-      {visibleJobs.length > 0 && (
-        <ul className="space-y-0 mb-6">
-          {visibleJobs.map((job) => (
-            <EnableJobRow key={job.id} job={job} />
-          ))}
-        </ul>
-      )}
 
       {error && (
         <p
@@ -62,17 +71,21 @@ export function ImagesPanel() {
         </p>
       )}
 
-      {isLoading && <ListLoadingSkeleton />}
+      {isLoading && unifiedRows.length === 0 && <ListLoadingSkeleton />}
 
-      {!isLoading && data && data.length > 0 && (
+      {unifiedRows.length > 0 && (
         <ul className="space-y-0">
-          {data.map((row) => (
-            <ImageRow key={row.id} row={row} />
-          ))}
+          {unifiedRows.map((row) =>
+            row.kind === 'job' ? (
+              <EnableJobRow key={row.entry.id} job={row.entry} />
+            ) : (
+              <ImageRow key={row.entry.id} row={row.entry} />
+            ),
+          )}
         </ul>
       )}
 
-      {!isLoading && data && data.length === 0 && !addOpen && <EmptyState />}
+      {!isLoading && unifiedRows.length === 0 && !addOpen && <EmptyState />}
 
       <AnimatePresence initial={false}>
         {addOpen && (

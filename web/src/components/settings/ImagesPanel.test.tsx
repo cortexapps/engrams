@@ -21,8 +21,12 @@ interface FetchCall {
 
 /** Install a route-aware fetch stub. Returns the spy + a snapshot
  * accessor so each test reads its own POST history. */
-function installFetchMock(initialList: unknown[] = []) {
+function installFetchMock(
+  initialList: unknown[] = [],
+  initialJobs: unknown[] = [],
+) {
   let listSnapshot = initialList;
+  let jobsSnapshot = initialJobs;
   const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const url =
@@ -35,6 +39,12 @@ function installFetchMock(initialList: unknown[] = []) {
 
       if (url === '/api/v1/enabled-images' && method === 'GET') {
         return new Response(JSON.stringify({ images: listSnapshot }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === '/api/v1/enable-jobs' && method === 'GET') {
+        return new Response(JSON.stringify({ jobs: jobsSnapshot }), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -85,6 +95,9 @@ function installFetchMock(initialList: unknown[] = []) {
     spy,
     setList: (rows: unknown[]) => {
       listSnapshot = rows;
+    },
+    setJobs: (rows: unknown[]) => {
+      jobsSnapshot = rows;
     },
     callsMatching(pred: (c: FetchCall) => boolean): FetchCall[] {
       return spy.mock.calls
@@ -203,6 +216,45 @@ describe('ImagesPanel wire contract', () => {
       expect(JSON.parse(posts[0].body!)).toEqual({
         image_uri: 'ghcr.io/cortex/api:warm-1',
       });
+    });
+  });
+
+  test('active refresh job suppresses the static image row for the same URI', async () => {
+    // Both an enabled-images row and an active enable-job exist for the
+    // same URI (the state right after clicking "refresh"). The panel must
+    // show only the progress row — not both.
+    installFetchMock(
+      [
+        {
+          id: 'row-1',
+          image_uri: 'ghcr.io/cortex/api:warm-1',
+          manifest_digest: 'sha256:abc',
+          manifest_name: 'cortex-api',
+          manifest_description: null,
+          harness_name: null,
+          last_refreshed_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+        },
+      ],
+      [
+        {
+          id: 'job-1',
+          image_uri: 'ghcr.io/cortex/api:warm-1',
+          state: 'materializing',
+          chunks_done: 3,
+          chunks_total: 10,
+          error: null,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      ],
+    );
+    renderWithProviders(<ImagesPanel />);
+
+    // The URI should appear exactly once — from the EnableJobRow.
+    await waitFor(() => {
+      const matches = screen.getAllByText('ghcr.io/cortex/api:warm-1');
+      expect(matches).toHaveLength(1);
     });
   });
 });
