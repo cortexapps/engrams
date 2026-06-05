@@ -495,6 +495,25 @@ impl PooledBackend {
             .clone()
     }
 
+    /// ADR 0038 B1: is a capture (eviction / evac / drain / a prior
+    /// checkpoint) currently holding this sandbox's capture lock? The
+    /// periodic checkpoint driver probes this and SKIPS the tick when
+    /// it returns true — a best-effort checkpoint must never *queue*
+    /// behind another capture, which is how one slow/hung capture
+    /// gridlocked the fleet (the 52–151 s dark `host.snapshot` waits in
+    /// the 5fadd364 incident). `try_lock` is the probe: a held lock
+    /// means a capture is in flight.
+    ///
+    /// A benign sub-ms race remains — a capture can start between this
+    /// probe and `snapshot()`'s own blocking acquire, in which case the
+    /// periodic tick queues behind that *one* fresh capture rather than
+    /// skipping. That's harmless: the gridlock we're killing is queuing
+    /// behind a HUNG capture, which the probe catches (try_lock fails)
+    /// and skips outright; the next tick retries regardless.
+    pub fn capture_in_flight(&self, id: SandboxId) -> bool {
+        self.capture_lock(id).try_lock().is_err()
+    }
+
     /// ADR 0028 Fix A: where un-acked durable checkpoint records live.
     pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
