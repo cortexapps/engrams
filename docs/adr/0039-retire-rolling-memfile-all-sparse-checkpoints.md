@@ -1,6 +1,28 @@
 # ADR 0039: Retire the rolling memfile — all-sparse periodic checkpoints
 
-Status: 2026-06-05 — **Proposed.**
+Status: 2026-06-05 — **Accepted.** Implemented (commit chain below) and
+validated on the Linux dev-vm with real microVMs:
+
+- **All-sparse end-to-end** (`checkpoint_chain`, real FC, 60.45 s): Full
+  seed (v1) → **Diff (v2, same manifest_id)** — proving the *fresh*-seeded
+  chain now DIFFS via the sparse path (the leg that used the rolling
+  memfile before this ADR) → restore-mid-chain (markers byte-identical) →
+  post-resume sparse Diff (v3, same id) → restore (all three markers
+  byte-identical). No Full re-seed, no 60 s hang.
+- **Leak-fix guard:** the test asserts a Full capture leaves NO local
+  `memory.bin` in the snapshot dir, and the restore still succeeds
+  (re-materialized from the chunk manifest). The macOS-runnable unit
+  `restore_materializes_missing_state_and_sidecar_from_blob_storage`
+  asserts the same, so the guard runs in CI without the FC gate.
+- `just check` green (976 unit tests; fmt + clippy + check) on macOS;
+  `cargo clippy -p engram-host-agent --all-targets` clean on the dev-vm
+  (the Linux-gated integration test).
+
+Prod follow-ups (post-merge, after the FC-host MIG re-bake auto-rolls):
+new `checkpoints/` (rolling) and leaked `snapshots/**/memory.bin` growth
+both stop; a one-shot prod-ops cleanup reclaims the existing 61G (this
+code only prevents *new* growth). The `snapshots/` dir reaper + the
+chunk-cache LRU remain the queued follow-ups.
 
 Continuation of **ADR 0038** (low-pause periodic checkpoints). 0038
 introduced the sparse re-chunk primitive
@@ -118,8 +140,31 @@ Eliminates both big disk consumers: the 8.1 G rolling (gone) and the
 - **Existing on-host 61 G** — needs a one-shot prod-ops cleanup (this code
   only stops *new* growth, after the FC-host MIG re-bakes + rolls).
 
+## Implementation
+
+Commit chain (this branch, off the ADR-0038 branch):
+
+- `7e8ced1` ADR authored (Proposed)
+- `0bd1028` all-sparse retirement: `seed_checkpoint_chain_sparse` for both
+  resume AND the fresh Full capture; `memory.bin` removed after chunking
+  (the 61G leak fix); diff branch always `update_for_dirty_ranges_sparse`;
+  rolling path retired — `CheckpointChain.rolling_memfile`,
+  `checkpoint_rolling_path`, the copy-variant `seed_checkpoint_chain`,
+  `checkpoint::overlay_sparse`, and the chunk-store full-file
+  `update_for_dirty_ranges` (+ its unit test). Net −246 LOC.
+- (this commit) ADR → Accepted with the dev-vm validation record.
+
+## Divergences from this proposal
+
+- **The chunk-store `update_for_dirty_ranges` (full-file re-chunk) was
+  retired too**, not just the host-agent rolling path. Once the rolling
+  memfile was gone it had no in-tree caller, and the sparse variant is
+  proven byte-identical to it — so leaving it (plus `overlay_sparse`)
+  would have been dead public API. Both were removed with their tests;
+  ADR-0022 fork can reintroduce a local-image re-chunk deliberately if it
+  needs one.
+
 ## Status
 
-Proposed → (implementation) → Accepted. Stacked on the ADR-0038 branch
-(`fix/fc-snapshot-create-hang`, PR #93); PR base = that branch so the two
-review + roll back independently.
+Accepted. Stacked on the ADR-0038 branch (`fix/fc-snapshot-create-hang`,
+PR #93); PR base = that branch so the two review + roll back independently.
