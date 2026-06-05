@@ -312,6 +312,7 @@ mod tests {
             _id: HostId,
             _status: engram_core::types::HostStatus,
             _capacity: engram_core::types::HostCapacity,
+            _utilization: engram_core::types::HostUtilization,
         ) -> Result<(), MetaError> {
             Ok(())
         }

@@ -98,6 +98,10 @@ pub fn build_heartbeat(
         ready_images: Vec::new(),
         nbd_unhealthy: nbd_health.snapshot(),
         checkpoints: Vec::new(),
+        // In-process (`--mode=all`) path doesn't probe observed
+        // utilization; the HTTP heartbeat loop in `lib.rs` is the
+        // real producer.
+        utilization: Default::default(),
     }
 }
 

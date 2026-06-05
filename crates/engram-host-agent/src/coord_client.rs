@@ -464,6 +464,11 @@ pub struct HeartbeatRequest {
     /// them.
     #[serde(default)]
     pub checkpoints: Vec<engram_protocol::heartbeat::CheckpointAdvert>,
+    /// Observed disk/mem/cpu utilization this tick — rendered by the
+    /// operator fleet view. `#[serde(default)]` for interop with a
+    /// coord that predates the field.
+    #[serde(default)]
+    pub utilization: engram_core::types::host::HostUtilization,
 }
 
 #[derive(Deserialize)]
@@ -638,6 +643,7 @@ mod tests {
                 drive_id: "skills".into(),
                 sha256: "ff00".into(),
             }],
+            utilization: Default::default(),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");

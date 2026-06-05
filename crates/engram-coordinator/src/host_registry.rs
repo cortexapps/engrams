@@ -72,6 +72,12 @@ pub struct HostState {
     /// fleet skew mid-roll; capture resolution itself happens
     /// host-side against the same stamp.
     pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// Observed disk/mem/cpu utilization from the latest heartbeat.
+    /// Read-only fleet-view signal — the scheduler reasons about
+    /// `capacity` (reservation), not this. Mirrors the persisted
+    /// `hosts` row so the view is correct even on a coord pod that
+    /// didn't field this host's heartbeat.
+    pub utilization: engram_core::types::host::HostUtilization,
 }
 
 /// Inputs the scheduler considers when picking a host. [`SandboxBackend`]
@@ -940,6 +946,7 @@ mod tests {
             _: HostId,
             _: engram_core::types::host::HostStatus,
             _: engram_core::types::host::HostCapacity,
+            _: engram_core::types::host::HostUtilization,
         ) -> Result<(), engram_core::MetaError> {
             unreachable!()
         }
@@ -1207,6 +1214,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
         reg.update_state(
@@ -1227,6 +1235,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
 
@@ -1267,6 +1276,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
         reg.update_state(
@@ -1281,6 +1291,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
 
@@ -1319,6 +1330,7 @@ mod tests {
                 draining: true,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
         reg.update_state(
@@ -1333,6 +1345,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
 
@@ -1376,6 +1389,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
         reg.update_state(
@@ -1390,6 +1404,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
 
@@ -1430,6 +1445,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
 
@@ -1557,6 +1573,7 @@ mod tests {
                 draining: false,
                 ready_images: Default::default(),
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
         reg.update_state(
@@ -1571,6 +1588,7 @@ mod tests {
                 draining: false,
                 ready_images: ready_set,
                 current_bundles: Vec::new(),
+                utilization: Default::default(),
             },
         );
 

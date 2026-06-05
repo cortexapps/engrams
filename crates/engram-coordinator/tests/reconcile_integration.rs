@@ -185,6 +185,7 @@ impl MetadataStore for ReconcileMeta {
         _: HostId,
         _: HostStatus,
         _: engram_core::types::HostCapacity,
+        _: engram_core::types::HostUtilization,
     ) -> Result<(), MetaError> {
         Ok(())
     }

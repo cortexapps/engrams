@@ -183,6 +183,15 @@ pub struct HostView {
     /// poll for a specific digest's readiness without guessing
     /// from the count. Sorted for deterministic output.
     pub ready_image_digests: Vec<String>,
+    /// Observed disk/mem/cpu utilization from the latest heartbeat
+    /// (the fleet view's bars). Like capacity, these prefer the
+    /// persisted `hosts` row so they're consistent across coord
+    /// replicas; 0 until the host's first post-migration heartbeat.
+    pub util_disk_total_mib: u64,
+    pub util_disk_used_mib: u64,
+    pub util_mem_total_mib: u64,
+    pub util_mem_used_mib: u64,
+    pub util_cpu_pct: f32,
     pub last_heartbeat_at: DateTime<Utc>,
 }
 
@@ -203,18 +212,24 @@ impl HostView {
         // persisted yet. It'll read as 0 on the heartbeat-non-owning
         // pod, which matches the existing pre-MiB-fields behaviour.
         let live = live.unwrap_or_default();
-        let (capacity_total_mib, capacity_used_mib, running_sandboxes) =
+        // Same row-vs-live preference as capacity: the row is written
+        // on every heartbeat and is replica-consistent; fall back to
+        // the in-memory value only for a pre-MiB-fields row that has
+        // never had a fresh heartbeat write.
+        let (capacity_total_mib, capacity_used_mib, running_sandboxes, util) =
             if row.capacity.total_mib > 0 {
                 (
                     row.capacity.total_mib,
                     row.capacity.used_mib,
                     row.capacity.running_sandboxes,
+                    row.utilization.clone(),
                 )
             } else {
                 (
                     live.capacity.total_mib,
                     live.capacity.used_mib,
                     live.capacity.running_sandboxes,
+                    live.utilization.clone(),
                 )
             };
         let ready_images = live.ready_images.len();
@@ -234,6 +249,11 @@ impl HostView {
             local_snapshots: live.local_snapshots.len(),
             ready_images,
             ready_image_digests,
+            util_disk_total_mib: util.disk_total_mib,
+            util_disk_used_mib: util.disk_used_mib,
+            util_mem_total_mib: util.mem_total_mib,
+            util_mem_used_mib: util.mem_used_mib,
+            util_cpu_pct: util.cpu_pct,
             last_heartbeat_at: row.last_heartbeat_at,
         }
     }

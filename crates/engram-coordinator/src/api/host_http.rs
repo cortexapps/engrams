@@ -137,6 +137,9 @@ pub async fn register(
             used_mib: 0,
             running_sandboxes: 0,
         },
+        // Registration carries no utilization yet — populated on the
+        // first heartbeat.
+        utilization: Default::default(),
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
         host_addr: Some(req.host_addr.clone()),
@@ -273,6 +276,13 @@ pub struct HeartbeatRequest {
     /// coord (if any) survived the original capture pipeline.
     #[serde(default)]
     pub checkpoints: Vec<engram_protocol::heartbeat::CheckpointAdvert>,
+    /// Observed disk/mem/cpu utilization this tick. Persisted to the
+    /// `hosts` row (migration 0056) + mirrored into the in-memory
+    /// scheduler view so `/api/hosts` renders the operator fleet
+    /// gauges consistently across coord replicas. `#[serde(default)]`
+    /// so a pre-utilization host-agent mid-roll reports none → 0.
+    #[serde(default)]
+    pub utilization: engram_core::types::host::HostUtilization,
 }
 
 #[derive(Serialize)]
@@ -374,6 +384,7 @@ pub async fn heartbeat(
             draining: hb.draining,
             ready_images: hb.ready_images.iter().cloned().collect(),
             current_bundles: hb.current_bundles.clone(),
+            utilization: hb.utilization.clone(),
         },
     );
 
@@ -397,7 +408,7 @@ pub async fn heartbeat(
     if let Err(e) = state
         .services
         .meta
-        .touch_host_heartbeat(host_id, row_status, row_capacity)
+        .touch_host_heartbeat(host_id, row_status, row_capacity, hb.utilization.clone())
         .await
     {
         tracing::debug!(host_id = %host_id, error = %e, "heartbeat persistence failed");

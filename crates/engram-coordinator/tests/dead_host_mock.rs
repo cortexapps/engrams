@@ -126,6 +126,7 @@ impl MetadataStore for MiniMeta {
         _id: HostId,
         _s: HostStatus,
         _cap: engram_core::types::HostCapacity,
+        _util: engram_core::types::HostUtilization,
     ) -> Result<(), MetaError> {
         Ok(())
     }
