@@ -645,7 +645,7 @@ impl PooledBackend {
             crate::checkpoint::CheckpointChain {
                 manifest_ref: memory_ref,
                 manifest,
-                rolling_memfile: rolling,
+                rolling_memfile: Some(rolling),
             },
         );
         tracing::info!(
@@ -654,6 +654,57 @@ impl PooledBackend {
             "checkpoint chain seeded; subsequent captures ride the diff path",
         );
         Ok(())
+    }
+
+    /// ADR 0038 B2: seed the checkpoint chain on RESUME, manifest-only
+    /// (no local rolling image — "sparse mode"). The resume source's
+    /// memory manifest already describes the full image in the chunk
+    /// store, so the first post-resume periodic checkpoint can take the
+    /// diff path (`update_for_dirty_ranges_sparse`) instead of a Full
+    /// re-read of guest RAM — which under UFFD faults the entire working
+    /// set in from the store (the 60 s `PUT /snapshot/create` hang).
+    ///
+    /// Best-effort: a missing/unfetchable manifest just means the first
+    /// checkpoint falls back to Full (the prior behavior). Skips when
+    /// checkpointing is disabled, there's no chunk store, or a chain is
+    /// already tracked (a fresh `restore` always mints a new sandbox id,
+    /// so the latter is just defensive).
+    async fn seed_checkpoint_chain_sparse(
+        &self,
+        id: SandboxId,
+        memory_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return;
+        };
+        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
+            return;
+        }
+        match chunk_store.get_manifest(memory_ref).await {
+            Ok(manifest) => {
+                self.checkpoint_chains.insert(
+                    id,
+                    crate::checkpoint::CheckpointChain {
+                        manifest_ref: memory_ref,
+                        manifest,
+                        rolling_memfile: None,
+                    },
+                );
+                tracing::info!(
+                    sandbox_id = %id,
+                    manifest = %memory_ref,
+                    "ADR 0038: resume-seeded sparse checkpoint chain; first checkpoint will diff",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    manifest = %memory_ref,
+                    error = %e,
+                    "resume chain seed failed; first checkpoint falls back to Full",
+                );
+            }
+        }
     }
 
     /// Sandboxes due for a periodic checkpoint: session-bound, and no
@@ -2146,23 +2197,36 @@ impl SandboxBackend for PooledBackend {
             };
             let manifest_ref = if let Some((prev_ref, prev_manifest, rolling)) = chain_prev.as_ref()
             {
-                // ADR 0028 Fix A diff path: overlay the sparse diff
-                // onto the rolling full image, then re-chunk ONLY the
-                // chunks the dirty extents touched — the previous
-                // manifest's hashes carry over for everything else,
-                // so CPU + upload stay O(dirty set). The manifest id
-                // is stable for the chain's lifetime; only `version`
-                // ticks.
+                // ADR 0028 Fix A diff path: re-chunk ONLY the chunks the
+                // dirty extents touched — the previous manifest's hashes
+                // carry over for everything else, so CPU + upload stay
+                // O(dirty set). The manifest id is stable for the chain's
+                // lifetime; only `version` ticks.
                 let diff_path = dest.join("memory.diff");
                 let ranges = crate::checkpoint::dirty_ranges(&diff_path)
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
-                crate::checkpoint::overlay_sparse(&diff_path, rolling)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("overlay diff: {e}")))?;
-                let next = chunk_store
-                    .update_for_dirty_ranges(prev_manifest, rolling, &ranges)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("incremental re-chunk: {e}")))?;
+                let next = match rolling {
+                    // File-mode VM with a local rolling full image:
+                    // overlay the sparse diff, then re-chunk from it.
+                    Some(rolling_path) => {
+                        crate::checkpoint::overlay_sparse(&diff_path, rolling_path)
+                            .await
+                            .map_err(|e| SandboxError::Snapshot(format!("overlay diff: {e}")))?;
+                        chunk_store
+                            .update_for_dirty_ranges(prev_manifest, rolling_path, &ranges)
+                            .await
+                            .map_err(|e| {
+                                SandboxError::Snapshot(format!("incremental re-chunk: {e}"))
+                            })?
+                    }
+                    // ADR 0038 sparse mode (UFFD-resumed chain, no local
+                    // image): reconstruct each dirty chunk from its prev
+                    // content + the sparse diff — no full memfile to read.
+                    None => chunk_store
+                        .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
+                        .await
+                        .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?,
+                };
                 let next_ref = prev_ref.next_version();
                 chunk_store
                     .put_manifest(next_ref, &next)
@@ -2176,7 +2240,8 @@ impl SandboxBackend for PooledBackend {
                     session_sandbox = %id,
                     manifest = %next_ref,
                     dirty_ranges = ranges.len(),
-                    "diff checkpoint re-chunked incrementally",
+                    sparse = rolling.is_none(),
+                    "diff checkpoint re-chunked",
                 );
                 next_ref
             } else {
@@ -2365,7 +2430,18 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.restore_with(metadata, /*fresh=*/ false).await
+        // ADR 0038 B2: capture the source's memory manifest before
+        // `metadata` is moved, then seed the chain sparse after the VM
+        // is up — so the first post-resume periodic checkpoint is a
+        // cheap diff, not a Full re-read of guest RAM (the UFFD fault
+        // storm). Idle-resume only; `restore_fresh` (base-create) keeps
+        // its Full seed.
+        let memory_ref = metadata.memory_manifest;
+        let id = self.restore_with(metadata, /*fresh=*/ false).await?;
+        if let Some(memory_ref) = memory_ref {
+            self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+        }
+        Ok(id)
     }
 
     async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
@@ -2417,7 +2493,11 @@ impl SandboxBackend for PooledBackend {
         // point). GCS chunks are the durable truth; the rolling file
         // is just the local diff-apply accelerator.
         if let Some((_, chain)) = self.checkpoint_chains.remove(&id) {
-            let _ = tokio::fs::remove_file(&chain.rolling_memfile).await;
+            // `None` for a sparse (UFFD-resumed) chain — nothing local
+            // to remove.
+            if let Some(rolling) = &chain.rolling_memfile {
+                let _ = tokio::fs::remove_file(rolling).await;
+            }
         }
         let _ = self.capture_locks.remove(&id);
         result

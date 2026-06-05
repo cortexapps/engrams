@@ -35,19 +35,27 @@ use engram_core::types::manifest::ManifestRef;
 use serde::{Deserialize, Serialize};
 
 /// Per-sandbox rolling chain state. Lives in
-/// `PooledBackend::checkpoint_chains`; seeded by the first (Full)
-/// checkpoint and advanced by every diff.
+/// `PooledBackend::checkpoint_chains`; seeded either by the first
+/// (Full) checkpoint (File-mode, with a rolling memfile) or
+/// manifest-only on resume (ADR 0038, UFFD "sparse mode"), and
+/// advanced by every diff.
 pub struct CheckpointChain {
     /// The last published memory manifest — same `manifest_id` for the
     /// chain's lifetime, `version` ticking on every checkpoint.
     pub manifest_ref: ManifestRef,
     /// Its full chunk list — the `prev` for the next incremental
-    /// re-chunk (`ChunkStore::update_for_dirty_ranges`).
+    /// re-chunk.
     pub manifest: engram_chunk_store::Manifest,
     /// The rolling full memory image on local NVMe — the diff-apply
-    /// target, and (fork-ready, ADR 0022) the same-host
-    /// File-restore / fork source. Disposable: GCS chunks are truth.
-    pub rolling_memfile: PathBuf,
+    /// target for `update_for_dirty_ranges`, and (fork-ready, ADR 0022)
+    /// the same-host File-restore / fork source. Disposable: GCS chunks
+    /// are truth.
+    ///
+    /// `None` = ADR 0038 "sparse mode": a UFFD-resumed chain seeded
+    /// manifest-only, with no local full image. Diffs re-chunk via
+    /// `update_for_dirty_ranges_sparse` (fetch prev chunks + apply the
+    /// sparse diff) so we never materialize guest RAM just to checkpoint.
+    pub rolling_memfile: Option<PathBuf>,
 }
 
 /// Durable, self-describing record of one completed checkpoint.
