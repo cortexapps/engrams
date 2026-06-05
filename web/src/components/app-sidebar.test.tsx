@@ -5,7 +5,7 @@ import { renderWithProviders } from '../test-utils';
 import { ThemeProvider } from './theme-provider';
 import { MainSidebar } from './app-sidebar';
 
-test('admin sees all four destinations', async () => {
+test('admin sees the two hats: Sessions and Operator', async () => {
   renderWithProviders(
     <ThemeProvider>
       <SidebarProvider>
@@ -17,12 +17,12 @@ test('admin sees all four destinations', async () => {
   // Exact-string names target the destination links (not the logo link, whose
   // accessible name also contains "sessions").
   expect(await screen.findByRole('link', { name: 'Sessions' })).toBeTruthy();
-  for (const label of ['Fleet', 'Storage', 'Settings']) {
-    expect(screen.getByRole('link', { name: label })).toBeTruthy();
-  }
+  expect(screen.getByRole('link', { name: 'Operator' })).toBeTruthy();
+  // Settings is not a rail destination; it lives in the avatar menu.
+  expect(screen.queryByRole('link', { name: 'Settings' })).toBeNull();
 });
 
-test('member does not see Fleet or Storage', async () => {
+test('member sees only Sessions in the rail', async () => {
   renderWithProviders(
     <ThemeProvider>
       <SidebarProvider>
@@ -35,6 +35,5 @@ test('member does not see Fleet or Storage', async () => {
     } },
   );
   expect(await screen.findByRole('link', { name: 'Sessions' })).toBeTruthy();
-  expect(screen.queryByRole('link', { name: 'Fleet' })).toBeNull();
-  expect(screen.queryByRole('link', { name: 'Storage' })).toBeNull();
+  expect(screen.queryByRole('link', { name: 'Operator' })).toBeNull();
 });

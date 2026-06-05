@@ -22,7 +22,7 @@ export function Storage() {
   ];
 
   return (
-    <div className="space-y-6 p-4 md:p-6">
+    <div className="space-y-6">
       <PageHeading
         title="Storage"
         description="Content-addressed chunk store, snapshots, and copy-on-write durability."

@@ -1,6 +1,6 @@
 import { type ComponentProps, useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from '@tanstack/react-router';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Controller, useForm } from 'react-hook-form';
 import * as z from 'zod';
@@ -94,7 +94,17 @@ export function NewSessionDialog({
         {isLoading && <p className="text-sm text-muted-foreground">Loading images…</p>}
         {images && images.length === 0 && (
           <p className="text-sm text-muted-foreground">
-            No images enabled. Enable one under Settings → Images.
+            {principal.role === 'admin' ? (
+              <>
+                No images enabled yet. Enable one in{' '}
+                <Link to="/operator/images" className="underline underline-offset-4 hover:text-foreground">
+                  Operator → Images
+                </Link>{' '}
+                before launching a session.
+              </>
+            ) : (
+              'No images enabled yet. Ask an admin to enable one before you can launch a session.'
+            )}
           </p>
         )}
 

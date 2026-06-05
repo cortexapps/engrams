@@ -31,7 +31,7 @@ export function Fleet() {
     s.filter((x: Session) => x.host_id === id && x.status === 'active').length;
 
   return (
-    <div className="space-y-6 p-4 md:p-6">
+    <div className="space-y-6">
       <PageHeading title="Fleet" description="Firecracker hosts and capacity." />
 
       <StatReadout

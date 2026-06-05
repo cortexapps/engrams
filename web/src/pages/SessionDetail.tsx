@@ -9,6 +9,7 @@ import { PageHeading } from '../components/page-heading';
 import { TerminalPane } from '../components/TerminalPane';
 import { SessionCowState } from '../components/CowState';
 import { DurabilityTimeline } from '../components/DurabilityTimeline';
+import { MetricRow } from '../components/MetricRow';
 import { relativeTime } from './sessions/session-format';
 import { Sidebar, SidebarContent, SidebarProvider } from '@/components/ui/sidebar';
 import { Text } from '@/components/ui/text';
@@ -119,7 +120,9 @@ function SessionMeta({
     <div className="space-y-5">
       <div className="flex items-center gap-2">
         <StatusGlyph status={session.status} />
-        <span className="text-sm font-medium text-foreground">{session.status}</span>
+        <span className="text-sm font-medium text-foreground">
+          {session.status.replace(/_/g, ' ')}
+        </span>
       </div>
 
       <dl className="space-y-2.5 text-sm">
@@ -129,16 +132,8 @@ function SessionMeta({
             {session.image}
           </dd>
         </div>
-        <div className="flex items-baseline justify-between gap-3">
-          <dt className="text-muted-foreground">created</dt>
-          <dd className="font-mono tabular-nums text-foreground">
-            {relativeTime(session.created_at)} ago
-          </dd>
-        </div>
-        <div className="flex items-baseline justify-between gap-3">
-          <dt className="text-muted-foreground">events</dt>
-          <dd className="font-mono tabular-nums text-foreground">{eventCount}</dd>
-        </div>
+        <MetricRow label="created" value={`${relativeTime(session.created_at)} ago`} />
+        <MetricRow label="events" value={eventCount} />
       </dl>
 
       {/* ADR 0016 Phase A + ADR 0028 A.log: per-session durability — "is my

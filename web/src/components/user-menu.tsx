@@ -43,7 +43,7 @@ export function UserMenu() {
               </div>
             </DropdownMenuLabel>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={() => navigate({ to: '/settings/profile' })}>
+            <DropdownMenuItem onClick={() => navigate({ to: '/settings' })}>
               <Settings /> Settings
             </DropdownMenuItem>
             {principal.can_sign_out && (

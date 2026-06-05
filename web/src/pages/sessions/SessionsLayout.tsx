@@ -2,6 +2,7 @@ import { Layers, ListChecks } from 'lucide-react';
 import { Link, Outlet, useRouterState, type LinkProps } from '@tanstack/react-router';
 import { useIsAdmin } from '../../auth/AuthProvider';
 import { Sidebar, SidebarProvider } from '@/components/ui/sidebar';
+import type { NavItem } from '@/components/nav';
 import { SessionsRail } from './SessionsRail';
 import { cn } from '@/lib/utils';
 
@@ -17,7 +18,7 @@ export function SessionsLayout() {
   const seg = pathname.startsWith('/sessions/') ? pathname.split('/')[2] : undefined;
   const onDetail = !!seg && seg !== 'all';
 
-  const scopes: { to: LinkProps['to']; label: string; icon: typeof Layers; active: boolean }[] = [
+  const scopes: (NavItem & { active: boolean })[] = [
     { to: '/sessions', label: 'My sessions', icon: Layers, active: pathname === '/sessions' || pathname === '/sessions/' },
     ...(isAdmin
       ? [{ to: '/sessions/all' as LinkProps['to'], label: 'All sessions', icon: ListChecks, active: pathname.startsWith('/sessions/all') }]

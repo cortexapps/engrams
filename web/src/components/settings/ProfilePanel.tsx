@@ -17,7 +17,7 @@ export function ProfilePanel() {
        'Inspect host capacity & drain hosts', 'Read storage durability & snapshots',
        'Curate images & registry credentials', 'Manage members & their roles']
     : ['Launch & manage your own sessions', 'Save your own Claude Code token'];
-  const cannot = isAdmin ? [] : ['The fleet, storage & deployment settings — admin only'];
+  const cannot = isAdmin ? [] : ['The Operator section (fleet, storage, images, registries): admin only'];
 
   return (
     <div className="max-w-2xl space-y-6">
