@@ -1047,6 +1047,390 @@ async fn e2e_warm_restore_bind_via_pooled_backend() {
     cleanup_host_state();
 }
 
+/// ADR 0037 P5 measurement — warm-capture's two payoffs, on real FC.
+///
+///   (b) CROSS-SIBLING DENSITY (the DECISIVE result of this test): restore N
+///       fresh siblings off one warm base (File backend, the `restore_fresh`
+///       default) and sample each FC VMM's smaps_rollup. FC runs un-chrooted,
+///       so every sibling MAP_PRIVATEs the ONE shared `snapshot_dir/memory.bin`
+///       inode — a page untouched since restore is Shared_Clean across
+///       siblings, a page the warm runtime writes is Private_Dirty. Measured
+///       (dev-vm, N=3): only ~26-29 MiB/sibling is Shared_Clean; ~285-314
+///       MiB/sibling is Private_Dirty ⇒ Σpss/Σrss ≈ 94%. So warm-harness
+///       cross-sibling density is MINIMAL — the live Bun/V8 runtime dirties
+///       ~90% of its resident set on resume — exactly as ADR 0022/0037 flagged
+///       (the V8 heap COW-diverges; only an immutable code residue shares).
+///       Sharing IS active (the 26 MiB proves it); the heap just dominates.
+///
+///   (a) FIRST-PROMPT LATENCY (INDICATIVE ONLY — confounded, do NOT quote as
+///       the win): restore the same warm base two ways and time
+///       prompt→RunCompleted. COLD = `start_agent` (respawn a fresh claude);
+///       WARM = P5b nudge + late-`bind` (reuse the warm child). Two confounds
+///       make the delta unreliable here: (1) the cold path's respawned claude
+///       reads its Bun ELF from the GUEST page cache the warm capture already
+///       populated, so its "cold boot" isn't truly cold (host drop_caches
+///       can't reach the guest cache); (2) prompt→RunCompleted is dominated by
+///       claude's multi-second per-turn processing, which swamps the ~1s boot
+///       delta (observed deltas across runs: +952ms, +672ms, −608ms — within
+///       noise). A clean number needs a separate cold base (no warm capture)
+///       or a prod canary on a real template.
+///
+/// A verdict-printer (asserts the MECHANISM — both paths complete, N siblings
+/// sampled — and prints the numbers), not a pass/fail gate on the values.
+/// Bogus token ⇒ the first prompt 401s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + KVM + FC + Docker + sudo + internet egress to api.anthropic.com"]
+async fn e2e_warm_latency_and_density_via_pooled_backend() {
+    if std::env::var("ENGRAM_WARM_RESTORE_E2E").is_err() {
+        eprintln!(
+            "SKIP: warm latency/density e2e needs a real claude + proxy + root; \
+             set ENGRAM_WARM_RESTORE_E2E=1 to run (dev-vm)"
+        );
+        return;
+    }
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !require_root() {
+        return;
+    }
+    cleanup_host_state();
+
+    let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
+    let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
+    let rootfs_path =
+        bake_harness_rootfs("engram-e2e-warm-latdens", &harness_bin, &claude_bin).await;
+
+    let work = tempfile::tempdir().expect("work");
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg.net_pool = Some("10.203.0.0".parse().unwrap());
+    cfg.egress_proxy_port = Some(proxy_port);
+    let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
+    fc.host_startup().await.expect("host_startup");
+    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+
+    let captured: Arc<Mutex<Vec<engram_harness_proto::HarnessEvent>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let cap_for_sink = captured.clone();
+    let hub = Arc::new(engram_host_agent::harness::HarnessHub::new(
+        engram_host_agent::harness::event_sink_to(move |_sid, _sbid, ev| {
+            let cap = cap_for_sink.clone();
+            async move {
+                cap.lock().push(ev);
+            }
+        }),
+    ));
+    let sink_hub = hub.clone();
+    let sink: engram_core::traits::HarnessSink =
+        Arc::new(move |sandbox_id, stream| sink_hub.accept_connection(sandbox_id, None, stream));
+    fc.set_harness_sink(sink);
+    pooled.set_warm_capture_hub(hub.clone());
+
+    let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
+    let register_in_proxy = |id: engram_core::SandboxId| {
+        let registry = registry.clone();
+        let allow_list = allow_list.clone();
+        let pooled = &pooled;
+        async move {
+            let session_id = engram_core::SessionId::new();
+            let guest_ip: std::net::Ipv4Addr = pooled
+                .guest_ip(id)
+                .await
+                .expect("guest_ip")
+                .parse()
+                .unwrap();
+            let network_allow =
+                engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
+            registry.register(engram_egress_proxy::SessionState {
+                session_id,
+                guest_ip,
+                network_allow,
+                secrets: Vec::new(),
+            });
+            session_id
+        }
+    };
+
+    // Count terminal RunCompleted events seen so far (cleared between phases).
+    let wait_for_completed = |want: usize, secs: u64| {
+        let captured = captured.clone();
+        async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+            while std::time::Instant::now() < deadline {
+                let n = captured
+                    .lock()
+                    .iter()
+                    .filter(|ev| {
+                        matches!(ev, engram_harness_proto::HarnessEvent::RunCompleted { .. })
+                    })
+                    .count();
+                if n >= want {
+                    return true;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+    };
+
+    let mk_spec = || SandboxSpec {
+        image: "engram-e2e-warm-latdens".into(),
+        rootfs_source: Some(rootfs_path.clone()),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 2 },
+        memory: MemoryLimit { max_mib: 512 },
+        disk: DiskLimit { max_gib: 2 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+
+    // ---- Build ONE warm base snapshot (shared by both measurements) ----
+    let sentinel = engram_core::SessionId::new();
+    let mut warm_env: HashMap<String, String> = HashMap::new();
+    warm_env.insert(
+        "PATH".into(),
+        "/opt/engram/harness:/usr/local/bin:/usr/bin:/bin".into(),
+    );
+    warm_env.insert(
+        "CLAUDE_CODE_OAUTH_TOKEN".into(),
+        "sk-bogus-e2e-test-token-not-real".into(),
+    );
+    warm_env.insert("CLAUDE_CODE_MAX_RETRIES".into(), "0".into());
+    let mut warm_session_env: HashMap<String, String> = HashMap::new();
+    warm_session_env.insert("ENGRAM_SESSION_ID".into(), sentinel.to_string());
+    let warm_agent = AgentSpec {
+        argv: vec![
+            "/opt/engram/harness/harness".into(),
+            "--vsock-host".into(),
+            engram_harness_proto::HARNESS_VSOCK_PORT.to_string(),
+            "--session-id".into(),
+            sentinel.to_string(),
+        ],
+        env: warm_env,
+        session_env: warm_session_env,
+        host_ca_pem: None,
+    };
+    std::env::set_var("ENGRAM_WARM_HARNESS_CAPTURE", "1");
+    let metadata = pooled
+        .build_base_snapshot(mk_spec(), Some(warm_agent))
+        .await
+        .expect("build_base_snapshot");
+    std::env::remove_var("ENGRAM_WARM_HARNESS_CAPTURE");
+    assert!(metadata.warm_harness, "capture should be warm");
+
+    // ---- (a1) WARM first-prompt (single sibling, clean — the known-good
+    //      path): restore the warm base, nudge (P5b) + late-`bind` (no
+    //      respawn ⇒ reuse the already-booted warm claude), time
+    //      prompt→RunCompleted. Kept alive for the density sample below. ----
+    let warm_id = pooled
+        .restore_base_for_session(metadata.clone(), HashMap::new())
+        .await
+        .expect("restore (warm)");
+    let _ = wait_for_guest_ip(&pooled, warm_id, Duration::from_secs(30)).await;
+    let warm_session = register_in_proxy(warm_id).await;
+    captured.lock().clear();
+    let warm_t0 = std::time::Instant::now();
+    let delivered = pooled.reconnect_harness(warm_id).await.expect("nudge warm");
+    assert!(delivered, "warm sibling should be signalable");
+    assert!(
+        hub.wait_harness_warm(warm_id, Duration::from_secs(20))
+            .await,
+        "warm sibling should re-attach after the nudge",
+    );
+    hub.bind(
+        warm_id,
+        warm_session,
+        HashMap::new(),
+        Some("say hi briefly".into()),
+    )
+    .await
+    .expect("bind warm");
+    let warm_ok = wait_for_completed(1, 90).await;
+    let warm_elapsed = warm_t0.elapsed();
+    assert!(warm_ok, "warm first prompt never reached RunCompleted");
+    eprintln!("--- warm first-prompt prompt→RunCompleted: {warm_elapsed:?} ---");
+    // Destroy it so the density siblings below are all in an identical
+    // at-rest state (none has run a turn).
+    pooled
+        .destroy(warm_id)
+        .await
+        .expect("destroy warm latency vm");
+
+    // ---- (b) DENSITY: restore N fresh siblings off the same warm base
+    //      (File backend = the `restore_fresh` default). No bind — the warm
+    //      claude is RESIDENT in each from the snapshot (the honest at-rest
+    //      cross-sibling state). FC runs un-chrooted, so every sibling
+    //      MAP_PRIVATEs the ONE shared snapshot_dir/memory.bin inode: a page
+    //      untouched since restore stays Shared_Clean across siblings; a page
+    //      the warm claude/guest writes becomes Private_Dirty. The
+    //      Shared_Clean vs Private_Dirty split is the decisive read — it
+    //      separates "sharing is available but the heap diverges" (expected)
+    //      from "nothing shares at all" (a setup bug). ----
+    const N: usize = 3;
+    let mut density_ids = Vec::new();
+    for _ in 0..N {
+        let id = pooled
+            .restore_base_for_session(metadata.clone(), HashMap::new())
+            .await
+            .expect("restore (density sibling)");
+        let _ = wait_for_guest_ip(&pooled, id, Duration::from_secs(30)).await;
+        density_ids.push(id);
+    }
+    // Let the freshly-restored siblings fault in their resident pages.
+    sleep(Duration::from_secs(5)).await;
+    let stats = fc
+        .guest_memory_stats()
+        .await
+        .expect("guest_memory_stats (Linux smaps_rollup)");
+    let pct = stats.pss_bytes * 100 / stats.rss_bytes.max(1);
+
+    // Decisive breakdown via each FC VMM's smaps_rollup.
+    let pgrep = std::process::Command::new("pgrep")
+        .args(["-x", "firecracker"])
+        .output()
+        .expect("pgrep firecracker");
+    let pids: Vec<u32> = String::from_utf8_lossy(&pgrep.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    let mut sum_sc = 0u64;
+    let mut sum_pd = 0u64;
+    let mut sum_pc = 0u64;
+    let mut sum_rss = 0u64;
+    for pid in &pids {
+        if let Ok(text) = tokio::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).await {
+            let field = |name: &str| -> u64 {
+                text.lines()
+                    .find_map(|l| {
+                        let l = l.trim();
+                        let rest = l.strip_prefix(name)?;
+                        rest.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()
+                    })
+                    .unwrap_or(0)
+            };
+            let (rss, sc, pd, pc) = (
+                field("Rss:"),
+                field("Shared_Clean:"),
+                field("Private_Dirty:"),
+                field("Private_Clean:"),
+            );
+            eprintln!(
+                "  FC pid {pid}: rss={} MiB  shared_clean={} MiB  private_dirty={} MiB  private_clean={} MiB",
+                rss / 1024,
+                sc / 1024,
+                pd / 1024,
+                pc / 1024,
+            );
+            sum_rss += rss;
+            sum_sc += sc;
+            sum_pd += pd;
+            sum_pc += pc;
+        }
+    }
+    let breakdown = format!(
+        "Σ shared_clean={} MiB (cross-sibling shared)  Σ private_dirty={} MiB (diverged)  \
+         Σ private_clean={} MiB  Σrss={} MiB across {} FC VMMs",
+        sum_sc / 1024,
+        sum_pd / 1024,
+        sum_pc / 1024,
+        sum_rss / 1024,
+        pids.len(),
+    );
+
+    for id in density_ids {
+        pooled.destroy(id).await.expect("destroy density sibling");
+    }
+
+    // ---- (a2) COLD first-prompt (done LAST so it can't perturb the warm
+    //      path): restore the warm base + `start_agent` — SpawnHarness
+    //      kills the captured warm child and respawns a fresh claude that
+    //      cold-boots Bun and auto-runs ENGRAM_INITIAL_PROMPT. ----
+    let cold_id = pooled
+        .restore_base_for_session(metadata.clone(), HashMap::new())
+        .await
+        .expect("restore (cold)");
+    let _ = wait_for_guest_ip(&pooled, cold_id, Duration::from_secs(30)).await;
+    let _cold_session = register_in_proxy(cold_id).await;
+    captured.lock().clear();
+    let mut cold_env: HashMap<String, String> = HashMap::new();
+    cold_env.insert(
+        "PATH".into(),
+        "/opt/engram/harness:/usr/local/bin:/usr/bin:/bin".into(),
+    );
+    cold_env.insert(
+        "CLAUDE_CODE_OAUTH_TOKEN".into(),
+        "sk-bogus-e2e-test-token-not-real".into(),
+    );
+    cold_env.insert("CLAUDE_CODE_MAX_RETRIES".into(), "0".into());
+    cold_env.insert("ENGRAM_INITIAL_PROMPT".into(), "say hi briefly".into());
+    // NOTE (latency caveat): this is the SAME warm base, so the cold path's
+    // respawned claude reads its Bun ELF from the GUEST page cache that the
+    // warm capture already populated — i.e. its "cold boot" isn't truly cold.
+    // (Host `drop_caches` doesn't help: the guest cache lives in the restored
+    // guest RAM, not the host's.) And prompt→RunCompleted is dominated by
+    // claude's multi-second per-turn processing, which swamps the ~1s boot
+    // delta. So the latency numbers below are INDICATIVE only; a clean
+    // warm-vs-cold first-prompt number needs a separate cold base (no warm
+    // capture) or a prod canary on a real template. The DENSITY measurement
+    // below is the robust, decisive result of this test.
+    let cold_t0 = std::time::Instant::now();
+    pooled
+        .start_agent(
+            cold_id,
+            AgentSpec {
+                argv: vec![
+                    "/opt/engram/harness/harness".into(),
+                    "--vsock-host".into(),
+                    engram_harness_proto::HARNESS_VSOCK_PORT.to_string(),
+                    "--session-id".into(),
+                    engram_core::SessionId::new().to_string(),
+                ],
+                env: cold_env,
+                session_env: HashMap::new(),
+                host_ca_pem: Some(ca_pem.to_string()),
+            },
+        )
+        .await
+        .expect("start_agent (cold)");
+    let cold_ok = wait_for_completed(1, 90).await;
+    let cold_elapsed = cold_t0.elapsed();
+    assert!(cold_ok, "cold first prompt never reached RunCompleted");
+    pooled.destroy(cold_id).await.expect("destroy cold");
+
+    eprintln!("==================== ADR 0037 P5 MEASUREMENT ====================");
+    eprintln!(
+        "FIRST-PROMPT LATENCY (INDICATIVE — same-base guest cache + per-turn \
+         noise confound this; see test doc):\n  \
+         COLD (start_agent, fresh Bun boot): {cold_elapsed:?}\n  \
+         WARM (nudge + late-bind, reuse):    {warm_elapsed:?}",
+    );
+    eprintln!(
+        "CROSS-SIBLING DENSITY (N={N} fresh File-backend warm siblings, at rest):\n  \
+         Σpss={} MiB  Σrss={} MiB  Σpss/Σrss={pct}%  (sampled={})\n  \
+         {breakdown}",
+        stats.pss_bytes / (1024 * 1024),
+        stats.rss_bytes / (1024 * 1024),
+        stats.sampled,
+    );
+    eprintln!("=================================================================");
+
+    assert_eq!(
+        stats.sampled as usize, N,
+        "should have sampled all N siblings"
+    );
+    assert!(
+        stats.pss_bytes > 0 && stats.rss_bytes > 0,
+        "non-empty sample"
+    );
+
+    cleanup_host_state();
+}
+
 /// ADR 0021 P1.6: `SessionMode::DevVm` against a HARNESSED image. The
 /// `/opt/engram/harness/harness` binary (+ `claude` CLI) is baked into
 /// the rootfs exactly like `e2e_harness_cold`, but the coord

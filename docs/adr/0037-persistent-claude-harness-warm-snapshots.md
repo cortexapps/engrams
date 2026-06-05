@@ -223,9 +223,26 @@ SHAs are current-as-of-rebase onto `main` #82.)
   late-bind → first prompt round-trips through the egress proxy in **~3.5s** (bogus token ⇒ a real 401
   `result` frame). Cold + pause/resume harness e2e unaffected; clippy clean. Test gated off CI (needs a
   real `claude` binary + proxy + root + Anthropic reachability); runs on the dev-vm.
-- _P5 cross-sibling density (Σpss/Σrss) + P6 (Accepted)_ pending — the connection-recovery accept gate is
-  now met; the remaining gates are the prod canary (first-prompt latency warm vs cold on a real
-  template) and the File-backend density sample.
+- **P5 measurement DONE on dev-vm** (`e2e_warm_latency_and_density_via_pooled_backend`, gated
+  `ENGRAM_WARM_RESTORE_E2E`): build one warm base, then cold-create (`start_agent`) vs warm-create
+  (nudge + late-bind), and restore N=3 fresh File-backend siblings to sample memory.
+  - **Cross-sibling density (the decisive result): Σpss/Σrss ≈ 94%** — i.e. minimal sharing. The
+    smaps_rollup breakdown is unambiguous: only **~26 MiB/sibling is Shared_Clean** (cross-sibling),
+    **~300 MiB/sibling is Private_Dirty**. FC runs un-chrooted so all siblings `MAP_PRIVATE` the one
+    shared `memory.bin` inode — sharing *is* active (the 26 MiB proves it) — but the live Bun/V8
+    runtime dirties ~90% of its ~326 MiB resident set on resume, so almost nothing stays shareable.
+    **This confirms the density-honesty prediction (§Warm-harness footprint): the V8 heap COW-diverges
+    per sibling; density is NOT the warm-capture win.**
+  - **First-prompt latency: inconclusive on the dev-vm (confounded), do not quote.** Restoring the
+    *same* warm base for both arms means the cold arm's respawned claude reads its Bun ELF from the
+    GUEST page cache the warm capture already populated (host `drop_caches` can't reach the guest
+    cache), so its "cold boot" isn't truly cold; and `prompt→RunCompleted` is dominated by claude's
+    multi-second per-turn processing, which swamps the ~1s boot delta (observed deltas: +952ms, +672ms,
+    −608ms — within noise). A clean number needs a separate cold base (no warm capture) **or the prod
+    canary** — so first-prompt latency becomes a **P6 prod-canary gate**, not a dev-vm-closed one.
+- _P6 (Accepted)_ pending — connection-recovery gate met, density measured (modest, as designed). The
+  remaining gate is the **prod canary**: first-prompt latency warm-vs-cold on a real template (the only
+  setup that exercises a genuinely-cold base against the warm base), behind the existing kill-switches.
   **Known follow-up (pitfall #4):** on the warm path agentd's `/exec` + ttyd shell keep the capture-time
   (sentinel) session env — FC `merge_session_env` is a documented no-op for the guest env; the agent
   loop is correct (forge/upload via the P4b file; OAuth via the baked constant placeholder), but
