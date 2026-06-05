@@ -46,7 +46,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod adapter {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::process::{ExitCode, Stdio};
     use std::sync::Arc;
     use std::time::Duration;
@@ -378,12 +378,26 @@ mod adapter {
         child: tokio::process::Child,
         stdin: ChildStdin,
         lines: tokio::io::Lines<BufReader<ChildStdout>>,
+        /// Bounded rolling tail of claude's stderr (ADR 0037 + #86),
+        /// maintained by a drain task that always reads the pipe (so a
+        /// chatty child can't wedge on a full pipe) and re-echoes each
+        /// line to our stderr (→ the in-guest harness log). Read on an
+        /// abnormal exit to attach the crash cause (e.g. an OOM-killer or
+        /// V8 "heap out of memory" line) to the System transcript message,
+        /// which survives the VM teardown the harness log does not.
+        stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>>,
+        /// Kept alive so the drain task lives as long as the child:
+        /// dropping `ClaudeChild` (respawn) kills the child (`kill_on_drop`)
+        /// → stderr EOF → the task ends on its own.
+        _stderr_task: tokio::task::JoinHandle<()>,
     }
 
     /// Spawn the persistent `claude` child in stream-json I/O mode.
     /// stdin is piped (we feed turns); stdout is piped (we parse
-    /// events); stderr is inherited (lands in the in-guest harness log —
-    /// piping it risks a write(2) deadlock once the 64KiB buffer fills).
+    /// events); stderr is piped + drained by a dedicated task into a
+    /// bounded tail (ADR 0037 + #86) — the task ALWAYS reads the pipe so
+    /// a chatty child never wedges on a full buffer, and re-echoes each
+    /// line to our stderr so it still lands in the in-guest harness log.
     /// `resume_id` is passed as `--resume` only when recovering an
     /// existing conversation (crash respawn / reconnect).
     ///
@@ -426,16 +440,41 @@ mod adapter {
             .env("IS_SANDBOX", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let lines = BufReader::new(stdout).lines();
+
+        // Drain claude's stderr into a bounded rolling tail. The task
+        // always reads the pipe (no write(2) wedge) and re-echoes each
+        // line to our own stderr so it still reaches the in-guest harness
+        // log; the tail is read on an abnormal exit for the crash artifact.
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>> = Arc::new(std::sync::Mutex::new(
+            VecDeque::with_capacity(MAX_STDERR_TAIL_LINES + 1),
+        ));
+        let tail_for_task = stderr_tail.clone();
+        let stderr_task = tokio::spawn(async move {
+            let mut elines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = elines.next_line().await {
+                eprintln!("{line}");
+                if let Ok(mut tail) = tail_for_task.lock() {
+                    if tail.len() >= MAX_STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+            }
+        });
+
         Ok(ClaudeChild {
             child,
             stdin,
             lines,
+            stderr_tail,
+            _stderr_task: stderr_task,
         })
     }
 
@@ -493,6 +532,45 @@ mod adapter {
             }
         }
         "claude exited abnormally (no exit code)".to_string()
+    }
+
+    /// Abnormal-exit diagnostics: how much of claude's stderr to retain
+    /// (#86). Bounded so a chatty child can't grow the tail without limit.
+    pub const MAX_STDERR_TAIL_LINES: usize = 64;
+    pub const MAX_STDERR_TAIL_BYTES: usize = 4096;
+
+    /// Snapshot the current stderr tail. Best-effort: a poisoned lock
+    /// (the drain task panicked) yields an empty tail rather than killing
+    /// the harness on the crash path.
+    fn collect_stderr_tail(tail: &std::sync::Mutex<VecDeque<String>>) -> Vec<String> {
+        tail.lock()
+            .map(|t| t.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Build the durable System-message body for an abnormal claude exit
+    /// (#86): the exit classification (`describe_exit` — SIGKILL≈OOM, …)
+    /// plus the tail of claude's stderr. Rides the event stream into
+    /// `session_events`, surviving the VM teardown that erases the in-guest
+    /// harness log — so "the agent crashed mid-turn" stays diagnosable.
+    pub fn describe_abnormal_exit(
+        status: Option<std::process::ExitStatus>,
+        stderr_tail: &[String],
+    ) -> String {
+        let exit = match status {
+            Some(s) => describe_exit(s),
+            None => "claude exited but its status could not be read".to_string(),
+        };
+        let tail = if stderr_tail.is_empty() {
+            "(no stderr captured)".to_string()
+        } else {
+            truncate_str(&stderr_tail.join("\n"), MAX_STDERR_TAIL_BYTES)
+        };
+        format!(
+            "{exit} mid-turn without emitting a terminal `result` — the turn did not complete. \
+             This is a harness/agent crash (e.g. OOM-kill / panic), NOT an engram platform error. \
+             claude stderr tail:\n{tail}"
+        )
     }
 
     async fn run_one_connection(
@@ -1017,10 +1095,15 @@ mod adapter {
                 }
             };
             if !solicited {
+                // A success exit (code 0) without a `result` frame is still
+                // abnormal in persistent mode — claude should never exit
+                // cleanly mid-session — but it carries no crash signal, so
+                // skip the System message (nothing actionable). Any other
+                // exit gets the stderr tail attached as the crash artifact.
+                let tail = collect_stderr_tail(&claude.stderr_tail);
                 out.abnormal_exit = match status {
                     Some(s) if s.success() => None,
-                    Some(s) => Some(describe_exit(s)),
-                    None => Some("claude exited but its status could not be read".to_string()),
+                    s => Some(describe_abnormal_exit(s, &tail)),
                 };
                 if out.abnormal_exit.is_some() {
                     tracing::error!(reason = ?out.abnormal_exit, "claude exited abnormally mid-turn");
@@ -1341,5 +1424,27 @@ mod tests {
             d.contains("OOM"),
             "SIGKILL should hint at the OOM-killer (the most common guest cause): {d}",
         );
+    }
+
+    #[test]
+    fn abnormal_exit_carries_signal_hint_and_stderr_tail() {
+        use std::os::unix::process::ExitStatusExt;
+        // SIGKILL (9) — the OOM-killer signature — with a captured stderr
+        // tail. The crash artifact must surface both.
+        let killed = std::process::ExitStatus::from_raw(9);
+        let detail = describe_abnormal_exit(
+            Some(killed),
+            &["FATAL ERROR: JS heap out of memory".to_string()],
+        );
+        assert!(detail.contains("signal 9"), "exit signal missing: {detail}");
+        assert!(detail.contains("OOM"), "OOM hint missing: {detail}");
+        assert!(
+            detail.contains("JS heap out of memory"),
+            "stderr tail missing: {detail}",
+        );
+        // No status (couldn't reap) + no stderr still produces a sane body.
+        let none = describe_abnormal_exit(None, &[]);
+        assert!(none.contains("status could not be read"), "got: {none}");
+        assert!(none.contains("(no stderr captured)"), "got: {none}");
     }
 }
