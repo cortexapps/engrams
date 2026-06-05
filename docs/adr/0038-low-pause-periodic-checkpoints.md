@@ -1,8 +1,25 @@
 # ADR 0038: Low-pause periodic checkpoints — resume-seeded sparse chains + off-pause upload
 
-Status: 2026-06-05 — **Proposed.** Authored before code (bookend
-convention); flips to **Accepted** with the commit chain once
-implemented and dev-vm-validated.
+Status: 2026-06-05 — **Accepted.** Implemented (commit chain below) and
+validated on the Linux dev-vm with real microVMs:
+
+- **Sparse re-chunk** (B2.1): 4 unit tests assert the sparse result is
+  byte-identical to a full `chunk_file` re-chunk (basic + carryover +
+  zero-elision, omitted/zero prev chunk, unaligned partial range, short
+  final chunk with a truncated diff).
+- **End-to-end** (`checkpoint_chain`, real FC microVMs): Full seed (v1)
+  → Diff (v2) → restore-mid-chain → **post-resume sparse Diff (v3, same
+  manifest_id** — proving the resume seeded the chain so the first
+  checkpoint diffed instead of cold-Full-seeding) → restore → all three
+  RAM markers byte-identical. Plus `nbd_chunked_disk` boots an FC VM on
+  the chunked NBD rootfs through the new flush split.
+- 148 host-agent unit tests + clippy clean (dev-vm).
+
+Prod watch (post-merge, after the FC-host MIG re-bake auto-rolls):
+`engram_snapshot_create_seconds{type="full"}` should fall toward zero on
+the resume path; `engram_snapshot_capture_lock_wait_seconds` should
+collapse; the `host.snapshot` waterfalls should lose the 52–151 s dark
+waits.
 
 Continuation of **ADR 0028** (diff-first periodic checkpoints) and
 **ADR 0022** (File vs UFFD memory backing). 0028 gave us the rolling
@@ -127,15 +144,38 @@ Realized in four pieces:
 
 ## Implementation
 
-Commit chain (this branch — to be filled as phases land):
+Commit chain (this branch):
 
-- ADR authored (Proposed)
-- B0: snapshot capture instrumentation
-- B1: `capture_lock` skip-not-queue
-- B2.1: `update_for_dirty_ranges_sparse` chunk-store primitive + tests
-- B2.2–2.4: resume chain-seed (host-agent)
-- B3: off-pause disk upload
+- `3cae265` ADR authored (Proposed)
+- `d743091` B2.1: `update_for_dirty_ranges_sparse` chunk-store primitive + 4 unit tests
+- `032008d` B1: `capture_lock` skip-not-queue (periodic `try_lock` + skip)
+- `c9384c4` B2.2–2.4: resume chain-seed (`CheckpointChain.rolling_memfile`
+  → `Option`, `seed_checkpoint_chain_sparse` on resume, sparse diff branch)
+- `1de8d34` B0: snapshot-create + capture-lock-wait histograms + skip counter
+- `a4d62a9` B3: off-pause disk upload (`flush` → `flush_local` + `flush_upload`,
+  pending read tier, rebase-after-upload)
+- `a045706` test: post-resume sparse-diff coverage on a real microVM
 
 ## Divergences from this proposal
 
-_(filled in at Accepted-flip.)_
+- **`put_manifest` stays post-resume, not under-pause.** The proposal
+  worried a deferred disk-manifest publish could "leapfrog" the live
+  pointer and regress the disk. Reading the resolver
+  (`evacuation.rs::pick_evac_disk_manifest` + the rung-1 branch) showed
+  that's not a hazard: a coherent checkpoint (rung 1, always the case
+  for our snapshots) restores `snapshot.disk_manifest` **verbatim** —
+  the live-pointer version comparison only applies to rung-2 cold boot.
+  So the real invariant is "manifest ⟹ chunks durable," preserved by
+  doing the `base` rebase *after* the upload (the background scheduler
+  reads `base`, so it never references a not-yet-uploaded chunk). B3
+  defers the whole upload+manifest+rebase to `flush_upload`; the pause
+  is just the drain into the pending tier.
+- **B3 scope confirmed in-PR with a real-microVM canary** rather than
+  split out — `checkpoint_chain` (extended) + `nbd_chunked_disk` cover
+  the flush split + the sparse path end-to-end, so the coherence risk
+  was validated before merge rather than deferred.
+- **The `fc.create_snapshot` span was dropped** in favor of just the
+  `engram_snapshot_create_seconds{type}` histogram — the histogram is
+  the verifiable "is the 60 s Full-seed gone" signal and avoids a
+  redundant span; the existing `snapshot` operation-scope already
+  brackets the capture in Cloud Trace.
