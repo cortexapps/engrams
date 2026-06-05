@@ -31,14 +31,25 @@ export function NewSessionDialog({
   onCreated,
   variant,
   className,
+  open: openProp,
+  onOpenChange,
+  showTrigger = true,
 }: {
   onCreated: (id: string) => void;
   /** Trigger styling. Defaults to the primary (lime) button; the sessions rail
    * passes `secondary` + `w-full` so it reads quietly beside the active row. */
   variant?: ComponentProps<typeof Button>['variant'];
   className?: string;
+  /** Controlled open state. Omit for the self-contained trigger usage; pass it
+   * (with `showTrigger={false}`) for the global, keyboard/palette-driven mount
+   * in RootLayout. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  showTrigger?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = openProp ?? internalOpen;
+  const setOpen = onOpenChange ?? setInternalOpen;
   const { data: images, isLoading } = useEnabledImages(true);
   const { principal } = useAuth();
   const qc = useQueryClient();
@@ -84,7 +95,9 @@ export function NewSessionDialog({
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild><Button variant={variant} className={className}>New session</Button></DialogTrigger>
+      {showTrigger && (
+        <DialogTrigger asChild><Button variant={variant} className={className}>New session</Button></DialogTrigger>
+      )}
       <DialogContent>
         <DialogHeader>
           <DialogTitle>New session</DialogTitle>

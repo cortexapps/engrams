@@ -1,77 +1,40 @@
 import type { CSSProperties } from 'react';
 import { Layers, ListChecks } from 'lucide-react';
-import { Link, useNavigate, useRouterState } from '@tanstack/react-router';
+import { Link, useRouterState } from '@tanstack/react-router';
 import { useIsAdmin } from '../../auth/AuthProvider';
-import { useSession, useSessions } from '../../hooks/useSessions';
 import { StatusGlyph } from '../../components/Glyph';
-import { NewSessionDialog } from '../../components/NewSessionDialog';
+import { useKeyboardUi } from '../../keyboard/store';
+import { cn } from '@/lib/utils';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import {
   SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent,
   SidebarGroupLabel, SidebarHeader, SidebarMenu, SidebarMenuBadge,
   SidebarMenuButton, SidebarMenuItem, SidebarMenuSkeleton,
 } from '@/components/ui/sidebar';
-import type { Session, SessionListItem, SessionState } from '../../types';
-import { lifecycleOf, relativeTime, shortId, stripImageHost, type Lifecycle } from './session-format';
+import { relativeTime, shortId, stripImageHost } from './session-format';
+import { useRailSessions } from './useRailSessions';
 
 // The persistent sessions rail: a live switcher between recent sessions that
 // stays mounted across the list views AND the transcript (the rail is the
 // second sidebar of the whole /sessions section). Running sessions sort to the
 // top; the open session is highlighted (the selected-session crumb). "See all"
-// drops to the full table; admins get the fleet-wide list too. Replaces the
-// old two-link rail — this is the navigation, not a menu pointing at it.
-
-const RAIL_CAP = 10;
-const ORDER: Lifecycle[] = ['ACTIVE', 'IDLE — RESUMABLE', 'ARCHIVED'];
-
-/** One rail row. We normalise both the list shape (`last_active_at`) and the
- * single-session shape (`created_at`, used to pin an open session that isn't in
- * the recent window) to a single `at` timestamp. */
-interface RailRow {
-  id: string;
-  status: SessionState;
-  image: string;
-  at: string;
-}
-const fromListItem = (s: SessionListItem): RailRow => ({ id: s.id, status: s.status, image: s.image, at: s.last_active_at });
-const fromSession = (s: Session): RailRow => ({ id: s.id, status: s.status, image: s.image, at: s.created_at });
-
-// Stable order so the 1s refetch never reorders rows under the cursor: by
-// lifecycle bucket (active → idle → archived), then most-recently-active.
-function sortForRail(rows: SessionListItem[]): SessionListItem[] {
-  return [...rows].sort((a, b) => {
-    const la = ORDER.indexOf(lifecycleOf(a.status));
-    const lb = ORDER.indexOf(lifecycleOf(b.status));
-    if (la !== lb) return la - lb;
-    return new Date(b.last_active_at).getTime() - new Date(a.last_active_at).getTime();
-  });
-}
+// drops to the full table; admins get the fleet-wide list too.
+//
+// The ordering comes from useRailSessions, the same hook the ⌥-jump keymap
+// reads — so the 1–9 numbers this rail reveals while ⌥ is held point at exactly
+// the rows ⌥1…⌥9 navigate to.
 
 export function SessionsRail() {
   const isAdmin = useIsAdmin();
-  const navigate = useNavigate();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const openNewSession = useKeyboardUi((s) => s.openNewSession);
+  const jumpHeld = useKeyboardUi((s) => s.jumpHeld);
 
-  // `/sessions/<id>` → the open session; `/sessions/all` is the fleet list, not
-  // a detail. `/sessions` and `/sessions/all` are the two list scopes.
-  const seg = pathname.startsWith('/sessions/') ? pathname.split('/')[2] : undefined;
-  const openId = seg && seg !== 'all' ? seg : undefined;
   const onMyList = pathname === '/sessions' || pathname === '/sessions/';
   const onAllList = pathname.startsWith('/sessions/all');
 
-  const { data, isPending, error } = useSessions('mine');
-  const all = data ?? [];
-  const recent = sortForRail(all).slice(0, RAIL_CAP);
-
-  // The open session always needs a row, even if it's older than the recent
-  // window or (for an admin) isn't one of mine. This shares the query cache
-  // with SessionDetail's own useSession, so it's not an extra fetch.
-  const openSession = useSession(openId);
-  const rows: RailRow[] = recent.map(fromListItem);
-  if (openId && !rows.some((r) => r.id === openId)) {
-    const inAll = all.find((s) => s.id === openId);
-    if (inAll) rows.unshift(fromListItem(inAll));
-    else if (openSession.data) rows.unshift(fromSession(openSession.data));
-  }
+  const { rows, openId, total, isPending, error } = useRailSessions();
 
   return (
     <>
@@ -80,11 +43,9 @@ export function SessionsRail() {
             footer's "My sessions" can mean the full list without colliding. */}
         <SidebarGroupLabel className="px-1">Recent</SidebarGroupLabel>
         {/* Lime primary — the rail's one "go" verb and the product's racecar
-            action. Active rows use sidebar-accent (green), so no lime clash. */}
-        <NewSessionDialog
-          className="w-full"
-          onCreated={(id) => navigate({ to: '/sessions/$id', params: { id } })}
-        />
+            action. Active rows use sidebar-accent (green), so no lime clash.
+            Drives the one global New Session dialog (shared with `c` + ⌘K). */}
+        <Button className="w-full" onClick={openNewSession}>New session</Button>
       </SidebarHeader>
 
       {/* SidebarContent is the scroll container (min-h-0 flex-1 overflow-auto
@@ -114,30 +75,58 @@ export function SessionsRail() {
               ) : rows.length === 0 ? (
                 <p className="px-2 py-2 text-xs text-sidebar-foreground/70">No sessions yet.</p>
               ) : (
-                rows.map((r) => (
-                  <SidebarMenuItem key={r.id}>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={r.id === openId}
-                      className="h-auto items-start gap-2.5 py-1.5 data-[active=true]:font-medium"
-                    >
-                      <Link to="/sessions/$id" params={{ id: r.id }} title={r.id}>
-                        <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
-                          <StatusGlyph status={r.status} />
-                        </span>
-                        <span className="flex min-w-0 flex-1 flex-col">
-                          <span className="truncate font-mono text-[0.8rem] leading-tight">{shortId(r.id)}</span>
-                          <span className="truncate text-[0.7rem] leading-tight text-sidebar-foreground/70">
-                            {stripImageHost(r.image)}
+                rows.map((r, i) => {
+                  const showNum = jumpHeld && i < 9;
+                  return (
+                    <SidebarMenuItem key={r.id}>
+                      <SidebarMenuButton
+                        asChild
+                        isActive={r.id === openId}
+                        className="h-auto items-start gap-2.5 py-1.5 data-[active=true]:font-medium"
+                      >
+                        <Link to="/sessions/$id" params={{ id: r.id }} title={r.id}>
+                          <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
+                            <StatusGlyph status={r.status} />
                           </span>
-                        </span>
-                        <span className="mt-0.5 shrink-0 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/70">
-                          {relativeTime(r.at)}
-                        </span>
-                      </Link>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                ))
+                          <span className="flex min-w-0 flex-1 flex-col">
+                            <span className="truncate font-mono text-[0.8rem] leading-tight">{shortId(r.id)}</span>
+                            <span className="truncate text-[0.7rem] leading-tight text-sidebar-foreground/70">
+                              {stripImageHost(r.image)}
+                            </span>
+                          </span>
+                          {/* Trailing slot crossfades the relative time with the
+                              ⌥-jump number while the modifier is held. Stretches
+                              the full row height (self-stretch) so the time keeps
+                              the top line while the badge centers vertically; the
+                              fixed footprint stops the row reflowing on reveal. */}
+                          <span className="relative flex min-w-[1.4rem] shrink-0 items-start justify-end self-stretch leading-none">
+                            <span
+                              className={cn(
+                                'mt-0.5 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/70 transition-opacity duration-150 motion-reduce:transition-none',
+                                showNum && 'opacity-0',
+                              )}
+                            >
+                              {relativeTime(r.at)}
+                            </span>
+                            {i < 9 && (
+                              <span
+                                aria-hidden
+                                className={cn(
+                                  'absolute inset-0 flex items-center justify-end transition-opacity duration-150 motion-reduce:transition-none',
+                                  showNum ? 'opacity-100' : 'opacity-0',
+                                )}
+                              >
+                                <Badge className="min-w-5 justify-center rounded-md px-1.5 py-1 font-display font-semibold leading-none tabular-nums bg-sidebar-primary text-sidebar-primary-foreground">
+                                  {i + 1}
+                                </Badge>
+                              </span>
+                            )}
+                          </span>
+                        </Link>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                })
               )}
             </SidebarMenu>
           </SidebarGroupContent>
@@ -154,7 +143,7 @@ export function SessionsRail() {
             <SidebarMenuButton asChild isActive={onMyList}>
               <Link to="/sessions"><Layers /><span>My sessions</span></Link>
             </SidebarMenuButton>
-            {all.length > 0 && <SidebarMenuBadge>{all.length}</SidebarMenuBadge>}
+            {total > 0 && <SidebarMenuBadge>{total}</SidebarMenuBadge>}
           </SidebarMenuItem>
           {isAdmin && (
             <SidebarMenuItem>
