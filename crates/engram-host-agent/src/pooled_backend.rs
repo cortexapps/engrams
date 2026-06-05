@@ -519,12 +519,6 @@ impl PooledBackend {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
 
-    fn checkpoint_rolling_path(&self, id: SandboxId) -> Option<PathBuf> {
-        self.checkpoint_dir
-            .as_ref()
-            .map(|d| d.join("rolling").join(format!("{id}.memory.bin")))
-    }
-
     /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
     /// host-owned record. Runs at the tail of every successful
     /// `snapshot()` (periodic checkpoint, eviction, drain, SIGTERM —
@@ -550,25 +544,20 @@ impl PooledBackend {
         };
 
         match next_manifest {
-            // Diff capture: the rolling file was already overlaid in
-            // the post block; just advance the chain's manifest.
+            // Diff capture: the sparse re-chunk already ran in the post
+            // block; just advance the chain's manifest pointer.
             Some(next) => {
                 if let Some(mut chain) = self.checkpoint_chains.get_mut(&id) {
                     chain.manifest_ref = memory_ref;
                     chain.manifest = next;
                 }
             }
-            // Full capture: seed the chain — copy the freshly-written
-            // memory.bin as the rolling diff-apply target and fetch
-            // the manifest we just published.
+            // Full capture: seed the chain manifest-only from the manifest
+            // we just published (ADR 0039 — no local rolling image; the
+            // memory.bin was chunked + removed in the post block).
+            // Subsequent captures ride the sparse diff path.
             None => {
-                if let Err(e) = self.seed_checkpoint_chain(id, metadata, memory_ref).await {
-                    tracing::warn!(
-                        sandbox_id = %id,
-                        error = %e,
-                        "checkpoint chain seed failed; next capture will be Full again",
-                    );
-                }
+                self.seed_checkpoint_chain_sparse(id, memory_ref).await;
             }
         }
 
@@ -603,72 +592,22 @@ impl PooledBackend {
         }
     }
 
-    async fn seed_checkpoint_chain(
-        &self,
-        id: SandboxId,
-        metadata: &SnapshotMetadata,
-        memory_ref: engram_core::types::manifest::ManifestRef,
-    ) -> Result<(), SandboxError> {
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
-            return Ok(());
-        };
-        let Some(rolling) = self.checkpoint_rolling_path(id) else {
-            return Ok(());
-        };
-        let src = self.inner.snapshot_path_for(metadata.id).join("memory.bin");
-        if tokio::fs::metadata(&src).await.is_err() {
-            return Ok(());
-        }
-        if let Some(parent) = rolling.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("rolling dir: {e}")))?;
-        }
-        // GiB-scale copy off the hot path (the guest already resumed);
-        // copy to a temp + rename so a crash never leaves a torn
-        // rolling file masquerading as a baseline.
-        let tmp = rolling.with_extension("partial");
-        let (src_c, tmp_c) = (src.clone(), tmp.clone());
-        tokio::task::spawn_blocking(move || std::fs::copy(&src_c, &tmp_c))
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("seed copy join: {e}")))?
-            .map_err(|e| SandboxError::Snapshot(format!("seed copy: {e}")))?;
-        tokio::fs::rename(&tmp, &rolling)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("seed rename: {e}")))?;
-        let manifest = chunk_store
-            .get_manifest(memory_ref)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("fetch seeded manifest: {e}")))?;
-        self.checkpoint_chains.insert(
-            id,
-            crate::checkpoint::CheckpointChain {
-                manifest_ref: memory_ref,
-                manifest,
-                rolling_memfile: Some(rolling),
-            },
-        );
-        tracing::info!(
-            sandbox_id = %id,
-            manifest = %memory_ref,
-            "checkpoint chain seeded; subsequent captures ride the diff path",
-        );
-        Ok(())
-    }
-
-    /// ADR 0038 B2: seed the checkpoint chain on RESUME, manifest-only
-    /// (no local rolling image — "sparse mode"). The resume source's
-    /// memory manifest already describes the full image in the chunk
-    /// store, so the first post-resume periodic checkpoint can take the
-    /// diff path (`update_for_dirty_ranges_sparse`) instead of a Full
-    /// re-read of guest RAM — which under UFFD faults the entire working
-    /// set in from the store (the 60 s `PUT /snapshot/create` hang).
+    /// ADR 0038 B2 / ADR 0039: seed the checkpoint chain manifest-only
+    /// (no local rolling image — "sparse mode"). Two entry points: on
+    /// RESUME from the source's memory manifest, and after a fresh Full
+    /// capture from the just-published one. ADR 0039 retired the rolling
+    /// memfile, so this is the *only* seed. The manifest already describes
+    /// the full image in the chunk store, so the next periodic checkpoint
+    /// takes the diff path (`update_for_dirty_ranges_sparse`) instead of a
+    /// Full re-read of guest RAM — which under UFFD faults the entire
+    /// working set in from the store (the 60 s `PUT /snapshot/create`
+    /// hang).
     ///
-    /// Best-effort: a missing/unfetchable manifest just means the first
-    /// checkpoint falls back to Full (the prior behavior). Skips when
-    /// checkpointing is disabled, there's no chunk store, or a chain is
-    /// already tracked (a fresh `restore` always mints a new sandbox id,
-    /// so the latter is just defensive).
+    /// Best-effort: a missing/unfetchable manifest just means the next
+    /// checkpoint falls back to Full. Skips when checkpointing is
+    /// disabled, there's no chunk store, or a chain is already tracked
+    /// (a fresh `restore` mints a new sandbox id; the Full-capture caller
+    /// only reaches here when the chain was empty).
     async fn seed_checkpoint_chain_sparse(
         &self,
         id: SandboxId,
@@ -687,13 +626,12 @@ impl PooledBackend {
                     crate::checkpoint::CheckpointChain {
                         manifest_ref: memory_ref,
                         manifest,
-                        rolling_memfile: None,
                     },
                 );
                 tracing::info!(
                     sandbox_id = %id,
                     manifest = %memory_ref,
-                    "ADR 0038: resume-seeded sparse checkpoint chain; first checkpoint will diff",
+                    "ADR 0038/0039: seeded sparse checkpoint chain; next checkpoint will diff",
                 );
             }
             Err(e) => {
@@ -2032,19 +1970,16 @@ impl SandboxBackend for PooledBackend {
         let _capture_guard = capture_lock.lock().await;
         metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
             .record(lock_wait.elapsed().as_secs_f64());
-        // Diff-mode when a rolling chain exists: same coherent
+        // Diff-mode when a checkpoint chain exists: same coherent
         // (memory, disk) capture contract, O(dirty set) cost. The
         // chain seeds on the first (Full) capture below — so an
         // eviction on a long-running session is just the final diff
         // in its checkpoint chain, collapsing the multi-GiB-dump
         // window the cf4d4afd incident sat in.
-        let chain_prev = self.checkpoint_chains.get(&id).map(|c| {
-            (
-                c.manifest_ref,
-                c.manifest.clone(),
-                c.rolling_memfile.clone(),
-            )
-        });
+        let chain_prev = self
+            .checkpoint_chains
+            .get(&id)
+            .map(|c| (c.manifest_ref, c.manifest.clone()));
 
         // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
         // was produced but never committed (caller's downstream
@@ -2231,38 +2166,23 @@ impl SandboxBackend for PooledBackend {
             let Some(chunk_store) = self.chunk_store.as_ref() else {
                 return Ok(metadata);
             };
-            let manifest_ref = if let Some((prev_ref, prev_manifest, rolling)) = chain_prev.as_ref()
-            {
+            let manifest_ref = if let Some((prev_ref, prev_manifest)) = chain_prev.as_ref() {
                 // ADR 0028 Fix A diff path: re-chunk ONLY the chunks the
                 // dirty extents touched — the previous manifest's hashes
                 // carry over for everything else, so CPU + upload stay
                 // O(dirty set). The manifest id is stable for the chain's
                 // lifetime; only `version` ticks.
+                //
+                // ADR 0039: sparse-only. Reconstruct each dirty chunk from
+                // its prev content (warm chunk cache) + the sparse diff —
+                // no full memfile to read, keep, or overlay.
                 let diff_path = dest.join("memory.diff");
                 let ranges = crate::checkpoint::dirty_ranges(&diff_path)
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
-                let next = match rolling {
-                    // File-mode VM with a local rolling full image:
-                    // overlay the sparse diff, then re-chunk from it.
-                    Some(rolling_path) => {
-                        crate::checkpoint::overlay_sparse(&diff_path, rolling_path)
-                            .await
-                            .map_err(|e| SandboxError::Snapshot(format!("overlay diff: {e}")))?;
-                        chunk_store
-                            .update_for_dirty_ranges(prev_manifest, rolling_path, &ranges)
-                            .await
-                            .map_err(|e| {
-                                SandboxError::Snapshot(format!("incremental re-chunk: {e}"))
-                            })?
-                    }
-                    // ADR 0038 sparse mode (UFFD-resumed chain, no local
-                    // image): reconstruct each dirty chunk from its prev
-                    // content + the sparse diff — no full memfile to read.
-                    None => chunk_store
-                        .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
-                        .await
-                        .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?,
-                };
+                let next = chunk_store
+                    .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
                 let next_ref = prev_ref.next_version();
                 chunk_store
                     .put_manifest(next_ref, &next)
@@ -2276,7 +2196,6 @@ impl SandboxBackend for PooledBackend {
                     session_sandbox = %id,
                     manifest = %next_ref,
                     dirty_ranges = ranges.len(),
-                    sparse = rolling.is_none(),
                     "diff checkpoint re-chunked",
                 );
                 next_ref
@@ -2286,10 +2205,17 @@ impl SandboxBackend for PooledBackend {
                     return Ok(metadata);
                 }
                 let mref = chunk_memory_to_store(chunk_store, &mem_path).await?;
+                // ADR 0039: the dump is now durable in the chunk store and
+                // the chain seeds from the manifest (not this file) — drop
+                // the GiB-scale memory.bin so committed snapshot dirs stay
+                // state.bin + sidecar sized. A cross-host restore
+                // re-materializes it from the chunks via the manifest
+                // (restore_materializes_missing_memory_bin_from_chunks).
+                let _ = fs::remove_file(&mem_path).await;
                 tracing::info!(
                     session_sandbox = %id,
                     manifest = %mref,
-                    "chunked FC memory.bin → chunk store",
+                    "chunked FC memory.bin → chunk store (local dump removed)",
                 );
                 mref
             };
@@ -2522,19 +2448,13 @@ impl SandboxBackend for PooledBackend {
         // snapshot timestamp) — same shape as a brand-new
         // sandbox.
         let _ = self.last_snapshot_unix_ms.remove(&id);
-        // ADR 0028 Fix A: tear down the checkpoint chain + its rolling
-        // memory image. Durable RECORDS deliberately survive destroy —
-        // an eviction's final checkpoint must stay re-advertisable
-        // until the coord acks it (that's the whole reconciliation
-        // point). GCS chunks are the durable truth; the rolling file
-        // is just the local diff-apply accelerator.
-        if let Some((_, chain)) = self.checkpoint_chains.remove(&id) {
-            // `None` for a sparse (UFFD-resumed) chain — nothing local
-            // to remove.
-            if let Some(rolling) = &chain.rolling_memfile {
-                let _ = tokio::fs::remove_file(rolling).await;
-            }
-        }
+        // ADR 0028 Fix A: tear down the checkpoint chain. Durable RECORDS
+        // deliberately survive destroy — an eviction's final checkpoint
+        // must stay re-advertisable until the coord acks it (that's the
+        // whole reconciliation point). GCS chunks are the durable truth;
+        // ADR 0039: the chain is manifest-only now (no local rolling
+        // image), so there's nothing on disk to remove here.
+        let _ = self.checkpoint_chains.remove(&id);
         let _ = self.capture_locks.remove(&id);
         result
     }
@@ -3591,15 +3511,18 @@ mod tests {
         let staging = inner.dir_for(metadata.id);
 
         // Simulate cross-host: delete the local staging files so
-        // restore has nothing to read from disk. Memory.bin is also
-        // deleted; it gets materialised from the chunked manifest.
+        // restore has nothing to read from disk. ADR 0039: the capture
+        // already removed memory.bin after chunking it — assert that
+        // (regression guard for the 61G leak fix), then restore
+        // re-materializes it from the chunked manifest.
+        assert!(
+            !staging.join("memory.bin").exists(),
+            "ADR 0039: Full capture must remove the local memory.bin after chunking",
+        );
         tokio::fs::remove_file(staging.join("state.bin"))
             .await
             .unwrap();
         tokio::fs::remove_file(staging.join("manifest.json"))
-            .await
-            .unwrap();
-        tokio::fs::remove_file(staging.join("memory.bin"))
             .await
             .unwrap();
 
