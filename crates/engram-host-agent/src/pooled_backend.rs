@@ -2099,22 +2099,25 @@ impl SandboxBackend for PooledBackend {
             Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
         }
 
-        // ADR 0018 commit 12m: snapshot ordering is now
-        //   pause → wait_idle → flush → inner.snapshot
-        // where inner.snapshot's internal pause/capture/resume is
-        // a no-op pause (FC's PATCH /vm is idempotent) followed by
-        // the memory dump and a resume that brings the VM back
-        // running. This guarantees memory + disk capture happen at
-        // the same point in time: the explicit pause stops vCPUs,
-        // wait_idle drains any in-flight virtio writes through the
-        // NBD daemon, flush publishes the just-quiesced disk
-        // manifest, and inner.snapshot then captures the page cache
-        // (which now agrees with the published disk lineage).
+        // ADR 0018 commit 12m + ADR 0038 B3: snapshot ordering is
+        //   pause → wait_idle → flush_local(drain) → inner.snapshot
+        //   → [resume] → flush_upload(GCS) (in the `post` block)
+        // where inner.snapshot's internal pause/capture/resume is a
+        // no-op pause (FC's PATCH /vm is idempotent) followed by the
+        // memory dump and a resume that brings the VM back running.
+        // This guarantees memory + disk are CAPTURED at the same point
+        // in time: the explicit pause stops vCPUs, wait_idle drains any
+        // in-flight virtio writes through the NBD daemon, flush_local
+        // drains the just-quiesced dirty set locally, and inner.snapshot
+        // then captures the page cache (which agrees with that disk
+        // state). The disk GCS upload is deferred to flush_upload AFTER
+        // resume — off the frozen-guest path — but the captured *content*
+        // is fixed at the drain, so coherence is unchanged.
         //
         // Pre-12m ordering was flush → inner.snapshot (FC's pause
         // happened inside the inner call AFTER our flush). Writes
         // queued between flush and pause landed in memory but not
-        // the published manifest — the cross-host evac canary md5
+        // the drained disk set — the cross-host evac canary md5
         // mismatch on dev-vm validation was exactly this race.
         //
         // ADR 0028 A.log: the pause instant is the coherence cut for
@@ -2127,32 +2130,26 @@ impl SandboxBackend for PooledBackend {
             .await
             .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
 
+        // ADR 0038 B3: under the pause, only DRAIN the dirty buffer
+        // (+ hash + stash in the backend's pending tier) — the
+        // multi-second GCS upload is deferred to `flush_upload` after
+        // the guest resumes (the `post` block below), so the
+        // guest-visible pause is O(local copy), not O(GCS). The drain
+        // still captures disk-at-the-pause-instant (ADR 0018 §12m); the
+        // memory capture below is paired with it.
         #[cfg(target_os = "linux")]
-        let nbd_disk_manifest = if let Some(entry) = self.nbd_sandboxes.get(&id) {
-            // Drain in-flight NBD requests so the upcoming flush
-            // sees a quiescent dirty buffer. With FC paused above,
-            // no new virtio writes are issued, and wait_idle returns
-            // once any already-in-flight requests have completed
-            // through backend.write().
+        let nbd_pending_flush = if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            // Drain in-flight NBD requests so the drain sees a quiescent
+            // dirty buffer. With FC paused above, no new virtio writes
+            // are issued, and wait_idle returns once already-in-flight
+            // requests have completed through backend.write().
             entry.backend.wait_idle().await;
-            // ADR 0019: scope the dirty-chunk flush — the idle-evict /
-            // evacuate critical-path cost — so each upload attaches a
-            // `chunk.flush` span to the snapshot op's trace. `kind="snapshot"`
-            // covers both flows; the coord parent trace distinguishes them.
-            // begin/end bracket only the flush so `end` runs on error too.
-            entry.backend.operation_scope().begin("snapshot");
-            let flush_result = entry.backend.flush().await;
-            entry.backend.operation_scope().end();
-            let outcome =
-                flush_result.map_err(|e| SandboxError::Snapshot(format!("nbd disk flush: {e}")))?;
-            tracing::info!(
-                sandbox_id = %id,
-                manifest = %outcome.manifest_ref,
-                chunks_flushed = outcome.chunks_flushed,
-                bytes_uploaded = outcome.bytes_uploaded,
-                "chunked NBD disk flushed (post-pause)",
-            );
-            Some(outcome.manifest_ref)
+            let pending = entry
+                .backend
+                .flush_local()
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
+            Some(pending)
         } else {
             None
         };
@@ -2196,12 +2193,32 @@ impl SandboxBackend for PooledBackend {
         // we leak 4 GiB per failure — idle-evict retries every ~30s
         // and fills the host disk inside an hour.
         let post = async {
-            // Plumb the new disk manifest onto SnapshotMetadata so
-            // the coord-side snapshot recorder persists it on the
-            // `snapshots` row's `disk_manifest_*` columns.
+            // ADR 0038 B3: the guest has resumed (inner.snapshot above
+            // brought it back). Upload the drained disk chunks to GCS +
+            // publish the manifest now — OFF the frozen-guest path. The
+            // operation scope makes the chunk uploads attach `chunk.flush`
+            // spans to the snapshot op's trace. Awaited here (before the
+            // snapshot is recorded) so the recorded `disk_manifest`
+            // references durable chunks; `base` is rebased only after the
+            // upload, so the background scheduler never sees a
+            // not-yet-uploaded chunk.
             #[cfg(target_os = "linux")]
-            if let Some(mref) = nbd_disk_manifest {
-                metadata.disk_manifest = Some(mref);
+            if let Some(pending) = nbd_pending_flush {
+                if let Some(entry) = self.nbd_sandboxes.get(&id) {
+                    entry.backend.operation_scope().begin("snapshot");
+                    let res = entry.backend.flush_upload(pending).await;
+                    entry.backend.operation_scope().end();
+                    let outcome =
+                        res.map_err(|e| SandboxError::Snapshot(format!("nbd disk upload: {e}")))?;
+                    tracing::info!(
+                        sandbox_id = %id,
+                        manifest = %outcome.manifest_ref,
+                        chunks_flushed = outcome.chunks_flushed,
+                        bytes_uploaded = outcome.bytes_uploaded,
+                        "chunked NBD disk uploaded (post-resume)",
+                    );
+                    metadata.disk_manifest = Some(outcome.manifest_ref);
+                }
             }
             // ADR 0007 / Phase 5: when a chunk store is wired AND the
             // underlying backend left a memory.bin in `dest` (FC does;
