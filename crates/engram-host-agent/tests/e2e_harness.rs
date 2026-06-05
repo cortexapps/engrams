@@ -799,14 +799,12 @@ async fn e2e_warm_capture_via_pooled_backend() {
         host_ca_pem: None,
     };
 
-    // Opt into warm capture (host-side kill-switch). --test-threads=1 for
-    // the FC suite keeps this process-global var from racing other tests.
-    std::env::set_var("ENGRAM_WARM_HARNESS_CAPTURE", "1");
+    // ADR 0037: warm capture is on by default (no env to set); this guards
+    // that default — a regression to off would capture cold and fail below.
     let metadata = pooled
         .build_base_snapshot(spec, Some(warm_agent))
         .await
         .expect("build_base_snapshot");
-    std::env::remove_var("ENGRAM_WARM_HARNESS_CAPTURE");
 
     assert!(
         metadata.warm_harness,
@@ -941,12 +939,13 @@ async fn e2e_warm_restore_bind_via_pooled_backend() {
         host_ca_pem: None,
     };
 
-    std::env::set_var("ENGRAM_WARM_HARNESS_CAPTURE", "1");
+    // ADR 0037: warm-capture is on by default now — no env to set. This
+    // also guards the default: a regression to default-off would capture
+    // cold and trip the `warm_harness` assertion below.
     let metadata = pooled
         .build_base_snapshot(spec, Some(warm_agent))
         .await
         .expect("build_base_snapshot");
-    std::env::remove_var("ENGRAM_WARM_HARNESS_CAPTURE");
     assert!(metadata.warm_harness, "capture should be warm");
 
     // Restore the warm base for a real session. The warm harness re-dials
@@ -1215,12 +1214,11 @@ async fn e2e_warm_latency_and_density_via_pooled_backend() {
         session_env: warm_session_env,
         host_ca_pem: None,
     };
-    std::env::set_var("ENGRAM_WARM_HARNESS_CAPTURE", "1");
+    // ADR 0037: warm capture on by default (no env); guards the default.
     let metadata = pooled
         .build_base_snapshot(mk_spec(), Some(warm_agent))
         .await
         .expect("build_base_snapshot");
-    std::env::remove_var("ENGRAM_WARM_HARNESS_CAPTURE");
     assert!(metadata.warm_harness, "capture should be warm");
 
     // ---- (a1) WARM first-prompt (single sibling, clean — the known-good

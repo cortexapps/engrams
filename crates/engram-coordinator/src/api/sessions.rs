@@ -1732,15 +1732,19 @@ pub(crate) fn resolve_harness(
 /// Currently only the Claude OAuth token.
 pub(crate) const WARM_CLAUDE_OAUTH_PLACEHOLDER: &str = "engram_warm_ph_claude_oauth";
 
-/// ADR 0037: coord-side kill-switch for warm-bind on restore. Default off ⇒
-/// every restore takes the cold `start_agent` path (today's behavior), even
-/// for a snapshot captured warm (its harness is cleanly replaced by
-/// SpawnHarness). Operators flip this — alongside the host's
-/// `ENGRAM_WARM_HARNESS_CAPTURE` — to reap warm restores.
+/// ADR 0037: coord-side kill-switch for warm-bind on restore. **ON by
+/// default** — a warm-captured snapshot is reaped via late-bind (no
+/// respawn). Set `ENGRAM_WARM_HARNESS_BIND=0/false/no/off` to force the
+/// cold `start_agent` path (its SpawnHarness cleanly replaces the warm
+/// child). A cold (non-warm) snapshot always takes the cold path
+/// regardless, since the create-flow also gates on `snapshot.warm_harness`.
 pub(crate) fn warm_bind_enabled() -> bool {
-    matches!(
-        std::env::var("ENGRAM_WARM_HARNESS_BIND").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
+    !matches!(
+        std::env::var("ENGRAM_WARM_HARNESS_BIND")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
     )
 }
 

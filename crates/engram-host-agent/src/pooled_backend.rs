@@ -502,10 +502,15 @@ impl PooledBackend {
         id: SandboxId,
         warm_harness_spec: Option<AgentSpec>,
     ) -> bool {
-        // Kill-switch: opt-in only (default off ⇒ today's cold capture).
-        if !matches!(
-            std::env::var("ENGRAM_WARM_HARNESS_CAPTURE").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes")
+        // ADR 0037: warm-capture is ON by default. Kill-switch: set
+        // ENGRAM_WARM_HARNESS_CAPTURE=0/false/no/off to fall back to a cold
+        // capture (any other value, or unset, captures warm).
+        if matches!(
+            std::env::var("ENGRAM_WARM_HARNESS_CAPTURE")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
         ) {
             return false;
         }
