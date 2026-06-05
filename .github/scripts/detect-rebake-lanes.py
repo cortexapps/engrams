@@ -24,6 +24,10 @@ Lanes:
                 publish-host-binaries job — the GHCR artifact must exist at
                 this SHA for either downstream bake to consume.
   tf_or_helm    deploy/terraform/ + deploy/helm/
+  dev_image     dev-engrams dogfood rebake — images OR host_binaries OR
+                host_base OR the release closure of {engram-harness-claude}
+                (baked into the image, not pulled at runtime) OR the
+                dev-orchestration inputs. Fires `engrams-dev-image-changed`.
 
 `Cargo.lock` / root `Cargo.toml` / this script / the bake workflow are
 conservative triggers for the host_binaries lane.
@@ -43,6 +47,16 @@ from pathlib import Path
 # host lanes but not images.
 FC_BINS = {"engram-host-agent", "engram-uffd-handler"}
 CONTAINER_BINS = {"engram-coordinator", "engram-host-agent"}
+# Binaries baked INTO session images at image-build time by
+# engram-image-builder::inject_builtin_harness (pulled from the
+# harness-claude GHCR pack, written to /sbin/engram-harness-claude). The
+# dev-engrams + demo-claude images bake this in — they do NOT pull it at
+# runtime — so a change to the harness binary (or anything in its release
+# closure) must re-bake those images. It is in NEITHER container nor host
+# closure, so without this lane a harness-only change shipped nothing: the
+# dev-engrams rebake never fired (the bug this fixes). It gates only the
+# dev_image lane below — the demo image bakes every push regardless.
+SESSION_HARNESS_BINS = {"engram-harness-claude"}
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
 # script/the bake workflow conservatively trip the binary lanes.
@@ -155,6 +169,7 @@ def main():
     cc = changed_crates(changed, crate_dirs(meta, repo_root))
     fc = release_closure(meta, FC_BINS)
     cont = release_closure(meta, CONTAINER_BINS)
+    harness = release_closure(meta, SESSION_HARNESS_BINS)
 
     images = bool(cc & cont) or any_path(changed, IMAGES_PATHS)
     host_binaries = bool(cc & fc) or any_path(changed, HOST_BINARIES_PATHS)
@@ -166,8 +181,18 @@ def main():
     bundles = any_path(changed, BUNDLES_PATHS)
     # The dogfood image builds the whole repo via `just dev`, so it's stale on
     # any source the container/host bakes consume, plus the dev-orchestration
-    # inputs. Union of those — NOT tripped by doc/TF/helm-only pushes.
-    dev_image = images or host_binaries or host_base or any_path(changed, DEV_IMAGE_PATHS)
+    # inputs. It ALSO bakes in the builtin claude harness, so a harness-only
+    # change (in neither container nor host closure) must rebake it too —
+    # without this term, a harness change shipped nothing. NOT tripped by
+    # doc/TF/helm-only pushes.
+    harness_changed = bool(cc & harness)
+    dev_image = (
+        images
+        or host_binaries
+        or host_base
+        or harness_changed
+        or any_path(changed, DEV_IMAGE_PATHS)
+    )
 
     print(f"changed files: {len(changed)}", file=sys.stderr)
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
