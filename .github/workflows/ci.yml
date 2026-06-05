@@ -912,6 +912,15 @@ jobs:
   bake-demo-image:
     name: bake ${{ matrix.variant }} image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    # Order AFTER the harness artifact is republished. `demo-claude`
+    # pulls `harness-claude:<version>-linux-x86_64` from GHCR at bake
+    # time, and that tag is version-pinned + overwritten in place — so
+    # without this dependency the two jobs race and demo-claude can bake
+    # the PREVIOUS harness binary. `bake-harness-claude-artifact` has no
+    # job-level `if`, so it runs (and this `needs:` resolves) on every
+    # event this job fires for (push-to-main / workflow_dispatch); on PRs
+    # this job is skipped by the `if:` above regardless.
+    needs: bake-harness-claude-artifact
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
