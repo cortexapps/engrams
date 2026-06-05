@@ -178,6 +178,25 @@ impl HostClient for LocalHostClient {
         session_env: std::collections::HashMap<String, String>,
         first_prompt: Option<String>,
     ) -> Result<(), SandboxError> {
+        // ADR 0037 P5b: the restore black-holed the vsock the resident
+        // warm harness was attached to at capture (no RST/EOF), so it's
+        // stuck on a hung idle read and won't re-dial on its own. Nudge
+        // agentd to SIGUSR1 it first — it drops the dead connection and
+        // re-attaches — so the `bind` attach-wait below can resolve.
+        // Best-effort: a `false`/error here just falls through to the
+        // bind's own deadline (which then surfaces a clean NotAttached).
+        match self.sandbox.reconnect_harness(sandbox_id).await {
+            Ok(delivered) => tracing::info!(
+                %sandbox_id,
+                delivered,
+                "warm-bind: nudged resident harness to reconnect"
+            ),
+            Err(e) => tracing::warn!(
+                %sandbox_id,
+                error = %e,
+                "warm-bind: reconnect nudge failed; relying on bind attach-wait"
+            ),
+        }
         self.harness_hub
             .bind(sandbox_id, session_id, session_env, first_prompt)
             .await

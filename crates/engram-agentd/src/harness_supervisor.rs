@@ -105,6 +105,44 @@ impl HarnessSupervisor {
             .clone()
     }
 
+    /// ADR 0037 P5b: `SIGUSR1` the resident harness child so it drops its
+    /// host connection and re-dials at once. After a warm-base restore the
+    /// harness process resumes alive, but its vsock to the host died with
+    /// the capture VM and the read silently hangs (no RST/EOF), so its
+    /// read-error-driven reconnect never fires. The host sends
+    /// [`crate::proto::WireRequest::ReconnectHarness`] on warm restore;
+    /// this signals the child the supervisor still references (the `Child`
+    /// handle is restored from the snapshot, so `.id()` is the resumed
+    /// PID). Returns whether a child was present to signal.
+    pub async fn signal_reconnect(&self) -> bool {
+        let guard = self.inner.lock().await;
+        let Some(pid) = guard.current_child.as_ref().and_then(|c| c.id()) else {
+            tracing::debug!("reconnect nudge: no resident harness child");
+            return false;
+        };
+        #[cfg(target_os = "linux")]
+        {
+            match nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGUSR1,
+            ) {
+                Ok(()) => {
+                    tracing::info!(pid, "SIGUSR1 → harness reconnect nudge");
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(pid, error = %e, "SIGUSR1 to harness child failed");
+                    false
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            false
+        }
+    }
+
     /// Spawn (or respawn) the harness child described by `req`.
     /// Returns the new child's PID on success, or `None` when the
     /// call was a readiness probe (empty argv) — in which case we

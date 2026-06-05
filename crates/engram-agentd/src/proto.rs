@@ -263,6 +263,16 @@ pub enum WireRequest {
     /// baked agentd that predates the variant, the decode fails and the
     /// host's flush degrades to best-effort/logged — by design.)
     Sync,
+    /// ADR 0037 P5b: nudge the resident harness child to immediately
+    /// re-dial its host connection (send it `SIGUSR1`). After a warm-base
+    /// restore, the harness process resumes alive but its vsock to the host
+    /// died with the capture VM and its read silently hangs (no RST/EOF), so
+    /// its read-error-driven reconnect never fires. The host sends this on
+    /// warm restore; agentd signals the supervised child. Replies
+    /// [`WireResponse::HarnessReconnectNudged`] (`delivered = false` if no
+    /// harness child is resident — e.g. a cold base, where it's a no-op).
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    ReconnectHarness,
 }
 
 /// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
@@ -354,6 +364,13 @@ pub enum WireResponse {
     /// guest's dirty page cache is now on the virtio-blk disk.
     /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
     Synced,
+    /// Reply to [`WireRequest::ReconnectHarness`]. `delivered = true` when a
+    /// resident harness child was signalled; `false` when none exists (the
+    /// nudge was a no-op — e.g. a cold base with no warm harness).
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    HarnessReconnectNudged {
+        delivered: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

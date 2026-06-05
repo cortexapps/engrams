@@ -841,18 +841,18 @@ async fn e2e_warm_capture_via_pooled_backend() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Linux + KVM + FC + Docker + sudo + internet egress to api.anthropic.com"]
 async fn e2e_warm_restore_bind_via_pooled_backend() {
-    // OPEN ISSUE (ADR 0037 P5): after a full snapshot→destroy→restore (a new
-    // VM / vsock backend, unlike the pause/resume the Phase A/B spikes
-    // covered), the restored warm harness's idle vsock connection does NOT
-    // cleanly error — so its reconnect loop never fires and it doesn't
-    // re-attach, so the late-bind finds no harness. The fix (a harness-side
-    // liveness probe, or an agentd nudge on restore) is a focused follow-up.
-    // Gated off CI's `--run-ignored` lane until then; run manually with
-    // ENGRAM_WARM_RESTORE_E2E=1 to drive the fix.
+    // ADR 0037 P5b end-to-end: build a warm base snapshot, restore it as a
+    // fresh session, nudge the resident warm harness to reconnect (the
+    // restore silently black-holes its capture-time vsock), late-bind the
+    // real session identity + first prompt onto the still-running warm
+    // child (no respawn), and assert the first prompt round-trips. Needs a
+    // real `claude` binary + the egress proxy + root + FC, so it's gated
+    // off CI's lanes (no Anthropic reachability there); run on the dev-vm
+    // with ENGRAM_WARM_RESTORE_E2E=1.
     if std::env::var("ENGRAM_WARM_RESTORE_E2E").is_err() {
         eprintln!(
-            "SKIP: warm-restore reconnect is a known-open issue (ADR 0037 P5); \
-             set ENGRAM_WARM_RESTORE_E2E=1 to run"
+            "SKIP: warm-restore bind e2e needs a real claude + proxy + root; \
+             set ENGRAM_WARM_RESTORE_E2E=1 to run (dev-vm)"
         );
         return;
     }
@@ -975,17 +975,32 @@ async fn e2e_warm_restore_bind_via_pooled_backend() {
         secrets: Vec::new(),
     });
 
-    // The warm harness's vsock died with the capture VM; after restore it
-    // re-dials (a few backoff retries while the restored VM's vsock comes
-    // up), re-attaches by the restored sandbox id, and emits Idle. Wait for
-    // that warm+idle re-attach before binding (longer than bind's own 10s
-    // attach-wait, since FC restore + reconnect-backoff can run past it).
+    // ADR 0037 P5b: the restore black-holed the warm harness's vsock (no
+    // RST/EOF — unlike the pause/resume the Phase A/B spikes covered), so
+    // it sits on a hung idle read and its read-error reconnect loop never
+    // fires. Nudge agentd to SIGUSR1 the resident harness child — it drops
+    // the dead connection and re-dials at once. In prod this nudge is
+    // folded into `late_bind_harness`; the test drives PooledBackend +
+    // HarnessHub directly (no host_client layer), so it calls the backend
+    // method explicitly, exactly as `late_bind_harness` does.
+    let delivered = pooled
+        .reconnect_harness(restored_id)
+        .await
+        .expect("reconnect_harness");
+    assert!(
+        delivered,
+        "agentd should still reference the resident warm harness child to SIGUSR1",
+    );
+
+    // After the nudge the warm harness re-dials, re-attaches by the
+    // restored sandbox id, and emits Idle. Wait for that warm+idle
+    // re-attach before binding (a margin over bind's own 10s attach-wait).
     let reattached = hub
-        .wait_harness_warm(restored_id, Duration::from_secs(60))
+        .wait_harness_warm(restored_id, Duration::from_secs(20))
         .await;
     assert!(
         reattached,
-        "warm harness should re-attach (routed by restored sandbox id) + emit Idle after restore",
+        "warm harness should re-attach (routed by restored sandbox id) + emit Idle after the reconnect nudge",
     );
 
     // Late-bind the real session identity + first prompt onto the running
@@ -1453,6 +1468,179 @@ async fn e2e_persistent_claude_socket_across_resume() {
         alive_final, "ALIVE",
         "persistent claude did not survive the freeze",
     );
+}
+
+/// DIAGNOSTIC (ADR 0037 / prod silent-crash 301de75b): does an FC
+/// pause/resume *while a turn is in flight* kill claude? Every other
+/// pause/resume test freezes the VM BETWEEN turns (claude idle); ADR 0028's
+/// periodic checkpoints are the first thing that pauses MID-turn (on a
+/// timer), and prod crashes started after 0028. This drives a REAL claude
+/// API call (real token from `/tmp/engram-e2e-claude-token`, a long
+/// streaming prompt) and pauses/resumes ~2s in, while the response is
+/// streaming, then reports: did the turn complete? is claude alive? + the
+/// guest's own evidence (claude's stdout/stderr tail + `dmesg` for the
+/// OOM-killer). Not an assertion — a verdict-printer. Run manually with
+/// the token file present; skips otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual diagnostic: requires Linux + KVM + FC + Docker + sudo + a real Claude token"]
+async fn e2e_claude_pause_mid_turn_diagnostic() {
+    let token = std::fs::read_to_string("/tmp/engram-e2e-claude-token")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        eprintln!("SKIP: /tmp/engram-e2e-claude-token absent/empty (need a real Claude token)");
+        return;
+    }
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !require_root() {
+        return;
+    }
+    cleanup_host_state();
+
+    let (harness_bin, claude_bin) = ensure_harness_artifacts().await;
+    let (proxy_port, ca_pem, registry) = spawn_real_proxy().await;
+    let rootfs_path = bake_harness_rootfs("engram-claude-midturn", &harness_bin, &claude_bin).await;
+
+    let work = tempfile::tempdir().expect("work");
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg.net_pool = Some("10.203.0.0".parse().unwrap());
+    cfg.egress_proxy_port = Some(proxy_port);
+    let fc = Arc::new(FirecrackerBackend::new(work.path(), cfg));
+    fc.host_startup().await.expect("host_startup");
+    let pooled = PooledBackend::new(fc.clone() as Arc<dyn SandboxBackend>);
+
+    let spec = SandboxSpec {
+        image: "engram-claude-midturn".into(),
+        rootfs_source: Some(rootfs_path),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 2 },
+        memory: MemoryLimit { max_mib: 512 },
+        disk: DiskLimit { max_gib: 2 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let sandbox_id = pooled.create(spec).await.expect("create");
+    let guest_ip_str = wait_for_guest_ip(&pooled, sandbox_id, Duration::from_secs(30)).await;
+    pooled
+        .start_agent(
+            sandbox_id,
+            AgentSpec {
+                argv: Vec::new(),
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: Some(ca_pem.clone()),
+            },
+        )
+        .await
+        .expect("start_agent readiness + CA");
+
+    let session_id = engram_core::SessionId::new();
+    let guest_ip: std::net::Ipv4Addr = guest_ip_str.parse().unwrap();
+    let allow_list: Vec<String> = ALLOW_HOSTS.iter().map(|s| s.to_string()).collect();
+    let network_allow = engram_egress_proxy::HostList::from_manifest(&allow_list, &[]).unwrap();
+    registry.register(engram_egress_proxy::SessionState {
+        session_id,
+        guest_ip,
+        network_allow,
+        secrets: Vec::new(),
+    });
+
+    // Launcher: REAL token (read from the guest file we staged) so claude
+    // makes a genuine, multi-second streaming API call — a window we can
+    // pause inside. The token is written into the in-guest script only; it
+    // is never logged here.
+    let run_claude = format!(
+        "#!/bin/sh\n\
+        sleep 3600 > /tmp/cin &\n\
+        env NODE_EXTRA_CA_CERTS=/tmp/ca.pem CLAUDE_CODE_OAUTH_TOKEN='{token}' \
+            CLAUDE_CODE_MAX_RETRIES=0 IS_SANDBOX=1 PATH=/opt/engram/harness:/usr/bin:/bin \
+            /opt/engram/harness/claude --input-format stream-json --output-format stream-json \
+            --verbose --dangerously-skip-permissions < /tmp/cin > /tmp/cout 2>&1 &\n\
+        echo $! > /tmp/claude.pid\n\
+        wait\n"
+    );
+    let setup = format!(
+        "cat > /tmp/ca.pem <<'CAEOF'\n{ca_pem}\nCAEOF\n\
+         cat > /tmp/run-claude.sh <<'RCEOF'\n{run_claude}RCEOF\n\
+         mkfifo /tmp/cin 2>/dev/null; rm -f /tmp/cout /tmp/claude.pid; \
+         setsid sh /tmp/run-claude.sh </dev/null >/tmp/launch.out 2>&1 & echo LAUNCHED"
+    );
+    let (_lo, _le, lx) = exec_sh(&pooled, sandbox_id, &setup).await;
+    eprintln!("MIDTURN: launch exit={lx:?}");
+    sleep(Duration::from_secs(2)).await;
+
+    async fn alive(pooled: &PooledBackend, id: engram_core::SandboxId) -> String {
+        let (o, _, _) = exec_sh(
+            pooled,
+            id,
+            "kill -0 $(cat /tmp/claude.pid 2>/dev/null) 2>/dev/null && echo ALIVE || echo DEAD",
+        )
+        .await;
+        o.trim().to_string()
+    }
+
+    // A prompt that elicits a long, multi-second streaming response — so
+    // there's a real in-flight API window to pause inside.
+    let prompt = "Write a thorough ~400 word explanation of how TCP congestion control \
+                  works (slow start, congestion avoidance, fast retransmit, CUBIC), then \
+                  count slowly from 1 to 30 with a short note on each number.";
+    send_turn(&pooled, sandbox_id, prompt).await;
+    eprintln!("MIDTURN: prompt sent; letting the request go out + start streaming (2s)…");
+    sleep(Duration::from_secs(2)).await;
+    eprintln!(
+        "MIDTURN: alive just-before-pause = {}",
+        alive(&pooled, sandbox_id).await
+    );
+
+    // Pause/resume WHILE the turn is in flight — the ADR 0028
+    // periodic-checkpoint scenario nothing else exercises.
+    let st = fc.snapshot_state(sandbox_id).expect("snapshot_state");
+    let api = FirecrackerClient::new(&st.firecracker_socket);
+    api.pause().await.expect("pause");
+    eprintln!("MIDTURN: PAUSED mid-turn; holding 4s (checkpoint-pause analogue)…");
+    sleep(Duration::from_secs(4)).await;
+    api.resume().await.expect("resume");
+    eprintln!("MIDTURN: RESUMED");
+
+    // Give the turn a chance to finish (or for the crash to surface).
+    let cout = wait_for_results(&pooled, sandbox_id, 1, Duration::from_secs(60)).await;
+    let results = cout.matches(r#""type":"result""#).count();
+    let alive_final = alive(&pooled, sandbox_id).await;
+
+    // The guest's own evidence: claude's tail (error/panic if it died) +
+    // the kernel OOM-killer log.
+    let (cout_tail, _, _) = exec_sh(
+        &pooled,
+        sandbox_id,
+        "echo '--- /tmp/cout tail ---'; tail -c 1200 /tmp/cout 2>/dev/null",
+    )
+    .await;
+    let (dmesg, _, _) = exec_sh(
+        &pooled,
+        sandbox_id,
+        "echo '--- dmesg oom/kill ---'; dmesg 2>/dev/null | grep -iE 'out of memory|oom|kill|claude|segfault' | tail -20",
+    )
+    .await;
+
+    eprintln!("MIDTURN VERDICT: results={results} claude={alive_final}");
+    eprintln!("{cout_tail}");
+    eprintln!("{dmesg}");
+    eprintln!(
+        "MIDTURN: interpretation — results>=1 + ALIVE = the turn survived a mid-turn pause/resume \
+         (hypothesis NOT reproduced by a bare pause). results=0 or DEAD = reproduced; the cout tail / \
+         dmesg above say whether it was OOM, a signal, or a connection/API error on resume."
+    );
+
+    pooled.destroy(sandbox_id).await.expect("destroy");
+    cleanup_host_state();
 }
 
 // ====================================================================

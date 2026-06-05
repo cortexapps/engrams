@@ -36,13 +36,14 @@ engram-telemetry.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 # Linux-only: harness_supervisor calls mount(2) via the safe `nix`
-# wrapper for the per-session harness drive (ADR 0014 M1.12), and
-# main.rs flips the console stdout to O_NONBLOCK via fcntl(2) ("fs",
-# ADR 0033). The workspace forbids unsafe_code, so libc directly
-# isn't available. On non-Linux (the supervisor's mount_harness is a
-# stub) nix is harmless.
+# wrapper for the per-session harness drive (ADR 0014 M1.12), main.rs
+# flips the console stdout to O_NONBLOCK via fcntl(2) ("fs", ADR 0033),
+# and the supervisor SIGUSR1s the harness child to nudge a reconnect
+# ("signal", ADR 0037 P5b). The workspace forbids unsafe_code, so libc
+# directly isn't available. On non-Linux (the supervisor's mount_harness
+# is a stub) nix is harmless.
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", features = ["mount", "fs"] }
+nix = { version = "0.29", features = ["mount", "fs", "signal"] }
 
 [dev-dependencies]
 tempfile = "3"

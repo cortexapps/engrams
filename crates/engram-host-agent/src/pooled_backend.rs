@@ -2672,6 +2672,14 @@ impl SandboxBackend for PooledBackend {
         self.inner.vm_internal_ip(id).await
     }
 
+    /// ADR 0037 P5b: forward the reconnect nudge to the inner FC
+    /// backend (which dials agentd). Without this the trait's default
+    /// (`Ok(false)`) runs and the warm-restore harness never gets
+    /// SIGUSR1'd — exactly the `start_shell` missing-forward class above.
+    async fn reconnect_harness(&self, id: SandboxId) -> Result<bool, SandboxError> {
+        self.inner.reconnect_harness(id).await
+    }
+
     /// ADR 0016 Phase A: COW diagnostic. Reads from the NBD-backed
     /// disk state (`nbd_sandboxes`) + the per-host `chunk_cache`
     /// for base-chunk locality + the in-memory `last_snapshot_unix_ms`

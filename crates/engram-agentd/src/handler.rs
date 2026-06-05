@@ -182,6 +182,15 @@ where
             write_msg(&mut writer, &resp).await?;
             return Ok(());
         }
+        WireRequest::ReconnectHarness => {
+            let delivered = supervisor.signal_reconnect().await;
+            write_msg(
+                &mut writer,
+                &WireResponse::HarnessReconnectNudged { delivered },
+            )
+            .await?;
+            return Ok(());
+        }
     };
 
     let req = exec_req;

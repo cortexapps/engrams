@@ -427,6 +427,27 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
+    /// ADR 0037 P5b: nudge a warm-restored harness to drop its dead
+    /// host connection and immediately re-dial. A full
+    /// snapshot→destroy→restore cycle silently black-holes the vsock the
+    /// resident `claude` harness was attached to at capture — no RST/EOF
+    /// ever reaches the guest, so the harness's read-error reconnect loop
+    /// never fires and it sits forever on a hung idle read (pause/resume
+    /// connections, by contrast, get an RST and recover on their own).
+    ///
+    /// The harness's `tokio::process::Child` handle survives restore
+    /// (its `.id()` is the resumed PID), so agentd can `SIGUSR1` it; the
+    /// signal handler aborts the dead reader and re-dials at once. This
+    /// sends agentd a `ReconnectHarness` RPC over the per-sandbox vsock
+    /// and returns whether the signal was delivered. Called by
+    /// [`Self::restore_base_for_session`] on the warm-bind path only.
+    ///
+    /// Default `Ok(false)` — backends with no resident harness to nudge
+    /// (Process, VZ, mocks) inherit it; only the FC backend overrides.
+    async fn reconnect_harness(&self, _id: SandboxId) -> Result<bool, SandboxError> {
+        Ok(false)
+    }
+
     /// Local-host path where the backend writes/reads snapshot
     /// artifacts for `snapshot_id`. Used by `PooledBackend` to
     /// chunk `memory.bin` after `snapshot()` returns and to

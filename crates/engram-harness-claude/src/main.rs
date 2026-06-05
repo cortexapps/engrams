@@ -228,6 +228,39 @@ mod adapter {
         //   - `/workspace/.engram/claude-session-id`: persisted on disk;
         //     used to `--resume` on a crash respawn.
         let mut next_prompt: Option<String> = std::env::var("ENGRAM_INITIAL_PROMPT").ok();
+
+        // ADR 0037 P5b: a SIGUSR1 nudge forces an immediate host-connection
+        // reconnect. After a warm-restore, the harness's vsock to the host
+        // died with the capture VM but its read SILENTLY HANGS (no RST/EOF —
+        // unlike a pause/resume), so the read-error-driven reconnect never
+        // fires and the harness sits idle forever. agentd (which supervises
+        // this process) sends SIGUSR1 on restore; the idle connection loop
+        // `select!`s on this `Notify` and re-dials at once.
+        let reconnect_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        {
+            let sig = reconnect_signal.clone();
+            tokio::spawn(async move {
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                {
+                    Ok(mut s) => {
+                        while s.recv().await.is_some() {
+                            tracing::info!("SIGUSR1: forcing host-connection reconnect");
+                            // notify_one (not notify_waiters): stores a permit
+                            // if the idle loop isn't parked on `.notified()`
+                            // yet, so a nudge that races our re-entry into the
+                            // select! still fires on the next poll instead of
+                            // being silently dropped.
+                            sig.notify_one();
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "couldn't install SIGUSR1 handler; warm-restore reconnect nudge disabled",
+                    ),
+                }
+            });
+        }
+
         let mut consecutive_failures: u32 = 0;
         const MAX_BACKOFF_SECS: u64 = 30;
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
@@ -259,11 +292,21 @@ mod adapter {
                 &mut claude,
                 &mut bound_env,
                 &mut bound_session_id,
+                &reconnect_signal,
             )
             .await
             {
                 Outcome::Exit(code) => return code,
                 Outcome::Reconnect { reason } => {
+                    // ADR 0037 P5b: a SIGUSR1 nudge is a *deliberate*
+                    // reconnect (the host knows the connection is dead and
+                    // wants a fresh one NOW), not a failure. Re-dial
+                    // immediately — no backoff, no failure count — so the
+                    // warm-restore latency win isn't eaten by a 2s+ sleep.
+                    if reason == "reconnect_nudge" {
+                        tracing::info!(reason, "harness reconnect nudge; re-dialing immediately");
+                        continue;
+                    }
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     let backoff =
                         std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(5));
@@ -459,6 +502,7 @@ mod adapter {
         claude: &mut Option<ClaudeChild>,
         bound_env: &mut HashMap<String, String>,
         bound_session_id: &mut Option<SessionId>,
+        reconnect_signal: &std::sync::Arc<tokio::sync::Notify>,
     ) -> Outcome {
         let (mut reader, writer) = stream;
 
@@ -530,7 +574,20 @@ mod adapter {
             let text = match next_prompt.take() {
                 Some(t) => t,
                 None => loop {
-                    match cmd_rx.recv().await {
+                    // ADR 0037 P5b: while idle, a SIGUSR1 reconnect nudge
+                    // (warm-restore) must wake us even though the dead vsock
+                    // read is hung — so `select!` the command channel against
+                    // the reconnect signal. On nudge: drop this (dead)
+                    // connection + re-dial.
+                    let cmd = tokio::select! {
+                        c = cmd_rx.recv() => c,
+                        _ = reconnect_signal.notified() => {
+                            tracing::info!("reconnect nudge while idle; re-dialing host channel");
+                            reader_task.abort();
+                            return Outcome::Reconnect { reason: "reconnect_nudge" };
+                        }
+                    };
+                    match cmd {
                         Some(HarnessCommand::Prompt { text }) => break text,
                         Some(HarnessCommand::Shutdown { .. }) => {
                             tracing::info!("shutdown received; killing claude + exiting");

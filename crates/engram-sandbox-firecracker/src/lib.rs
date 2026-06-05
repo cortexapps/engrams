@@ -3404,6 +3404,46 @@ impl SandboxBackend for FirecrackerBackend {
         ip
     }
 
+    /// ADR 0037 P5b: nudge the warm-restored harness to re-dial its
+    /// host connection. The restore black-holed the vsock the resident
+    /// `claude` harness was attached to at capture, with no RST/EOF — so
+    /// the harness sits on a hung idle read and its reconnect loop never
+    /// fires. agentd holds the harness child's `tokio::process::Child`
+    /// (its `.id()` is the resumed PID), so we ask agentd to `SIGUSR1` it;
+    /// the handler aborts the dead reader and re-dials at once.
+    ///
+    /// Mirrors `guest_ip`'s agentd-RPC shape: dial the per-sandbox vsock,
+    /// send `ReconnectHarness`, read back `HarnessReconnectNudged`. Best
+    /// effort + deadline-bounded — the warm restore must not hang on it.
+    async fn reconnect_harness(&self, id: SandboxId) -> Result<bool, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        let fut = async {
+            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await
+                .ok()?;
+            engram_agentd::write_msg(&mut conn, &WireRequest::ReconnectHarness)
+                .await
+                .ok()?;
+            let resp: engram_agentd::WireResponse =
+                engram_agentd::read_msg(&mut conn).await.ok()?;
+            match resp {
+                engram_agentd::WireResponse::HarnessReconnectNudged { delivered } => {
+                    Some(delivered)
+                }
+                _ => None,
+            }
+        };
+        let delivered = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        Ok(delivered)
+    }
+
     /// ADR 0014 issue #6: the per-VM netns this sandbox runs inside,
     /// when warm-restored under the M1.16 netns model. Cold sandboxes
     /// run with TAPs on host root (`Some(net)`, `None`-netns); warm
