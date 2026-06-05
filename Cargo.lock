@@ -843,6 +843,7 @@ dependencies = [
  "engram-storage-local",
  "futures",
  "metrics",
+ "nix 0.31.2",
  "parking_lot",
  "serde",
  "serde_json",

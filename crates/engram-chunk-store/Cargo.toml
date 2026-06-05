@@ -20,6 +20,11 @@ futures.workspace = true
 # exporter binds at boot. When no recorder is installed (unit tests
 # without the exporter) the macros are cheap no-ops.
 metrics.workspace = true
+# ADR 0039 #16: disk-aware cache floor. `statvfs(2)` (Linux + macOS) lets
+# the evictor yield to snapshots/checkpoints sharing the work_dir mount.
+# default-features=false keeps it to the `fs` wrapper — same pin the
+# host-agent / workspace-hack already lock to (nix 0.31).
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
