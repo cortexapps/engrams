@@ -20,22 +20,50 @@ function hostTone(status: HostStatus) {
       : 'var(--color-ink-quiet)';
 }
 
-function CapacityBar({ used, total }: { used: number; total: number }) {
-  const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
-  const hot = pct >= 80;
+// One labelled utilization meter (disk / mem / cpu). For disk + mem
+// pass `usedMib`/`totalMib` and the readout shows GiB; for cpu pass
+// `pct` directly. The fill turns amber past 80% — the "this host is
+// about to fall over" threshold an operator scans for.
+function Meter({
+  label,
+  usedMib,
+  totalMib,
+  pct,
+}: {
+  label: string;
+  usedMib?: number;
+  totalMib?: number;
+  pct?: number;
+}) {
+  const ratio =
+    pct !== undefined
+      ? pct
+      : totalMib && totalMib > 0
+        ? ((usedMib ?? 0) / totalMib) * 100
+        : 0;
+  const shown = Math.min(100, Math.max(0, Math.round(ratio)));
+  const hot = shown >= 80;
+  const known = pct !== undefined || (totalMib ?? 0) > 0;
+  const readout =
+    pct !== undefined
+      ? `${shown}%`
+      : known
+        ? `${((usedMib ?? 0) / 1024).toFixed(1)}/${((totalMib ?? 0) / 1024).toFixed(0)} GiB`
+        : '—';
   return (
-    <div className="cap-wrap" title={`${pct}% used`}>
+    <div className="meter" title={`${label}: ${shown}%`}>
+      <span className="meter-label">{label}</span>
       <div className="cap-bar">
         <div
           className="cap-fill"
           style={{
-            width: `${pct}%`,
+            width: `${shown}%`,
             background: hot ? 'var(--color-amber)' : 'var(--color-ink)',
           }}
         />
       </div>
-      <span className="cap-pct" data-tabular>
-        {pct}%
+      <span className="meter-readout" data-tabular>
+        {readout}
       </span>
     </div>
   );
@@ -65,8 +93,8 @@ function HostStratum({
   onDrain: (id: string) => void;
   draining: boolean;
 }) {
-  const totalGiB = (host.capacity_total_mib / 1024).toFixed(0);
-  const usedGiB = (host.capacity_used_mib / 1024).toFixed(1);
+  const diskUsedGiB = (host.util_disk_used_mib / 1024).toFixed(1);
+  const diskTotalGiB = (host.util_disk_total_mib / 1024).toFixed(0);
   return (
     <div className="stratum">
       <div className="stratum-id">
@@ -80,15 +108,19 @@ function HostStratum({
       </div>
       <div className="stratum-body">
         <SandboxCells count={host.running_sandboxes} live={liveSessions} />
-        <CapacityBar used={host.capacity_used_mib} total={host.capacity_total_mib} />
+        <div className="meters">
+          <Meter label="disk" usedMib={host.util_disk_used_mib} totalMib={host.util_disk_total_mib} />
+          <Meter label="mem" usedMib={host.util_mem_used_mib} totalMib={host.util_mem_total_mib} />
+          <Meter label="cpu" pct={host.util_cpu_pct} />
+        </div>
       </div>
       <div className="stratum-meta">
         <span>{host.running_sandboxes} sandboxes</span>
-        {host.capacity_total_mib > 0 && (
+        {host.util_disk_total_mib > 0 && (
           <>
             <span className="dot">·</span>
             <span>
-              {usedGiB}/{totalGiB} GiB
+              {diskUsedGiB}/{diskTotalGiB} GiB disk
             </span>
           </>
         )}
@@ -125,8 +157,10 @@ export function Fleet() {
   const h = hosts ?? [];
   const s = sessions ?? [];
   const totalSb = h.reduce((a, x) => a + x.running_sandboxes, 0);
-  const usedGiB = (h.reduce((a, x) => a + x.capacity_used_mib, 0) / 1024).toFixed(0);
-  const totGiB = (h.reduce((a, x) => a + x.capacity_total_mib, 0) / 1024).toFixed(0);
+  // Fleet-wide disk is the headline operational number — a full host
+  // disk is what bricks sessions. (Memory + CPU live per-host.)
+  const usedGiB = (h.reduce((a, x) => a + x.util_disk_used_mib, 0) / 1024).toFixed(0);
+  const totGiB = (h.reduce((a, x) => a + x.util_disk_total_mib, 0) / 1024).toFixed(0);
   const anyDraining = h.some((x) => x.status === 'draining');
 
   // Count Active sessions bound to each host → how many cells light amber.
@@ -155,7 +189,7 @@ export function Fleet() {
           <b data-tabular>
             {usedGiB}/{totGiB}
           </b>{' '}
-          GiB
+          GiB disk
         </span>
       </div>
 

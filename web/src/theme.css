@@ -645,6 +645,35 @@ select.ledger-input {
   min-width: 3ch;
   text-align: right;
 }
+/* Per-host utilization meters (disk / mem / cpu), stacked in the
+ * right grid column of `.stratum-body`. Each row reuses `.cap-bar` /
+ * `.cap-fill` for the bar itself, flanked by a label and a readout. */
+.meters {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.meter {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.meter-label {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-quiet);
+  min-width: 2.6ch;
+}
+.meter-readout {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--fg-muted);
+  min-width: 9.5ch;
+  text-align: right;
+  white-space: nowrap;
+}
 .stratum-meta {
   display: flex;
   align-items: baseline;

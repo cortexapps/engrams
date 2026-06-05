@@ -224,6 +224,7 @@ impl MetadataStore for MockMetadataStore {
         _id: HostId,
         _status: HostStatus,
         _cap: engram_core::types::HostCapacity,
+        _util: engram_core::types::HostUtilization,
     ) -> Result<(), MetaError> {
         Ok(())
     }

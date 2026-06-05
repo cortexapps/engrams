@@ -201,6 +201,7 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
             used_mib: 0,
             running_sandboxes: 0,
         },
+        utilization: Default::default(),
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
         host_addr: None,

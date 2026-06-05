@@ -44,6 +44,7 @@ pub mod resource;
 pub mod shutdown;
 pub mod snapshot;
 pub mod trace_scope;
+pub mod util;
 
 pub use config::HostAgentConfig;
 
@@ -668,9 +669,14 @@ impl HostAgent {
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
             let nbd_health_for_heartbeat = nbd_health.clone();
+            let util_work_dir = self.cfg.work_dir.clone();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Observed disk/mem/cpu for the fleet view. Holds the
+                // prior `/proc/stat` sample so CPU is a true interval
+                // delta; the first tick reports cpu_pct=0.
+                let mut util_probe = crate::util::UtilizationProbe::new();
                 loop {
                     tick.tick().await;
                     let running_sandboxes = match pooled_for_heartbeat.list().await {
@@ -720,6 +726,7 @@ impl HostAgent {
                             captured_at: r.captured_at,
                         })
                         .collect();
+                    let utilization = util_probe.sample(&util_work_dir);
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -734,6 +741,7 @@ impl HostAgent {
                         nbd_unhealthy: nbd_health_for_heartbeat.snapshot(),
                         current_bundles: current_bundles.clone(),
                         checkpoints,
+                        utilization,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {
@@ -981,6 +989,9 @@ impl HostAgent {
                         nbd_unhealthy: Vec::new(),
                         current_bundles: Vec::new(),
                         checkpoints,
+                        // Draining host on its way out; the fleet view
+                        // doesn't care about utilization here.
+                        utilization: Default::default(),
                     };
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),

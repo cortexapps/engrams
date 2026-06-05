@@ -13,8 +13,8 @@ use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore, UserStore, 
 use engram_core::types::user::{Role, RoleSource, User, UserToken, WebSession};
 use engram_core::types::{
     ArtifactRow, EnableJob, EnableJobState, EnabledImage, HostCapacity, HostRecord, HostStatus,
-    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState,
-    SnapshotRecord,
+    HostUtilization, PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec,
+    SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, UserId};
 use row::col_err;
@@ -712,6 +712,8 @@ impl MetadataStore for PostgresStore {
                    capacity_total_gb, capacity_used_gb,
                    capacity_total_mib, capacity_used_mib,
                    running_sandboxes_count,
+                   util_disk_total_mib, util_disk_used_mib,
+                   util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -742,6 +744,7 @@ impl MetadataStore for PostgresStore {
         id: HostId,
         status: HostStatus,
         capacity: HostCapacity,
+        utilization: HostUtilization,
     ) -> Result<(), MetaError> {
         let n = sqlx::query(
             r#"UPDATE hosts
@@ -749,6 +752,11 @@ impl MetadataStore for PostgresStore {
                       capacity_total_mib = $3,
                       capacity_used_mib = $4,
                       running_sandboxes_count = $5,
+                      util_disk_total_mib = $6,
+                      util_disk_used_mib = $7,
+                      util_mem_total_mib = $8,
+                      util_mem_used_mib = $9,
+                      util_cpu_pct = $10,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -758,6 +766,11 @@ impl MetadataStore for PostgresStore {
         .bind(capacity.total_mib as i64)
         .bind(capacity.used_mib as i64)
         .bind(capacity.running_sandboxes as i32)
+        .bind(utilization.disk_total_mib as i64)
+        .bind(utilization.disk_used_mib as i64)
+        .bind(utilization.mem_total_mib as i64)
+        .bind(utilization.mem_used_mib as i64)
+        .bind(utilization.cpu_pct)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -778,6 +791,8 @@ impl MetadataStore for PostgresStore {
                    capacity_total_gb, capacity_used_gb,
                    capacity_total_mib, capacity_used_mib,
                    running_sandboxes_count,
+                   util_disk_total_mib, util_disk_used_mib,
+                   util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    last_heartbeat_at, status, host_addr
               FROM hosts
              WHERE status IN ('ready','draining')

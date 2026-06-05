@@ -59,6 +59,12 @@ pub struct Heartbeat {
     /// `#[serde(default)]` for mixed-version interop during the roll.
     #[serde(default)]
     pub checkpoints: Vec<CheckpointAdvert>,
+    /// Observed disk/mem/cpu utilization sampled this tick. Drives the
+    /// operator fleet view; persisted to the `hosts` row so it stays
+    /// consistent across coord replicas. `#[serde(default)]` so a
+    /// pre-utilization host-agent interops cleanly against this coord.
+    #[serde(default)]
+    pub utilization: engram_core::types::host::HostUtilization,
 }
 
 /// ADR 0028 Fix A: one un-acked durable checkpoint. Carries
@@ -209,6 +215,7 @@ mod tests {
             ready_images: Vec::new(),
             nbd_unhealthy: Vec::new(),
             checkpoints: Vec::new(),
+            utilization: Default::default(),
         }
     }
 
@@ -232,6 +239,44 @@ mod tests {
         assert!(back.local_snapshots[0].replicated);
         assert_eq!(back.running_sandboxes, original.running_sandboxes);
         assert_eq!(back.draining, original.draining);
+    }
+
+    #[test]
+    fn utilization_round_trips_through_json() {
+        let mut original = sample();
+        original.utilization = engram_core::types::host::HostUtilization {
+            disk_total_mib: 102_400,
+            disk_used_mib: 81_920,
+            mem_total_mib: 32_768,
+            mem_used_mib: 9_001,
+            cpu_pct: 42.5,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.utilization.disk_total_mib, 102_400);
+        assert_eq!(back.utilization.disk_used_mib, 81_920);
+        assert_eq!(back.utilization.mem_total_mib, 32_768);
+        assert_eq!(back.utilization.mem_used_mib, 9_001);
+        assert_eq!(back.utilization.cpu_pct, 42.5);
+    }
+
+    #[test]
+    fn heartbeat_without_utilization_field_defaults_to_zero() {
+        // Rollout interop: coord deploys before the host MIG, so a
+        // pre-utilization host-agent sends heartbeats with no
+        // `utilization` key. `#[serde(default)]` must make that decode
+        // to zeros rather than failing the whole heartbeat.
+        let json = r#"{
+            "host_id": "00000000-0000-0000-0000-000000000000",
+            "sent_at": "2026-06-05T00:00:00Z",
+            "capacity": {"total_mib": 1024, "used_mib": 0, "running_sandboxes": 0},
+            "local_snapshots": [],
+            "running_sandboxes": [],
+            "draining": false
+        }"#;
+        let hb: Heartbeat = serde_json::from_str(json).expect("decode without utilization");
+        assert_eq!(hb.utilization.disk_total_mib, 0);
+        assert_eq!(hb.utilization.cpu_pct, 0.0);
     }
 
     #[test]

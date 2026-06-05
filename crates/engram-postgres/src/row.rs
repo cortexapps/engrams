@@ -6,7 +6,8 @@ use engram_core::types::session::SessionMode;
 use engram_core::types::user::{Role, RoleSource, User, UserToken, WebSession};
 use engram_core::types::{
     EnableJob, EnableJobState, EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus,
-    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState, SnapshotRecord,
+    HostUtilization, PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState,
+    SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId, UserId};
 use sqlx::postgres::PgRow;
@@ -76,6 +77,11 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let total_mib: i64 = row.try_get("capacity_total_mib").map_err(col_err)?;
     let used_mib: i64 = row.try_get("capacity_used_mib").map_err(col_err)?;
     let running_sandboxes: i32 = row.try_get("running_sandboxes_count").map_err(col_err)?;
+    let util_disk_total_mib: i64 = row.try_get("util_disk_total_mib").map_err(col_err)?;
+    let util_disk_used_mib: i64 = row.try_get("util_disk_used_mib").map_err(col_err)?;
+    let util_mem_total_mib: i64 = row.try_get("util_mem_total_mib").map_err(col_err)?;
+    let util_mem_used_mib: i64 = row.try_get("util_mem_used_mib").map_err(col_err)?;
+    let util_cpu_pct: f32 = row.try_get("util_cpu_pct").map_err(col_err)?;
     let status: String = row.try_get("status").map_err(col_err)?;
     let last_heartbeat_at: DateTime<Utc> = row.try_get("last_heartbeat_at").map_err(col_err)?;
     let cloud_metadata: HostMetadata =
@@ -91,6 +97,13 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
             total_mib: total_mib.max(0) as u64,
             used_mib: used_mib.max(0) as u64,
             running_sandboxes: running_sandboxes.max(0) as u32,
+        },
+        utilization: HostUtilization {
+            disk_total_mib: util_disk_total_mib.max(0) as u64,
+            disk_used_mib: util_disk_used_mib.max(0) as u64,
+            mem_total_mib: util_mem_total_mib.max(0) as u64,
+            mem_used_mib: util_mem_used_mib.max(0) as u64,
+            cpu_pct: util_cpu_pct.max(0.0),
         },
         status: parse_host_status(&status)?,
         last_heartbeat_at,
