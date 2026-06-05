@@ -1,7 +1,7 @@
-import { useEffect, useRef } from 'react';
-import { useNavigate } from '@tanstack/react-router';
-import { useRailSessions } from '../pages/sessions/useRailSessions';
-import { useKeyboardUi, useAnyKeyboardModalOpen } from './store';
+import { useEffect, useRef } from "react";
+import { useNavigate } from "@tanstack/react-router";
+import { useRailSessions } from "../pages/sessions/useRailSessions";
+import { useKeyboardUi, useAnyKeyboardModalOpen } from "./store";
 
 // The ⌥/Alt "session-jump layer". Three behaviours on one window listener,
 // because they share the same modifier and one of them (hold-to-reveal) isn't
@@ -32,7 +32,7 @@ export function useSessionJumpKeys(): void {
   live.current = { rows, openId, blocked, navigate, setJumpHeld };
 
   useEffect(() => {
-    const go = (id: string) => live.current.navigate({ to: '/sessions/$id', params: { id } });
+    const go = (id: string) => live.current.navigate({ to: "/sessions/$id", params: { id } });
 
     const onKeyDown = (e: KeyboardEvent) => {
       const { rows, openId, blocked } = live.current;
@@ -40,7 +40,7 @@ export function useSessionJumpKeys(): void {
       // ⌘/Ctrl/⇧) arms the layer, so ⌥⇧3-style chords don't light it up.
       if (e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
         if (!blocked) live.current.setJumpHeld(true);
-      } else if (e.key === 'Alt') {
+      } else if (e.key === "Alt") {
         // Alt pressed together with another modifier — not our layer.
         live.current.setJumpHeld(false);
       }
@@ -49,7 +49,7 @@ export function useSessionJumpKeys(): void {
       if (rows.length === 0) return;
 
       const code = e.code;
-      if (code.startsWith('Digit')) {
+      if (code.startsWith("Digit")) {
         const n = Number(code.slice(5));
         if (n >= 1 && n <= 9 && n <= rows.length) {
           e.preventDefault();
@@ -57,34 +57,38 @@ export function useSessionJumpKeys(): void {
         }
         return;
       }
-      if (code === 'BracketLeft' || code === 'BracketRight') {
+      if (code === "BracketLeft" || code === "BracketRight") {
         e.preventDefault();
         const i = openId ? rows.findIndex((r) => r.id === openId) : -1;
         const len = rows.length;
         const next =
-          code === 'BracketRight'
-            ? i < 0 ? 0 : (i + 1) % len
-            : i < 0 ? len - 1 : (i - 1 + len) % len;
+          code === "BracketRight"
+            ? i < 0
+              ? 0
+              : (i + 1) % len
+            : i < 0
+              ? len - 1
+              : (i - 1 + len) % len;
         go(rows[next].id);
       }
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Alt' || !e.altKey) live.current.setJumpHeld(false);
+      if (e.key === "Alt" || !e.altKey) live.current.setJumpHeld(false);
     };
     // Alt-Tabbing away or losing focus mid-hold must not leave the rail stuck
     // showing numbers.
     const clear = () => live.current.setJumpHeld(false);
 
-    window.addEventListener('keydown', onKeyDown);
-    window.addEventListener('keyup', onKeyUp);
-    window.addEventListener('blur', clear);
-    document.addEventListener('visibilitychange', clear);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", clear);
+    document.addEventListener("visibilitychange", clear);
     return () => {
-      window.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('keyup', onKeyUp);
-      window.removeEventListener('blur', clear);
-      document.removeEventListener('visibilitychange', clear);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", clear);
+      document.removeEventListener("visibilitychange", clear);
     };
   }, []);
 }

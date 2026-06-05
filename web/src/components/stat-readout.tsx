@@ -1,6 +1,6 @@
-import type { ReactNode } from 'react';
-import { cn } from '@/lib/utils';
-import { Text } from '@/components/ui/text';
+import type { ReactNode } from "react";
+import { cn } from "@/lib/utils";
+import { Text } from "@/components/ui/text";
 
 export interface Stat {
   label: string;
@@ -16,7 +16,7 @@ export function StatReadout({ items, className }: { items: Stat[]; className?: s
   return (
     <dl
       className={cn(
-        'grid grid-cols-2 gap-px overflow-hidden rounded-md border bg-border sm:grid-cols-4',
+        "grid grid-cols-2 gap-px overflow-hidden rounded-md border bg-border sm:grid-cols-4",
         className,
       )}
     >
@@ -25,7 +25,9 @@ export function StatReadout({ items, className }: { items: Stat[]; className?: s
           {/* Figure dominates (full ink, oversized mono); caption recedes
               beneath it (quiet Saira caps, muted). The variant/tone split is
               the hierarchy. */}
-          <Text as="dd" variant="stat" tone="default">{value}</Text>
+          <Text as="dd" variant="stat" tone="default">
+            {value}
+          </Text>
           <Text as="dt" variant="label" tone="muted" className="mt-1.5 text-[0.65rem]">
             {label}
           </Text>

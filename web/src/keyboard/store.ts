@@ -1,4 +1,4 @@
-import { create } from 'zustand';
+import { create } from "zustand";
 
 // One small store for the keyboard layer's transient UI state. The command
 // palette, the global New Session dialog, and the shortcuts cheatsheet are all
@@ -39,7 +39,5 @@ export const useKeyboardUi = create<KeyboardUiState>((set) => ({
 /** True when any keyboard-owned modal is up — single-key accelerators and the
  * jump layer disable themselves so they don't fire underneath an open dialog. */
 export function useAnyKeyboardModalOpen(): boolean {
-  return useKeyboardUi(
-    (s) => s.paletteOpen || s.newSessionOpen || s.shortcutsOpen,
-  );
+  return useKeyboardUi((s) => s.paletteOpen || s.newSessionOpen || s.shortcutsOpen);
 }

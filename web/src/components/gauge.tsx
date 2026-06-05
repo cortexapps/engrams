@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
-import { cn } from '@/lib/utils';
-import { Text } from '@/components/ui/text';
+import { useEffect, useState } from "react";
+import { cn } from "@/lib/utils";
+import { Text } from "@/components/ui/text";
 
 // A radial instrument gauge — the cockpit's signature element. A 270° dial
 // (gap at the bottom, like a tachometer) with a coloured zone face, a needle
@@ -11,7 +11,7 @@ import { Text } from '@/components/ui/text';
 // in tints the needle and the figure, so a red needle reads as "redline" at a
 // glance. `value === null` means no data — the needle parks at zero, muted.
 
-export type Tone = 'nominal' | 'caution' | 'critical';
+export type Tone = "nominal" | "caution" | "critical";
 export interface Zone {
   /** Upper bound of this band, as a percentage of `max` (0–100). */
   to: number;
@@ -22,24 +22,24 @@ const SWEEP = 270; // degrees of arc; the missing 90° is the bottom gap
 const START = -135; // needle angle at value 0 (lower-left), clockwise-positive
 
 const STROKE: Record<Tone, string> = {
-  nominal: 'stroke-instrument-nominal',
-  caution: 'stroke-instrument-caution',
-  critical: 'stroke-instrument-critical',
+  nominal: "stroke-instrument-nominal",
+  caution: "stroke-instrument-caution",
+  critical: "stroke-instrument-critical",
 };
 const ZONE_STROKE: Record<Tone, string> = {
-  nominal: 'stroke-instrument-nominal/30',
-  caution: 'stroke-instrument-caution/30',
-  critical: 'stroke-instrument-critical/30',
+  nominal: "stroke-instrument-nominal/30",
+  caution: "stroke-instrument-caution/30",
+  critical: "stroke-instrument-critical/30",
 };
 const FILL: Record<Tone, string> = {
-  nominal: 'fill-instrument-nominal',
-  caution: 'fill-instrument-caution',
-  critical: 'fill-instrument-critical',
+  nominal: "fill-instrument-nominal",
+  caution: "fill-instrument-caution",
+  critical: "fill-instrument-critical",
 };
 const FIGURE: Record<Tone, string> = {
-  nominal: 'text-instrument-nominal',
-  caution: 'text-instrument-caution',
-  critical: 'text-instrument-critical',
+  nominal: "text-instrument-nominal",
+  caution: "text-instrument-caution",
+  critical: "text-instrument-critical",
 };
 
 const CX = 50;
@@ -63,13 +63,13 @@ function arcPath(fromDeg: number, toDeg: number, r: number) {
 
 function toneFor(pct: number, zones: Zone[]): Tone {
   for (const z of zones) if (pct <= z.to) return z.tone;
-  return zones[zones.length - 1]?.tone ?? 'nominal';
+  return zones[zones.length - 1]?.tone ?? "nominal";
 }
 
 export function Gauge({
   value,
   max = 100,
-  unit = '%',
+  unit = "%",
   label,
   zones,
   className,
@@ -82,9 +82,8 @@ export function Gauge({
   className?: string;
 }) {
   const hasValue = value != null && Number.isFinite(value);
-  const pct = value != null && Number.isFinite(value)
-    ? Math.min(100, Math.max(0, (value / max) * 100))
-    : 0;
+  const pct =
+    value != null && Number.isFinite(value) ? Math.min(100, Math.max(0, (value / max) * 100)) : 0;
   const tone = toneFor(pct, zones);
   const target = frac2deg(pct / 100);
   const FULL = START + SWEEP;
@@ -94,22 +93,22 @@ export function Gauge({
   // reading. The transition lives in the class (not inline) so motion-reduce
   // can cancel it — reduced-motion users jump straight to the value, no sweep.
   const [angle, setAngle] = useState(START);
-  const [phase, setPhase] = useState<'sweep' | 'settle'>('sweep');
+  const [phase, setPhase] = useState<"sweep" | "settle">("sweep");
   useEffect(() => {
     if (!hasValue) return; // nothing to read — needle stays parked
     const reduce =
-      typeof window !== 'undefined' && window.matchMedia
-        ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      typeof window !== "undefined" && window.matchMedia
+        ? window.matchMedia("(prefers-reduced-motion: reduce)").matches
         : false;
     if (reduce) {
-      setPhase('settle');
+      setPhase("settle");
       setAngle(target);
       return;
     }
-    setPhase('sweep');
+    setPhase("sweep");
     setAngle(FULL); // rush to the redline
     const t = setTimeout(() => {
-      setPhase('settle');
+      setPhase("settle");
       setAngle(target); // ease back down to the reading
     }, 620);
     return () => clearTimeout(t);
@@ -119,37 +118,80 @@ export function Gauge({
   let cursor = 0;
 
   return (
-    <div className={cn('relative flex aspect-[10/9] w-full max-w-[220px] items-center justify-center', className)}>
-      <svg viewBox="0 0 100 90" className="h-full w-full" role="img" aria-label={`${label}: ${hasValue ? `${Math.round(pct)}${unit}` : 'no data'}`}>
+    <div
+      className={cn(
+        "relative flex aspect-[10/9] w-full max-w-[220px] items-center justify-center",
+        className,
+      )}
+    >
+      <svg
+        viewBox="0 0 100 90"
+        className="h-full w-full"
+        role="img"
+        aria-label={`${label}: ${hasValue ? `${Math.round(pct)}${unit}` : "no data"}`}
+      >
         {/* dial face: the unlit track */}
-        <path d={arcPath(START, START + SWEEP, R)} fill="none" strokeWidth={7} strokeLinecap="round" className="stroke-border" />
+        <path
+          d={arcPath(START, START + SWEEP, R)}
+          fill="none"
+          strokeWidth={7}
+          strokeLinecap="round"
+          className="stroke-border"
+        />
         {/* coloured zone bands over the track */}
         {zones.map((z) => {
           const seg = arcPath(frac2deg(cursor / 100), frac2deg(z.to / 100), R);
           cursor = z.to;
-          return <path key={z.tone + z.to} d={seg} fill="none" strokeWidth={7} className={ZONE_STROKE[z.tone]} />;
+          return (
+            <path
+              key={z.tone + z.to}
+              d={seg}
+              fill="none"
+              strokeWidth={7}
+              className={ZONE_STROKE[z.tone]}
+            />
+          );
         })}
         {/* tick at each zone boundary — the redline marks */}
         {zones.slice(0, -1).map((z) => {
           const a = polar(frac2deg(z.to / 100), R + 4);
           const b = polar(frac2deg(z.to / 100), R - 4);
-          return <line key={`tick-${z.to}`} x1={a.x} y1={a.y} x2={b.x} y2={b.y} strokeWidth={1} className="stroke-border" />;
+          return (
+            <line
+              key={`tick-${z.to}`}
+              x1={a.x}
+              y1={a.y}
+              x2={b.x}
+              y2={b.y}
+              strokeWidth={1}
+              className="stroke-border"
+            />
+          );
         })}
         {/* needle + hub: tone-coloured when live, muted when no data */}
         <g
           className={cn(
-            'origin-center [transform-box:view-box] transition-transform ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none',
-            phase === 'sweep' ? 'duration-[500ms]' : 'duration-[850ms]',
+            "origin-center [transform-box:view-box] transition-transform ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none",
+            phase === "sweep" ? "duration-[500ms]" : "duration-[850ms]",
           )}
-          style={{ transform: `rotate(${angle}deg)`, transformOrigin: '50px 50px' }}
+          style={{ transform: `rotate(${angle}deg)`, transformOrigin: "50px 50px" }}
         >
           <line
-            x1={CX} y1={CY} x2={CX} y2={CY - (R - 4)}
-            strokeWidth={2.5} strokeLinecap="round"
-            className={hasValue ? STROKE[tone] : 'stroke-muted-foreground/50'}
+            x1={CX}
+            y1={CY}
+            x2={CX}
+            y2={CY - (R - 4)}
+            strokeWidth={2.5}
+            strokeLinecap="round"
+            className={hasValue ? STROKE[tone] : "stroke-muted-foreground/50"}
           />
         </g>
-        <circle cx={CX} cy={CY} r={3.5} className={hasValue ? FILL[tone] : 'fill-muted-foreground/50'} />
+        <circle
+          cx={CX}
+          cy={CY}
+          r={3.5}
+          className={hasValue ? FILL[tone] : "fill-muted-foreground/50"}
+        />
       </svg>
 
       {/* Readout: the figure owns the dial face (centred on the hub); the
@@ -158,8 +200,12 @@ export function Gauge({
           them. */}
       <div className="pointer-events-none absolute inset-0">
         <div className="absolute inset-x-0 top-[47%] flex -translate-y-1/2 justify-center">
-          <Text as="span" variant="stat" className={cn('text-3xl', hasValue ? FIGURE[tone] : 'text-muted-foreground')}>
-            {hasValue ? Math.round(pct) : '—'}
+          <Text
+            as="span"
+            variant="stat"
+            className={cn("text-3xl", hasValue ? FIGURE[tone] : "text-muted-foreground")}
+          >
+            {hasValue ? Math.round(pct) : "—"}
             {hasValue && <span className="ml-0.5 align-top text-base">{unit}</span>}
           </Text>
         </div>

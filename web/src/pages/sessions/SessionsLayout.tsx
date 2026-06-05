@@ -1,10 +1,10 @@
-import { Layers, ListChecks } from 'lucide-react';
-import { Link, Outlet, useRouterState, type LinkProps } from '@tanstack/react-router';
-import { useIsAdmin } from '../../auth/AuthProvider';
-import { Sidebar, SidebarProvider } from '@/components/ui/sidebar';
-import type { NavItem } from '@/components/nav';
-import { SessionsRail } from './SessionsRail';
-import { cn } from '@/lib/utils';
+import { Layers, ListChecks } from "lucide-react";
+import { Link, Outlet, useRouterState, type LinkProps } from "@tanstack/react-router";
+import { useIsAdmin } from "../../auth/AuthProvider";
+import { Sidebar, SidebarProvider } from "@/components/ui/sidebar";
+import type { NavItem } from "@/components/nav";
+import { SessionsRail } from "./SessionsRail";
+import { cn } from "@/lib/utils";
 
 // The /sessions section shell. Its second sidebar is the persistent
 // SessionsRail (a live switcher), which stays mounted across the list views
@@ -15,13 +15,25 @@ import { cn } from '@/lib/utils';
 export function SessionsLayout() {
   const isAdmin = useIsAdmin();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const seg = pathname.startsWith('/sessions/') ? pathname.split('/')[2] : undefined;
-  const onDetail = !!seg && seg !== 'all';
+  const seg = pathname.startsWith("/sessions/") ? pathname.split("/")[2] : undefined;
+  const onDetail = !!seg && seg !== "all";
 
   const scopes: (NavItem & { active: boolean })[] = [
-    { to: '/sessions', label: 'My sessions', icon: Layers, active: pathname === '/sessions' || pathname === '/sessions/' },
+    {
+      to: "/sessions",
+      label: "My sessions",
+      icon: Layers,
+      active: pathname === "/sessions" || pathname === "/sessions/",
+    },
     ...(isAdmin
-      ? [{ to: '/sessions/all' as LinkProps['to'], label: 'All sessions', icon: ListChecks, active: pathname.startsWith('/sessions/all') }]
+      ? [
+          {
+            to: "/sessions/all" as LinkProps["to"],
+            label: "All sessions",
+            icon: ListChecks,
+            active: pathname.startsWith("/sessions/all"),
+          },
+        ]
       : []),
   ];
 
@@ -32,7 +44,10 @@ export function SessionsLayout() {
     // transcript alike. `min-h-0` neutralises the provider's base `min-h-svh`.
     <SidebarProvider className="h-[calc(100svh-3rem)] min-h-0 md:h-svh">
       {/* desktop (md+): the persistent sessions rail */}
-      <Sidebar collapsible="none" className="sidebar-section hidden border-r border-sidebar-border md:flex">
+      <Sidebar
+        collapsible="none"
+        className="sidebar-section hidden border-r border-sidebar-border md:flex"
+      >
         <SessionsRail />
       </Sidebar>
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
@@ -41,10 +56,16 @@ export function SessionsLayout() {
         {!onDetail && (
           <nav className="flex gap-1 overflow-x-auto border-b p-2 md:hidden">
             {scopes.map((it) => (
-              <Link key={it.label} to={it.to}
-                className={cn('inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm',
-                  it.active ? 'bg-accent text-accent-foreground' : 'text-muted-foreground')}>
-                <it.icon className="size-4" />{it.label}
+              <Link
+                key={it.label}
+                to={it.to}
+                className={cn(
+                  "inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm",
+                  it.active ? "bg-accent text-accent-foreground" : "text-muted-foreground",
+                )}
+              >
+                <it.icon className="size-4" />
+                {it.label}
               </Link>
             ))}
           </nav>

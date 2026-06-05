@@ -22,9 +22,9 @@
 // the cleanup contract. These tests assert it via mock invocation
 // counters so a future refactor fails loudly.
 
-import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { act, cleanup, render } from '@testing-library/react';
-import { TerminalPane } from './TerminalPane';
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { act, cleanup, render } from "@testing-library/react";
+import { TerminalPane } from "./TerminalPane";
 
 // vi.hoisted runs before the vi.mock factory, so the classes are
 // defined when the mock module is constructed AND accessible inside
@@ -57,7 +57,7 @@ const { MockTerminal, MockFitAddon } = vi.hoisted(() => {
   return { MockTerminal, MockFitAddon };
 });
 
-vi.mock('ghostty-web', () => ({
+vi.mock("ghostty-web", () => ({
   init: vi.fn(async () => {}),
   Terminal: MockTerminal,
   FitAddon: MockFitAddon,
@@ -70,7 +70,7 @@ class MockWebSocket {
   onmessage: ((ev: MessageEvent) => void) | null = null;
   onerror: ((ev: Event) => void) | null = null;
   onclose: ((ev: CloseEvent) => void) | null = null;
-  binaryType = 'blob';
+  binaryType = "blob";
   send = vi.fn();
   close = vi.fn();
   constructor(
@@ -85,7 +85,7 @@ beforeEach(() => {
   MockTerminal.instances = [];
   MockFitAddon.instances = [];
   MockWebSocket.instances = [];
-  vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
+  vi.stubGlobal("WebSocket", MockWebSocket as unknown as typeof WebSocket);
 });
 
 afterEach(() => {
@@ -103,8 +103,8 @@ async function flush() {
   });
 }
 
-describe('TerminalPane mount sequence', () => {
-  test('clear escape runs AFTER fitAddon.fit() so post-resize cells are zeroed', async () => {
+describe("TerminalPane mount sequence", () => {
+  test("clear escape runs AFTER fitAddon.fit() so post-resize cells are zeroed", async () => {
     render(<TerminalPane sessionId="s1" />);
     await flush();
 
@@ -113,7 +113,7 @@ describe('TerminalPane mount sequence', () => {
 
     expect(term.open).toHaveBeenCalledTimes(1);
     expect(addon.fit).toHaveBeenCalledTimes(1);
-    expect(term.write).toHaveBeenCalledWith('\x1b[2J\x1b[3J\x1b[H');
+    expect(term.write).toHaveBeenCalledWith("\x1b[2J\x1b[3J\x1b[H");
 
     // Order: open → fit → write(clear). If a future change moves the
     // clear above fit, fit() would resize the grid afterward and the
@@ -121,7 +121,7 @@ describe('TerminalPane mount sequence', () => {
     const openOrder = term.open.mock.invocationCallOrder[0];
     const fitOrder = addon.fit.mock.invocationCallOrder[0];
     const clearWriteCall = term.write.mock.calls.findIndex(
-      ([arg]) => arg === '\x1b[2J\x1b[3J\x1b[H',
+      ([arg]) => arg === "\x1b[2J\x1b[3J\x1b[H",
     );
     const clearOrder = term.write.mock.invocationCallOrder[clearWriteCall];
 
@@ -129,19 +129,19 @@ describe('TerminalPane mount sequence', () => {
     expect(fitOrder).toBeLessThan(clearOrder);
   });
 
-  test('opens a WebSocket to /sessions/:id/shell with the tty subprotocol', async () => {
+  test("opens a WebSocket to /sessions/:id/shell with the tty subprotocol", async () => {
     render(<TerminalPane sessionId="abc-123" />);
     await flush();
 
     expect(MockWebSocket.instances).toHaveLength(1);
     const ws = MockWebSocket.instances[0]!;
-    expect(ws.url).toContain('/sessions/abc-123/shell');
-    expect(ws.protocols).toBe('tty');
+    expect(ws.url).toContain("/sessions/abc-123/shell");
+    expect(ws.protocols).toBe("tty");
   });
 });
 
-describe('TerminalPane unmount sequence', () => {
-  test('disposes the Terminal but does NOT call wasmTerm.free() — that path double-frees', async () => {
+describe("TerminalPane unmount sequence", () => {
+  test("disposes the Terminal but does NOT call wasmTerm.free() — that path double-frees", async () => {
     const { unmount } = render(<TerminalPane sessionId="s1" />);
     await flush();
 
@@ -163,13 +163,13 @@ describe('TerminalPane unmount sequence', () => {
   });
 });
 
-describe('TerminalPane remount cycle', () => {
-  test('a fresh mount allocates a new Terminal and re-runs the fit-then-clear sequence', async () => {
+describe("TerminalPane remount cycle", () => {
+  test("a fresh mount allocates a new Terminal and re-runs the fit-then-clear sequence", async () => {
     const { unmount } = render(<TerminalPane sessionId="s1" />);
     await flush();
 
     const firstTerm = MockTerminal.instances.at(-1)!;
-    expect(firstTerm.write).toHaveBeenCalledWith('\x1b[2J\x1b[3J\x1b[H');
+    expect(firstTerm.write).toHaveBeenCalledWith("\x1b[2J\x1b[3J\x1b[H");
 
     unmount();
 
@@ -183,18 +183,18 @@ describe('TerminalPane remount cycle', () => {
     expect(secondTerm).not.toBe(firstTerm);
     expect(secondTerm.open).toHaveBeenCalledTimes(1);
     expect(secondAddon.fit).toHaveBeenCalledTimes(1);
-    expect(secondTerm.write).toHaveBeenCalledWith('\x1b[2J\x1b[3J\x1b[H');
+    expect(secondTerm.write).toHaveBeenCalledWith("\x1b[2J\x1b[3J\x1b[H");
 
     // And the second mount's clear is still post-fit.
     const fitOrder = secondAddon.fit.mock.invocationCallOrder[0];
     const clearWriteCall = secondTerm.write.mock.calls.findIndex(
-      ([arg]) => arg === '\x1b[2J\x1b[3J\x1b[H',
+      ([arg]) => arg === "\x1b[2J\x1b[3J\x1b[H",
     );
     const clearOrder = secondTerm.write.mock.invocationCallOrder[clearWriteCall];
     expect(fitOrder).toBeLessThan(clearOrder);
   });
 
-  test('regression: navigate-away-and-back never explicitly frees wasmTerm (would corrupt the next mount)', async () => {
+  test("regression: navigate-away-and-back never explicitly frees wasmTerm (would corrupt the next mount)", async () => {
     // Mirrors the user repro: open SHELL, navigate to overview via
     // SPA (unmount), navigate back (remount), click SHELL again, type
     // `ls /`. Pre-fix, the explicit wasmTerm.free() in the unmount

@@ -9,16 +9,16 @@ import {
   SquarePlus,
   User,
   Users,
-} from 'lucide-react';
-import { useNavigate } from '@tanstack/react-router';
-import type { LinkProps } from '@tanstack/react-router';
-import type { LucideIcon } from 'lucide-react';
-import { useIsAdmin } from '../auth/AuthProvider';
-import { StatusGlyph } from '../components/Glyph';
-import { shortId, stripImageHost } from '../pages/sessions/session-format';
-import { useRailSessions } from '../pages/sessions/useRailSessions';
-import { useKeyboardUi } from './store';
-import { ALT_LABEL } from './platform';
+} from "lucide-react";
+import { useNavigate } from "@tanstack/react-router";
+import type { LinkProps } from "@tanstack/react-router";
+import type { LucideIcon } from "lucide-react";
+import { useIsAdmin } from "../auth/AuthProvider";
+import { StatusGlyph } from "../components/Glyph";
+import { shortId, stripImageHost } from "../pages/sessions/session-format";
+import { useRailSessions } from "../pages/sessions/useRailSessions";
+import { useKeyboardUi } from "./store";
+import { ALT_LABEL } from "./platform";
 import {
   CommandDialog,
   CommandEmpty,
@@ -28,8 +28,8 @@ import {
   CommandList,
   CommandSeparator,
   CommandShortcut,
-} from '@/components/ui/command';
-import { Kbd, KbdGroup } from '@/components/ui/kbd';
+} from "@/components/ui/command";
+import { Kbd, KbdGroup } from "@/components/ui/kbd";
 
 // The ⌘K palette. No backend search: the input filters locally over the
 // already-loaded recent sessions plus the static Actions / Go-to commands
@@ -37,7 +37,7 @@ import { Kbd, KbdGroup } from '@/components/ui/kbd';
 // reaches for them: act, switch, navigate.
 
 interface Dest {
-  to: LinkProps['to'];
+  to: LinkProps["to"];
   label: string;
   icon: LucideIcon;
   admin?: boolean;
@@ -48,15 +48,15 @@ interface Dest {
 // `value` strings (what cmdk scores against) deliberately include extra synonyms
 // so "go to fleet" / "hosts" style typing still lands.
 const DESTS: Dest[] = [
-  { to: '/sessions', label: 'Sessions', icon: Layers, leader: 's' },
-  { to: '/operator', label: 'Operator', icon: Gauge, admin: true, leader: 'o' },
-  { to: '/operator/fleet', label: 'Fleet', icon: Server, admin: true, leader: 'f' },
-  { to: '/operator/storage', label: 'Storage', icon: Database, admin: true },
-  { to: '/operator/images', label: 'Images', icon: Box, admin: true },
-  { to: '/operator/registries', label: 'Registries', icon: KeyRound, admin: true },
-  { to: '/settings', label: 'Settings · Profile', icon: User, leader: ',' },
-  { to: '/settings/tokens', label: 'Settings · Tokens', icon: KeySquare },
-  { to: '/settings/members', label: 'Settings · Members', icon: Users, admin: true },
+  { to: "/sessions", label: "Sessions", icon: Layers, leader: "s" },
+  { to: "/operator", label: "Operator", icon: Gauge, admin: true, leader: "o" },
+  { to: "/operator/fleet", label: "Fleet", icon: Server, admin: true, leader: "f" },
+  { to: "/operator/storage", label: "Storage", icon: Database, admin: true },
+  { to: "/operator/images", label: "Images", icon: Box, admin: true },
+  { to: "/operator/registries", label: "Registries", icon: KeyRound, admin: true },
+  { to: "/settings", label: "Settings · Profile", icon: User, leader: "," },
+  { to: "/settings/tokens", label: "Settings · Tokens", icon: KeySquare },
+  { to: "/settings/members", label: "Settings · Members", icon: Users, admin: true },
 ];
 
 export function CommandMenu() {
@@ -83,10 +83,7 @@ export function CommandMenu() {
         <CommandEmpty>No matching commands.</CommandEmpty>
 
         <CommandGroup heading="Actions">
-          <CommandItem
-            value="start new session create launch"
-            onSelect={() => run(openNewSession)}
-          >
+          <CommandItem value="start new session create launch" onSelect={() => run(openNewSession)}>
             <SquarePlus />
             <span>Start new session</span>
             <CommandShortcut>
@@ -112,7 +109,9 @@ export function CommandMenu() {
                   <CommandItem
                     key={r.id}
                     value={`session ${shortId(r.id)} ${stripImageHost(r.image)} ${r.id}`}
-                    onSelect={() => run(() => navigate({ to: '/sessions/$id', params: { id: r.id } }))}
+                    onSelect={() =>
+                      run(() => navigate({ to: "/sessions/$id", params: { id: r.id } }))
+                    }
                   >
                     <span className="text-[0.7rem] leading-none">
                       <StatusGlyph status={r.status} beat={false} />

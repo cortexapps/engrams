@@ -1,15 +1,17 @@
-import { ChevronsUpDown, LogOut, Settings } from 'lucide-react';
-import { useNavigate } from '@tanstack/react-router';
-import { logout } from '../api';
-import { useAuth } from '../auth/AuthProvider';
-import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { ChevronsUpDown, LogOut, Settings } from "lucide-react";
+import { useNavigate } from "@tanstack/react-router";
+import { logout } from "../api";
+import { useAuth } from "../auth/AuthProvider";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem,
-  DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
-import {
-  SidebarMenu, SidebarMenuButton, SidebarMenuItem,
-} from '@/components/ui/sidebar';
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar";
 
 export function UserMenu() {
   const { principal } = useAuth();
@@ -28,9 +30,7 @@ export function UserMenu() {
               </Avatar>
               <div className="grid flex-1 text-left text-sm leading-tight">
                 <span className="truncate font-medium">{label}</span>
-                <span className="truncate text-xs text-muted-foreground">
-                  {principal.email}
-                </span>
+                <span className="truncate text-xs text-muted-foreground">{principal.email}</span>
               </div>
               <ChevronsUpDown className="ml-auto size-4" />
             </SidebarMenuButton>
@@ -43,7 +43,7 @@ export function UserMenu() {
               </div>
             </DropdownMenuLabel>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={() => navigate({ to: '/settings' })}>
+            <DropdownMenuItem onClick={() => navigate({ to: "/settings" })}>
               <Settings /> Settings
             </DropdownMenuItem>
             {principal.can_sign_out && (

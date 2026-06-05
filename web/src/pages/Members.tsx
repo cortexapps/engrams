@@ -1,33 +1,53 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { MoreHorizontal } from 'lucide-react';
-import { fetchUsers, updateUser } from '../api';
-import { useAuth } from '../auth/AuthProvider';
-import { PageHeading } from '../components/page-heading';
-import { Avatar, AvatarFallback } from '@/components/ui/avatar';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { MoreHorizontal } from "lucide-react";
+import { fetchUsers, updateUser } from "../api";
+import { useAuth } from "../auth/AuthProvider";
+import { PageHeading } from "../components/page-heading";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
-  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
-} from '@/components/ui/table';
-import type { AdminUser, Role } from '../types';
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import type { AdminUser, Role } from "../types";
 
 export function Members() {
   const { principal } = useAuth();
   const qc = useQueryClient();
-  const { data: users = [], isLoading, error } = useQuery({ queryKey: ['admin', 'users'], queryFn: fetchUsers });
+  const {
+    data: users = [],
+    isLoading,
+    error,
+  } = useQuery({ queryKey: ["admin", "users"], queryFn: fetchUsers });
   const mutation = useMutation({
-    mutationFn: ({ id, patch }: { id: string; patch: { role?: Role; active?: boolean } }) => updateUser(id, patch),
-    onSuccess: (u) => qc.setQueryData<AdminUser[]>(['admin', 'users'], (prev) =>
-      prev ? prev.map((x) => (x.id === u.id ? u : x)) : [u]),
+    mutationFn: ({ id, patch }: { id: string; patch: { role?: Role; active?: boolean } }) =>
+      updateUser(id, patch),
+    onSuccess: (u) =>
+      qc.setQueryData<AdminUser[]>(["admin", "users"], (prev) =>
+        prev ? prev.map((x) => (x.id === u.id ? u : x)) : [u],
+      ),
   });
 
   if (isLoading) return <p className="p-6 text-sm text-muted-foreground">Loading…</p>;
-  if (error) return <p className="p-6 text-sm text-destructive">Could not load members — {(error as Error).message}</p>;
+  if (error)
+    return (
+      <p className="p-6 text-sm text-destructive">
+        Could not load members — {(error as Error).message}
+      </p>
+    );
 
-  const admins = users.filter((u) => u.role === 'admin' && u.active).length;
+  const admins = users.filter((u) => u.role === "admin" && u.active).length;
   const disabled = users.filter((u) => !u.active).length;
 
   return (
@@ -37,46 +57,80 @@ export function Members() {
         description={`${users.length} people · ${admins} admins · ${disabled} disabled`}
       />
       <Table>
-        <TableHeader><TableRow>
-          <TableHead>Person</TableHead><TableHead>Role</TableHead>
-          <TableHead>Source</TableHead><TableHead>Status</TableHead>
-          <TableHead className="w-10" />
-        </TableRow></TableHeader>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Person</TableHead>
+            <TableHead>Role</TableHead>
+            <TableHead>Source</TableHead>
+            <TableHead>Status</TableHead>
+            <TableHead className="w-10" />
+          </TableRow>
+        </TableHeader>
         <TableBody>
           {users.map((u) => {
             const isYou = u.email === principal.email;
             return (
-              <TableRow key={u.id} className={u.active ? '' : 'opacity-60'}>
+              <TableRow key={u.id} className={u.active ? "" : "opacity-60"}>
                 <TableCell>
                   <span className="flex items-center gap-2">
-                    <Avatar className="size-7"><AvatarFallback className="text-xs">
-                      {(u.display_name || u.email).charAt(0).toUpperCase()}
-                    </AvatarFallback></Avatar>
+                    <Avatar className="size-7">
+                      <AvatarFallback className="text-xs">
+                        {(u.display_name || u.email).charAt(0).toUpperCase()}
+                      </AvatarFallback>
+                    </Avatar>
                     <span>
-                      <span className="block text-sm">{u.display_name || u.email}{isYou && ' (you)'}</span>
-                      <span className="block font-mono text-xs text-muted-foreground">{u.email}</span>
+                      <span className="block text-sm">
+                        {u.display_name || u.email}
+                        {isYou && " (you)"}
+                      </span>
+                      <span className="block font-mono text-xs text-muted-foreground">
+                        {u.email}
+                      </span>
                     </span>
                   </span>
                 </TableCell>
-                <TableCell><Badge variant={u.role === 'admin' ? 'default' : 'secondary'}>{u.role}</Badge></TableCell>
+                <TableCell>
+                  <Badge variant={u.role === "admin" ? "default" : "secondary"}>{u.role}</Badge>
+                </TableCell>
                 <TableCell className="text-sm text-muted-foreground">{u.role_source}</TableCell>
-                <TableCell className="text-sm text-muted-foreground">{u.active ? 'active' : 'disabled'}</TableCell>
+                <TableCell className="text-sm text-muted-foreground">
+                  {u.active ? "active" : "disabled"}
+                </TableCell>
                 <TableCell>
                   {!isYou && (
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon" aria-label="Member actions"><MoreHorizontal className="size-4" /></Button>
+                        <Button variant="ghost" size="icon" aria-label="Member actions">
+                          <MoreHorizontal className="size-4" />
+                        </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        {u.role === 'member' ? (
-                          <DropdownMenuItem onClick={() => mutation.mutate({ id: u.id, patch: { role: 'admin' } })}>Make admin</DropdownMenuItem>
+                        {u.role === "member" ? (
+                          <DropdownMenuItem
+                            onClick={() => mutation.mutate({ id: u.id, patch: { role: "admin" } })}
+                          >
+                            Make admin
+                          </DropdownMenuItem>
                         ) : (
-                          <DropdownMenuItem onClick={() => mutation.mutate({ id: u.id, patch: { role: 'member' } })}>Revoke admin</DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => mutation.mutate({ id: u.id, patch: { role: "member" } })}
+                          >
+                            Revoke admin
+                          </DropdownMenuItem>
                         )}
                         {u.active ? (
-                          <DropdownMenuItem variant="destructive" onClick={() => mutation.mutate({ id: u.id, patch: { active: false } })}>Deactivate</DropdownMenuItem>
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onClick={() => mutation.mutate({ id: u.id, patch: { active: false } })}
+                          >
+                            Deactivate
+                          </DropdownMenuItem>
                         ) : (
-                          <DropdownMenuItem onClick={() => mutation.mutate({ id: u.id, patch: { active: true } })}>Reactivate</DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => mutation.mutate({ id: u.id, patch: { active: true } })}
+                          >
+                            Reactivate
+                          </DropdownMenuItem>
                         )}
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -88,9 +142,9 @@ export function Members() {
         </TableBody>
       </Table>
       <p className="max-w-prose text-sm text-muted-foreground">
-        Roles are provisioned from your identity provider on first sign-in and stay in sync over SCIM;
-        promote or revoke here and the change is marked “set by an admin”. A deactivated member keeps
-        their sessions but can't sign in.
+        Roles are provisioned from your identity provider on first sign-in and stay in sync over
+        SCIM; promote or revoke here and the change is marked “set by an admin”. A deactivated
+        member keeps their sessions but can't sign in.
       </p>
     </div>
   );

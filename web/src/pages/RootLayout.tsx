@@ -1,11 +1,11 @@
-import { Outlet, useNavigate } from '@tanstack/react-router';
-import { MainSidebar } from '../components/app-sidebar';
-import { NewSessionDialog } from '../components/NewSessionDialog';
-import { KeyboardShortcuts } from '../keyboard/KeyboardShortcuts';
-import { CommandMenu } from '../keyboard/CommandMenu';
-import { ShortcutsHelp } from '../keyboard/ShortcutsHelp';
-import { useKeyboardUi } from '../keyboard/store';
-import { SidebarInset, SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar';
+import { Outlet, useNavigate } from "@tanstack/react-router";
+import { MainSidebar } from "../components/app-sidebar";
+import { NewSessionDialog } from "../components/NewSessionDialog";
+import { KeyboardShortcuts } from "../keyboard/KeyboardShortcuts";
+import { CommandMenu } from "../keyboard/CommandMenu";
+import { ShortcutsHelp } from "../keyboard/ShortcutsHelp";
+import { useKeyboardUi } from "../keyboard/store";
+import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 
 // The app shell: the primary destinations rail + the active surface. Section
 // layouts (/sessions, /settings) render their own second sidebar INTO this
@@ -43,7 +43,7 @@ export function RootLayout() {
         showTrigger={false}
         open={newSessionOpen}
         onOpenChange={setNewSessionOpen}
-        onCreated={(id) => navigate({ to: '/sessions/$id', params: { id } })}
+        onCreated={(id) => navigate({ to: "/sessions/$id", params: { id } })}
       />
     </SidebarProvider>
   );

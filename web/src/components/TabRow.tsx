@@ -1,5 +1,5 @@
-import { cn } from '@/lib/utils';
-import { textVariants } from '@/components/ui/text';
+import { cn } from "@/lib/utils";
+import { textVariants } from "@/components/ui/text";
 
 // Typeset tab labels with a hairline underline below the active one.
 // Not pill buttons. Not icons. Just the instrument-label voice (Saira tracked
@@ -19,12 +19,7 @@ export interface TabRowProps<T extends string> {
   right?: React.ReactNode;
 }
 
-export function TabRow<T extends string>({
-  tabs,
-  active,
-  onChange,
-  right,
-}: TabRowProps<T>) {
+export function TabRow<T extends string>({ tabs, active, onChange, right }: TabRowProps<T>) {
   return (
     <div className="mb-4 flex items-baseline justify-between border-b pb-2">
       <nav className="-mb-2.5 flex items-baseline gap-5">
@@ -36,11 +31,11 @@ export function TabRow<T extends string>({
               type="button"
               onClick={() => onChange(t.id)}
               className={cn(
-                textVariants({ variant: 'label' }),
-                'border-b-2 pb-2 transition-colors',
+                textVariants({ variant: "label" }),
+                "border-b-2 pb-2 transition-colors",
                 isActive
-                  ? 'border-primary text-foreground'
-                  : 'border-transparent text-muted-foreground hover:text-foreground',
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
               )}
             >
               {t.label}
@@ -48,9 +43,7 @@ export function TabRow<T extends string>({
           );
         })}
       </nav>
-      {right && (
-        <div className="font-mono text-[0.7rem] text-muted-foreground">{right}</div>
-      )}
+      {right && <div className="font-mono text-[0.7rem] text-muted-foreground">{right}</div>}
     </div>
   );
 }

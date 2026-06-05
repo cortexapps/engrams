@@ -1,7 +1,7 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useRef } from 'react';
-import { fetchEnableJobs, retryEnableJob } from '../api';
-import type { EnableJob } from '../types';
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
+import { fetchEnableJobs, retryEnableJob } from "../api";
+import type { EnableJob } from "../types";
 
 // ADR 0036: enabling an image is asynchronous. POST returns 202 with
 // an EnableJob; the coordinator's scanner drives the pipeline
@@ -10,10 +10,10 @@ import type { EnableJob } from '../types';
 // the job list while anything is in flight — REAL progress from the
 // server, replacing the old wall-clock-driven stage guesser.
 
-export const ENABLE_JOBS_KEY = ['enable-jobs'] as const;
+export const ENABLE_JOBS_KEY = ["enable-jobs"] as const;
 
 export function isJobActive(job: EnableJob): boolean {
-  return job.state !== 'ready' && job.state !== 'failed';
+  return job.state !== "ready" && job.state !== "failed";
 }
 
 /** Recent enable jobs (newest first), polled at 2s while any job is
@@ -43,7 +43,7 @@ export function useEnableJobs() {
     const active = new Set(jobs.filter(isJobActive).map((j) => j.id));
     for (const id of prevActive.current) {
       if (!active.has(id)) {
-        qc.invalidateQueries({ queryKey: ['enabled-images'] });
+        qc.invalidateQueries({ queryKey: ["enabled-images"] });
         break;
       }
     }

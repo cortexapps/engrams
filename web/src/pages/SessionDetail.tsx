@@ -1,33 +1,33 @@
-import { useParams } from '@tanstack/react-router';
-import { useEffect, useState, type CSSProperties } from 'react';
-import { useSession } from '../hooks/useSessions';
-import { useSessionEvents } from '../hooks/useSessionEvents';
-import { StatusGlyph } from '../components/Glyph';
-import { SessionThread } from '../components/session-thread/SessionThread';
-import { TabRow } from '../components/TabRow';
-import { PageHeading } from '../components/page-heading';
-import { TerminalPane } from '../components/TerminalPane';
-import { SessionCowState } from '../components/CowState';
-import { DurabilityTimeline } from '../components/DurabilityTimeline';
-import { MetricRow } from '../components/MetricRow';
-import { relativeTime } from './sessions/session-format';
-import { Sidebar, SidebarContent, SidebarProvider } from '@/components/ui/sidebar';
-import { Text } from '@/components/ui/text';
-import type { Session } from '../types';
+import { useParams } from "@tanstack/react-router";
+import { useEffect, useState, type CSSProperties } from "react";
+import { useSession } from "../hooks/useSessions";
+import { useSessionEvents } from "../hooks/useSessionEvents";
+import { StatusGlyph } from "../components/Glyph";
+import { SessionThread } from "../components/session-thread/SessionThread";
+import { TabRow } from "../components/TabRow";
+import { PageHeading } from "../components/page-heading";
+import { TerminalPane } from "../components/TerminalPane";
+import { SessionCowState } from "../components/CowState";
+import { DurabilityTimeline } from "../components/DurabilityTimeline";
+import { MetricRow } from "../components/MetricRow";
+import { relativeTime } from "./sessions/session-format";
+import { Sidebar, SidebarContent, SidebarProvider } from "@/components/ui/sidebar";
+import { Text } from "@/components/ui/text";
+import type { Session } from "../types";
 
-type ViewTab = 'transcript' | 'shell' | 'raw';
+type ViewTab = "transcript" | "shell" | "raw";
 
 const TABS = [
-  { id: 'transcript' as const, label: 'TRANSCRIPT' },
-  { id: 'shell' as const, label: 'SHELL' },
-  { id: 'raw' as const, label: 'RAW' },
+  { id: "transcript" as const, label: "TRANSCRIPT" },
+  { id: "shell" as const, label: "SHELL" },
+  { id: "raw" as const, label: "RAW" },
 ];
 
 export function SessionDetail() {
-  const { id } = useParams({ from: '/sessions/$id' });
+  const { id } = useParams({ from: "/sessions/$id" });
   const { data: session } = useSession(id);
   const events = useSessionEvents(id);
-  const [tab, setTab] = useState<ViewTab>('transcript');
+  const [tab, setTab] = useState<ViewTab>("transcript");
   // Once the user opens the SHELL tab, keep TerminalPane mounted for
   // the lifetime of this page. Switching back to TRANSCRIPT/RAW just
   // hides it via CSS — no remount, no fresh canvas, no replayed
@@ -35,7 +35,7 @@ export function SessionDetail() {
   // connection for users who never visit the SHELL tab.
   const [shellEverActive, setShellEverActive] = useState(false);
   useEffect(() => {
-    if (tab === 'shell') setShellEverActive(true);
+    if (tab === "shell") setShellEverActive(true);
   }, [tab]);
 
   // App-like layout: the page fills the inset as a row — a content column
@@ -54,7 +54,7 @@ export function SessionDetail() {
     <SidebarProvider
       defaultOpen
       className="min-h-0 flex-1 overflow-hidden"
-      style={{ '--sidebar-width': '18rem' } as CSSProperties}
+      style={{ "--sidebar-width": "18rem" } as CSSProperties}
     >
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <div className="shrink-0 px-6 pt-6">
@@ -70,7 +70,7 @@ export function SessionDetail() {
         </div>
 
         <div className="min-h-0 flex-1 overflow-hidden">
-          {tab === 'transcript' && (
+          {tab === "transcript" && (
             <SessionThread sessionId={id} events={events} status={session?.status} />
           )}
 
@@ -80,15 +80,12 @@ export function SessionDetail() {
               ghostty-web's render loop has cross-mount quirks) ghost the
               previous session's output into the fresh canvas. */}
           {shellEverActive && (
-            <div
-              className="h-full"
-              style={{ display: tab === 'shell' ? 'block' : 'none' }}
-            >
+            <div className="h-full" style={{ display: tab === "shell" ? "block" : "none" }}>
               <TerminalPane sessionId={id} />
             </div>
           )}
 
-          {tab === 'raw' && <RawEvents events={events} />}
+          {tab === "raw" && <RawEvents events={events} />}
         </div>
       </div>
 
@@ -121,7 +118,7 @@ function SessionMeta({
       <div className="flex items-center gap-2">
         <StatusGlyph status={session.status} />
         <span className="text-sm font-medium text-foreground">
-          {session.status.replace(/_/g, ' ')}
+          {session.status.replace(/_/g, " ")}
         </span>
       </div>
 
@@ -152,23 +149,17 @@ function SessionMeta({
   );
 }
 
-function RawEvents({
-  events,
-}: {
-  events: ReturnType<typeof useSessionEvents>;
-}) {
+function RawEvents({ events }: { events: ReturnType<typeof useSessionEvents> }) {
   return (
     <div className="h-full space-y-0.5 overflow-auto px-6 py-4 font-mono text-[0.74rem] text-muted-foreground">
       {events.map((e) => (
         <div
           key={e.idx}
           className="grid items-baseline gap-3"
-          style={{ gridTemplateColumns: '4ch min-content 1fr' }}
+          style={{ gridTemplateColumns: "4ch min-content 1fr" }}
         >
           <span className="tabular-nums text-muted-foreground/70">{e.idx}</span>
-          <span className="text-[0.66rem] uppercase tracking-[0.12em]">
-            {e.event.type}
-          </span>
+          <span className="text-[0.66rem] uppercase tracking-[0.12em]">{e.event.type}</span>
           <span className="truncate text-foreground/80" title={JSON.stringify(e.event)}>
             {summarizeRaw(e.event)}
           </span>
@@ -182,8 +173,8 @@ function summarizeRaw(ev: unknown): string {
   // Compact one-liner of any event body — used only in the raw tab.
   const obj = ev as Record<string, unknown>;
   const fields = Object.entries(obj)
-    .filter(([k]) => k !== 'type' && k !== 'at')
+    .filter(([k]) => k !== "type" && k !== "at")
     .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-    .join(' ');
+    .join(" ");
   return fields;
 }

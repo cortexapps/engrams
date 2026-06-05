@@ -1,7 +1,7 @@
-import { useAuiState } from '@assistant-ui/react';
-import { CornerDownRightIcon } from 'lucide-react';
-import { hms } from '../transcriptFmt';
-import type { RunFooter as RunFooterData } from './buildMessages';
+import { useAuiState } from "@assistant-ui/react";
+import { CornerDownRightIcon } from "lucide-react";
+import { hms } from "../transcriptFmt";
+import type { RunFooter as RunFooterData } from "./buildMessages";
 
 // The per-run receipt that closes an assistant turn (`↳ read 3 · edited 1 ·
 // ran 2`), read from the assistant message's metadata.custom.run. Rendered in
@@ -9,9 +9,7 @@ import type { RunFooter as RunFooterData } from './buildMessages';
 // for the trailing in-flight message (no footer until the run closes).
 
 export function RunFooter() {
-  const run = useAuiState(
-    (s) => s.message.metadata.custom?.run as RunFooterData | undefined,
-  );
+  const run = useAuiState((s) => s.message.metadata.custom?.run as RunFooterData | undefined);
   if (!run) return null;
 
   const parts: string[] = [];
@@ -28,7 +26,7 @@ export function RunFooter() {
       ) : !run.ok ? (
         <span className="text-destructive">failed</span>
       ) : null}
-      {parts.length > 0 && <span className="tabular-nums">{parts.join(' · ')}</span>}
+      {parts.length > 0 && <span className="tabular-nums">{parts.join(" · ")}</span>}
       <span aria-hidden>·</span>
       <span className="tabular-nums">{hms(run.endAt)}</span>
     </div>

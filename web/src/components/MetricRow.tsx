@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import type { ReactNode } from "react";
 
 // The instrument rail's key/value row: a quiet lowercase label on the left,
 // the machine value (mono, tabular) hard-right against it. Shared so the

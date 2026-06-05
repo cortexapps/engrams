@@ -1,5 +1,5 @@
-import { motion } from 'framer-motion';
-import type { SessionState } from '../types';
+import { motion } from "framer-motion";
+import type { SessionState } from "../types";
 
 // Status glyphs in the margin — these stand in for colored dots. The
 // shape carries the meaning, not the color.
@@ -8,6 +8,8 @@ import type { SessionState } from '../types';
 //   ◌  idle              ○  pending
 //   ⚠  host_lost         ✓  completed
 //   ✕  dead              !  failed
+//   ◑  evicting / evacuating (transitional: suspend/relocate in
+//      flight — the half-moon mirrors the starting states' ◐)
 //
 // Active sessions get a slow opacity heartbeat. Active renders in the
 // theme ring (racing green on paper, lime on the dark ground) to read as
@@ -24,7 +26,7 @@ export interface GlyphProps {
 export function StatusGlyph({ status, beat = true }: GlyphProps) {
   const glyph = glyphFor(status);
   const tone = toneFor(status);
-  const isLive = beat && status === 'active';
+  const isLive = beat && status === "active";
 
   return (
     <motion.span
@@ -32,8 +34,8 @@ export function StatusGlyph({ status, beat = true }: GlyphProps) {
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: 0.35, ease: 'easeOut' }}
-      className={`inline-block leading-none ${isLive ? 'animate-pulse motion-reduce:animate-none' : ''}`}
+      transition={{ duration: 0.35, ease: "easeOut" }}
+      className={`inline-block leading-none ${isLive ? "animate-pulse motion-reduce:animate-none" : ""}`}
       style={{ color: tone }}
       aria-label={status}
     >
@@ -44,39 +46,46 @@ export function StatusGlyph({ status, beat = true }: GlyphProps) {
 
 function glyphFor(status: SessionState): string {
   switch (status) {
-    case 'pending':
-      return '○';
-    case 'created':
-    case 'guest_ready':
-      return '◐';
-    case 'active':
-      return '●';
-    case 'idle':
-      return '◌';
-    case 'host_lost':
-      return '⚠';
-    case 'completed':
-      return '✓';
-    case 'failed':
-      return '!';
-    case 'dead':
-      return '✕';
+    case "pending":
+      return "○";
+    case "created":
+    case "guest_ready":
+      return "◐";
+    case "active":
+      return "●";
+    case "idle":
+      return "◌";
+    case "evicting":
+    case "evacuating":
+      return "◑";
+    case "host_lost":
+      return "⚠";
+    case "completed":
+      return "✓";
+    case "failed":
+      return "!";
+    case "dead":
+      return "✕";
   }
 }
 
 function toneFor(status: SessionState): string {
   switch (status) {
-    case 'active':
-      return 'var(--ring)'; // racing green on paper, lime on the dark ground
-    case 'idle':
-    case 'pending':
-    case 'created':
-    case 'guest_ready':
-    case 'completed':
-    case 'dead':
-      return 'var(--muted-foreground)';
-    case 'host_lost':
-    case 'failed':
-      return 'var(--destructive)';
+    case "active":
+      return "var(--ring)"; // racing green on paper, lime on the dark ground
+    case "idle":
+    case "pending":
+    case "created":
+    case "guest_ready":
+    // Transitional suspend/relocate: faded like idle — on their way there
+    // (or back to active), not in trouble.
+    case "evicting":
+    case "evacuating":
+    case "completed":
+    case "dead":
+      return "var(--muted-foreground)";
+    case "host_lost":
+    case "failed":
+      return "var(--destructive)";
   }
 }

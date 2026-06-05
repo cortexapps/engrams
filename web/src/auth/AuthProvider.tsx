@@ -5,13 +5,13 @@
 //   - "not a member" screen for a 403 (authenticated but not provisioned)
 //   - error screen for non-401/403 failures (coordinator down, etc.)
 
-import { useQuery } from '@tanstack/react-query';
-import { createContext, useContext, type ReactNode } from 'react';
-import { fetchMe, logout, NotMemberError } from '../api';
-import type { Principal } from '../types';
-import { EngramMark } from '../components/EngramMark';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
+import { useQuery } from "@tanstack/react-query";
+import { createContext, useContext, type ReactNode } from "react";
+import { fetchMe, logout, NotMemberError } from "../api";
+import type { Principal } from "../types";
+import { EngramMark } from "../components/EngramMark";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 
 export interface AuthState {
   /** Always present for children — the provider only renders them once the
@@ -38,8 +38,13 @@ export function AuthContextProvider({
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const { data: principal, isLoading, error, refetch } = useQuery({
-    queryKey: ['me'],
+  const {
+    data: principal,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
+    queryKey: ["me"],
     queryFn: fetchMe,
     retry: 0,
     staleTime: 60_000,
@@ -55,12 +60,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   if (error || !principal) {
-    return (
-      <AuthErrorScreen
-        message={error?.message}
-        onRetry={() => void refetch()}
-      />
-    );
+    return <AuthErrorScreen message={error?.message} onRetry={() => void refetch()} />;
   }
 
   const value: AuthState = {
@@ -74,7 +74,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 export function useAuth(): AuthState {
   const ctx = useContext(AuthContext);
   if (!ctx) {
-    throw new Error('useAuth must be used within an AuthProvider');
+    throw new Error("useAuth must be used within an AuthProvider");
   }
   return ctx;
 }
@@ -105,23 +105,17 @@ function BootScreen() {
   );
 }
 
-function AuthErrorScreen({
-  message,
-  onRetry,
-}: {
-  message?: string;
-  onRetry: () => void;
-}) {
+function AuthErrorScreen({ message, onRetry }: { message?: string; onRetry: () => void }) {
   return (
     <AuthStage>
       <Card className="w-full max-w-md">
         <CardContent className="flex flex-col items-center gap-4 py-8 text-center">
           <EngramMark size={72} mode="static" />
-          <p className="text-base font-medium">
-            Could not reach the coordinator — retrying…
-          </p>
+          <p className="text-base font-medium">Could not reach the coordinator — retrying…</p>
           {message && <p className="text-sm text-muted-foreground">{message}</p>}
-          <Button variant="outline" onClick={onRetry}>Retry now</Button>
+          <Button variant="outline" onClick={onRetry}>
+            Retry now
+          </Button>
         </CardContent>
       </Card>
     </AuthStage>
@@ -139,7 +133,9 @@ function NotMemberScreen({ email }: { email: string }) {
           </p>
           {email && <p className="font-mono text-sm text-muted-foreground">{email}</p>}
           <p className="text-sm text-muted-foreground">Ask an admin to add you, then reload.</p>
-          <Button variant="ghost" onClick={() => void logout()}>Sign out</Button>
+          <Button variant="ghost" onClick={() => void logout()}>
+            Sign out
+          </Button>
         </CardContent>
       </Card>
     </AuthStage>

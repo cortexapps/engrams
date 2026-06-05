@@ -1,5 +1,5 @@
-import { afterEach } from 'vitest';
-import { cleanup } from '@testing-library/react';
+import { afterEach } from "vitest";
+import { cleanup } from "@testing-library/react";
 
 afterEach(() => cleanup());
 
@@ -17,7 +17,7 @@ if (!window.matchMedia) {
     }) as unknown as MediaQueryList;
 }
 
-if (!('ResizeObserver' in window)) {
+if (!("ResizeObserver" in window)) {
   // @ts-expect-error minimal stub
   window.ResizeObserver = class {
     observe() {}
@@ -31,6 +31,7 @@ if (!('ResizeObserver' in window)) {
 // mount via requestAnimationFrame (`viewport.scrollTo(...)`), which surfaced as
 // repeated "div.scrollTo is not a function" uncaught exceptions. No-op them, the
 // same way matchMedia/ResizeObserver are stubbed above.
-if (typeof Element.prototype.scrollTo !== 'function') Element.prototype.scrollTo = () => {};
-if (typeof Element.prototype.scrollBy !== 'function') Element.prototype.scrollBy = () => {};
-if (typeof Element.prototype.scrollIntoView !== 'function') Element.prototype.scrollIntoView = () => {};
+if (typeof Element.prototype.scrollTo !== "function") Element.prototype.scrollTo = () => {};
+if (typeof Element.prototype.scrollBy !== "function") Element.prototype.scrollBy = () => {};
+if (typeof Element.prototype.scrollIntoView !== "function")
+  Element.prototype.scrollIntoView = () => {};

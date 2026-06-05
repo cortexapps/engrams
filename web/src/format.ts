@@ -3,8 +3,8 @@
 
 /** Human byte size with binary units, e.g. `1.5 MiB`. `0 B` for zero. */
 export function fmtBytes(n: number): string {
-  if (n === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  if (n === 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let value = n;
   let unit = 0;
   while (value >= 1024 && unit < units.length - 1) {
@@ -16,7 +16,7 @@ export function fmtBytes(n: number): string {
 
 /** "Xs ago" / "Xm ago" / … from an ISO-8601 timestamp; `never` for null. */
 export function fmtAgo(iso: string | null): string {
-  if (!iso) return 'never';
+  if (!iso) return "never";
   const then = new Date(iso).getTime();
   const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
   if (seconds < 60) return `${seconds}s ago`;

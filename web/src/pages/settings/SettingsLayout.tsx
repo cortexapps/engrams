@@ -1,22 +1,27 @@
-import { KeyRound, Users, UserCircle } from 'lucide-react';
-import { Link, Outlet, useRouterState } from '@tanstack/react-router';
-import { useIsAdmin } from '../../auth/AuthProvider';
+import { KeyRound, Users, UserCircle } from "lucide-react";
+import { Link, Outlet, useRouterState } from "@tanstack/react-router";
+import { useIsAdmin } from "../../auth/AuthProvider";
 import {
-  Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarGroupLabel,
-  SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider,
-} from '@/components/ui/sidebar';
-import type { NavItem } from '@/components/nav';
-import { cn } from '@/lib/utils';
+  Sidebar,
+  SidebarContent,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+} from "@/components/ui/sidebar";
+import type { NavItem } from "@/components/nav";
+import { cn } from "@/lib/utils";
 
 // Account scope only. Infrastructure config (images, registries) moved to the
 // Operator section; Settings now holds your own account and org-wide membership.
 const MINE: NavItem[] = [
-  { to: '/settings/profile', label: 'Profile', icon: UserCircle },
-  { to: '/settings/tokens', label: 'Tokens', icon: KeyRound },
+  { to: "/settings/profile", label: "Profile", icon: UserCircle },
+  { to: "/settings/tokens", label: "Tokens", icon: KeyRound },
 ];
-const ORG: NavItem[] = [
-  { to: '/settings/members', label: 'Members', icon: Users },
-];
+const ORG: NavItem[] = [{ to: "/settings/members", label: "Members", icon: Users }];
 
 export function SettingsLayout() {
   const isAdmin = useIsAdmin();
@@ -29,7 +34,10 @@ export function SettingsLayout() {
           {items.map((it) => (
             <SidebarMenuItem key={it.label}>
               <SidebarMenuButton asChild isActive={pathname.startsWith(it.to as string)}>
-                <Link to={it.to}><it.icon /><span>{it.label}</span></Link>
+                <Link to={it.to}>
+                  <it.icon />
+                  <span>{it.label}</span>
+                </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
           ))}
@@ -43,24 +51,37 @@ export function SettingsLayout() {
   return (
     <SidebarProvider className="min-h-0 flex-1">
       {/* desktop (md+): vertical second sidebar */}
-      <Sidebar collapsible="none" className="sidebar-section hidden border-r border-sidebar-border md:flex">
+      <Sidebar
+        collapsible="none"
+        className="sidebar-section hidden border-r border-sidebar-border md:flex"
+      >
         <SidebarContent>
-          {group('My settings', MINE)}
-          {isAdmin && group('Org', ORG)}
+          {group("My settings", MINE)}
+          {isAdmin && group("Org", ORG)}
         </SidebarContent>
       </Sidebar>
       <div className="flex flex-1 flex-col overflow-auto">
         {/* mobile (<md): horizontal nav strip */}
         <nav className="flex gap-1 overflow-x-auto border-b p-2 md:hidden">
           {items.map((it) => (
-            <Link key={it.label} to={it.to}
-              className={cn('inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm',
-                pathname.startsWith(it.to as string) ? 'bg-accent text-accent-foreground' : 'text-muted-foreground')}>
-              <it.icon className="size-4" />{it.label}
+            <Link
+              key={it.label}
+              to={it.to}
+              className={cn(
+                "inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm",
+                pathname.startsWith(it.to as string)
+                  ? "bg-accent text-accent-foreground"
+                  : "text-muted-foreground",
+              )}
+            >
+              <it.icon className="size-4" />
+              {it.label}
             </Link>
           ))}
         </nav>
-        <div className="flex-1 p-4 md:p-6"><Outlet /></div>
+        <div className="flex-1 p-4 md:p-6">
+          <Outlet />
+        </div>
       </div>
     </SidebarProvider>
   );

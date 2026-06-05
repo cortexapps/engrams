@@ -1,7 +1,7 @@
-import * as React from "react"
-import { cva, type VariantProps } from "class-variance-authority"
+import * as React from "react";
+import { cva, type VariantProps } from "class-variance-authority";
 
-import { cn } from "@/lib/utils"
+import { cn } from "@/lib/utils";
 
 // The single source of truth for type roles. Two orthogonal axes:
 //
@@ -31,8 +31,7 @@ const textVariants = cva("", {
       body: "text-sm leading-relaxed",
       // Instrument label / eyebrow / table header / tab. Callers set color via
       // `tone` and may override size; the default 0.7rem fits most labels.
-      label:
-        "font-display text-[0.7rem] leading-none font-medium tracking-[0.1em] uppercase",
+      label: "font-display text-[0.7rem] leading-none font-medium tracking-[0.1em] uppercase",
       // The figure in a gauge: big, aligned, machine.
       stat: "font-mono text-2xl leading-none tabular-nums",
       code: "font-mono text-[0.8rem]",
@@ -46,14 +45,14 @@ const textVariants = cva("", {
     },
   },
   defaultVariants: { variant: "body", tone: "inherit" },
-})
+});
 
-type TextVariantProps = VariantProps<typeof textVariants>
+type TextVariantProps = VariantProps<typeof textVariants>;
 
 type TextProps<T extends React.ElementType> = TextVariantProps & {
   /** The element/component to render. Defaults to `p`. */
-  as?: T
-} & Omit<React.ComponentPropsWithoutRef<T>, keyof TextVariantProps | "as">
+  as?: T;
+} & Omit<React.ComponentPropsWithoutRef<T>, keyof TextVariantProps | "as">;
 
 // Polymorphic, typesafe: `as` widens the accepted props to the chosen element
 // (React 19 takes `ref` as a normal prop, so no forwardRef ceremony needed).
@@ -64,10 +63,8 @@ function Text<T extends React.ElementType = "p">({
   className,
   ...props
 }: TextProps<T>) {
-  const Comp = (as ?? "p") as React.ElementType
-  return (
-    <Comp className={cn(textVariants({ variant, tone }), className)} {...props} />
-  )
+  const Comp = (as ?? "p") as React.ElementType;
+  return <Comp className={cn(textVariants({ variant, tone }), className)} {...props} />;
 }
 
-export { Text, textVariants }
+export { Text, textVariants };

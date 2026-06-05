@@ -1,14 +1,10 @@
-import { ChevronDownIcon, TerminalIcon } from 'lucide-react';
-import type { ToolCallMessagePartProps } from '@assistant-ui/react';
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible';
-import { Badge } from '@/components/ui/badge';
-import { cn } from '@/lib/utils';
-import { fmtDur } from '../transcriptFmt';
-import type { ShellArgs } from './buildMessages';
+import { ChevronDownIcon, TerminalIcon } from "lucide-react";
+import type { ToolCallMessagePartProps } from "@assistant-ui/react";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
+import { fmtDur } from "../transcriptFmt";
+import type { ShellArgs } from "./buildMessages";
 
 // Renders an `engram.shell` tool part — a sandbox/operator shell exec, which
 // is a distinct thing from an agent tool call (those fall through to
@@ -21,23 +17,20 @@ export function ShellToolPart({
   result,
   status,
 }: ToolCallMessagePartProps<ShellArgs, string>) {
-  const running = status?.type === 'running';
-  const command = args?.command ?? '';
+  const running = status?.type === "running";
+  const command = args?.command ?? "";
   const exit = args?.exit;
   const durationMs = args?.durationMs;
   const failed = !running && exit != null && exit !== 0;
-  const output = typeof result === 'string' ? result.trimEnd() : '';
+  const output = typeof result === "string" ? result.trimEnd() : "";
   const hasOutput = output.length > 0;
 
   return (
-    <Collapsible
-      className="w-full rounded-lg border bg-card/40"
-      disabled={!hasOutput}
-    >
+    <Collapsible className="w-full rounded-lg border bg-card/40" disabled={!hasOutput}>
       <CollapsibleTrigger
         className={cn(
-          'group flex w-full items-center gap-2 px-3 py-2 text-left font-mono text-sm',
-          hasOutput ? 'cursor-pointer' : 'cursor-default',
+          "group flex w-full items-center gap-2 px-3 py-2 text-left font-mono text-sm",
+          hasOutput ? "cursor-pointer" : "cursor-default",
         )}
       >
         <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
@@ -49,10 +42,7 @@ export function ShellToolPart({
             running…
           </Badge>
         ) : exit != null ? (
-          <Badge
-            variant={failed ? 'destructive' : 'outline'}
-            className="shrink-0 tabular-nums"
-          >
+          <Badge variant={failed ? "destructive" : "outline"} className="shrink-0 tabular-nums">
             exit {exit}
           </Badge>
         ) : null}

@@ -1,7 +1,7 @@
-import { useRouterState } from '@tanstack/react-router';
-import { useSession, useSessions } from '../../hooks/useSessions';
-import type { Session, SessionListItem, SessionState } from '../../types';
-import { compareSessions } from './session-format';
+import { useRouterState } from "@tanstack/react-router";
+import { useSession, useSessions } from "../../hooks/useSessions";
+import type { Session, SessionListItem, SessionState } from "../../types";
+import { compareSessions } from "./session-format";
 
 // The ordered, capped, open-session-pinned list that backs BOTH the sessions
 // rail and the keyboard jump layer (⌥1–9 / ⌥[ ⌥]). Lifting it here is what
@@ -20,8 +20,18 @@ export interface RailRow {
   image: string;
   at: string;
 }
-const fromListItem = (s: SessionListItem): RailRow => ({ id: s.id, status: s.status, image: s.image, at: s.last_active_at });
-const fromSession = (s: Session): RailRow => ({ id: s.id, status: s.status, image: s.image, at: s.created_at });
+const fromListItem = (s: SessionListItem): RailRow => ({
+  id: s.id,
+  status: s.status,
+  image: s.image,
+  at: s.last_active_at,
+});
+const fromSession = (s: Session): RailRow => ({
+  id: s.id,
+  status: s.status,
+  image: s.image,
+  at: s.created_at,
+});
 
 // Stable order so the 1s refetch never reorders rows under the cursor: by
 // lifecycle bucket (active → idle → archived), then most-recently-active. The
@@ -47,10 +57,10 @@ export function useRailSessions(): RailSessions {
 
   // `/sessions/<id>` → the open session; `/sessions/all` is the fleet list, not
   // a detail.
-  const seg = pathname.startsWith('/sessions/') ? pathname.split('/')[2] : undefined;
-  const openId = seg && seg !== 'all' ? seg : undefined;
+  const seg = pathname.startsWith("/sessions/") ? pathname.split("/")[2] : undefined;
+  const openId = seg && seg !== "all" ? seg : undefined;
 
-  const { data, isPending, error } = useSessions('mine');
+  const { data, isPending, error } = useSessions("mine");
   const all = data ?? [];
   const recent = sortForRail(all).slice(0, RAIL_CAP);
 

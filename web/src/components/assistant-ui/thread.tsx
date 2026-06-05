@@ -46,18 +46,14 @@ export const Thread: FC = () => {
       className="aui-root aui-thread-root @container flex h-full flex-col bg-background"
       style={{ ["--thread-max-width" as string]: "44rem" }}
     >
-      <ThreadPrimitive.Viewport
-        className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth"
-      >
+      <ThreadPrimitive.Viewport className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth">
         <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-1 flex-col px-4 pt-4">
           <AuiIf condition={(s) => s.thread.isEmpty}>
             <ThreadEmpty />
           </AuiIf>
 
           <div className="mb-8 flex flex-col gap-y-6 empty:hidden">
-            <ThreadPrimitive.Messages>
-              {() => <ThreadMessage />}
-            </ThreadPrimitive.Messages>
+            <ThreadPrimitive.Messages>{() => <ThreadMessage />}</ThreadPrimitive.Messages>
           </div>
 
           <ThreadPrimitive.ViewportFooter className="sticky bottom-0 mt-auto flex flex-col gap-2 bg-background pb-4">
@@ -72,9 +68,28 @@ export const Thread: FC = () => {
 
 const ThreadMessage: FC = () => {
   const role = useAuiState((s) => s.message.role);
-  if (role === "system") return <SystemMessage />;
-  if (role === "user") return <UserMessage />;
-  return <AssistantMessage />;
+  // ADR 0028 A.log: messages tombstoned by a rung-1 rewind stay viewable but
+  // greyed behind a left rule — the recovery is honest, not a silent deletion.
+  const rewound = useAuiState((s) => s.message.metadata.custom?.rewound === true);
+  const inner =
+    role === "system" ? (
+      <SystemMessage />
+    ) : role === "user" ? (
+      <UserMessage />
+    ) : (
+      <AssistantMessage />
+    );
+  if (rewound) {
+    return (
+      <div
+        className="border-l-2 border-muted-foreground/40 pl-3 opacity-45"
+        title="Rolled back by a checkpoint recovery"
+      >
+        {inner}
+      </div>
+    );
+  }
+  return inner;
 };
 
 const ThreadEmpty: FC = () => {
@@ -278,7 +293,9 @@ const ComposerAction: FC = () => {
             className="h-8 w-auto gap-0.5 rounded-full px-3 font-mono text-xs"
             aria-label="Send message"
           >
-            <span aria-hidden className="leading-none">⌘</span>
+            <span aria-hidden className="leading-none">
+              ⌘
+            </span>
             <CornerDownLeftIcon className="size-3.5" />
           </TooltipIconButton>
         </ComposerPrimitive.Send>

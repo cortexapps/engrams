@@ -1,6 +1,6 @@
-import { useHosts } from './useHosts';
-import { useStorageSummary } from './useStorageSummary';
-import { deriveHealthMetrics, operatorIssues, type HealthTone } from '../operator-health';
+import { useHosts } from "./useHosts";
+import { useStorageSummary } from "./useStorageSummary";
+import { deriveHealthMetrics, operatorIssues, type HealthTone } from "../operator-health";
 
 export type { HealthTone };
 export interface OperatorHealth {

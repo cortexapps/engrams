@@ -1,9 +1,9 @@
-import { Fragment } from 'react';
-import { cn } from '@/lib/utils';
-import { Badge } from '@/components/ui/badge';
-import { useSessionCheckpoints } from '../hooks/useCheckpoints';
-import { fmtAgo, fmtBytes } from '../format';
-import type { CheckpointSummary } from '../types';
+import { Fragment } from "react";
+import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
+import { useSessionCheckpoints } from "../hooks/useCheckpoints";
+import { fmtAgo, fmtBytes } from "../format";
+import type { CheckpointSummary } from "../types";
 
 // ADR 0028 A.log / Fix A: the consolidated durability view for a
 // session — the recovery ladder made legible.
@@ -25,29 +25,29 @@ import type { CheckpointSummary } from '../types';
 // the semantic moments (eviction snapshot, resume, the recovery boundary);
 // the steady cadence lives here.
 
-type Tone = 'anchor' | 'recoverable' | 'unverified';
+type Tone = "anchor" | "recoverable" | "unverified";
 
 function toneOf(c: CheckpointSummary): Tone {
-  if (c.is_latest) return 'anchor';
-  return c.recoverable ? 'recoverable' : 'unverified';
+  if (c.is_latest) return "anchor";
+  return c.recoverable ? "recoverable" : "unverified";
 }
 
 const DOT: Record<Tone, string> = {
-  anchor: 'bg-instrument-nominal',
-  recoverable: 'bg-muted-foreground/40',
-  unverified: 'border border-instrument-caution bg-card',
+  anchor: "bg-instrument-nominal",
+  recoverable: "bg-muted-foreground/40",
+  unverified: "border border-instrument-caution bg-card",
 };
 
 const BADGE: Record<Tone, string> = {
-  anchor: 'border-instrument-nominal/40 text-instrument-nominal',
-  recoverable: 'text-muted-foreground',
-  unverified: 'border-instrument-caution/40 text-instrument-caution',
+  anchor: "border-instrument-nominal/40 text-instrument-nominal",
+  recoverable: "text-muted-foreground",
+  unverified: "border-instrument-caution/40 text-instrument-caution",
 };
 
 const LABEL: Record<Tone, string> = {
-  anchor: 'anchor',
-  recoverable: 'recoverable',
-  unverified: 'unverified',
+  anchor: "anchor",
+  recoverable: "recoverable",
+  unverified: "unverified",
 };
 
 export function DurabilityTimeline({ sessionId }: { sessionId: string }) {
@@ -91,9 +91,9 @@ function TimelineStrip({ ordered }: { ordered: CheckpointSummary[] }) {
               aria-hidden
               title={`${fmtAgo(c.created_at)} · ${fmtBytes(c.size_bytes)} · ${LABEL[tone]}`}
               className={cn(
-                'size-2 shrink-0 rounded-full',
+                "size-2 shrink-0 rounded-full",
                 DOT[tone],
-                c.is_latest && 'ring-2 ring-instrument-nominal/25',
+                c.is_latest && "ring-2 ring-instrument-nominal/25",
               )}
             />
           </Fragment>
@@ -112,20 +112,16 @@ function ChainList({ checkpoints }: { checkpoints: CheckpointSummary[] }) {
           <li
             key={c.snapshot_id}
             className="flex items-center gap-2 border-b border-dashed border-border py-1.5 last:border-0"
-            title={`snapshot ${c.snapshot_id} · events cursor ${
-              c.events_cursor ?? 'unresolved'
-            }`}
+            title={`snapshot ${c.snapshot_id} · events cursor ${c.events_cursor ?? "unresolved"}`}
           >
-            <span aria-hidden className={cn('size-1.5 shrink-0 rounded-full', DOT[tone])} />
-            <span className="font-mono tabular-nums text-foreground">
-              {fmtAgo(c.created_at)}
-            </span>
+            <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", DOT[tone])} />
+            <span className="font-mono tabular-nums text-foreground">{fmtAgo(c.created_at)}</span>
             <span className="ml-auto font-mono tabular-nums text-muted-foreground">
               {fmtBytes(c.size_bytes)}
             </span>
             <Badge
               variant="outline"
-              className={cn('shrink-0 px-1.5 py-0 text-[0.65rem] font-normal', BADGE[tone])}
+              className={cn("shrink-0 px-1.5 py-0 text-[0.65rem] font-normal", BADGE[tone])}
             >
               {LABEL[tone]}
             </Badge>

@@ -1,15 +1,23 @@
-import { Server, SquareTerminal } from 'lucide-react';
-import { Link, useRouterState } from '@tanstack/react-router';
-import { useIsAdmin } from '../auth/AuthProvider';
-import { useOperatorHealth } from '../hooks/useOperatorHealth';
-import type { NavItem } from './nav';
-import { EngramMark } from './EngramMark';
-import { ModeToggle } from './mode-toggle';
-import { UserMenu } from './user-menu';
+import { Server, SquareTerminal } from "lucide-react";
+import { Link, useRouterState } from "@tanstack/react-router";
+import { useIsAdmin } from "../auth/AuthProvider";
+import { useOperatorHealth } from "../hooks/useOperatorHealth";
+import type { NavItem } from "./nav";
+import { EngramMark } from "./EngramMark";
+import { ModeToggle } from "./mode-toggle";
+import { UserMenu } from "./user-menu";
 import {
-  Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent,
-  SidebarHeader, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarTrigger,
-} from '@/components/ui/sidebar';
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
 
 interface Dest extends NavItem {
   adminOnly: boolean;
@@ -27,8 +35,20 @@ interface Dest extends NavItem {
 // columns: the terminal stands for the developer hat, the server for the
 // operator hat.
 const DESTS: Dest[] = [
-  { to: '/sessions', label: 'Sessions', icon: SquareTerminal, adminOnly: false, match: (p) => p === '/' || p.startsWith('/sessions') },
-  { to: '/operator', label: 'Operator', icon: Server, adminOnly: true, match: (p) => p.startsWith('/operator') },
+  {
+    to: "/sessions",
+    label: "Sessions",
+    icon: SquareTerminal,
+    adminOnly: false,
+    match: (p) => p === "/" || p.startsWith("/sessions"),
+  },
+  {
+    to: "/operator",
+    label: "Operator",
+    icon: Server,
+    adminOnly: true,
+    match: (p) => p.startsWith("/operator"),
+  },
 ];
 
 export function MainSidebar() {
@@ -41,10 +61,7 @@ export function MainSidebar() {
   // otherwise sit between this rail and the section sidebar.
   return (
     <Sidebar collapsible="icon" className="border-r-sidebar">
-      <div
-        aria-hidden
-        className="bg-carbon-fade pointer-events-none absolute inset-0 -z-10"
-      />
+      <div aria-hidden className="bg-carbon-fade pointer-events-none absolute inset-0 -z-10" />
       <SidebarHeader>
         <SidebarMenu>
           <SidebarMenuItem>
@@ -72,7 +89,7 @@ export function MainSidebar() {
                       <span>{d.label}</span>
                     </Link>
                   </SidebarMenuButton>
-                  {d.to === '/operator' && <OperatorRailSignal />}
+                  {d.to === "/operator" && <OperatorRailSignal />}
                 </SidebarMenuItem>
               ))}
             </SidebarMenu>
@@ -110,7 +127,7 @@ function OperatorRailSignal() {
       aria-label={`Operator needs attention: ${reason}`}
       className="pointer-events-none absolute right-1.5 top-1.5 z-10 flex size-2"
     >
-      {tone === 'critical' && (
+      {tone === "critical" && (
         <span
           aria-hidden
           className="absolute inline-flex size-full animate-ping rounded-full opacity-60 [animation-duration:1.8s] motion-reduce:hidden"

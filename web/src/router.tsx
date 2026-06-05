@@ -18,23 +18,23 @@ import {
   createRoute,
   createRouter,
   redirect,
-} from '@tanstack/react-router';
-import type { AuthState } from './auth/AuthProvider';
-import { RootLayout } from './pages/RootLayout';
-import { SessionsLayout } from './pages/sessions/SessionsLayout';
-import { MySessions } from './pages/sessions/MySessions';
-import { AllSessions } from './pages/sessions/AllSessions';
-import { SessionDetail } from './pages/SessionDetail';
-import { OperatorLayout } from './pages/operator/OperatorLayout';
-import { Overview } from './pages/operator/Overview';
-import { Fleet } from './pages/Fleet';
-import { Storage } from './pages/Storage';
-import { SettingsLayout } from './pages/settings/SettingsLayout';
-import { Members } from './pages/Members';
-import { ImagesPanel } from './components/settings/ImagesPanel';
-import { ProfilePanel } from './components/settings/ProfilePanel';
-import { RegistriesPanel } from './components/settings/RegistriesPanel';
-import { TokensPanel } from './components/settings/TokensPanel';
+} from "@tanstack/react-router";
+import type { AuthState } from "./auth/AuthProvider";
+import { RootLayout } from "./pages/RootLayout";
+import { SessionsLayout } from "./pages/sessions/SessionsLayout";
+import { MySessions } from "./pages/sessions/MySessions";
+import { AllSessions } from "./pages/sessions/AllSessions";
+import { SessionDetail } from "./pages/SessionDetail";
+import { OperatorLayout } from "./pages/operator/OperatorLayout";
+import { Overview } from "./pages/operator/Overview";
+import { Fleet } from "./pages/Fleet";
+import { Storage } from "./pages/Storage";
+import { SettingsLayout } from "./pages/settings/SettingsLayout";
+import { Members } from "./pages/Members";
+import { ImagesPanel } from "./components/settings/ImagesPanel";
+import { ProfilePanel } from "./components/settings/ProfilePanel";
+import { RegistriesPanel } from "./components/settings/RegistriesPanel";
+import { TokensPanel } from "./components/settings/TokensPanel";
 
 export interface RouterContext {
   auth: AuthState;
@@ -44,7 +44,7 @@ export interface RouterContext {
  * bounced to their profile instead of rendering an empty/erroring panel. */
 function requireAdmin({ context }: { context: RouterContext }) {
   if (!context.auth.isAdmin) {
-    throw redirect({ to: '/settings/profile' });
+    throw redirect({ to: "/settings/profile" });
   }
 }
 
@@ -53,26 +53,26 @@ const rootRoute = createRootRoute({ component: RootLayout });
 
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: '/',
+  path: "/",
   beforeLoad: () => {
-    throw redirect({ to: '/sessions' });
+    throw redirect({ to: "/sessions" });
   },
 });
 
 // /sessions layout route (second sidebar) ----------------------------------
 const sessionsLayoutRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: '/sessions',
+  path: "/sessions",
   component: SessionsLayout,
 });
 const mySessionsRoute = createRoute({
   getParentRoute: () => sessionsLayoutRoute,
-  path: '/',
+  path: "/",
   component: MySessions,
 });
 const allSessionsRoute = createRoute({
   getParentRoute: () => sessionsLayoutRoute,
-  path: 'all',
+  path: "all",
   beforeLoad: requireAdmin,
   component: AllSessions,
 });
@@ -81,7 +81,7 @@ const allSessionsRoute = createRoute({
 // `$id`, so /sessions/all still resolves to the fleet list.
 const sessionDetailRoute = createRoute({
   getParentRoute: () => sessionsLayoutRoute,
-  path: '$id',
+  path: "$id",
   component: SessionDetail,
 });
 
@@ -89,42 +89,77 @@ const sessionDetailRoute = createRoute({
 // is admin-gated here, so the child telemetry/config routes don't each re-guard.
 const operatorLayoutRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: '/operator',
+  path: "/operator",
   beforeLoad: requireAdmin,
   component: OperatorLayout,
 });
-const operatorIndexRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: '/', component: Overview });
-const operatorFleetRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: 'fleet', component: Fleet });
-const operatorStorageRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: 'storage', component: Storage });
-const operatorImagesRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: 'images', component: ImagesPanel });
-const operatorRegistriesRoute = createRoute({ getParentRoute: () => operatorLayoutRoute, path: 'registries', component: RegistriesPanel });
+const operatorIndexRoute = createRoute({
+  getParentRoute: () => operatorLayoutRoute,
+  path: "/",
+  component: Overview,
+});
+const operatorFleetRoute = createRoute({
+  getParentRoute: () => operatorLayoutRoute,
+  path: "fleet",
+  component: Fleet,
+});
+const operatorStorageRoute = createRoute({
+  getParentRoute: () => operatorLayoutRoute,
+  path: "storage",
+  component: Storage,
+});
+const operatorImagesRoute = createRoute({
+  getParentRoute: () => operatorLayoutRoute,
+  path: "images",
+  component: ImagesPanel,
+});
+const operatorRegistriesRoute = createRoute({
+  getParentRoute: () => operatorLayoutRoute,
+  path: "registries",
+  component: RegistriesPanel,
+});
 
 // /settings layout route (second sidebar) ----------------------------------
 const settingsLayoutRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: '/settings',
+  path: "/settings",
   component: SettingsLayout,
 });
 const settingsIndexRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
-  path: '/',
+  path: "/",
   beforeLoad: () => {
-    throw redirect({ to: '/settings/profile' });
+    throw redirect({ to: "/settings/profile" });
   },
 });
-const profileRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'profile', component: ProfilePanel });
-const tokensRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'tokens', component: TokensPanel });
-const membersRoute = createRoute({ getParentRoute: () => settingsLayoutRoute, path: 'members', beforeLoad: requireAdmin, component: Members });
+const profileRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "profile",
+  component: ProfilePanel,
+});
+const tokensRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "tokens",
+  component: TokensPanel,
+});
+const membersRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "members",
+  beforeLoad: requireAdmin,
+  component: Members,
+});
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
   sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
   operatorLayoutRoute.addChildren([
-    operatorIndexRoute, operatorFleetRoute, operatorStorageRoute, operatorImagesRoute, operatorRegistriesRoute,
+    operatorIndexRoute,
+    operatorFleetRoute,
+    operatorStorageRoute,
+    operatorImagesRoute,
+    operatorRegistriesRoute,
   ]),
-  settingsLayoutRoute.addChildren([
-    settingsIndexRoute, profileRoute, tokensRoute, membersRoute,
-  ]),
+  settingsLayoutRoute.addChildren([settingsIndexRoute, profileRoute, tokensRoute, membersRoute]),
 ]);
 
 export const router = createRouter({
@@ -133,7 +168,7 @@ export const router = createRouter({
   context: { auth: undefined! as AuthState },
 });
 
-declare module '@tanstack/react-router' {
+declare module "@tanstack/react-router" {
   interface Register {
     router: typeof router;
   }

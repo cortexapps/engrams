@@ -1,16 +1,16 @@
-import { useMemo } from 'react';
+import { useMemo } from "react";
 import {
   AssistantRuntimeProvider,
   useExternalStoreRuntime,
   type AppendMessage,
   type ThreadMessageLike,
-} from '@assistant-ui/react';
-import { Thread } from '@/components/assistant-ui/thread';
-import { TooltipProvider } from '@/components/ui/tooltip';
-import { sendPrompt, interruptSession } from '../../api';
-import { buildMessages } from './buildMessages';
-import { SessionStatusContext } from './session-status';
-import type { IndexedEvent, SessionState } from '../../types';
+} from "@assistant-ui/react";
+import { Thread } from "@/components/assistant-ui/thread";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { sendPrompt, interruptSession } from "../../api";
+import { buildMessages } from "./buildMessages";
+import { SessionStatusContext } from "./session-status";
+import type { IndexedEvent, SessionState } from "../../types";
 
 // The transcript tab, on assistant-ui. The session's SSE event stream is the
 // single source of truth: `buildMessages` reduces it to the assistant-ui
@@ -26,9 +26,9 @@ import type { IndexedEvent, SessionState } from '../../types';
 /** Pull the plain-text body out of a composer AppendMessage. */
 function appendText(message: AppendMessage): string {
   return message.content
-    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+    .filter((p): p is { type: "text"; text: string } => p.type === "text")
     .map((p) => p.text)
-    .join('\n')
+    .join("\n")
     .trim();
 }
 
@@ -40,10 +40,10 @@ export interface SessionThreadProps {
 }
 
 const SEND_BLOCKED: ReadonlySet<SessionState> = new Set<SessionState>([
-  'completed',
-  'failed',
-  'dead',
-  'host_lost',
+  "completed",
+  "failed",
+  "dead",
+  "host_lost",
 ]);
 
 export function SessionThread({ sessionId, events, status }: SessionThreadProps) {
@@ -67,7 +67,7 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
       try {
         await interruptSession(sessionId);
       } catch (err) {
-        console.warn('interrupt failed', err);
+        console.warn("interrupt failed", err);
       }
     },
   });

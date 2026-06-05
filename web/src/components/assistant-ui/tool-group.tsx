@@ -3,11 +3,7 @@
 import { useCallback, useRef, useState } from "react";
 import { ChevronDownIcon, Layers2Icon, LoaderIcon } from "lucide-react";
 import { useScrollLock } from "@assistant-ui/react";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 
 // A disclosure that coalesces a run of adjacent tool calls into one
@@ -61,10 +57,7 @@ export function ToolGroupRoot({
       data-slot="tool-group-root"
       open={isOpen}
       onOpenChange={handleOpenChange}
-      className={cn(
-        "aui-tool-group-root group/tool-group-root w-full",
-        className,
-      )}
+      className={cn("aui-tool-group-root group/tool-group-root w-full", className)}
       style={
         {
           "--animation-duration": `${ANIMATION_DURATION}ms`,
@@ -103,10 +96,7 @@ export function ToolGroupTrigger({
           className="size-3.5 shrink-0 animate-spin"
         />
       ) : (
-        <Layers2Icon
-          data-slot="tool-group-trigger-icon"
-          className="size-3.5 shrink-0"
-        />
+        <Layers2Icon data-slot="tool-group-trigger-icon" className="size-3.5 shrink-0" />
       )}
       <span
         data-slot="tool-group-trigger-label"

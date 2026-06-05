@@ -1,5 +1,5 @@
-import type { ThreadMessageLike } from '@assistant-ui/react';
-import type { AgentRole, IndexedEvent } from '../../types';
+import type { ThreadMessageLike } from "@assistant-ui/react";
+import type { AgentRole, IndexedEvent } from "../../types";
 
 // Adapt the session's append-only SSE event stream (ADR 0030) into the
 // assistant-ui message model. This is the successor to Transcript's
@@ -28,7 +28,7 @@ import type { AgentRole, IndexedEvent } from '../../types';
 
 /** Reserved synthetic tool name for a sandbox shell exec (vs. an agent
  *  tool_call). Namespaced so it can't collide with a real harness tool. */
-export const SHELL_TOOL = 'engram.shell';
+export const SHELL_TOOL = "engram.shell";
 
 /** Args we stash on the synthetic shell tool-call part. */
 export interface ShellArgs {
@@ -40,9 +40,9 @@ export interface ShellArgs {
 /** Payload carried in a system message's `metadata.custom.marker` — the
  *  harness-register events that aren't agent messages. */
 export type SystemMarker =
-  | { kind: 'durability'; mark: 'snapshot' | 'resumed'; sizeBytes?: number; at: string }
+  | { kind: "durability"; mark: "snapshot" | "resumed"; sizeBytes?: number; at: string }
   | {
-      kind: 'pull_request';
+      kind: "pull_request";
       url: string;
       repo: string;
       title: string;
@@ -52,7 +52,7 @@ export type SystemMarker =
       at: string;
     }
   | {
-      kind: 'artifact';
+      kind: "artifact";
       sessionId: string;
       artifactId: string;
       mediaType: string;
@@ -60,7 +60,17 @@ export type SystemMarker =
       caption: string | null;
       at: string;
     }
-  | { kind: 'note'; role: AgentRole; at: string };
+  | { kind: "note"; role: AgentRole; at: string }
+  // ADR 0028 A.log: a rung-1 recovery rewound the live transcript to a
+  // checkpoint. The boundary itself is live; the rolled-back events above
+  // it render greyed (see `rewound` tagging below). Outside-world side
+  // effects in the rolled-back span survived and are surfaced, not hidden.
+  | {
+      kind: "recovery";
+      rolledBack: number;
+      survivingSideEffects: string[];
+      at: string;
+    };
 
 /** Footer carried in an assistant message's `metadata.custom.run` — the
  *  per-run receipt (`↳ read N · edited N · ran N`). */
@@ -83,9 +93,9 @@ export interface BuildMessagesResult {
 
 // ---- internal mutable drafts (assignable to ThreadMessageLike) --------
 
-type TextPart = { type: 'text'; text: string };
+type TextPart = { type: "text"; text: string };
 type ToolPart = {
-  type: 'tool-call';
+  type: "tool-call";
   toolCallId: string;
   toolName: string;
   args: Record<string, unknown>;
@@ -96,42 +106,43 @@ type ToolPart = {
 type Part = TextPart | ToolPart;
 
 interface Draft {
-  role: 'user' | 'assistant' | 'system';
+  role: "user" | "assistant" | "system";
   content: Part[];
   id: string;
   createdAt?: Date;
-  status?: ThreadMessageLike['status'];
+  status?: ThreadMessageLike["status"];
   metadata?: { custom: Record<string, unknown> };
 }
 
-const PENDING_ID = 'pending';
+const PENDING_ID = "pending";
 
-function classifyTool(name: string): 'reads' | 'edits' | 'ran' | 'other' {
+function classifyTool(name: string): "reads" | "edits" | "ran" | "other" {
   if (/^(read|grep|glob|ls|list|search|cat|find|notebookread|fetch|web)/i.test(name))
-    return 'reads';
-  if (/^(edit|write|create|apply_?patch|multiedit|notebookedit|update|delete|remove|move|rename|mkdir)/i.test(name))
-    return 'edits';
+    return "reads";
+  if (
+    /^(edit|write|create|apply_?patch|multiedit|notebookedit|update|delete|remove|move|rename|mkdir)/i.test(
+      name,
+    )
+  )
+    return "edits";
   // Command-running tools — the agent's `Bash`/shell calls live here so they
   // tally as "ran" alongside sandbox execs, not as opaque "other".
   if (/^(bash|shell|sh|exec|run|command|terminal|kill|process|task|agent)/i.test(name))
-    return 'ran';
-  return 'other';
+    return "ran";
+  return "other";
 }
 
 function parseArgs(argsSummary: string | null): Record<string, unknown> {
   if (!argsSummary) return {};
   try {
     const o = JSON.parse(argsSummary) as unknown;
-    return o && typeof o === 'object' ? (o as Record<string, unknown>) : {};
+    return o && typeof o === "object" ? (o as Record<string, unknown>) : {};
   } catch {
     return {};
   }
 }
 
-export function buildMessages(
-  events: IndexedEvent[],
-  sessionId: string,
-): BuildMessagesResult {
+export function buildMessages(events: IndexedEvent[], sessionId: string): BuildMessagesResult {
   const out: Draft[] = [];
 
   // The assistant message currently accumulating this run's parts, or null
@@ -145,18 +156,18 @@ export function buildMessages(
 
   // Per-run tally feeding the assistant-message footer.
   let tally: { reads: number; edits: number; ran: number; other: number } | null = null;
-  const bump = (k: 'reads' | 'edits' | 'ran' | 'other') => {
+  const bump = (k: "reads" | "edits" | "ran" | "other") => {
     if (tally) tally[k] += 1;
   };
 
   const ensureAssistant = (at?: string): Draft => {
     if (active) return active;
     active = {
-      role: 'assistant',
+      role: "assistant",
       content: [],
       id: `a:${out.length}`,
       createdAt: at ? new Date(at) : undefined,
-      status: { type: 'running' },
+      status: { type: "running" },
     };
     out.push(active);
     return active;
@@ -167,17 +178,26 @@ export function buildMessages(
   const pushSystem = (id: string, fallback: string, marker: SystemMarker) => {
     active = null;
     out.push({
-      role: 'system',
-      content: [{ type: 'text', text: fallback }],
+      role: "system",
+      content: [{ type: "text", text: fallback }],
       id,
-      createdAt: 'at' in marker ? new Date(marker.at) : undefined,
+      createdAt: "at" in marker ? new Date(marker.at) : undefined,
       metadata: { custom: { marker } },
     });
   };
 
-  for (const { idx, event: ev } of events) {
+  // ADR 0028 A.log: stamp `rewound` into the custom metadata of every draft
+  // an event touched, so the rolled-back span renders greyed. Preserves any
+  // existing custom payload (run footer, marker).
+  const markRewound = (d: Draft) => {
+    d.metadata = { custom: { ...(d.metadata?.custom ?? {}), rewound: true } };
+  };
+
+  for (const indexed of events) {
+    const { idx, event: ev } = indexed;
+    const lenBefore = out.length;
     switch (ev.type) {
-      case 'run_started': {
+      case "run_started": {
         tally = { reads: 0, edits: 0, ran: 0, other: 0 };
         runOpen = true;
         active = null;
@@ -186,8 +206,8 @@ export function buildMessages(
         // IS present, surface it as the user turn.
         if (ev.prompt_summary) {
           out.push({
-            role: 'user',
-            content: [{ type: 'text', text: ev.prompt_summary }],
+            role: "user",
+            content: [{ type: "text", text: ev.prompt_summary }],
             id: `rs:${idx}`,
             createdAt: new Date(ev.at),
           });
@@ -195,44 +215,44 @@ export function buildMessages(
         break;
       }
 
-      case 'agent_message': {
-        if (ev.role === 'user') {
+      case "agent_message": {
+        if (ev.role === "user") {
           active = null;
           out.push({
-            role: 'user',
-            content: [{ type: 'text', text: ev.text }],
+            role: "user",
+            content: [{ type: "text", text: ev.text }],
             id: `m:${idx}`,
             createdAt: new Date(ev.at),
           });
-        } else if (ev.role === 'system') {
-          pushSystem(`m:${idx}`, ev.text, { kind: 'note', role: ev.role, at: ev.at });
+        } else if (ev.role === "system") {
+          pushSystem(`m:${idx}`, ev.text, { kind: "note", role: ev.role, at: ev.at });
         } else {
           const a = ensureAssistant(ev.at);
           const last = a.content[a.content.length - 1];
           // Coalesce consecutive assistant text into one prose part (matches
           // the old block model's join), keeping tool parts as boundaries.
-          if (last && last.type === 'text') last.text += `\n\n${ev.text}`;
-          else a.content.push({ type: 'text', text: ev.text });
+          if (last && last.type === "text") last.text += `\n\n${ev.text}`;
+          else a.content.push({ type: "text", text: ev.text });
         }
         break;
       }
 
-      case 'tool_call_started': {
+      case "tool_call_started": {
         bump(classifyTool(ev.tool_name));
         const a = ensureAssistant(ev.at);
         const part: ToolPart = {
-          type: 'tool-call',
+          type: "tool-call",
           toolCallId: ev.tool_call_id,
           toolName: ev.tool_name,
           args: parseArgs(ev.args_summary),
-          argsText: ev.args_summary ?? '',
+          argsText: ev.args_summary ?? "",
         };
         a.content.push(part);
         openTools.set(ev.tool_call_id, part);
         break;
       }
 
-      case 'tool_call_completed': {
+      case "tool_call_completed": {
         const part = openTools.get(ev.tool_call_id);
         if (part) {
           part.result = ev.result_summary ?? undefined;
@@ -243,11 +263,11 @@ export function buildMessages(
           // standalone completed part.
           const a = ensureAssistant(ev.at);
           a.content.push({
-            type: 'tool-call',
+            type: "tool-call",
             toolCallId: ev.tool_call_id,
             toolName: ev.tool_name,
             args: {},
-            argsText: '',
+            argsText: "",
             result: ev.result_summary ?? undefined,
             isError: !ev.ok,
           });
@@ -255,12 +275,12 @@ export function buildMessages(
         break;
       }
 
-      case 'exec_started': {
-        bump('ran');
+      case "exec_started": {
+        bump("ran");
         const a = ensureAssistant(ev.at);
-        const command = (ev.command ?? []).join(' ');
+        const command = (ev.command ?? []).join(" ");
         const part: ToolPart = {
-          type: 'tool-call',
+          type: "tool-call",
           toolCallId: ev.exec_id,
           toolName: SHELL_TOOL,
           args: { command } satisfies ShellArgs,
@@ -271,14 +291,14 @@ export function buildMessages(
         break;
       }
 
-      case 'stdout':
-      case 'stderr': {
+      case "stdout":
+      case "stderr": {
         const part = openExecs.get(ev.exec_id);
-        if (part) part.result = `${(part.result as string | undefined) ?? ''}${ev.chunk}`;
+        if (part) part.result = `${(part.result as string | undefined) ?? ""}${ev.chunk}`;
         break;
       }
 
-      case 'exec_completed': {
+      case "exec_completed": {
         const part = openExecs.get(ev.exec_id);
         if (part) {
           const args = part.args as unknown as ShellArgs;
@@ -290,9 +310,9 @@ export function buildMessages(
         break;
       }
 
-      case 'run_completed':
-      case 'run_interrupted': {
-        const interrupted = ev.type === 'run_interrupted';
+      case "run_completed":
+      case "run_interrupted": {
+        const interrupted = ev.type === "run_interrupted";
         const ok = interrupted ? false : ev.ok;
         const footer: RunFooter = {
           reads: tally?.reads ?? 0,
@@ -305,8 +325,8 @@ export function buildMessages(
         };
         const a = ensureAssistant(ev.at);
         a.status = ok
-          ? { type: 'complete', reason: 'stop' }
-          : { type: 'incomplete', reason: interrupted ? 'cancelled' : 'error' };
+          ? { type: "complete", reason: "stop" }
+          : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
         a.metadata = { custom: { ...(a.metadata?.custom ?? {}), run: footer } };
         active = null;
         runOpen = false;
@@ -314,26 +334,26 @@ export function buildMessages(
         break;
       }
 
-      case 'snapshot_taken':
-        pushSystem(`snap:${idx}`, 'snapshot taken', {
-          kind: 'durability',
-          mark: 'snapshot',
+      case "snapshot_taken":
+        pushSystem(`snap:${idx}`, "snapshot taken", {
+          kind: "durability",
+          mark: "snapshot",
           sizeBytes: ev.size_bytes,
           at: ev.at,
         });
         break;
 
-      case 'resumed':
-        pushSystem(`res:${idx}`, 'resumed', {
-          kind: 'durability',
-          mark: 'resumed',
+      case "resumed":
+        pushSystem(`res:${idx}`, "resumed", {
+          kind: "durability",
+          mark: "resumed",
           at: ev.at,
         });
         break;
 
-      case 'pull_request_opened':
+      case "pull_request_opened":
         pushSystem(`pr:${idx}`, `opened PR #${ev.number}: ${ev.title}`, {
-          kind: 'pull_request',
+          kind: "pull_request",
           url: ev.url,
           repo: ev.repo,
           title: ev.title,
@@ -344,9 +364,9 @@ export function buildMessages(
         });
         break;
 
-      case 'file_shared':
-        pushSystem(`art:${idx}`, ev.caption ?? 'shared a file', {
-          kind: 'artifact',
+      case "file_shared":
+        pushSystem(`art:${idx}`, ev.caption ?? "shared a file", {
+          kind: "artifact",
           sessionId,
           artifactId: ev.artifact_id,
           mediaType: ev.media_type,
@@ -356,7 +376,16 @@ export function buildMessages(
         });
         break;
 
-      case 'harness_idle':
+      case "recovered_from_checkpoint":
+        pushSystem(`rec:${idx}`, "↩ recovered from a checkpoint", {
+          kind: "recovery",
+          rolledBack: ev.rolled_back,
+          survivingSideEffects: ev.surviving_side_effects,
+          at: ev.at,
+        });
+        break;
+
+      case "harness_idle":
         active = null;
         break;
 
@@ -364,6 +393,16 @@ export function buildMessages(
         // status_changed, evicted, checkpoint_* — not surfaced; the RAW
         // tab shows them.
         break;
+    }
+
+    // ADR 0028 A.log: events tombstoned by a rung-1 rewind stay viewable but
+    // greyed. Tag both any draft this event pushed and the assistant draft it
+    // appended to (tool/message events accrue into `active` without pushing).
+    // The recovery boundary itself is live (not flagged rewound), so it stays
+    // full-opacity below the greyed span.
+    if (indexed.rewound) {
+      for (let i = lenBefore; i < out.length; i++) markRewound(out[i]!);
+      if (active) markRewound(active);
     }
   }
 
@@ -374,8 +413,8 @@ export function buildMessages(
   // a prompt, or a fresh run opened with no parts yet).
   if (isRunning) {
     const last = out[out.length - 1];
-    if (!(last && last.role === 'assistant' && last.status?.type === 'running')) {
-      out.push({ role: 'assistant', content: [], id: PENDING_ID, status: { type: 'running' } });
+    if (!(last && last.role === "assistant" && last.status?.type === "running")) {
+      out.push({ role: "assistant", content: [], id: PENDING_ID, status: { type: "running" } });
     }
   }
 
@@ -388,13 +427,13 @@ export function buildMessages(
 function tailAwaiting(out: Draft[]): boolean {
   for (let i = out.length - 1; i >= 0; i--) {
     const m = out[i]!;
-    if (m.role === 'system') {
+    if (m.role === "system") {
       const marker = m.metadata?.custom?.marker as SystemMarker | undefined;
-      if (marker?.kind === 'durability') continue;
+      if (marker?.kind === "durability") continue;
       return false;
     }
-    if (m.role === 'assistant') return m.status?.type === 'running';
-    if (m.role === 'user') return true;
+    if (m.role === "assistant") return m.status?.type === "running";
+    if (m.role === "user") return true;
   }
   return false;
 }

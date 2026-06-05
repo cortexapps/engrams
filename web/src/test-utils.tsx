@@ -8,18 +8,18 @@
 // context carries `auth` (mirrors src/router.tsx's RouterContext) seeded from a
 // test principal, bypassing the /me query.
 
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryHistory,
   createRootRouteWithContext,
   createRoute,
   createRouter,
   RouterProvider,
-} from '@tanstack/react-router';
-import { render, type RenderOptions } from '@testing-library/react';
-import { type ReactElement } from 'react';
-import { AuthContextProvider, type AuthState } from './auth/AuthProvider';
-import type { Principal } from './types';
+} from "@tanstack/react-router";
+import { render, type RenderOptions } from "@testing-library/react";
+import { type ReactElement } from "react";
+import { AuthContextProvider, type AuthState } from "./auth/AuthProvider";
+import type { Principal } from "./types";
 
 interface TestRouterContext {
   auth: AuthState;
@@ -28,15 +28,15 @@ interface TestRouterContext {
 /** Default test principal: a local admin with a saved token, matching the
  * dev synthetic admin. Override via `renderWithProviders({ principal })`. */
 const DEFAULT_PRINCIPAL: Principal = {
-  email: 'dev@engram.local',
-  display_name: 'Local Admin',
-  role: 'admin',
+  email: "dev@engram.local",
+  display_name: "Local Admin",
+  role: "admin",
   is_admin: true,
   has_claude_token: true,
   can_sign_out: true,
 };
 
-export interface RenderWithProvidersOptions extends Omit<RenderOptions, 'wrapper'> {
+export interface RenderWithProvidersOptions extends Omit<RenderOptions, "wrapper"> {
   /** Reuse a caller-supplied client (rare — for multi-step tests that need
    * cache continuity). Default: a fresh client per call. */
   queryClient?: QueryClient;
@@ -47,11 +47,7 @@ export interface RenderWithProvidersOptions extends Omit<RenderOptions, 'wrapper
 
 export function renderWithProviders(
   ui: ReactElement,
-  {
-    queryClient,
-    principal = DEFAULT_PRINCIPAL,
-    ...renderOptions
-  }: RenderWithProvidersOptions = {},
+  { queryClient, principal = DEFAULT_PRINCIPAL, ...renderOptions }: RenderWithProvidersOptions = {},
 ) {
   const client =
     queryClient ??
@@ -83,13 +79,13 @@ export function renderWithProviders(
   // doesn't throw.
   const splatRoute = createRoute({
     getParentRoute: () => rootRoute,
-    path: '$',
+    path: "$",
     component: () => null,
   });
 
   const router = createRouter({
     routeTree: rootRoute.addChildren([splatRoute]),
-    history: createMemoryHistory({ initialEntries: ['/'] }),
+    history: createMemoryHistory({ initialEntries: ["/"] }),
     context: { auth: authValue },
   });
 

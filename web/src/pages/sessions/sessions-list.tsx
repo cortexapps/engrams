@@ -1,14 +1,20 @@
-import { useState, type ReactNode } from 'react';
-import { Link } from '@tanstack/react-router';
-import { Avatar, AvatarFallback } from '@/components/ui/avatar';
-import { Skeleton } from '@/components/ui/skeleton';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { StatusGlyph } from '../../components/Glyph';
-import type { SessionListItem } from '../../types';
+import { useState, type ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { StatusGlyph } from "../../components/Glyph";
+import type { SessionListItem } from "../../types";
 import {
-  compareSessions, lifecycleOf, matchesFilter, relativeTime, shortId, statusLabel,
-  stripImageHost, type StatusFilter,
-} from './session-format';
+  compareSessions,
+  lifecycleOf,
+  matchesFilter,
+  relativeTime,
+  shortId,
+  statusLabel,
+  stripImageHost,
+  type StatusFilter,
+} from "./session-format";
 
 // The sessions list reads as a workspace switcher, not a data grid: a flat list
 // of rich rows ordered running-first (the same order as the rail), each row a
@@ -17,10 +23,15 @@ import {
 // take over later — and the image/status/age trail as quiet metadata. Live /
 // Archived / All tabs keep terminal history out of the default working set.
 
-const FILTERS: StatusFilter[] = ['live', 'archived', 'all'];
+const FILTERS: StatusFilter[] = ["live", "archived", "all"];
 
 export function SessionsList({
-  sessions, showOwner, emptyText, emptyAction, isPending, error,
+  sessions,
+  showOwner,
+  emptyText,
+  emptyAction,
+  isPending,
+  error,
 }: {
   sessions: SessionListItem[];
   showOwner: boolean;
@@ -34,7 +45,7 @@ export function SessionsList({
    * background refetch keeps the last-good list visible (calm under live state). */
   error?: unknown;
 }) {
-  const [filter, setFilter] = useState<StatusFilter>('live');
+  const [filter, setFilter] = useState<StatusFilter>("live");
 
   // The query keeps `placeholderData: prev`, so once we've loaded, `isPending`
   // is false and stale rows stay on screen through refetches. These two guards
@@ -44,7 +55,7 @@ export function SessionsList({
     return (
       <div role="alert" className="rounded-lg border border-dashed py-12 text-center">
         <p className="text-sm text-destructive">
-          Couldn’t load sessions.{error instanceof Error ? ` ${error.message}` : ''}
+          Couldn’t load sessions.{error instanceof Error ? ` ${error.message}` : ""}
         </p>
       </div>
     );
@@ -62,14 +73,23 @@ export function SessionsList({
     );
   }
 
-  const live = sessions.filter((s) => lifecycleOf(s.status) !== 'ARCHIVED').length;
+  const live = sessions.filter((s) => lifecycleOf(s.status) !== "ARCHIVED").length;
 
   return (
     <Tabs value={filter} onValueChange={(v) => setFilter(v as StatusFilter)}>
       <TabsList>
-        <TabsTrigger value="live">Live<Count n={live} /></TabsTrigger>
-        <TabsTrigger value="archived">Archived<Count n={sessions.length - live} /></TabsTrigger>
-        <TabsTrigger value="all">All<Count n={sessions.length} /></TabsTrigger>
+        <TabsTrigger value="live">
+          Live
+          <Count n={live} />
+        </TabsTrigger>
+        <TabsTrigger value="archived">
+          Archived
+          <Count n={sessions.length - live} />
+        </TabsTrigger>
+        <TabsTrigger value="all">
+          All
+          <Count n={sessions.length} />
+        </TabsTrigger>
       </TabsList>
       {FILTERS.map((f) => (
         <TabsContent key={f} value={f}>
@@ -81,15 +101,19 @@ export function SessionsList({
 }
 
 function SessionRows({
-  sessions, filter, showOwner,
+  sessions,
+  filter,
+  showOwner,
 }: {
-  sessions: SessionListItem[]; filter: StatusFilter; showOwner: boolean;
+  sessions: SessionListItem[];
+  filter: StatusFilter;
+  showOwner: boolean;
 }) {
   const rows = sessions.filter((s) => matchesFilter(s.status, filter)).sort(compareSessions);
   if (rows.length === 0) {
     return (
       <p className="py-10 text-center text-sm text-muted-foreground">
-        {filter === 'archived' ? 'No archived sessions.' : 'No live sessions.'}
+        {filter === "archived" ? "No archived sessions." : "No live sessions."}
       </p>
     );
   }
@@ -149,13 +173,13 @@ function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }
         </span>
         {showOwner && (
           <span className="hidden w-40 shrink-0 items-center gap-2 sm:flex">
-            {s.owner_kind === 'system' ? (
+            {s.owner_kind === "system" ? (
               <span className="text-xs italic text-muted-foreground">system</span>
             ) : (
               <>
                 <Avatar className="size-5 shrink-0">
                   <AvatarFallback className="text-[10px]">
-                    {(s.owner_name || s.owner_email || '?').charAt(0).toUpperCase()}
+                    {(s.owner_name || s.owner_email || "?").charAt(0).toUpperCase()}
                   </AvatarFallback>
                 </Avatar>
                 <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">

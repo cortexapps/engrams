@@ -1,22 +1,22 @@
-import { Fragment } from 'react';
-import { useIsAdmin } from '../auth/AuthProvider';
-import { useKeyboardUi } from './store';
-import { ALT_LABEL, MOD_LABEL } from './platform';
+import { Fragment } from "react";
+import { useIsAdmin } from "../auth/AuthProvider";
+import { useKeyboardUi } from "./store";
+import { ALT_LABEL, MOD_LABEL } from "./platform";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
   DialogHeader,
   DialogTitle,
-} from '@/components/ui/dialog';
-import { Kbd, KbdGroup } from '@/components/ui/kbd';
-import { Text } from '@/components/ui/text';
+} from "@/components/ui/dialog";
+import { Kbd, KbdGroup } from "@/components/ui/kbd";
+import { Text } from "@/components/ui/text";
 
 // The `?` cheatsheet — the discoverability home for the keymap. Each row pairs
 // a plain-language action with its key caps; sequences read "g then s", chords
 // read "⌥ + 1". Modifier glyphs adapt to the platform (⌘ vs Ctrl).
 
-type Cap = { kind: 'chord' | 'seq' | 'range'; keys: string[] };
+type Cap = { kind: "chord" | "seq" | "range"; keys: string[] };
 
 interface Row {
   label: string;
@@ -28,40 +28,40 @@ interface Group {
   rows: Row[];
 }
 
-const chord = (...keys: string[]): Cap => ({ kind: 'chord', keys });
-const seq = (...keys: string[]): Cap => ({ kind: 'seq', keys });
-const range = (...keys: string[]): Cap => ({ kind: 'range', keys });
+const chord = (...keys: string[]): Cap => ({ kind: "chord", keys });
+const seq = (...keys: string[]): Cap => ({ kind: "seq", keys });
+const range = (...keys: string[]): Cap => ({ kind: "range", keys });
 
 const GROUPS: Group[] = [
   {
-    heading: 'General',
+    heading: "General",
     rows: [
-      { label: 'Open command palette', cap: chord(MOD_LABEL, 'K') },
-      { label: 'Start new session', cap: chord('c') },
-      { label: 'Toggle sidebar', cap: chord(MOD_LABEL, 'B') },
-      { label: 'Keyboard shortcuts', cap: chord('?') },
+      { label: "Open command palette", cap: chord(MOD_LABEL, "K") },
+      { label: "Start new session", cap: chord("c") },
+      { label: "Toggle sidebar", cap: chord(MOD_LABEL, "B") },
+      { label: "Keyboard shortcuts", cap: chord("?") },
     ],
   },
   {
-    heading: 'Go to',
+    heading: "Go to",
     rows: [
-      { label: 'Sessions', cap: seq('g', 's') },
-      { label: 'Operator', cap: seq('g', 'o'), admin: true },
-      { label: 'Fleet', cap: seq('g', 'f'), admin: true },
-      { label: 'Settings', cap: seq('g', ',') },
+      { label: "Sessions", cap: seq("g", "s") },
+      { label: "Operator", cap: seq("g", "o"), admin: true },
+      { label: "Fleet", cap: seq("g", "f"), admin: true },
+      { label: "Settings", cap: seq("g", ",") },
     ],
   },
   {
-    heading: 'Switch sessions',
+    heading: "Switch sessions",
     rows: [
-      { label: 'Jump to session 1–9', cap: range(ALT_LABEL, '1', '9') },
-      { label: 'Previous / next session', cap: range(ALT_LABEL, '[', ']') },
+      { label: "Jump to session 1–9", cap: range(ALT_LABEL, "1", "9") },
+      { label: "Previous / next session", cap: range(ALT_LABEL, "[", "]") },
     ],
   },
 ];
 
 function CapKeys({ cap }: { cap: Cap }) {
-  if (cap.kind === 'seq') {
+  if (cap.kind === "seq") {
     // "g then s" — a sequence, not a chord.
     return (
       <KbdGroup>
@@ -74,10 +74,10 @@ function CapKeys({ cap }: { cap: Cap }) {
       </KbdGroup>
     );
   }
-  if (cap.kind === 'range') {
+  if (cap.kind === "range") {
     // "⌥ 1 … 9" or "⌥ [ / ]".
     const [mod, a, b] = cap.keys;
-    const sep = a === '1' ? '…' : '/';
+    const sep = a === "1" ? "…" : "/";
     return (
       <KbdGroup>
         <Kbd>{mod}</Kbd>

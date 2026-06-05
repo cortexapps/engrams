@@ -30,37 +30,37 @@
 :root {
   --radius: 0.5rem; /* gently rounded — precise, not hard-cornered, not pill */
 
-  --background: oklch(0.972 0.014 128);         /* lab paper — a whisper of green, not celadon */
-  --foreground: oklch(0.301 0.020 206);         /* petrol ink (#223133) */
-  --card: oklch(0.992 0.006 128);               /* a clean sheet raised off the paper */
-  --card-foreground: oklch(0.301 0.020 206);
+  --background: oklch(0.972 0.014 128); /* lab paper — a whisper of green, not celadon */
+  --foreground: oklch(0.301 0.02 206); /* petrol ink (#223133) */
+  --card: oklch(0.992 0.006 128); /* a clean sheet raised off the paper */
+  --card-foreground: oklch(0.301 0.02 206);
   --popover: oklch(0.992 0.006 128);
-  --popover-foreground: oklch(0.301 0.020 206);
-  --primary: oklch(0.878 0.181 121);            /* Aston-F1 lime — a FILL only */
-  --primary-foreground: oklch(0.22 0.040 150);  /* deep racing-green ink on lime */
-  --secondary: oklch(0.945 0.018 128);          /* soft sage fill, recessed from the paper */
+  --popover-foreground: oklch(0.301 0.02 206);
+  --primary: oklch(0.878 0.181 121); /* Aston-F1 lime — a FILL only */
+  --primary-foreground: oklch(0.22 0.04 150); /* deep racing-green ink on lime */
+  --secondary: oklch(0.945 0.018 128); /* soft sage fill, recessed from the paper */
   --secondary-foreground: oklch(0.33 0.018 206);
   --muted: oklch(0.945 0.018 128);
-  --muted-foreground: oklch(0.44 0.028 200);    /* ink-faded — AA on paper */
-  --accent: oklch(0.955 0.022 128);             /* faint hover wash */
+  --muted-foreground: oklch(0.44 0.028 200); /* ink-faded — AA on paper */
+  --accent: oklch(0.955 0.022 128); /* faint hover wash */
   --accent-foreground: oklch(0.33 0.018 206);
-  --destructive: oklch(0.52 0.20 27);           /* signal red — now the only red */
-  --border: oklch(0.885 0.018 128);             /* hairline rule */
+  --destructive: oklch(0.52 0.2 27); /* signal red — now the only red */
+  --border: oklch(0.885 0.018 128); /* hairline rule */
   --input: oklch(0.885 0.018 128);
-  --ring: oklch(0.55 0.15 132);                 /* racing green — lime is invisible on paper */
+  --ring: oklch(0.55 0.15 132); /* racing green — lime is invisible on paper */
 
   /* The cover is the drama: a deep bottle-green spine against the celadon
      content (the Mont Blanc move), not another pale-green panel. Sage ink,
      claret active marker — the dark sidebar reads like the dark theme even
      in light mode, which is the point. */
-  --sidebar: oklch(0.32 0.050 190);             /* deep bottle-green spine */
-  --sidebar-foreground: oklch(0.93 0.030 125);  /* sage ink on the cover */
-  --sidebar-primary: oklch(0.878 0.181 121);    /* lime — active nav item on the dark cover */
-  --sidebar-primary-foreground: oklch(0.18 0.020 200);
-  --sidebar-accent: oklch(0.38 0.052 190);      /* raised green — hover/active wash */
+  --sidebar: oklch(0.32 0.05 190); /* deep bottle-green spine */
+  --sidebar-foreground: oklch(0.93 0.03 125); /* sage ink on the cover */
+  --sidebar-primary: oklch(0.878 0.181 121); /* lime — active nav item on the dark cover */
+  --sidebar-primary-foreground: oklch(0.18 0.02 200);
+  --sidebar-accent: oklch(0.38 0.052 190); /* raised green — hover/active wash */
   --sidebar-accent-foreground: oklch(0.95 0.025 120);
-  --sidebar-border: oklch(0.93 0.030 125 / 14%);
-  --sidebar-ring: oklch(0.80 0.16 121);         /* lime — visible on the dark spine */
+  --sidebar-border: oklch(0.93 0.03 125 / 14%);
+  --sidebar-ring: oklch(0.8 0.16 121); /* lime — visible on the dark spine */
 
   /* Carbon-fibre twill, woven over the green spine and fading upward. Built
      from translucent threads so the green shows through: a darker warp thread
@@ -74,39 +74,39 @@
      interactive-only, so these three never touch its hue (121). Vivid enough
      to read as arcs and lit dots on the card; status text always pairs a
      colored dot with ink, never colored body copy, so AA holds. */
-  --instrument-nominal: oklch(0.60 0.15 150);   /* signal green — emerald, not lime */
-  --instrument-caution: oklch(0.70 0.155 71);   /* amber */
-  --instrument-critical: oklch(0.55 0.21 27);   /* instrument red ≈ destructive */
+  --instrument-nominal: oklch(0.6 0.15 150); /* signal green — emerald, not lime */
+  --instrument-caution: oklch(0.7 0.155 71); /* amber */
+  --instrument-critical: oklch(0.55 0.21 27); /* instrument red ≈ destructive */
 }
 
 .dark {
-  --background: oklch(0.205 0.024 200);         /* racing-green-black — the ink gone deep */
-  --foreground: oklch(0.90 0.035 125);          /* pale sage ink */
+  --background: oklch(0.205 0.024 200); /* racing-green-black — the ink gone deep */
+  --foreground: oklch(0.9 0.035 125); /* pale sage ink */
   --card: oklch(0.242 0.026 200);
-  --card-foreground: oklch(0.90 0.035 125);
+  --card-foreground: oklch(0.9 0.035 125);
   --popover: oklch(0.242 0.026 200);
-  --popover-foreground: oklch(0.90 0.035 125);
-  --primary: oklch(0.85 0.18 121);              /* Aston-F1 lime — luminous on green-black */
-  --primary-foreground: oklch(0.20 0.030 150);
+  --popover-foreground: oklch(0.9 0.035 125);
+  --primary: oklch(0.85 0.18 121); /* Aston-F1 lime — luminous on green-black */
+  --primary-foreground: oklch(0.2 0.03 150);
   --secondary: oklch(0.27 0.026 200);
-  --secondary-foreground: oklch(0.90 0.035 125);
+  --secondary-foreground: oklch(0.9 0.035 125);
   --muted: oklch(0.27 0.026 200);
-  --muted-foreground: oklch(0.73 0.030 125);    /* sage-faded — AA on green-black */
+  --muted-foreground: oklch(0.73 0.03 125); /* sage-faded — AA on green-black */
   --accent: oklch(0.29 0.028 200);
-  --accent-foreground: oklch(0.90 0.035 125);
-  --destructive: oklch(0.65 0.20 25);
-  --border: oklch(0.90 0.035 125 / 12%);
-  --input: oklch(0.90 0.035 125 / 16%);
-  --ring: oklch(0.80 0.16 121);                 /* lime — pops on the dark ground */
+  --accent-foreground: oklch(0.9 0.035 125);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(0.9 0.035 125 / 12%);
+  --input: oklch(0.9 0.035 125 / 16%);
+  --ring: oklch(0.8 0.16 121); /* lime — pops on the dark ground */
 
-  --sidebar: oklch(0.175 0.024 200);            /* notebook cover — darker than content */
-  --sidebar-foreground: oklch(0.90 0.035 125);
+  --sidebar: oklch(0.175 0.024 200); /* notebook cover — darker than content */
+  --sidebar-foreground: oklch(0.9 0.035 125);
   --sidebar-primary: oklch(0.85 0.18 121);
-  --sidebar-primary-foreground: oklch(0.20 0.030 150);
+  --sidebar-primary-foreground: oklch(0.2 0.03 150);
   --sidebar-accent: oklch(0.27 0.026 200);
-  --sidebar-accent-foreground: oklch(0.90 0.035 125);
-  --sidebar-border: oklch(0.90 0.035 125 / 9%);
-  --sidebar-ring: oklch(0.80 0.16 121);
+  --sidebar-accent-foreground: oklch(0.9 0.035 125);
+  --sidebar-border: oklch(0.9 0.035 125 / 9%);
+  --sidebar-ring: oklch(0.8 0.16 121);
 
   --carbon-thread: oklch(0 0 0 / 0.22);
   --carbon-sheen: oklch(1 0 0 / 0.05);
@@ -114,8 +114,8 @@
 
   /* Instrument status — luminance lifted to sit on the green-black ground. */
   --instrument-nominal: oklch(0.72 0.16 150);
-  --instrument-caution: oklch(0.80 0.15 75);
-  --instrument-critical: oklch(0.66 0.20 25);
+  --instrument-caution: oklch(0.8 0.15 75);
+  --instrument-critical: oklch(0.66 0.2 25);
 }
 
 /* The section rail (the second sidebar) is one step lighter than the primary
@@ -127,12 +127,12 @@
   --sidebar: oklch(0.385 0.052 190);
   --sidebar-accent: oklch(0.46 0.055 190);
   --sidebar-accent-foreground: oklch(0.96 0.025 120);
-  --sidebar-border: oklch(0.93 0.030 125 / 12%);
+  --sidebar-border: oklch(0.93 0.03 125 / 12%);
 }
 .dark .sidebar-section {
   --sidebar: oklch(0.235 0.026 200);
   --sidebar-accent: oklch(0.305 0.028 200);
-  --sidebar-border: oklch(0.90 0.035 125 / 10%);
+  --sidebar-border: oklch(0.9 0.035 125 / 10%);
 }
 
 @theme inline {
@@ -172,12 +172,10 @@
      button) — squared and technical, with a racing edge from width + tracked
      caps; mono is the lab readout (IDs, digests, timestamps, code, labels). */
   --font-sans:
-    system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
-    "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
-  --font-display:
-    "Saira Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-mono:
-    "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+    system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji",
+    "Segoe UI Emoji", sans-serif;
+  --font-display: "Saira Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -190,10 +188,14 @@
    truth for every label across the app. */
 
 @layer base {
-  * { @apply border-border outline-ring/50; }
+  * {
+    @apply border-border outline-ring/50;
+  }
   html,
   body,
-  #root { height: 100%; }
+  #root {
+    height: 100%;
+  }
   body {
     @apply bg-background text-foreground font-sans;
     -webkit-font-smoothing: antialiased;
@@ -204,19 +206,29 @@
   code,
   kbd,
   samp,
-  pre { font-variant-numeric: tabular-nums; }
+  pre {
+    font-variant-numeric: tabular-nums;
+  }
   /* The claret ribbon shows up on selection too — a wash of the accent,
      text keeps its own ink so it stays readable. Adapts per theme. */
-  ::selection { background-color: color-mix(in oklch, var(--primary) 24%, transparent); }
+  ::selection {
+    background-color: color-mix(in oklch, var(--primary) 24%, transparent);
+  }
 
   /* Scrollbars: transparent track, lime thumb. Firefox first, then WebKit. */
   * {
     scrollbar-width: thin;
     scrollbar-color: var(--primary) transparent;
   }
-  ::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+    background: transparent;
+  }
   ::-webkit-scrollbar-track,
-  ::-webkit-scrollbar-corner { background: transparent; }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
   ::-webkit-scrollbar-thumb {
     background-color: var(--primary);
     /* Inset the thumb with a transparent padding-box border so it reads as a
@@ -243,12 +255,28 @@
     linear-gradient(207deg, var(--carbon-sheen) 4px, transparent 4px) 8px 4px,
     linear-gradient(90deg, var(--carbon-thread) 8px, transparent 8px),
     linear-gradient(
-      var(--carbon-sheen) 25%, var(--carbon-thread) 25%, var(--carbon-thread) 50%,
-      transparent 50%, transparent 75%, var(--carbon-sheen) 75%
+      var(--carbon-sheen) 25%,
+      var(--carbon-thread) 25%,
+      var(--carbon-thread) 50%,
+      transparent 50%,
+      transparent 75%,
+      var(--carbon-sheen) 75%
     );
   background-size: var(--carbon-tile) var(--carbon-tile);
   /* Clears the footer controls at the foot and dissolves below the nav up top,
      so the weave reads as a band woven into the lower spine. */
-  -webkit-mask-image: linear-gradient(to top, transparent 10%, oklch(0 0 0 / 0.32) 28%, oklch(0 0 0 / 0.32) 58%, transparent 82%);
-  mask-image: linear-gradient(to top, transparent 10%, oklch(0 0 0 / 0.32) 28%, oklch(0 0 0 / 0.32) 58%, transparent 82%);
+  -webkit-mask-image: linear-gradient(
+    to top,
+    transparent 10%,
+    oklch(0 0 0 / 0.32) 28%,
+    oklch(0 0 0 / 0.32) 58%,
+    transparent 82%
+  );
+  mask-image: linear-gradient(
+    to top,
+    transparent 10%,
+    oklch(0 0 0 / 0.32) 28%,
+    oklch(0 0 0 / 0.32) 58%,
+    transparent 82%
+  );
 }

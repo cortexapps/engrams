@@ -1,5 +1,5 @@
-import { useQuery } from '@tanstack/react-query';
-import { fetchSessionCowState } from '../api';
+import { useQuery } from "@tanstack/react-query";
+import { fetchSessionCowState } from "../api";
 
 // ADR 0016 Phase A: per-session COW diagnostic data.
 //
@@ -16,7 +16,7 @@ const POLL_INTERVAL_MS = 2_000;
 
 export function useSessionCowState(sessionId: string | undefined) {
   return useQuery({
-    queryKey: ['cow-state', 'session', sessionId],
+    queryKey: ["cow-state", "session", sessionId],
     queryFn: () => fetchSessionCowState(sessionId!),
     enabled: sessionId !== undefined,
     refetchInterval: POLL_INTERVAL_MS,
