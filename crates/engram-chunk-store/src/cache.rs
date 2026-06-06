@@ -10,12 +10,18 @@
 //! - **Atomic writes**: bytes land in a temp file alongside the
 //!   target path, then rename. Crashes mid-write don't leave the
 //!   cache pointing at half-written chunks.
-//! - **LRU eviction**: when total cached bytes exceeds the budget,
-//!   the oldest-accessed chunk gets unlinked. "Oldest" is by
-//!   modification time on the cache file, which Linux + macOS
-//!   both update on `read`-via-`atime`-promotion when mounted
-//!   with default options. Cheap; doesn't require a separate
-//!   in-memory metadata store.
+//! - **LRU eviction**: when the cache filesystem is fuller than the
+//!   free-space floor (default: keep ~10% free) — or, if an absolute
+//!   ceiling is configured, when total cached bytes exceed it — the
+//!   oldest-accessed chunks get unlinked. "Oldest" is by modification
+//!   time on the cache file, which Linux + macOS both update on
+//!   `read`-via-`atime`-promotion when mounted with default options.
+//!   Cheap; doesn't require a separate in-memory metadata store. The
+//!   free-space floor is re-checked via `statvfs(2)` on every sweep, so
+//!   the cache yields disk to the snapshots and checkpoints that share
+//!   the work_dir mount rather than racing them to ENOSPC (the prod
+//!   incident where a 200 GiB byte-budget never tripped on a ~98 GiB
+//!   FC host).
 //! - **Singleflight on miss**: if N threads simultaneously ask for
 //!   a chunk that's not cached, exactly one BlobStorage fetch
 //!   runs; the others await its completion.
@@ -50,42 +56,83 @@ use crate::error::{ChunkStoreError, Result};
 use crate::manifest::ChunkHash;
 
 /// Configuration for the on-disk cache.
+///
+/// Eviction is governed by two independent constraints, whichever bites
+/// first on a given sweep (see [`bytes_to_free`]):
+///
+/// - an **absolute byte ceiling** ([`Self::budget_bytes`]) — an operator
+///   knob; and
+/// - a **dynamic free-space floor** — keep the cache filesystem at/under
+///   ~90% full, re-probed via `statvfs(2)` every sweep so the cache
+///   yields disk to snapshots/checkpoints sharing the mount.
+///
+/// The floor is *not* a field here on purpose: this struct is
+/// constructed by several other crates with struct literals, and the
+/// floor is a host-level / env concern resolved inside
+/// [`ChunkCache::new`]. Override it via [`FREE_FLOOR_PCT_ENV_VAR`] /
+/// [`FREE_FLOOR_BYTES_ENV_VAR`].
 #[derive(Clone, Debug)]
 pub struct ChunkCacheConfig {
     /// Where cached chunks live. Typically a subdirectory of the
     /// host's NVMe-backed work_dir (e.g.
     /// `/var/lib/engram/chunk-cache/`).
     pub root: PathBuf,
-    /// Eviction budget in bytes. The cache enforces this lazily —
-    /// each `put` over the budget evicts oldest entries.
+    /// Absolute eviction ceiling in bytes — the cache never grows past
+    /// it. Set to [`NO_CEILING`] (the default from [`Self::new`]) to
+    /// disable the byte ceiling and let the free-space floor govern
+    /// alone. Enforced lazily: each `put` over the ceiling evicts oldest
+    /// entries.
     pub budget_bytes: u64,
 }
 
-/// Default cache budget when no override is provided: 200 GiB. The
-/// number assumes a standard FC host with a multi-TB NVMe attached
-/// for `<work_dir>`; smaller hosts (dev VMs, lab boxes) should
-/// override via env.
-pub const DEFAULT_BUDGET_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+/// Default value for [`ChunkCacheConfig::budget_bytes`]: no absolute
+/// byte ceiling, so the dynamic free-space floor governs (fill to ~90%
+/// of whatever disk backs the cache, then LRU-evict). The 200 GiB fixed
+/// budget this replaces never tripped on the ~98 GiB FC host — the disk
+/// filled first (the prod incident).
+pub const NO_CEILING: u64 = u64::MAX;
 
-/// Env var that overrides [`DEFAULT_BUDGET_BYTES`]. Plain integer
+/// Default free-space floor: keep 10% of the cache filesystem free
+/// (i.e. evict to hold the mount at/under ~90% full). Re-checked via
+/// `statvfs(2)` on every sweep.
+pub const DEFAULT_FREE_FLOOR_PCT: f64 = 0.10;
+
+/// Env var: optional absolute eviction ceiling in bytes. Plain integer
 /// bytes — no suffix parsing — to stay consistent with the other
-/// engram_* env knobs.
+/// engram_* env knobs. Unset ⇒ no ceiling; the free-space floor governs.
 pub const BUDGET_ENV_VAR: &str = "ENGRAM_CHUNK_CACHE_BUDGET_BYTES";
 
+/// Env var: free-space floor as a percentage (0–100), e.g. `10` keeps
+/// ~10% free. Overrides [`DEFAULT_FREE_FLOOR_PCT`]. Takes precedence
+/// over [`FREE_FLOOR_BYTES_ENV_VAR`] when both are set.
+pub const FREE_FLOOR_PCT_ENV_VAR: &str = "ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT";
+
+/// Env var: free-space floor as an absolute byte count. Converted to a
+/// fraction against the live filesystem size at construction; if the
+/// filesystem can't be probed the default is kept (the per-sweep
+/// decision re-probes anyway). Only consulted when
+/// [`FREE_FLOOR_PCT_ENV_VAR`] is unset.
+pub const FREE_FLOOR_BYTES_ENV_VAR: &str = "ENGRAM_CHUNK_CACHE_FREE_FLOOR_BYTES";
+
 impl ChunkCacheConfig {
-    /// Sensible default: cap at [`DEFAULT_BUDGET_BYTES`].
+    /// Sensible default: no absolute byte ceiling ([`NO_CEILING`]); the
+    /// [`DEFAULT_FREE_FLOOR_PCT`] free-space floor (resolved in
+    /// [`ChunkCache::new`]) governs. On a typical host this means "fill
+    /// to ~90% of whatever disk backs the cache, then LRU-evict."
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            budget_bytes: DEFAULT_BUDGET_BYTES,
+            budget_bytes: NO_CEILING,
         }
     }
 
-    /// Construct with `budget_bytes` from `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`
-    /// if set + parseable, otherwise [`DEFAULT_BUDGET_BYTES`]. Logs at
-    /// info on override so operators can confirm the value picked up.
-    /// Unparseable values fall back to the default with a warn log —
-    /// fail-soft mirrors the other env-knob parsers in the codebase.
+    /// Construct with `budget_bytes` (the absolute ceiling) from
+    /// `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` if set + parseable, otherwise
+    /// [`NO_CEILING`]. Logs at info on override so operators can confirm
+    /// the value picked up. Unparseable values fall back to no-ceiling
+    /// with a warn log — fail-soft mirrors the other env-knob parsers in
+    /// the codebase. The free-space floor knobs are read separately, in
+    /// [`ChunkCache::new`].
     pub fn from_env_or_default(root: impl Into<PathBuf>) -> Self {
         let mut cfg = Self::new(root);
         match std::env::var(BUDGET_ENV_VAR) {
@@ -94,7 +141,7 @@ impl ChunkCacheConfig {
                     tracing::info!(
                         budget_bytes = bytes,
                         env = BUDGET_ENV_VAR,
-                        "chunk cache budget overridden via env",
+                        "chunk cache absolute ceiling set via env (wins over free-space floor)",
                     );
                     cfg.budget_bytes = bytes;
                 }
@@ -103,17 +150,83 @@ impl ChunkCacheConfig {
                         env = BUDGET_ENV_VAR,
                         value = raw,
                         error = %e,
-                        budget_bytes = cfg.budget_bytes,
-                        "could not parse chunk cache budget env var; using default",
+                        "could not parse chunk cache ceiling env var; no absolute ceiling",
                     );
                 }
             },
             Err(_) => {
-                // Unset is the common case — no log needed.
+                // Unset is the common case — the floor governs.
             }
         }
         cfg
     }
+}
+
+/// Resolve the free-space floor fraction from env, fail-soft. `_PCT`
+/// (0–100) wins over `_BYTES` (converted against the FS backing `root`).
+/// Returns [`DEFAULT_FREE_FLOOR_PCT`] when neither is set/valid. Pure
+/// w.r.t. the config struct so the env precedence is unit-testable.
+fn resolve_free_floor_pct(root: &Path) -> f64 {
+    if let Ok(raw) = std::env::var(FREE_FLOOR_PCT_ENV_VAR) {
+        match raw.parse::<f64>() {
+            Ok(pct) if (0.0..=100.0).contains(&pct) => {
+                let frac = pct / 100.0;
+                tracing::info!(
+                    free_floor_pct = pct,
+                    env = FREE_FLOOR_PCT_ENV_VAR,
+                    "chunk cache free-space floor set via env",
+                );
+                return frac;
+            }
+            other => {
+                tracing::warn!(
+                    env = FREE_FLOOR_PCT_ENV_VAR,
+                    value = raw,
+                    parsed = ?other,
+                    "free-floor pct env var out of range / unparseable; using default",
+                );
+            }
+        }
+    }
+
+    if let Ok(raw) = std::env::var(FREE_FLOOR_BYTES_ENV_VAR) {
+        match raw.parse::<u64>() {
+            // Convert to a fraction against the live FS size. If the
+            // probe fails we keep the default rather than guess — the
+            // per-sweep decision re-probes anyway.
+            Ok(floor_bytes) => match fs_total_bytes(root) {
+                Some(total) if total > 0 => {
+                    let frac = (floor_bytes as f64 / total as f64).clamp(0.0, 1.0);
+                    tracing::info!(
+                        free_floor_bytes = floor_bytes,
+                        fs_total_bytes = total,
+                        resolved_pct = frac * 100.0,
+                        env = FREE_FLOOR_BYTES_ENV_VAR,
+                        "chunk cache free-space floor set via env (bytes ⇒ fraction)",
+                    );
+                    return frac;
+                }
+                _ => {
+                    tracing::warn!(
+                        env = FREE_FLOOR_BYTES_ENV_VAR,
+                        value = raw,
+                        root = %root.display(),
+                        "could not probe cache filesystem size; keeping default floor",
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    env = FREE_FLOOR_BYTES_ENV_VAR,
+                    value = raw,
+                    error = %e,
+                    "could not parse free-floor bytes env var; using default",
+                );
+            }
+        }
+    }
+
+    DEFAULT_FREE_FLOOR_PCT
 }
 
 /// Local-disk cache for chunked content. Cheap to clone.
@@ -136,8 +249,19 @@ pub struct ChunkCache {
     inner: Arc<CacheInner>,
 }
 
+/// How many recently-evicted hashes the thrash ring remembers. Bounded
+/// so the set stays O(1) memory regardless of churn; a hash that fell
+/// out of the window simply isn't counted as a refetch-after-evict.
+/// 4096 × 32-byte hashes ≈ 128 KiB — cheap, and wide enough to catch
+/// the working-set-too-big-for-the-disk thrash this metric targets.
+const EVICTED_RING_CAP: usize = 4096;
+
 struct CacheInner {
     config: ChunkCacheConfig,
+    /// Free-space floor fraction, resolved once from env (or the
+    /// default) at construction. The *value* is fixed; the disk it's
+    /// compared against is re-probed every sweep (see `evict_to_budget`).
+    free_floor_pct: f64,
     /// Singleflight: hashes currently being fetched. Concurrent
     /// requesters for the same hash await the in-flight fetch
     /// rather than racing the underlying fetcher.
@@ -145,15 +269,40 @@ struct CacheInner {
     /// Pin set — never-evict. The cache still inserts pinned
     /// chunks like any other; the evictor skips them.
     pinned: Mutex<HashSet<ChunkHash>>,
+    /// Bounded FIFO of recently-evicted hashes. A remote (GCS) miss for
+    /// a hash in this set means we paid the round-trip we just freed —
+    /// the floor/ceiling is too tight for the working set. Drives
+    /// `engram_chunk_cache_refetch_after_evict_total`.
+    evicted_ring: Mutex<EvictedRing>,
 }
 
 impl ChunkCache {
     pub fn new(config: ChunkCacheConfig) -> Self {
+        let free_floor_pct = resolve_free_floor_pct(&config.root);
         Self {
             inner: Arc::new(CacheInner {
                 config,
+                free_floor_pct,
                 inflight: Mutex::new(std::collections::HashMap::new()),
                 pinned: Mutex::new(HashSet::new()),
+                evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
+            }),
+        }
+    }
+
+    /// Test/explicit constructor that sets the free-space floor directly,
+    /// bypassing env resolution. Used by unit tests that need a
+    /// deterministic floor (real test filesystems are huge, so the
+    /// default 10% floor never trips). Not part of the public surface.
+    #[cfg(test)]
+    fn new_with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
+        Self {
+            inner: Arc::new(CacheInner {
+                config,
+                free_floor_pct,
+                inflight: Mutex::new(std::collections::HashMap::new()),
+                pinned: Mutex::new(HashSet::new()),
+                evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
             }),
         }
     }
@@ -234,6 +383,14 @@ impl ChunkCache {
         };
 
         if do_fetch {
+            // ADR 0039 #16: thrash signal. If we're about to pay a remote
+            // round-trip for a hash we recently evicted, the cache is too
+            // small for the working set — count it (and stop tracking the
+            // hash; it's about to be re-cached). A sustained nonzero rate
+            // says "raise the budget / the disk is the bottleneck."
+            if self.inner.evicted_ring.lock().take(&hash) {
+                metrics::counter!("engram_chunk_cache_refetch_after_evict_total").increment(1);
+            }
             // ADR 0019 0d: time the remote fetch — the cold-cache page-in
             // cost that stretches cold boot (the slow tier). Histogram +
             // the bytes counter below quantify "how much of the boot is
@@ -444,23 +601,45 @@ impl ChunkCache {
         Ok(())
     }
 
-    /// Walk the cache directory, total bytes, LRU-evict until
-    /// under budget. Skips pinned hashes.
+    /// Walk the cache directory, total bytes, LRU-evict until both the
+    /// optional absolute ceiling and the dynamic free-space floor are
+    /// satisfied. Skips pinned hashes; remembers what it evicted (for
+    /// the thrash metric).
+    ///
+    /// The free-space floor is re-probed via `statvfs(2)` here, on every
+    /// sweep — so a snapshot/checkpoint that filled the shared mount
+    /// since the last sweep makes *this* sweep evict more, even though
+    /// the cache itself didn't grow. That's the whole point: the cache
+    /// yields disk dynamically rather than holding a fixed slice.
     async fn evict_to_budget(&self) -> Result<()> {
         let mut entries = self.list_entries().await?;
-        let total: u64 = entries.iter().map(|e| e.size).sum();
+        let cache_total: u64 = entries.iter().map(|e| e.size).sum();
         // ADR 0014 M1.15: snapshot of current cache size at every
         // budget check. Cheap; the metric is read by the dashboard,
         // not the hot path.
-        metrics::gauge!("engram_chunk_cache_size_bytes").set(total as f64);
-        let budget = self.inner.config.budget_bytes;
-        if total <= budget {
+        metrics::gauge!("engram_chunk_cache_size_bytes").set(cache_total as f64);
+
+        // How tight is the disk right now? `None` ⇒ probe failed; we
+        // fail soft to "no floor pressure" (the ceiling, if any, still
+        // applies) rather than evict blindly.
+        let fs = fs_usage(&self.inner.config.root);
+        if let Some(fs) = fs {
+            metrics::gauge!("engram_chunk_cache_fs_free_bytes").set(fs.free as f64);
+        }
+
+        // NO_CEILING ⇒ no absolute byte ceiling; only the floor governs.
+        let ceiling = match self.inner.config.budget_bytes {
+            NO_CEILING => None,
+            c => Some(c),
+        };
+        let mut over = bytes_to_free(cache_total, ceiling, self.inner.free_floor_pct, fs);
+        if over == 0 {
             return Ok(());
         }
+
         // Oldest mtime first; skip pinned.
         entries.sort_by_key(|e| e.mtime);
         let pinned = self.inner.pinned.lock().clone();
-        let mut over = total - budget;
         for entry in entries {
             if over == 0 {
                 break;
@@ -470,6 +649,9 @@ impl ChunkCache {
             }
             let _ = fs::remove_file(&entry.path).await;
             over = over.saturating_sub(entry.size);
+            // ADR 0039 #16: track what we evicted so a later remote miss
+            // for it can be counted as refetch-after-evict thrash.
+            self.inner.evicted_ring.lock().insert(entry.hash);
             // ADR 0014 M1.15: per-chunk LRU eviction counter.
             // Operators watch the rate to know if the budget is
             // too small for the working set.
@@ -557,6 +739,129 @@ struct CacheEntry {
     mtime: std::time::SystemTime,
 }
 
+/// Filesystem usage of the mount backing the cache, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsUsage {
+    /// Total size of the filesystem (`f_blocks × f_frsize`).
+    total: u64,
+    /// Bytes available to an unprivileged writer
+    /// (`f_bavail × f_frsize`) — what actually limits us before ENOSPC,
+    /// matching what `df` reports as available.
+    free: u64,
+}
+
+/// Probe the filesystem backing `path` via `statvfs(2)` (Linux +
+/// macOS). `None` on any failure — callers fail soft. Thin wrapper so
+/// the pure floor math ([`bytes_to_free`]) is unit-testable without a
+/// real FS, and so the one syscall site mirrors the host-agent's
+/// `disk_mib` probe.
+fn fs_usage(path: &Path) -> Option<FsUsage> {
+    let stat = nix::sys::statvfs::statvfs(path).ok()?;
+    let frag = stat.fragment_size() as u64;
+    let total = (stat.blocks() as u64).saturating_mul(frag);
+    let free = (stat.blocks_available() as u64).saturating_mul(frag);
+    Some(FsUsage { total, free })
+}
+
+/// Total size in bytes of the filesystem backing `path`, or `None` on
+/// failure. Used at config time to turn a free-floor *byte* knob into a
+/// fraction. (The per-sweep decision uses [`fs_usage`] directly.)
+fn fs_total_bytes(path: &Path) -> Option<u64> {
+    fs_usage(path).map(|u| u.total)
+}
+
+/// Pure eviction-target math: how many bytes must we free *this sweep*
+/// to satisfy both the optional absolute ceiling and the dynamic
+/// free-space floor? Returns the larger of the two demands (0 ⇒ no
+/// eviction). Separated out with no I/O so it's exhaustively
+/// unit-testable.
+///
+/// - **Ceiling**: if `ceiling` is `Some(c)`, free `cache_total − c`.
+/// - **Floor**: keep `free_floor_pct` of the filesystem free. If the
+///   mount is fuller than that (free < required), free the deficit —
+///   but never ask to free more than the cache actually holds, since
+///   non-cache occupants (snapshots, the OS) aren't ours to evict.
+///
+/// `fs` is `None` when the `statvfs` probe failed: we then apply the
+/// ceiling only and exert no floor pressure (fail soft — better to risk
+/// over-filling than to evict the working set on a bad reading).
+fn bytes_to_free(
+    cache_total: u64,
+    ceiling: Option<u64>,
+    free_floor_pct: f64,
+    fs: Option<FsUsage>,
+) -> u64 {
+    let ceiling_over = match ceiling {
+        Some(c) => cache_total.saturating_sub(c),
+        None => 0,
+    };
+
+    let floor_over = match fs {
+        Some(fs) if fs.total > 0 => {
+            let required_free = (fs.total as f64 * free_floor_pct.clamp(0.0, 1.0)) as u64;
+            let deficit = required_free.saturating_sub(fs.free);
+            // We can only free chunks we hold; the rest of the disk's
+            // fullness is someone else's (snapshots, checkpoints, OS).
+            deficit.min(cache_total)
+        }
+        _ => 0,
+    };
+
+    ceiling_over.max(floor_over)
+}
+
+/// Bounded FIFO set of recently-evicted hashes. Membership query +
+/// insert are O(1); the oldest entry is dropped once `cap` is reached.
+/// Backs the refetch-after-evict thrash metric — see [`CacheInner`].
+struct EvictedRing {
+    order: std::collections::VecDeque<ChunkHash>,
+    set: HashSet<ChunkHash>,
+    cap: usize,
+}
+
+impl EvictedRing {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            order: std::collections::VecDeque::with_capacity(cap),
+            set: HashSet::with_capacity(cap),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record a freshly-evicted hash, evicting the oldest tracked hash
+    /// if at capacity. Re-inserting a still-tracked hash is a no-op (it
+    /// keeps its original position — good enough for a thrash signal).
+    fn insert(&mut self, hash: ChunkHash) {
+        if self.set.insert(hash) {
+            self.order.push_back(hash);
+            if self.order.len() > self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// If `hash` is tracked, remove it and return `true` (it's about to
+    /// be re-cached, so it's no longer "evicted"). Lazy removal from the
+    /// `order` deque — a stale entry is skipped on the next eviction
+    /// pop. We keep it in `order` to avoid an O(n) deque scan; the set
+    /// is the source of truth for membership.
+    fn take(&mut self, hash: &ChunkHash) -> bool {
+        self.set.remove(hash)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, hash: &ChunkHash) -> bool {
+        self.set.contains(hash)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 async fn read_if_present(path: &Path) -> Result<Option<Bytes>> {
     match fs::read(path).await {
         Ok(bytes) => Ok(Some(Bytes::from(bytes))),
@@ -590,16 +895,25 @@ mod tests {
     use engram_core::traits::BlobStorage;
     use engram_storage_local::LocalBlobStorage;
 
+    /// Construct a cache with an explicit absolute ceiling and the
+    /// free-space floor DISABLED (`free_floor_pct: 0`). The existing
+    /// LRU/pin tests assert exact ceiling behaviour on a real tempdir
+    /// whose backing FS has hundreds of GiB free — leaving the floor on
+    /// would never make it trip, masking the byte-budget logic. Floor
+    /// behaviour gets its own pure tests + a tempdir statvfs smoke test.
     async fn setup(budget: u64) -> (ChunkCache, ChunkStore, tempfile::TempDir, tempfile::TempDir) {
         let blob_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> =
             Arc::new(LocalBlobStorage::new(blob_dir.path().to_path_buf()));
         let store = ChunkStore::new(blob);
-        let cache = ChunkCache::new(ChunkCacheConfig {
-            root: cache_dir.path().to_path_buf(),
-            budget_bytes: budget,
-        });
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: budget,
+            },
+            0.0,
+        );
         (cache, store, blob_dir, cache_dir)
     }
 
@@ -902,16 +1216,24 @@ mod tests {
         ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn clear_floor_env() {
+        std::env::remove_var(FREE_FLOOR_PCT_ENV_VAR);
+        std::env::remove_var(FREE_FLOOR_BYTES_ENV_VAR);
+    }
+
     #[test]
     fn from_env_or_default_uses_default_when_unset() {
         let _g = env_guard();
         std::env::remove_var(BUDGET_ENV_VAR);
         let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
-        assert_eq!(cfg.budget_bytes, DEFAULT_BUDGET_BYTES);
+        assert_eq!(
+            cfg.budget_bytes, NO_CEILING,
+            "no ceiling by default — the free-space floor governs",
+        );
     }
 
     #[test]
-    fn from_env_or_default_round_trips_byte_count() {
+    fn from_env_or_default_round_trips_ceiling_byte_count() {
         let _g = env_guard();
         std::env::set_var(BUDGET_ENV_VAR, "12345");
         let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
@@ -920,14 +1242,294 @@ mod tests {
     }
 
     #[test]
-    fn from_env_or_default_falls_back_on_unparseable() {
+    fn from_env_or_default_falls_back_on_unparseable_ceiling() {
         let _g = env_guard();
         std::env::set_var(BUDGET_ENV_VAR, "not-a-number");
         let cfg = ChunkCacheConfig::from_env_or_default("/tmp/cache-test");
         std::env::remove_var(BUDGET_ENV_VAR);
         assert_eq!(
-            cfg.budget_bytes, DEFAULT_BUDGET_BYTES,
-            "unparseable env must fail-soft to default",
+            cfg.budget_bytes, NO_CEILING,
+            "unparseable ceiling must fail-soft to no-ceiling",
+        );
+    }
+
+    // ---- resolve_free_floor_pct: env precedence ----
+
+    #[test]
+    fn free_floor_pct_defaults_when_unset() {
+        let _g = env_guard();
+        clear_floor_env();
+        assert_eq!(
+            resolve_free_floor_pct(Path::new("/tmp/cache-test")),
+            DEFAULT_FREE_FLOOR_PCT,
+        );
+    }
+
+    #[test]
+    fn free_floor_pct_env_overrides_default() {
+        let _g = env_guard();
+        clear_floor_env();
+        std::env::set_var(FREE_FLOOR_PCT_ENV_VAR, "25");
+        let pct = resolve_free_floor_pct(Path::new("/tmp/cache-test"));
+        clear_floor_env();
+        assert!((pct - 0.25).abs() < 1e-9, "25% ⇒ 0.25 fraction, got {pct}");
+    }
+
+    #[test]
+    fn free_floor_pct_env_out_of_range_keeps_default() {
+        let _g = env_guard();
+        clear_floor_env();
+        std::env::set_var(FREE_FLOOR_PCT_ENV_VAR, "150");
+        let pct = resolve_free_floor_pct(Path::new("/tmp/cache-test"));
+        clear_floor_env();
+        assert_eq!(pct, DEFAULT_FREE_FLOOR_PCT);
+    }
+
+    #[test]
+    fn free_floor_bytes_env_resolves_against_real_fs() {
+        // _BYTES is converted to a fraction against the live FS size; on
+        // a real tempdir the FS is many GiB, so a 1 GiB floor resolves
+        // to a small-but-positive fraction. We only assert it's a sane
+        // fraction in (0, 1) — the exact value depends on the test host.
+        let _g = env_guard();
+        clear_floor_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var(FREE_FLOOR_BYTES_ENV_VAR, "1073741824"); // 1 GiB
+        let pct = resolve_free_floor_pct(dir.path());
+        clear_floor_env();
+        assert!(
+            pct > 0.0 && pct < 1.0,
+            "1 GiB floor on a multi-GiB FS should resolve to a fraction in (0,1), got {pct}",
+        );
+    }
+
+    #[test]
+    fn free_floor_pct_wins_over_bytes() {
+        let _g = env_guard();
+        clear_floor_env();
+        std::env::set_var(FREE_FLOOR_PCT_ENV_VAR, "5");
+        std::env::set_var(FREE_FLOOR_BYTES_ENV_VAR, "1073741824");
+        let pct = resolve_free_floor_pct(Path::new("/tmp/cache-test"));
+        clear_floor_env();
+        assert!(
+            (pct - 0.05).abs() < 1e-9,
+            "_PCT must win over _BYTES, got {pct}"
+        );
+    }
+
+    // ---- bytes_to_free: pure floor/ceiling decision ----
+
+    #[test]
+    fn bytes_to_free_no_pressure_returns_zero() {
+        // Ceiling unset, mount well under the floor (90% free, floor 10%).
+        let fs = FsUsage {
+            total: 100,
+            free: 90,
+        };
+        assert_eq!(bytes_to_free(50, None, 0.10, Some(fs)), 0);
+    }
+
+    #[test]
+    fn bytes_to_free_floor_pressure_frees_deficit() {
+        // 100-byte FS, only 5 free, floor wants 10 ⇒ deficit 5. Cache
+        // holds 50, so we can cover the whole deficit.
+        let fs = FsUsage {
+            total: 100,
+            free: 5,
+        };
+        assert_eq!(bytes_to_free(50, None, 0.10, Some(fs)), 5);
+    }
+
+    #[test]
+    fn bytes_to_free_floor_capped_at_cache_total() {
+        // Disk is nearly full but the cache holds only 3 bytes — the
+        // rest is snapshots/OS we can't evict. Never ask to free more
+        // than we hold.
+        let fs = FsUsage {
+            total: 100,
+            free: 1,
+        };
+        assert_eq!(bytes_to_free(3, None, 0.10, Some(fs)), 3);
+    }
+
+    #[test]
+    fn bytes_to_free_ceiling_only_when_fs_probe_fails() {
+        // statvfs failed ⇒ no floor pressure; ceiling still applies.
+        assert_eq!(bytes_to_free(50, Some(30), 0.10, None), 20);
+        // No ceiling + no FS ⇒ nothing to do.
+        assert_eq!(bytes_to_free(50, None, 0.10, None), 0);
+    }
+
+    #[test]
+    fn bytes_to_free_takes_max_of_ceiling_and_floor() {
+        // Ceiling demands freeing 20 (50 → 30); floor demands freeing 5.
+        // Max wins: 20.
+        let fs = FsUsage {
+            total: 100,
+            free: 5,
+        };
+        assert_eq!(bytes_to_free(50, Some(30), 0.10, Some(fs)), 20);
+
+        // Now the floor is the tighter constraint: free only 2 below
+        // ceiling, but disk wants 40 freed.
+        let fs = FsUsage {
+            total: 100,
+            free: 0,
+        };
+        assert_eq!(bytes_to_free(50, Some(48), 0.40, Some(fs)), 40);
+    }
+
+    #[test]
+    fn bytes_to_free_ceiling_satisfied_returns_zero() {
+        assert_eq!(bytes_to_free(30, Some(50), 0.0, None), 0);
+    }
+
+    // ---- EvictedRing: bounded thrash tracking ----
+
+    fn h(byte: u8) -> ChunkHash {
+        ChunkHash::of(&[byte])
+    }
+
+    #[test]
+    fn evicted_ring_tracks_then_takes() {
+        let mut ring = EvictedRing::with_capacity(8);
+        ring.insert(h(1));
+        ring.insert(h(2));
+        assert!(ring.contains(&h(1)));
+        assert!(ring.take(&h(1)), "first take returns true");
+        assert!(!ring.contains(&h(1)), "taken hash no longer tracked");
+        assert!(!ring.take(&h(1)), "second take returns false");
+        assert!(!ring.take(&h(99)), "never-inserted hash returns false");
+    }
+
+    #[test]
+    fn evicted_ring_evicts_oldest_at_capacity() {
+        let mut ring = EvictedRing::with_capacity(2);
+        ring.insert(h(1));
+        ring.insert(h(2));
+        ring.insert(h(3)); // pushes out h(1)
+        assert!(!ring.contains(&h(1)), "oldest dropped at capacity");
+        assert!(ring.contains(&h(2)));
+        assert!(ring.contains(&h(3)));
+        assert_eq!(ring.len(), 2, "set stays bounded at capacity");
+    }
+
+    #[test]
+    fn evicted_ring_dedups_reinsert() {
+        let mut ring = EvictedRing::with_capacity(4);
+        ring.insert(h(1));
+        ring.insert(h(1));
+        assert_eq!(ring.len(), 1, "re-inserting a tracked hash is a no-op");
+    }
+
+    // ---- fs_usage: statvfs smoke test on a real tempdir ----
+
+    #[test]
+    fn fs_usage_reports_sane_values_for_tempdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = fs_usage(dir.path()).expect("a real FS should be probeable");
+        assert!(usage.total > 0, "total should be positive");
+        assert!(usage.free <= usage.total, "free must not exceed total");
+    }
+
+    #[test]
+    fn fs_usage_none_on_bad_path() {
+        assert_eq!(fs_usage(Path::new("/nonexistent/engram/cache/probe")), None);
+    }
+
+    // ---- end-to-end: thrash counter increments on refetch-after-evict ----
+
+    #[tokio::test]
+    async fn refetch_after_evict_is_tracked() {
+        // Ceiling of 20 bytes, floor disabled. As in
+        // `budget_triggers_lru_eviction`, the sweep runs after each put
+        // and the third 10-byte chunk pushes us to 30/20 → the oldest
+        // (a) evicts. Re-getting a is then a remote miss for a
+        // recently-evicted hash, which must be flagged.
+        let (cache, store, _b, _c) = setup(20).await;
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let c = b"cccccccccc";
+        let ha = store.put_chunk(a).await.unwrap();
+        let hb = store.put_chunk(b).await.unwrap();
+        let hc = store.put_chunk(c).await.unwrap();
+        cache_get_from(&cache, &store, ha).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cache_get_from(&cache, &store, hb).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cache_get_from(&cache, &store, hc).await.unwrap();
+        // a is gone and remembered as evicted.
+        assert!(!cache.contains(ha).await, "a should be evicted");
+        assert!(
+            cache.inner.evicted_ring.lock().contains(&ha),
+            "evicted hash must be in the thrash ring",
+        );
+        // Re-get a: it's a remote miss for a recently-evicted hash. The
+        // get() leader takes it out of the ring (counting the refetch).
+        cache_get_from(&cache, &store, ha).await.unwrap();
+        assert!(
+            !cache.inner.evicted_ring.lock().contains(&ha),
+            "refetched hash should be cleared from the ring",
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_floor_evicts_even_without_ceiling() {
+        // The whole point of #16: with NO absolute ceiling, a tight
+        // free-space floor still triggers eviction. A real tempdir's FS
+        // is huge with plenty free, so we can't make the *real* disk
+        // breach a 10% floor — instead set the floor to 1.0 ("require
+        // 100% free"), which `bytes_to_free` caps at the cache's own
+        // total: every unpinned chunk becomes evictable on each sweep.
+        let blob_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> =
+            Arc::new(LocalBlobStorage::new(blob_dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob);
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: NO_CEILING, // floor governs, not a byte ceiling
+            },
+            1.0,
+        );
+        let a = b"aaaaaaaaaa";
+        let ha = store.put_chunk(a).await.unwrap();
+        cache.put(ha, a).await.unwrap();
+        // The post-put sweep saw the disk under the (impossible) 100%
+        // floor and evicted the only unpinned chunk we hold.
+        assert!(
+            !cache.contains(ha).await,
+            "tight free-space floor must evict even with no byte ceiling",
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_floor_skips_pinned_under_pressure() {
+        // Same impossible-floor setup, but the chunk is pinned: the
+        // floor sweep must not evict it (pins win over both governors).
+        let blob_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> =
+            Arc::new(LocalBlobStorage::new(blob_dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob);
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: NO_CEILING,
+            },
+            1.0,
+        );
+        let a = b"aaaaaaaaaa";
+        let ha = store.put_chunk(a).await.unwrap();
+        cache.put(ha, a).await.unwrap();
+        cache.pin(ha);
+        // Trigger another sweep via a second put of the same (idempotent)
+        // chunk; the pinned chunk must survive the floor pressure.
+        cache.put(ha, a).await.unwrap();
+        assert!(
+            cache.contains(ha).await,
+            "pinned chunk must survive free-space-floor eviction",
         );
     }
 }
