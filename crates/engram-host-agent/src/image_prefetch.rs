@@ -840,7 +840,9 @@ mod tests {
             .collect();
 
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
-        let warmed = prefetch_one(&img, &store, &cache, &sem, None).await.unwrap();
+        let warmed = prefetch_one(&img, &store, &cache, &sem, None)
+            .await
+            .unwrap();
 
         // No duplicates in the returned batch.
         let got: HashSet<ChunkHash> = warmed.hashes.iter().copied().collect();
