@@ -332,8 +332,28 @@ const DISK_CHUNK_MEM_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 /// hang a VM; the chunk-GC pin-recheck fix prevents the missing chunk,
 /// this is the defense-in-depth that keeps a miss from wedging the host.
 const CHUNK_FETCH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Retry budget for a TRANSIENT fetch failure (origin 5xx / connection /
+/// per-attempt timeout): the blob exists, so it's worth riding out a GCS
+/// hiccup (~5 × backoff ≈ 15s) before failing the read with EIO.
 const CHUNK_FETCH_MAX_ATTEMPTS: u32 = 5;
+/// Retry budget for a definitive 404 (blob genuinely absent). Near-
+/// permanent, so retry only enough to ride out GCS read-after-write
+/// eventual consistency, then fail fast — no point spending the full
+/// transient budget on a blob that isn't coming back.
+const CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS: u32 = 2;
 const CHUNK_FETCH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Classify a chunk-fetch error: a definitive 404 (`BlobError::NotFound`,
+/// which the GCS backend maps a 404 to) gets the short
+/// [`CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS`] budget; everything else (5xx /
+/// connection / per-attempt [`ChunkStoreError::FetchTimeout`]) gets the
+/// fuller [`CHUNK_FETCH_MAX_ATTEMPTS`] since the blob is expected to exist.
+fn chunk_fetch_is_not_found(e: &engram_chunk_store::error::ChunkStoreError) -> bool {
+    matches!(
+        e,
+        engram_chunk_store::error::ChunkStoreError::Blob(engram_core::error::BlobError::NotFound)
+    )
+}
 
 /// In-memory LRU of recently-read **clean** chunks, keyed by content hash.
 ///
@@ -1121,31 +1141,45 @@ impl ChunkedDiskBackend {
             };
             match outcome {
                 Ok(bytes) => return Ok(bytes),
-                Err(e) if attempt >= CHUNK_FETCH_MAX_ATTEMPTS => {
-                    // Exhausted the bounded budget — fail the read so the NBD
-                    // layer returns EIO. Loud + countable so a missing/stuck
-                    // chunk surfaces as an alert, not a silent wedge.
-                    metrics::counter!(
-                        "engram_nbd_chunk_fetch_failed_total",
-                        "tier" => tier,
-                    )
-                    .increment(1);
-                    tracing::error!(
-                        chunk = chunk_idx,
-                        hash = %hash,
-                        attempts = attempt,
-                        error = %e,
-                        "chunk fetch exhausted bounded retries; failing the NBD request \
-                         (guest gets EIO — rootfs degrades read-only but the VM stays \
-                         pausable/evictable instead of wedging)",
-                    );
-                    return Err(e.into());
-                }
                 Err(e) => {
+                    // 404s are near-permanent (short budget — just ride out
+                    // GCS read-after-write EC); transient errors get the
+                    // fuller budget since the blob is expected to exist.
+                    let not_found = chunk_fetch_is_not_found(&e);
+                    let max = if not_found {
+                        CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS
+                    } else {
+                        CHUNK_FETCH_MAX_ATTEMPTS
+                    };
+                    if attempt >= max {
+                        // Exhausted the bounded budget — fail the read so the
+                        // NBD layer returns EIO. Loud + countable (with the
+                        // outcome class) so a missing/stuck chunk surfaces as
+                        // an alert, not a silent wedge.
+                        let outcome = if not_found { "notfound" } else { "transient" };
+                        metrics::counter!(
+                            "engram_nbd_chunk_fetch_failed_total",
+                            "tier" => tier,
+                            "outcome" => outcome,
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            chunk = chunk_idx,
+                            hash = %hash,
+                            attempts = attempt,
+                            outcome,
+                            error = %e,
+                            "chunk fetch exhausted bounded retries; failing the NBD request \
+                             (guest gets EIO — rootfs degrades read-only but the VM stays \
+                             pausable/evictable instead of wedging)",
+                        );
+                        return Err(e.into());
+                    }
                     tracing::warn!(
                         chunk = chunk_idx,
                         hash = %hash,
                         attempt,
+                        not_found,
                         error = %e,
                         "chunk fetch failed; retrying (bounded)",
                     );
@@ -1285,6 +1319,28 @@ mod tests {
         assert!(
             outcome.is_err(),
             "a read of a missing chunk must surface an error (→ NBD EIO), got Ok",
+        );
+    }
+
+    /// The 404-vs-transient delineation that drives the retry budget: a
+    /// definitive `BlobError::NotFound` (GCS 404) is near-permanent and
+    /// gets the short budget; a fetch timeout / origin 5xx is transient and
+    /// gets the fuller budget.
+    #[test]
+    fn chunk_fetch_classifies_notfound_vs_transient() {
+        use engram_chunk_store::error::ChunkStoreError;
+        use engram_core::error::BlobError;
+        assert!(
+            chunk_fetch_is_not_found(&ChunkStoreError::Blob(BlobError::NotFound)),
+            "a 404 must classify as not-found (short retry budget)",
+        );
+        assert!(
+            !chunk_fetch_is_not_found(&ChunkStoreError::FetchTimeout("h after 3s".into())),
+            "a per-attempt timeout is transient (full retry budget)",
+        );
+        assert!(
+            !chunk_fetch_is_not_found(&ChunkStoreError::Origin("origin 5xx".into())),
+            "an origin/5xx error is transient (full retry budget)",
         );
     }
 
