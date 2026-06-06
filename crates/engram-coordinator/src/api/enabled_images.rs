@@ -435,6 +435,70 @@ pub(crate) async fn materialize_disk_chunks(
     Ok(Some(manifest_ref))
 }
 
+/// Verify a reuse-candidate base snapshot's chunks are actually present in
+/// BlobStorage before re-pointing a fresh enable at it. Content-keyed reuse
+/// skips the capture VM entirely — but if the candidate snapshot's chunks
+/// were lost (a GC over-delete, a manual deletion, a partial earlier upload),
+/// reusing it re-points the image at a corrupt base that 404s at restore (the
+/// wedged-session class). The disk materialize re-uploads missing disk chunks
+/// from the OCI source on every refresh, but a base snapshot's MEMORY chunks
+/// have no source other than a fresh capture — so a miss in EITHER of the
+/// candidate's manifests means we must recapture rather than reuse. HEADs
+/// every chunk (short-circuiting on the first miss); any miss — or any error
+/// reading a manifest/probe — is treated as "not reusable" so we fail safe
+/// toward a correct fresh capture.
+async fn reuse_candidate_chunks_present(
+    chunk_store: &engram_chunk_store::ChunkStore,
+    blob: std::sync::Arc<dyn engram_core::traits::BlobStorage>,
+    disk_manifest: engram_core::types::manifest::ManifestRef,
+    memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+) -> bool {
+    use futures::stream::{self, StreamExt};
+    for mref in std::iter::once(disk_manifest).chain(memory_manifest) {
+        let manifest = match chunk_store.get_manifest(mref).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    manifest = %mref,
+                    error = %e,
+                    "reuse verify: could not read candidate base-snapshot manifest; \
+                     treating as not reusable (will recapture)",
+                );
+                return false;
+            }
+        };
+        // Collect owned keys up front: holding a borrow of `manifest` (a
+        // slice Iter) across the buffer_unordered awaits makes this future
+        // non-Send, and it runs inside the spawned enable pipeline.
+        let keys: Vec<String> = manifest
+            .chunks
+            .iter()
+            .map(|c| c.hash.storage_key())
+            .collect();
+        let mut checks = stream::iter(keys.into_iter().map(|key| {
+            let blob = blob.clone();
+            async move { blob.exists(&key).await }
+        }))
+        .buffer_unordered(32);
+        while let Some(res) = checks.next().await {
+            match res {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(e) => {
+                    tracing::warn!(
+                        manifest = %mref,
+                        error = %e,
+                        "reuse verify: chunk existence probe failed; \
+                         treating as not reusable (will recapture)",
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// ADR 0020 P1: capture (or reuse) the per-image base snapshot, record
 /// its `snapshots` row, and return the snapshot id. The caller stamps it
 /// onto the enabled_images row's NOT NULL `base_snapshot_id` and upserts
@@ -486,13 +550,6 @@ pub(crate) async fn capture_and_record_base_snapshot(
             .await?
         {
             if let Some(id) = existing.base_snapshot_id {
-                tracing::info!(
-                    image_uri = %row.image_uri,
-                    reused_from = %existing.image_uri,
-                    disk_manifest = %disk_ref,
-                    snapshot_id = %id,
-                    "content-identical image already captured; reusing base snapshot",
-                );
                 let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
                     ApiError::Internal(format!(
                         "enabled image `{}` reuses base snapshot {id} but carries no \
@@ -504,7 +561,34 @@ pub(crate) async fn capture_and_record_base_snapshot(
                 // Memory manifest is nullable since migration 0049 — `None`
                 // for cold-boot backends (VZ). Reuse whatever the row carries.
                 let memory_manifest = existing.base_snapshot_memory_manifest;
-                return Ok((id, disk_manifest, memory_manifest));
+                // Self-heal: only reuse if the candidate's chunks are actually
+                // durable. Re-pointing at a base snapshot whose chunks were
+                // reaped is the wedged-session bug; memory chunks have no
+                // source but a fresh capture, so a miss ⇒ recapture.
+                if reuse_candidate_chunks_present(
+                    &state.services.chunk_store,
+                    state.services.blob.clone(),
+                    disk_manifest,
+                    memory_manifest,
+                )
+                .await
+                {
+                    tracing::info!(
+                        image_uri = %row.image_uri,
+                        reused_from = %existing.image_uri,
+                        disk_manifest = %disk_ref,
+                        snapshot_id = %id,
+                        "content-identical image already captured; reusing base snapshot",
+                    );
+                    return Ok((id, disk_manifest, memory_manifest));
+                }
+                tracing::warn!(
+                    image_uri = %row.image_uri,
+                    reused_from = %existing.image_uri,
+                    snapshot_id = %id,
+                    "content-identical base snapshot is missing chunks in BlobStorage; \
+                     re-capturing instead of reusing (self-heal)",
+                );
             }
         }
     }
@@ -520,12 +604,6 @@ pub(crate) async fn capture_and_record_base_snapshot(
     {
         if existing.manifest_digest == row.manifest_digest {
             if let Some(id) = existing.base_snapshot_id {
-                tracing::info!(
-                    image_uri = %row.image_uri,
-                    digest = %row.manifest_digest,
-                    snapshot_id = %id,
-                    "base snapshot already recorded for this digest; reusing",
-                );
                 let disk_manifest = existing.base_snapshot_disk_manifest.ok_or_else(|| {
                     ApiError::Internal(format!(
                         "enabled image `{}` reuses base snapshot {id} but carries no \
@@ -537,7 +615,31 @@ pub(crate) async fn capture_and_record_base_snapshot(
                 // Memory manifest is nullable since migration 0049 — `None`
                 // for cold-boot backends (VZ). Reuse whatever the row carries.
                 let memory_manifest = existing.base_snapshot_memory_manifest;
-                return Ok((id, disk_manifest, memory_manifest));
+                // Self-heal: only reuse if the candidate's chunks are durable
+                // (see the content-keyed branch above).
+                if reuse_candidate_chunks_present(
+                    &state.services.chunk_store,
+                    state.services.blob.clone(),
+                    disk_manifest,
+                    memory_manifest,
+                )
+                .await
+                {
+                    tracing::info!(
+                        image_uri = %row.image_uri,
+                        digest = %row.manifest_digest,
+                        snapshot_id = %id,
+                        "base snapshot already recorded for this digest; reusing",
+                    );
+                    return Ok((id, disk_manifest, memory_manifest));
+                }
+                tracing::warn!(
+                    image_uri = %row.image_uri,
+                    digest = %row.manifest_digest,
+                    snapshot_id = %id,
+                    "recorded base snapshot for this digest is missing chunks in BlobStorage; \
+                     re-capturing instead of reusing (self-heal)",
+                );
             }
         }
     }
@@ -927,5 +1029,67 @@ mod tests {
         .expect("materialize again");
         assert_eq!(wrote2, 0, "second materialize should dedup all chunks");
         assert_eq!(deduped2, 2);
+    }
+
+    /// Self-heal verify: a reuse candidate whose manifest chunks are all
+    /// present in BlobStorage is reusable; a missing chunk (the reaped-base
+    /// case) makes it NOT reusable, so the enable path recaptures instead of
+    /// re-pointing the image at a corrupt base snapshot.
+    #[tokio::test]
+    async fn reuse_candidate_verify_detects_missing_chunk() {
+        use engram_chunk_store::{ChunkHash, ChunkRef, Manifest};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
+        let cs = ManifestKind::Memory.default_chunk_size();
+
+        // Manifest whose single chunk IS stored → reusable.
+        let present_hash = chunk_store.put_chunk(b"present-chunk-bytes").await.unwrap();
+        let mut present = Manifest::empty(ManifestKind::Memory, cs);
+        present.chunks.push(ChunkRef {
+            offset: 0,
+            hash: present_hash,
+        });
+        let present_ref = ManifestRef::new();
+        chunk_store
+            .put_manifest(present_ref, &present)
+            .await
+            .unwrap();
+        assert!(
+            reuse_candidate_chunks_present(&chunk_store, blob.clone(), present_ref, None).await,
+            "all chunks present ⇒ reusable",
+        );
+
+        // Manifest referencing a chunk whose blob was never stored (reaped)
+        // → NOT reusable; the enable path must recapture.
+        let missing_hash = ChunkHash::of(b"a-reaped-chunk-never-stored");
+        let mut missing = Manifest::empty(ManifestKind::Memory, cs);
+        missing.chunks.push(ChunkRef {
+            offset: 0,
+            hash: missing_hash,
+        });
+        let missing_ref = ManifestRef::new();
+        chunk_store
+            .put_manifest(missing_ref, &missing)
+            .await
+            .unwrap();
+        assert!(
+            !reuse_candidate_chunks_present(&chunk_store, blob.clone(), missing_ref, None).await,
+            "a missing chunk ⇒ not reusable (recapture)",
+        );
+
+        // The prod shape: intact disk manifest + a missing MEMORY chunk (a
+        // reaped base-memfile chunk) ⇒ not reusable.
+        assert!(
+            !reuse_candidate_chunks_present(
+                &chunk_store,
+                blob.clone(),
+                present_ref,
+                Some(missing_ref),
+            )
+            .await,
+            "present disk + missing memory chunk ⇒ not reusable",
+        );
     }
 }

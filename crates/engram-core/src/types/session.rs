@@ -187,6 +187,27 @@ impl SessionState {
         }
     }
 
+    /// The FSM-legal terminal a forced termination (operator delete, drain,
+    /// give-up) should drive this state to: `Completed` for states that
+    /// actually ran, `Failed` for the early states that never became
+    /// usable, `None` if already terminal (nothing to do). Single source of
+    /// truth for "what terminal does terminating this session mean" — kept
+    /// beside [`Self::can_transition_to`] so it can't drift from the table
+    /// above (and debug-asserted to be a legal edge).
+    pub fn terminal_target(&self) -> Option<Self> {
+        use SessionState::*;
+        let target = match self {
+            Active | Idle | HostLost | Evacuating | Evicting => Completed,
+            Pending | Created | GuestReady => Failed,
+            Failed | Completed | Dead => return None,
+        };
+        debug_assert!(
+            self.can_transition_to(target),
+            "terminal_target({self:?}) = {target:?} must be a legal transition",
+        );
+        Some(target)
+    }
+
     /// Consume `self` and produce the next state if the transition is
     /// legal. Used by [`MetadataStore::transition_session`] (engram-
     /// postgres) to gate every `UPDATE sessions SET status = ...` —
@@ -494,6 +515,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn terminal_target_is_legal_and_total() {
+        use SessionState::*;
+        // Every non-terminal state maps to a terminal via a LEGAL edge.
+        for &s in &[
+            Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
+        ] {
+            let target = s
+                .terminal_target()
+                .expect("a non-terminal state must have a terminal_target");
+            assert!(target.is_terminal(), "{s:?} -> {target:?} must be terminal");
+            assert!(
+                s.can_transition_to(target),
+                "{s:?} -> {target:?} must be a legal FSM edge",
+            );
+        }
+        // Terminal states have nothing to terminate.
+        for &t in &[Failed, Completed, Dead] {
+            assert_eq!(t.terminal_target(), None, "{t:?} is already terminal");
+        }
+        // The semantic split: states that ran complete; never-ran ones fail.
+        assert_eq!(Active.terminal_target(), Some(Completed));
+        assert_eq!(Idle.terminal_target(), Some(Completed));
+        assert_eq!(Created.terminal_target(), Some(Failed));
+        assert_eq!(Pending.terminal_target(), Some(Failed));
     }
 
     #[test]
