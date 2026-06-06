@@ -191,6 +191,33 @@ pub trait MetadataStore: Send + Sync {
         id: SessionId,
         target: SessionState,
     ) -> Result<SessionState, MetaError>;
+
+    /// Force a session to its FSM-legal terminal state — the shared
+    /// "delete / give up on this session" primitive (the delete handler
+    /// uses it; drain / dead-host paths can too). Reads the current state,
+    /// picks the terminal [`SessionState::terminal_target`] permits
+    /// (`Completed` for states that ran, `Failed` for ones that never
+    /// became usable), and drives [`Self::transition_session`] to it.
+    /// Returns `Some((prev, target))` on a transition, `None` if the
+    /// session is already terminal (idempotent no-op).
+    ///
+    /// The default impl composes `get_session` + `transition_session`, so
+    /// it reuses the latter's row-locked atomic write rather than
+    /// duplicating the UPDATE; only the target choice is read separately,
+    /// and a race there is self-correcting — the transition is still legal
+    /// for the new state, or returns `Conflict` for a now-terminal row.
+    async fn terminate_session(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<(SessionState, SessionState)>, MetaError> {
+        let session = self.get_session(id).await?;
+        let Some(target) = session.status.terminal_target() else {
+            return Ok(None);
+        };
+        let prev = self.transition_session(id, target).await?;
+        Ok(Some((prev, target)))
+    }
+
     async fn assign_session_host(
         &self,
         id: SessionId,

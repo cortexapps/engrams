@@ -1278,51 +1278,38 @@ pub async fn delete_session(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<StatusCode, ApiError> {
-    // Confirm the session exists *before* tearing anything down so
-    // unknown ids return 404 (matching the get/exec contract) instead
-    // of silently succeeding.
-    let session = state.services.meta.get_session(id).await?;
-
-    // Idempotent: a session already in a terminal state has nothing
-    // to tear down. Skip straight to 204 instead of trying to drive
-    // a `Completed`/`Failed`/`Dead` → `Completed` transition (which
-    // the state machine would reject as an illegal terminal-state
-    // move).
-    if session.status.is_terminal() {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    // ADR 0015 M2: transition to Completed *before* destroying the
-    // sandbox. The reconcile pass that runs on every heartbeat looks
-    // for `status='active'` sessions whose `sandbox_id` is missing
-    // from the host's running set; moving to Completed first removes
-    // this row from that view so reconcile can't race us into
-    // HostLost while we're waiting for the host RPC. The DB UPDATE
-    // is fast (single locked row); the destroy that follows is
-    // best-effort and can take seconds.
+    // Drive the session to its FSM-legal terminal BEFORE destroying the
+    // sandbox. `terminate_session` reads the current state and picks the
+    // terminal `SessionState::terminal_target` permits — `Completed` for
+    // states that ran, `Failed` for the early states (Pending / Created /
+    // GuestReady) that never became usable (this is what fixes the
+    // `5fadd364` phantom: deleting a `Created` session used to drive an
+    // illegal Created→Completed that surfaced as Conflict, destroying the
+    // sandbox but leaving the row non-terminal). Terminating first also
+    // removes this row from the heartbeat reconcile's "active session whose
+    // sandbox is missing" view, so reconcile can't race us into HostLost
+    // during the (best-effort, can-take-seconds) destroy RPC below.
     //
-    // If a sibling path (preemption drain, dead-host detector) flipped
-    // the row first, our transition fails with Conflict — treat that
-    // as idempotent success, the session is already on its way out.
+    // - `Ok(None)`: already terminal — idempotent 204, nothing to tear down.
+    // - `Ok(Some((prev, target)))`: transitioned; emit + drop the broker
+    //   token, then destroy.
+    // - `Conflict`: a sibling (drain, dead-host detector, eviction scanner)
+    //   raced us to terminal — best-effort tear down, then 204. (ADR 0034:
+    //   deleting mid-eviction works this way — the scanner's racing
+    //   transition_session(Idle) then fails against the terminal row, fires
+    //   abort_inflight_snapshot, and releases the lease.)
     //
-    // ADR 0034: deleting mid-eviction works the same way —
-    // Evicting → Completed is legal, and the eviction scanner's
-    // racing pipeline then fails its own transition_session(Idle)
-    // against the terminal row, fires abort_inflight_snapshot, and
-    // releases the session lease. No special-casing needed here.
-    match state
-        .services
-        .meta
-        .transition_session(id, SessionState::Completed)
-        .await
-    {
-        Ok(prev) => {
+    // An unknown id surfaces as 404 from `terminate_session`'s own
+    // `get_session` — matching the get/exec contract — before any teardown.
+    match state.services.meta.terminate_session(id).await {
+        Ok(None) => return Ok(StatusCode::NO_CONTENT),
+        Ok(Some((prev, target))) => {
             state
                 .emit(
                     id,
                     SessionEvent::StatusChanged {
                         from: prev,
-                        to: SessionState::Completed,
+                        to: target,
                         at: chrono::Utc::now(),
                     },
                 )
@@ -1347,7 +1334,7 @@ pub async fn delete_session(
         Err(e) => return Err(e.into()),
     }
 
-    // Status is Completed; reconcile won't touch this row anymore.
+    // Status is now terminal; reconcile won't touch this row anymore.
     // Now tear down the sandbox and clear the routing columns.
     if let Some(sandbox_id) = state.registry.unbind(id) {
         if let Err(e) = state.services.host.destroy(sandbox_id).await {
