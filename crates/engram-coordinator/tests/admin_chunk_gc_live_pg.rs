@@ -465,6 +465,125 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
     assert_eq!(report_again.promoted_deletes, 0, "nothing to promote");
 }
 
+/// ADR 0016 Phase C durability regression (the wedged-session bug): a
+/// chunk marked a candidate while transiently unpinned, then RE-PINNED
+/// before the grace elapses (e.g. an image refresh re-referencing a
+/// shared base-memory chunk), must NOT be deleted by the promote pass.
+/// `first_seen_at` is sticky and classification never clears a re-pinned
+/// candidate's row, so the promote pass re-verifies the live pin set and
+/// skips + clears it. Without the re-check the live chunk's blob is wrongly
+/// deleted and every reader of the pinning manifest 404s on first fault.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn promote_skips_candidate_that_became_repinned() {
+    let Some(rig) = rig().await else { return };
+
+    // A base-snapshot MEMORY manifest referencing one chunk — the exact
+    // shape that wedged prod (a reaped base-memfile chunk). seed_manifest
+    // puts the chunk; its content hash is ChunkHash::of(bytes).
+    let target_bytes: &[u8] = b"repin-target-base-memory-chunk";
+    let base_mem = seed_manifest(&rig.chunk_store, &[target_bytes], ManifestKind::Memory).await;
+    let target_hash = ChunkHash::of(target_bytes);
+
+    // A prior sweep marked it a candidate while it was (transiently)
+    // unpinned; the sticky first_seen_at is now in the past.
+    rig.meta
+        .upsert_chunk_gc_candidate(*target_hash.as_bytes())
+        .await
+        .expect("mark candidate");
+
+    // The chunk is RE-PINNED: an enabled image's base snapshot now
+    // references it via base_snapshot_memory_manifest. Classification will
+    // skip it as pinned but never clears the stale candidate row.
+    let base_disk =
+        seed_manifest(&rig.chunk_store, &[b"repin-base-disk"], ManifestKind::Disk).await;
+    let img_disk = seed_manifest(&rig.chunk_store, &[b"repin-img-disk"], ManifestKind::Disk).await;
+    let image_uri = format!("phase-c-repin-test:warm-{}", Uuid::new_v4());
+    let base_snap = SnapshotId::new();
+    rig.meta
+        .record_snapshot(SnapshotRecord {
+            id: base_snap,
+            session_id: None,
+            host_id: None,
+            image_version: "base-snapshot-fixture".into(),
+            size_bytes: 0,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            disk_manifest: None,
+            memory_manifest: None,
+            recoverable: true,
+            aux_bundles: vec![],
+            events_cursor: None,
+        })
+        .await
+        .expect("seed base snapshot");
+    rig.meta
+        .upsert_enabled_image(EnabledImage {
+            id: Uuid::new_v4(),
+            image_uri: image_uri.clone(),
+            manifest_toml: "image = { uri = \"phase-c\" }\n".into(),
+            manifest_digest: format!("sha256:{:064x}", 3u32),
+            disk_manifest: Some(img_disk),
+            base_snapshot_id: Some(base_snap),
+            base_snapshot_disk_manifest: Some(base_disk),
+            base_snapshot_memory_manifest: Some(base_mem),
+            last_refreshed_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: None,
+            soft_deleted_at: None,
+        })
+        .await
+        .expect("upsert enabled image");
+
+    // grace=0 → the candidate row is "expired" on this sweep, so promote
+    // considers it for deletion — and must skip it because it's pinned.
+    let cfg = ChunkGcConfig {
+        grace_period: Duration::from_secs(0),
+        ..ChunkGcConfig::default()
+    };
+    let report = run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &cfg,
+        SweepMode::Full,
+    )
+    .await
+    .expect("sweep");
+
+    assert!(
+        report.promote_repinned_skips >= 1,
+        "the re-pinned candidate must be skipped, not deleted: {report:?}"
+    );
+    assert_eq!(
+        report.promoted_deletes, 0,
+        "nothing was genuinely unpinned, so nothing should be deleted: {report:?}"
+    );
+
+    // The load-bearing assertion: the live chunk's blob survives (the bug
+    // deletes it here, 404ing the base-snapshot memfile prefetch).
+    assert!(
+        rig.blob
+            .exists(&target_hash.storage_key())
+            .await
+            .expect("exists"),
+        "a re-pinned chunk's blob must NOT be deleted by the promote pass",
+    );
+
+    // The stale candidate row is cleared so it isn't re-evaluated forever.
+    let candidates = rig
+        .meta
+        .list_gc_candidates(100, None)
+        .await
+        .expect("list candidates");
+    assert!(
+        !candidates
+            .iter()
+            .any(|r| r.content_hash == *target_hash.as_bytes()),
+        "the rescued candidate's stale row must be cleared",
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn nonzero_grace_protects_recent_candidates() {
