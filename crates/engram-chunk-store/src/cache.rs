@@ -26,8 +26,16 @@
 //!   a chunk that's not cached, exactly one BlobStorage fetch
 //!   runs; the others await its completion.
 //! - **Pin set**: working-set chunks can be marked never-evict.
-//!   The UFFD handler will populate this from the replay trace so
-//!   the prefaulted set survives between restores.
+//!   The UFFD handler populates this from the replay trace so the
+//!   prefaulted set survives between restores; the image-prefetch
+//!   supervisor (ADR 0039) pins each enabled image's canonical base
+//!   manifest (disk + memory) so the LRU can never evict the shared
+//!   base out from under live File-backend siblings. Pins are
+//!   **reference-counted**: two enabled images that share a base
+//!   chunk each hold a pin, and disabling one leaves the chunk
+//!   pinned until the last holder unpins. `pin`/`unpin` are the
+//!   single-hash primitives; `pin_all`/`unpin_all` batch over a
+//!   manifest's chunk set.
 //!
 //! What this module does NOT do:
 //!
@@ -43,7 +51,7 @@
 //!   0016 Phase C — `engram-coordinator/src/chunk_gc.rs`: pin-set +
 //!   24 h-grace candidate promotion), not this cache's concern.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -265,10 +273,14 @@ struct CacheInner {
     /// Singleflight: hashes currently being fetched. Concurrent
     /// requesters for the same hash await the in-flight fetch
     /// rather than racing the underlying fetcher.
-    inflight: Mutex<std::collections::HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>>,
-    /// Pin set — never-evict. The cache still inserts pinned
-    /// chunks like any other; the evictor skips them.
-    pinned: Mutex<HashSet<ChunkHash>>,
+    inflight: Mutex<HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>>,
+    /// Pin set — never-evict, **reference-counted**. The cache still
+    /// inserts pinned chunks like any other; the evictor skips any
+    /// hash with a non-zero count. Refcounting lets independent
+    /// holders (two enabled images sharing a base chunk; a per-session
+    /// working set overlapping the base manifest) pin the same hash
+    /// without one's `unpin` releasing another's pin.
+    pinned: Mutex<HashMap<ChunkHash, u32>>,
     /// Bounded FIFO of recently-evicted hashes. A remote (GCS) miss for
     /// a hash in this set means we paid the round-trip we just freed —
     /// the floor/ceiling is too tight for the working set. Drives
@@ -283,8 +295,8 @@ impl ChunkCache {
             inner: Arc::new(CacheInner {
                 config,
                 free_floor_pct,
-                inflight: Mutex::new(std::collections::HashMap::new()),
-                pinned: Mutex::new(HashSet::new()),
+                inflight: Mutex::new(HashMap::new()),
+                pinned: Mutex::new(HashMap::new()),
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
             }),
         }
@@ -300,8 +312,8 @@ impl ChunkCache {
             inner: Arc::new(CacheInner {
                 config,
                 free_floor_pct,
-                inflight: Mutex::new(std::collections::HashMap::new()),
-                pinned: Mutex::new(HashSet::new()),
+                inflight: Mutex::new(HashMap::new()),
+                pinned: Mutex::new(HashMap::new()),
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
             }),
         }
@@ -545,21 +557,69 @@ impl ChunkCache {
         Ok(())
     }
 
-    /// Pin a chunk against eviction. Used by the UFFD handler for
-    /// the working-set set so prefault stays warm across restarts.
+    /// Pin a chunk against eviction (increments its refcount). Used by
+    /// the UFFD handler for the working-set set so prefault stays warm
+    /// across restarts, and by the image-prefetch supervisor to keep an
+    /// enabled image's canonical base manifest resident.
     pub fn pin(&self, hash: ChunkHash) {
-        self.inner.pinned.lock().insert(hash);
+        *self.inner.pinned.lock().entry(hash).or_insert(0) += 1;
     }
 
-    /// Remove a hash from the pin set.
+    /// Release one pin on a chunk (decrements its refcount). The chunk
+    /// becomes evictable only once the last holder unpins. A spurious
+    /// unpin of an unpinned hash is a no-op.
     pub fn unpin(&self, hash: ChunkHash) {
-        self.inner.pinned.lock().remove(&hash);
+        let mut pinned = self.inner.pinned.lock();
+        if let Some(count) = pinned.get_mut(&hash) {
+            *count -= 1;
+            if *count == 0 {
+                pinned.remove(&hash);
+            }
+        }
     }
 
-    /// Drop all pins. Useful when changing which manifest a host
-    /// is serving (different working set).
+    /// Pin every hash in the batch (one refcount each). Used by the
+    /// image-prefetch supervisor to pin a whole base manifest's chunk
+    /// set in one call after warming it onto NVMe.
+    pub fn pin_all(&self, hashes: impl IntoIterator<Item = ChunkHash>) {
+        let mut pinned = self.inner.pinned.lock();
+        for hash in hashes {
+            *pinned.entry(hash).or_insert(0) += 1;
+        }
+    }
+
+    /// Release one pin on every hash in the batch. The mirror of
+    /// [`Self::pin_all`], used when an image is disabled so its
+    /// canonical base manifest's chunks become LRU-evictable again —
+    /// but only those not still pinned by another enabled image.
+    pub fn unpin_all(&self, hashes: impl IntoIterator<Item = ChunkHash>) {
+        let mut pinned = self.inner.pinned.lock();
+        for hash in hashes {
+            if let Some(count) = pinned.get_mut(&hash) {
+                *count -= 1;
+                if *count == 0 {
+                    pinned.remove(&hash);
+                }
+            }
+        }
+    }
+
+    /// Drop all pins (every refcount). Useful when changing which
+    /// manifest a host is serving (different working set).
     pub fn clear_pins(&self) {
         self.inner.pinned.lock().clear();
+    }
+
+    /// Number of distinct chunk hashes currently pinned (refcount > 0).
+    /// Diagnostic / test accessor — not used by the eviction loop.
+    pub fn pinned_count(&self) -> usize {
+        self.inner.pinned.lock().len()
+    }
+
+    /// Whether this hash currently holds at least one pin. Diagnostic /
+    /// test accessor.
+    pub fn is_pinned(&self, hash: ChunkHash) -> bool {
+        self.inner.pinned.lock().contains_key(&hash)
     }
 
     /// True if local NVMe currently has this chunk. Cheap stat;
@@ -637,14 +697,14 @@ impl ChunkCache {
             return Ok(());
         }
 
-        // Oldest mtime first; skip pinned.
+        // Oldest mtime first; skip pinned (any refcount > 0).
         entries.sort_by_key(|e| e.mtime);
         let pinned = self.inner.pinned.lock().clone();
         for entry in entries {
             if over == 0 {
                 break;
             }
-            if pinned.contains(&entry.hash) {
+            if pinned.contains_key(&entry.hash) {
                 continue;
             }
             let _ = fs::remove_file(&entry.path).await;
@@ -1077,6 +1137,80 @@ mod tests {
         assert!(cache.contains(ha).await, "pinned a must survive");
         assert!(!cache.contains(hb).await, "unpinned b should evict");
         assert!(cache.contains(hc).await);
+    }
+
+    #[tokio::test]
+    async fn refcounted_pin_survives_partial_unpin() {
+        // ADR 0039: two independent holders pin the same base chunk
+        // (e.g. two enabled images sharing it). One unpin must NOT make
+        // it evictable — the chunk stays pinned until the last holder
+        // releases. Sleeps separate mtimes so the LRU order is stable.
+        let (cache, _store, _b, _c) = setup(20).await;
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let c = b"cccccccccc";
+        let ha = ChunkHash::of(a);
+        let hb = ChunkHash::of(b);
+        let hc = ChunkHash::of(c);
+        cache.put(ha, a).await.unwrap();
+        // Two holders pin `a`.
+        cache.pin(ha);
+        cache.pin(ha);
+        assert_eq!(cache.pinned_count(), 1, "one distinct hash pinned");
+        // One holder releases — refcount drops to 1, still pinned.
+        cache.unpin(ha);
+        assert_eq!(cache.pinned_count(), 1, "still pinned after one unpin");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cache.put(hb, b).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cache.put(hc, c).await.unwrap();
+        assert!(cache.contains(ha).await, "a still pinned (refcount 1)");
+        assert!(!cache.contains(hb).await, "unpinned b evicts");
+        assert!(cache.contains(hc).await);
+        // Last holder releases — now evictable.
+        cache.unpin(ha);
+        assert_eq!(cache.pinned_count(), 0, "fully unpinned");
+    }
+
+    #[test]
+    fn pin_all_unpin_all_refcount_batch() {
+        // ADR 0039: pin_all / unpin_all batch a manifest's chunk set.
+        // Overlapping batches (shared base chunks) refcount correctly:
+        // a hash in both batches needs both unpins to release.
+        let cfg = ChunkCacheConfig {
+            root: std::path::PathBuf::from("/tmp/engram-pin-batch-test"),
+            budget_bytes: 1024,
+        };
+        let cache = ChunkCache::new(cfg);
+        let shared = ChunkHash::of(b"shared-base-chunk");
+        let only_a = ChunkHash::of(b"image-a-only");
+        let only_b = ChunkHash::of(b"image-b-only");
+        // Image A pins {shared, only_a}; image B pins {shared, only_b}.
+        cache.pin_all([shared, only_a]);
+        cache.pin_all([shared, only_b]);
+        assert_eq!(cache.pinned_count(), 3);
+        // Disable image A: unpin its set. `shared` keeps B's pin.
+        cache.unpin_all([shared, only_a]);
+        assert!(cache.is_pinned(shared), "shared still pinned by B");
+        assert!(!cache.is_pinned(only_a), "only_a released with A");
+        assert!(cache.is_pinned(only_b));
+        assert_eq!(cache.pinned_count(), 2);
+        // Disable image B: everything releases.
+        cache.unpin_all([shared, only_b]);
+        assert_eq!(cache.pinned_count(), 0);
+    }
+
+    #[test]
+    fn unpin_unpinned_hash_is_noop() {
+        let cfg = ChunkCacheConfig {
+            root: std::path::PathBuf::from("/tmp/engram-unpin-noop-test"),
+            budget_bytes: 1024,
+        };
+        let cache = ChunkCache::new(cfg);
+        let h = ChunkHash::of(b"never-pinned");
+        cache.unpin(h); // must not panic / underflow
+        cache.unpin_all([h]);
+        assert_eq!(cache.pinned_count(), 0);
     }
 
     #[tokio::test]

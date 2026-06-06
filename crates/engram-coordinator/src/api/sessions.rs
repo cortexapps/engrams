@@ -1068,6 +1068,28 @@ async fn create_session_inner(
 /// host, and runs the combined restore + harness-swap op. Any error
 /// bubbles to the caller, which falls back to a cold create — so this
 /// never fails a session, it only declines to fast-path it.
+/// ADR 0039 (cache locality): the BlobStorage key for a base image's
+/// *canonical* working-set trace (`traces/<memory_manifest_id>/canonical.json`,
+/// published by the image-builder's profile pass), or `None` when the base
+/// snapshot has no memory image.
+///
+/// When set on the restore `SnapshotMetadata`, the host narrows its
+/// memory-chunk prefetch from "all base-memory chunks" to "just the chunks
+/// the kernel faults in the first ~5 s" — the REAP-style warm set
+/// (`prefetch_memory_chunks` in the pooled backend). Keyed off the *memory*
+/// manifest because the trace describes memory faults; disk-only / cold-boot
+/// base snapshots (VZ) have no memory image, so there is nothing to narrow.
+///
+/// Safe before any bake has published a canonical trace: a missing blob is
+/// treated as an empty working set and the host falls back to full-manifest
+/// prefetch (the prior, behaviour-preserving path).
+fn base_working_set_blob_key(
+    memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+) -> Option<String> {
+    memory_manifest
+        .map(|m| engram_chunk_store::working_set::TraceRef::canonical(m.manifest_id).storage_key())
+}
+
 async fn try_restore_base_snapshot(
     state: &SharedState,
     snapshot_id: engram_core::types::SnapshotId,
@@ -1110,9 +1132,10 @@ async fn try_restore_base_snapshot(
             snapshot_id,
         )),
         rootfs_blob_key: None,
-        // P1 leaves working-set prefetch off; P2 (ADR 0020) publishes the
-        // bake-time trace and points UFFD prefetch at it.
-        working_set_blob_key: None,
+        // ADR 0039 (cache locality): narrow the host's memory-chunk prefetch
+        // to the base image's canonical working-set trace. See
+        // [`base_working_set_blob_key`].
+        working_set_blob_key: base_working_set_blob_key(record.memory_manifest),
         // ADR 0035: the generations this base snapshot pins; the host
         // materializes any it's missing and (fresh flavor) swaps to
         // its current generation post-load.
@@ -1603,6 +1626,31 @@ mod tests {
         assert_eq!(resolved_memory_mib(&mk(true, Some(8192))), 8192);
         // Browser + default (4 GiB): already above the floor.
         assert_eq!(resolved_memory_mib(&mk(true, None)), DEFAULT_MEMORY_MIB);
+    }
+
+    /// ADR 0039: the base-restore metadata points the host's memory-chunk
+    /// prefetch at the canonical working-set trace, keyed off the base
+    /// snapshot's *memory* manifest. Disk-only / cold-boot base snapshots
+    /// (no memory manifest) get `None` and fall back to full-manifest
+    /// prefetch.
+    #[test]
+    fn base_working_set_blob_key_points_at_canonical_trace() {
+        use engram_core::types::manifest::ManifestRef;
+        // FC base snapshot with a memory manifest → canonical trace key
+        // keyed on the *manifest_id* (not the version — the trace is per
+        // manifest lineage, stable across diff-chain version bumps).
+        let mref = ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 3,
+        };
+        let key = base_working_set_blob_key(Some(mref)).expect("memory manifest → Some key");
+        assert_eq!(
+            key,
+            format!("traces/{}/canonical.json", mref.manifest_id),
+            "key must be the canonical trace for the memory manifest lineage",
+        );
+        // Disk-only / cold-boot (VZ) base snapshot: no memory image → None.
+        assert_eq!(base_working_set_blob_key(None), None);
     }
 
     /// ADR 0016 §A.1.7 regression guard. The pure assembly path
