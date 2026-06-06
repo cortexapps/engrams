@@ -45,6 +45,15 @@ fn nbd_state_none() -> NbdStateSlot {
 #[cfg(not(target_os = "linux"))]
 fn nbd_state_none() -> NbdStateSlot {}
 
+/// ADR 0039 item #19: bounded concurrency for the cold-restore memory
+/// chunk prefetch. Raised from 8 — single-stream GCS ~80 MB/s on the
+/// prod n2-standard-8 hosts left ~90 % of the 10 Gbps line rate idle
+/// while a cold resume blocked 66.5 s on this prefetch (traced). 32
+/// (~2.5 GB/s aggregate) saturates closer to line rate without tripping
+/// GCS per-object rate limits. Mirrors the re-chunk/upload bound so the
+/// save and load paths use the same fleet-tuned fan-out.
+const MEMORY_PREFETCH_CONCURRENCY: usize = 32;
+
 /// Return the cached image's legacy `rootfs.ext4` path or a
 /// typed error when neither it nor a bundle is present.
 ///
@@ -1097,11 +1106,15 @@ impl PooledBackend {
     /// when the cache is already warm) and best-effort (errors
     /// degrade to the serial fault path inside materialize_to_file_cached).
     ///
-    /// Concurrency is bounded at 8 — well under the NIC's
-    /// saturation point on the prod n2-standard-8 hosts (single-
-    /// stream GCS hits ~80 MB/s; 8× parallel = ~640 MB/s, half the
-    /// 10 Gbps line rate) and well below GCS's per-object rate
-    /// limits.
+    /// Concurrency is bounded at [`MEMORY_PREFETCH_CONCURRENCY`] (32).
+    /// Single-stream GCS hits ~80 MB/s on the prod n2-standard-8 hosts;
+    /// the prior bound of 8 (~640 MB/s) left most of the 10 Gbps line
+    /// rate idle while the cold resume waited 66.5 s on this prefetch
+    /// (traced). 32 (~2.5 GB/s aggregate) saturates closer to line rate
+    /// without tripping GCS per-object rate limits, shrinking the
+    /// cold-cache refill that gates resume. (ADR 0039 item #19 also
+    /// flags moving this prefetch off the resume critical path entirely
+    /// — see the design note; that's the higher-risk follow-up.)
     async fn prefetch_memory_chunks(
         &self,
         metadata: &SnapshotMetadata,
@@ -1164,10 +1177,14 @@ impl PooledBackend {
         let chunk_count = hashes_to_prefetch.len();
         let store_for_fetch = chunk_store.clone();
         cache
-            .prefetch_chunks_parallel(hashes_to_prefetch, 8, move |hash| {
-                let s = store_for_fetch.clone();
-                async move { s.get_chunk(hash).await }
-            })
+            .prefetch_chunks_parallel(
+                hashes_to_prefetch,
+                MEMORY_PREFETCH_CONCURRENCY,
+                move |hash| {
+                    let s = store_for_fetch.clone();
+                    async move { s.get_chunk(hash).await }
+                },
+            )
             .await
             .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks_parallel: {e}")))?;
         tracing::debug!(

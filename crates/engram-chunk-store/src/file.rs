@@ -27,6 +27,15 @@ use crate::error::Result;
 use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION};
 use crate::store::ChunkStore;
 
+/// ADR 0039 item #19: bounded concurrency for the per-chunk GCS I/O in
+/// the re-chunk paths (`chunk_file`, `update_for_dirty_ranges_sparse`).
+/// Chunk puts are content-addressed/idempotent and keyed by offset, so
+/// they're order-independent — we fan them out instead of awaiting one
+/// at a time (~16 ms/chunk serial). 32 sits well under a 10 Gbps host
+/// NIC's saturation at the 512 KiB memory / 16 MiB disk chunk sizes and
+/// below GCS per-object rate limits (mirrors the prefetch bound).
+const SPARSE_RECHUNK_CONCURRENCY: usize = 32;
+
 impl ChunkStore {
     /// Walk a file in `chunk_size` blocks, PUT each non-zero block
     /// into the store, return a `Manifest` describing the result.
@@ -61,24 +70,69 @@ impl ChunkStore {
             annotations: serde_json::Value::Null,
         };
 
+        // ADR 0039 item #19: the per-chunk GCS put dominates here
+        // (~16 ms each), so awaiting one chunk at a time made an 8 GiB
+        // memory re-chunk (~16 K × 512 KiB) take minutes. The reads are
+        // cheap local I/O off a single handle (kept sequential), but the
+        // puts are content-addressed/idempotent and order-independent —
+        // so we read a window of up to `SPARSE_RECHUNK_CONCURRENCY`
+        // non-zero chunks into owned buffers, fan their puts out with
+        // `buffer_unordered`, then drain the window before reading the
+        // next one. This bounds resident RAM at concurrency × chunk_size
+        // (no whole-image buffering) while still overlapping the network.
         let mut buf = vec![0u8; chunk_size as usize];
         let mut offset: u64 = 0;
+        let mut window: Vec<(u64, Bytes)> = Vec::with_capacity(SPARSE_RECHUNK_CONCURRENCY);
         while offset < total_bytes {
             let want = chunk_size.min(total_bytes - offset) as usize;
             let slice = &mut buf[..want];
             file.read_exact(slice).await?;
 
-            if is_all_zero(slice) {
-                offset += want as u64;
-                continue;
+            if !is_all_zero(slice) {
+                window.push((offset, Bytes::copy_from_slice(slice)));
             }
-
-            let hash = self.put_chunk(slice).await?;
-            manifest.chunks.push(ChunkRef { offset, hash });
             offset += want as u64;
+
+            if window.len() == SPARSE_RECHUNK_CONCURRENCY {
+                self.flush_chunk_window(std::mem::take(&mut window), &mut manifest)
+                    .await?;
+            }
         }
+        if !window.is_empty() {
+            self.flush_chunk_window(window, &mut manifest).await?;
+        }
+        // Windows are read + appended in offset order and each window is
+        // internally re-sorted, so `manifest.chunks` stays offset-sorted.
 
         Ok(manifest)
+    }
+
+    /// Put a window of non-zero `(offset, bytes)` chunks concurrently
+    /// (bounded by [`SPARSE_RECHUNK_CONCURRENCY`]) and append the
+    /// resulting `ChunkRef`s to `manifest` in offset order. Used by
+    /// [`Self::chunk_file`] to overlap the per-chunk GCS puts.
+    async fn flush_chunk_window(
+        &self,
+        window: Vec<(u64, Bytes)>,
+        manifest: &mut Manifest,
+    ) -> Result<()> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        let mut refs: Vec<ChunkRef> = stream::iter(window)
+            .map(|(offset, bytes)| {
+                let store = self.clone();
+                async move {
+                    let hash = store.put_chunk(&bytes).await?;
+                    Ok::<_, crate::error::ChunkStoreError>(ChunkRef { offset, hash })
+                }
+            })
+            .buffer_unordered(SPARSE_RECHUNK_CONCURRENCY)
+            .try_collect()
+            .await?;
+        // `buffer_unordered` yields in completion order — restore the
+        // offset ordering the manifest invariant requires.
+        refs.sort_by_key(|c| c.offset);
+        manifest.chunks.extend(refs);
+        Ok(())
     }
 
     /// ADR 0038 / 0039: produce the next full-image manifest from a
@@ -134,53 +188,101 @@ impl ChunkStore {
         let mut by_offset: BTreeMap<u64, ChunkRef> =
             prev.chunks.iter().map(|c| (c.offset, c.clone())).collect();
 
-        let mut diff = fs::File::open(diff_path).await?;
-        let mut buf = vec![0u8; chunk_size as usize];
-        for idx in dirty_chunks {
-            let offset = idx * chunk_size;
-            if offset >= total_bytes {
-                continue;
-            }
-            let want = chunk_size.min(total_bytes - offset) as usize;
-            let slice = &mut buf[..want];
+        // ADR 0039 item #19: each dirty chunk is independent — its
+        // result depends only on its prev content (fetched by hash,
+        // order-free) and the diff bytes that fall inside it. Drive the
+        // per-chunk get_chunk + overlay + put_chunk concurrently with a
+        // bounded `buffer_unordered`, then fold the results into
+        // `by_offset` after the concurrent phase (so the manifest's
+        // chunk order stays deterministic regardless of completion
+        // order). Replaces the serial loop that cost ~16 ms/chunk and
+        // made evictions O(dirty set) in wall-clock — 1,936 chunks
+        // ≈ 32 s — instead of O(dirty set / concurrency).
+        //
+        // `put_chunk` is content-addressed/idempotent and the diff is
+        // read with per-task `seek+read` on a private file handle, so
+        // concurrent tasks never share mutable I/O state.
+        use futures::stream::{self, StreamExt, TryStreamExt};
 
-            // Seed the chunk from its previous content (warm cache) —
-            // or zeros if `prev` elided this offset (all-zero chunk).
-            match by_offset.get(&offset).map(|c| c.hash) {
-                Some(prev_hash) => {
-                    let bytes = self.get_chunk(prev_hash).await?;
-                    let n = bytes.len().min(want);
-                    slice[..n].copy_from_slice(&bytes[..n]);
-                    if n < want {
-                        slice[n..].fill(0);
+        // Snapshot each dirty chunk's prev hash before spawning so the
+        // tasks don't borrow `by_offset`.
+        let work: Vec<(u64, usize, Option<crate::manifest::ChunkHash>)> = dirty_chunks
+            .into_iter()
+            .filter_map(|idx| {
+                let offset = idx * chunk_size;
+                if offset >= total_bytes {
+                    return None;
+                }
+                let want = chunk_size.min(total_bytes - offset) as usize;
+                Some((offset, want, by_offset.get(&offset).map(|c| c.hash)))
+            })
+            .collect();
+
+        let results: Vec<(u64, Option<ChunkRef>)> = stream::iter(work)
+            .map(|(offset, want, prev_hash)| {
+                let store = self.clone();
+                let diff_path = diff_path.to_path_buf();
+                async move {
+                    let mut slice = vec![0u8; want];
+
+                    // Seed the chunk from its previous content (warm
+                    // cache) — or zeros if `prev` elided this offset
+                    // (all-zero chunk).
+                    match prev_hash {
+                        Some(prev_hash) => {
+                            let bytes = store.get_chunk(prev_hash).await?;
+                            let n = bytes.len().min(want);
+                            slice[..n].copy_from_slice(&bytes[..n]);
+                            // `slice` was zero-initialized, so a short
+                            // prev chunk already leaves the tail zeroed.
+                        }
+                        None => { /* already zeros */ }
                     }
-                }
-                None => slice.fill(0),
-            }
 
-            // Overlay the diff's dirty bytes that fall in this chunk.
-            // `dirty_ranges` are the diff's data extents, so reads land
-            // on real bytes (never a hole).
-            for &(off, len) in dirty_ranges {
-                if len == 0 {
-                    continue;
-                }
-                let lo = off.max(offset);
-                let hi = (off + len).min(offset + want as u64);
-                if lo >= hi {
-                    continue;
-                }
-                diff.seek(std::io::SeekFrom::Start(lo)).await?;
-                diff.read_exact(&mut slice[(lo - offset) as usize..(hi - offset) as usize])
-                    .await?;
-            }
+                    // Overlay the diff's dirty bytes that fall in this
+                    // chunk. `dirty_ranges` are the diff's data extents,
+                    // so reads land on real bytes (never a hole). A
+                    // fresh handle per task keeps the seek+read state
+                    // private.
+                    let mut diff = fs::File::open(&diff_path).await?;
+                    for &(off, len) in dirty_ranges {
+                        if len == 0 {
+                            continue;
+                        }
+                        let lo = off.max(offset);
+                        let hi = (off + len).min(offset + want as u64);
+                        if lo >= hi {
+                            continue;
+                        }
+                        diff.seek(std::io::SeekFrom::Start(lo)).await?;
+                        diff.read_exact(&mut slice[(lo - offset) as usize..(hi - offset) as usize])
+                            .await?;
+                    }
 
-            if is_all_zero(slice) {
-                by_offset.remove(&offset);
-                continue;
+                    if is_all_zero(&slice) {
+                        return Ok::<_, crate::error::ChunkStoreError>((offset, None));
+                    }
+                    let hash = store.put_chunk(&slice).await?;
+                    Ok((offset, Some(ChunkRef { offset, hash })))
+                }
+            })
+            .buffer_unordered(SPARSE_RECHUNK_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        // Fold the (order-independent) results into the carried-over
+        // map: a `Some` replaces/inserts the chunk, a `None` (chunk
+        // dirtied to all-zero) elides it — preserving the sparse
+        // invariant.
+        for (offset, entry) in results {
+            match entry {
+                Some(c) => {
+                    by_offset.insert(offset, c);
+                }
+                None => {
+                    by_offset.remove(&offset);
+                }
             }
-            let hash = self.put_chunk(slice).await?;
-            by_offset.insert(offset, ChunkRef { offset, hash });
         }
 
         Ok(Manifest {
@@ -786,6 +888,131 @@ mod tests {
 
         assert_eq!(got.total_bytes, total);
         assert_eq!(keys(&got), keys(&ground));
+        let out = work.path().join("out.bin");
+        s.materialize_to_file(&got, &out).await.unwrap();
+        assert_eq!(fs::read(&out).await.unwrap(), cur);
+    }
+
+    // ---- ADR 0039 item #19: parallel re-chunk I/O ----
+
+    /// `chunk_file` fans its per-chunk puts out across multiple
+    /// concurrency windows, then must still emit a strictly
+    /// offset-sorted manifest that materializes byte-for-byte. Use
+    /// MANY more chunks than `SPARSE_RECHUNK_CONCURRENCY` so the path
+    /// crosses several windows (and a final short partial window),
+    /// surfacing any completion-order vs. offset-order bug. A few
+    /// interior chunks are all-zero so the sparse elision still holds
+    /// under the windowed path.
+    #[tokio::test]
+    async fn chunk_file_parallel_windows_are_sorted_and_byte_faithful() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+        // 5 full windows + 7 = 167 chunks; chunks 10/50/100 zeroed.
+        let n_chunks = SPARSE_RECHUNK_CONCURRENCY * 5 + 7;
+        let zeroed: std::collections::BTreeSet<usize> = [10usize, 50, 100].into_iter().collect();
+
+        let mut data = vec![0u8; n_chunks * cs as usize];
+        for c in 0..n_chunks {
+            if zeroed.contains(&c) {
+                continue;
+            }
+            let fill = ((c % 250) + 1) as u8; // never 0 → chunk is non-zero
+            data[c * cs as usize..(c + 1) * cs as usize].fill(fill);
+        }
+        let src = work.path().join("big.bin");
+        fs::write(&src, &data).await.unwrap();
+
+        let m = s
+            .chunk_file(&src, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        // Exactly the non-zero chunks appear, and offsets are sorted.
+        assert_eq!(m.chunks.len(), n_chunks - zeroed.len());
+        let offsets: Vec<u64> = m.chunks.iter().map(|c| c.offset).collect();
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(offsets, sorted, "manifest chunks must stay offset-sorted");
+        for c in &m.chunks {
+            assert!(!zeroed.contains(&((c.offset / cs) as usize)));
+        }
+
+        let dest = work.path().join("dest.bin");
+        s.materialize_to_file(&m, &dest).await.unwrap();
+        assert_eq!(fs::read(&dest).await.unwrap(), data);
+    }
+
+    /// The sparse re-chunk fans its per-dirty-chunk get/overlay/put out
+    /// concurrently and folds the order-independent results back in.
+    /// Dirty MANY more chunks than `SPARSE_RECHUNK_CONCURRENCY` (across
+    /// several windows), including one dirtied-to-zero (must elide) and
+    /// one whose prev was elided (must seed from zeros), and assert it
+    /// still equals a full `chunk_file` re-chunk of the post-diff image.
+    #[tokio::test]
+    async fn update_for_dirty_ranges_sparse_parallel_matches_full_rechunk() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+        let n_chunks = SPARSE_RECHUNK_CONCURRENCY * 3 + 5; // 101 chunks
+                                                           // chunk 0 starts all-zero (elided in prev).
+        let mut prev_img = vec![0u8; n_chunks * cs as usize];
+        for c in 1..n_chunks {
+            prev_img[c * cs as usize..(c + 1) * cs as usize].fill(((c % 200) + 1) as u8);
+        }
+        let p = work.path().join("prev.bin");
+        fs::write(&p, &prev_img).await.unwrap();
+        let prev = s
+            .chunk_file(&p, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        // Dirty every even chunk: set a fresh value; chunk 0 gets data
+        // (prev was elided → seed-from-zero path); chunk 40 → all zeros
+        // (must drop out of the manifest).
+        let mut cur = prev_img.clone();
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut extents: Vec<(u64, Vec<u8>)> = Vec::new();
+        for c in (0..n_chunks).step_by(2) {
+            let off = c as u64 * cs;
+            let bytes = if c == 40 {
+                vec![0u8; cs as usize]
+            } else {
+                vec![((c % 90) + 100) as u8; cs as usize]
+            };
+            cur[off as usize..off as usize + cs as usize].copy_from_slice(&bytes);
+            ranges.push((off, cs));
+            extents.push((off, bytes));
+        }
+        let cur_path = work.path().join("cur.bin");
+        fs::write(&cur_path, &cur).await.unwrap();
+        let ground = s
+            .chunk_file(&cur_path, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        let diff = work.path().join("mem.diff");
+        write_sparse_diff(&diff, prev.total_bytes, &extents).await;
+        let got = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &ranges)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            keys(&got),
+            keys(&ground),
+            "parallel sparse re-chunk must equal a full re-chunk of the post-diff image"
+        );
+        let hash_at =
+            |m: &Manifest, off: u64| m.chunks.iter().find(|c| c.offset == off).map(|c| c.hash);
+        assert_eq!(
+            hash_at(&got, 40 * cs),
+            None,
+            "chunk 40 dirtied-to-zero elided"
+        );
+        // An untouched (odd) chunk carries over hash-identical.
+        assert_eq!(hash_at(&got, cs), hash_at(&prev, cs));
+
         let out = work.path().join("out.bin");
         s.materialize_to_file(&got, &out).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);

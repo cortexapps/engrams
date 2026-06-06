@@ -40,6 +40,15 @@ use tokio::sync::{Mutex, Notify};
 /// `u64::MAX` to disable threshold-driven notification.
 pub const DEFAULT_DIRTY_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 
+/// ADR 0039 item #19: bounded concurrency for the per-chunk GCS puts in
+/// [`ChunkedDiskBackend::flush_upload`]. The 16 MiB-disk-chunk puts are
+/// content-addressed/idempotent and keyed by chunk index, so they're
+/// order-independent — we fan them out instead of awaiting one at a time
+/// (~16 ms/put serial → ~32 s for a ~1,936-chunk dirty set). 32 sits
+/// under a 10 Gbps host NIC's saturation and below GCS per-object rate
+/// limits (mirrors the memory prefetch + re-chunk bound).
+const DISK_FLUSH_UPLOAD_CONCURRENCY: usize = 32;
+
 /// Anything that can go wrong on the backend data plane.
 #[derive(Debug)]
 pub enum DiskBackendError {
@@ -808,37 +817,60 @@ impl ChunkedDiskBackend {
             self.stamp_flush_completion();
             return Ok(out);
         }
-        // Upload each stashed chunk to GCS — OFF the frozen-guest path.
-        for (chunk_idx, _hash, size) in &new_chunks {
-            let Some(bytes) = self
-                .pending_uploads
-                .lock()
-                .await
-                .get(chunk_idx)
-                .map(|(_, b)| b.clone())
-            else {
-                continue;
-            };
-            // ADR 0019: span each dirty-chunk upload under an active
-            // operation so this (now post-resume) flush still shows in
-            // the op's trace.
-            let put = self.store.put_chunk(&bytes);
-            match self.operation_scope.current() {
-                Some(op) => {
-                    let span = op.span.in_scope(|| {
-                        tracing::info_span!(
-                            "chunk.flush",
-                            op = op.kind,
-                            chunk = *chunk_idx,
-                            bytes = *size,
-                        )
-                    });
-                    tracing::Instrument::instrument(put, span).await?;
-                }
-                None => {
-                    put.await?;
-                }
-            }
+        // Upload the stashed chunks to GCS — OFF the frozen-guest path.
+        // ADR 0039 item #19: the per-chunk put dominates the flush
+        // (~16 ms each), so awaiting one at a time made a large dirty
+        // set (~1,936 chunks → ~32 s) the slow phase of an eviction.
+        // Puts are content-addressed/idempotent and keyed by chunk_idx,
+        // so they're order-independent — fan them out with bounded
+        // `buffer_unordered`. Errors propagate from the first failure;
+        // already-uploaded chunks are durable (the manifest rebuild
+        // below only runs on full success, so it never references a
+        // not-yet-uploaded chunk — the durability invariant holds).
+        {
+            use futures::stream::{self, StreamExt, TryStreamExt};
+            let snapshot: Vec<(usize, u64)> = new_chunks
+                .iter()
+                .map(|(idx, _hash, size)| (*idx, *size))
+                .collect();
+            let op = self.operation_scope.current();
+            stream::iter(snapshot)
+                .map(|(chunk_idx, size)| {
+                    let store = &self.store;
+                    let pending = &self.pending_uploads;
+                    let op = op.clone();
+                    async move {
+                        let Some(bytes) =
+                            pending.lock().await.get(&chunk_idx).map(|(_, b)| b.clone())
+                        else {
+                            return Ok(());
+                        };
+                        // ADR 0019: span each dirty-chunk upload under an
+                        // active operation so this (now post-resume)
+                        // flush still shows in the op's trace.
+                        let put = store.put_chunk(&bytes);
+                        match op {
+                            Some(op) => {
+                                let span = op.span.in_scope(|| {
+                                    tracing::info_span!(
+                                        "chunk.flush",
+                                        op = op.kind,
+                                        chunk = chunk_idx,
+                                        bytes = size,
+                                    )
+                                });
+                                tracing::Instrument::instrument(put, span).await?;
+                            }
+                            None => {
+                                put.await?;
+                            }
+                        }
+                        Ok::<_, DiskBackendError>(())
+                    }
+                })
+                .buffer_unordered(DISK_FLUSH_UPLOAD_CONCURRENCY)
+                .try_collect::<()>()
+                .await?;
         }
 
         // Now atomically: rebuild the manifest from the (locked)
@@ -2039,5 +2071,51 @@ mod tests {
         let r1 = tokio::time::timeout(std::time::Duration::from_millis(200), w1).await;
         let r2 = tokio::time::timeout(std::time::Duration::from_millis(200), w2).await;
         assert!(r1.is_ok() && r2.is_ok(), "both waiters must wake on drain");
+    }
+
+    /// ADR 0039 item #19: `flush_upload` fans its per-chunk puts out
+    /// with bounded `buffer_unordered`. Dirty MANY more chunks than
+    /// `DISK_FLUSH_UPLOAD_CONCURRENCY` so the parallel path runs across
+    /// several windows, then assert the published manifest is correct:
+    /// every dirty chunk's bytes are uploaded + retrievable, the
+    /// manifest is offset-sorted, and a post-flush read serves the
+    /// flushed bytes (proving the rebase saw every parallel put).
+    #[tokio::test]
+    async fn flush_upload_parallel_publishes_all_dirty_chunks_sorted() {
+        let chunk_size = 4096u64;
+        let n_chunks = DISK_FLUSH_UPLOAD_CONCURRENCY * 3 + 5; // 101 chunks
+        let total = n_chunks as u64 * chunk_size;
+        // Sparse base (no chunks): every write targets a fresh chunk.
+        let base = synth_manifest(total, chunk_size, vec![]);
+        let (backend, store, _dir) = build_backend(&base).await;
+
+        // Write a distinct non-zero byte into every chunk.
+        for c in 0..n_chunks {
+            let byte = ((c % 250) + 1) as u8;
+            backend
+                .write(c as u64 * chunk_size, &vec![byte; chunk_size as usize])
+                .await
+                .unwrap();
+        }
+
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, n_chunks);
+        assert_eq!(outcome.bytes_uploaded, total);
+
+        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        assert_eq!(published.chunks.len(), n_chunks);
+        let offsets: Vec<u64> = published.chunks.iter().map(|c| c.offset).collect();
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(offsets, sorted, "published manifest must be offset-sorted");
+
+        // Every published chunk's bytes are durable in the store, and a
+        // spot-check read serves the flushed (not stale-base) bytes.
+        for c in published.chunks.iter() {
+            store.get_chunk(c.hash).await.unwrap();
+        }
+        let mid = (n_chunks / 2) as u64;
+        let got = backend.read(mid * chunk_size, 16).await.unwrap();
+        assert_eq!(got, vec![((mid as usize % 250) + 1) as u8; 16]);
     }
 }
