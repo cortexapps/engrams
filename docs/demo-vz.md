@@ -125,8 +125,11 @@ curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
     -H 'Content-Type: application/json' \
     -d '{"text": "list /workspace and tell me what you see"}'
 
-# Idle eviction → hot auto-resume.
-sleep 35       # crosses the 30s soft TTL
+# Idle eviction → hot auto-resume. The default soft TTL is 5 min
+# (ADR 0039 follow-up #20) so it doesn't evict interactive sessions
+# mid-conversation; run the coord/host with `ENGRAM_IDLE_TTL_SECS=30`
+# so the sleeps below trip it.
+sleep 35       # crosses the demo soft TTL (ENGRAM_IDLE_TTL_SECS=30)
 curl http://127.0.0.1:8090/sessions/$SID  # status: idle
 curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
     -H 'Content-Type: application/json' \

@@ -81,8 +81,9 @@ You'll see `run_started` → `tool_call_started` →
 ## 3. Watch idle eviction
 
 The noop harness emits 3 tool calls at 5s intervals, then falls
-silent. With `ENGRAM_IDLE_TTL_SECS=60` (default), the idle
-evictor will hot-suspend the session ~60s after the last harness
+silent. The default soft TTL is 5 min (ADR 0039 follow-up #20);
+run the host with `ENGRAM_IDLE_TTL_SECS=60` for this demo so the
+idle evictor hot-suspends the session ~60s after the last harness
 event:
 
 ```bash

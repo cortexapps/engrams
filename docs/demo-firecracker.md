@@ -117,8 +117,11 @@ SID=$(curl -s -X POST http://localhost:8090/sessions \
   -d "{\"image\":\"localhost:5001/demo-claude:warm-1\",
        \"harness\":{\"kind\":\"builtin\",\"name\":\"claude\"}}" | jq -r .session_id)
 
-# Idle eviction → hot auto-resume.
-sleep 35       # crosses the 30s soft TTL (ENGRAM_IDLE_TTL_SECS)
+# Idle eviction → hot auto-resume. The default soft TTL is 5 min
+# (ADR 0039 follow-up #20) so it doesn't evict interactive sessions
+# mid-conversation; this demo sets a short TTL so the sleeps below
+# trip it. Run the coord/host with `ENGRAM_IDLE_TTL_SECS=30`.
+sleep 35       # crosses the demo soft TTL (ENGRAM_IDLE_TTL_SECS=30)
 curl http://localhost:8090/sessions/$SID  # status: idle
 curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
   -H "content-type: application/json" \
