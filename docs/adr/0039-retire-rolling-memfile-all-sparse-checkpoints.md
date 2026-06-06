@@ -219,6 +219,136 @@ priority order:
    pre-ADR-0039 `memory.bin`s (this code only stops *new* growth, after the
    FC-host MIG re-bakes + rolls).
 
+## Roadmap implementation (follow-up PRs #96–#99)
+
+The §1–§4 items above shipped as four follow-up PRs, all merged to `main`;
+the chunk-I/O, locality, and resume-scheduling pieces were prod-validated
+on the rolled FC fleet (2026-06-06, throwaway `demo-claude` `mode=dev_vm`
+sessions driven via `/exec`). What landed, what's design-only, and what
+still needs dev-vm/FC validation:
+
+### §1 — Async, single-flight chunk I/O — PR [#97](https://github.com/cortexapps/engrams/pull/97) (`fix/chunk-io-concurrency`)
+
+**Implemented** (bounded `futures::buffer_unordered`, concurrency 32):
+
+- `chunk-store::file::update_for_dirty_ranges_sparse` — per-dirty-chunk
+  `get_chunk(prev)` + diff-overlay + `put_chunk` run concurrently on private
+  per-task diff handles; results folded into the carried `BTreeMap` after
+  the concurrent phase (`None` elides → sparse invariant preserved).
+- `chunk-store::file::chunk_file` (the memory re-chunk) — sequential reads
+  off one handle, puts in concurrency-sized windows (RAM bounded at
+  `concurrency × chunk_size`, no whole-image buffering); manifest stays
+  offset-sorted.
+- `host-agent::disk_daemon::backend::flush_upload` (NBD disk flush) — serial
+  put loop fanned out at 32; manifest rebuilt only after every put succeeds
+  (durability invariant), `chunk.flush` span kept.
+- `host-agent::pooled_backend::prefetch_memory_chunks` — cold-resume
+  prefetch concurrency 8→32 (`MEMORY_PREFETCH_CONCURRENCY`).
+
+**Design-only** (high-risk, dev-vm-gated): make `restore.prefetch_memory`
+non-blocking + move the prefetch into the `engram-uffd-handler` process so
+lazy UFFD faults coalesce onto the in-flight `ChunkCache.get` — today
+host-agent and uffd-handler are separate processes with separate
+`ChunkCache`s and would double-fetch in-flight chunks. This is the
+`66.5 s of a 69 s cold resume` win. It is **sound** (UFFD already lazy-faults
+from durable chunks, and the resume path already falls back to lazy faulting
+when the prefetch errors) and **de-risked by §2 pinning** (the cold-fault
+surface shrinks to the per-session diff); the remaining work also needs a
+missing-page fail-fast in the uffd-handler (else a missing page hangs the
+guest, the UFFD analog of the NBD wedge fixed in #103).
+
+**Prod-validated:** evict + warm resume fast, disk byte-identical across
+evict→resume, no wedge/blob-not-found. (Large-dirty-set ~4 min serial
+baseline comparison still open.)
+
+### §2 — Cache locality: pin canonical base manifests + narrow prefetch — PR [#99](https://github.com/cortexapps/engrams/pull/99) (`adr0039-cache-locality-pin-base`)
+
+**Implemented:**
+
+- **Pin canonical base manifests.** The cache `pin`/`unpin` API existed but
+  was never called, so the LRU could evict the shared base out from under
+  live File-backend siblings. The image-prefetch supervisor now pins each
+  enabled image's deduped base-manifest chunk set (disk + memory) via
+  `ChunkCache::pin_all` after a successful warm at host boot AND
+  image-enable, unpinning on disable. Pins are now **reference-counted**
+  (`HashMap<ChunkHash, u32>` replacing `HashSet`) so two images sharing a
+  base chunk both pin it; `evict_to_budget` skips pinned hashes.
+- **Narrow base prefetch.** `try_restore_base_snapshot` now sets
+  `working_set_blob_key` → `traces/<memory_manifest_id>/canonical.json` so
+  `prefetch_memory_chunks` narrows to the working set when a canonical trace
+  exists (full-manifest fallback when absent; `None` for disk-only/VZ).
+
+**Design-only:** resume host-affinity (soft last-host preference /
+`ScheduleContext.prefer_host`) — snapshot-affinity via `prefer_snapshot_id`
+already covers the primary win; the soft preference touches the
+evac/host-lost/`exclude_host` paths → multi-host FC dev-vm validation.
+
+**Prod-validated:** rolled hosts log `"image base snapshot prefetched +
+pinned; marked ready"` (demo-claude 280 chunks, dev-engrams 709);
+`engram_chunk_cache_refetch_after_evict_total` stays 0 across evict→resume
+(the pinned base is never evicted + refetched).
+
+### §3 — Disk-aware chunk-cache budget + thrash metrics — PR [#98](https://github.com/cortexapps/engrams/pull/98) (`chunk-cache-disk-aware-budget`)
+
+**Implemented** (self-contained to `chunk-store::cache`):
+
+- `evict_to_budget` re-probes the cache filesystem via `statvfs(2)` each
+  sweep and LRU-evicts oldest-first (skipping pinned) to hold the mount
+  at/under ~90 % full (10 % free floor), dynamically yielding disk to
+  snapshots/checkpoints sharing `work_dir` — fixes the prod incident where
+  the fixed 200 GiB byte-budget never tripped on a ~98 GiB host.
+- `budget_bytes` → optional absolute ceiling (`NO_CEILING` default lets the
+  floor govern). Env: `ENGRAM_CHUNK_CACHE_BUDGET_BYTES`,
+  `_FREE_FLOOR_PCT` / `_FREE_FLOOR_BYTES`.
+- Thrash metric: bounded `EvictedRing` (4096 hashes) +
+  `engram_chunk_cache_refetch_after_evict_total`; `engram_chunk_cache_fs_free_bytes`
+  gauge. `ChunkCacheConfig` kept struct-literal-compatible (floor resolved
+  inside `ChunkCache::new`, not a new field) so downstream crates compile
+  unedited.
+
+**Prod-confirmed:** `fs_free_bytes` gauge + (absent ⇒ 0) thrash counter
+scrape on the rolled host-agents. **Needs dev-vm/FC validation:** the floor
+evicting oldest-first under real `work_dir` pressure without ENOSPC while
+pinned working-set chunks survive **floor** (not just ceiling) pressure.
+(`statvfs` works on macOS, so the floor math is exercised locally.)
+
+### §4 — Resume scheduling: hold-not-bounce + saner idle TTL — PR [#96](https://github.com/cortexapps/engrams/pull/96) (`fix/resume-evicting-hold-and-idle-ttl`)
+
+**Implemented:**
+
+- **Hold-not-bounce.** `ensure_active`'s `Evicting` arm holds via a bounded
+  poll (`ensure_active_after_evicting_hold[_for]`, default 8 s / 250 ms, env
+  `ENGRAM_RESUME_EVICTING_HOLD_SECS`, `0` = opt-out) until the eviction
+  lands the session at `Idle`/`Evacuating`, then dispatches the existing
+  `resume_session()` inline; fallback after the bound is the same retryable
+  409.
+- **Saner idle TTL.** `DEFAULT_IDLE_TTL_SECS` 30→300 (env
+  `ENGRAM_IDLE_TTL_SECS`; 30-min hard-TTL backstop unchanged).
+
+**Prod-validated + known follow-up:** the idle-eviction state machine and
+300 s TTL are confirmed, and a message arriving mid-eviction is retryable
+(not stranded — a post-eviction retry resumes + delivers). The hold does
+**not** reliably deliver single-shot, though: `evict_session_to_state`
+transitions the session →`Idle` *before* its `SessionLeaseGuard` releases
+(`Drop` spawns a detached release task), so the hold's `resume_session` can
+observe `Idle` while the lease is still held and return the retryable
+lease-409. Fix (deferred): have the hold retry the transient lease-conflict
+within its deadline, or release the lease before/with the `Idle` transition;
+confirm via the `ensure_active_after_evicting_hold_for` test seam.
+
+### Roadmap coverage
+
+| 0039 § | PR | State |
+| --- | --- | --- |
+| §1 Async, single-flight chunk I/O | [#97](https://github.com/cortexapps/engrams/pull/97) | Parallel I/O shipped; async cross-process prefetch design-only |
+| §2 Cache locality | [#99](https://github.com/cortexapps/engrams/pull/99) | Pin + narrow shipped; resume host-affinity design-only |
+| §3 Disk-aware budget + thrash metrics | [#98](https://github.com/cortexapps/engrams/pull/98) | Shipped |
+| §4 Resume scheduling | [#96](https://github.com/cortexapps/engrams/pull/96) | Shipped (hold single-shot has a lease-race follow-up) |
+
+§5 (`snapshots/<id>/` reaper), §6 (host-registry / FC SIGKILL hygiene), and
+§7 (one-shot prod-ops cleanup of pre-0039 `memory.bin`s) remain unaddressed
+and stay queued above.
+
 ## Implementation
 
 Commit chain (this branch, off the ADR-0038 branch):
@@ -253,6 +383,8 @@ after #93 merged, so live SHAs differ — see `git log`.)
 ## Status
 
 Accepted. #93 (ADR 0038) has merged to `main`; this branch was rebased
-onto `origin/main`, so the PR bases on `main`. The chunk-I/O, cache-budget,
-locality, and resume-scheduling items in **Further work** are tracked as
-separate follow-up PRs.
+onto `origin/main`, so the PR bases on `main`. The chunk-I/O (§1, #97),
+cache-locality (§2, #99), disk-aware-budget (§3, #98), and
+resume-scheduling (§4, #96) items from **Further work** have all shipped —
+see **Roadmap implementation** above for what landed vs. what stays
+design-only/dev-vm-gated. §5–§7 remain queued.
