@@ -568,15 +568,17 @@ async fn main() -> Result<(), CoordinatorError> {
                 // (`""` / `"none"` disables, anything else passes
                 // through verbatim).
                 fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
-                // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips
-                // restore to the chunk-native UFFD handler (lazy memory,
-                // no memory.bin materialize). Defaults to File.
+                // ADR 0020 Route B / ADR 0039: idle-resume uses the
+                // chunk-native UFFD handler (lazy memory). Now the DEFAULT
+                // (ENGRAM_FC_RESTORE_MODE unset ⇒ uffd), so the Helm chart
+                // no longer needs to set it; `file` is the explicit opt-out.
                 fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
-                // ADR 0022 Option A: ENGRAM_FC_BASE_RESTORE_MODE=file flips
-                // *base session.create* restores to the File backend
-                // against the per-template resident memfile (density +
-                // faster boot); idle-resume stays on `restore_mode`. Unset
-                // ⇒ inherit `restore_mode` (behaviour-preserving).
+                // ADR 0022 Option A / ADR 0039: *base session.create*
+                // restores against the per-template resident memfile via
+                // the File backend (density + fast local boot). Now the
+                // DEFAULT (ENGRAM_FC_BASE_RESTORE_MODE unset ⇒ file);
+                // `uffd` is the kill-switch. idle-resume stays on
+                // `restore_mode`.
                 fc_cfg.base_restore_mode = engram_sandbox_firecracker::base_restore_mode_from_env();
                 // Point the UFFD handler at the SAME chunk cache the
                 // PooledBackend restore-prefetch warms (`local_path/

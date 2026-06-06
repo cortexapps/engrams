@@ -3,16 +3,17 @@
 //!
 //! What this pins (the whole diff-first pipeline, on real KVM):
 //!
-//!   1. First `checkpoint_sandbox` = Full capture → seeds the rolling
-//!      chain (rolling memory.bin + manifest v1) + writes a durable
-//!      `CheckpointRecord`.
+//!   1. First `checkpoint_sandbox` = Full capture → chunks guest RAM
+//!      into the store (manifest v1), removes the local memory.bin
+//!      (ADR 0039 — no rolling memfile) + seeds the chain manifest-only,
+//!      writes a durable `CheckpointRecord`.
 //!   2. Second checkpoint = **Diff** capture → O(dirty) pause, sparse
-//!      overlay onto the rolling file, incremental re-chunk (same
-//!      manifest id, version 2), second durable record.
+//!      re-chunk from prev chunks + the sparse diff (same manifest id,
+//!      version 2), second durable record.
 //!   3. `restore()` from the *second* checkpoint's metadata on the
 //!      same backend (File mode → memory.bin materializes from the
-//!      v2 chunked manifest — the incremental manifest must reproduce
-//!      the full image) and the guest proves BOTH markers (pre-seed +
+//!      v2 chunked manifest — the sparse manifest must reproduce the
+//!      full image) and the guest proves BOTH markers (pre-seed +
 //!      pre-diff) byte-identical via sha256 over exec.
 //!   4. The durable records re-load from disk (the heartbeat advert
 //!      payload) and `delete_acked` clears them.
@@ -167,6 +168,21 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
         .memory_manifest
         .expect("seed must publish a memory manifest");
 
+    // ADR 0039: the Full capture chunked guest RAM into the store and
+    // then removed the local memory.bin — committed snapshot dirs must
+    // NOT carry the GiB-scale dump (the 61G prod leak). state.bin stays
+    // so the snapshot is still restorable (memory.bin re-materializes
+    // from the chunks via the manifest).
+    let ckpt1_dir = pooled.snapshot_path_for(ckpt1.id);
+    assert!(
+        !ckpt1_dir.join("memory.bin").exists(),
+        "ADR 0039: Full capture must remove the local memory.bin after chunking",
+    );
+    assert!(
+        ckpt1_dir.join("state.bin").exists(),
+        "state.bin must remain for restore",
+    );
+
     // ---- 4. Marker 2 → Diff checkpoint ----
     let sum2 = plant_marker(&pooled, sandbox, 2).await;
     let t = Instant::now();
@@ -198,8 +214,8 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     assert_eq!(records.len(), 1, "acked record deleted, un-acked kept");
 
     // ---- 6. Restore from the DIFF checkpoint on the same backend ----
-    // File mode materializes memory.bin from the v2 incremental
-    // manifest — the byte-fidelity proof for update_for_dirty_ranges
+    // File mode materializes memory.bin from the v2 sparse-rechunk
+    // manifest — the byte-fidelity proof for update_for_dirty_ranges_sparse
     // against real guest memory. Destroy first (frees the canonical
     // vsock path for the restored sibling).
     pooled.destroy(sandbox).await.expect("destroy original");

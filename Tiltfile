@@ -389,6 +389,14 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         kernel_key: kernel_path,
         'ENGRAM_SANDBOX_WORK_DIR': work_dir,
         'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
+        # ADR 0039: the Tilt dev/e2e stack doesn't bake engram-uffd-handler
+        # (prod's FC-host image does), and the host-agent runs under sudo
+        # with a scrubbed PATH so it couldn't spawn a co-located one anyway.
+        # The host-agent code default is now `uffd`, so pin `file` here to
+        # keep idle-resume on the no-handler path. Override to `uffd` only
+        # where the handler is present. (Base-create stays code-default
+        # `file`, which needs no handler.)
+        'ENGRAM_FC_RESTORE_MODE': env_or('ENGRAM_FC_RESTORE_MODE', 'file'),
         # gRPC plumbing — coord dials advertise, host-agent listens on
         # bind. Same machine in dev, so loopback works for both.
         'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:' + grpc_port,

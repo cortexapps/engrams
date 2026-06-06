@@ -180,7 +180,6 @@ ENGRAM_BLOB_BACKEND=gcs
 ENGRAM_GCS_BUCKET=${var.chunks_bucket}
 ENGRAM_SANDBOX_BACKEND=firecracker
 ENGRAM_KERNEL_IMAGE_PATH=${var.kernel_image_path}
-ENGRAM_FC_RESTORE_MODE=${var.restore_mode}
 ENGRAM_SANDBOX_WORK_DIR=/var/lib/engram/sandboxes
 ENGRAM_WARM_POOL_SIZE=${var.warm_pool_size}
 ${var.warm_pool_disabled ? "ENGRAM_WARM_POOL_DISABLED=1" : ""}
