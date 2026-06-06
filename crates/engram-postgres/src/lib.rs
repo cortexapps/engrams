@@ -31,11 +31,36 @@ pub struct PostgresStore {
 
 impl PostgresStore {
     pub async fn connect(url: &str) -> Result<Self, MetaError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .connect(url)
-            .await
-            .map_err(|e| MetaError::Db(Box::new(e)))?;
+        // Retry the initial connect with backoff. In prod PG (Cloud SQL)
+        // is always up, so the first attempt succeeds with no delay. But
+        // a freshly-started PG — the docker-compose container in CI's
+        // `test-e2e-stack` lane, or a just-provisioned instance — can
+        // reset the first connections while it finishes booting. Without
+        // a retry the coord exits at startup ("postgres connect:
+        // Connection reset by peer") and the e2e-stack bring-up flakes
+        // ("coord never came up"). ~10 attempts over ~20s covers the
+        // container-startup race without masking a genuinely-bad URL.
+        const MAX_ATTEMPTS: u32 = 10;
+        let mut attempt = 0;
+        let pool = loop {
+            attempt += 1;
+            match PgPoolOptions::new().max_connections(8).connect(url).await {
+                Ok(pool) => break pool,
+                Err(e) if attempt < MAX_ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %e,
+                        "postgres connect failed; retrying after backoff",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * u64::from(attempt.min(6)),
+                    ))
+                    .await;
+                }
+                Err(e) => return Err(MetaError::Db(Box::new(e))),
+            }
+        };
         Ok(Self { pool })
     }
 
