@@ -1311,7 +1311,10 @@ mod tests {
         std::env::set_var(FREE_FLOOR_BYTES_ENV_VAR, "1073741824");
         let pct = resolve_free_floor_pct(Path::new("/tmp/cache-test"));
         clear_floor_env();
-        assert!((pct - 0.05).abs() < 1e-9, "_PCT must win over _BYTES, got {pct}");
+        assert!(
+            (pct - 0.05).abs() < 1e-9,
+            "_PCT must win over _BYTES, got {pct}"
+        );
     }
 
     // ---- bytes_to_free: pure floor/ceiling decision ----
