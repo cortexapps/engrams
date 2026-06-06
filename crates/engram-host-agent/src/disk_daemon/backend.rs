@@ -319,6 +319,42 @@ struct BackendState {
 /// bounding per-sandbox RAM.
 const DISK_CHUNK_MEM_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
+/// NBD durability: bound a single chunk fetch so a stuck origin GET can
+/// never hang the NBD request forever. Without this, a fetch that never
+/// returns (a black-holed GCS GET) leaves the guest's virtio-blk I/O in
+/// uninterruptible sleep (jbd2/writeback D-state) AND prevents FC from
+/// pausing the VM (`PATCH /vm` times out) — the wedged-session class.
+/// On exhaustion the fetch returns an error, which `serve_loop` turns
+/// into an NBD EIO: the guest's rootfs degrades to read-only but the VM
+/// stays responsive (pausable, evictable). Bounded retries cover a
+/// transient origin blip / GCS eventual-consistency without wedging
+/// (~5 × 3s ≈ 15s worst case before EIO). A missing chunk should never
+/// hang a VM; the chunk-GC pin-recheck fix prevents the missing chunk,
+/// this is the defense-in-depth that keeps a miss from wedging the host.
+const CHUNK_FETCH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Retry budget for a TRANSIENT fetch failure (origin 5xx / connection /
+/// per-attempt timeout): the blob exists, so it's worth riding out a GCS
+/// hiccup (~5 × backoff ≈ 15s) before failing the read with EIO.
+const CHUNK_FETCH_MAX_ATTEMPTS: u32 = 5;
+/// Retry budget for a definitive 404 (blob genuinely absent). Near-
+/// permanent, so retry only enough to ride out GCS read-after-write
+/// eventual consistency, then fail fast — no point spending the full
+/// transient budget on a blob that isn't coming back.
+const CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS: u32 = 2;
+const CHUNK_FETCH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Classify a chunk-fetch error: a definitive 404 (`BlobError::NotFound`,
+/// which the GCS backend maps a 404 to) gets the short
+/// [`CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS`] budget; everything else (5xx /
+/// connection / per-attempt [`ChunkStoreError::FetchTimeout`]) gets the
+/// fuller [`CHUNK_FETCH_MAX_ATTEMPTS`] since the blob is expected to exist.
+fn chunk_fetch_is_not_found(e: &engram_chunk_store::error::ChunkStoreError) -> bool {
+    matches!(
+        e,
+        engram_chunk_store::error::ChunkStoreError::Blob(engram_core::error::BlobError::NotFound)
+    )
+}
+
 /// In-memory LRU of recently-read **clean** chunks, keyed by content hash.
 ///
 /// Why this exists: a guest block read resolves to its containing chunk and
@@ -1037,30 +1073,119 @@ impl ChunkedDiskBackend {
                 } else {
                     "blobstorage"
                 };
-                let fut = self.cache.get(hash, || self.store.get_chunk(hash));
-                // ADR 0019: when a lifecycle operation is active (e.g. cold
-                // boot), span this base-chunk fetch under it so the page-in
-                // shows in the operation's trace, tagged with the serving tier.
-                let bytes = match self.operation_scope.current() {
-                    Some(op) => {
-                        let span = op.span.in_scope(|| {
-                            tracing::info_span!(
-                                "chunk.fetch",
-                                op = op.kind,
-                                chunk = chunk_idx,
-                                bytes = chunk_len,
-                                tier = tier,
-                            )
-                        });
-                        tracing::Instrument::instrument(fut, span).await?
-                    }
-                    None => fut.await?,
-                };
+                // NBD durability: bounded-retry + per-attempt timeout so a
+                // stuck or missing origin fetch fails fast (→ NBD EIO via
+                // serve_loop) instead of hanging the guest's virtio-blk I/O.
+                // The `chunk.fetch` span is emitted inside the helper,
+                // attached to the active op scope + serving tier.
+                let bytes = self
+                    .fetch_chunk_bounded(hash, chunk_idx, chunk_len, tier)
+                    .await?;
                 self.mem_cache.lock().unwrap().put(hash, bytes.clone());
                 Ok(bytes)
             }
             // Zero-filled hole — the manifest had no entry here.
             None => Ok(Bytes::from(vec![0u8; chunk_len as usize])),
+        }
+    }
+
+    /// Fetch a chunk via the cache (single-flight + populate), bounding
+    /// each attempt with [`CHUNK_FETCH_ATTEMPT_TIMEOUT`] and retrying up to
+    /// [`CHUNK_FETCH_MAX_ATTEMPTS`] so a stuck or transiently-missing origin
+    /// GET fails fast with an error (→ NBD EIO) rather than hanging the
+    /// guest's virtio-blk I/O indefinitely (which also blocks FC from
+    /// pausing the VM).
+    ///
+    /// The timeout lives INSIDE the single-flight closure on purpose:
+    /// [`ChunkCache::get`] drains its waiters whenever the fetch returns
+    /// (Ok or Err), so a timed-out fetch propagates the error to every
+    /// waiter and never poisons the inflight map — whereas timing out
+    /// *around* `cache.get` would cancel the in-flight fetcher and strand
+    /// the other waiters on the same hash.
+    async fn fetch_chunk_bounded(
+        &self,
+        hash: ChunkHash,
+        chunk_idx: usize,
+        chunk_len: u64,
+        tier: &'static str,
+    ) -> Result<Bytes, DiskBackendError> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let store = self.store.clone();
+            let fut = self.cache.get(hash, move || async move {
+                match tokio::time::timeout(CHUNK_FETCH_ATTEMPT_TIMEOUT, store.get_chunk(hash)).await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(engram_chunk_store::error::ChunkStoreError::FetchTimeout(
+                        format!("{hash} after {CHUNK_FETCH_ATTEMPT_TIMEOUT:?}"),
+                    )),
+                }
+            });
+            // ADR 0019: attach the page-in span to the active lifecycle
+            // operation (cold boot etc.), tagged with the serving tier.
+            let outcome = match self.operation_scope.current() {
+                Some(op) => {
+                    let span = op.span.in_scope(|| {
+                        tracing::info_span!(
+                            "chunk.fetch",
+                            op = op.kind,
+                            chunk = chunk_idx,
+                            bytes = chunk_len,
+                            tier = tier,
+                        )
+                    });
+                    tracing::Instrument::instrument(fut, span).await
+                }
+                None => fut.await,
+            };
+            match outcome {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => {
+                    // 404s are near-permanent (short budget — just ride out
+                    // GCS read-after-write EC); transient errors get the
+                    // fuller budget since the blob is expected to exist.
+                    let not_found = chunk_fetch_is_not_found(&e);
+                    let max = if not_found {
+                        CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS
+                    } else {
+                        CHUNK_FETCH_MAX_ATTEMPTS
+                    };
+                    if attempt >= max {
+                        // Exhausted the bounded budget — fail the read so the
+                        // NBD layer returns EIO. Loud + countable (with the
+                        // outcome class) so a missing/stuck chunk surfaces as
+                        // an alert, not a silent wedge.
+                        let outcome = if not_found { "notfound" } else { "transient" };
+                        metrics::counter!(
+                            "engram_nbd_chunk_fetch_failed_total",
+                            "tier" => tier,
+                            "outcome" => outcome,
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            chunk = chunk_idx,
+                            hash = %hash,
+                            attempts = attempt,
+                            outcome,
+                            error = %e,
+                            "chunk fetch exhausted bounded retries; failing the NBD request \
+                             (guest gets EIO — rootfs degrades read-only but the VM stays \
+                             pausable/evictable instead of wedging)",
+                        );
+                        return Err(e.into());
+                    }
+                    tracing::warn!(
+                        chunk = chunk_idx,
+                        hash = %hash,
+                        attempt,
+                        not_found,
+                        error = %e,
+                        "chunk fetch failed; retrying (bounded)",
+                    );
+                    tokio::time::sleep(CHUNK_FETCH_RETRY_BACKOFF).await;
+                }
+            }
         }
     }
 
@@ -1157,6 +1282,66 @@ mod tests {
 
         let bytes = backend.read(4096, 4096).await.unwrap();
         assert!(bytes.iter().all(|b| *b == 0xbb));
+    }
+
+    /// NBD durability: a read whose backing chunk blob is missing must
+    /// return an error in BOUNDED time (→ NBD EIO via serve_loop), never
+    /// hang. Regression for the wedged-session class where a stuck/missing
+    /// chunk fetch left the guest's virtio-blk I/O in uninterruptible sleep
+    /// (jbd2/writeback D-state) and blocked FC from pausing the VM. The
+    /// outer timeout is the assertion: the bounded-retry budget must elapse
+    /// to an `Err`, not block forever.
+    #[tokio::test]
+    async fn read_of_missing_chunk_fails_fast_within_bound_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        // Reference a chunk hash we NEVER store: the backing blob is absent,
+        // so every fetch attempt 404s — the prod "reaped chunk" shape.
+        let missing = ChunkHash::of(b"a-chunk-that-was-reaped-and-never-stored");
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, missing)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        // The read must resolve to an Err well within this generous bound
+        // (the bounded-retry budget), NOT hang. A timeout here = regression.
+        let outer = CHUNK_FETCH_RETRY_BACKOFF * (CHUNK_FETCH_MAX_ATTEMPTS + 4)
+            + CHUNK_FETCH_ATTEMPT_TIMEOUT;
+        let outcome = tokio::time::timeout(outer, backend.read(0, chunk_size))
+            .await
+            .expect("read must fail fast on a missing chunk, not hang");
+        assert!(
+            outcome.is_err(),
+            "a read of a missing chunk must surface an error (→ NBD EIO), got Ok",
+        );
+    }
+
+    /// The 404-vs-transient delineation that drives the retry budget: a
+    /// definitive `BlobError::NotFound` (GCS 404) is near-permanent and
+    /// gets the short budget; a fetch timeout / origin 5xx is transient and
+    /// gets the fuller budget.
+    #[test]
+    fn chunk_fetch_classifies_notfound_vs_transient() {
+        use engram_chunk_store::error::ChunkStoreError;
+        use engram_core::error::BlobError;
+        assert!(
+            chunk_fetch_is_not_found(&ChunkStoreError::Blob(BlobError::NotFound)),
+            "a 404 must classify as not-found (short retry budget)",
+        );
+        assert!(
+            !chunk_fetch_is_not_found(&ChunkStoreError::FetchTimeout("h after 3s".into())),
+            "a per-attempt timeout is transient (full retry budget)",
+        );
+        assert!(
+            !chunk_fetch_is_not_found(&ChunkStoreError::Origin("origin 5xx".into())),
+            "an origin/5xx error is transient (full retry budget)",
+        );
     }
 
     #[tokio::test]
