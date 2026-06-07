@@ -174,17 +174,32 @@ pub fn dirty_ranges(diff: &Path) -> std::io::Result<Vec<(u64, u64)>> {
 /// Config for the periodic driver.
 #[derive(Clone, Debug)]
 pub struct CheckpointConfig {
-    /// Capture cadence per sandbox. `None` disables the driver
-    /// (`ENGRAM_CHECKPOINT_INTERVAL_SECS=0`).
+    /// Capture cadence per sandbox — the relaxed *in-RAM* backstop (ADR 0043
+    /// P2a). `None` disables the periodic driver entirely
+    /// (`ENGRAM_CHECKPOINT_INTERVAL_SECS=0`); disk durability and the
+    /// event-driven memory checkpoints (drain / idle-evict / operator) are
+    /// unaffected either way.
     pub interval: Option<Duration>,
 }
 
 impl CheckpointConfig {
+    /// ADR 0043 P2a relaxed the default cadence from the old aggressive 60 s
+    /// to 10 minutes. The periodic checkpoint is only the *in-RAM* backstop
+    /// for an unplanned crash of an ACTIVE session: the guest DISK is already
+    /// durable on a continuous ~30 s flush
+    /// ([`crate::disk_daemon::flush_scheduler`], no guest pause), and the FC
+    /// memory state is captured on every meaningful event — drain (SIGTERM),
+    /// idle-eviction, and the operator `POST /sessions/:id/snapshot`. So the
+    /// timer only bounds how much in-RAM progress an active session can lose to
+    /// an unplanned host crash (its disk + harness transcript survive). 10 min
+    /// is "infrequent but sane", with far less per-session pause / capture-lock
+    /// contention / GCS churn than every 60 s. Override (or disable, `=0`) via
+    /// `ENGRAM_CHECKPOINT_INTERVAL_SECS`.
     pub fn from_env() -> Self {
         let secs = std::env::var("ENGRAM_CHECKPOINT_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60);
+            .unwrap_or(600);
         Self {
             interval: (secs > 0).then(|| Duration::from_secs(secs)),
         }
