@@ -22,6 +22,7 @@ use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use futures::Stream;
 use std::pin::Pin;
+use std::time::Duration;
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::transport::Channel;
@@ -56,6 +57,28 @@ impl Interceptor for TraceparentInjector {
         }
         Ok(req)
     }
+}
+
+/// Deadline applied (via the gRPC `grpc-timeout` header) to the
+/// snapshot-restore RPCs — `restore` (resume) and
+/// `restore_base_for_session` (cold-create-via-restore). Without it a
+/// host that wedges mid-restore leaves the coord caller hung
+/// indefinitely (observed as a ~6-minute dead-host stall); the
+/// keepalive pings only catch a *silent* connection, not a peer that
+/// ACKs but never completes the call. Set generously above the
+/// slowest legitimate restore (cold boot ~15-30s, rechunk-heavy
+/// resumes up to a couple of minutes) so it never aborts a real
+/// restore, while still bounding the pathological hang. Because it
+/// rides the gRPC deadline header, the *host* side observes it too and
+/// can abort its own work. Override via
+/// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS`.
+fn restore_rpc_timeout() -> Duration {
+    let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(240);
+    Duration::from_secs(secs)
 }
 
 /// Coord-side client wrapping a `tonic::transport::Channel` to one
@@ -183,9 +206,10 @@ impl GrpcHostClient {
     }
 
     pub async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        let req = RestoreRequest {
+        let mut req = tonic::Request::new(RestoreRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
-        };
+        });
+        req.set_timeout(restore_rpc_timeout());
         let resp = self
             .inner
             .clone()
@@ -218,10 +242,11 @@ impl GrpcHostClient {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
-        let req = RestoreBaseForSessionRequest {
+        let mut req = tonic::Request::new(RestoreBaseForSessionRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
             session_env,
-        };
+        });
+        req.set_timeout(restore_rpc_timeout());
         let resp = self
             .inner
             .clone()
