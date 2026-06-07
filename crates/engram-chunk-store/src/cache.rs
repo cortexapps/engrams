@@ -264,6 +264,37 @@ pub struct ChunkCache {
 /// the working-set-too-big-for-the-disk thrash this metric targets.
 const EVICTED_RING_CAP: usize = 4096;
 
+/// Singleflight slot map: hash → the waiters' oneshot senders the
+/// leader broadcasts the fetched bytes to. An entry exists iff a leader
+/// is in flight for that hash.
+type InflightMap = HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>;
+
+/// Removes a leader's in-flight slot on drop **unless disarmed** — the
+/// cancel-safety net for [`ChunkCache::get`]. The leader registers a
+/// slot, then `fetch().await`s; if that future is *cancelled* (e.g. an
+/// FC `load_snapshot` 60 s timeout tears down the whole restore), the
+/// leader's normal "remove slot + notify waiters" tail never runs, so
+/// the slot — holding the leader's own sender — lingers forever and
+/// every waiter (and every later `get` for this hash, which joins the
+/// orphaned slot) blocks on a broadcast that never comes. That poisons
+/// the host's chunk cache (prod incident: session 9f82064b wedged every
+/// resume retry). This guard removes the slot on drop, dropping its
+/// senders so waiters observe `RecvError` and retry as a fresh leader.
+/// The leader disarms it once it has removed the slot itself.
+struct LeaderGuard<'a> {
+    inflight: &'a Mutex<InflightMap>,
+    hash: ChunkHash,
+    armed: bool,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inflight.lock().remove(&self.hash);
+        }
+    }
+}
+
 struct CacheInner {
     config: ChunkCacheConfig,
     /// Free-space floor fraction, resolved once from env (or the
@@ -273,7 +304,7 @@ struct CacheInner {
     /// Singleflight: hashes currently being fetched. Concurrent
     /// requesters for the same hash await the in-flight fetch
     /// rather than racing the underlying fetcher.
-    inflight: Mutex<HashMap<ChunkHash, Vec<oneshot::Sender<Result<Bytes>>>>>,
+    inflight: Mutex<InflightMap>,
     /// Pin set — never-evict, **reference-counted**. The cache still
     /// inserts pinned chunks like any other; the evictor skips any
     /// hash with a non-zero count. Refcounting lets independent
@@ -392,114 +423,140 @@ impl ChunkCache {
             return Ok(bytes);
         }
 
-        // Singleflight: register our waiter; if we're the first,
-        // do the fetch + broadcast.
-        let (tx, rx) = oneshot::channel();
-        let do_fetch = {
-            let mut inflight = self.inner.inflight.lock();
-            let entry = inflight.entry(hash).or_default();
-            let first = entry.is_empty();
-            entry.push(tx);
-            first
-        };
-
-        if do_fetch {
-            // ADR 0039 #16: thrash signal. If we're about to pay a remote
-            // round-trip for a hash we recently evicted, the cache is too
-            // small for the working set — count it (and stop tracking the
-            // hash; it's about to be re-cached). A sustained nonzero rate
-            // says "raise the budget / the disk is the bottleneck."
-            if self.inner.evicted_ring.lock().take(&hash) {
-                metrics::counter!("engram_chunk_cache_refetch_after_evict_total").increment(1);
-            }
-            // ADR 0019 0d: time the remote fetch — the cold-cache page-in
-            // cost that stretches cold boot (the slow tier). Histogram +
-            // the bytes counter below quantify "how much of the boot is
-            // blob page-in" without per-read trace spam.
-            let fetch_start = std::time::Instant::now();
-            let fetched = fetch().await;
-            metrics::histogram!(
-                "engram_chunk_fetch_seconds",
-                "tier" => "blobstorage",
-            )
-            .record(fetch_start.elapsed().as_secs_f64());
-            // Verify-on-populate. This is the ONE place a chunk is hashed:
-            // a content-addressed cache must never serve OR store bytes that
-            // don't match the requested hash (corrupt / truncated object). On
-            // mismatch we fail the read for every waiter rather than poison
-            // the guest's rootfs, and never write the bad bytes. The read
-            // fast path above then trusts the verified, atomically-written
-            // file — that's what moves the 16 MiB sha256 off the hot per-read
-            // path (ADR 0021).
-            let result = match fetched {
-                Ok(bytes) => {
-                    let actual = ChunkHash::of(&bytes);
-                    if actual == hash {
-                        Ok(bytes)
-                    } else {
-                        tracing::error!(
-                            hash = %hash,
-                            actual = %actual,
-                            "fetched chunk hash mismatch; refusing to cache or serve",
-                        );
-                        Err(ChunkStoreError::HashMismatch {
-                            expected: hash.to_hex(),
-                            actual: actual.to_hex(),
-                        })
-                    }
-                }
-                Err(e) => Err(e),
-            };
-            // Persist + drain waiters under a single lock acquisition.
-            let waiters = {
+        // Singleflight, cancel-safe. We loop because a waiter whose leader
+        // is cancelled mid-fetch (see `LeaderGuard`) wakes with `RecvError`
+        // and re-enters — re-checking the local hit, then re-leading or
+        // re-joining — rather than failing the read. The leader path runs
+        // at most once per call (the `fetch` closure is `FnOnce`, taken via
+        // `Option::take`); a call only re-loops as a woken waiter.
+        let mut fetch = Some(fetch);
+        loop {
+            let (tx, rx) = oneshot::channel();
+            let do_fetch = {
                 let mut inflight = self.inner.inflight.lock();
-                inflight.remove(&hash).unwrap_or_default()
+                let entry = inflight.entry(hash).or_default();
+                let first = entry.is_empty();
+                entry.push(tx);
+                first
             };
-            if let Ok(bytes) = result.as_ref() {
-                // write_local failure is non-fatal I/O (ENOSPC, perms): the
-                // fetched bytes still return to the caller, but the chunk
-                // isn't cached, so every later read re-fetches from GCS —
-                // which presents exactly as "warming ran but reads still
-                // miss". Surface it loudly rather than swallowing (`let _ =`).
-                if let Err(e) = self.write_local(hash, bytes).await {
-                    tracing::warn!(
-                        hash = %hash,
-                        root = %self.inner.config.root.display(),
-                        bytes = bytes.len(),
-                        error = %e,
-                        "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
-                    );
+
+            if do_fetch {
+                // Arm the cancel-safety guard for the whole leader section:
+                // if this future is dropped before we remove the slot below,
+                // the guard removes it so waiters retry instead of wedging.
+                let mut guard = LeaderGuard {
+                    inflight: &self.inner.inflight,
+                    hash,
+                    armed: true,
+                };
+                let fetch = fetch.take().expect("leader runs the fetch once");
+                // ADR 0039 #16: thrash signal. If we're about to pay a remote
+                // round-trip for a hash we recently evicted, the cache is too
+                // small for the working set — count it (and stop tracking the
+                // hash; it's about to be re-cached). A sustained nonzero rate
+                // says "raise the budget / the disk is the bottleneck."
+                if self.inner.evicted_ring.lock().take(&hash) {
+                    metrics::counter!("engram_chunk_cache_refetch_after_evict_total").increment(1);
                 }
-                metrics::counter!(
-                    "engram_chunk_cache_bytes_total",
+                // ADR 0019 0d: time the remote fetch — the cold-cache page-in
+                // cost that stretches cold boot (the slow tier). Histogram +
+                // the bytes counter below quantify "how much of the boot is
+                // blob page-in" without per-read trace spam.
+                let fetch_start = std::time::Instant::now();
+                let fetched = fetch().await;
+                metrics::histogram!(
+                    "engram_chunk_fetch_seconds",
                     "tier" => "blobstorage",
                 )
-                .increment(bytes.len() as u64);
+                .record(fetch_start.elapsed().as_secs_f64());
+                // Verify-on-populate. This is the ONE place a chunk is hashed:
+                // a content-addressed cache must never serve OR store bytes that
+                // don't match the requested hash (corrupt / truncated object). On
+                // mismatch we fail the read for every waiter rather than poison
+                // the guest's rootfs, and never write the bad bytes. The read
+                // fast path above then trusts the verified, atomically-written
+                // file — that's what moves the 16 MiB sha256 off the hot per-read
+                // path (ADR 0021).
+                let result = match fetched {
+                    Ok(bytes) => {
+                        let actual = ChunkHash::of(&bytes);
+                        if actual == hash {
+                            Ok(bytes)
+                        } else {
+                            tracing::error!(
+                                hash = %hash,
+                                actual = %actual,
+                                "fetched chunk hash mismatch; refusing to cache or serve",
+                            );
+                            Err(ChunkStoreError::HashMismatch {
+                                expected: hash.to_hex(),
+                                actual: actual.to_hex(),
+                            })
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                // Persist + drain waiters under a single lock acquisition,
+                // then DISARM: the slot is gone, so the guard must not remove
+                // a fresh slot a later leader may have created.
+                let waiters = {
+                    let mut inflight = self.inner.inflight.lock();
+                    inflight.remove(&hash).unwrap_or_default()
+                };
+                guard.armed = false;
+                if let Ok(bytes) = result.as_ref() {
+                    // write_local failure is non-fatal I/O (ENOSPC, perms): the
+                    // fetched bytes still return to the caller, but the chunk
+                    // isn't cached, so every later read re-fetches from GCS —
+                    // which presents exactly as "warming ran but reads still
+                    // miss". Surface it loudly rather than swallowing (`let _ =`).
+                    if let Err(e) = self.write_local(hash, bytes).await {
+                        tracing::warn!(
+                            hash = %hash,
+                            root = %self.inner.config.root.display(),
+                            bytes = bytes.len(),
+                            error = %e,
+                            "chunk cache write_local failed — chunk not cached (reads will miss → GCS)",
+                        );
+                    }
+                    metrics::counter!(
+                        "engram_chunk_cache_bytes_total",
+                        "tier" => "blobstorage",
+                    )
+                    .increment(bytes.len() as u64);
+                }
+                // Notify waiters. Send-failure (their rx dropped)
+                // is benign.
+                for waiter in waiters {
+                    let _ = waiter.send(clone_result(&result));
+                }
+                // ADR 0014 M1.15: counts the leader's fetch as a miss
+                // (we went to the underlying store). Singleflight
+                // followers are accounted as nvme hits when they
+                // re-enter `get` on a subsequent call — they're
+                // counted via the rx-await arm here only when the
+                // leader's fetch failed, which is rare.
+                metrics::counter!(
+                    "engram_chunk_cache_hits_total",
+                    "tier" => "blobstorage",
+                )
+                .increment(1);
+                return result;
+            } else {
+                // We're not the first; await the leader's broadcast. The
+                // closure we were passed stays unused (the leader's fetcher
+                // fires; content-addressing means any fetcher yields the same
+                // bytes).
+                match rx.await {
+                    Ok(result) => return result,
+                    // `RecvError` ⇒ the leader was dropped (cancelled) before
+                    // broadcasting and its `LeaderGuard` cleaned the slot.
+                    // Retry: re-loop to re-check the local hit, then re-lead
+                    // or re-join. This is the un-poisoning — a cancelled
+                    // restore no longer wedges every later read of this hash.
+                    Err(_) => continue,
+                }
             }
-            // Notify waiters. Send-failure (their rx dropped)
-            // is benign.
-            for waiter in waiters {
-                let _ = waiter.send(clone_result(&result));
-            }
-            // ADR 0014 M1.15: counts the leader's fetch as a miss
-            // (we went to the underlying store). Singleflight
-            // followers are accounted as nvme hits when they
-            // re-enter `get` on a subsequent call — they're
-            // counted via the rx-await arm here only when the
-            // leader's fetch failed, which is rare.
-            metrics::counter!(
-                "engram_chunk_cache_hits_total",
-                "tier" => "blobstorage",
-            )
-            .increment(1);
-            result
-        } else {
-            // We're not the first; the closure we were passed is
-            // dropped here without running. The leader's fetcher
-            // is the one that fires, and content-addressing means
-            // any fetcher would have produced the same bytes.
-            rx.await
-                .map_err(|_| ChunkStoreError::Internal("singleflight sender dropped".into()))?
         }
     }
 
@@ -1319,6 +1376,98 @@ mod tests {
             count <= 10,
             "fetcher invocations: {count} (expected singleflight to collapse)"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_leader_does_not_poison_the_inflight_slot() {
+        // Regression for the single-flight poison (prod: session 9f82064b).
+        // A leader cancelled mid-fetch (FC `load_snapshot` 60 s timeout tears
+        // down the restore) must clean its slot so a later `get` for the same
+        // hash leads a fresh fetch instead of wedging forever as a waiter.
+        use std::time::Duration;
+        let (cache, store, _b, _c) = setup(1024 * 1024).await;
+        let body = b"un-poison-me";
+        let h = store.put_chunk(body).await.unwrap();
+
+        // Leader whose fetch never resolves; cancel it via `timeout`, which
+        // drops the `get` future mid-`fetch().await`.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            cache.get(h, || async {
+                futures::future::pending::<Result<Bytes>>().await
+            }),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "leader get should time out (be cancelled)"
+        );
+
+        // The slot must be gone — not left holding the cancelled leader's
+        // sender — so this fresh get LEADS and completes, bounded.
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(5),
+            cache.get(h, || async { store.get_chunk(h).await }),
+        )
+        .await
+        .expect("post-cancel get must NOT hang (slot was poisoned)")
+        .expect("fetch should succeed");
+        assert_eq!(&recovered[..], body);
+        // And the inflight map is empty (no orphaned slot lingering).
+        assert!(cache.inner.inflight.lock().is_empty(), "no orphaned slot");
+    }
+
+    #[tokio::test]
+    async fn waiters_retry_when_their_leader_is_cancelled() {
+        // Waiters blocked on a leader that gets cancelled must wake and
+        // recover (re-lead / re-join), not fail or hang. Drives a leader to
+        // hang, parks real waiters on it, cancels the leader, and asserts the
+        // waiters still resolve to the right bytes.
+        use std::time::Duration;
+        let (cache, store, _b, _c) = setup(1024 * 1024).await;
+        let body = b"waiter-recovers";
+        let h = store.put_chunk(body).await.unwrap();
+
+        // Gate the leader's fetch so waiters have time to join its slot.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let leader = {
+            let cache = cache.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                cache
+                    .get(h, move || async move {
+                        gate.notified().await; // hang until we (never) release
+                        Ok(Bytes::from_static(b"unused"))
+                    })
+                    .await
+            })
+        };
+        // Let the leader register its slot, then park two waiters on it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let cache = cache.clone();
+                let store = store.clone();
+                tokio::spawn(async move {
+                    cache
+                        .get(h, || async move { store.get_chunk(h).await })
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Cancel the leader — its guard cleans the slot, waking the waiters.
+        leader.abort();
+
+        for w in waiters {
+            let bytes = tokio::time::timeout(Duration::from_secs(5), w)
+                .await
+                .expect("waiter must not hang after leader cancellation")
+                .unwrap()
+                .expect("waiter should recover the bytes");
+            assert_eq!(&bytes[..], body);
+        }
     }
 
     #[tokio::test]

@@ -400,6 +400,32 @@ back); `ready_images.contains(digest)` ⟹ the base's disk+memory chunks
 resolve from the local cache, so a restore never lands on a ready-but-cold
 host.
 
+### Follow-up: single-flight poison-on-cancel (cache wedge)
+
+Same incident family — a *cancelled* restore could wedge a host's chunk
+cache permanently. `ChunkCache::get`'s single-flight leader registers a
+oneshot sender in the `inflight` slot, then `fetch().await`s, then (on
+completion) removes the slot and broadcasts to waiters. If the leader
+future is **cancelled mid-`fetch().await`** — e.g. an FC `load_snapshot`
+60 s timeout tears down the whole restore — the removal/broadcast tail
+never runs, so the slot lingers holding the leader's own sender; every
+waiter, **and every later `get` for that hash** (which joins the orphaned
+slot), blocks forever on a broadcast that never comes. Prod: session
+`9f82064b` — a cold-fetch on resume exceeded the FC timeout, the cancel
+poisoned the host's cache, and *every* subsequent resume retry hung on the
+same chunk (D-state FC + stuck NBD, host degraded like the earlier
+base-restore wedge).
+
+Fix: a `LeaderGuard` removes the in-flight slot if the leader is dropped
+before it notifies (dropping the senders), and waiters that wake with
+`RecvError` **retry** — re-checking the local hit, then re-leading or
+re-joining — instead of hanging or erroring. A cancelled fetch now leaves
+the slot clean, so the next `get` leads a fresh fetch. Tests:
+`cancelled_leader_does_not_poison_the_inflight_slot`,
+`waiters_retry_when_their_leader_is_cancelled`. (Independent of the
+write-through above — but write-through shrinks the trigger by making the
+post-eviction resume read local instead of cold-fetching.)
+
 ## Implementation
 
 Commit chain (this branch, off the ADR-0038 branch):
