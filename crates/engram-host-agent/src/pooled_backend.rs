@@ -1748,9 +1748,18 @@ async fn materialize_chunked_rootfs(
 async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
     memory_bin: &std::path::Path,
+    cache: Option<&ChunkCache>,
 ) -> Result<engram_core::types::manifest::ManifestRef, SandboxError> {
+    // ADR 0039 (sticky-everywhere): write-through the base memory chunks
+    // into the host's local cache as they're uploaded, so the capturing
+    // host keeps them local instead of re-fetching its own writes.
     let manifest = chunk_store
-        .chunk_file(memory_bin, engram_chunk_store::ManifestKind::Memory, None)
+        .chunk_file_into(
+            memory_bin,
+            engram_chunk_store::ManifestKind::Memory,
+            None,
+            cache,
+        )
         .await
         .map_err(|e| {
             SandboxError::Snapshot(format!("chunk memory.bin {}: {e}", memory_bin.display(),))
@@ -2221,7 +2230,8 @@ impl SandboxBackend for PooledBackend {
                 if fs::metadata(&mem_path).await.is_err() {
                     return Ok(metadata);
                 }
-                let mref = chunk_memory_to_store(chunk_store, &mem_path).await?;
+                let mref = chunk_memory_to_store(chunk_store, &mem_path, self.chunk_cache.as_ref())
+                    .await?;
                 // ADR 0039: the dump is now durable in the chunk store and
                 // the chain seeds from the manifest (not this file) — drop
                 // the GiB-scale memory.bin so committed snapshot dirs stay
