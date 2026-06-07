@@ -14,11 +14,11 @@
 // deliberately mocks fetch so we can assert on the call arguments
 // without booting the coordinator.
 
-import { afterEach, describe, expect, test, vi } from 'vitest';
-import { cleanup, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
-import { renderWithProviders } from '../../test-utils';
-import { RegistriesPanel } from './RegistriesPanel';
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { cleanup, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { renderWithProviders } from "../../test-utils";
+import { RegistriesPanel } from "./RegistriesPanel";
 
 // Helper: install a route-aware fetch stub.
 //   GET /api/registries   → empty list (so the panel renders without rows)
@@ -28,42 +28,42 @@ import { RegistriesPanel } from './RegistriesPanel';
 // Returns the spy on `fetch` so tests can read the captured POST
 // body and headers.
 function installFetchMock(): ReturnType<typeof vi.spyOn> {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(
-    async (input: RequestInfo | URL, init?: RequestInit) => {
+  return vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url =
-        typeof input === 'string'
+        typeof input === "string"
           ? input
           : input instanceof URL
             ? input.toString()
             : (input as Request).url;
-      const method = init?.method ?? 'GET';
-    if (url === '/api/v1/registries' && method === 'GET') {
-      return new Response(JSON.stringify({ registries: [] }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url === '/api/v1/registries' && method === 'POST') {
-      return new Response(
-        JSON.stringify({
-          id: '00000000-0000-0000-0000-000000000000',
-          host: 'gcr.io',
-          auth_kind: 'static',
-          auth_principal: '_json_key',
-        }),
-        { status: 201, headers: { 'content-type': 'application/json' } },
-      );
-    }
+      const method = init?.method ?? "GET";
+      if (url === "/api/v1/registries" && method === "GET") {
+        return new Response(JSON.stringify({ registries: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url === "/api/v1/registries" && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            id: "00000000-0000-0000-0000-000000000000",
+            host: "gcr.io",
+            auth_kind: "static",
+            auth_principal: "_json_key",
+          }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        );
+      }
       throw new Error(`unexpected fetch in test: ${method} ${url}`);
-    },
-  );
+    });
 }
 
 /** Open the inline AddRegistryForm. The panel renders the trigger
  * once the empty-list query has resolved, so we wait for it. */
 async function openAddForm() {
   const user = userEvent.setup();
-  const trigger = await screen.findByRole('button', {
+  const trigger = await screen.findByRole("button", {
     name: /register a new registry/i,
   });
   await user.click(trigger);
@@ -73,15 +73,15 @@ async function openAddForm() {
 /** Pull the body off the most recent POST captured by `fetch`. */
 function lastPostBody(spy: ReturnType<typeof vi.spyOn>): unknown {
   const posts = spy.mock.calls.filter(
-    ([, init]: [unknown, RequestInit | undefined]) => init?.method === 'POST',
+    ([, init]: [unknown, RequestInit | undefined]) => init?.method === "POST",
   );
-  expect(posts.length, 'expected at least one POST').toBeGreaterThan(0);
+  expect(posts.length, "expected at least one POST").toBeGreaterThan(0);
   const body = (posts.at(-1)![1] as RequestInit).body;
-  expect(typeof body).toBe('string');
+  expect(typeof body).toBe("string");
   return JSON.parse(body as string);
 }
 
-describe('AddRegistryForm payload contract', () => {
+describe("AddRegistryForm payload contract", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
@@ -95,22 +95,19 @@ describe('AddRegistryForm payload contract', () => {
 
     // Static is the default auth kind, so we just fill in the three
     // visible fields and submit.
-    await user.type(screen.getByPlaceholderText('ghcr.io'), 'gcr.io');
-    await user.type(
-      screen.getByPlaceholderText('username or _json_key'),
-      '_json_key',
-    );
-    await user.type(screen.getByPlaceholderText('•••••'), 'hunter2');
+    await user.type(screen.getByPlaceholderText("ghcr.io"), "gcr.io");
+    await user.type(screen.getByPlaceholderText("username or _json_key"), "_json_key");
+    await user.type(screen.getByPlaceholderText("•••••"), "hunter2");
 
-    await user.click(screen.getByRole('button', { name: /^register$/i }));
+    await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     await waitFor(() => {
       expect(lastPostBody(fetchSpy)).toEqual({
-        host: 'gcr.io',
+        host: "gcr.io",
         auth: {
-          kind: 'static',
-          username: '_json_key',
-          password: 'hunter2',
+          kind: "static",
+          username: "_json_key",
+          password: "hunter2",
         },
       });
     });
@@ -121,23 +118,18 @@ describe('AddRegistryForm payload contract', () => {
     renderWithProviders(<RegistriesPanel />);
 
     const user = await openAddForm();
-    await user.type(
-      screen.getByPlaceholderText('ghcr.io'),
-      'us-east1-docker.pkg.dev',
-    );
+    await user.type(screen.getByPlaceholderText("ghcr.io"), "us-east1-docker.pkg.dev");
 
     // Click the GCP WI radio card. We match on the visible label
     // text so the test survives DOM-structure refactors.
-    await user.click(
-      screen.getByRole('radio', { name: /gcp workload identity/i }),
-    );
+    await user.click(screen.getByRole("radio", { name: /gcp workload identity/i }));
     // Wait for the GCP-WI form fragment to mount (AnimatePresence
     // mode="wait" waits for the static fragment's exit animation
     // first). findBy* polls until present.
     await screen.findByPlaceholderText(/engram@my-project/);
     // Leave impersonate empty — ambient identity path.
 
-    await user.click(screen.getByRole('button', { name: /^register$/i }));
+    await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     await waitFor(() => {
       // The shape under `auth` must be exactly `{kind: ...}` — NO
@@ -145,45 +137,40 @@ describe('AddRegistryForm payload contract', () => {
       // the server's serde decoder treats missing as "ambient" and
       // an empty string as a malformed input.
       expect(lastPostBody(fetchSpy)).toEqual({
-        host: 'us-east1-docker.pkg.dev',
-        auth: { kind: 'gcp_workload_identity' },
+        host: "us-east1-docker.pkg.dev",
+        auth: { kind: "gcp_workload_identity" },
       });
     });
   });
 
-  test('gcp workload identity with impersonation: posts impersonate_sa verbatim', async () => {
+  test("gcp workload identity with impersonation: posts impersonate_sa verbatim", async () => {
     const fetchSpy = installFetchMock();
     renderWithProviders(<RegistriesPanel />);
 
     const user = await openAddForm();
-    await user.type(
-      screen.getByPlaceholderText('ghcr.io'),
-      'us-east1-docker.pkg.dev',
-    );
-    await user.click(
-      screen.getByRole('radio', { name: /gcp workload identity/i }),
-    );
+    await user.type(screen.getByPlaceholderText("ghcr.io"), "us-east1-docker.pkg.dev");
+    await user.click(screen.getByRole("radio", { name: /gcp workload identity/i }));
     // The impersonate field belongs to the GCP-WI form fragment
     // that AnimatePresence mounts after the static fragment exits.
     // Use findBy* so the test waits for that transition instead of
     // racing it.
     const impersonate = await screen.findByPlaceholderText(/engram@my-project/);
-    await user.type(impersonate, 'engram@cortex.iam.gserviceaccount.com');
+    await user.type(impersonate, "engram@cortex.iam.gserviceaccount.com");
 
-    await user.click(screen.getByRole('button', { name: /^register$/i }));
+    await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     await waitFor(() => {
       expect(lastPostBody(fetchSpy)).toEqual({
-        host: 'us-east1-docker.pkg.dev',
+        host: "us-east1-docker.pkg.dev",
         auth: {
-          kind: 'gcp_workload_identity',
-          impersonate_sa: 'engram@cortex.iam.gserviceaccount.com',
+          kind: "gcp_workload_identity",
+          impersonate_sa: "engram@cortex.iam.gserviceaccount.com",
         },
       });
     });
   });
 
-  test('static missing username: rejects locally, never POSTs', async () => {
+  test("static missing username: rejects locally, never POSTs", async () => {
     // The form must validate before fetch — surfacing inline errors
     // is friendlier than waiting for the server's 400 + a generic
     // "Bad request" toast.
@@ -191,43 +178,40 @@ describe('AddRegistryForm payload contract', () => {
     renderWithProviders(<RegistriesPanel />);
 
     const user = await openAddForm();
-    await user.type(screen.getByPlaceholderText('ghcr.io'), 'gcr.io');
-    await user.type(screen.getByPlaceholderText('•••••'), 'hunter2');
+    await user.type(screen.getByPlaceholderText("ghcr.io"), "gcr.io");
+    await user.type(screen.getByPlaceholderText("•••••"), "hunter2");
     // username deliberately blank.
 
-    await user.click(screen.getByRole('button', { name: /^register$/i }));
+    await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     // Inline error rendered.
     await screen.findByText(/username is required/i);
     // No POST fired.
     const posts = fetchSpy.mock.calls.filter(
-      ([, init]: [unknown, RequestInit | undefined]) => init?.method === 'POST',
+      ([, init]: [unknown, RequestInit | undefined]) => init?.method === "POST",
     );
     expect(posts).toHaveLength(0);
   });
 
-  test('static missing password: rejects locally, never POSTs', async () => {
+  test("static missing password: rejects locally, never POSTs", async () => {
     const fetchSpy = installFetchMock();
     renderWithProviders(<RegistriesPanel />);
 
     const user = await openAddForm();
-    await user.type(screen.getByPlaceholderText('ghcr.io'), 'gcr.io');
-    await user.type(
-      screen.getByPlaceholderText('username or _json_key'),
-      '_json_key',
-    );
+    await user.type(screen.getByPlaceholderText("ghcr.io"), "gcr.io");
+    await user.type(screen.getByPlaceholderText("username or _json_key"), "_json_key");
     // password blank.
 
-    await user.click(screen.getByRole('button', { name: /^register$/i }));
+    await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     await screen.findByText(/password is required/i);
     const posts = fetchSpy.mock.calls.filter(
-      ([, init]: [unknown, RequestInit | undefined]) => init?.method === 'POST',
+      ([, init]: [unknown, RequestInit | undefined]) => init?.method === "POST",
     );
     expect(posts).toHaveLength(0);
   });
 
-  test('aws instance role card is rendered but not selectable', async () => {
+  test("aws instance role card is rendered but not selectable", async () => {
     // The card sits in the auth-model grid as a "coming soon" stub.
     // We render the row so users see the road map; we *must not*
     // let them select it (clicking would set authKind to a value
@@ -236,14 +220,12 @@ describe('AddRegistryForm payload contract', () => {
     renderWithProviders(<RegistriesPanel />);
     const user = await openAddForm();
 
-    const card = screen.getByRole('radio', { name: /aws instance role/i });
+    const card = screen.getByRole("radio", { name: /aws instance role/i });
     expect((card as HTMLButtonElement).disabled).toBe(true);
 
     // Clicking does nothing — authKind stays on `static`, password
     // field remains visible.
     await user.click(card);
-    expect(
-      screen.queryByPlaceholderText('username or _json_key'),
-    ).not.toBeNull();
+    expect(screen.queryByPlaceholderText("username or _json_key")).not.toBeNull();
   });
 });

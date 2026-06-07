@@ -1,5 +1,5 @@
-import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 // Render a completed assistant/system message as Markdown, styled
 // in-system (ADR 0030 §2g). LLMs emit Markdown; every serious AI UI
@@ -35,18 +35,11 @@ const COMPONENTS: Components = {
   ),
   pre: ({ children }) => <pre className="md-pre">{children}</pre>,
   a: ({ children, href }) => (
-    <a
-      className="md-link"
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-    >
+    <a className="md-link" href={href} target="_blank" rel="noopener noreferrer">
       {children}
     </a>
   ),
-  blockquote: ({ children }) => (
-    <blockquote className="md-quote">{children}</blockquote>
-  ),
+  blockquote: ({ children }) => <blockquote className="md-quote">{children}</blockquote>,
   hr: () => <hr className="md-hr" />,
 };
 

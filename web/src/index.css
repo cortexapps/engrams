@@ -1,0 +1,282 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "tw-shimmer";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ------------------------------------------------------------------
+ * "Mont Blanc logbook" — engineering-logbook identity, heritage voice.
+ *
+ *   A German-precise / British-elegant hybrid. Light is the primary
+ *   brand voice: aged celadon ledger paper (genuine green chroma, NOT
+ *   a timid warm-white) under deep petrol fountain-pen ink, with a
+ *   faint ruled grid doing the structural work. Committed, not
+ *   Restrained — the green sheet carries the surface.
+ *
+ *   Dark is the equal twin: the notebook closed at night — a near-black
+ *   racing-green ground (the ink hue gone deep), pale sage ink, the
+ *   same grid, the accent gone luminous. Contrast is verified AA in
+ *   both themes.
+ *
+ *   The accent is Aston-F1 LIME — but lime is a FILL, not light-mode
+ *   text (chartreuse on celadon is invisible). So it carries primary
+ *   buttons (lime fill + dark-green ink), the active nav item and ring
+ *   on the dark sidebar, and the selection wash. On light grounds the
+ *   focus ring falls back to a visible racing green; links use ink.
+ *   Lime is reserved strictly for interactive accent — never for
+ *   status (lifecycle keeps its glyph+text vocabulary). Destructive is
+ *   the only red now. Corners gently rounded — exact, never pill-like.
+ * ------------------------------------------------------------------ */
+:root {
+  --radius: 0.5rem; /* gently rounded — precise, not hard-cornered, not pill */
+
+  --background: oklch(0.972 0.014 128); /* lab paper — a whisper of green, not celadon */
+  --foreground: oklch(0.301 0.02 206); /* petrol ink (#223133) */
+  --card: oklch(0.992 0.006 128); /* a clean sheet raised off the paper */
+  --card-foreground: oklch(0.301 0.02 206);
+  --popover: oklch(0.992 0.006 128);
+  --popover-foreground: oklch(0.301 0.02 206);
+  --primary: oklch(0.878 0.181 121); /* Aston-F1 lime — a FILL only */
+  --primary-foreground: oklch(0.22 0.04 150); /* deep racing-green ink on lime */
+  --secondary: oklch(0.945 0.018 128); /* soft sage fill, recessed from the paper */
+  --secondary-foreground: oklch(0.33 0.018 206);
+  --muted: oklch(0.945 0.018 128);
+  --muted-foreground: oklch(0.44 0.028 200); /* ink-faded — AA on paper */
+  --accent: oklch(0.955 0.022 128); /* faint hover wash */
+  --accent-foreground: oklch(0.33 0.018 206);
+  --destructive: oklch(0.52 0.2 27); /* signal red — now the only red */
+  --border: oklch(0.885 0.018 128); /* hairline rule */
+  --input: oklch(0.885 0.018 128);
+  --ring: oklch(0.55 0.15 132); /* racing green — lime is invisible on paper */
+
+  /* The cover is the drama: a deep bottle-green spine against the celadon
+     content (the Mont Blanc move), not another pale-green panel. Sage ink,
+     claret active marker — the dark sidebar reads like the dark theme even
+     in light mode, which is the point. */
+  --sidebar: oklch(0.32 0.05 190); /* deep bottle-green spine */
+  --sidebar-foreground: oklch(0.93 0.03 125); /* sage ink on the cover */
+  --sidebar-primary: oklch(0.878 0.181 121); /* lime — active nav item on the dark cover */
+  --sidebar-primary-foreground: oklch(0.18 0.02 200);
+  --sidebar-accent: oklch(0.38 0.052 190); /* raised green — hover/active wash */
+  --sidebar-accent-foreground: oklch(0.95 0.025 120);
+  --sidebar-border: oklch(0.93 0.03 125 / 14%);
+  --sidebar-ring: oklch(0.8 0.16 121); /* lime — visible on the dark spine */
+
+  /* Carbon-fibre twill, woven over the green spine and fading upward. Built
+     from translucent threads so the green shows through: a darker warp thread
+     and a faint sheen on the weft. */
+  --carbon-thread: oklch(0 0 0 / 0.14);
+  --carbon-sheen: oklch(1 0 0 / 0.05);
+  --carbon-tile: 11px;
+
+  /* Instrument status — the Operator cockpit's gauge zones and telltales.
+     A status vocabulary kept strictly apart from the lime accent: lime is
+     interactive-only, so these three never touch its hue (121). Vivid enough
+     to read as arcs and lit dots on the card; status text always pairs a
+     colored dot with ink, never colored body copy, so AA holds. */
+  --instrument-nominal: oklch(0.6 0.15 150); /* signal green — emerald, not lime */
+  --instrument-caution: oklch(0.7 0.155 71); /* amber */
+  --instrument-critical: oklch(0.55 0.21 27); /* instrument red ≈ destructive */
+}
+
+.dark {
+  --background: oklch(0.205 0.024 200); /* racing-green-black — the ink gone deep */
+  --foreground: oklch(0.9 0.035 125); /* pale sage ink */
+  --card: oklch(0.242 0.026 200);
+  --card-foreground: oklch(0.9 0.035 125);
+  --popover: oklch(0.242 0.026 200);
+  --popover-foreground: oklch(0.9 0.035 125);
+  --primary: oklch(0.85 0.18 121); /* Aston-F1 lime — luminous on green-black */
+  --primary-foreground: oklch(0.2 0.03 150);
+  --secondary: oklch(0.27 0.026 200);
+  --secondary-foreground: oklch(0.9 0.035 125);
+  --muted: oklch(0.27 0.026 200);
+  --muted-foreground: oklch(0.73 0.03 125); /* sage-faded — AA on green-black */
+  --accent: oklch(0.29 0.028 200);
+  --accent-foreground: oklch(0.9 0.035 125);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(0.9 0.035 125 / 12%);
+  --input: oklch(0.9 0.035 125 / 16%);
+  --ring: oklch(0.8 0.16 121); /* lime — pops on the dark ground */
+
+  --sidebar: oklch(0.175 0.024 200); /* notebook cover — darker than content */
+  --sidebar-foreground: oklch(0.9 0.035 125);
+  --sidebar-primary: oklch(0.85 0.18 121);
+  --sidebar-primary-foreground: oklch(0.2 0.03 150);
+  --sidebar-accent: oklch(0.27 0.026 200);
+  --sidebar-accent-foreground: oklch(0.9 0.035 125);
+  --sidebar-border: oklch(0.9 0.035 125 / 9%);
+  --sidebar-ring: oklch(0.8 0.16 121);
+
+  --carbon-thread: oklch(0 0 0 / 0.22);
+  --carbon-sheen: oklch(1 0 0 / 0.05);
+  --carbon-tile: 11px;
+
+  /* Instrument status — luminance lifted to sit on the green-black ground. */
+  --instrument-nominal: oklch(0.72 0.16 150);
+  --instrument-caution: oklch(0.8 0.15 75);
+  --instrument-critical: oklch(0.66 0.2 25);
+}
+
+/* The section rail (the second sidebar) is one step lighter than the primary
+   spine, so the boundary between them reads as depth, not a seam — which is
+   why the primary rail draws no divider line. Overriding the --sidebar* tokens
+   on this scope re-tones the bg AND its hover/active wash together, so the
+   active item stays legible against the lighter ground. */
+.sidebar-section {
+  --sidebar: oklch(0.385 0.052 190);
+  --sidebar-accent: oklch(0.46 0.055 190);
+  --sidebar-accent-foreground: oklch(0.96 0.025 120);
+  --sidebar-border: oklch(0.93 0.03 125 / 12%);
+}
+.dark .sidebar-section {
+  --sidebar: oklch(0.235 0.026 200);
+  --sidebar-accent: oklch(0.305 0.028 200);
+  --sidebar-border: oklch(0.9 0.035 125 / 10%);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --color-instrument-nominal: var(--instrument-nominal);
+  --color-instrument-caution: var(--instrument-caution);
+  --color-instrument-critical: var(--instrument-critical);
+
+  /* Three-font system. Sans is the invisible workhorse (chrome, labels, body);
+     Saira is the display/identity voice (page titles, the primary action
+     button) — squared and technical, with a racing edge from width + tracked
+     caps; mono is the lab readout (IDs, digests, timestamps, code, labels). */
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji",
+    "Segoe UI Emoji", sans-serif;
+  --font-display: "Saira Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* The instrument-label voice now lives in the Text component's `label`
+   variant (components/ui/text.tsx) — Saira tracked caps, the single source of
+   truth for every label across the app. */
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  /* These are tables and IDs, not prose — keep digits aligned. */
+  .font-mono,
+  code,
+  kbd,
+  samp,
+  pre {
+    font-variant-numeric: tabular-nums;
+  }
+  /* The claret ribbon shows up on selection too — a wash of the accent,
+     text keeps its own ink so it stays readable. Adapts per theme. */
+  ::selection {
+    background-color: color-mix(in oklch, var(--primary) 24%, transparent);
+  }
+
+  /* Scrollbars: transparent track, lime thumb. Firefox first, then WebKit. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--primary) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+    background: transparent;
+  }
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--primary);
+    /* Inset the thumb with a transparent padding-box border so it reads as a
+       floating lime pill on the transparent track. */
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in oklch, var(--primary) 80%, var(--foreground));
+  }
+}
+
+@utility bg-carbon-fade {
+  /* A 2/2 carbon-fibre twill: two sets of diagonal threads offset to read as
+     a woven lattice, plus a soft vertical sheen. Threads are translucent so
+     the green spine shows through. Densest at the foot and dissolving upward
+     so it clears the nav — lives on a pointer-events-none layer behind the
+     sidebar's content (the mask would otherwise fade the controls). */
+  background:
+    linear-gradient(27deg, var(--carbon-thread) 4px, transparent 4px) 0 4px,
+    linear-gradient(207deg, var(--carbon-thread) 4px, transparent 4px) 8px 0,
+    linear-gradient(27deg, var(--carbon-sheen) 4px, transparent 4px) 0 8px,
+    linear-gradient(207deg, var(--carbon-sheen) 4px, transparent 4px) 8px 4px,
+    linear-gradient(90deg, var(--carbon-thread) 8px, transparent 8px),
+    linear-gradient(
+      var(--carbon-sheen) 25%,
+      var(--carbon-thread) 25%,
+      var(--carbon-thread) 50%,
+      transparent 50%,
+      transparent 75%,
+      var(--carbon-sheen) 75%
+    );
+  background-size: var(--carbon-tile) var(--carbon-tile);
+  /* Clears the footer controls at the foot and dissolves below the nav up top,
+     so the weave reads as a band woven into the lower spine. */
+  -webkit-mask-image: linear-gradient(
+    to top,
+    transparent 10%,
+    oklch(0 0 0 / 0.32) 28%,
+    oklch(0 0 0 / 0.32) 58%,
+    transparent 82%
+  );
+  mask-image: linear-gradient(
+    to top,
+    transparent 10%,
+    oklch(0 0 0 / 0.32) 28%,
+    oklch(0 0 0 / 0.32) 58%,
+    transparent 82%
+  );
+}

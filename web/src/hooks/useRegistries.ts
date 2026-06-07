@@ -1,8 +1,8 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { addRegistry, deleteRegistry, fetchRegistries } from '../api';
-import type { AddRegistryRequest } from '../types';
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { addRegistry, deleteRegistry, fetchRegistries } from "../api";
+import type { AddRegistryRequest } from "../types";
 
-const KEY = ['registries'] as const;
+const KEY = ["registries"] as const;
 
 /** List of registered registry credentials. The coordinator never
  * returns secret material here — only `(host, auth_kind, principal)`

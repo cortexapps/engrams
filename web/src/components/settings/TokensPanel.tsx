@@ -1,182 +1,120 @@
-// ADR 0031 redesign: a per-service token ledger (not a single-service form).
-// Each row: service name + italic "what it's for" left; status + actions right.
-// Saved rows → replace. Unsaved → "add →" reveals an inline password field +
-// hint + save / cancel. Tokens are sealed on save and never shown again.
-//
-// Today the ledger has a single row (Claude Code). Git credentials are
-// brokered by the platform's installation-scoped GitHub App (ADR 0023) —
-// users never paste git tokens here. New services land as their own row
-// once the backend grows a `/me/<service>-token` route for them.
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { Controller, useForm } from "react-hook-form";
+import * as z from "zod";
+import { saveClaudeToken } from "../../api";
+import { useAuth } from "../../auth/AuthProvider";
+import { PageHeading } from "../page-heading";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Field, FieldDescription, FieldError, FieldGroup } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
-import { saveClaudeToken } from '../../api';
-import { useAuth } from '../../auth/AuthProvider';
-
-interface Service {
-  id: 'claude';
-  name: string;
-  use: string;
-  hint: string;
-  placeholder: string;
-}
-
-const SERVICES: Service[] = [
-  {
-    id: 'claude',
-    name: 'Claude Code',
-    use: 'built-in Claude sessions authenticate with this',
-    hint: 'from `claude setup-token` — stored encrypted, never shown again',
-    placeholder: 'sk-ant-oat…',
-  },
-];
+const tokenSchema = z.object({
+  token: z.string().trim().min(1, "Token is required"),
+});
+type TokenValues = z.infer<typeof tokenSchema>;
 
 export function TokensPanel() {
   const { principal, refresh } = useAuth();
-  const queryClient = useQueryClient();
-
-  // Which service row is in the editing state.
-  const [editing, setEditing] = useState<'claude' | null>(null);
-
-  const savedState: Record<string, boolean> = {
-    claude: principal.has_claude_token,
-  };
-
-  const saveMutation = useMutation({
-    mutationFn: async ({ token }: { id: 'claude'; token: string }) => {
-      await saveClaudeToken(token);
-    },
-    onSuccess: () => {
-      setEditing(null);
-      void queryClient.invalidateQueries({ queryKey: ['me'] });
-      refresh();
-    },
-  });
+  const qc = useQueryClient();
+  const [editing, setEditing] = useState(false);
+  const saved = principal.has_claude_token;
 
   return (
-    <section style={{ maxWidth: '46rem' }}>
-      <header className="mb-6 flex items-baseline justify-between">
-        <h2 className="section-label">Tokens</h2>
-        <p className="font-display italic text-[0.8rem]" style={{ color: 'var(--color-ink-quiet)' }}>
-          sealed · auto-used per session
-        </p>
-      </header>
-
-      <div className="tokens-ledger">
-        {SERVICES.map((svc) => (
-          <ServiceRow
-            key={svc.id}
-            svc={svc}
-            isSaved={savedState[svc.id] ?? false}
-            isEditing={editing === svc.id}
-            isMutating={saveMutation.isPending}
-            onEdit={() => setEditing(svc.id)}
-            onCancel={() => setEditing(null)}
-            onSave={(token) => saveMutation.mutate({ id: svc.id, token })}
-          />
-        ))}
-      </div>
-
-      <p className="ledger-note">
-        every token is sealed under the deployment key the moment you save it —
-        the plaintext never touches Postgres, and it's used automatically so
-        you're never prompted per session. git access is brokered by the
-        platform, so there's no git token to paste. new services land here as
-        their own row.
+    <div className="max-w-2xl space-y-6">
+      <PageHeading title="Tokens" />
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">
+          <div>
+            <CardTitle>Claude Code</CardTitle>
+            <p className="text-sm text-muted-foreground">
+              Built-in Claude sessions authenticate with this.
+            </p>
+          </div>
+          <Badge variant={saved ? "secondary" : "outline"}>
+            {saved ? "saved · sealed" : "not connected"}
+          </Badge>
+        </CardHeader>
+        <CardContent>
+          {editing ? (
+            <TokenForm
+              onCancel={() => setEditing(false)}
+              onSaved={() => {
+                setEditing(false);
+                void qc.invalidateQueries({ queryKey: ["me"] });
+                refresh();
+              }}
+            />
+          ) : (
+            <Button
+              size="sm"
+              variant={saved ? "outline" : "default"}
+              onClick={() => setEditing(true)}
+            >
+              {saved ? "Replace" : "Add token"}
+            </Button>
+          )}
+        </CardContent>
+      </Card>
+      <p className="max-w-prose text-sm text-muted-foreground">
+        Every token is sealed under the deployment key the moment you save it — the plaintext never
+        touches Postgres, and it's used automatically so you're never prompted per session.
       </p>
-    </section>
+    </div>
   );
 }
 
-function ServiceRow({
-  svc,
-  isSaved,
-  isEditing,
-  isMutating,
-  onEdit,
-  onCancel,
-  onSave,
-}: {
-  svc: Service;
-  isSaved: boolean;
-  isEditing: boolean;
-  isMutating: boolean;
-  onEdit: () => void;
-  onCancel: () => void;
-  onSave: (token: string) => void;
-}) {
-  const [token, setToken] = useState('');
-  const trimmed = token.trim();
+function TokenForm({ onCancel, onSaved }: { onCancel: () => void; onSaved: () => void }) {
+  const form = useForm<TokenValues>({
+    resolver: zodResolver(tokenSchema),
+    defaultValues: { token: "" },
+  });
+  const save = useMutation({
+    mutationFn: (t: string) => saveClaudeToken(t),
+    onSuccess: onSaved,
+    onError: (e) => form.setError("root", { message: String(e) }),
+  });
 
-  const handleSave = () => {
-    if (trimmed) {
-      onSave(trimmed);
-      setToken('');
-    }
-  };
-  const handleCancel = () => {
-    setToken('');
-    onCancel();
-  };
+  const onSubmit = (data: TokenValues) => save.mutate(data.token);
 
   return (
-    <div className="token-row">
-      <div className="token-svc">
-        <span className="token-name">{svc.name}</span>
-        <span className="token-use">{svc.use}</span>
-        {isEditing && (
-          <div className="token-edit">
-            <input
-              type="password"
-              className="ledger-input font-mono"
-              autoFocus
-              placeholder={svc.placeholder}
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleSave();
-                if (e.key === 'Escape') handleCancel();
-              }}
-              style={{ fontSize: '0.85rem' }}
-            />
-            <span className="token-hint">{svc.hint}</span>
-            <div className="token-edit-actions">
-              <button
-                type="button"
-                className="members-act"
-                disabled={!trimmed || isMutating}
-                onClick={handleSave}
-                style={{ opacity: !trimmed || isMutating ? 0.4 : 1 }}
-              >
-                save
-              </button>
-              <button
-                type="button"
-                className="members-act act-quiet"
-                onClick={handleCancel}
-              >
-                cancel
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      <span className={`token-status${isSaved ? ' is-saved' : ''}`}>
-        {isSaved ? 'saved · sealed' : 'not connected'}
-      </span>
-
-      <div className="token-row-actions">
-        {isSaved ? (
-          <button type="button" className="members-act" onClick={onEdit}>
-            replace
-          </button>
-        ) : (
-          <button type="button" className="members-act act-primary" onClick={onEdit}>
-            add →
-          </button>
-        )}
-      </div>
-    </div>
+    <form onSubmit={form.handleSubmit(onSubmit)}>
+      <FieldGroup>
+        <Controller
+          name="token"
+          control={form.control}
+          render={({ field, fieldState }) => (
+            <Field data-invalid={fieldState.invalid}>
+              <Input
+                {...field}
+                id={field.name}
+                type="password"
+                autoFocus
+                placeholder="sk-ant-oat…"
+                className="font-mono"
+                aria-invalid={fieldState.invalid}
+              />
+              <FieldDescription>
+                From <code className="font-mono">claude setup-token</code> — stored encrypted, never
+                shown again.
+              </FieldDescription>
+              {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+            </Field>
+          )}
+        />
+        <Field orientation="horizontal">
+          <Button type="submit" size="sm" disabled={save.isPending}>
+            {save.isPending ? "Saving…" : "Save"}
+          </Button>
+          <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+        </Field>
+        {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
+      </FieldGroup>
+    </form>
   );
 }

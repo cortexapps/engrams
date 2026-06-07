@@ -1,6 +1,7 @@
 /// <reference types="vitest" />
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
@@ -59,6 +60,7 @@ const proxyAgent = new http.Agent({ keepAlive: true });
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), ghosttyWasmPlugin()],
+  resolve: { alias: { '@': path.resolve(__dirname, './src') } },
   server: {
     port: 5173,
     proxy: {
@@ -78,6 +80,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: false,
+    setupFiles: ['./src/test-setup.ts'],
     include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
 });

@@ -38,5 +38,7 @@ result-*
 
 # personal Claude Code skills + dev-vm scripts (local-only)
 /.claude/
+# local-only Claude Code settings in any subproject (e.g. web/.claude/)
+settings.local.json
 .playwright-mcp/
 scratch/

@@ -28,7 +28,8 @@ name: CI
 #                       Root set under sudo for iptables + TAP + loop
 #                       mounts: host_startup, proxy_e2e, snapshot_net,
 #                       patch_drive_swap, option_d_warm_lease.
-#   - web:              pnpm install + tsc + vite build + vitest
+#   - web:              pnpm install + oxlint + tsc + vite build +
+#                       vitest
 #   - bake-demo-image:  push-to-main only. Bakes the canonical
 #                       deploy/demo rootfs as a chunked-OCI artifact
 #                       and pushes to
@@ -393,6 +394,11 @@ jobs:
 
       - name: pnpm install
         run: pnpm install --frozen-lockfile
+
+      # oxlint over src/. Fast (Rust-based) static gate; runs before the
+      # build so lint failures surface without waiting on tsc + vite.
+      - name: pnpm lint (oxlint)
+        run: pnpm lint
 
       # `pnpm build` runs `tsc -b && vite build` — gives us typecheck
       # AND production bundle validation in one step.

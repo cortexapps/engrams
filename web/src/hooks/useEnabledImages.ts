@@ -1,12 +1,7 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  disableImage,
-  enableImage,
-  fetchEnabledImages,
-  refreshEnabledImage,
-} from '../api';
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { disableImage, enableImage, fetchEnabledImages, refreshEnabledImage } from "../api";
 
-const KEY = ['enabled-images'] as const;
+const KEY = ["enabled-images"] as const;
 
 /** List of operator-enabled OCI image URIs. The coordinator stores a
  * snapshot of each URI's manifest.toml on enable, so this list is the
@@ -30,7 +25,7 @@ export function useEnableImage() {
   return useMutation({
     mutationFn: (imageUri: string) => enableImage(imageUri),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['enable-jobs'] });
+      qc.invalidateQueries({ queryKey: ["enable-jobs"] });
     },
   });
 }
@@ -57,7 +52,7 @@ export function useRefreshEnabledImage() {
   return useMutation({
     mutationFn: (imageUri: string) => refreshEnabledImage(imageUri),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['enable-jobs'] });
+      qc.invalidateQueries({ queryKey: ["enable-jobs"] });
     },
   });
 }
