@@ -58,6 +58,7 @@ use super::slot::{NbdSlot, NbdSlotAllocator};
 //   #define NBD_CLEAR_SOCK       _IO(0xab, 4)
 //   #define NBD_SET_SIZE_BLOCKS  _IO(0xab, 7)
 //   #define NBD_DISCONNECT       _IO(0xab, 8)
+//   #define NBD_SET_TIMEOUT      _IO(0xab, 9)
 //   #define NBD_SET_FLAGS        _IO(0xab, 10)
 //
 // `_IO(type, nr)` on Linux is `((type) << _IOC_TYPESHIFT) |
@@ -81,6 +82,7 @@ const NBD_DO_IT: libc::Ioctl = (0xab << 8) | 3;
 const NBD_CLEAR_SOCK: libc::Ioctl = (0xab << 8) | 4;
 const NBD_SET_SIZE_BLOCKS: libc::Ioctl = (0xab << 8) | 7;
 const NBD_DISCONNECT: libc::Ioctl = (0xab << 8) | 8;
+const NBD_SET_TIMEOUT: libc::Ioctl = (0xab << 8) | 9;
 const NBD_SET_FLAGS: libc::Ioctl = (0xab << 8) | 10;
 
 /// `NBD_FLAG_HAS_FLAGS` bit. Required so the kernel honours the
@@ -99,6 +101,35 @@ const NBD_FLAG_SEND_TRIM: u32 = 1 << 5;
 /// page size on x86_64 and the chunk-aligned units we serve.
 /// `NBD_SET_SIZE_BLOCKS` uses this as its unit.
 pub const NBD_BLOCK_SIZE: u64 = 4096;
+
+/// Kernel-side NBD request timeout in seconds, set via
+/// `NBD_SET_TIMEOUT` during the startup dance.
+///
+/// This is the second of two fail-fast layers. The first is the
+/// daemon's own chunk-fetch retry budget (`CHUNK_FETCH_*` in
+/// `backend.rs`): a stalled or missing chunk makes `backend.read`
+/// return `Err` in bounded time (~tens of seconds), which the serve
+/// loop turns into EIO. The kernel timeout backstops the cases that
+/// budget can't see — a wedged serve loop, a lock deadlock, or the
+/// daemon dying outright — where the daemon never sends *any* reply.
+/// Without it the kernel waits forever, leaving the guest's I/O
+/// (notably the device-open / partition-probe read at attach) in
+/// uninterruptible (`D`-state) sleep, which cascades into a jbd2
+/// D-state and an FC pause timeout. With it the kernel times the
+/// request out and returns EIO to the guest instead.
+///
+/// Set comfortably above the daemon's worst-case *legitimate* reply
+/// (a 2-chunk op each riding the full retry budget is ~tens of
+/// seconds) so it never kills a request that's still making progress.
+/// Override via `ENGRAM_NBD_KERNEL_TIMEOUT_SECS`; E2B uses a
+/// comparable ~90s ceiling.
+fn nbd_kernel_timeout_secs() -> u64 {
+    std::env::var("ENGRAM_NBD_KERNEL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(90)
+}
 
 /// Anything that can go wrong launching or running the daemon.
 #[derive(Debug)]
@@ -569,6 +600,18 @@ pub async fn spawn(
     let flags = (NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM) as u64;
     ioctl_set(nbd_fd.as_raw_fd(), NBD_SET_FLAGS, flags)?;
 
+    // 3b. Bound the kernel's per-request wait (see `nbd_kernel_timeout_secs`).
+    //     Without NBD_SET_TIMEOUT a daemon that never replies — a wedged
+    //     serve loop, a lock deadlock, the daemon dying — leaves guest
+    //     I/O (notably the device-open / partition-probe read at attach)
+    //     wedged in D-state indefinitely; with it the kernel times the
+    //     request out and returns EIO. Takes the timeout in seconds.
+    ioctl_set(
+        nbd_fd.as_raw_fd(),
+        NBD_SET_TIMEOUT,
+        nbd_kernel_timeout_secs(),
+    )?;
+
     // 4. Hand the kernel its half of the socketpair. After this,
     //    the kernel speaks NBD wire protocol over its end; we
     //    serve from ours.
@@ -696,6 +739,13 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, mut stream: TokioUnixStrea
 
         match req.command {
             NbdCommand::Read => {
+                // `backend.read` self-bounds via the chunk-fetch retry
+                // budget (per-attempt timeout × max attempts), so a
+                // stalled/missing chunk surfaces as an `Err` → EIO in
+                // bounded time rather than hanging. The kernel-side
+                // NBD_SET_TIMEOUT (see `spawn`) is the backstop for the
+                // cases the budget can't cover (a wedged serve loop or
+                // lock — where the daemon never replies at all).
                 let bytes = match backend.read(req.offset, req.length as u64).await {
                     Ok(b) => b,
                     Err(e) => {
