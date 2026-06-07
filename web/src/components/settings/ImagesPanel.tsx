@@ -131,11 +131,15 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
   return (
     <TableRow>
       <TableCell className="font-mono text-sm whitespace-nowrap">{row.image_uri}</TableCell>
-      <TableCell className="text-sm text-muted-foreground">
-        {row.manifest_name || "—"}
-        {row.manifest_description && (
-          <span className="block text-xs">{row.manifest_description}</span>
-        )}
+      <TableCell className="text-sm text-muted-foreground whitespace-normal">
+        <div className="max-w-md">
+          {row.manifest_name || "—"}
+          {row.manifest_description && (
+            <span className="mt-0.5 block text-xs line-clamp-2" title={row.manifest_description}>
+              {row.manifest_description}
+            </span>
+          )}
+        </div>
       </TableCell>
       <TableCell>
         <Badge variant="outline" className="font-mono text-[0.65rem]" title={row.manifest_digest}>
