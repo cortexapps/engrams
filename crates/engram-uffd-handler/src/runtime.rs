@@ -626,13 +626,208 @@ pub fn run_listener(
     if let Some(path) = trace_output {
         rt.set_trace_output(path);
     }
-    if let Some(trace) = prefault_trace {
-        rt.prefault_from_trace(&trace)?;
-    }
+    // ADR 0043 P1: run the working-set prefault as a BACKGROUND producer
+    // concurrent with the fault loop, instead of blocking resume on it.
+    // vCPUs run the instant Firecracker resumes; any page the guest touches
+    // before the prefault reaches it is served on-demand by the fault loop.
+    // This is safe to run in parallel: `install_chunk_at` is idempotent via
+    // the per-chunk `installed` bitmap (whichever of prefault/fault installs
+    // first wins, the other skips), and `serve_pagefault` explicitly wakes a
+    // vCPU whose fault raced ahead of a prefault install (the `wake_page`
+    // path). `Uffd` is `Send + Sync` (a `RawFd`) and every install path is
+    // mutex-guarded, so sharing the `Runtime` across the two threads is
+    // sound. Previously prefault ran to completion before `run()`, which put
+    // the entire working-set fetch on the resume critical path.
+    let rt = Arc::new(rt);
+    let prefault_thread = prefault_trace.map(|trace| {
+        let rt = Arc::clone(&rt);
+        std::thread::Builder::new()
+            .name("engram-uffd-prefault".to_string())
+            .spawn(move || {
+                if let Err(e) = rt.prefault_from_trace(&trace) {
+                    tracing::warn!(
+                        error = %e,
+                        "background prefault failed; remaining pages serve on-demand",
+                    );
+                }
+            })
+    });
     let _stream_alive = stream;
     tracing::info!(pid, "starting fault loop");
     let result = rt.run();
     tracing::info!(pid, ?result, "fault loop returned");
+    // Join the prefault producer before freezing the recorder so it's
+    // quiesced. Once the uffd closes (FC exited) the prefault's next install
+    // errors out, so this returns promptly rather than blocking teardown.
+    if let Some(Ok(handle)) = prefault_thread {
+        let _ = handle.join();
+    }
     result?;
     Ok(rt.finish_recorder())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunked::ChunkedMemoryBackend;
+    use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
+    use engram_chunk_store::manifest::{
+        ChunkRef, ChunkSize, ManifestKind, MANIFEST_SCHEMA_VERSION,
+    };
+    use engram_chunk_store::{ChunkStore, Manifest};
+    use engram_core::traits::BlobStorage;
+    use engram_storage_local::LocalBlobStorage;
+    use userfaultfd::UffdBuilder;
+
+    /// ADR 0043 P1: the prefault now runs on a background thread CONCURRENT
+    /// with the fault loop instead of fully ahead of it. Prove the two install
+    /// paths race safely: a `prefault_from_trace` thread and a `serve_pagefault`
+    /// thread, with an overlapping chunk range, must between them install every
+    /// chunk EXACTLY once (the `installed` bitmap serialises the check-and-set)
+    /// and leave the guest region byte-correct — no double-`UFFDIO_COPY`
+    /// (`EEXIST`), no corruption, no panic. This is the core safety property the
+    /// concurrent restructure relies on (the wake-a-blocked-vCPU half is
+    /// `wake_page`, unchanged + covered by the FC UFFD integration tests).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn concurrent_prefault_and_faults_install_every_chunk_once_and_correctly() {
+        let page_size = 4096u64;
+        let chunk_size = page_size; // one page per chunk keeps the math simple
+        let n_chunks = 16usize;
+        let total = chunk_size * n_chunks as u64;
+
+        // Plant n_chunks of known content (chunk i = byte i+1 repeated) into a
+        // local-backed store, and build a session==canonical manifest over them.
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob);
+        let mut entries = Vec::with_capacity(n_chunks);
+        let mut hashes = Vec::with_capacity(n_chunks);
+        for i in 0..n_chunks {
+            let tag = (i as u8).wrapping_add(1);
+            let hash = store
+                .put_chunk(&vec![tag; chunk_size as usize])
+                .await
+                .unwrap();
+            entries.push(ChunkRef {
+                offset: i as u64 * chunk_size,
+                hash,
+            });
+            hashes.push(hash);
+        }
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes: total,
+            chunks: entries,
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend = Arc::new(
+            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+        );
+
+        // mmap a private region and create + register an (unprivileged,
+        // user-mode-only) userfaultfd over it. Skip gracefully where the kernel
+        // forbids unprivileged uffd (some CI sandboxes) rather than failing.
+        let len = total as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(true)
+            .create()
+        {
+            Ok(u) => u,
+            Err(e) => {
+                unsafe { libc::munmap(ptr, len) };
+                eprintln!(
+                    "SKIP: cannot create userfaultfd ({e}); kernel forbids unprivileged uffd"
+                );
+                return;
+            }
+        };
+        uffd.register(ptr, len).expect("register region with uffd");
+
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: ptr as u64,
+            size: len,
+            offset: 0,
+            page_size: page_size as usize,
+        }];
+        let rt = Arc::new(
+            Runtime::new(
+                mappings,
+                uffd,
+                backend,
+                tokio::runtime::Handle::current(),
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+
+        // Two install paths race with an OVERLAP in the middle quarter
+        // [n/4, 3n/4): the prefault thread covers chunks [0, 3n/4); the
+        // "fault server" thread serves chunks [n/4, n). Every chunk is covered
+        // by at least one path; the overlap forces the bitmap to arbitrate.
+        // Both call `handle.block_on`, so they MUST run on plain threads (not
+        // tokio workers) — exactly as the handler runs on a spawn_blocking thread.
+        let base = ptr as u64;
+        // Build the trace the way production does — observe the first 3/4 of
+        // the chunks into a recorder, then freeze it.
+        let mut recorder = WorkingSetRecorder::new(1, Duration::from_secs(60));
+        for h in hashes.iter().take(3 * n_chunks / 4) {
+            recorder.observe(*h);
+        }
+        let trace = recorder.finish();
+        let rt_pf = Arc::clone(&rt);
+        let prefault = std::thread::spawn(move || {
+            rt_pf.prefault_from_trace(&trace).expect("prefault");
+        });
+        let rt_sf = Arc::clone(&rt);
+        let server = std::thread::spawn(move || {
+            for i in (n_chunks / 4)..n_chunks {
+                rt_sf
+                    .serve_pagefault(base + i as u64 * chunk_size)
+                    .expect("serve_pagefault");
+            }
+        });
+        prefault.join().unwrap();
+        server.join().unwrap();
+
+        // Every chunk installed exactly once.
+        let installed = rt.installed.lock().unwrap();
+        assert!(
+            installed.iter().all(|b| *b),
+            "every chunk should be installed"
+        );
+
+        // Region is byte-correct — no page faults (all present), no corruption.
+        let view = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        for i in 0..n_chunks {
+            let tag = (i as u8).wrapping_add(1);
+            let start = i * chunk_size as usize;
+            assert!(
+                view[start..start + chunk_size as usize]
+                    .iter()
+                    .all(|b| *b == tag),
+                "chunk {i} content mismatch (expected {tag})",
+            );
+        }
+        drop(installed);
+        unsafe { libc::munmap(ptr, len) };
+    }
 }
