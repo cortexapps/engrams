@@ -361,7 +361,34 @@ async fn reconcile(
     // chunk fetches across all images.
     for image in enabled {
         if current.contains(&image.manifest_digest) {
-            continue;
+            // ADR 0039 (honest readiness): a `ready` image must still have
+            // ALL its base chunks locally resolvable. Re-verify against the
+            // pinned set (the disk + memory hashes recorded at prefetch) —
+            // if the LRU evicted any, or a `write_local` silently failed so a
+            // pinned hash never actually landed on NVMe, flip to not-ready so
+            // this round re-prefetches. Without this the host keeps
+            // advertising `ready` while a restore cold-fetches (or EIOs) the
+            // base — the dev-engrams base-restore incident. (Cheap: a
+            // `try_exists` per pinned hash; the pin set is hundreds of
+            // entries.)
+            let still_warm = {
+                let guard = pinned_manifests.lock();
+                guard
+                    .get(&image.manifest_digest)
+                    .map(|hashes| hashes.iter().all(|h| chunk_cache.contains_on_disk(*h)))
+                    .unwrap_or(false)
+            };
+            if still_warm {
+                continue;
+            }
+            tracing::warn!(
+                image_uri = %image.image_uri,
+                digest = image.manifest_digest.as_str(),
+                "ready image's base chunks no longer resolvable locally; flipping to not-ready for re-prefetch",
+            );
+            readiness.mark_unready(&image.manifest_digest);
+            // fall through to re-prefetch (prefetch_one re-warms the chunks;
+            // the pin set is already recorded so it skips re-pinning).
         }
         // ADR 0022: where this image's contiguous per-template base
         // memfile must land — the SAME path a base session.create restore
@@ -921,5 +948,74 @@ mod tests {
         assert!(!readiness.contains(&img.manifest_digest), "now unready");
         assert!(pinned.lock().get(&img.manifest_digest).is_none());
         assert_eq!(cache.pinned_count(), 0, "all base pins released on disable");
+    }
+
+    #[tokio::test]
+    async fn reconcile_flips_ready_to_unready_when_base_chunk_is_gone() {
+        // ADR 0039 (honest readiness): if a `ready` image's base chunks are
+        // no longer resolvable on local NVMe (LRU eviction / a silently-
+        // failed write_local), the next reconcile must flip it back to
+        // not-ready so a restore never lands on a ready-but-cold host.
+        let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let readiness = ImageReadiness::new();
+        let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+        let base_id = SnapshotId::new();
+        let img = image_ref(base_id, disk_ref, Some(mem_ref));
+
+        // Enable + wait for ready.
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if readiness.contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            readiness.contains(&img.manifest_digest),
+            "ready after prefetch"
+        );
+
+        // Simulate the chunk going cold: delete one pinned chunk's on-disk
+        // cache file out from under the cache (what an LRU sweep or a failed
+        // write_local would leave behind — pinned-but-not-resident).
+        let victim = *pinned
+            .lock()
+            .get(&img.manifest_digest)
+            .unwrap()
+            .first()
+            .unwrap();
+        cache.evict_on_disk_for_test(victim);
+        assert!(!cache.contains_on_disk(victim), "victim chunk now gone");
+
+        // Re-verify on the next reconcile: the image is no longer warm, so it
+        // flips to not-ready (then re-prefetches — but it's gone unready,
+        // which is the contract the scheduler relies on).
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+        )
+        .await;
+        assert!(
+            !readiness.contains(&img.manifest_digest),
+            "a ready image with an evicted base chunk must flip to not-ready",
+        );
     }
 }

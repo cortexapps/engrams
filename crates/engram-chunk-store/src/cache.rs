@@ -332,6 +332,15 @@ impl ChunkCache {
         self.path_for(hash).try_exists().unwrap_or(false)
     }
 
+    /// Test-only: drop a chunk's on-disk cache file, simulating an LRU
+    /// eviction (or a silently-failed `write_local`) so callers can exercise
+    /// the "pinned-but-not-resident" recovery paths without driving real
+    /// disk pressure. Not part of the runtime surface.
+    #[doc(hidden)]
+    pub fn evict_on_disk_for_test(&self, hash: ChunkHash) {
+        let _ = std::fs::remove_file(self.path_for(hash));
+    }
+
     /// Get a chunk's bytes. Local NVMe first; on miss, the
     /// `fetch` closure is invoked exactly once (singleflight —
     /// concurrent waiters for the same hash share its result).

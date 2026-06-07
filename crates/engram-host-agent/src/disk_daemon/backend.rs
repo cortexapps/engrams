@@ -860,7 +860,6 @@ impl ChunkedDiskBackend {
             let upload = stream::iter(new_chunks.iter().cloned())
                 .map(|(chunk_idx, hash, bytes)| {
                     let store = &self.store;
-                    let cache = cache;
                     let op = op.clone();
                     async move {
                         let size = bytes.len() as u64;
