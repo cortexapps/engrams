@@ -49,6 +49,33 @@ All latency/throughput numbers are vendor-published benchmarks on favorable work
 
 ---
 
-## Pass 2 — live migration / network-disk-for-memory / state-of-the-art
+## Pass 2 — live migration / network-disk-for-memory / state-of-the-art (verified)
 
-_(pending — `wf_91afc498`; will be appended on completion)_
+Stats: 5 angles, 22 sources, 106 claims, **25 verified / 25 confirmed / 0 killed** (the structured synthesis array truncated to a "size probe"; findings reconstructed from the verification logs + 4 detailed findings + source list, all 3-0 unless noted).
+
+### Live migration
+
+- **Post-copy live migration (the "move without dropping" primitive):** transfer only CPU state, **resume the destination immediately**, then demand-page guest RAM over the network from the source via userfaultfd + a background push, **each page transferred at most once**. Modern QEMU UFFD post-copy downtime is **~7–12 ms** (vs the 2009 Xen ~600 ms–1 s, which was implementation-bound). Sources: `qemu.org/docs/master/devel/migration/postcopy.html`, Hines'09 (`kartikgopalan.github.io/publications/hines09postcopy_osr.pdf`).
+- **Post-copy host-failure caveat:** state is split across source+destination, so **failure of EITHER side loses the guest**; QEMU `postcopy-recover` handles only network blips, not a host crash. *Mitigated only if the working set is independently durable* — which is engrams' opening. Source: QEMU docs.
+- **Stock Firecracker does NOT implement true live migration** (pre- or post-copy); its only cross-host primitive is snapshot-on-source → restore-on-destination, and FC's UFFD is a **local** lazy restore from an mmapped file, not network post-copy. True FC live migration exists only in forks. Sources: FC discussion #3119, `snapshot-support.md`.
+- **FC's UFFD restore is page-source-PLUGGABLE** (the key seam): the user-written handler receives the userfaultfd + memory layout over a Unix socket and resolves faults via `UFFDIO_COPY` from any source; upstream demos a local file only, so network fetch must be hand-rolled — and **E2B/CodeSandbox/BuildBuddy already hand-roll network-backed UFFD handlers**. Sources: FC `handling-page-faults-on-snapshot-resume.md`, issue #2938.
+- **Fly.io Machine migrations** — cold move / suspend-resume / volume-reattach (sources: `fly.io/blog/machine-migrations`, `fly.io/docs/reference/machine-migration`).
+
+### Network-disk / far / disaggregated memory for VM RAM
+
+- **FluidMem** backs an *unmodified* KVM/QEMU VM's entire guest RAM with external/remote memory via userfaultfd — transparent paging of VM RAM from a network tier; median page-fault latency in the **tens-of-μs** range (RDMA); cites OSDI'16 "Network requirements for resource disaggregation." Source: `arxiv.org/pdf/1707.07780`. *(Proof that VM RAM can be paged from a remote tier transparently.)*
+- **Fastswap** (OSDI'20) — kernel driver + scheduler for **page-granular RDMA far-memory paging**. **AIFM** (OSDI'20) — application-integrated far memory at object (not page) granularity. **Carbink** (OSDI'22, Google) — application-runtime far memory over one-sided RDMA. **TMO** (ASPLOS'22, Meta) — transparent memory offloading. All RDMA-class latency (single-digit–tens of μs); all require an RDMA fabric. Sources: `clusterfarmem/fastswap`, `osdi20-ruan`, `osdi22-zhou-yang`, `tmo_asplos22`.
+
+### Fast snapshot-restore research (the lazy-fault-done-right consensus)
+
+- **REAP** (ASPLOS'21), **FaaSnap** (EuroSys'22), **Catalyzer** (ASPLOS'20) converge: don't full-load, don't pure-serial-lazy-fault — **record the working set on first run and prefetch exactly those pages (contiguously) on restore**, then lazy-fault the cold tail. The fix for the serial-fault storm; what engrams' deferred ADR 0039 #19 was circling. Sources: `marioskogias.github.io/docs/reap.pdf`, `faasnap-eurosys22.pdf`, `dl.acm.org/doi/10.1145/3373376.3378512`.
+
+### Drafter + Silo — read directly from source (`~/test/drafter` + `silo` v0.2.21)
+
+Drafter (`loopholelabs/drafter`, **archived**, AGPL-3.0) is a thin FC orchestrator; the real machinery is **`silo`** (separate AGPL module). It's the closest existing implementation of the unified-disk+memory, post-copy, durable-backed model engrams is reaching for.
+
+- **Unified device abstraction:** *everything* — guest disk AND the FC memory file — is a `storage.Provider` (`ReadAt`/`WriteAt`/`Size`/`Flush`), composed in one stack: backing → CoW base+overlay → `dirtytracker` → `expose` (NBD) → `migrator` → S3-sync (`silo/pkg/storage/{storage.go,device/device.go,devicegroup/}`). Disk and memory share **one** migration + durability + dirty-tracking path. The FC **memory file is exposed as an NBD device** (`File` backend with `Shared:true`, MAP_SHARED) — *not* via FC's UFFD seam (silo has **no userfaultfd at all**; it faults memory at the NBD/block layer or via `/proc/<pid>/mem`).
+- **Post-copy:** hybrid pre-copy (dirty-block streaming, `DirtyManager` convergence → suspend → authority transfer) + **post-copy by default** — the destination resumes the VM *before all data arrives* (`drafter-peer/main.go:273-283`); a guest read of a missing block blocks in `waitingcache.Local.ReadAt`, the first waiter fires `NeedAt(offset,len)` to the source, which prioritizes that block (`silo/pkg/storage/waitingcache/`, `protocol/`). **Block-granular** (KiB–MiB), custom wire protocol (not gRPC), per-device goroutine pools.
+- **THE key pattern for engrams — durable-backed migratable device** (`device.go:375-653` + `sources/s3_storage.go`): a `sources.S3Storage` Provider stores each block as an offset-keyed S3 object (≈ engrams' GCS chunk store); a background `migrator.Syncer` continuously replicates dirty blocks to S3 while the VM runs. On migration the source emits `AlternateSource{offset,len,hash,location}` for blocks already safe in S3; the destination **pulls cold blocks from S3 in parallel and only faults the hot delta P2P from the source** (`WriteCombinator` merges two prioritized inputs: P2P vs object-store, verify-by-SHA-256). So one device is simultaneously live (NBD), P2P-migratable, AND continuously object-store-checkpointed. *Caveat:* the S3 sync is a lagging bulk replica (CheckPeriod/MaxAge), not a crash-consistent in-flight-RAM snapshot — a mid-migration host crash recovers "from last S3 state + surviving overlay," not a transparent transactional resume.
+- **Requires a forked Firecracker** (`loopholelabs/firecracker` `release-main-live-migration` + forked go-sdk) adding `Msync`/`MsyncAndState` snapshot types that flush the MAP_SHARED memory mmap *without a full pause* (the dirty-sync enabler). Cannot reproduce on stock FC without the fork or an equivalent UFFD/NBD dirty-flush.
+- **Maturity/caveats:** archived but a real product (backed a KubeCon cross-continent live-migrate demo; productized as "Architect"); silo migration logic is sophisticated + test-covered. **Both AGPL-3.0** → treat as a *design reference to reimplement*, not code to import (engrams is OSS publishing images; vendoring imposes copyleft). Offset-keyed (no content dedup — engrams' content-addressing is strictly better here); block sizes far finer than engrams' 16 MiB chunks.

@@ -68,17 +68,25 @@ Verified findings that matter most:
 - **Drain-first / version-pinned host deploys + VM-detach** (E2B's blue/green-by-boot) → eliminates deploy storms; pairs with the existing ADR 0028 drain-before-roll follow-up.
 - **Cache on a separate co-located storage tier** (Replit-style) to decouple warmth from host rolls.
 
-**Tier 3 — under active research (follow-up pass `wf_91afc498`):**
-- **Persistent network disk as the memory backing** — mmap the FC memory file off a reattachable network block device (Hyperdisk/PD/NVMe-oF), UFFD-fault from it; "pause" = flush dirty pages to that disk (block write, not GCS upload); "host loss / deploy" = detach + reattach + re-fault. Eliminates the chunk-store for memory entirely *if* the latency/density/cost work.
-- **Post-copy / cross-host lazy memory fault** (QEMU-style post-copy via UFFD): resume on the destination immediately and fault pages from the source/network — true near-zero-pause migration.
-- **Far / disaggregated memory** (RDMA paging, CXL.mem) as a shared persistent memory tier — almost certainly research-only/speculative on GCP today, but worth scoping.
+**Tier 3 — structural bets informed by pass 2 + the Drafter/silo source dive (the substantive new material):**
+- **Post-copy migration with a durable-snapshot fallback — the differentiated move.** Post-copy (resume the destination immediately, demand-fault RAM from the source; QEMU downtime ~7–12 ms) is the real "move a running session without dropping it" primitive. Its universal flaw — a host crash mid-migration loses the guest (state split across both) — is exactly what engrams can neutralize, because **our working set is already durably in GCS**. So: post-copy speed + recover-from-last-durable-flush on crash. **Silo (under Drafter) already implements this pattern** — a single device that is simultaneously live (NBD), P2P-post-copy-migratable, and continuously object-store-checkpointed, with the destination pulling cold blocks from the object store in parallel and only faulting the hot delta P2P (`AlternateSource` + `WriteCombinator` two-priority merge, verify-by-hash). This is the closest existing implementation of the architecture we're reaching for. **Caveats:** AGPL (design reference to *reimplement*, not import); needs a forked FC (`Msync` snapshot types) or an equivalent UFFD/NBD dirty-flush; silo faults memory at the NBD/block layer, *not* via FC's UFFD seam (engrams would keep its UFFD handler and borrow the protocol/durability patterns).
+- **Network-disk-backed UFFD memory — feasible, but as the durable backstop, not the hot-path source.** FC's UFFD handler is page-source-pluggable (proven; E2B/CodeSandbox hand-roll network handlers) and FluidMem shows VM RAM can be transparently paged from a remote tier. But Hyperdisk/PD random-4 KB reads are **~ms** (vs local NVMe ~μs, vs GCS GET ~tens of ms + overhead), so naive serial faulting of a 300–400 MB working set is untenable — it **requires working-set prefetch + parallel fault**. Plus per-instance disk-attach limits cap density. Conclusion: keep **local NVMe as the warm primary**, use a reattachable network disk as the **durable backstop you reattach on host loss** (no GCS round-trip), not the per-fault source. *(Benchmark the exact Hyperdisk random-4 KB latency before committing — pass 2 didn't pin it.)*
+- **Working-set prefetch (REAP/FaaSnap/Catalyzer) — the missing piece that makes any lazy source fast.** Record the working set on first run, prefetch it contiguously on restore, lazy-fault the cold tail. This is what makes network-disk memory *or* post-copy *or* GCS-backed restore viable, and it's the deferred ADR 0039 #19 idea with academic backing.
+- **Unify disk + memory behind one `Provider`-style interface** (silo's core lesson): engrams has two parallel codepaths (NBD disk chunk store vs UFFD memory handler); putting both behind one `ReadAt/WriteAt` device with pluggable backings means dirty-tracking, post-copy, and durable-sync are written *once* and apply to both.
+- **Far / disaggregated memory** (Fastswap/AIFM/Carbink/TMO, CXL.mem): RDMA-class latency (μs) would be fast enough, but needs an RDMA fabric GCP doesn't standardly offer; CXL pooling isn't usable on GCP today — **research-only/speculative**, parked.
 
-## Open questions (the follow-up research pass is answering)
+## Open questions
 
-1. Does a persistent network disk (or far/disaggregated memory) actually beat object-storage-chunking + local cache **for memory specifically**, and on which axis (fault latency, host-loss survival, cost, density)? Concrete Hyperdisk/PD random-4 KB-read latency vs GCS vs local NVMe.
-2. What does "move a running session across hosts" cost under each model — post-copy live migration vs snapshot-and-reattach-disk vs snapshot-to-GCS-and-rehome?
-3. The Fly/Cloudflare/AWS evidence gap on network-block-storage + live-migration that the first pass couldn't verify.
-4. Is there a **non-obvious technique the incumbents are NOT doing** that engrams could combine (network-disk-backed UFFD memory, unified reattachable disk for disk+memory, post-copy cross-host fault)?
+**Resolved by pass 2 + the Drafter/silo dive:**
+- *Can a persistent network disk solve the memory problem?* Partially — VM RAM can be transparently paged from a network/remote tier (FC UFFD is pluggable; FluidMem proves it), but Hyperdisk's ~ms random-read latency makes it a **durable backstop + reattach-on-host-loss** play, not a per-fault hot-path source. Local NVMe stays the warm primary; working-set prefetch is mandatory.
+- *Move a running session across hosts?* Post-copy is the primitive (~7–12 ms downtime); engrams is uniquely able to do it **crash-safely** via its durable working set. Silo is the reference implementation.
+- *Something the incumbents aren't doing?* Post-copy + durable-snapshot-fallback (CodeSandbox/Modal/E2B all snapshot-and-rehome with no post-copy; Drafter does post-copy but without an independent durable backstop). That intersection is engrams' opening.
+
+**Still open (to resolve before a decision ADR):**
+1. **Benchmark** the exact Hyperdisk/PD random-4 KB-read latency on our instance types — the number that decides whether a network disk can back memory faulting at all (pass 2 didn't pin it).
+2. **Density math** for a reattachable network disk per session vs GCP per-instance disk-attach limits — does it fit our density targets (ADR 0022) or only the long-tail-idle case?
+3. **Stock-FC feasibility** of the dirty-flush-without-pause that silo gets from its forked FC `Msync` — can we approximate it with our existing UFFD/NBD layer + `MAP_SHARED`, or does post-copy require an FC fork (see ADR 0025, we already own the guest kernel)?
+4. Fly/Cloudflare/AWS network-block-storage detail still unverified (lower priority now that the design direction is clearer).
 
 ## Sources
 
@@ -90,7 +98,7 @@ Verified competitive research (primary engineering blogs):
 - Modal — *Memory snapshots: Checkpoint/restore for sub-second startup* (2025); gVisor checkpoint/restore docs.
 - Firecracker NSDI'20; FC snapshot/UFFD docs; AWS Lambda SnapStart (under-the-hood).
 
-(Tier-3 sources to be appended when `wf_91afc498` lands.)
+Pass 2 (live migration / network-disk-for-memory / state of the art) — read directly: `loopholelabs/drafter` + `silo` v0.2.21 (`~/test/drafter`). Primary: QEMU post-copy docs; Hines'09 post-copy; FC snapshot/UFFD-handler docs + discussions #3119/#2938; FluidMem (arXiv 1707.07780); Fastswap (OSDI'20), AIFM (OSDI'20), Carbink (OSDI'22), TMO (ASPLOS'22); REAP (ASPLOS'21), FaaSnap (EuroSys'22), Catalyzer (ASPLOS'20); Fly.io machine-migration docs; GCP sharing-disks-between-VMs. Full verified findings + per-claim sources in the evidence companion.
 
 ## Status
 
