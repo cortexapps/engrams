@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hostfleet.hostAgent.fullname" . }}
+  labels:
+    {{- include "hostfleet.hostAgent.labels" . | nindent 4 }}
+data:
+  # Non-secret host-agent env (the token comes from a Secret, the
+  # advertise addr from the Downward API — both set on the DaemonSet).
+  ENGRAM_SANDBOX_BACKEND: "firecracker"
+  ENGRAM_SANDBOX_WORK_DIR: "/var/lib/engram/sandboxes"
+  ENGRAM_KERNEL_IMAGE_PATH: "/opt/engram/vmlinux"
+  ENGRAM_GRPC_LISTEN_ADDR: "0.0.0.0:{{ .Values.hostAgent.grpcPort }}"
+  ENGRAM_HOST_METRICS_ADDR: "0.0.0.0:{{ .Values.hostAgent.metricsPort }}"
+  ENGRAM_BLOB_BACKEND: {{ .Values.blob.backend | quote }}
+  {{- if .Values.coordinator.endpoint }}
+  ENGRAM_COORDINATOR_ENDPOINT: {{ .Values.coordinator.endpoint | quote }}
+  {{- end }}
+  {{- if eq .Values.blob.backend "gcs" }}
+  ENGRAM_GCS_BUCKET: {{ .Values.blob.gcsBucket | quote }}
+  {{- else if eq .Values.blob.backend "s3" }}
+  ENGRAM_S3_BUCKET: {{ .Values.blob.s3Bucket | quote }}
+  {{- with .Values.blob.s3EndpointUrl }}
+  ENGRAM_S3_ENDPOINT_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.blob.s3Region }}
+  ENGRAM_S3_REGION: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.nbd.devices }}
+  ENGRAM_NBD_DEVICES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.firecracker.restoreMode }}
+  ENGRAM_FC_RESTORE_MODE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.storage.chunkCacheBudgetBytes }}
+  ENGRAM_CHUNK_CACHE_BUDGET_BYTES: {{ . | quote }}
+  {{- end }}

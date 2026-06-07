@@ -1,0 +1,24 @@
+apiVersion: v2
+name: engram-host-fleet
+description: |
+  Engram Firecracker host fleet for Kubernetes (ADR 0044). Runs the
+  engram-host-agent as a privileged DaemonSet — one pod per KVM /
+  nested-virt node — that owns /dev/kvm, /dev/nbdN, taps and iptables
+  and fans out N Firecracker microVMs as children (K8s schedules the
+  daemon, NOT the sessions; the coordinator schedules sessions itself).
+  A node-prep DaemonSet handles the host-OS setup (kernel modules,
+  sysctls) that Packer used to bake. Requires nodes with /dev/kvm +
+  cgroup v2; on managed K8s that means a metal SKU or explicit
+  nested-virt (Intel-only today — see ADR 0044).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - engram
+  - firecracker
+  - microvm
+  - daemonset
+sources:
+  - https://github.com/cortexapps/engrams
+maintainers:
+  - name: Cortex

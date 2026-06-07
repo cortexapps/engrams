@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "hostfleet.hostAgent.fullname" . }}
+  labels:
+    {{- include "hostfleet.hostAgent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hostfleet.hostAgent.selectorLabels" . | nindent 6 }}
+  # OnDelete: the host-agent holds live microVM state, so K8s must not
+  # roll pods out from under it. The ADR 0044 K3 operator drives
+  # drain-gated, node-by-node replacement instead.
+  updateStrategy:
+    type: {{ .Values.updateStrategy }}
+  template:
+    metadata:
+      labels:
+        {{- include "hostfleet.hostAgent.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "hostfleet.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # terminationGracePeriod is generous: the K3 operator drains via
+      # the coordinator before deleting a pod, but a bare `kubectl
+      # delete` should still let in-flight captures finish.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: host-agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            # Spike (ADR 0044) ran fully privileged; production should
+            # tighten to a KVM device plugin + scoped caps (K-hardening).
+            privileged: true
+            runAsUser: 0
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "IPC_LOCK"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "hostfleet.hostAgent.fullname" . }}
+          env:
+            # The coord dials this back for gRPC (ADR 0013). pod-netns +
+            # pod IP works in-cluster (the spike used pod-netns).
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: ENGRAM_GRPC_ADVERTISE_ADDR
+              value: "http://$(POD_IP):{{ .Values.hostAgent.grpcPort }}"
+            {{- if .Values.coordinator.tokenSecretName }}
+            - name: ENGRAM_COORDINATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coordinator.tokenSecretName }}
+                  key: {{ .Values.coordinator.tokenSecretKey }}
+            {{- end }}
+            {{- with .Values.hostAgent.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - {name: grpc, containerPort: {{ .Values.hostAgent.grpcPort }}, protocol: TCP}
+            - {name: metrics, containerPort: {{ .Values.hostAgent.metricsPort }}, protocol: TCP}
+          resources:
+            {{- toYaml .Values.hostAgent.resources | nindent 12 }}
+          volumeMounts:
+            - {name: dev, mountPath: /dev}
+            - {name: firecracker, mountPath: /usr/local/bin/firecracker}
+            - {name: kernel, mountPath: /opt/engram/vmlinux}
+            - {name: work, mountPath: /var/lib/engram}
+            - {name: cgroup, mountPath: /sys/fs/cgroup}
+      volumes:
+        - {name: dev, hostPath: {path: /dev, type: Directory}}
+        - {name: firecracker, hostPath: {path: {{ .Values.firecracker.binaryHostPath | quote }}, type: File}}
+        - {name: kernel, hostPath: {path: {{ .Values.firecracker.kernelHostPath | quote }}, type: File}}
+        - {name: work, hostPath: {path: {{ .Values.storage.workDirHostPath | quote }}, type: DirectoryOrCreate}}
+        - {name: cgroup, hostPath: {path: /sys/fs/cgroup, type: Directory}}
