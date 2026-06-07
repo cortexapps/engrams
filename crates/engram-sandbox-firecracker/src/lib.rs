@@ -1205,7 +1205,17 @@ impl FirecrackerBackend {
         // upload, shell tunnel, CA). Retry EOF/RST-shaped handshake failures
         // with a short backoff; a genuinely-dead agentd EOFs every attempt
         // and the final error propagates.
-        const MAX_ATTEMPTS: u32 = 5;
+        // The muxer-settle window is usually a few ms, but on a cold boot,
+        // under CI load, or with more restore-time devices (ADR 0027 added a
+        // RO bundle drive) it can stretch well past the old flat 5×50 ms
+        // (~250 ms) budget — observed as a CI `early eof` flake when
+        // `start_shell` dials agentd on a freshly cold-booted VM. Use more
+        // attempts with an escalating-but-capped backoff so the total budget
+        // (~1.75 s) covers the long tail, while staying cheap on the common
+        // (few-ms) case and well under every caller's outer timeout (e.g.
+        // start_shell's 15 s). Re-dialing is always safe here — the CONNECT
+        // handshake is pre-application, no bytes have reached the guest.
+        const MAX_ATTEMPTS: u32 = 10;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -1220,13 +1230,15 @@ impl FirecrackerBackend {
                     if !retryable || attempt >= MAX_ATTEMPTS {
                         return Err(e);
                     }
+                    let backoff_ms = (attempt as u64 * 50).min(250);
                     tracing::debug!(
                         attempt,
                         port,
+                        backoff_ms,
                         error = %e,
-                        "FC vsock CONNECT transient (muxer settle); retrying after 50 ms",
+                        "FC vsock CONNECT transient (muxer settle); retrying",
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 }
             }
         }
