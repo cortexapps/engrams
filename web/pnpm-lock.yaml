@@ -133,8 +133,8 @@ importers:
         specifier: ^4.3.0
         version: 4.3.0
       typescript:
-        specifier: ^5.7.2
-        version: 5.9.3
+        specifier: ^6.0.3
+        version: 6.0.3
       vite:
         specifier: ^6.0.7
         version: 6.4.2(jiti@2.7.0)(lightningcss@1.32.0)(yaml@2.9.0)
@@ -2824,8 +2824,8 @@ packages:
     peerDependencies:
       tailwindcss: '>=4.0.0-0'
 
-  typescript@5.9.3:
-    resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
+  typescript@6.0.3:
+    resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
     engines: {node: '>=14.17'}
     hasBin: true
 
@@ -5861,7 +5861,7 @@ snapshots:
     dependencies:
       tailwindcss: 4.3.0
 
-  typescript@5.9.3: {}
+  typescript@6.0.3: {}
 
   undici@7.25.0: {}
 
