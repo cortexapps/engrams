@@ -349,6 +349,57 @@ confirm via the `ensure_active_after_evicting_hold_for` test seam.
 §7 (one-shot prod-ops cleanup of pre-0039 `memory.bin`s) remain unaddressed
 and stay queued above.
 
+### Follow-up: image chunks sticky everywhere (writer-retains + honest readiness)
+
+A second round of prod incidents (sessions `79b689e4` + the dev-engrams
+base-restore wedge, 2026-06-06) exposed two gaps the §2 cache-locality work
+didn't close: a *refreshed* base restored slowly / EIO'd because the host
+the scheduler routed restores to had the base's **disk chunks cold**.
+
+**Root causes.** (1) **The writer doesn't keep its chunks** — the base
+capture (`build_base_snapshot` → `ChunkStore::chunk_file`) and the eviction
+flush (`flush_upload`) upload via `put_chunk`, which is upload-only and does
+NOT populate the local `ChunkCache`; a host that just *captured* a base has
+its disk chunks only in GCS. (2) **Readiness can be dishonest** — a host
+advertises an image `ready` (which `pick_for_session` gates placement on) on
+memory-residency / capture alone, without the base's **disk** chunks being
+locally present; snapshot-affinity then correctly routes to that "ready"
+host, whose disk is cold → cold-fetch every read (and on a writer-dropped
+chunk, EIO — see the §-below flush-atomicity fix / #109). The image-prefetch
+supervisor already warms every *non-capturer* host, so the capturer was the
+lone exception.
+
+**Decision (stacks on #109):**
+- **(a) Writer-retains (write-through).** Both upload paths write each chunk
+  to the local `ChunkCache` as they upload it (bytes already in hand, so
+  ~free): `flush_upload` write-throughs via the backend's cache after a
+  successful put (preserving #109's atomicity); `chunk_file` gains an
+  optional cache (`chunk_file_into`) and the capture sites pass the host's
+  shared cache. The capturer is warm by construction; no re-fetch of its own
+  writes.
+- **(b) Honest readiness.** `mark_ready` is gated on the base's disk **and**
+  memory chunks actually resolving from the local cache, so
+  `pick_for_session`/affinity never route a restore to a host that would
+  cold-fetch; a host warming a new base reports not-ready until genuinely
+  warm.
+
+**Rejected:** *push-on-enable* (broadcast to warm all hosts) — the
+post-refresh window is dominated by the multi-GB warm *time*, not the ~5 s
+heartbeat pull cadence, and (a) makes the capturer warm instantly; a clean
+supervisor-wake (via the existing coord→host gRPC, no parallel warm path)
+is feasible but marginal, deferred pending measurement. *Dropping affinity*
+— it's sound (respects readiness + co-locates a resume with the bytes); the
+defect was dishonest readiness. *Coupling `ChunkStore` to `ChunkCache`
+globally* — the store is the GCS tier used cache-less (coord chunk-GC), so
+write-through belongs at the producing call sites (in-crate via
+`chunk_file_into`).
+
+**Invariants:** a host that uploads a chunk holds it locally (write-through
+failure is best-effort/logged — the chunk is durable in GCS, reads fall
+back); `ready_images.contains(digest)` ⟹ the base's disk+memory chunks
+resolve from the local cache, so a restore never lands on a ready-but-cold
+host.
+
 ## Implementation
 
 Commit chain (this branch, off the ADR-0038 branch):

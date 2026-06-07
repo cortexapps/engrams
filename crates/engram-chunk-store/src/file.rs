@@ -23,6 +23,7 @@ use bytes::Bytes;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
+use crate::cache::ChunkCache;
 use crate::error::Result;
 use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION};
 use crate::store::ChunkStore;
@@ -53,6 +54,23 @@ impl ChunkStore {
         path: &Path,
         kind: ManifestKind,
         chunk_size: Option<u64>,
+    ) -> Result<Manifest> {
+        self.chunk_file_into(path, kind, chunk_size, None).await
+    }
+
+    /// Like [`Self::chunk_file`], but also write-throughs each produced
+    /// chunk into `cache` as it's uploaded — ADR 0039 (sticky-everywhere):
+    /// a host that *captures* a base keeps its chunks on local NVMe rather
+    /// than re-fetching its own writes from GCS (`put_chunk` is
+    /// upload-only). `None` ⇒ identical to `chunk_file`; caching is
+    /// best-effort (a local-cache write failure is logged, not fatal —
+    /// the chunk is durable in the store).
+    pub async fn chunk_file_into(
+        &self,
+        path: &Path,
+        kind: ManifestKind,
+        chunk_size: Option<u64>,
+        cache: Option<&ChunkCache>,
     ) -> Result<Manifest> {
         let chunk_size = chunk_size.unwrap_or_else(|| kind.default_chunk_size());
         let mut file = fs::File::open(path).await?;
@@ -94,12 +112,13 @@ impl ChunkStore {
             offset += want as u64;
 
             if window.len() == SPARSE_RECHUNK_CONCURRENCY {
-                self.flush_chunk_window(std::mem::take(&mut window), &mut manifest)
+                self.flush_chunk_window(std::mem::take(&mut window), &mut manifest, cache)
                     .await?;
             }
         }
         if !window.is_empty() {
-            self.flush_chunk_window(window, &mut manifest).await?;
+            self.flush_chunk_window(window, &mut manifest, cache)
+                .await?;
         }
         // Windows are read + appended in offset order and each window is
         // internally re-sorted, so `manifest.chunks` stays offset-sorted.
@@ -115,13 +134,28 @@ impl ChunkStore {
         &self,
         window: Vec<(u64, Bytes)>,
         manifest: &mut Manifest,
+        cache: Option<&ChunkCache>,
     ) -> Result<()> {
         use futures::stream::{self, StreamExt, TryStreamExt};
         let mut refs: Vec<ChunkRef> = stream::iter(window)
             .map(|(offset, bytes)| {
                 let store = self.clone();
+                let cache = cache.cloned();
                 async move {
                     let hash = store.put_chunk(&bytes).await?;
+                    // ADR 0039 (sticky-everywhere): write-through so the
+                    // capturing host keeps its chunk on local NVMe and never
+                    // re-fetches its own write from GCS. Best-effort — the
+                    // chunk is durable in the store regardless.
+                    if let Some(cache) = &cache {
+                        if let Err(e) = cache.put(hash, &bytes).await {
+                            tracing::warn!(
+                                %hash,
+                                error = %e,
+                                "chunk_file write-through to local cache failed (chunk durable in store)",
+                            );
+                        }
+                    }
                     Ok::<_, crate::error::ChunkStoreError>(ChunkRef { offset, hash })
                 }
             })

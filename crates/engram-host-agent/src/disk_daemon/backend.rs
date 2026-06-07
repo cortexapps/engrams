@@ -856,8 +856,9 @@ impl ChunkedDiskBackend {
         {
             use futures::stream::{self, StreamExt, TryStreamExt};
             let op = self.operation_scope.current();
+            let cache = &self.cache;
             let upload = stream::iter(new_chunks.iter().cloned())
-                .map(|(chunk_idx, _hash, bytes)| {
+                .map(|(chunk_idx, hash, bytes)| {
                     let store = &self.store;
                     let op = op.clone();
                     async move {
@@ -881,6 +882,21 @@ impl ChunkedDiskBackend {
                             None => {
                                 put.await?;
                             }
+                        }
+                        // ADR 0039 (sticky-everywhere): write-through to the
+                        // local cache so the flushing host keeps its OWN
+                        // just-uploaded chunks and never re-fetches its writes
+                        // from GCS (`put_chunk` is upload-only). Best-effort:
+                        // the chunk is durable in GCS, so a local-cache write
+                        // failure (ENOSPC/perms) is logged, not fatal — reads
+                        // fall back to GCS.
+                        if let Err(e) = cache.put(hash, &bytes).await {
+                            tracing::warn!(
+                                chunk = chunk_idx,
+                                %hash,
+                                error = %e,
+                                "flush write-through to local cache failed (chunk durable in GCS; reads fall back)",
+                            );
                         }
                         Ok::<_, DiskBackendError>(())
                     }
@@ -2280,5 +2296,49 @@ mod tests {
                 .expect("every published chunk must be durable after a successful flush");
         }
         assert_eq!(backend.read(chunk_size, 16).await.unwrap(), vec![2u8; 16]);
+    }
+
+    /// ADR 0039 (sticky-everywhere): a flush write-throughs each uploaded
+    /// chunk into the local cache, so the flushing host keeps its own
+    /// chunks resident on NVMe instead of re-fetching its writes from GCS.
+    #[tokio::test]
+    async fn flush_write_throughs_chunks_into_local_cache() {
+        let chunk_size = 4096u64;
+        let total = 3 * chunk_size;
+        let base = synth_manifest(total, chunk_size, vec![]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &base).await.unwrap();
+        // Hold a clone of the cache so we can assert the write-through.
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &base, cache.clone(), store.clone(), u64::MAX)
+                .unwrap();
+
+        backend
+            .write(chunk_size, &vec![0x5a; chunk_size as usize])
+            .await
+            .unwrap();
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 1);
+
+        // The flushed chunk is now resident in the LOCAL cache (write-through),
+        // not only in GCS — so a same-host read never round-trips to blob.
+        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        let h = published
+            .chunks
+            .iter()
+            .find(|c| c.offset == chunk_size)
+            .expect("flushed chunk in manifest")
+            .hash;
+        assert!(
+            cache.contains_on_disk(h),
+            "flush must write-through the uploaded chunk into the local cache",
+        );
     }
 }
