@@ -1,5 +1,5 @@
-import { useQuery } from '@tanstack/react-query';
-import { fetchStorageSummary } from '../api';
+import { useQuery } from "@tanstack/react-query";
+import { fetchStorageSummary } from "../api";
 
 // ADR 0029: the Storage surface's data. The endpoint aggregates the
 // per-host COW state (coord-cached at 1s) plus two cheap Postgres
@@ -10,7 +10,7 @@ const POLL_INTERVAL_MS = 4_000;
 
 export function useStorageSummary() {
   return useQuery({
-    queryKey: ['storage-summary'],
+    queryKey: ["storage-summary"],
     queryFn: fetchStorageSummary,
     refetchInterval: POLL_INTERVAL_MS,
     refetchOnWindowFocus: false,

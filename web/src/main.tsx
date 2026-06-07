@@ -1,18 +1,21 @@
-// Newsreader and JetBrains Mono are both multi-axis variable fonts.
-// Fontsource splits each into one CSS file per axis and *pins* the
-// other axes, so importing Newsreader's `opsz` (optical-size) axis
-// registers the face at `font-weight: 400` only — every serif element
-// asked for at another weight (`.smallcaps` is 500, bold headings,
-// `<strong>`) has no matching `@font-face` and falls down the stack to
-// a generic serif. Import the `wght` axis on both faces so the full
-// weight range is available (mirrors the JetBrains Mono imports).
-import '@fontsource-variable/newsreader/wght.css';
-import '@fontsource-variable/newsreader/wght-italic.css';
-import '@fontsource-variable/jetbrains-mono/wght.css';
-import '@fontsource-variable/jetbrains-mono/wght-italic.css';
-import { createRoot } from 'react-dom/client';
-import { App } from './App';
-import './theme.css';
+// JetBrains Mono is a multi-axis variable font; Fontsource splits it into one
+// CSS file per axis. Import the `wght` axis so the full weight range is
+// available to anything using `--font-mono` (code, IDs, tabular numbers).
+import "@fontsource-variable/jetbrains-mono/wght.css";
+import "@fontsource-variable/jetbrains-mono/wght-italic.css";
+// Saira is the display voice — page/section titles and the primary action
+// button. A squared, technical grotesque with an aerospace lineage; the
+// "speed" read comes from Saira plus treatment (a touch of width on titles,
+// tracked caps on the primary button), not a literal racing wordmark. Import
+// the weight AND width axes so titles can take a subtle Aston-style extension.
+import "@fontsource-variable/saira/wght.css";
+import "@fontsource-variable/saira/wdth.css";
+import { createRoot } from "react-dom/client";
+import { App } from "./App";
+import { ThemeProvider } from "./components/theme-provider";
+// index.css pulls in Tailwind once and @imports theme.css (the Lab-Notebook
+// partial kept for the not-yet-migrated SessionDetail transcript subtree).
+import "./index.css";
 
 // StrictMode intentionally double-mounts effects in dev. Useful in
 // general, but it interacts badly with ghostty-web's WASM Terminal:
@@ -21,4 +24,8 @@ import './theme.css';
 // flurries on top of each other and the rendered output overlaps.
 // Until we make TerminalPane fully StrictMode-idempotent, opt out
 // at the root.
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById("root")!).render(
+  <ThemeProvider>
+    <App />
+  </ThemeProvider>,
+);

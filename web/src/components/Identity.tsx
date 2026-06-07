@@ -1,7 +1,7 @@
 // ADR 0031 identity vocabulary — the "people" layer of the Lab Notebook system.
 // Typography + hairline rules only; no new hues, no rounded corners.
 
-import { EngramMark } from './EngramMark';
+import { EngramMark } from "./EngramMark";
 
 // --- PersonMark -----------------------------------------------------------
 // Embossed typesetter's initial on --bg-raised in a square hairline frame.
@@ -10,20 +10,17 @@ import { EngramMark } from './EngramMark';
 export function PersonMark({
   name,
   email,
-  size = 'sm',
+  size = "sm",
   off = false,
 }: {
   name?: string | null;
   email?: string | null;
-  size?: 'xs' | 'sm' | 'md';
+  size?: "xs" | "sm" | "md";
   off?: boolean;
 }) {
-  const initial = ((name || email || '?').charAt(0) || '?').toUpperCase();
+  const initial = ((name || email || "?").charAt(0) || "?").toUpperCase();
   return (
-    <span
-      className={`person-mark pm-${size}${off ? ' pm-off' : ''}`}
-      aria-hidden="true"
-    >
+    <span className={`person-mark pm-${size}${off ? " pm-off" : ""}`} aria-hidden="true">
       <span>{initial}</span>
     </span>
   );
@@ -36,17 +33,17 @@ export function OwnerBadge({
   kind,
   name,
   email,
-  size = 'xs',
+  size = "xs",
   off = false,
 }: {
-  kind?: 'user' | 'system' | null;
+  kind?: "user" | "system" | null;
   name?: string | null;
   email?: string | null;
-  size?: 'xs' | 'sm' | 'md';
+  size?: "xs" | "sm" | "md";
   off?: boolean;
 }) {
-  if (kind === 'system') {
-    const px = size === 'xs' ? 15 : 19;
+  if (kind === "system") {
+    const px = size === "xs" ? 15 : 19;
     return (
       <span className={`person-mark pm-${size} pm-system`} title="engrams · automated">
         <EngramMark size={px} mode="static" />
@@ -64,21 +61,22 @@ export function OwnerCell({
   ownerName,
   ownerEmail,
 }: {
-  ownerKind?: 'user' | 'system' | null;
+  ownerKind?: "user" | "system" | null;
   ownerName?: string | null;
   ownerEmail?: string | null;
 }) {
-  const isSystem = ownerKind === 'system' || (!ownerEmail && !ownerName);
+  const isSystem = ownerKind === "system" || (!ownerEmail && !ownerName);
   return (
     <span
       className="owner-cell"
-      title={
-        isSystem
-          ? 'engrams · automated'
-          : `owner · ${ownerEmail ?? ownerName ?? ''}`
-      }
+      title={isSystem ? "engrams · automated" : `owner · ${ownerEmail ?? ownerName ?? ""}`}
     >
-      <OwnerBadge kind={isSystem ? 'system' : 'user'} name={ownerName} email={ownerEmail} size="xs" />
+      <OwnerBadge
+        kind={isSystem ? "system" : "user"}
+        name={ownerName}
+        email={ownerEmail}
+        size="xs"
+      />
       {isSystem ? (
         <span className="owner-sys">engrams</span>
       ) : (
@@ -99,16 +97,14 @@ export function RoleTag({ role }: { role: string }) {
 // A faint Newsreader-italic note for role_source.
 
 const PROVENANCE_LABELS: Record<string, string> = {
-  claim: 'via auth claim',
-  scim: 'via scim sync',
-  manual: 'set by an admin',
+  claim: "via auth claim",
+  scim: "via scim sync",
+  manual: "set by an admin",
 };
 
 export function Provenance({ source }: { source?: string | null }) {
   if (!source) return null;
-  return (
-    <span className="provenance">{PROVENANCE_LABELS[source] ?? source}</span>
-  );
+  return <span className="provenance">{PROVENANCE_LABELS[source] ?? source}</span>;
 }
 
 // --- MemberStatus ---------------------------------------------------------

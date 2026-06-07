@@ -1,0 +1,5 @@
+# Auto-format staged web/ files with oxfmt via lint-staged.
+# Git runs hooks from the repo root; lint-staged's config lives in
+# web/package.json and scopes to its own subtree, so cd there first.
+cd "$(git rev-parse --show-toplevel)/web" || exit 1
+pnpm exec lint-staged

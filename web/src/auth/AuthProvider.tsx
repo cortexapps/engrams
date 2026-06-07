@@ -5,11 +5,13 @@
 //   - "not a member" screen for a 403 (authenticated but not provisioned)
 //   - error screen for non-401/403 failures (coordinator down, etc.)
 
-import { useQuery } from '@tanstack/react-query';
-import { createContext, useContext, type ReactNode } from 'react';
-import { fetchMe, logout, NotMemberError } from '../api';
-import type { Principal } from '../types';
-import { EngramMark } from '../components/EngramMark';
+import { useQuery } from "@tanstack/react-query";
+import { createContext, useContext, type ReactNode } from "react";
+import { fetchMe, logout, NotMemberError } from "../api";
+import type { Principal } from "../types";
+import { EngramMark } from "../components/EngramMark";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 
 export interface AuthState {
   /** Always present for children — the provider only renders them once the
@@ -36,8 +38,13 @@ export function AuthContextProvider({
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const { data: principal, isLoading, error, refetch } = useQuery({
-    queryKey: ['me'],
+  const {
+    data: principal,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
+    queryKey: ["me"],
     queryFn: fetchMe,
     retry: 0,
     staleTime: 60_000,
@@ -53,12 +60,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   if (error || !principal) {
-    return (
-      <AuthErrorScreen
-        message={error?.message}
-        onRetry={() => void refetch()}
-      />
-    );
+    return <AuthErrorScreen message={error?.message} onRetry={() => void refetch()} />;
   }
 
   const value: AuthState = {
@@ -72,7 +74,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 export function useAuth(): AuthState {
   const ctx = useContext(AuthContext);
   if (!ctx) {
-    throw new Error('useAuth must be used within an AuthProvider');
+    throw new Error("useAuth must be used within an AuthProvider");
   }
   return ctx;
 }
@@ -82,76 +84,60 @@ export function useIsAdmin(): boolean {
 }
 
 // ---- Auth state screens --------------------------------------------------
-// Full-viewport, centered on --bg, 32rem card, engram mark, lowercase em-dash voice.
+// Full-viewport, centered on the shadcn background, engram mark, quiet voice.
 
-function BootScreen() {
+function AuthStage({ children }: { children: ReactNode }) {
   return (
-    <div className="auth-stage">
-      <div className="auth-card">
-        <span className="auth-mark">
-          <EngramMark size={72} mode="loop" />
-        </span>
-        <div className="auth-line">authenticating…</div>
-      </div>
+    <div className="grid min-h-svh place-items-center bg-background p-8 text-foreground">
+      {children}
     </div>
   );
 }
 
-function AuthErrorScreen({
-  message,
-  onRetry,
-}: {
-  message?: string;
-  onRetry: () => void;
-}) {
+function BootScreen() {
   return (
-    <div className="auth-stage">
-      <div className="auth-card">
-        <span className="auth-mark">
-          <EngramMark size={72} mode="static" />
-        </span>
-        <div className="auth-strong">
-          could not reach the coordinator —<br />retrying…
-        </div>
-        {message && <div className="auth-detail">{message}</div>}
-        <div className="auth-actions">
-          <button
-            type="button"
-            className="members-act"
-            onClick={onRetry}
-          >
-            retry now
-          </button>
-        </div>
+    <AuthStage>
+      <div className="flex flex-col items-center gap-3 text-center">
+        <EngramMark size={72} mode="loop" />
+        <p className="text-sm italic text-muted-foreground">authenticating…</p>
       </div>
-    </div>
+    </AuthStage>
+  );
+}
+
+function AuthErrorScreen({ message, onRetry }: { message?: string; onRetry: () => void }) {
+  return (
+    <AuthStage>
+      <Card className="w-full max-w-md">
+        <CardContent className="flex flex-col items-center gap-4 py-8 text-center">
+          <EngramMark size={72} mode="static" />
+          <p className="text-base font-medium">Could not reach the coordinator — retrying…</p>
+          {message && <p className="text-sm text-muted-foreground">{message}</p>}
+          <Button variant="outline" onClick={onRetry}>
+            Retry now
+          </Button>
+        </CardContent>
+      </Card>
+    </AuthStage>
   );
 }
 
 function NotMemberScreen({ email }: { email: string }) {
   return (
-    <div className="auth-stage">
-      <div className="auth-card">
-        <span className="auth-mark">
+    <AuthStage>
+      <Card className="w-full max-w-md">
+        <CardContent className="flex flex-col items-center gap-3 py-8 text-center">
           <EngramMark size={72} mode="static" />
-        </span>
-        <div className="auth-strong">
-          you're signed in — but not yet<br />a member of this deployment.
-        </div>
-        {email && <div className="auth-detail">{email}</div>}
-        <div className="auth-line">
-          ask an admin to add you, then reload.
-        </div>
-        <div className="auth-actions">
-          <button
-            type="button"
-            className="members-act act-quiet"
-            onClick={() => void logout()}
-          >
-            sign out
-          </button>
-        </div>
-      </div>
-    </div>
+          <p className="text-base font-medium">
+            You're signed in — but not yet a member of this deployment.
+          </p>
+          {email && <p className="font-mono text-sm text-muted-foreground">{email}</p>}
+          <p className="text-sm text-muted-foreground">Ask an admin to add you, then reload.</p>
+          <Button variant="ghost" onClick={() => void logout()}>
+            Sign out
+          </Button>
+        </CardContent>
+      </Card>
+    </AuthStage>
   );
 }
