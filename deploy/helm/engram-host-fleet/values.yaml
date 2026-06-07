@@ -1,0 +1,94 @@
+# Default (cloud-agnostic) values for the engram host fleet.
+# ADR 0044. Cloud-specific overlays (Workload Identity, secret
+# providers) live in values-*.yaml.example, mirroring the engram chart.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/cortexapps/engrams/host-agent
+  tag: ""            # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}    # e.g. GKE Workload Identity / EKS IRSA binding
+
+# Only schedule the host-agent + node-prep onto KVM / nested-virt
+# nodes. Label them: `kubectl label node <n> engram.io/kvm=true`.
+# (On managed K8s the node pool must have nested virt enabled — Intel
+# only today, see ADR 0044.)
+nodeSelector:
+  engram.io/kvm: "true"
+tolerations: []
+
+coordinator:
+  # ws:// or http:// endpoint the host-agent dials. Empty => the
+  # host-agent runs but does not register (useful for a bring-up
+  # smoke test). In-cluster: ws://<coord-release>-coordinator:8080
+  endpoint: ""
+  # Bearer token (ADR 0031). Sourced from an existing Secret to avoid
+  # baking it into values; key `coordinator-token`.
+  tokenSecretName: ""
+  tokenSecretKey: coordinator-token
+
+blob:
+  backend: gcs        # local | gcs | s3 (s3 lands in ADR 0044 K5)
+  gcsBucket: ""
+  s3Bucket: ""
+  s3EndpointUrl: ""   # MinIO / R2 / Spaces
+  s3Region: ""
+
+firecracker:
+  # The host-agent image is a thin binary; firecracker + the guest
+  # kernel come from the NODE. Until the asset-staging image lands
+  # (ADR 0044 K1.x), point these at where node-prep / the node image
+  # places them. Defaults match the GCE/Packer layout.
+  binaryHostPath: /usr/local/bin/firecracker
+  kernelHostPath: /usr/local/lib/engram/vmlinux
+  # uffd handler ships in the host-agent image at this path.
+  restoreMode: ""     # "" (binary default) | file | uffd
+
+storage:
+  # Local NVMe for the chunk cache + per-sandbox work dir.
+  workDirHostPath: /var/lib/engram
+  chunkCacheBudgetBytes: ""   # "" => host-agent default (200 GiB)
+
+nbd:
+  # Comma-separated /dev/nbdN the host-agent serves. Empty => file-mode
+  # (no NBD). node-prep loads the module with nbdsMax slots.
+  devices: "/dev/nbd0,/dev/nbd1,/dev/nbd2,/dev/nbd3"
+  nbdsMax: 64
+
+nodePrep:
+  enabled: true
+  image:
+    repository: busybox
+    tag: "1.36"
+    pullPolicy: IfNotPresent
+  # sysctls node-prep sets (idempotent). The host-agent runs root so
+  # unprivileged_userfaultfd isn't strictly required, but we set it so
+  # a future non-root handler works, plus ip_forward for guest egress.
+  sysctls:
+    vm.unprivileged_userfaultfd: "1"
+    net.ipv4.ip_forward: "1"
+
+hostAgent:
+  grpcPort: 9101
+  metricsPort: 9100
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "16"
+      memory: 32Gi
+  extraEnv: []        # [{name, value}] escape hatch for any ENGRAM_* knob
+
+# Strategy note: forkd uses `Recreate`-equivalent because the daemon
+# holds VM state. We default the DaemonSet to OnDelete so the K3
+# operator (ADR 0044) drives drain-gated, node-by-node rollouts rather
+# than K8s rolling pods out from under live microVMs.
+updateStrategy: OnDelete
