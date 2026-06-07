@@ -247,20 +247,45 @@ impl PooledBackend {
         // prefetch / state materialize / NBD attach) alongside the
         // `fc.restore_in_jail` legs, so one trace shows where the whole
         // `host.restore_base_for_session` window goes. Pure observability.
-        let prefetch_start = std::time::Instant::now();
-        let prefetched_chunks = tracing::Instrument::instrument(
-            self.prefetch_memory_chunks(&metadata),
-            tracing::info_span!("restore.prefetch_memory"),
-        )
-        .await;
-        if let Err(e) = prefetched_chunks.as_ref() {
-            tracing::warn!(
-                error = %e,
-                snapshot_id = %metadata.id,
-                "chunked restore memory chunk prefetch failed; falling back to serial fault path",
-            );
+        // ADR 0043 P1: warm the memory-chunk cache before the handler faults
+        // from it. On a File base-create (`fresh`) the serial
+        // `materialize_memory_if_missing` below reads the warmed cache, so the
+        // prefetch stays on the critical path (awaited). On a UFFD resume
+        // (`!fresh`) the chunks are consumed only by the handler's lazy faults
+        // AFTER `inner.restore`, so warming need not block resume: spawn it and
+        // let restore proceed immediately. The handler faults from the same
+        // cancel-safe single-flight cache, so a fault that races ahead of the
+        // background prefetch just fetches its one chunk itself. (Pairs with
+        // the handler-side background prefault — ADR 0043 P1 / ADR 0039 #19.)
+        if fresh {
+            let prefetched_chunks = tracing::Instrument::instrument(
+                self.prefetch_memory_chunks(&metadata),
+                tracing::info_span!("restore.prefetch_memory"),
+            )
+            .await;
+            if let Err(e) = prefetched_chunks.as_ref() {
+                tracing::warn!(
+                    error = %e,
+                    snapshot_id = %metadata.id,
+                    "chunked restore memory chunk prefetch failed; falling back to serial fault path",
+                );
+            }
+        } else if let (Some(cs), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone())
+        {
+            let md = metadata.clone();
+            tokio::spawn(tracing::Instrument::instrument(
+                async move {
+                    if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &cache, &md).await {
+                        tracing::warn!(
+                            error = %e,
+                            snapshot_id = %md.id,
+                            "background memory prefetch failed; UFFD faults serve on-demand",
+                        );
+                    }
+                },
+                tracing::info_span!("restore.prefetch_memory_bg"),
+            ));
         }
-        let _ = (prefetched_chunks, prefetch_start);
 
         // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
         // The backend owns its staging dir layout (Phase 6); we ask
@@ -1119,13 +1144,27 @@ impl PooledBackend {
         &self,
         metadata: &SnapshotMetadata,
     ) -> Result<usize, SandboxError> {
+        match (self.chunk_store.as_ref(), self.chunk_cache.as_ref()) {
+            (Some(cs), Some(cache)) => {
+                Self::prefetch_memory_chunks_inner(cs, cache, metadata).await
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Owner-agnostic body of [`Self::prefetch_memory_chunks`]. Takes the
+    /// already-resolved store + cache (by ref) so it can run either inline
+    /// (`await`, on the File base-create path where the serial
+    /// `materialize_memory_if_missing` reads the warmed cache) or inside a
+    /// spawned background task (ADR 0043 P1, the UFFD-resume path — the warmed
+    /// chunks are consumed only by the handler's later lazy faults, so warming
+    /// need not block resume).
+    async fn prefetch_memory_chunks_inner(
+        chunk_store: &ChunkStore,
+        cache: &ChunkCache,
+        metadata: &SnapshotMetadata,
+    ) -> Result<usize, SandboxError> {
         let Some(mref) = metadata.memory_manifest else {
-            return Ok(0);
-        };
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
-            return Ok(0);
-        };
-        let Some(cache) = self.chunk_cache.as_ref() else {
             return Ok(0);
         };
         // ADR 0014 M1.14: if the snapshot has a published working-
@@ -1136,7 +1175,7 @@ impl PooledBackend {
         // prefetch (M1.13 behavior) when the trace isn't present,
         // unreachable, or empty.
         let hashes_to_prefetch: Vec<_> = match metadata.working_set_blob_key.as_deref() {
-            Some(ws_key) => match self.fetch_working_set_chunks(chunk_store, ws_key).await {
+            Some(ws_key) => match Self::fetch_working_set_chunks(chunk_store, ws_key).await {
                 Ok(chunks) if !chunks.is_empty() => {
                     tracing::debug!(
                         ws_key,
@@ -1202,7 +1241,6 @@ impl PooledBackend {
     /// the blob is missing (older bakes that pre-date M1.14) so
     /// the caller falls back to full-manifest prefetch.
     async fn fetch_working_set_chunks(
-        &self,
         chunk_store: &ChunkStore,
         ws_key: &str,
     ) -> Result<Vec<engram_chunk_store::manifest::ChunkHash>, SandboxError> {
