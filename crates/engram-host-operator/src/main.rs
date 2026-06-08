@@ -10,6 +10,7 @@ mod coord;
 mod crd;
 mod error;
 mod reconcile;
+mod scaler;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,8 +46,27 @@ async fn main() -> Result<(), OperatorError> {
 
     let client = Client::try_default().await?;
     let fleets: Api<HostFleet> = Api::all(client.clone());
+
+    // ADR 0044 K4: select the node-pool scaler. Default noop (logs the desired
+    // size); `gke` actuates a GKE pool via the Container API. Off-GKE detection
+    // fails fast → fall back to noop so a misconfig never wedges the operator.
+    let node_scaler: Arc<dyn engram_core::traits::cloud::NodePoolScaler> =
+        match std::env::var("ENGRAM_NODE_POOL_SCALER").as_deref() {
+            Ok("gke") => match engram_cloud_gcp::gke::GkeNodePoolScaler::detect().await {
+                Ok(s) => {
+                    tracing::info!("node-pool scaler: gke");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "gke scaler init failed (not on GKE?); using noop");
+                    Arc::new(scaler::NoopScaler)
+                }
+            },
+            _ => Arc::new(scaler::NoopScaler),
+        };
     let ctx = Arc::new(Ctx {
         client: client.clone(),
+        scaler: node_scaler,
     });
 
     tracing::info!("engram-host-operator starting; watching HostFleet resources");

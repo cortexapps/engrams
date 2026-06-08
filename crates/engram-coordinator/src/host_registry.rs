@@ -128,6 +128,22 @@ pub enum PickError {
     NoCapacity,
 }
 
+/// Fleet-wide autoscaling signals (ADR 0044 K4). Read off the in-memory
+/// registry on a tick; emitted as the `engram_fleet_*` gauges the node-pool
+/// autoscaler scales on.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FleetMetrics {
+    /// Hosts with a live heartbeat in the registry.
+    pub ready_hosts: u32,
+    /// Non-draining hosts the scheduler can place on.
+    pub schedulable_hosts: u32,
+    /// Σ (total_mib − used_mib) over schedulable hosts.
+    pub free_mib: u64,
+    /// Σ total_mib over schedulable hosts — lets a consumer derive the
+    /// average per-host capacity (how much one node adds).
+    pub total_mib: u64,
+}
+
 impl From<PickError> for SandboxError {
     fn from(e: PickError) -> Self {
         match e {
@@ -430,6 +446,23 @@ impl HostRegistry {
         &self,
         ctx: &ScheduleContext<'_>,
     ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
+        // ADR 0044 K4: emit the demand-pressure signal at the one place every
+        // scheduling decision funnels through.
+        let result = self.pick_for_session_inner(ctx);
+        let outcome = match &result {
+            Ok(_) => "placed",
+            Err(PickError::NoCapacity) => "no_capacity",
+            Err(PickError::ImageNotReady(_)) => "image_not_ready",
+        };
+        ::metrics::counter!(crate::metrics::SESSION_PLACEMENT_TOTAL, "outcome" => outcome)
+            .increment(1);
+        result
+    }
+
+    fn pick_for_session_inner(
+        &self,
+        ctx: &ScheduleContext<'_>,
+    ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
         // Closure encoding "this host is a viable candidate".
         // Non-draining + (no digest required OR ready for the digest)
         // + not the excluded host (ADR 0018 Phase C evac guard).
@@ -500,6 +533,23 @@ impl HostRegistry {
             .find(|e| host_is_ready(*e.key(), &e.value().state.read()))
             .map(|e| (*e.key(), e.value().backend.clone()))
             .ok_or(PickError::NoCapacity)
+    }
+
+    /// Fleet-wide autoscaling signals (ADR 0044 K4), sampled on a tick and
+    /// emitted as gauges. `schedulable_hosts` excludes draining hosts;
+    /// `free_mib` is the spare guest-RAM reservation across them.
+    pub fn fleet_metrics(&self) -> FleetMetrics {
+        let mut m = FleetMetrics::default();
+        for entry in self.hosts.iter() {
+            m.ready_hosts += 1;
+            let st = entry.value().state.read();
+            if !st.draining {
+                m.schedulable_hosts += 1;
+                m.free_mib += st.capacity.total_mib.saturating_sub(st.capacity.used_mib);
+                m.total_mib += st.capacity.total_mib;
+            }
+        }
+        m
     }
 
     /// Pick a host for `ctx`, then `restore` from `metadata` on that

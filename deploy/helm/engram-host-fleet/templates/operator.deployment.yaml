@@ -43,6 +43,10 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.operator.logLevel | quote }}
+            # ADR 0044 K4: node-pool scaler — `noop` (logs only) or `gke`
+            # (resizes a GKE pool via the Container API + Workload Identity).
+            - name: ENGRAM_NODE_POOL_SCALER
+              value: {{ .Values.operator.scaler | quote }}
             {{- if .Values.coordinator.tokenSecretName }}
             # ADR 0031: the operator authenticates to the coordinator admin
             # API with a service bearer token.

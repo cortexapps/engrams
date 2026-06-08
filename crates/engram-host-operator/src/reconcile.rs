@@ -18,9 +18,12 @@ use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Client, ResourceExt};
 
+use engram_core::traits::cloud::NodePoolScaler;
+
 use crate::coord::CoordClient;
 use crate::crd::{HostFleet, HostFleetSpec};
 use crate::error::OperatorError;
+use crate::scaler::{desired_hosts, AutoscalePolicy};
 
 const HOST_AGENT_CONTAINER: &str = "host-agent";
 const STAGE_ASSETS_CONTAINER: &str = "stage-node-assets";
@@ -28,6 +31,8 @@ const STAGE_ASSETS_CONTAINER: &str = "stage-node-assets";
 /// Context shared across reconciles.
 pub struct Ctx {
     pub client: Client,
+    /// ADR 0044 K4: actuates node-pool size changes. `NoopScaler` by default.
+    pub scaler: Arc<dyn NodePoolScaler>,
 }
 
 /// A host-agent pod distilled to the fields the planner needs.
@@ -119,6 +124,12 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     );
     tracing::info!(fleet = %hf.name_any(), ?decision, "reconcile");
 
+    // ADR 0044 K4: autoscale the node pool from coordinator demand. Best-
+    // effort + independent of the roll — a coord hiccup shouldn't block rolls.
+    if let Err(e) = maybe_autoscale(spec, ctx.scaler.as_ref()).await {
+        tracing::warn!(error = %e, "autoscale step failed; continuing");
+    }
+
     // 4. Act.
     match decision {
         RollDecision::UpToDate { .. } => Ok(Action::requeue(Duration::from_secs(60))),
@@ -138,6 +149,34 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
             Ok(Action::requeue(Duration::from_secs(5)))
         }
     }
+}
+
+/// ADR 0044 K4: read coordinator fleet demand and drive the node-pool scaler
+/// toward the headroom target. No-op unless the CR sets `autoscaling`.
+async fn maybe_autoscale(
+    spec: &HostFleetSpec,
+    scaler: &dyn NodePoolScaler,
+) -> Result<(), OperatorError> {
+    let Some(a) = &spec.autoscaling else {
+        return Ok(());
+    };
+    let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
+    let demand = coord.fleet_demand().await?;
+    let policy = AutoscalePolicy {
+        min_hosts: a.min_hosts,
+        max_hosts: a.max_hosts,
+        target_free_mib: a.target_free_mib,
+    };
+    let desired = desired_hosts(demand, policy);
+    tracing::info!(
+        node_pool = %a.node_pool,
+        current = demand.schedulable_hosts,
+        free_mib = demand.free_mib,
+        desired,
+        "autoscale: computed desired host count"
+    );
+    scaler.set_size(&a.node_pool, desired).await?;
+    Ok(())
 }
 
 /// Cordon → drain → gate → delete the pod → uncordon, for one node.
