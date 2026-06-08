@@ -16,8 +16,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Trixie matches the builder's glibc — bookworm (2.36) refuses
 # binaries linked against trixie's glibc 2.39+.
 FROM debian:trixie-slim
+# Runtime deps the host-agent shells out to (on the GCE/Packer hosts
+# these come from the node image; the K8s host-agent image must carry
+# them itself — ADR 0044 K1):
+#   - e2fsprogs: mke2fs, to materialize the per-sandbox ext4 rootfs
+#   - iproute2:  ip, for the tap device + guest netns
+#   - iptables:  egress NAT / firewall rules for guest networking
+# (ca-certificates: TLS to the blob backend — GCS/S3.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates e2fsprogs iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /tmp/engram-host-agent /usr/local/bin/engram-host-agent
 ENTRYPOINT ["/usr/local/bin/engram-host-agent"]
