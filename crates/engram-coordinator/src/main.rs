@@ -525,6 +525,26 @@ async fn main() -> Result<(), CoordinatorError> {
     // starts empty and hosts dial in via /api/hosts/connect.
     let host_registry = Arc::new(HostRegistry::new(meta_arc.clone()));
 
+    // ADR 0044 K4: emit the fleet-demand gauges on a tick (the node-pool
+    // autoscaler scales on these). Also wires HOSTS_READY, defined in
+    // metrics.rs but previously never emitted.
+    {
+        let reg = host_registry.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                let m = reg.fleet_metrics();
+                ::metrics::gauge!(engram_coordinator::metrics::HOSTS_READY)
+                    .set(m.ready_hosts as f64);
+                ::metrics::gauge!(engram_coordinator::metrics::FLEET_SCHEDULABLE_HOSTS)
+                    .set(m.schedulable_hosts as f64);
+                ::metrics::gauge!(engram_coordinator::metrics::FLEET_FREE_MIB)
+                    .set(m.free_mib as f64);
+            }
+        });
+    }
+
     // ADR 0007 Phase 5: stable HostId for `--mode=all`. Hoisted
     // up here (was computed below alongside the host_registry
     // register) so the FC backend can stamp it on its config

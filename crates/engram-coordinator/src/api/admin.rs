@@ -455,6 +455,36 @@ pub async fn evacuate_session(
 }
 
 // ---------------------------------------------------------------------
+// ADR 0044 K4 — fleet-demand signal for the node-pool autoscaler
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct FleetDemandResponse {
+    /// Hosts with a live heartbeat.
+    pub ready_hosts: u32,
+    /// Non-draining hosts the scheduler can place on.
+    pub schedulable_hosts: u32,
+    /// Σ (total_mib − used_mib) over schedulable hosts — the headroom.
+    pub free_mib: u64,
+    /// Σ total_mib over schedulable hosts — lets the caller derive the
+    /// average per-host capacity (how much one node adds).
+    pub total_mib: u64,
+}
+
+/// `GET /api/admin/fleet/demand` — the K4 node-pool autoscaler's input.
+/// Schedulable host count + free/total guest-RAM reservation, read from the
+/// in-memory registry. The coordinator is single-replica (ADR 0044), so that
+/// registry is the whole fleet.
+pub async fn fleet_demand(State(state): State<SharedState>) -> Json<FleetDemandResponse> {
+    let m = state.host_registry.fleet_metrics();
+    Json(FleetDemandResponse {
+        ready_hosts: m.ready_hosts,
+        schedulable_hosts: m.schedulable_hosts,
+        free_mib: m.free_mib,
+        total_mib: m.total_mib,
+    })
+}
+
 // ADR 0018 commit 12e — host cordon / uncordon / drain
 // ---------------------------------------------------------------------
 

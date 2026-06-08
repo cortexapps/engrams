@@ -149,3 +149,20 @@ pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhaus
 /// Healthy steady-state drains to 0 between ticks; a climbing value
 /// means evictions are arriving faster than pipelines complete.
 pub const EVICTION_SCANNER_QUEUE: &str = "engram_eviction_scanner_queue";
+
+/// Counter (ADR 0044 K4). Outcome of every `pick_for_session` scheduling
+/// decision — the fleet's demand-pressure signal for autoscaling. Labels:
+/// `outcome` = `placed` / `no_capacity` / `image_not_ready`. A rising
+/// `no_capacity` rate means the fleet is out of room; the autoscaler scales
+/// the node pool up. (Scaling only on this is already late — pair it with
+/// `engram_fleet_free_mib` to scale *ahead* of hard rejections.)
+pub const SESSION_PLACEMENT_TOTAL: &str = "engram_session_placement_total";
+
+/// Gauge (ADR 0044 K4). Aggregate free guest-RAM *reservation* across
+/// non-draining hosts, MiB (`Σ total_mib − used_mib`). The headroom signal:
+/// scale the node pool up before this approaches the size of one session.
+pub const FLEET_FREE_MIB: &str = "engram_fleet_free_mib";
+
+/// Gauge (ADR 0044 K4). Non-draining hosts the scheduler can place on — the
+/// schedulable fleet size the autoscaler drives toward demand.
+pub const FLEET_SCHEDULABLE_HOSTS: &str = "engram_fleet_schedulable_hosts";
