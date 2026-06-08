@@ -119,6 +119,10 @@ operator:
     tag: main
     pullPolicy: IfNotPresent
   logLevel: info
+  # ADR 0044 K4: node-pool scaler. `noop` logs the desired size only; `gke`
+  # resizes a GKE pool via the Container API + Workload Identity (the operator
+  # GSA needs container.clusters.update). New clouds add their own value.
+  scaler: noop          # noop | gke
   # Render a HostFleet CR for this release's host-agent DaemonSet (the common
   # case). Set false to manage the CR out-of-band.
   createHostFleet: true

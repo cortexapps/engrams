@@ -23,6 +23,8 @@ pub enum OperatorError {
     DrainTimeout { host_id: String, remaining: u32 },
     /// The CR or a managed object was missing an expected field.
     Invalid(String),
+    /// A cloud node-pool actuator (e.g. the GKE scaler) call failed.
+    Cloud(engram_core::BackendError),
 }
 
 impl fmt::Display for OperatorError {
@@ -38,6 +40,7 @@ impl fmt::Display for OperatorError {
                 "drain of host {host_id} timed out with {remaining} sandbox(es) still running"
             ),
             Self::Invalid(msg) => write!(f, "invalid host-fleet state: {msg}"),
+            Self::Cloud(e) => write!(f, "cloud scaler error: {e}"),
         }
     }
 }
@@ -47,6 +50,7 @@ impl std::error::Error for OperatorError {
         match self {
             Self::Kube(e) => Some(e),
             Self::Http(e) => Some(e),
+            Self::Cloud(e) => Some(e),
             _ => None,
         }
     }
@@ -61,5 +65,11 @@ impl From<kube::Error> for OperatorError {
 impl From<reqwest::Error> for OperatorError {
     fn from(e: reqwest::Error) -> Self {
         Self::Http(e)
+    }
+}
+
+impl From<engram_core::BackendError> for OperatorError {
+    fn from(e: engram_core::BackendError) -> Self {
+        Self::Cloud(e)
     }
 }

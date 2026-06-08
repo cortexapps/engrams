@@ -1,30 +1,24 @@
-//! ADR 0044 K4: node-pool autoscaling — the cloud-agnostic core.
+//! ADR 0044 K4: node-pool autoscaling — the operator's *policy* half.
 //!
 //! The operator reads the coordinator's fleet demand and computes a desired
-//! host node-pool size; a [`NodePoolScaler`] actuates it. The trait mirrors
-//! engram's existing cloud split (`engram-cloud-gcp` / `-static` / `-mock`):
-//! the policy is OSS + cloud-agnostic, the actuator is per-cloud. The GKE
-//! actuator is a follow-up; the default [`NoopScaler`] only *logs* the
-//! decision so you can observe what the autoscaler would do before wiring a
-//! real one.
+//! host node-pool size ([`desired_hosts`]); a [`NodePoolScaler`]
+//! (`engram_core::traits::cloud`) actuates it. The actuator is per-cloud and
+//! lives in its own crate (`engram_cloud_gcp::gke` does GKE); [`NoopScaler`]
+//! here is the default that only *logs* the decision, so you can observe what
+//! the autoscaler would do without an actuator wired.
 
+use engram_core::traits::cloud::NodePoolScaler;
+use engram_core::BackendError;
 use serde::Deserialize;
 
-use crate::error::OperatorError;
-
-/// Resizes the host node pool. Idempotent — called every reconcile with the
-/// operator's current target.
-#[async_trait::async_trait]
-pub trait NodePoolScaler: Send + Sync {
-    async fn set_size(&self, node_pool: &str, desired: u32) -> Result<(), OperatorError>;
-}
-
-/// Logs the decision without touching any cloud. OSS default + dev/test.
+/// Logs the decision without touching any cloud — the operator's default +
+/// dev/test fallback. Real actuators (e.g. `engram_cloud_gcp::gke`) implement
+/// [`NodePoolScaler`] in their own crates and are selected in `main`.
 pub struct NoopScaler;
 
 #[async_trait::async_trait]
 impl NodePoolScaler for NoopScaler {
-    async fn set_size(&self, node_pool: &str, desired: u32) -> Result<(), OperatorError> {
+    async fn set_size(&self, node_pool: &str, desired: u32) -> Result<(), BackendError> {
         tracing::info!(
             node_pool,
             desired,

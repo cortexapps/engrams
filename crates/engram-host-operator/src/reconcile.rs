@@ -18,10 +18,12 @@ use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Client, ResourceExt};
 
+use engram_core::traits::cloud::NodePoolScaler;
+
 use crate::coord::CoordClient;
 use crate::crd::{HostFleet, HostFleetSpec};
 use crate::error::OperatorError;
-use crate::scaler::{desired_hosts, AutoscalePolicy, NodePoolScaler};
+use crate::scaler::{desired_hosts, AutoscalePolicy};
 
 const HOST_AGENT_CONTAINER: &str = "host-agent";
 const STAGE_ASSETS_CONTAINER: &str = "stage-node-assets";
@@ -173,7 +175,8 @@ async fn maybe_autoscale(
         desired,
         "autoscale: computed desired host count"
     );
-    scaler.set_size(&a.node_pool, desired).await
+    scaler.set_size(&a.node_pool, desired).await?;
+    Ok(())
 }
 
 /// Cordon → drain → gate → delete the pod → uncordon, for one node.
