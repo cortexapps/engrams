@@ -141,7 +141,8 @@ impl HostAgent {
 
     /// ADR 0009 §6: register the concrete FC backend for the
     /// startup reattach pass. Optional — only meaningful when
-    /// `--sandbox-backend=firecracker` AND `ENGRAM_LIVE_ATTACH=1`.
+    /// `--sandbox-backend=firecracker` (reattach is unconditional
+    /// for the FC backend).
     /// When unset, the host-agent starts clean-slate (reconcile
     /// then flips orphaned sessions per §3).
     pub fn with_fc_reattach(
@@ -639,7 +640,7 @@ impl HostAgent {
             };
 
             // ADR 0035: bundle store + supervisor. The stamp is read once
-            // (hosts are immutable; only a MIG roll changes it). The
+            // (hosts are immutable; only a host-agent pod restart changes it). The
             // supervisor consumes the ack's `live_bundles` pin set:
             // prefetch missing pinned generations, sweep unpinned ones.
             let bundle_dir = bundles::bundle_dir_from_env();

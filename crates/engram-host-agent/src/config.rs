@@ -27,14 +27,13 @@ pub struct HostAgentConfig {
     pub harness_listen_addr: std::net::SocketAddr,
     /// ADR 0013: bind address for the gRPC `HostService` server. The
     /// coord dials this from inside the VPC; usually `0.0.0.0:9101`
-    /// on a GCE host so any coord pod can reach it. `None` skips the
-    /// gRPC server entirely (mode=all, local dev with no coord).
+    /// on the host-agent pod so any coord pod can reach it. `None`
+    /// skips the gRPC server entirely (mode=all, local dev with no coord).
     pub grpc_listen_addr: Option<std::net::SocketAddr>,
     /// ADR 0013: externally-routable address the coord uses to dial
     /// the gRPC server. Sent as `host_addr` in
-    /// `POST /api/hosts/register`. Typically `http://<self-ip>:9101`,
-    /// where the self-IP is discovered from GCE metadata at startup.
-    /// `None` skips registration (mode=all).
+    /// `POST /api/hosts/register`. Typically `http://<pod-ip>:9101`,
+    /// injected by the chart on K8s. `None` skips registration (mode=all).
     pub grpc_advertise_addr: Option<String>,
 }
 
