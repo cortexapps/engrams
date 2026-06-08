@@ -108,3 +108,30 @@ hostAgent:
 # operator (ADR 0044) drives drain-gated, node-by-node rollouts rather
 # than K8s rolling pods out from under live microVMs.
 updateStrategy: OnDelete
+
+operator:
+  # ADR 0044 K3: the drain-gated rollout operator. OFF by default until the
+  # operator image is published + a coordinatorUrl is set; with it off, the
+  # OnDelete DaemonSet must be rolled by hand (drain each host first).
+  enabled: false
+  image:
+    repository: ghcr.io/cortexapps/engrams/host-operator
+    tag: main
+    pullPolicy: IfNotPresent
+  logLevel: info
+  # Render a HostFleet CR for this release's host-agent DaemonSet (the common
+  # case). Set false to manage the CR out-of-band.
+  createHostFleet: true
+  # Coordinator base URL the operator drives admin endpoints on (REQUIRED when
+  # enabled). In-cluster: http://<coord-release>-coordinator:8080
+  coordinatorUrl: ""
+  # Never drain a node if it would drop the fleet below this many Ready hosts.
+  capacityFloor: 1
+  # Abort a roll if a drained host still has running sandboxes after this long.
+  drainTimeoutSeconds: 600
+  resources:
+    requests: {cpu: "10m", memory: 64Mi}
+    limits: {cpu: "250m", memory: 128Mi}
+  # The operator only needs the K8s API + coordinator; keep it off the tainted
+  # kvm nodes (default: schedule anywhere untainted).
+  nodeSelector: {}
