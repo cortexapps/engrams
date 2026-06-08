@@ -147,18 +147,32 @@ pub async fn reattach_pass(
                 });
             }
             Err(path1_err) => {
-                // The original FC is truly gone (process exited, identity
-                // mismatch, or a dead API). ADR 0044 K2 has no local
-                // restore fallback — drop the manifest and let
-                // orphan-reap + reconcile transition the owning session,
-                // which warm-recovers elsewhere from its last periodic
-                // checkpoint.
+                // Reattach failed: the FC exited, its identity didn't match, a
+                // dead API socket, or an unrecoverable network state. ADR 0044
+                // K2 has no local restore fallback — drop the manifest and let
+                // reconcile transition the owning session, which warm-recovers
+                // elsewhere from its last periodic checkpoint.
                 let reason = format!("{path1_err}");
                 tracing::info!(
                     sandbox_id = %sandbox_id_str,
                     error = %reason,
-                    "reattach pass: FC process gone; orphan-reaping (session reconciles)"
+                    "reattach pass: FC unreattachable; orphan-reaping (session reconciles)"
                 );
+                // ADR 0044 K2: don't leak a still-running microVM. The FC may
+                // have died (then the pid is harmless), but it may also be
+                // ALIVE-but-unreattachable — leaving it running orphans a
+                // microVM that no host-agent owns, burning the node's RAM. Kill
+                // the FC + its uffd-handler IFF they're still the recorded
+                // processes (start-time identity match); a recycled pid is left
+                // untouched.
+                reap_orphan_if_alive(
+                    manifest.firecracker.process.pid,
+                    manifest.firecracker.process.start_time_jiffies,
+                    "firecracker",
+                );
+                if let Some(uffd) = manifest.uffd_handler.as_ref() {
+                    reap_orphan_if_alive(uffd.pid, uffd.start_time_jiffies, "uffd-handler");
+                }
                 engram_sandbox_firecracker::sandbox_manifest::delete_manifest(&manifest_path);
                 report.orphaned.push(ReattachOutcome::Orphaned {
                     sandbox_id: sandbox_id_str,
@@ -170,6 +184,35 @@ pub async fn reattach_pass(
     }
 
     Ok(report)
+}
+
+/// ADR 0044 K2: SIGKILL a manifest-recorded process IFF it's still the
+/// original — verified by `/proc` start-time identity, so a recycled pid is
+/// never signalled (the kernel reuses pids but not `(pid, start_time)` pairs).
+/// The orphan-reap uses this to stop a leaked, unreattachable microVM (FC +
+/// uffd-handler) from burning the node's RAM with no owner. On non-Linux
+/// `read_proc_start_time_jiffies` returns `None`, so this is a no-op.
+fn reap_orphan_if_alive(pid: u32, manifest_start_jiffies: u64, what: &str) {
+    let live = engram_sandbox_firecracker::sandbox_manifest::read_proc_start_time_jiffies(pid);
+    if live == Some(manifest_start_jiffies) {
+        // SAFETY: SIGKILL on a pid whose `/proc` start-time we just verified
+        // matches the manifest — provably the recorded process, not a recycled
+        // pid. `libc::kill` with a recorded pid is the established pattern in
+        // the FC backend's own teardown.
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        tracing::info!(
+            pid,
+            what,
+            rc,
+            "ADR 0044 K2: SIGKILL'd leaked orphan microVM process (identity-matched)"
+        );
+    } else {
+        tracing::debug!(
+            pid,
+            what,
+            "orphan-reap: process gone or recycled; not signalling"
+        );
+    }
 }
 
 /// Trait-level entry point that takes any `SandboxBackend` and
