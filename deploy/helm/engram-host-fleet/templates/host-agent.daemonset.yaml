@@ -18,6 +18,14 @@ spec:
       labels:
         {{- include "hostfleet.hostAgent.selectorLabels" . | nindent 8 }}
     spec:
+      # ADR 0044 K2 (VM-detach): the FC microVMs (and any uffd-handler)
+      # must SURVIVE a host-agent pod restart so the successor pod can
+      # pidfd-reattach them — a routine DaemonSet upgrade then drops zero
+      # sessions. hostPID puts those processes in the NODE's PID
+      # namespace, so deleting this pod doesn't tear down their PID
+      # namespace and kill them. The host-agent spawns FC without
+      # kill_on_drop and never checkpoints on SIGTERM; it just detaches.
+      hostPID: true
       serviceAccountName: {{ include "hostfleet.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -56,6 +64,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # ADR 0044 K2 (GAP 1): the host-agent seeds a STABLE HostId
+            # from the node name (persisted to the work_dir hostPath), so a
+            # DaemonSet pod restart keeps its identity and the coordinator's
+            # session->host binding survives while detach+reattach re-adopts
+            # the node's still-live microVMs.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: ENGRAM_GRPC_ADVERTISE_ADDR
               value: "http://$(POD_IP):{{ .Values.hostAgent.grpcPort }}"
             {{- if .Values.coordinator.tokenSecretName }}

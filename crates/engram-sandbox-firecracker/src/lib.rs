@@ -154,7 +154,9 @@ fn per_port_uds(base_vsock_uds: &Path, port: u32) -> PathBuf {
     }
 }
 
-fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
+/// Host-side UDS the harness adapter's port-1026 vsock dial lands on.
+/// `pub` so the reattach integration test can assert it gets re-bound.
+pub fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
     per_port_uds(base_vsock_uds, engram_harness_proto::HARNESS_VSOCK_PORT)
 }
 
@@ -319,6 +321,17 @@ pub struct FirecrackerConfig {
     /// `current.json` stamp live. Production hosts use the fleet
     /// canonical [`AuxRoDrive::SHARED_DIR`]; tests inject a tempdir.
     pub bundle_dir: PathBuf,
+    /// ADR 0044 K2: parent cgroup-v2 dir under which to place each VM's
+    /// FC + uffd-handler processes (a leaf `<parent>/<sandbox_id>/`),
+    /// moving them OUT of the host-agent's own (pod) cgroup. On K8s the
+    /// host-agent runs in the pod's container cgroup; tearing the pod
+    /// down `cgroup.kill`s that whole cgroup, which would SIGKILL the
+    /// microVMs even under `hostPID`. Escaping to a node-level cgroup
+    /// lets them survive a pod restart so the successor can reattach.
+    /// `None` (dev / the MIG / tests) keeps FC in the host-agent's cgroup
+    /// — correct where there's no pod scope to escape. The chart sets it
+    /// via `ENGRAM_FC_VM_CGROUP_PARENT` (e.g. `/sys/fs/cgroup/engram-vms`).
+    pub vm_cgroup_parent: Option<PathBuf>,
 }
 
 /// Resolve the FC CPU template from `ENGRAM_FC_CPU_TEMPLATE`.
@@ -513,6 +526,8 @@ impl FirecrackerConfig {
             // ADR 0035: fleet-canonical staging dir; tests override
             // with a tempdir.
             bundle_dir: PathBuf::from(engram_core::types::sandbox::AuxRoDrive::SHARED_DIR),
+            // ADR 0044 K2: off by default — only the K8s host-fleet sets it.
+            vm_cgroup_parent: None,
         }
     }
 }
@@ -538,6 +553,12 @@ struct LiveSandbox {
     /// and the supervisor have a stable handle.
     fc_pid: Option<u32>,
     uffd_handler: Option<Child>,
+    /// UFFD handler pid — the pid analogue of `fc_pid`. Populated for
+    /// Uffd-mode restores AND for pidfd-reattached Uffd sandboxes (where
+    /// `uffd_handler` is `None` because a previous host-agent generation
+    /// owned the `Child`). `destroy()` falls back to this to SIGKILL the
+    /// handler when we don't own its `Child` (ADR 0044 K2).
+    uffd_pid: Option<u32>,
     /// Per-VM /30 + iptables chain + TAP. Stashed so `destroy` can
     /// release the slot back to the allocator and yank exactly its
     /// own iptables rules. `None` if networking failed to provision
@@ -1023,6 +1044,8 @@ impl FirecrackerBackend {
         // `create()` calls don't double-allocate, and verify the
         // TAP still exists. If TAP is gone the kernel state was
         // wiped externally — reattach won't be usable.
+        //
+        // Host-root path (cold-created VMs): re-reserve the per-VM /30.
         let net_setup = if let Some(net_rec) = manifest.network.as_ref() {
             let vm_cidr = net::VmCidr::new(net_rec.vm_cidr_network);
             self.net_allocator
@@ -1037,10 +1060,64 @@ impl FirecrackerBackend {
             None
         };
 
-        // pidfd_open for the future supervisor + the eventual
-        // Phase 8 SIGTERM-checkpoint reattach. On non-Linux this
-        // returns Unsupported; we treat it as "no pidfd but the
-        // poll-based supervisor still works."
+        // ADR 0044 K2 — per-VM netns path (warm-restored VMs): the netns,
+        // veth pair, TAP, and SNAT rule all survive in the kernel across a
+        // host-agent restart. Verify the netns survived, re-reserve the
+        // SNAT `/30` from the host pool (existence-check FIRST so a missing
+        // netns doesn't leak a reservation), and rebuild the in-memory
+        // `NetnsSetup` so `destroy()` can later tear it down + `guest_ip()`
+        // resolves to the SNAT IP. Mutually exclusive with `net_setup`.
+        let netns_setup = if let Some(ns_rec) = manifest.netns.as_ref() {
+            let netns_path =
+                std::path::PathBuf::from(format!("/var/run/netns/{}", ns_rec.netns_name));
+            if !netns_path.exists() {
+                return Err(ReattachError::NetReserveFailed(format!(
+                    "netns {} gone (kernel state wiped); restored VM unreattachable",
+                    ns_rec.netns_name
+                )));
+            }
+            let snat_cidr = net::VmCidr::new(ns_rec.snat_cidr_network);
+            self.net_allocator
+                .lock()
+                .reserve(snat_cidr)
+                .map_err(|e| ReattachError::NetReserveFailed(format!("{e:?}")))?;
+            Some(net::NetnsSetup {
+                netns_name: ns_rec.netns_name.clone(),
+                veth_host: ns_rec.veth_host.clone(),
+                veth_ns: ns_rec.veth_ns.clone(),
+                tap_name: ns_rec.tap_name.clone(),
+                vm_cidr: net::VmCidr::new(ns_rec.vm_cidr_network),
+                snat_cidr,
+            })
+        } else {
+            None
+        };
+
+        // Re-verify the uffd handler (Uffd-mode restores) BEFORE adopting
+        // the sandbox, so we only record a still-live handler. A
+        // stale/recycled pid is dropped to `None` — otherwise `destroy()`
+        // could later SIGTERM an unrelated process that recycled the pid.
+        let uffd_pid = manifest.uffd_handler.as_ref().and_then(|uffd| {
+            let live_start = sandbox_manifest::read_proc_start_time_jiffies(uffd.pid);
+            let live_comm = sandbox_manifest::read_proc_comm(uffd.pid);
+            if live_start == Some(uffd.start_time_jiffies)
+                && live_comm.as_deref() == Some(uffd.comm.as_str())
+            {
+                Some(uffd.pid)
+            } else {
+                tracing::warn!(
+                    %id,
+                    uffd_pid = uffd.pid,
+                    "UFFD handler gone or recycled during reattach; FC may page-fault forever"
+                );
+                None
+            }
+        });
+
+        // pidfd_open confirms the kernel still has this exact process
+        // (race-free vs the pid-recycling the three-axis check guards
+        // against). On non-Linux this returns Unsupported; we treat it as
+        // "no pidfd but the poll-based supervisor still works."
         match pidfd::open_pidfd(fc.process.pid) {
             Ok(_fd) => {
                 // We could keep the fd in LiveSandbox for a
@@ -1071,11 +1148,11 @@ impl FirecrackerBackend {
             // field for future symmetry with create().
             vsock_cid: fc.vsock_cid,
             vsock_uds_path: fc.vsock_uds_base.clone(),
-            // Only cold-created sandboxes write an on-disk manifest, so
-            // a path-1 reattach only ever sees a cold lineage; the
-            // persisted `rootfs_canonical` is `rootfs/<id>.dev`. Carry
-            // it forward so a re-snapshot after restart still stamps
-            // the embedded path FC has open.
+            // Both cold-created and warm-restored sandboxes persist a
+            // manifest (ADR 0044 K2), so the recorded `rootfs_canonical`
+            // is whatever FC has open — `rootfs/<id>.dev` for cold, the
+            // ancestor's path for a restore. Carry it forward so a
+            // re-snapshot after restart still stamps the embedded path.
             rootfs_canonical: fc.rootfs_canonical.clone(),
         };
         // Reattach: agentd was already up when the previous host-
@@ -1089,36 +1166,56 @@ impl FirecrackerBackend {
                 state,
                 child: None,
                 fc_pid: Some(fc.process.pid),
+                // No owned `Child` for a reattached handler (a previous
+                // generation spawned it); destroy() kills it via `uffd_pid`.
                 uffd_handler: None,
+                uffd_pid,
                 net: net_setup,
-                // pidfd-reattach is for pre-M1.16 sandboxes that
-                // never used a per-VM netns; the field is always
-                // None on this path.
-                netns: None,
+                // ADR 0044 K2: warm-restored VMs reattach with their per-VM
+                // netns rehydrated above; cold/host-root VMs leave this None.
+                netns: netns_setup,
                 guest_ip: parking_lot::Mutex::new(None),
                 agent_ready: ready_rx,
             },
         );
 
-        // §4 supervisor on the reattached pid.
+        // §4 supervisor on the reattached FC pid, and the uffd handler pid
+        // when one was verified still-live above.
         spawn_process_supervisor(self.sandboxes.clone(), id, fc.process.pid, "firecracker");
-        if let Some(uffd) = manifest.uffd_handler.as_ref() {
-            // Verify UFFD handler too. Same three-axis check; if
-            // it's gone the FC is mid-restore-with-no-pager —
-            // unusable. Phase 8 may add fallback paths; for now
-            // we treat this as reattach failure that should clean
-            // up FC too.
-            let uffd_start = sandbox_manifest::read_proc_start_time_jiffies(uffd.pid);
-            let uffd_comm = sandbox_manifest::read_proc_comm(uffd.pid);
-            if uffd_start == Some(uffd.start_time_jiffies)
-                && uffd_comm.as_deref() == Some(uffd.comm.as_str())
-            {
-                spawn_process_supervisor(self.sandboxes.clone(), id, uffd.pid, "uffd-handler");
-            } else {
+        if let Some(pid) = uffd_pid {
+            spawn_process_supervisor(self.sandboxes.clone(), id, pid, "uffd-handler");
+        }
+
+        // ADR 0044 K2: re-bind the host-side vsock listeners. The in-guest
+        // harness/forge/upload adapters re-dial when their connection to the
+        // dead host-agent drops; the run is decoupled from the host link and
+        // resumes losslessly on reconnect (engram-harness-claude backpressures
+        // rather than dropping events) — but ONLY if a listener is here to
+        // reconnect to. Without this the reattached session wedges: the run
+        // pauses forever and the transcript stops flowing. create() + restore()
+        // bind these too. Best-effort + loud: a bind failure leaves the FC
+        // tracked (destroy can still reap it) rather than orphan-leaked.
+        for (label, res) in [
+            (
+                "harness",
+                self.spawn_harness_listener(id, &fc.vsock_uds_base).await,
+            ),
+            (
+                "forge",
+                self.spawn_forge_listener(id, &fc.vsock_uds_base).await,
+            ),
+            (
+                "upload",
+                self.spawn_upload_listener(id, &fc.vsock_uds_base).await,
+            ),
+        ] {
+            if let Err(e) = res {
                 tracing::warn!(
                     %id,
-                    uffd_pid = uffd.pid,
-                    "UFFD handler gone or recycled during reattach; FC may page-fault forever"
+                    listener = label,
+                    error = %e,
+                    "reattach: failed to re-bind vsock listener; the guest adapter cannot \
+                     reconnect and the session will wedge until destroyed"
                 );
             }
         }
@@ -1343,11 +1440,14 @@ impl FirecrackerBackend {
                 c
             }
         };
+        // ADR 0044 K2: NO `kill_on_drop` — a live FC must survive the
+        // host-agent process exiting (detach + reattach). The
+        // create-window backstop is the explicit `SpawnKillGuard` the
+        // caller arms; steady-state teardown is `destroy()` via pid.
         let mut child = cmd
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_clone))
             .stdin(Stdio::null())
-            .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
                 vm_err(format!(
@@ -1451,11 +1551,14 @@ impl FirecrackerBackend {
             cmd.env("TRACEPARENT", tp);
         }
 
+        // ADR 0044 K2: no `kill_on_drop` (see spawn_firecracker) — the
+        // uffd handler must also survive a host-agent restart so the
+        // successor can reattach it. Create-window cleanup is the
+        // caller's `SpawnKillGuard`; teardown is `destroy()` via pid.
         let mut child = cmd
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_clone))
             .stdin(Stdio::null())
-            .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
                 vm_err(format!(
@@ -1591,10 +1694,18 @@ impl FirecrackerBackend {
         // only puts warm restores in their own netns; cold path
         // stays simpler.
         let (socket, child) = self.spawn_firecracker(jail_dir, None).await?;
+        // ADR 0044 K2: arm the create-window SIGKILL backstop now that FC
+        // is spawned without kill_on_drop. Every `?` from here to the
+        // `sandboxes.insert` below reaps the half-spawned FC; we
+        // `disarm()` it immediately before committing the live sandbox.
+        let mut fc_guard = child
+            .id()
+            .map(SpawnKillGuard::new)
+            .ok_or_else(|| vm_err("firecracker child has no pid right after spawn"))?;
 
-        // Configure + start. Any failure here means the Child gets
-        // dropped (and SIGKILL'd via kill_on_drop) by the outer
-        // `create` cleanup, so we don't need explicit teardown.
+        // Configure + start. Any failure here drops the Child (no kill —
+        // kill_on_drop is gone) and fires `fc_guard`, which SIGKILLs FC;
+        // the Child drop then reaps the zombie via tokio's orphan queue.
         let api = FirecrackerClient::new(&socket);
         api.put_machine_config(&MachineConfig {
             vcpu_count: spec.cpu.vcpus.try_into().map_err(|_| {
@@ -1793,53 +1904,34 @@ impl FirecrackerBackend {
         // whose underlying VM is dead, defeating reconcile.
         let fc_pid = child.id();
 
-        // ADR 0009 §5: write the per-sandbox on-disk manifest before
-        // we hand control back to the caller. The Phase 6 reattach
-        // pass reads this on host-agent startup to decide whether to
-        // pidfd-attach (path 1) the still-live FC process. Manifest
-        // write failure is degrading-but-not-fatal: the supervisor
-        // (§4) still works, and a host-agent restart loses the
-        // ability to reattach this specific sandbox (treated as a
-        // missing-sandbox by reconcile, flips per the §3 policy).
+        // ADR 0009 §5 / ADR 0044 K2: write the per-sandbox on-disk
+        // manifest before handing control back, so the startup reattach
+        // pass can re-adopt this still-live FC after a host-agent
+        // restart. Cold create = host-root `network`, no netns, no uffd.
         if let Some(pid) = fc_pid {
-            let m = sandbox_manifest::SandboxManifest {
-                schema_version: sandbox_manifest::SCHEMA_VERSION,
+            persist_sandbox_manifest(
+                &self.work_dir,
                 sandbox_id,
-                backend: sandbox_manifest::BACKEND_FIRECRACKER.to_string(),
-                spec: state.spec.clone(),
-                firecracker: sandbox_manifest::FirecrackerProcessRecord {
-                    process: sandbox_manifest::ProcessRecord {
-                        pid,
-                        start_time_jiffies: sandbox_manifest::read_proc_start_time_jiffies(pid)
-                            .unwrap_or(0),
-                        comm: sandbox_manifest::read_proc_comm(pid).unwrap_or_default(),
-                    },
-                    api_socket: state.firecracker_socket.clone(),
-                    vsock_uds_base: state.vsock_uds_path.clone(),
-                    rootfs_canonical: state.rootfs_canonical.clone(),
-                    vsock_cid,
-                },
-                network: net_setup.map(|ns| sandbox_manifest::NetworkRecord {
+                &state,
+                pid,
+                net_setup.map(|ns| sandbox_manifest::NetworkRecord {
                     tap_name: ns.tap_name.clone(),
                     vm_cidr_network: ns.vm_cidr.network(),
                     host_ip: ns.vm_cidr.host(),
                     guest_ip: ns.vm_cidr.guest(),
                 }),
-                uffd_handler: None,
-                last_local_snapshot: None,
-            };
-            let manifest_path = sandbox_manifest::manifest_path(&self.work_dir, sandbox_id);
-            if let Err(e) = sandbox_manifest::write_manifest(&manifest_path, &m) {
-                tracing::warn!(
-                    %sandbox_id,
-                    error = %e,
-                    "sandbox manifest write failed; reattach across host-agent restart \
-                     will be impossible for this sandbox (it'll flip per reconcile §3 \
-                     instead). Sandbox itself is fine."
-                );
-            }
+                None,
+                None,
+            );
+            // ADR 0044 K2: move FC into the node cgroup so a host-agent pod
+            // restart doesn't `cgroup.kill` it. Cold create = FC only.
+            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &[pid]);
         }
 
+        // FC is configured, started, and recorded in its manifest: the
+        // sandbox is now committed. Defuse the create-window backstop so
+        // the VM is fully decoupled from this host-agent's lifecycle.
+        fc_guard.disarm();
         self.sandboxes.insert(
             sandbox_id,
             LiveSandbox {
@@ -1847,6 +1939,7 @@ impl FirecrackerBackend {
                 child: Some(child),
                 fc_pid,
                 uffd_handler: None,
+                uffd_pid: None,
                 net: net_setup.cloned(),
                 // Cold create path: VM is in host root netns.
                 netns: None,
@@ -2260,7 +2353,7 @@ impl FirecrackerBackend {
             )
             .await?;
             let netns_name = netns_setup.as_ref().map(|s| s.netns_name.clone());
-            let (socket, child) = match tracing::Instrument::instrument(
+            let (socket, mut child) = match tracing::Instrument::instrument(
                 self.spawn_firecracker(jail_dir, netns_name.as_deref()),
                 tracing::info_span!("fc.spawn_process"),
             )
@@ -2277,8 +2370,8 @@ impl FirecrackerBackend {
             // ADR 0014: `state.bin` embeds the canonical rootfs path keyed by
             // the SOURCE sandbox_id; recreate the source-id-keyed symlink
             // pointing at the host-local backing before `load_snapshot` opens
-            // it. On failure drop `child` (kill_on_drop SIGKILLs FC) + tear the
-            // netns down before propagating.
+            // it. On failure SIGKILL the just-spawned FC (kill_on_drop is gone
+            // — ADR 0044 K2) + tear the netns down before propagating.
             if let Err(e) = tracing::Instrument::instrument(
                 restore_canonical_symlinks(
                     &self.work_dir,
@@ -2290,7 +2383,7 @@ impl FirecrackerBackend {
             )
             .await
             {
-                drop(child);
+                let _ = child.kill().await;
                 if let Some(setup) = netns_setup.as_ref() {
                     net::teardown_netns(setup, &self.net_allocator).await;
                 }
@@ -2351,15 +2444,16 @@ impl FirecrackerBackend {
         let (netns_setup, socket, child, uffd_leg) = match (setup_res, uffd_res) {
             (Ok((netns, socket, child)), Ok(uffd)) => (netns, socket, child, uffd),
             (Err(e), Ok(uffd)) => {
-                // Setup failed (self-cleaned). Kill the handler leg 2 spawned.
-                if let Some((handler, _uds)) = uffd {
-                    drop(handler);
+                // Setup failed (self-cleaned). SIGKILL the handler leg 2
+                // spawned (kill_on_drop is gone — ADR 0044 K2).
+                if let Some((mut handler, _uds)) = uffd {
+                    let _ = handler.kill().await;
                 }
                 return Err(e);
             }
-            (Ok((netns, _socket, child)), Err(e)) => {
-                // UFFD leg failed. Tear down leg 1's netns + FC child.
-                drop(child);
+            (Ok((netns, _socket, mut child)), Err(e)) => {
+                // UFFD leg failed. Tear down leg 1's netns + SIGKILL the FC.
+                let _ = child.kill().await;
                 if let Some(setup) = netns.as_ref() {
                     net::teardown_netns(setup, &self.net_allocator).await;
                 }
@@ -2368,6 +2462,20 @@ impl FirecrackerBackend {
             // Both failed; each self-cleaned. Surface the setup error.
             (Err(e), Err(_)) => return Err(e),
         };
+
+        // ADR 0044 K2: arm create-window SIGKILL backstops for the restored
+        // FC and (Uffd mode) the page-fault handler — neither carries
+        // kill_on_drop, so every `?` from here through `load_snapshot` and
+        // the listener spawns reaps them. Disarmed just before the
+        // `sandboxes.insert` once the VM is resumed and committed.
+        let mut fc_guard = child
+            .id()
+            .map(SpawnKillGuard::new)
+            .ok_or_else(|| vm_err("restored firecracker child has no pid right after spawn"))?;
+        let mut uffd_guard = uffd_leg
+            .as_ref()
+            .and_then(|(handler, _uds)| handler.id())
+            .map(SpawnKillGuard::new);
 
         // Legacy/test path: no netns means we still might need the
         // old host-root TAP setup (when `manifest.net.is_some` but
@@ -2464,19 +2572,16 @@ impl FirecrackerBackend {
         let uffd_handler: Option<Child> = match load_result {
             Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
             Err(e) => {
-                // Snapshot load failed: tear down the network state, the leg-2
-                // UFFD handler, and the FC child before propagating, so a
-                // failed restore leaks nothing host-side.
+                // Snapshot load failed: tear down the network state before
+                // propagating. The FC child + uffd handler are SIGKILLed by
+                // their `SpawnKillGuard`s firing on this early return, then
+                // reaped when `child`/`uffd_leg` drop (ADR 0044 K2).
                 if let Some(setup) = net_setup.as_ref() {
                     net::teardown(setup, &self.net_allocator).await;
                 }
                 if let Some(setup) = netns_setup.as_ref() {
                     net::teardown_netns(setup, &self.net_allocator).await;
                 }
-                if let Some((handler, _uds)) = uffd_leg {
-                    drop(handler);
-                }
-                drop(child);
                 return Err(e);
             }
         };
@@ -2565,6 +2670,43 @@ impl FirecrackerBackend {
         // startup happens). Pre-set the watch to true so start_agent
         // proceeds immediately to SpawnHarness.
         let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+        // VM is resumed, listeners are up, and (below) its manifest is
+        // written: the restored sandbox is committed. Defuse the
+        // create-window backstops so the VM is fully decoupled from this
+        // host-agent's lifecycle (ADR 0044 K2 detach).
+        fc_guard.disarm();
+        if let Some(g) = uffd_guard.as_mut() {
+            g.disarm();
+        }
+        // ADR 0044 K2: persist the manifest so the successor host-agent
+        // can reattach this still-live restored VM — recording the per-VM
+        // netns (warm restores) and the uffd handler pid (Uffd mode).
+        if let Some(fc_pid_u) = fc_pid {
+            persist_sandbox_manifest(
+                &self.work_dir,
+                sandbox_id,
+                &state,
+                fc_pid_u,
+                None, // warm restores run in a per-VM netns, not host-root
+                netns_setup
+                    .as_ref()
+                    .map(|ns| sandbox_manifest::NetnsRecord {
+                        netns_name: ns.netns_name.clone(),
+                        veth_host: ns.veth_host.clone(),
+                        veth_ns: ns.veth_ns.clone(),
+                        tap_name: ns.tap_name.clone(),
+                        vm_cidr_network: ns.vm_cidr.network(),
+                        snat_cidr_network: ns.snat_cidr.network(),
+                    }),
+                uffd_pid,
+            );
+            // ADR 0044 K2: move FC AND the uffd handler (Uffd mode) into the
+            // node cgroup — both must survive a host-agent pod restart, or a
+            // killed handler leaves the restored guest page-faulting forever.
+            let mut pids = vec![fc_pid_u];
+            pids.extend(uffd_pid);
+            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &pids);
+        }
         self.sandboxes.insert(
             sandbox_id,
             LiveSandbox {
@@ -2572,6 +2714,7 @@ impl FirecrackerBackend {
                 child: Some(child),
                 fc_pid,
                 uffd_handler,
+                uffd_pid,
                 net: net_setup,
                 netns: netns_setup,
                 guest_ip: parking_lot::Mutex::new(None),
@@ -2769,6 +2912,194 @@ async fn restore_canonical_symlinks(
     let _ = (stub_harness_override, new_sandbox_id, work_dir);
 
     Ok(())
+}
+
+/// ADR 0044 K2: disarm-on-success SIGKILL backstop for the
+/// create/restore window. We removed `kill_on_drop(true)` from the FC
+/// and uffd-handler spawns so a live VM is decoupled from the
+/// host-agent's process lifecycle (a host-agent restart *detaches* its
+/// VMs — leaves them running — and the successor reattaches). But that
+/// also means a create/restore which errors out *before* the sandbox
+/// is fully live would otherwise leak a half-spawned process. This
+/// guard restores that cleanup precisely: it SIGKILLs `pid` on drop
+/// unless [`disarm`](Self::disarm)ed, so every `?` early-return between
+/// spawn and the final `sandboxes.insert` reaps the process, while a
+/// successful path disarms it and the VM keeps running. Pairs with the
+/// still-held `Child` (now `kill_on_drop=false`) dropping at scope exit,
+/// which reaps the just-killed zombie via tokio's orphan queue.
+struct SpawnKillGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl SpawnKillGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    /// Defuse the guard once the spawned process is committed to a
+    /// live sandbox. After this, dropping the guard is a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SpawnKillGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: `kill(pid, SIGKILL)` on a pid we just spawned is a
+        // basic process-control syscall with no UB; the result is
+        // best-effort cleanup, not relied on for any invariant.
+        let rc = unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno != libc::ESRCH {
+                tracing::warn!(
+                    pid = self.pid,
+                    errno,
+                    "SpawnKillGuard: SIGKILL of half-spawned process failed; may linger"
+                );
+            }
+        }
+    }
+}
+
+/// Build a `ProcessRecord` (pid + `/proc` starttime + comm) for a live
+/// pid. starttime/comm fall back to 0/"" if the pid is already gone — the
+/// reattach pass's three-axis identity check then fails closed and
+/// orphans the sandbox rather than re-adopting a recycled pid.
+fn process_record(pid: u32) -> sandbox_manifest::ProcessRecord {
+    sandbox_manifest::ProcessRecord {
+        pid,
+        start_time_jiffies: sandbox_manifest::read_proc_start_time_jiffies(pid).unwrap_or(0),
+        comm: sandbox_manifest::read_proc_comm(pid).unwrap_or_default(),
+    }
+}
+
+/// Write the per-sandbox `sandbox.json` so the startup reattach pass can
+/// re-adopt this still-live VM after a host-agent restart (ADR 0044 K2).
+/// Called at the end of BOTH `create()` and `restore()` — the only
+/// difference is host-root `network` vs per-VM `netns`, and whether a
+/// uffd handler is present. Best-effort: a write failure means this one
+/// sandbox can't be reattached (it orphan-reaps + the session reconciles
+/// instead), but the running VM itself is unaffected.
+fn persist_sandbox_manifest(
+    work_dir: &std::path::Path,
+    sandbox_id: SandboxId,
+    state: &SandboxState,
+    fc_pid: u32,
+    network: Option<sandbox_manifest::NetworkRecord>,
+    netns: Option<sandbox_manifest::NetnsRecord>,
+    uffd_pid: Option<u32>,
+) {
+    let m = sandbox_manifest::SandboxManifest {
+        schema_version: sandbox_manifest::SCHEMA_VERSION,
+        sandbox_id,
+        backend: sandbox_manifest::BACKEND_FIRECRACKER.to_string(),
+        spec: state.spec.clone(),
+        firecracker: sandbox_manifest::FirecrackerProcessRecord {
+            process: process_record(fc_pid),
+            api_socket: state.firecracker_socket.clone(),
+            vsock_uds_base: state.vsock_uds_path.clone(),
+            rootfs_canonical: state.rootfs_canonical.clone(),
+            vsock_cid: state.vsock_cid,
+        },
+        network,
+        netns,
+        uffd_handler: uffd_pid.map(process_record),
+    };
+    let path = sandbox_manifest::manifest_path(work_dir, sandbox_id);
+    if let Err(e) = sandbox_manifest::write_manifest(&path, &m) {
+        tracing::warn!(
+            %sandbox_id,
+            error = %e,
+            "sandbox manifest write failed; this sandbox can't be reattached across a \
+             host-agent restart (it'll orphan-reap + the session reconciles). VM is fine."
+        );
+    }
+}
+
+/// ADR 0044 K2: move the VM's processes (FC + any uffd-handler) into a
+/// node-level cgroup-v2 leaf `<parent>/<sandbox_id>/`, OUT of the
+/// host-agent's own (pod) cgroup, so a pod-scope `cgroup.kill` on
+/// teardown doesn't reap the microVM. `hostPID` alone is insufficient —
+/// it shares the PID namespace, but the FC processes stay in the pod's
+/// cgroup and die with it. Best-effort: returns the error so the caller
+/// can log loudly, but it never aborts create/restore (the VM still
+/// runs; it just won't survive a pod restart on this host).
+#[cfg(target_os = "linux")]
+fn escape_to_node_cgroup(
+    parent: &Path,
+    sandbox_id: SandboxId,
+    pids: &[u32],
+) -> std::io::Result<()> {
+    let dir = parent.join(sandbox_id.to_string());
+    std::fs::create_dir_all(&dir)?;
+    let procs = dir.join("cgroup.procs");
+    for &pid in pids {
+        // cgroup v2: writing a pid to `cgroup.procs` migrates the whole
+        // process (all its threads — FC's vCPU threads included) into
+        // this cgroup. One pid per write.
+        std::fs::write(&procs, pid.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn escape_to_node_cgroup(
+    _parent: &Path,
+    _sandbox_id: SandboxId,
+    _pids: &[u32],
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Place the VM's processes in the node cgroup when one is configured,
+/// logging LOUDLY on failure — a configured-but-failing move means
+/// detach-survival is silently broken on this host, which we want
+/// visible rather than discovered at the next deploy.
+fn place_vm_in_node_cgroup(parent: Option<&Path>, sandbox_id: SandboxId, pids: &[u32]) {
+    let Some(parent) = parent else {
+        return; // dev / MIG / tests: no pod scope to escape.
+    };
+    match escape_to_node_cgroup(parent, sandbox_id, pids) {
+        Ok(()) => tracing::debug!(
+            %sandbox_id,
+            parent = %parent.display(),
+            ?pids,
+            "ADR 0044 K2: moved VM processes to node cgroup (detached from pod scope)"
+        ),
+        Err(e) => tracing::warn!(
+            %sandbox_id,
+            parent = %parent.display(),
+            error = %e,
+            "ADR 0044 K2: FAILED to move VM to a node cgroup; this VM will NOT survive a \
+             host-agent pod restart (detach disabled for it). Requires a privileged \
+             host-agent with /sys/fs/cgroup mounted rw."
+        ),
+    }
+}
+
+/// Remove the per-VM node cgroup leaf [`escape_to_node_cgroup`] created.
+/// `rmdir` of a cgroup only succeeds once it's empty, so `destroy()`
+/// calls this AFTER killing FC + the uffd handler. Best-effort.
+fn remove_node_cgroup(parent: Option<&Path>, sandbox_id: SandboxId) {
+    let Some(parent) = parent else {
+        return;
+    };
+    let dir = parent.join(sandbox_id.to_string());
+    if let Err(e) = std::fs::remove_dir(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(
+                %sandbox_id,
+                path = %dir.display(),
+                error = %e,
+                "ADR 0044 K2: could not remove per-VM node cgroup (non-empty or already gone)"
+            );
+        }
+    }
 }
 
 /// ADR 0009 §6: branch destroy's wait-for-exit on whether we own a
@@ -3266,6 +3597,10 @@ impl SandboxBackend for FirecrackerBackend {
         // relies on the handler having already flushed `--trace-output`
         // by the time we get here, so the write must happen earlier
         // (the runtime dumps after the recorder window closes).
+        // We own a `Child` for a handler spawned in THIS host-agent
+        // generation; for a pidfd-reattached one we only have the pid
+        // (`uffd_pid`, ADR 0044 K2). Either way: SIGTERM, then escalate to
+        // SIGKILL if it doesn't exit promptly.
         if let Some(mut handler) = live.uffd_handler {
             if let Some(pid) = handler.id() {
                 #[cfg(unix)]
@@ -3280,7 +3615,27 @@ impl SandboxBackend for FirecrackerBackend {
                     let _ = handler.wait().await;
                 }
             }
+        } else if let Some(pid) = live.uffd_pid {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            if wait_for_pid_death(pid, Duration::from_secs(2))
+                .await
+                .is_err()
+            {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                let _ = wait_for_pid_death(pid, Duration::from_secs(5)).await;
+            }
         }
+
+        // ADR 0044 K2: FC + the uffd handler are gone, so the per-VM node
+        // cgroup is now empty — remove it (rmdir of a cgroup only succeeds
+        // once empty). No-op when no `vm_cgroup_parent` is configured.
+        remove_node_cgroup(self.config.vm_cgroup_parent.as_deref(), id);
 
         // Tear down per-VM networking: yank iptables rules tagged
         // with this sandbox's chain comment, delete the TAP, return
@@ -4020,6 +4375,36 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    // ADR 0044 K2: node-cgroup escape helpers. A tempdir stands in for the
+    // cgroup parent — this exercises the leaf-path + pid-write + rmdir logic,
+    // NOT the kernel process-migration (which needs a real cgroupfs and is
+    // dev-vm-validated; on cgroupfs the pid write moves the process).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_cgroup_escape_creates_leaf_and_writes_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        escape_to_node_cgroup(tmp.path(), id, &[4242]).expect("escape");
+        let leaf = tmp.path().join(id.to_string());
+        assert!(leaf.is_dir(), "per-VM leaf cgroup dir created");
+        let procs = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap();
+        assert_eq!(procs.trim(), "4242", "pid written to cgroup.procs");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_cgroup_remove_drops_empty_leaf_idempotently() {
+        // Models destroy() after FC + the handler are killed (empty cgroup).
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let leaf = tmp.path().join(id.to_string());
+        std::fs::create_dir_all(&leaf).unwrap();
+        remove_node_cgroup(Some(tmp.path()), id);
+        assert!(!leaf.exists(), "empty leaf removed");
+        remove_node_cgroup(Some(tmp.path()), id); // gone → no-op
+        remove_node_cgroup(None, id); // unconfigured → no-op
+    }
+
     /// Default backend for negative-path unit tests: kernel/firecracker
     /// paths point at non-existent files so `create()` fails early at
     /// spec validation rather than trying to spawn anything. The
@@ -4045,6 +4430,7 @@ mod tests {
             uffd_blob_root: None,
             cpu_template: None,
             bundle_dir: dir.path().join("bundles"),
+            vm_cgroup_parent: None,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }

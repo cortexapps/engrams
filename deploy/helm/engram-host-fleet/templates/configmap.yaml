@@ -33,6 +33,12 @@ data:
   {{- with .Values.firecracker.restoreMode }}
   ENGRAM_FC_RESTORE_MODE: {{ . | quote }}
   {{- end }}
+  {{- with .Values.firecracker.vmCgroupParent }}
+  # ADR 0044 K2: node-level cgroup-v2 dir the host-agent moves each VM's
+  # FC + uffd-handler into, so they survive this pod's cgroup teardown on
+  # a restart (hostPID alone keeps the PID namespace, not the cgroup).
+  ENGRAM_FC_VM_CGROUP_PARENT: {{ . | quote }}
+  {{- end }}
   {{- with .Values.storage.chunkCacheBudgetBytes }}
   ENGRAM_CHUNK_CACHE_BUDGET_BYTES: {{ . | quote }}
   {{- end }}

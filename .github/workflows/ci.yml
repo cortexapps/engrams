@@ -581,6 +581,7 @@ jobs:
             -p engram-sandbox-firecracker \
             --test boot \
             --test lifecycle \
+            --test reattach_detach \
             --test snapshot \
             --test snapshot_uffd \
             --test exec_real_vm \

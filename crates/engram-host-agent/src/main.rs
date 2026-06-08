@@ -223,13 +223,16 @@ async fn main() -> Result<(), HostAgentError> {
         ..HostAgentConfig::default()
     };
 
-    // ADR 0007 Phase 5: generate a per-startup HostId early so the
-    // FC config can stamp it on snapshots' `trace_host_hint` and
-    // pass it as `--publish-trace-host` to the UFFD handler.
-    // Cross-host trace replay keys off this id — a snapshot taken
-    // by host A becomes restoreable on host B with B reusing A's
-    // recorded trace.
-    let host_id = engram_core::HostId::new();
+    // ADR 0007 Phase 5: resolve the HostId early so the FC config can
+    // stamp it on snapshots' `trace_host_hint` and pass it as
+    // `--publish-trace-host` to the UFFD handler. Cross-host trace replay
+    // keys off this id — a snapshot taken by host A becomes restoreable on
+    // host B with B reusing A's recorded trace.
+    // ADR 0044 K2 (GAP 1): STABLE across restarts (persisted in work_dir,
+    // node-name-seeded on K8s) so a DaemonSet pod restart keeps its host
+    // identity and the coordinator's session→host binding survives.
+    let node_name = std::env::var("NODE_NAME").ok().filter(|s| !s.is_empty());
+    let host_id = resolve_host_id(&cli.work_dir, node_name.as_deref());
 
     // ADR 0007: blob backend + chunk store. Created before the backend
     // match so the inner VZ backend can be wired with its own chunk
@@ -294,6 +297,14 @@ async fn main() -> Result<(), HostAgentError> {
             // env var overrides (`""` / `"none"` for passthrough, any
             // other value for a custom template name).
             fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
+            // ADR 0044 K2: on K8s the chart sets this to a node-level cgroup
+            // dir (e.g. /sys/fs/cgroup/engram-vms); the FC backend moves each
+            // VM's processes there so a host-agent pod restart's cgroup teardown
+            // doesn't kill them. Unset on the MIG / dev (no pod scope to escape).
+            fc_cfg.vm_cgroup_parent = std::env::var("ENGRAM_FC_VM_CGROUP_PARENT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
             // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips restore
             // to the chunk-native UFFD handler (lazy memory, no memory.bin
             // materialize). Defaults to File.
@@ -656,6 +667,62 @@ async fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Op
 ///
 /// The returned guard must be held for the lifetime of `main` so spans
 /// flush on shutdown (`TelemetryGuard` is itself `#[must_use]`).
+/// ADR 0044 K2 (GAP 1): resolve a STABLE `HostId` so a DaemonSet pod
+/// restart keeps the same host identity. K2's detach+reattach leaves the
+/// node's VMs running and the successor pod re-adopts them — but only if
+/// it re-registers under the SAME id, or the coordinator's session→host
+/// binding goes stale (reconcile would migrate a live VM out from under
+/// itself). Resolution order:
+///   1. `<work_dir>/host_id` if present + parseable — the work_dir is a
+///      node hostPath on K8s, so it survives a pod restart on the node.
+///   2. else seed deterministically from the K8s node name (so a
+///      same-node restart with a wiped work_dir still recovers the id),
+///      and persist it.
+///   3. else (no node name — non-K8s dev, or the MIG) a fresh random id,
+///      persisted. The MIG never restarts the agent in place (instance
+///      replacement), so a per-instance id is correct there.
+fn resolve_host_id(work_dir: &std::path::Path, node_name: Option<&str>) -> engram_core::HostId {
+    let id_path = work_dir.join("host_id");
+    if let Ok(contents) = std::fs::read_to_string(&id_path) {
+        if let Ok(id) = contents.trim().parse::<engram_core::HostId>() {
+            tracing::info!(%id, path = %id_path.display(), "host_id: reusing persisted id");
+            return id;
+        }
+        tracing::warn!(
+            path = %id_path.display(),
+            "host_id: file present but unparseable; regenerating"
+        );
+    }
+    let id = match node_name {
+        Some(name) if !name.is_empty() => host_id_from_node_name(name),
+        _ => engram_core::HostId::new(),
+    };
+    if let Some(parent) = id_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&id_path, id.to_string()) {
+        tracing::warn!(
+            error = %e,
+            path = %id_path.display(),
+            "host_id: failed to persist; a work_dir wipe on the same node would change identity"
+        );
+    }
+    tracing::info!(%id, node_name = ?node_name, "host_id: generated + persisted");
+    id
+}
+
+/// Deterministic `HostId` derived from a Kubernetes node name. Not an
+/// RFC-4122 versioned UUID — `HostId` is an opaque identifier; we only
+/// need it stable + collision-resistant across node names so the same
+/// node recovers the same id after a work_dir wipe.
+fn host_id_from_node_name(node_name: &str) -> engram_core::HostId {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("engram-host:{node_name}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    engram_core::HostId::from(uuid::Uuid::from_bytes(bytes))
+}
+
 /// ADR 0022: raise `RLIMIT_MEMLOCK` to unlimited so the image prefetcher can
 /// pin (`mlock`) per-template base memfiles resident. Root can raise its own
 /// hard limit; best-effort — a failure is logged and the mlock attempts in
@@ -700,5 +767,49 @@ fn default_vz_kernel_path() -> Option<PathBuf> {
         Some(candidate)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_id_persists_and_is_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = resolve_host_id(tmp.path(), Some("node-a"));
+        // A persisted id wins over the node-name seed on the next start.
+        let second = resolve_host_id(tmp.path(), Some("a-totally-different-node"));
+        assert_eq!(first, second, "persisted host_id must be reused verbatim");
+        let on_disk = std::fs::read_to_string(tmp.path().join("host_id")).unwrap();
+        assert_eq!(
+            on_disk.trim().parse::<engram_core::HostId>().unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn node_name_seed_is_deterministic_across_wiped_work_dirs() {
+        // Same node name → same id even with a fresh work_dir (the
+        // disk-wipe-same-node recovery path).
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_host_id(a.path(), Some("node-x")),
+            resolve_host_id(b.path(), Some("node-x")),
+        );
+        assert_ne!(
+            host_id_from_node_name("node-x"),
+            host_id_from_node_name("node-y"),
+        );
+    }
+
+    #[test]
+    fn no_node_name_generates_random_then_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = resolve_host_id(tmp.path(), None);
+        // Persisted, so the next start on the same work_dir reuses it.
+        let second = resolve_host_id(tmp.path(), None);
+        assert_eq!(first, second);
     }
 }
