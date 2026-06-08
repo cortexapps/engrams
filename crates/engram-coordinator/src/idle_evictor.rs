@@ -113,6 +113,34 @@ pub async fn evict_session_to_state(
         }
     };
 
+    // ADR 0044 K5: race-free re-entry guard on the authoritative PG state.
+    // The lease above is held until after the PG transition, so once we hold
+    // it any concurrent eviction (idle-evict, admin drain, dead-host recovery)
+    // has *fully* completed — re-read the state and skip if the session is no
+    // longer evictable. `Active` (direct idle-evict / drain) and `Evicting`
+    // (backstop-nominated, scanner finishing the job) are the legal inputs;
+    // anything else (already `Idle`, mid-`Evacuating`, terminal) means a peer
+    // already handled it. The registry guard below catches the stale in-memory
+    // binding; this catches the case that wedged a session when an idle-evict
+    // completed exactly as a drain dispatched it — already `Idle`, but the
+    // drain still drove it to `Evacuating` on a destroyed sandbox.
+    match state.services.meta.get_session(session_id).await {
+        Ok(s) if !matches!(s.status, SessionState::Active | SessionState::Evicting) => {
+            tracing::info!(
+                session_id = %session_id,
+                state = s.status.as_str(),
+                "evict skipped: session no longer evictable (a concurrent eviction won the lease first)",
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(EvictError::Meta(format!(
+                "evict: re-read session state after lease: {e}"
+            )));
+        }
+    }
+
     // ADR 0016 A.1.1: entry log. Was silent before — a coord pod
     // running the pipeline repeatedly (e.g. retry storm, post-roll
     // race) showed up only as host-side `chunked NBD disk flushed`
