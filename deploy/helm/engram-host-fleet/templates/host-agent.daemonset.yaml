@@ -26,6 +26,18 @@ spec:
       # namespace and kill them. The host-agent spawns FC without
       # kill_on_drop and never checkpoints on SIGTERM; it just detaches.
       hostPID: true
+      # ADR 0044 K2: hostPID alone keeps the FC *process* alive across a pod
+      # restart, but the VM's network plumbing — the veth host-side and the
+      # MASQUERADE/SNAT iptables — lives in the host-agent's network namespace.
+      # In a pod-scoped netns that's torn down on delete, so the successor pod
+      # can't reattach ("net slot reserve failed: netns gone"). hostNetwork
+      # puts the host-agent (and everything it plumbs) in the NODE root netns,
+      # so the veth + iptables + the host->VM dial all persist across the roll.
+      # The kvm nodes are dedicated (no port contention) and the node IP is a
+      # stabler advertise addr than an ephemeral pod IP. ClusterFirstWithHostNet
+      # keeps the in-cluster coordinator Service resolvable under hostNetwork.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       serviceAccountName: {{ include "hostfleet.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -79,8 +91,9 @@ spec:
             - configMapRef:
                 name: {{ include "hostfleet.hostAgent.fullname" . }}
           env:
-            # The coord dials this back for gRPC (ADR 0013). pod-netns +
-            # pod IP works in-cluster (the spike used pod-netns).
+            # The coord dials this back for gRPC (ADR 0013). Under hostNetwork
+            # (above), status.podIP resolves to the NODE's primary IP — a
+            # stable, in-cluster-routable advertise addr that outlives any pod.
             - name: POD_IP
               valueFrom:
                 fieldRef:
