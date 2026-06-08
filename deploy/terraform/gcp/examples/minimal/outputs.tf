@@ -14,8 +14,8 @@ output "coordinator_sa_email" {
 }
 
 output "fc_host_instance_sa_email" {
-  description = "Per-host SA — already attached to MIG instances."
-  value       = module.fc_host_mig.instance_sa_email
+  description = "Per-host GSA — annotate the engram-host-fleet chart's serviceAccount with this for Workload Identity."
+  value       = module.fc_host_gsa.instance_sa_email
 }
 
 output "coordinator_internal_lb_ip" {
@@ -24,13 +24,8 @@ output "coordinator_internal_lb_ip" {
 }
 
 output "coordinator_endpoint" {
-  description = "Full `ws://` URL the FC host MIG is already configured to dial. Use it to point CLI smoke-tests at the same internal LB."
+  description = "Full `http://` URL the host fleet dials. Use it to point CLI smoke-tests at the same internal LB."
   value       = local.coordinator_endpoint
-}
-
-output "fc_host_mig_name" {
-  description = "MIG name. `gcloud compute instance-groups managed describe <this>` to see fleet state."
-  value       = module.fc_host_mig.mig_name
 }
 
 output "network_name" {

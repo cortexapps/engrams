@@ -510,8 +510,7 @@ For multi-host production (coordinator on GKE behind a load balancer, a pool of 
 
 Deployment artifacts ship in-tree:
 - [`deploy/helm/engram/`](./deploy/helm/engram/) — Helm chart, cloud-agnostic templates. Deploys the coordinator + optional nginx web frontend.
-- [`deploy/packer/`](./deploy/packer/) — Packer manifest for the GCE FC host image.
-- [`deploy/terraform/gcp/`](./deploy/terraform/gcp/) — GCP reference modules (network, storage, fc-host-mig) + `examples/minimal/`.
+- [`deploy/terraform/gcp/`](./deploy/terraform/gcp/) — GCP reference modules (network, storage, fc-host-gsa) + `examples/minimal/`.
 
 See [`docs/deploy.md`](./docs/deploy.md) for the full env-var inventory, the KEK + egress-proxy CA sourcing path, IAM/Workload-Identity wiring, and the operational gaps (observability, AWS Terraform, multi-region) still slated for v2 with their workarounds.
 
