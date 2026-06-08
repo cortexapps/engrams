@@ -701,7 +701,7 @@ fn resolve_host_id(work_dir: &std::path::Path, node_name: Option<&str>) -> engra
         );
     }
     let id = match node_name {
-        Some(name) if !name.is_empty() => host_id_from_node_name(name),
+        Some(name) if !name.is_empty() => engram_core::HostId::from_node_name(name),
         _ => engram_core::HostId::new(),
     };
     if let Some(parent) = id_path.parent() {
@@ -716,18 +716,6 @@ fn resolve_host_id(work_dir: &std::path::Path, node_name: Option<&str>) -> engra
     }
     tracing::info!(%id, node_name = ?node_name, "host_id: generated + persisted");
     id
-}
-
-/// Deterministic `HostId` derived from a Kubernetes node name. Not an
-/// RFC-4122 versioned UUID — `HostId` is an opaque identifier; we only
-/// need it stable + collision-resistant across node names so the same
-/// node recovers the same id after a work_dir wipe.
-fn host_id_from_node_name(node_name: &str) -> engram_core::HostId {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("engram-host:{node_name}").as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    engram_core::HostId::from(uuid::Uuid::from_bytes(bytes))
 }
 
 /// ADR 0022: raise `RLIMIT_MEMLOCK` to unlimited so the image prefetcher can
@@ -806,8 +794,8 @@ mod tests {
             resolve_host_id(b.path(), Some("node-x")),
         );
         assert_ne!(
-            host_id_from_node_name("node-x"),
-            host_id_from_node_name("node-y"),
+            engram_core::HostId::from_node_name("node-x"),
+            engram_core::HostId::from_node_name("node-y"),
         );
     }
 

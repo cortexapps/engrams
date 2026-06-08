@@ -66,6 +66,23 @@ id_newtype!(MessageId);
 id_newtype!(ToolCallId);
 id_newtype!(AgentCommitId);
 
+impl HostId {
+    /// Deterministic `HostId` derived from a Kubernetes node name (ADR 0044
+    /// K2 / GAP 1). Not an RFC-4122 versioned UUID — `HostId` is opaque; we
+    /// only need it stable + collision-resistant across node names so that a
+    /// same-node host-agent restart (even with a wiped work_dir) recovers the
+    /// same id, and the K3 rollout operator can address a node's host without
+    /// a registry lookup. Keep the seed string in lockstep with any consumer
+    /// that recomputes it.
+    pub fn from_node_name(node_name: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(format!("engram-host:{node_name}").as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
