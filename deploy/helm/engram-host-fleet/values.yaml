@@ -41,14 +41,23 @@ blob:
   s3EndpointUrl: ""   # MinIO / R2 / Spaces
   s3Region: ""
 
+nodeAssets:
+  # ADR 0044 K2 / GAP 2: firecracker + the engram guest kernel, staged into
+  # each host-agent pod by an init container into a shared emptyDir (stock
+  # K8s nodes don't carry them; the GCE/Packer node image did). Built by
+  # docker/node-assets.Dockerfile — docker/node-assets-fetch.sh stages the
+  # build context (pinned FC release + the engram guest-kernel GH asset).
+  # Pin to a digest in prod and roll it via the K3 operator's node sequence.
+  image:
+    repository: ghcr.io/cortexapps/engrams/node-assets
+    tag: main
+    pullPolicy: IfNotPresent
+
 firecracker:
-  # The host-agent image is a thin binary; firecracker + the guest
-  # kernel come from the NODE. Until the asset-staging image lands
-  # (ADR 0044 K1.x), point these at where node-prep / the node image
-  # places them. Defaults match the GCE/Packer layout.
-  binaryHostPath: /usr/local/bin/firecracker
-  kernelHostPath: /usr/local/lib/engram/vmlinux
-  # uffd handler ships in the host-agent image at this path.
+  # firecracker + the guest kernel are staged into the pod emptyDir at
+  # /opt/engram by the node-assets init container (see nodeAssets); the
+  # host-agent reads them from there (ENGRAM_FIRECRACKER_BIN + the configmap
+  # ENGRAM_KERNEL_IMAGE_PATH). No node hostPath for them anymore.
   restoreMode: ""     # "" (binary default) | file | uffd
   # ADR 0044 K2 (VM-detach): a node-level cgroup-v2 dir the host-agent
   # moves each VM's FC + uffd-handler into, so they survive THIS pod's
