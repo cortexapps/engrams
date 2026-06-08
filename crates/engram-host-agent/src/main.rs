@@ -262,6 +262,13 @@ async fn main() -> Result<(), HostAgentError> {
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
             fc_cfg.host_id = Some(host_id);
+            // ADR 0044 K2 / GAP 2: on K8s the firecracker binary is staged
+            // into a pod emptyDir (e.g. /opt/engram/firecracker), not on
+            // PATH. Point the backend at it. Defaults to a PATH lookup of
+            // `firecracker` (the GCE/Packer hosts + dev).
+            if let Some(p) = std::env::var_os("ENGRAM_FIRECRACKER_BIN") {
+                fc_cfg.firecracker_bin = PathBuf::from(p);
+            }
             // ADR 0028 Fix A: arm KVM dirty tracking fleet-wide so every
             // capture after the chain's first can be a Diff (O(dirty)
             // pause). Tied to the same env knob as the checkpoint driver —

@@ -43,6 +43,27 @@ spec:
       # the coordinator before deleting a pod, but a bare `kubectl
       # delete` should still let in-flight captures finish.
       terminationGracePeriodSeconds: 120
+      initContainers:
+        # ADR 0044 K2 / GAP 2: stage firecracker + the guest kernel out of
+        # the node-assets image into a shared emptyDir. Stock K8s nodes have
+        # neither (the GCE/Packer node image baked them in); this is the K8s
+        # equivalent, and being per-pod means a reattached FC keeps its own
+        # running binary — no swap under a live VM. Runs before the
+        # host-agent and before the emptyDir is read, so there's no
+        # fail-before-init race a `type: File` hostPath mount would have.
+        - name: stage-node-assets
+          image: "{{ .Values.nodeAssets.image.repository }}:{{ .Values.nodeAssets.image.tag }}"
+          imagePullPolicy: {{ .Values.nodeAssets.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              cp /assets/firecracker /opt/engram/firecracker
+              cp /assets/vmlinux     /opt/engram/vmlinux
+              chmod 0755 /opt/engram/firecracker
+              echo "[stage-node-assets] firecracker + vmlinux -> /opt/engram"
+          volumeMounts:
+            - {name: engram-assets, mountPath: /opt/engram}
       containers:
         - name: host-agent
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -75,6 +96,11 @@ spec:
                   fieldPath: spec.nodeName
             - name: ENGRAM_GRPC_ADVERTISE_ADDR
               value: "http://$(POD_IP):{{ .Values.hostAgent.grpcPort }}"
+            # ADR 0044 K2 / GAP 2: firecracker lives in the staged emptyDir,
+            # not on PATH (ENGRAM_KERNEL_IMAGE_PATH=/opt/engram/vmlinux is set
+            # in the configmap, and matches the emptyDir layout).
+            - name: ENGRAM_FIRECRACKER_BIN
+              value: /opt/engram/firecracker
             {{- if .Values.coordinator.tokenSecretName }}
             - name: ENGRAM_COORDINATOR_TOKEN
               valueFrom:
@@ -92,13 +118,15 @@ spec:
             {{- toYaml .Values.hostAgent.resources | nindent 12 }}
           volumeMounts:
             - {name: dev, mountPath: /dev}
-            - {name: firecracker, mountPath: /usr/local/bin/firecracker}
-            - {name: kernel, mountPath: /opt/engram/vmlinux}
+            # firecracker + vmlinux, staged by the init container (GAP 2)
+            - {name: engram-assets, mountPath: /opt/engram}
             - {name: work, mountPath: /var/lib/engram}
             - {name: cgroup, mountPath: /sys/fs/cgroup}
       volumes:
         - {name: dev, hostPath: {path: /dev, type: Directory}}
-        - {name: firecracker, hostPath: {path: {{ .Values.firecracker.binaryHostPath | quote }}, type: File}}
-        - {name: kernel, hostPath: {path: {{ .Values.firecracker.kernelHostPath | quote }}, type: File}}
+        # ADR 0044 K2 / GAP 2: firecracker + the guest kernel land here from
+        # the node-assets init container — replaces the hostPath `type: File`
+        # mounts, which fail-before-init when the node lacks the files.
+        - {name: engram-assets, emptyDir: {}}
         - {name: work, hostPath: {path: {{ .Values.storage.workDirHostPath | quote }}, type: DirectoryOrCreate}}
         - {name: cgroup, hostPath: {path: /sys/fs/cgroup, type: Directory}}
