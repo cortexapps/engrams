@@ -18,6 +18,14 @@ spec:
       labels:
         {{- include "hostfleet.hostAgent.selectorLabels" . | nindent 8 }}
     spec:
+      # ADR 0044 K2 (VM-detach): the FC microVMs (and any uffd-handler)
+      # must SURVIVE a host-agent pod restart so the successor pod can
+      # pidfd-reattach them — a routine DaemonSet upgrade then drops zero
+      # sessions. hostPID puts those processes in the NODE's PID
+      # namespace, so deleting this pod doesn't tear down their PID
+      # namespace and kill them. The host-agent spawns FC without
+      # kill_on_drop and never checkpoints on SIGTERM; it just detaches.
+      hostPID: true
       serviceAccountName: {{ include "hostfleet.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
