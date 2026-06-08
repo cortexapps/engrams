@@ -7,11 +7,13 @@ description: |
   and fans out N Firecracker microVMs as children (K8s schedules the
   daemon, NOT the sessions; the coordinator schedules sessions itself).
   A node-prep DaemonSet handles the host-OS setup (kernel modules,
-  sysctls) that Packer used to bake. Requires nodes with /dev/kvm +
-  cgroup v2; on managed K8s that means a metal SKU or explicit
-  nested-virt (Intel-only today — see ADR 0044).
+  sysctls) that Packer used to bake. An optional rollout operator (K3)
+  drives drain-gated, node-by-node host-agent rollouts from a HostFleet
+  CR. Requires nodes with /dev/kvm + cgroup v2; on managed K8s that
+  means a metal SKU or explicit nested-virt (Intel-only today — see
+  ADR 0044).
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.1.0"
 keywords:
   - engram

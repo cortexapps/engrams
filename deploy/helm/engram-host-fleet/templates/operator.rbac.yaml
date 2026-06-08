@@ -1,0 +1,47 @@
+{{- if .Values.operator.enabled -}}
+# ADR 0044 K3: cluster-scoped permissions the rollout operator needs —
+# read its CRs, patch the host-agent DaemonSet image, and list/delete its
+# pods + cordon nodes for the drain-gated roll. Node + DaemonSet/Pod access
+# is cluster-wide because the host fleet spans nodes; scope is otherwise
+# minimal (no secrets, no create on workloads).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "hostfleet.operator.fullname" . }}
+  labels:
+    {{- include "hostfleet.operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["engram.io"]
+    resources: ["hostfleets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["engram.io"]
+    resources: ["hostfleets/status"]
+    verbs: ["get", "update", "patch"]
+  # Patch the host-agent DaemonSet's image toward the CR.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  # List the fleet's pods + delete one per drained node (OnDelete roll).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  # Cordon/uncordon the node during its roll.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "hostfleet.operator.fullname" . }}
+  labels:
+    {{- include "hostfleet.operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "hostfleet.operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hostfleet.operator.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

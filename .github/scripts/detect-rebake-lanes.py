@@ -46,7 +46,9 @@ from pathlib import Path
 # host image (spawned by host-agent), never in a container — so it gates the
 # host lanes but not images.
 FC_BINS = {"engram-host-agent", "engram-uffd-handler"}
-CONTAINER_BINS = {"engram-coordinator", "engram-host-agent"}
+# engram-host-operator (ADR 0044 K3) bakes into its own container image; add
+# it so an operator-only crate change rebuilds the images lane.
+CONTAINER_BINS = {"engram-coordinator", "engram-host-agent", "engram-host-operator"}
 # Binaries baked INTO session images at image-build time by
 # engram-image-builder::inject_builtin_harness (pulled from the
 # harness-claude GHCR pack, written to /sbin/engram-harness-claude). The

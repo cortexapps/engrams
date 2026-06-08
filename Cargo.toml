@@ -5,6 +5,7 @@ members = [
     "crates/engram-protocol",
     "crates/engram-coordinator",
     "crates/engram-host-agent",
+    "crates/engram-host-operator",
     "crates/engram-chunk-store",
     "crates/engram-image-builder",
     "crates/engram-publish-builtin-harness",
@@ -50,6 +51,13 @@ rust-version = "1.80"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
+# kubernetes — ADR 0044 K3 host-fleet rollout operator (engram-host-operator).
+# rustls (not openssl) to match reqwest's TLS choice; "latest" k8s-openapi
+# feature since the operator is the sole consumer.
+kube = { version = "0.99", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
+# schemars is required by kube's CustomResource derive (CRD schema gen).
+schemars = "0.8"
 # internal
 engram-core = { path = "crates/engram-core" }
 engram-protocol = { path = "crates/engram-protocol" }

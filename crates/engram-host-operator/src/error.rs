@@ -1,0 +1,65 @@
+//! ADR 0044 K3: operator error type. Hand-rolled `Display` + `Error`
+//! impls per the project convention (no anyhow/thiserror).
+
+use std::fmt;
+
+/// Errors the reconcile loop can surface. The kube `Controller` requires a
+/// `std::error::Error` reconcile error; the `error_policy` requeues on any
+/// of these.
+#[derive(Debug)]
+pub enum OperatorError {
+    /// Kubernetes API error (get/list/patch/delete, or client setup).
+    Kube(kube::Error),
+    /// Transport-level failure talking to the coordinator admin API.
+    Http(reqwest::Error),
+    /// The coordinator admin API returned a non-success status.
+    Coord {
+        op: &'static str,
+        status: u16,
+        body: String,
+    },
+    /// A drain did not reach `running_sandboxes == 0` within the budget;
+    /// the roll is aborted and the pod left in place.
+    DrainTimeout { host_id: String, remaining: u32 },
+    /// The CR or a managed object was missing an expected field.
+    Invalid(String),
+}
+
+impl fmt::Display for OperatorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kube(e) => write!(f, "kubernetes api error: {e}"),
+            Self::Http(e) => write!(f, "coordinator http error: {e}"),
+            Self::Coord { op, status, body } => {
+                write!(f, "coordinator {op} returned {status}: {body}")
+            }
+            Self::DrainTimeout { host_id, remaining } => write!(
+                f,
+                "drain of host {host_id} timed out with {remaining} sandbox(es) still running"
+            ),
+            Self::Invalid(msg) => write!(f, "invalid host-fleet state: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for OperatorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Kube(e) => Some(e),
+            Self::Http(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<kube::Error> for OperatorError {
+    fn from(e: kube::Error) -> Self {
+        Self::Kube(e)
+    }
+}
+
+impl From<reqwest::Error> for OperatorError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Http(e)
+    }
+}

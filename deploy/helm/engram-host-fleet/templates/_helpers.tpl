@@ -65,3 +65,19 @@ app.kubernetes.io/component: node-prep
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
+
+{{/* ADR 0044 K3: the rollout operator (a Deployment, not a DaemonSet). */}}
+{{- define "hostfleet.operator.fullname" -}}
+{{- printf "%s-operator" (include "hostfleet.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "hostfleet.operator.labels" -}}
+{{ include "hostfleet.labels" . }}
+app.kubernetes.io/component: operator
+{{- end -}}
+
+{{- define "hostfleet.operator.selectorLabels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: operator
+{{- end -}}
