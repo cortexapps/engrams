@@ -325,11 +325,26 @@ pub async fn heartbeat(
     // don't need a PG lookup; the warm + register are idempotent
     // on the steady-state path.
     if let Some(host_addr) = hb.host_addr.as_deref() {
-        if !state.host_registry.contains(host_id) {
+        // (Re)warm + register when EITHER the host is unknown to this
+        // coord pod (it was rolled by helm-deploy — the original ADR 0013
+        // self-heal), OR its advertised addr changed since we last dialed
+        // it. The latter is ADR 0044 K2 (GAP 1): a DaemonSet pod restart
+        // keeps a STABLE HostId but gets a fresh POD_IP, so `contains` is
+        // still true — without the addr-change arm we'd keep dialing the
+        // dead old IP forever. `warm` is idempotent (a no-op when the addr
+        // is unchanged), and the `register` below re-points the dispatch
+        // backend; `update_state` later in this handler repopulates the
+        // reset HostState from this same heartbeat.
+        let known = state.host_registry.contains(host_id);
+        let addr_changed =
+            state.services.host_pool.current_addr(host_id).as_deref() != Some(host_addr);
+        if !known || addr_changed {
             tracing::info!(
                 host_id = %host_id,
                 host_addr = %host_addr,
-                "heartbeat for unregistered host; warming pool + registering",
+                known,
+                addr_changed,
+                "heartbeat: (re)warming pool + registering (new host or changed dial addr)",
             );
             state
                 .services

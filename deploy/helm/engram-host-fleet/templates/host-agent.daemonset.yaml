@@ -64,6 +64,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # ADR 0044 K2 (GAP 1): the host-agent seeds a STABLE HostId
+            # from the node name (persisted to the work_dir hostPath), so a
+            # DaemonSet pod restart keeps its identity and the coordinator's
+            # session->host binding survives while detach+reattach re-adopts
+            # the node's still-live microVMs.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: ENGRAM_GRPC_ADVERTISE_ADDR
               value: "http://$(POD_IP):{{ .Values.hostAgent.grpcPort }}"
             {{- if .Values.coordinator.tokenSecretName }}
