@@ -119,20 +119,16 @@ resource "google_kms_crypto_key_iam_member" "coord_kek_user" {
   member        = "serviceAccount:${google_service_account.coordinator.email}"
 }
 
-module "fc_host_mig" {
-  source = "../../modules/fc-host-mig"
+# ADR 0044: the Firecracker host fleet runs as a Kubernetes DaemonSet (the
+# `engram-host-fleet` Helm chart), not a Terraform GCE MIG. This module creates
+# only the per-host GSA the host pods impersonate via Workload Identity —
+# annotate the chart's serviceAccount with `fc_host_instance_sa_email` (output
+# below). The chunks-bucket + KEK grants below bind to that SA.
+module "fc_host_gsa" {
+  source = "../../modules/fc-host-gsa"
 
-  project_id           = var.project_id
-  name                 = "${var.name_prefix}-fc"
-  region               = var.region
-  network_name         = module.network.network_name
-  subnet_self_link     = module.network.subnet_self_link
-  iap_target_tag       = module.network.iap_target_tag
-  machine_type         = var.host_machine_type
-  chunks_bucket        = module.storage.bucket_name
-  coordinator_endpoint = local.coordinator_endpoint
-  coordinator_token    = var.coordinator_token
-  target_size          = var.host_count
+  project_id = var.project_id
+  region     = var.region
 }
 
 # Host instance SA needs objectAdmin on the chunks bucket — the
@@ -142,7 +138,7 @@ module "fc_host_mig" {
 resource "google_storage_bucket_iam_member" "host_chunks_rw" {
   bucket = module.storage.bucket_name
   role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${module.fc_host_mig.instance_sa_email}"
+  member = "serviceAccount:${module.fc_host_gsa.instance_sa_email}"
 }
 
 # Host instance SA also needs Encrypt/Decrypt on the KEK for the
@@ -151,5 +147,5 @@ resource "google_storage_bucket_iam_member" "host_chunks_rw" {
 resource "google_kms_crypto_key_iam_member" "host_kek_user" {
   crypto_key_id = google_kms_crypto_key.kek.id
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-  member        = "serviceAccount:${module.fc_host_mig.instance_sa_email}"
+  member        = "serviceAccount:${module.fc_host_gsa.instance_sa_email}"
 }

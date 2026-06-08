@@ -12,9 +12,10 @@ swap in their environment-specific values.
 modules/
   network/         VPC + subnet + Cloud NAT + firewall
   storage/         GCS chunks bucket + bucket-scoped SA
-  fc-host-mig/     Regional MIG of Firecracker hosts (Packer image)
+  fc-host-gsa/     Per-host GSA (ADR 0044: the FC host fleet is the
+                   engram-host-fleet Helm chart, not a TF MIG)
 examples/
-  minimal/         End-to-end: VPC + bucket + KMS key + MIG +
+  minimal/         End-to-end: VPC + bucket + KMS key + host GSA +
                    coordinator SA. Bring your own GKE + Cloud SQL.
 ```
 
