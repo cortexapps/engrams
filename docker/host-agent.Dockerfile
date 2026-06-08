@@ -10,8 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p engram-host-agent \
-    && cp target/release/engram-host-agent /tmp/engram-host-agent
+    cargo build --release -p engram-host-agent -p engram-uffd-handler \
+    && cp target/release/engram-host-agent /tmp/engram-host-agent \
+    && cp target/release/engram-uffd-handler /tmp/engram-uffd-handler
 
 # Trixie matches the builder's glibc — bookworm (2.36) refuses
 # binaries linked against trixie's glibc 2.39+.
@@ -27,4 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates e2fsprogs iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /tmp/engram-host-agent /usr/local/bin/engram-host-agent
+# ADR 0044 K2: the UFFD memory-restore handler. On the GCE/Packer hosts it
+# came from the node image; the K8s host-agent image must carry it (a PATH
+# lookup of `engram-uffd-handler` is the FirecrackerConfig default). Without
+# it, every Uffd-mode restore/resume page-faults forever / fails to spawn.
+COPY --from=builder /tmp/engram-uffd-handler /usr/local/bin/engram-uffd-handler
 ENTRYPOINT ["/usr/local/bin/engram-host-agent"]

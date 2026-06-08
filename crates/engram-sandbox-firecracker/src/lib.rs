@@ -1071,10 +1071,28 @@ impl FirecrackerBackend {
             let netns_path =
                 std::path::PathBuf::from(format!("/var/run/netns/{}", ns_rec.netns_name));
             if !netns_path.exists() {
-                return Err(ReattachError::NetReserveFailed(format!(
-                    "netns {} gone (kernel state wiped); restored VM unreattachable",
-                    ns_rec.netns_name
-                )));
+                // ADR 0044 K2: the named bind-mount lived in the predecessor
+                // pod's mount namespace and is gone — but the netns *kernel
+                // object* survives because the FC process still holds it open
+                // (it's that process's /proc/<pid>/ns/net). Re-bind it under
+                // the name so reattach can resolve it again. Under hostNetwork
+                // the veth host-side + SNAT iptables are in the node root netns
+                // and already survived the pod delete, so re-naming the netns
+                // is the only missing piece. The network analog of the cgroup
+                // escape (the FC process itself survived the same way).
+                net::reattach_netns_name(&ns_rec.netns_name, fc.process.pid)
+                    .await
+                    .map_err(|e| {
+                        ReattachError::NetReserveFailed(format!(
+                            "netns {} name gone and re-bind from fc pid {} failed: {e}",
+                            ns_rec.netns_name, fc.process.pid
+                        ))
+                    })?;
+                tracing::info!(
+                    netns = %ns_rec.netns_name,
+                    fc_pid = fc.process.pid,
+                    "ADR 0044 K2: re-bound surviving VM netns name after pod restart",
+                );
             }
             let snat_cidr = net::VmCidr::new(ns_rec.snat_cidr_network);
             self.net_allocator

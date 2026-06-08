@@ -911,6 +911,20 @@ async fn run_iptables_in_netns(netns: &str, args: &[&str]) -> Result<(), NetErro
     run_cmd("ip", &full).await
 }
 
+/// ADR 0044 K2: re-create the `/var/run/netns/<name>` NAME for an already-
+/// running VM after a host-agent pod restart. The netns *kernel object*
+/// survives the pod (the FC process holds it open via its own
+/// `/proc/<pid>/ns/net`), but the named bind-mount lived in the dead pod's
+/// mount namespace and is gone — so reattach can no longer resolve it by name.
+/// `ip netns attach` re-binds the FC's live netns under the name, the network
+/// analog of the cgroup escape. Assumes the name is currently absent (caller
+/// checks); under `hostNetwork` the veth + iptables are already in the node
+/// root netns, so re-naming the netns is the only missing piece.
+#[cfg(target_os = "linux")]
+pub async fn reattach_netns_name(netns_name: &str, fc_pid: u32) -> Result<(), NetError> {
+    run_cmd("ip", &["netns", "attach", netns_name, &fc_pid.to_string()]).await
+}
+
 // Non-Linux stubs.
 #[cfg(not(target_os = "linux"))]
 pub async fn provision_netns(
@@ -933,6 +947,17 @@ pub async fn teardown_netns(
     _setup: &NetnsSetup,
     _allocator: &parking_lot::Mutex<NetworkAllocator>,
 ) {
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn reattach_netns_name(_netns_name: &str, _fc_pid: u32) -> Result<(), NetError> {
+    Err(NetError::Spawn(
+        "reattach_netns_name".into(),
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "FC networking is Linux-only",
+        ),
+    ))
 }
 
 // Non-Linux stubs.
