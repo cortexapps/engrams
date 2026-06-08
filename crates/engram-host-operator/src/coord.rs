@@ -103,4 +103,26 @@ impl CoordClient {
         }
         Ok(Some(resp.json().await?))
     }
+
+    /// `GET /api/admin/fleet/demand` — the K4 autoscaler's input (schedulable
+    /// hosts + free/total guest-RAM reservation).
+    pub async fn fleet_demand(&self) -> Result<crate::scaler::FleetDemand, OperatorError> {
+        let resp = self
+            .with_auth(
+                self.http
+                    .get(format!("{}/api/admin/fleet/demand", self.base)),
+            )
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OperatorError::Coord {
+                op: "fleet_demand",
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp.json().await?)
+    }
 }

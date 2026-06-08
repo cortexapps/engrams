@@ -1242,6 +1242,7 @@ dependencies = [
 name = "engram-host-operator"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "engram-core",
  "futures",
  "k8s-openapi",

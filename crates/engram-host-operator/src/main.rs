@@ -10,6 +10,7 @@ mod coord;
 mod crd;
 mod error;
 mod reconcile;
+mod scaler;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,10 @@ async fn main() -> Result<(), OperatorError> {
     let fleets: Api<HostFleet> = Api::all(client.clone());
     let ctx = Arc::new(Ctx {
         client: client.clone(),
+        // ADR 0044 K4: the noop scaler logs the desired host count without
+        // touching any cloud. A GKE actuator (engram-cloud-gcp) is the
+        // follow-up; swap it in here once wired.
+        scaler: Arc::new(scaler::NoopScaler),
     });
 
     tracing::info!("engram-host-operator starting; watching HostFleet resources");

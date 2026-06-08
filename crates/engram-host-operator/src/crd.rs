@@ -55,6 +55,14 @@ pub struct HostFleetSpec {
     /// before aborting the roll (leaving the pod in place).
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_seconds: u64,
+
+    /// ADR 0044 K4: optional node-pool autoscaling. When set, the operator
+    /// polls the coordinator's fleet demand and resizes the host node pool to
+    /// hold `targetFreeMib` of headroom (scale-up only in v1; drain-gated
+    /// scale-down is a follow-up). With the default noop scaler the operator
+    /// only *logs* the desired size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscaling: Option<AutoscalingSpec>,
 }
 
 fn default_drain_timeout() -> u64 {
@@ -67,6 +75,21 @@ fn default_drain_timeout() -> u64 {
 pub struct DaemonSetRef {
     pub namespace: String,
     pub name: String,
+}
+
+/// ADR 0044 K4: node-pool autoscaling config.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoscalingSpec {
+    /// The cloud node pool the scaler resizes (actuator-specific identifier,
+    /// e.g. a GKE node-pool name).
+    pub node_pool: String,
+    /// Never size the pool below this (set ≥ 1 — an empty fleet has no
+    /// demand signal to grow from).
+    pub min_hosts: u32,
+    pub max_hosts: u32,
+    /// Keep at least this much free guest-RAM (MiB) across the fleet.
+    pub target_free_mib: u64,
 }
 
 /// Reported progress. v1 leaves this for `kubectl` visibility; the operator
