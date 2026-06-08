@@ -328,7 +328,7 @@ pub struct FirecrackerConfig {
     /// down `cgroup.kill`s that whole cgroup, which would SIGKILL the
     /// microVMs even under `hostPID`. Escaping to a node-level cgroup
     /// lets them survive a pod restart so the successor can reattach.
-    /// `None` (dev / the MIG / tests) keeps FC in the host-agent's cgroup
+    /// `None` (dev / tests) keeps FC in the host-agent's cgroup
     /// — correct where there's no pod scope to escape. The chart sets it
     /// via `ENGRAM_FC_VM_CGROUP_PARENT` (e.g. `/sys/fs/cgroup/engram-vms`).
     pub vm_cgroup_parent: Option<PathBuf>,
@@ -723,8 +723,8 @@ pub struct FirecrackerBackend {
     upload_sink: Arc<parking_lot::RwLock<Option<engram_core::traits::UploadSink>>>,
     /// ADR 0035: the bake-time bundle stamp (`current.json` under
     /// `config.bundle_dir`), read once and cached — hosts are immutable
-    /// (a MIG roll replaces them), so the stamp can't change under a
-    /// running host-agent. `drive_id` → sha256.
+    /// (a host-agent pod restart replaces them), so the stamp can't
+    /// change under a running host-agent. `drive_id` → sha256.
     bundle_stamp: tokio::sync::OnceCell<std::collections::HashMap<String, String>>,
 }
 
@@ -773,8 +773,8 @@ impl FirecrackerBackend {
 
     /// ADR 0035: the host's bake-time bundle stamp (`drive_id` → sha256),
     /// read from `<bundle_dir>/current.json` on first use and cached for
-    /// the host-agent's lifetime (hosts are immutable; only a MIG roll
-    /// changes the stamp, and that replaces the host). Errors if the stamp
+    /// the host-agent's lifetime (hosts are immutable; only a host-agent
+    /// pod restart changes the stamp, and that replaces the host). Errors if the stamp
     /// is missing or malformed — callers only reach here when a spec
     /// actually requests aux drives, and a bundle-less host can't satisfy
     /// that correctly, so loud is right.
@@ -2311,7 +2311,7 @@ impl FirecrackerBackend {
         // skips `materialize_memory_if_missing` when
         // `restore_memory_is_lazy()` returns true). Requiring it here
         // unconditionally was the prod blocker on 2026-05-29: after a
-        // MIG roll the new hosts had every base-snapshot restore fail
+        // host-agent pod restart the new hosts had every base-snapshot restore fail
         // with "snapshot memory.bin missing" before the mode-specific
         // load branch could run. Same-host UFFD restore passed only
         // because `PooledBackend::snapshot` had already written
@@ -3080,7 +3080,7 @@ fn escape_to_node_cgroup(
 /// visible rather than discovered at the next deploy.
 fn place_vm_in_node_cgroup(parent: Option<&Path>, sandbox_id: SandboxId, pids: &[u32]) {
     let Some(parent) = parent else {
-        return; // dev / MIG / tests: no pod scope to escape.
+        return; // dev / tests: no pod scope to escape.
     };
     match escape_to_node_cgroup(parent, sandbox_id, pids) {
         Ok(()) => tracing::debug!(

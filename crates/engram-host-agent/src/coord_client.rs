@@ -626,8 +626,8 @@ mod tests {
     }
 
     /// The request side IS `serde(default)`: coord rolls before the
-    /// host MIG, so a new coord must accept old hosts' heartbeats
-    /// (they simply report no current bundles).
+    /// host-agent pod restart, so a new coord must accept old hosts'
+    /// heartbeats (they simply report no current bundles).
     #[test]
     fn heartbeat_request_current_bundles_serializes() {
         let req = HeartbeatRequest {

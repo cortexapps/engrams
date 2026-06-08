@@ -1,13 +1,8 @@
 //! Prometheus metrics exporter for the host-agent.
 //!
-//! Listens on `ENGRAM_HOST_METRICS_ADDR` (default `0.0.0.0:9100`)
-//! so it doubles as the TCP target for the GCE MIG's autohealing
-//! health check (see `deploy/terraform/gcp/modules/fc-host-mig/main.tf`
-//! — `google_compute_health_check.host_agent` targets this port).
-//! Before this listener existed, the MIG marked every instance
-//! unhealthy after `initial_delay_sec` and rolled them in a tight
-//! loop. Just binding the port satisfies the TCP probe; the
-//! metrics themselves are a bonus.
+//! Listens on `ENGRAM_HOST_METRICS_ADDR` (default `0.0.0.0:9100`),
+//! the Prometheus scrape target (a k8s ServiceMonitor scrapes this
+//! port).
 //!
 //! Same naming convention as the coord's metrics module:
 //! `engram_<subsystem>_<thing>_<unit>`, low-cardinality labels.
