@@ -4,8 +4,12 @@ WORKDIR /src
 # protobuf-compiler: ADR 0013 added a build.rs in engram-protocol that
 # invokes `protoc` to compile `proto/host_service.proto`. The Debian
 # package version is compatible with `tonic-build` 0.12.
+# clang + libclang-dev: ADR 0044 K2 — engram-uffd-handler pulls in
+# userfaultfd-sys, whose build.rs runs bindgen against <linux/userfaultfd.h>,
+# and bindgen needs libclang. (Only needed in this builder stage; the slim
+# runtime image below doesn't carry them.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates protobuf-compiler \
+    pkg-config libssl-dev ca-certificates protobuf-compiler clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
