@@ -23,6 +23,12 @@ Lanes:
   host_image    host_binaries OR host_base. The union gates the OSS
                 publish-host-binaries job — the GHCR artifact must exist at
                 this SHA for either downstream bake to consume.
+  cli_tools     engram-cli + engram-agentd changed — release closure of
+                {engram-cli, engram-agentd}. Gates the OSS publish-cli-tools
+                job, which republishes the "golden" cli+agentd GHCR artifact
+                (cli-tools) that the reusable bake-dev-image workflow pulls
+                instead of recompiling. Same role publish-host-binaries plays
+                for the FC-host bakes.
   tf_or_helm    deploy/terraform/ + deploy/helm/
   dev_image     dev-engrams dogfood rebake — images OR host_binaries OR
                 host_base OR the release closure of {engram-harness-claude}
@@ -59,6 +65,13 @@ CONTAINER_BINS = {"engram-coordinator", "engram-host-agent", "engram-host-operat
 # dev-engrams rebake never fired (the bug this fixes). It gates only the
 # dev_image lane below — the demo image bakes every push regardless.
 SESSION_HARNESS_BINS = {"engram-harness-claude"}
+# The ops CLI + the in-guest agent injected into session images at bake time.
+# OSS publishes them once as the `cli-tools` GHCR artifact (publish-cli-tools);
+# the reusable bake-dev-image workflow pulls that instead of compiling from a
+# source checkout — exactly how the FC-host bakes consume publish-host-binaries.
+# agentd must match the deployed coordinator, so a change to either binary (or
+# anything in its release closure) must republish cli-tools.
+CLI_TOOLS_BINS = {"engram-cli", "engram-agentd"}
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
 # script/the bake workflow conservatively trip the binary lanes.
@@ -172,6 +185,7 @@ def main():
     fc = release_closure(meta, FC_BINS)
     cont = release_closure(meta, CONTAINER_BINS)
     harness = release_closure(meta, SESSION_HARNESS_BINS)
+    cli_tools_closure = release_closure(meta, CLI_TOOLS_BINS)
 
     images = bool(cc & cont) or any_path(changed, IMAGES_PATHS)
     host_binaries = bool(cc & fc) or any_path(changed, HOST_BINARIES_PATHS)
@@ -179,6 +193,10 @@ def main():
     # Union — gates the publish-host-binaries job so the GHCR artifact exists
     # at this SHA for whichever downstream bake (thin and/or base) fires.
     host_image = host_binaries or host_base
+    # Golden cli+agentd artifact (cli-tools). Republish whenever either binary's
+    # release closure moved, or a conservative common trigger (lockfile / root
+    # manifest / the bake workflow / this script) changed.
+    cli_tools = bool(cc & cli_tools_closure) or any_path(changed, BINARY_COMMON)
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
     bundles = any_path(changed, BUNDLES_PATHS)
     # The dogfood image builds the whole repo via `just dev`, so it's stale on
@@ -199,8 +217,9 @@ def main():
     print(f"changed files: {len(changed)}", file=sys.stderr)
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
     print(f"-> images={images} host_binaries={host_binaries} "
-          f"host_base={host_base} host_image={host_image} tf_or_helm={tf_or_helm} "
-          f"bundles={bundles} dev_image={dev_image}", file=sys.stderr)
+          f"host_base={host_base} host_image={host_image} cli_tools={cli_tools} "
+          f"tf_or_helm={tf_or_helm} bundles={bundles} dev_image={dev_image}",
+          file=sys.stderr)
 
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
@@ -209,6 +228,7 @@ def main():
             f.write(f"host_binaries={'true' if host_binaries else 'false'}\n")
             f.write(f"host_base={'true' if host_base else 'false'}\n")
             f.write(f"host_image={'true' if host_image else 'false'}\n")
+            f.write(f"cli_tools={'true' if cli_tools else 'false'}\n")
             f.write(f"tf_or_helm={'true' if tf_or_helm else 'false'}\n")
             f.write(f"bundles={'true' if bundles else 'false'}\n")
             f.write(f"dev_image={'true' if dev_image else 'false'}\n")
