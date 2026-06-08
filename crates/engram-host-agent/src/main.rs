@@ -297,6 +297,14 @@ async fn main() -> Result<(), HostAgentError> {
             // env var overrides (`""` / `"none"` for passthrough, any
             // other value for a custom template name).
             fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
+            // ADR 0044 K2: on K8s the chart sets this to a node-level cgroup
+            // dir (e.g. /sys/fs/cgroup/engram-vms); the FC backend moves each
+            // VM's processes there so a host-agent pod restart's cgroup teardown
+            // doesn't kill them. Unset on the MIG / dev (no pod scope to escape).
+            fc_cfg.vm_cgroup_parent = std::env::var("ENGRAM_FC_VM_CGROUP_PARENT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
             // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips restore
             // to the chunk-native UFFD handler (lazy memory, no memory.bin
             // materialize). Defaults to File.

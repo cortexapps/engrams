@@ -50,6 +50,13 @@ firecracker:
   kernelHostPath: /usr/local/lib/engram/vmlinux
   # uffd handler ships in the host-agent image at this path.
   restoreMode: ""     # "" (binary default) | file | uffd
+  # ADR 0044 K2 (VM-detach): a node-level cgroup-v2 dir the host-agent
+  # moves each VM's FC + uffd-handler into, so they survive THIS pod's
+  # cgroup teardown on a restart (hostPID keeps the PID namespace, but
+  # the pod-scope `cgroup.kill` would still reap them). Must be on the
+  # host cgroup tree (the chart mounts /sys/fs/cgroup rw). Set "" to
+  # disable (then a pod restart kills the node's VMs).
+  vmCgroupParent: /sys/fs/cgroup/engram-vms
 
 storage:
   # Local NVMe for the chunk cache + per-sandbox work dir.

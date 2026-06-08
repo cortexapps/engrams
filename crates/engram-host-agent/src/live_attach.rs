@@ -241,6 +241,7 @@ mod tests {
             uffd_blob_root: None,
             cpu_template: None,
             bundle_dir: work_dir.join("bundles"),
+            vm_cgroup_parent: None,
         };
         Arc::new(FirecrackerBackend::new(work_dir, cfg))
     }

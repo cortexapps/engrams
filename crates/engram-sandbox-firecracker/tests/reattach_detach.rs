@@ -126,6 +126,19 @@ async fn detached_vm_survives_backend_drop_and_reattaches() {
         "FC must survive the host-agent backend being dropped (detach)"
     );
 
+    // The old host-agent's vsock listeners died with it. Model that by
+    // removing the harness UDS (in-process, generation A's listener task
+    // lingers; a real process restart takes it down). Only a successful
+    // re-bind on reattach makes it connectable again — without that, the
+    // guest harness adapter re-dials forever and the session wedges.
+    let harness_uds =
+        engram_sandbox_firecracker::harness_uds_for(&manifest.firecracker.vsock_uds_base);
+    let _ = std::fs::remove_file(&harness_uds);
+    assert!(
+        tokio::net::UnixStream::connect(&harness_uds).await.is_err(),
+        "harness listener must be gone once the old host-agent exits"
+    );
+
     // --- Generation B: reattach off the persisted manifest ---
     let backend_b = FirecrackerBackend::new(work.path(), mk_cfg());
     assert!(
@@ -142,6 +155,13 @@ async fn detached_vm_survives_backend_drop_and_reattaches() {
         "reattached sandbox must rejoin list() so the first heartbeat re-advertises it"
     );
     assert!(fc_alive(fc_pid), "reattach must not disturb the running FC");
+
+    // ADR 0044 K2: reattach must re-bind the host-side harness vsock
+    // listener, or the guest adapter can never reconnect and the run
+    // pauses forever. (forge + upload listeners are re-bound alongside.)
+    tokio::net::UnixStream::connect(&harness_uds)
+        .await
+        .expect("reattach must re-bind the harness vsock listener");
 
     // --- Teardown by pid: the reattached sandbox owns no `Child` ---
     backend_b

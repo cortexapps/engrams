@@ -154,7 +154,9 @@ fn per_port_uds(base_vsock_uds: &Path, port: u32) -> PathBuf {
     }
 }
 
-fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
+/// Host-side UDS the harness adapter's port-1026 vsock dial lands on.
+/// `pub` so the reattach integration test can assert it gets re-bound.
+pub fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
     per_port_uds(base_vsock_uds, engram_harness_proto::HARNESS_VSOCK_PORT)
 }
 
@@ -319,6 +321,17 @@ pub struct FirecrackerConfig {
     /// `current.json` stamp live. Production hosts use the fleet
     /// canonical [`AuxRoDrive::SHARED_DIR`]; tests inject a tempdir.
     pub bundle_dir: PathBuf,
+    /// ADR 0044 K2: parent cgroup-v2 dir under which to place each VM's
+    /// FC + uffd-handler processes (a leaf `<parent>/<sandbox_id>/`),
+    /// moving them OUT of the host-agent's own (pod) cgroup. On K8s the
+    /// host-agent runs in the pod's container cgroup; tearing the pod
+    /// down `cgroup.kill`s that whole cgroup, which would SIGKILL the
+    /// microVMs even under `hostPID`. Escaping to a node-level cgroup
+    /// lets them survive a pod restart so the successor can reattach.
+    /// `None` (dev / the MIG / tests) keeps FC in the host-agent's cgroup
+    /// — correct where there's no pod scope to escape. The chart sets it
+    /// via `ENGRAM_FC_VM_CGROUP_PARENT` (e.g. `/sys/fs/cgroup/engram-vms`).
+    pub vm_cgroup_parent: Option<PathBuf>,
 }
 
 /// Resolve the FC CPU template from `ENGRAM_FC_CPU_TEMPLATE`.
@@ -513,6 +526,8 @@ impl FirecrackerConfig {
             // ADR 0035: fleet-canonical staging dir; tests override
             // with a tempdir.
             bundle_dir: PathBuf::from(engram_core::types::sandbox::AuxRoDrive::SHARED_DIR),
+            // ADR 0044 K2: off by default — only the K8s host-fleet sets it.
+            vm_cgroup_parent: None,
         }
     }
 }
@@ -1169,6 +1184,40 @@ impl FirecrackerBackend {
         spawn_process_supervisor(self.sandboxes.clone(), id, fc.process.pid, "firecracker");
         if let Some(pid) = uffd_pid {
             spawn_process_supervisor(self.sandboxes.clone(), id, pid, "uffd-handler");
+        }
+
+        // ADR 0044 K2: re-bind the host-side vsock listeners. The in-guest
+        // harness/forge/upload adapters re-dial when their connection to the
+        // dead host-agent drops; the run is decoupled from the host link and
+        // resumes losslessly on reconnect (engram-harness-claude backpressures
+        // rather than dropping events) — but ONLY if a listener is here to
+        // reconnect to. Without this the reattached session wedges: the run
+        // pauses forever and the transcript stops flowing. create() + restore()
+        // bind these too. Best-effort + loud: a bind failure leaves the FC
+        // tracked (destroy can still reap it) rather than orphan-leaked.
+        for (label, res) in [
+            (
+                "harness",
+                self.spawn_harness_listener(id, &fc.vsock_uds_base).await,
+            ),
+            (
+                "forge",
+                self.spawn_forge_listener(id, &fc.vsock_uds_base).await,
+            ),
+            (
+                "upload",
+                self.spawn_upload_listener(id, &fc.vsock_uds_base).await,
+            ),
+        ] {
+            if let Err(e) = res {
+                tracing::warn!(
+                    %id,
+                    listener = label,
+                    error = %e,
+                    "reattach: failed to re-bind vsock listener; the guest adapter cannot \
+                     reconnect and the session will wedge until destroyed"
+                );
+            }
         }
 
         tracing::info!(
@@ -1874,6 +1923,9 @@ impl FirecrackerBackend {
                 None,
                 None,
             );
+            // ADR 0044 K2: move FC into the node cgroup so a host-agent pod
+            // restart doesn't `cgroup.kill` it. Cold create = FC only.
+            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &[pid]);
         }
 
         // FC is configured, started, and recorded in its manifest: the
@@ -2648,6 +2700,12 @@ impl FirecrackerBackend {
                     }),
                 uffd_pid,
             );
+            // ADR 0044 K2: move FC AND the uffd handler (Uffd mode) into the
+            // node cgroup — both must survive a host-agent pod restart, or a
+            // killed handler leaves the restored guest page-faulting forever.
+            let mut pids = vec![fc_pid_u];
+            pids.extend(uffd_pid);
+            place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &pids);
         }
         self.sandboxes.insert(
             sandbox_id,
@@ -2960,6 +3018,87 @@ fn persist_sandbox_manifest(
             "sandbox manifest write failed; this sandbox can't be reattached across a \
              host-agent restart (it'll orphan-reap + the session reconciles). VM is fine."
         );
+    }
+}
+
+/// ADR 0044 K2: move the VM's processes (FC + any uffd-handler) into a
+/// node-level cgroup-v2 leaf `<parent>/<sandbox_id>/`, OUT of the
+/// host-agent's own (pod) cgroup, so a pod-scope `cgroup.kill` on
+/// teardown doesn't reap the microVM. `hostPID` alone is insufficient —
+/// it shares the PID namespace, but the FC processes stay in the pod's
+/// cgroup and die with it. Best-effort: returns the error so the caller
+/// can log loudly, but it never aborts create/restore (the VM still
+/// runs; it just won't survive a pod restart on this host).
+#[cfg(target_os = "linux")]
+fn escape_to_node_cgroup(
+    parent: &Path,
+    sandbox_id: SandboxId,
+    pids: &[u32],
+) -> std::io::Result<()> {
+    let dir = parent.join(sandbox_id.to_string());
+    std::fs::create_dir_all(&dir)?;
+    let procs = dir.join("cgroup.procs");
+    for &pid in pids {
+        // cgroup v2: writing a pid to `cgroup.procs` migrates the whole
+        // process (all its threads — FC's vCPU threads included) into
+        // this cgroup. One pid per write.
+        std::fs::write(&procs, pid.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn escape_to_node_cgroup(
+    _parent: &Path,
+    _sandbox_id: SandboxId,
+    _pids: &[u32],
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Place the VM's processes in the node cgroup when one is configured,
+/// logging LOUDLY on failure — a configured-but-failing move means
+/// detach-survival is silently broken on this host, which we want
+/// visible rather than discovered at the next deploy.
+fn place_vm_in_node_cgroup(parent: Option<&Path>, sandbox_id: SandboxId, pids: &[u32]) {
+    let Some(parent) = parent else {
+        return; // dev / MIG / tests: no pod scope to escape.
+    };
+    match escape_to_node_cgroup(parent, sandbox_id, pids) {
+        Ok(()) => tracing::debug!(
+            %sandbox_id,
+            parent = %parent.display(),
+            ?pids,
+            "ADR 0044 K2: moved VM processes to node cgroup (detached from pod scope)"
+        ),
+        Err(e) => tracing::warn!(
+            %sandbox_id,
+            parent = %parent.display(),
+            error = %e,
+            "ADR 0044 K2: FAILED to move VM to a node cgroup; this VM will NOT survive a \
+             host-agent pod restart (detach disabled for it). Requires a privileged \
+             host-agent with /sys/fs/cgroup mounted rw."
+        ),
+    }
+}
+
+/// Remove the per-VM node cgroup leaf [`escape_to_node_cgroup`] created.
+/// `rmdir` of a cgroup only succeeds once it's empty, so `destroy()`
+/// calls this AFTER killing FC + the uffd handler. Best-effort.
+fn remove_node_cgroup(parent: Option<&Path>, sandbox_id: SandboxId) {
+    let Some(parent) = parent else {
+        return;
+    };
+    let dir = parent.join(sandbox_id.to_string());
+    if let Err(e) = std::fs::remove_dir(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(
+                %sandbox_id,
+                path = %dir.display(),
+                error = %e,
+                "ADR 0044 K2: could not remove per-VM node cgroup (non-empty or already gone)"
+            );
+        }
     }
 }
 
@@ -3492,6 +3631,11 @@ impl SandboxBackend for FirecrackerBackend {
                 let _ = wait_for_pid_death(pid, Duration::from_secs(5)).await;
             }
         }
+
+        // ADR 0044 K2: FC + the uffd handler are gone, so the per-VM node
+        // cgroup is now empty — remove it (rmdir of a cgroup only succeeds
+        // once empty). No-op when no `vm_cgroup_parent` is configured.
+        remove_node_cgroup(self.config.vm_cgroup_parent.as_deref(), id);
 
         // Tear down per-VM networking: yank iptables rules tagged
         // with this sandbox's chain comment, delete the TAP, return
@@ -4231,6 +4375,36 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    // ADR 0044 K2: node-cgroup escape helpers. A tempdir stands in for the
+    // cgroup parent — this exercises the leaf-path + pid-write + rmdir logic,
+    // NOT the kernel process-migration (which needs a real cgroupfs and is
+    // dev-vm-validated; on cgroupfs the pid write moves the process).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_cgroup_escape_creates_leaf_and_writes_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        escape_to_node_cgroup(tmp.path(), id, &[4242]).expect("escape");
+        let leaf = tmp.path().join(id.to_string());
+        assert!(leaf.is_dir(), "per-VM leaf cgroup dir created");
+        let procs = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap();
+        assert_eq!(procs.trim(), "4242", "pid written to cgroup.procs");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn node_cgroup_remove_drops_empty_leaf_idempotently() {
+        // Models destroy() after FC + the handler are killed (empty cgroup).
+        let tmp = tempfile::tempdir().unwrap();
+        let id = SandboxId::new();
+        let leaf = tmp.path().join(id.to_string());
+        std::fs::create_dir_all(&leaf).unwrap();
+        remove_node_cgroup(Some(tmp.path()), id);
+        assert!(!leaf.exists(), "empty leaf removed");
+        remove_node_cgroup(Some(tmp.path()), id); // gone → no-op
+        remove_node_cgroup(None, id); // unconfigured → no-op
+    }
+
     /// Default backend for negative-path unit tests: kernel/firecracker
     /// paths point at non-existent files so `create()` fails early at
     /// spec validation rather than trying to spawn anything. The
@@ -4256,6 +4430,7 @@ mod tests {
             uffd_blob_root: None,
             cpu_template: None,
             bundle_dir: dir.path().join("bundles"),
+            vm_cgroup_parent: None,
         };
         (FirecrackerBackend::new(dir.path(), cfg), dir)
     }
