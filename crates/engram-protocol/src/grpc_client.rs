@@ -323,6 +323,32 @@ impl GrpcHostClient {
         Ok(())
     }
 
+    /// ADR 0045 Phase F: freeze the microVM in place.
+    pub async fn pause_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .pause_sandbox(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    /// ADR 0045 Phase F: unfreeze a paused microVM.
+    pub async fn resume_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .resume_sandbox(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
     /// Bundled `start_agent` (ADR 0013 atomicity): the host applies
     /// the egress policy to its proxy registry BEFORE spawning the
     /// agent process. Caller must always pass a policy — the
@@ -817,6 +843,14 @@ impl HostClient for GrpcHostClient {
 
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.interrupt_harness(sandbox_id).await
+    }
+
+    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.pause_sandbox(sandbox_id).await
+    }
+
+    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.resume_sandbox(sandbox_id).await
     }
 
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {

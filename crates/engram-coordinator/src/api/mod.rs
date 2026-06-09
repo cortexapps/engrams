@@ -141,6 +141,9 @@ pub fn router(state: SharedState) -> Router {
             "/admin/sessions/:id/teleport",
             post(admin::teleport_session),
         )
+        // ADR 0045 Phase F: freeze / unfreeze a microVM in place.
+        .route("/admin/sessions/:id/pause", post(admin::pause_session))
+        .route("/admin/sessions/:id/resume", post(admin::resume_session))
         .route("/admin/hosts/:id/cordon", post(admin::cordon_host))
         .route("/admin/hosts/:id/uncordon", post(admin::uncordon_host))
         .route("/admin/hosts/:id/drain", post(admin::drain_host))

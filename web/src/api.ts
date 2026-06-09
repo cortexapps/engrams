@@ -231,6 +231,17 @@ export const teleportSession = (sessionId: string, targetHostId: string) =>
     target_host_id: targetHostId,
   });
 
+// ADR 0045 Phase F: freeze / unfreeze the session's microVM *in place* —
+// admin-only. The guest's vCPUs pause/resume without snapshotting or
+// changing session state (it stays `active`); a paused guest just stops
+// executing until resumed. Note: this `resume` is the in-place unfreeze,
+// NOT the idle-rehydrate at `/sessions/:id/resume`.
+export const pauseSession = (sessionId: string) =>
+  postJSON<{ session_id: string; note: string }>(`/admin/sessions/${sessionId}/pause`, {});
+
+export const resumeSession = (sessionId: string) =>
+  postJSON<{ session_id: string; note: string }>(`/admin/sessions/${sessionId}/resume`, {});
+
 // ---- Settings · Registries ---------------------------------------------
 
 export const fetchRegistries = () =>

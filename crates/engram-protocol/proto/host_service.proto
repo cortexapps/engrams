@@ -36,6 +36,12 @@ service HostService {
   rpc AbortSnapshot(SandboxIdMessage) returns (Empty);
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
+  // ADR 0045 Phase F: freeze / unfreeze a running microVM *in place* —
+  // pause vCPUs without snapshotting, destroying, or changing session
+  // state. An admin affordance to exercise + observe the pause/flush
+  // path; maps to SandboxBackend::pause / ::resume.
+  rpc PauseSandbox(SandboxIdMessage) returns (Empty);
+  rpc ResumeSandbox(SandboxIdMessage) returns (Empty);
 
   // ADR 0020 P1: boot the image to agentd-ready with a stub harness,
   // take a portable FC snapshot (chunked memory + uploaded

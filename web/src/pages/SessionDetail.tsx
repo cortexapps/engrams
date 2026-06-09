@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/select";
 import { useHosts } from "../hooks/useHosts";
 import { useTeleportSession } from "../hooks/useTeleportSession";
+import { usePauseResumeSession } from "../hooks/usePauseResumeSession";
 import { useIsAdmin } from "../auth/AuthProvider";
 import type { Session } from "../types";
 
@@ -160,6 +161,10 @@ function SessionMeta({
       {/* ADR 0045 Phase F: live-migration test surface — relocate this
           session to a chosen host. Admin-only, Active-only. */}
       <TeleportControl session={session} />
+
+      {/* ADR 0045 Phase F: freeze/flush test surface — pause/unfreeze the
+          microVM in place. Admin-only, Active-only. */}
+      <PauseResumeControl session={session} />
     </div>
   );
 }
@@ -217,6 +222,45 @@ function TeleportControl({ session }: { session: Session }) {
           </Button>
         </div>
       )}
+    </div>
+  );
+}
+
+// ADR 0045 Phase F: freeze / unfreeze this session's microVM in place — the
+// admin affordance to drive + observe the pause/flush path. Does not change
+// session state (the row stays `active`), so both buttons are always offered;
+// the operator picks. Admin-only, Active-only.
+function PauseResumeControl({ session }: { session: Session }) {
+  const isAdmin = useIsAdmin();
+  const { pause, resume } = usePauseResumeSession(session.id);
+
+  if (!isAdmin || session.status !== "active") return null;
+
+  return (
+    <div className="border-t pt-4">
+      <Text variant="label" tone="muted" className="mb-2.5 block text-[0.65rem]">
+        freeze
+      </Text>
+      <div className="flex gap-2">
+        <Button
+          size="sm"
+          variant="secondary"
+          className="flex-1"
+          disabled={pause.isPending}
+          onClick={() => pause.mutate()}
+        >
+          {pause.isPending ? "pausing…" : "Pause"}
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          className="flex-1"
+          disabled={resume.isPending}
+          onClick={() => resume.mutate()}
+        >
+          {resume.isPending ? "resuming…" : "Resume"}
+        </Button>
+      </div>
     </div>
   );
 }

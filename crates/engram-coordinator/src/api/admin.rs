@@ -538,6 +538,73 @@ pub async fn teleport_session(
 }
 
 // ---------------------------------------------------------------------
+// ADR 0045 Phase F — pause / resume a microVM in place (the freeze/flush
+// test surface). Thin admin passthroughs to the FC pause/resume
+// primitive: freeze or unfreeze the running guest WITHOUT snapshotting,
+// destroying, or changing session state. The session stays `Active`; a
+// paused guest simply stops executing until resumed. Distinct from
+// teleport/evac (which relocate) and from idle-eviction (which
+// snapshots + suspends to `Idle`).
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct PauseResumeResponse {
+    pub session_id: SessionId,
+    pub note: &'static str,
+}
+
+/// `POST /api/admin/sessions/:id/pause` — freeze the session's running
+/// microVM in place. 409 if the session has no live sandbox (idle / not
+/// yet started).
+pub async fn pause_session(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<PauseResumeResponse>, ApiError> {
+    let sandbox_id = state.registry.get(session_id).ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox to pause — it is idle or not yet started".into(),
+        )
+    })?;
+    state
+        .services
+        .host
+        .pause(sandbox_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("pause sandbox: {e}")))?;
+    tracing::info!(%session_id, %sandbox_id, "admin: froze microVM in place");
+    Ok(Json(PauseResumeResponse {
+        session_id,
+        note: "paused",
+    }))
+}
+
+/// `POST /api/admin/sessions/:id/resume` — unfreeze a `pause`d microVM in
+/// place. Note: this is the *in-place* unfreeze, NOT `/sessions/:id/resume`
+/// (which rehydrates an `Idle` session from a snapshot). 409 if the
+/// session has no live sandbox.
+pub async fn resume_session(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<PauseResumeResponse>, ApiError> {
+    let sandbox_id = state.registry.get(session_id).ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox to resume in place — it is idle or not yet started".into(),
+        )
+    })?;
+    state
+        .services
+        .host
+        .resume(sandbox_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("resume sandbox: {e}")))?;
+    tracing::info!(%session_id, %sandbox_id, "admin: unfroze microVM in place");
+    Ok(Json(PauseResumeResponse {
+        session_id,
+        note: "resumed",
+    }))
+}
+
+// ---------------------------------------------------------------------
 // ADR 0044 K4 — fleet-demand signal for the node-pool autoscaler
 // ---------------------------------------------------------------------
 
