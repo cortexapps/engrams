@@ -1,11 +1,20 @@
 # Runbook: the engrams Firecracker fork (ADR 0045 Phase B)
 
-ADR 0045's golden state (post-copy live migration + `MAP_SHARED` off-pause
-flush) needs a small fork of Firecracker. This runbook is the operational
+ADR 0045's golden state (the unified memory substrate; post-copy live teleport
+rides it) needs a fork of Firecracker. This runbook is the operational
 companion to ADR 0045 Phase B: how the fork is vendored, kept rebased onto
 upstream, built, and consumed — and the steps to **stand it up** (the parts
 that need a fork repo + the dev-vm, which can't be done from the engrams repo
 alone).
+
+> **Surface v2 incoming (ADR 0045 rewrite, 2026-06-09).** The v1 patch surface
+> described below (`shared` File-load flag + `Msync`/`MsyncAndState`) was built
+> for the original Phase D design and is **superseded by the substrate**: ADR
+> 0045 Phase D1 replaces it with shm-backed guest memory + UFFD `MINOR|WP`
+> registration, and repurposes or retires the v1 pieces. The vendoring, build
+> pipeline, R2 diff-guard, and rebase cron documented here all carry forward
+> unchanged. This runbook gets its v2 rewrite with the D1 PR; until then the
+> v1 description below matches what's deployed.
 
 ## The fork, in one paragraph
 
