@@ -16,15 +16,28 @@ OUT="${1:?usage: node-assets-fetch.sh <out-dir>}"
 mkdir -p "$OUT"
 ARCH="$(uname -m)"
 
-FC_VER="${FC_VER:-v1.10.1}"
-echo "==> firecracker ${FC_VER} (${ARCH})"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-curl -fSL --retry 3 --retry-delay 2 "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-${ARCH}.tgz" -o "$tmp/fc.tgz"
-tar -xzf "$tmp/fc.tgz" -C "$tmp"
-fc_bin="$(find "$tmp" -type f -name "firecracker-${FC_VER}-${ARCH}" | head -1)"
-[ -n "$fc_bin" ] || { echo "could not find firecracker binary in the tarball" >&2; exit 1; }
-install -m0755 "$fc_bin" "$OUT/firecracker"
+
+# Firecracker. ADR 0045 Phase B: a pre-staged binary (ENGRAM_FC_SRC — the
+# forked build from the `build-firecracker` CI job, carrying the MAP_SHARED +
+# Msync surface) wins; otherwise download the pinned upstream release. This
+# mirrors the kernel's ENGRAM_KERNEL_SRC override, so the fork plugs in at the
+# same seam without changing the node-assets image contract (still a single
+# `$OUT/firecracker`). With ENGRAM_FC_SRC unset this is identical to before.
+FC_VER="${FC_VER:-v1.10.1}"
+if [ -n "${ENGRAM_FC_SRC:-}" ]; then
+  echo "==> firecracker from ENGRAM_FC_SRC=${ENGRAM_FC_SRC} (forked build)"
+  [ -f "$ENGRAM_FC_SRC" ] || { echo "ENGRAM_FC_SRC is set but not a file: $ENGRAM_FC_SRC" >&2; exit 1; }
+  install -m0755 "$ENGRAM_FC_SRC" "$OUT/firecracker"
+else
+  echo "==> firecracker ${FC_VER} (${ARCH}) from upstream release"
+  curl -fSL --retry 3 --retry-delay 2 "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-${ARCH}.tgz" -o "$tmp/fc.tgz"
+  tar -xzf "$tmp/fc.tgz" -C "$tmp"
+  fc_bin="$(find "$tmp" -type f -name "firecracker-${FC_VER}-${ARCH}" | head -1)"
+  [ -n "$fc_bin" ] || { echo "could not find firecracker binary in the tarball" >&2; exit 1; }
+  install -m0755 "$fc_bin" "$OUT/firecracker"
+fi
 
 REPO="${ENGRAM_KERNEL_REPO:-cortexapps/engrams}"
 TAG="${ENGRAM_KERNEL_TAG:-fc-kernel-6.1.102-1}"

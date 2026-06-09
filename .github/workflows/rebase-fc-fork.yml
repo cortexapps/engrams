@@ -1,0 +1,115 @@
+# ADR 0045 Phase B: keep the engrams Firecracker fork rebased onto upstream.
+#
+# The fork carries a small surface (MAP_SHARED memory backend + `Msync`/
+# `MsyncAndState` snapshot types) on top of a pinned upstream `v1.10.x` tag,
+# vendored into engrams as the `third_party/firecracker` submodule. A long-
+# lived fork only stays cheap if rebasing onto upstream is automated and any
+# conflict is LOUD. Daily this job rebases our patch branch onto the newest
+# upstream tag: on success it pushes the rebased branch (then bump the
+# submodule + run `build-firecracker` to roll the fleet); on conflict it
+# opens/updates a tracking issue and fails (red badge in the README).
+#
+# INERT until the fork is configured: the job no-ops cleanly unless the
+# `FC_FORK_REPO` repository variable is set. So this can land before the fork
+# repo exists without breaking anything.
+name: rebase-fc-fork
+
+on:
+  schedule:
+    # Daily at 06:17 UTC (off the hour to avoid the Actions thundering herd).
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: rebase-fc-fork
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on fork configuration
+        id: gate
+        run: |
+          if [ -z "${FC_FORK_REPO}" ]; then
+            echo "FC_FORK_REPO is unset — the Firecracker fork isn't vendored yet (ADR 0045 Phase B). Skipping cleanly."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          FC_FORK_REPO: ${{ vars.FC_FORK_REPO }}
+
+      - name: Checkout the fork patch branch
+        if: steps.gate.outputs.configured == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.FC_FORK_REPO }}
+          ref: ${{ vars.FC_FORK_BRANCH || 'engram/live-migration' }}
+          token: ${{ secrets.FC_FORK_TOKEN }}
+          fetch-depth: 0
+          path: fc
+
+      - name: Rebase onto the newest upstream tag
+        if: steps.gate.outputs.configured == 'true'
+        id: rebase
+        working-directory: fc
+        run: |
+          set -euo pipefail
+          git config user.name "engrams-bot"
+          git config user.email "noreply@anthropic.com"
+          git remote add upstream https://github.com/firecracker-microvm/firecracker.git
+          git fetch --tags --quiet upstream
+          base="${FC_UPSTREAM_BASE:-v1.10}"
+          latest="$(git tag -l "${base}*" | sort -V | tail -1)"
+          if [ -z "$latest" ]; then
+            echo "no upstream tag matching ${base}*" >&2
+            exit 1
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Rebasing onto upstream $latest"
+          if git rebase "$latest"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort || true
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          FC_UPSTREAM_BASE: ${{ vars.FC_UPSTREAM_BASE }}
+
+      - name: Conflict — open/update a tracking issue, then fail
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.rebase.outputs.latest }}
+          FORK_REPO: ${{ vars.FC_FORK_REPO }}
+          FORK_BRANCH: ${{ vars.FC_FORK_BRANCH || 'engram/live-migration' }}
+        run: |
+          set -euo pipefail
+          title="Firecracker fork: rebase onto ${LATEST} has conflicts"
+          body=$(printf '%s\n' \
+            "The daily \`rebase-fc-fork\` job could not cleanly rebase the engrams Firecracker patch branch onto upstream \`${LATEST}\`." \
+            "" \
+            "Resolve by hand: rebase \`${FORK_BRANCH}\` in \`${FORK_REPO}\` onto \`${LATEST}\`, push, then re-run this workflow. Once green, bump \`third_party/firecracker\` here and let \`build-firecracker\` + the operator roll the fleet. (ADR 0045 Phase B)")
+          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+            --search "in:title Firecracker fork: rebase" --json number -q '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "${GITHUB_REPOSITORY}" --body "$body"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "$title" --body "$body"
+          fi
+          echo "::error::Firecracker fork rebase onto ${LATEST} has conflicts — see the tracking issue."
+          exit 1
+
+      - name: Success — push the rebased branch
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true'
+        working-directory: fc
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin HEAD
+          echo "Rebased onto ${{ steps.rebase.outputs.latest }} and pushed."
+          echo "Next: bump third_party/firecracker in engrams + run build-firecracker to roll the fleet."
