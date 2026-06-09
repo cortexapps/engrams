@@ -446,12 +446,6 @@ pub struct HeartbeatRequest {
     /// `ready_images.contains(digest)`.
     #[serde(default)]
     pub ready_images: Vec<engram_protocol::heartbeat::ManifestDigest>,
-    /// ADR 0018 Phase B: sandbox IDs whose backing `/dev/nbdN` is
-    /// degraded. Coord-side trigger (commit 5) relocates each.
-    /// `#[serde(default)]` so older coords ignore the field on rolling
-    /// upgrade.
-    #[serde(default)]
-    pub nbd_unhealthy: Vec<engram_core::SandboxId>,
     /// ADR 0035: the bake stamp's `drive_id` → sha256 set — which
     /// bundle generation this host image carries as *current*. Ops
     /// visibility (fleet skew mid-roll) + a defensive member of the
@@ -637,7 +631,6 @@ mod tests {
             draining: false,
             host_addr: None,
             ready_images: vec![],
-            nbd_unhealthy: vec![],
             checkpoints: vec![],
             current_bundles: vec![engram_core::types::sandbox::AuxBundleRef {
                 drive_id: "skills".into(),

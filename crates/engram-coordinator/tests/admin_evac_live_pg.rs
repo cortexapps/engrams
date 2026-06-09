@@ -21,7 +21,10 @@
 //!   the receipt carries `EvacLoss::Memory{reason: "source-dead-..."}`.
 //! - `evacuate_dead_source_no_state_returns_no_recoverable` — both
 //!   manifests absent → typed error; PG row stays at HostLost so the
-//!   caller (dead_host.rs / NBD trigger) can drive to Dead.
+//!   caller (the `evac_resumer` scanner, fed by operator drain) can
+//!   surface it. (As of ADR 0045 Phase A the dead-host detector no
+//!   longer calls this — it routes recoverable sessions to Idle and
+//!   the rest to Dead directly; this primitive is drain-only now.)
 
 use std::sync::Arc;
 

@@ -783,11 +783,10 @@ pub async fn apply_rung1_rewind(
 /// - [`resume_from_fc_snapshot`] (user-initiated `/resume` from Idle).
 /// - [`crate::api::admin::evacuate_session`] (operator drain via the
 ///   admin endpoint).
-/// - [`crate::dead_host::evict_host`] (auto-evac on heartbeat loss).
-/// - [`crate::nbd_loss_trigger::process_unhealthy`] (auto-evac on
-///   NBD degradation).
-/// - [`resume_from_created`] dispatcher arm (manual recovery of an
-///   auto-evac'd session).
+/// - [`crate::evac_resumer`] scanner (drives `Evacuating → Created`
+///   for sessions an operator drain marked; ADR 0044 K3).
+/// - [`resume_from_created`] dispatcher arm (manual recovery of a
+///   drained session).
 ///
 /// Preconditions: the session row is at `Created` state, `host_id` +
 /// `sandbox_id` are bound to the target (caller's responsibility).
@@ -1198,8 +1197,8 @@ async fn bind_resumed_session(
 ///   publisher uses to attach session_id to the publish RPC.
 ///
 /// Shared with `bind_resumed_session` (the /resume path); exposed
-/// `pub(crate)` so the admin evac endpoint and the dead_host.rs /
-/// nbd_loss_trigger auto-trigger paths can fire the same shape.
+/// `pub(crate)` so the admin evac endpoint and the `evac_resumer`
+/// scanner (driving operator-drained sessions) can fire the same shape.
 pub(crate) async fn bind_session_routing(
     state: &SharedState,
     id: SessionId,

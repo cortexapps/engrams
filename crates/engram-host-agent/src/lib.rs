@@ -593,12 +593,6 @@ impl HostAgent {
             // (production hosts; dev-process backend lacks both and
             // simply never reports ready).
             let readiness = image_prefetch::ImageReadiness::new();
-            // ADR 0018 Phase B: per-sandbox NBD-loss health signal.
-            // Empty in production until the probe task is wired in a
-            // follow-up commit. Surfaced now so commit 5 (coord-side
-            // trigger) has a wire field to consume and tests can
-            // inject unhealthy ids via an admin endpoint (commit 7).
-            let nbd_health = crate::heartbeat::NbdHealthMonitor::new();
             let enabled_images_tx = match (
                 self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
                 self.chunk_cache.clone(),
@@ -665,7 +659,6 @@ impl HostAgent {
             let pooled_for_heartbeat = pooled.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
-            let nbd_health_for_heartbeat = nbd_health.clone();
             let util_work_dir = self.cfg.work_dir.clone();
             let heartbeat_task = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat_interval);
@@ -735,7 +728,6 @@ impl HostAgent {
                         draining: false,
                         host_addr: host_addr_for_heartbeat.clone(),
                         ready_images: readiness_for_heartbeat.snapshot(),
-                        nbd_unhealthy: nbd_health_for_heartbeat.snapshot(),
                         current_bundles: current_bundles.clone(),
                         checkpoints,
                         utilization,
