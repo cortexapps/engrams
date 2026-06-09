@@ -8,7 +8,7 @@ import {
 import { Thread } from "@/components/assistant-ui/thread";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { sendPrompt, interruptSession } from "../../api";
-import { buildMessages } from "./buildMessages";
+import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
 import type { IndexedEvent, SessionState } from "../../types";
 
@@ -48,8 +48,8 @@ const SEND_BLOCKED: ReadonlySet<SessionState> = new Set<SessionState>([
 
 export function SessionThread({ sessionId, events, status }: SessionThreadProps) {
   const { messages, isRunning } = useMemo(
-    () => buildMessages(events, sessionId),
-    [events, sessionId],
+    () => buildMessages(events, sessionId, status),
+    [events, sessionId, status],
   );
 
   const runtime = useExternalStoreRuntime({
@@ -62,8 +62,12 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
       if (text) await sendPrompt(sessionId, text);
     },
     onCancel: async () => {
+      // Nothing to interrupt once the session is idle/terminal (e.g. it was
+      // idle-evicted mid-run) — the interrupt endpoint would 409 on the
+      // already-unbound sandbox. No-op so the Stop control is honestly inert.
+      if (status && INACTIVE_STATUSES.has(status)) return;
       // The run_interrupted event arrives over SSE and closes the run. A
-      // 409 (no live sandbox) is benign — the run already ended.
+      // 409 (no live sandbox) is still benign — the run may have just ended.
       try {
         await interruptSession(sessionId);
       } catch (err) {

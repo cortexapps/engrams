@@ -1,5 +1,17 @@
 import type { ThreadMessageLike } from "@assistant-ui/react";
-import type { AgentRole, IndexedEvent } from "../../types";
+import type { AgentRole, IndexedEvent, SessionState } from "../../types";
+
+// Session statuses that mean "no turn is in flight" — the authoritative
+// signal that overrides the event stream. A session evicted/terminated
+// mid-run emits no terminal run event, so `runOpen` would otherwise hang the
+// composer on "working…" forever (a dead Stop button). `idle` covers the
+// snapshot/idle-evict case; the rest are terminal.
+export const INACTIVE_STATUSES: ReadonlySet<SessionState> = new Set<SessionState>([
+  "idle",
+  "completed",
+  "failed",
+  "dead",
+]);
 
 // Adapt the session's append-only SSE event stream (ADR 0030) into the
 // assistant-ui message model. This is the successor to Transcript's
@@ -142,7 +154,11 @@ function parseArgs(argsSummary: string | null): Record<string, unknown> {
   }
 }
 
-export function buildMessages(events: IndexedEvent[], sessionId: string): BuildMessagesResult {
+export function buildMessages(
+  events: IndexedEvent[],
+  sessionId: string,
+  status?: SessionState,
+): BuildMessagesResult {
   const out: Draft[] = [];
 
   // The assistant message currently accumulating this run's parts, or null
@@ -406,7 +422,25 @@ export function buildMessages(events: IndexedEvent[], sessionId: string): BuildM
     }
   }
 
-  const isRunning = runOpen || tailAwaiting(out);
+  // Bug fix (mid-turn eviction): the session's authoritative status wins over
+  // the event stream. When a session is evicted/terminated mid-run the server
+  // emits no terminal run event, so `runOpen` / a trailing user turn would hang
+  // the composer on "working…". An inactive session has no live run — finalize
+  // any open assistant message as cut-short so its spinner clears, and veto
+  // `isRunning` so the composer flips back to Send.
+  const sessionInactive = status != null && INACTIVE_STATUSES.has(status);
+  if (sessionInactive && runOpen) {
+    for (let i = out.length - 1; i >= 0; i--) {
+      const m = out[i]!;
+      if (m.role === "assistant" && m.status?.type === "running") {
+        m.status = { type: "incomplete", reason: "cancelled" };
+        break;
+      }
+    }
+    runOpen = false;
+  }
+
+  const isRunning = !sessionInactive && (runOpen || tailAwaiting(out));
 
   // Give the working indicator somewhere to live when we're running but the
   // tail isn't already a running assistant message (e.g. the user just sent
