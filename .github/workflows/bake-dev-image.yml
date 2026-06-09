@@ -61,6 +61,14 @@ jobs:
       # Dockerfile) lives there, not in engrams.
       - name: Checkout image source
         uses: actions/checkout@v6
+        with:
+          # A dogfood Dockerfile may COPY the caller repo (including .git) into
+          # the image so a session does an incremental `git pull` instead of a
+          # full clone. actions/checkout's default persists the CI token in
+          # .git/config (http.extraheader) — that would bake the token into an
+          # image layer. The bake pushes via oras + docker login, never via git,
+          # so it needs no git credentials: drop them so .git rides token-free.
+          persist-credentials: false
 
       - name: Log in to GHCR
         # engram-cli reads ~/.docker/config.json to PULL the built-in harness
