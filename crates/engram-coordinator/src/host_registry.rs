@@ -458,6 +458,47 @@ impl HostRegistry {
         Ok((host_id, entry.value().backend.clone()))
     }
 
+    /// ADR 0046: the ranked candidate hosts for `ctx`, by the same soft
+    /// criteria `pick_for_session` uses — snapshot-affinity first, then any
+    /// ready non-draining host; excludes `exclude_host` and digest-unready
+    /// hosts — but WITHOUT the capacity gate, which moves to the PG
+    /// `reserve_placement` transaction (the only place that can atomically read
+    /// the reserved figure and reserve against it). Empty when nothing is ready.
+    pub fn candidates_for(&self, ctx: &ScheduleContext<'_>) -> Vec<HostId> {
+        let host_is_ready = |host_id: HostId, st: &HostState| {
+            if Some(host_id) == ctx.exclude_host {
+                return false;
+            }
+            if st.draining {
+                return false;
+            }
+            match ctx.required_image_digest.as_ref() {
+                Some(d) => st.ready_images.contains(d),
+                None => true,
+            }
+        };
+        let mut ranked: Vec<HostId> = Vec::new();
+        // 1. snapshot-affinity hosts first (zero-cost hot-tier hit).
+        if let Some(target) = ctx.prefer_snapshot_id {
+            for entry in self.hosts.iter() {
+                let st = entry.value().state.read();
+                if host_is_ready(*entry.key(), &st)
+                    && st.local_snapshots.iter().any(|s| s.snapshot_id == target)
+                {
+                    ranked.push(*entry.key());
+                }
+            }
+        }
+        // 2. then every other ready host.
+        for entry in self.hosts.iter() {
+            let st = entry.value().state.read();
+            if host_is_ready(*entry.key(), &st) && !ranked.contains(entry.key()) {
+                ranked.push(*entry.key());
+            }
+        }
+        ranked
+    }
+
     /// Session scheduler. Inputs the per-host heartbeat state (capacity,
     /// local snapshots, draining, ready_images) and ranks:
     ///
@@ -599,24 +640,30 @@ impl HostRegistry {
         Ok((host_id, sandbox_id))
     }
 
-    /// ADR 0020 P1: restore a per-image base snapshot for a fresh
-    /// session, late-binding the session harness (option-D swap). Like
-    /// `restore_for_session` but the picked host runs the combined
-    /// restore + harness-swap op so `create_session` can route a cold
-    /// create through restore instead of a fresh kernel boot.
-    #[tracing::instrument(name = "coord.restore_base_for_session", skip_all)]
-    pub async fn restore_base_for_session(
+    /// ADR 0046: restore the base snapshot onto an ALREADY-CHOSEN host (picked
+    /// and reserved by the PG `reserve_placement` transaction) rather than
+    /// picking here. Mirrors `restore_base_for_session` minus the pick — the
+    /// capacity decision already happened durably in Postgres.
+    pub async fn restore_base_on_host(
         &self,
-        ctx: &ScheduleContext<'_>,
+        host_id: HostId,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
-    ) -> Result<(HostId, SandboxId), SandboxError> {
-        let (host_id, backend) = self.pick_for_session(ctx)?;
+    ) -> Result<SandboxId, SandboxError> {
+        // The capacity decision already happened in `reserve_placement`; just
+        // resolve the chosen host's backend. NO free-capacity re-gate — that
+        // would wrongly reject a host with no allocatable measurement yet (the
+        // reserve-time fallback host, plus every test fixture / brand-new host).
+        let backend = self
+            .hosts
+            .get(&host_id)
+            .map(|e| e.value().backend.clone())
+            .ok_or_else(|| SandboxError::from(PickError::NoCapacity))?;
         let sandbox_id = backend
             .restore_base_for_session(metadata, session_env)
             .await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
-        Ok((host_id, sandbox_id))
+        Ok(sandbox_id)
     }
 
     /// Look up the host that owns `sandbox_id`. Used by 3d migration

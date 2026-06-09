@@ -96,6 +96,43 @@ pub trait MetadataStore: Send + Sync {
     /// session with an unroutable sandbox.
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
 
+    /// ADR 0046: the fleet's schedulable free memory (MiB) — `Σ over ready /
+    /// draining hosts of max(0, allocatable_mib − Σ reserved session budgets)`.
+    /// This is the REAL demand-pressure signal the K4 autoscaler scales on
+    /// (`/admin/fleet/demand` + the `engram_fleet_free_mib` gauge), replacing the
+    /// phantom in-memory `total − used(=0)` that always read "fleet empty" (why
+    /// it never scaled during the OOM incident). Default impl (mock stores)
+    /// returns 0.
+    async fn fleet_free_mib(&self) -> Result<i64, MetaError> {
+        Ok(0)
+    }
+
+    /// ADR 0046: atomically pick a host from `candidates` (ranked — the
+    /// in-memory affinity/readiness order) and reserve `mem_budget_mib` on it,
+    /// returning the chosen host, or `None` when no candidate has room
+    /// (`total − reserved − residency_floor ≥ mem_budget_mib`). The Postgres
+    /// impl runs under `SELECT … FROM hosts … FOR UPDATE` so concurrent placers
+    /// (any coordinator replica) serialize and a burst can't overcommit; it
+    /// inserts a `pending`, sandbox-less session row as the reservation — later
+    /// finalized by `create_session_created` (an upsert) after boot, or released
+    /// by `delete_pending_session` on boot failure. Default impl (mock stores)
+    /// just returns the first candidate, no capacity check or row insert.
+    async fn reserve_placement(
+        &self,
+        _session_id: SessionId,
+        _spec: &SessionSpec,
+        _mem_budget_mib: i64,
+        candidates: &[HostId],
+    ) -> Result<Option<HostId>, MetaError> {
+        Ok(candidates.first().copied())
+    }
+
+    /// ADR 0046: release a reservation whose boot failed, by deleting its
+    /// `pending`, sandbox-less row. Default impl (mocks) is a no-op.
+    async fn delete_pending_session(&self, _session_id: SessionId) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     /// ADR 0009 reconcile pass: enumerate the `(session_id,
     /// sandbox_id)` pairs for every `status='active'` session
     /// assigned to `host_id` whose `sandbox_id` is populated. The

@@ -39,15 +39,24 @@ impl UtilizationProbe {
     /// returns `cpu_pct = 0` because there's no prior sample to diff
     /// against; subsequent calls report utilization over the interval
     /// since the previous call.
-    pub fn sample(&mut self, work_dir: &Path) -> HostUtilization {
+    pub fn sample(&mut self, work_dir: &Path, guest_pss_mib: u64) -> HostUtilization {
         let (disk_total_mib, disk_used_mib) = disk_mib(work_dir);
         let (mem_total_mib, mem_used_mib) = mem_mib();
         let cpu_pct = self.cpu_pct();
+        // ADR 0046: allocatable = MemAvailable + Σ guest-resident (PSS).
+        // MemAvailable (= mem_total − mem_used) already nets out the daemon, OS,
+        // chunk cache, and the mlock'd base-memfile residency; adding back the
+        // running VMs' resident memory lets placement subtract each session's
+        // FULL budget without double-counting what the VMs already occupy.
+        let allocatable_mib = mem_total_mib
+            .saturating_sub(mem_used_mib)
+            .saturating_add(guest_pss_mib);
         HostUtilization {
             disk_total_mib,
             disk_used_mib,
             mem_total_mib,
             mem_used_mib,
+            allocatable_mib,
             cpu_pct,
         }
     }
@@ -187,11 +196,11 @@ mod tests {
     fn first_cpu_sample_is_zero_then_subsequent_are_bounded() {
         let mut probe = UtilizationProbe::new();
         // First sample establishes the baseline → 0 regardless of platform.
-        let first = probe.sample(Path::new("."));
+        let first = probe.sample(Path::new("."), 0);
         assert_eq!(first.cpu_pct, 0.0);
         // Second sample must stay within [0, 100] on every platform
         // (0 on non-Linux where there's no /proc).
-        let second = probe.sample(Path::new("."));
+        let second = probe.sample(Path::new("."), 0);
         assert!((0.0..=100.0).contains(&second.cpu_pct));
     }
 

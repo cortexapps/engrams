@@ -816,10 +816,12 @@ async fn create_session_inner(
 
     let (host_id, sandbox_id) = try_restore_base_snapshot(
         &state,
+        session_id,
         base_snapshot_id,
         &image_repo,
         &image_tag,
         memory_mib,
+        &spec,
         // Per-session sandbox env (manifest env + resolved secrets +
         // ENGRAM_SESSION_*). The shared base snapshot can't carry it, so
         // it's injected into the restored sandbox (cold-create baked it
@@ -1103,12 +1105,17 @@ fn base_working_set_blob_key(
         .map(|m| engram_chunk_store::working_set::TraceRef::canonical(m.manifest_id).storage_key())
 }
 
+// Cohesive base-restore + reserve-at-pick context; bundling into a struct would
+// just move the arg list. (ADR 0046 added session_id + spec for reservation.)
+#[allow(clippy::too_many_arguments)]
 async fn try_restore_base_snapshot(
     state: &SharedState,
+    session_id: engram_core::SessionId,
     snapshot_id: engram_core::types::SnapshotId,
     image_repo: &str,
     image_tag: &str,
     memory_mib: u32,
+    spec: &engram_core::types::SessionSpec,
     session_env: HashMap<String, String>,
 ) -> Result<(engram_core::HostId, engram_core::SandboxId), engram_core::SandboxError> {
     let record = state
@@ -1164,10 +1171,42 @@ async fn try_restore_base_snapshot(
         required_image_digest: None,
         exclude_host: None,
     };
-    state
-        .host_registry
-        .restore_base_for_session(&ctx, metadata, session_env)
+    // ADR 0046: reserve at pick. Rank candidates in-memory (affinity /
+    // readiness), then atomically pick + reserve in Postgres so a concurrent
+    // burst can't overcommit a host. The `pending` reservation row is finalized
+    // by `create_session_created` (an upsert) after boot, or released below on
+    // boot failure.
+    let candidates = state.host_registry.candidates_for(&ctx);
+    let host_id = match state
+        .services
+        .meta
+        .reserve_placement(session_id, spec, memory_mib as i64, &candidates)
         .await
+        .map_err(|e| engram_core::SandboxError::Snapshot(format!("reserve_placement: {e}")))?
+    {
+        Some(h) => h,
+        // No candidate has room — surfaces as the same 503 a pick miss does.
+        None => return Err(crate::host_registry::PickError::NoCapacity.into()),
+    };
+    match state
+        .host_registry
+        .restore_base_on_host(host_id, metadata, session_env)
+        .await
+    {
+        Ok(sandbox_id) => Ok((host_id, sandbox_id)),
+        Err(e) => {
+            // Boot failed — release the reservation (delete the pending row).
+            // Best-effort; the reconcile backstop reaps a stuck pending row.
+            if let Err(del) = state.services.meta.delete_pending_session(session_id).await {
+                tracing::warn!(
+                    %session_id,
+                    error = %del,
+                    "delete_pending_session after boot failure failed; reconcile will reap",
+                );
+            }
+            Err(e)
+        }
+    }
 }
 
 /// ADR 0031: inject the initiating user's saved Claude Code OAuth token into

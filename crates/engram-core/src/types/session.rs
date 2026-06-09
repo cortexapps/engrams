@@ -104,6 +104,39 @@ pub enum SessionState {
 }
 
 impl SessionState {
+    /// ADR 0046: states in which the session has a live VM resident on its host
+    /// and therefore holds a memory reservation. Excludes `Idle` (sandbox torn
+    /// down to a snapshot), `HostLost` (host gone), and the terminal states. The
+    /// reservation is held across the *entire* eviction — the snapshot can take
+    /// minutes (#147) and the VM is resident the whole time — and released only
+    /// at teardown to `Idle`/terminal. A paused VM keeps status `Active`, so it
+    /// stays reserved.
+    pub fn reserves_host_memory(&self) -> bool {
+        matches!(
+            self,
+            Self::Pending
+                | Self::Created
+                | Self::GuestReady
+                | Self::Active
+                | Self::Evacuating
+                | Self::Evicting
+        )
+    }
+
+    /// SQL-literal twin of [`Self::reserves_host_memory`], for the
+    /// `status IN (…)` reservation aggregate. Kept in lockstep with the matcher
+    /// by `reserving_states_match` (test).
+    pub const fn host_memory_reserving_states() -> &'static [&'static str] {
+        &[
+            "pending",
+            "created",
+            "guest_ready",
+            "active",
+            "evacuating",
+            "evicting",
+        ]
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",

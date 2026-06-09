@@ -614,23 +614,34 @@ pub struct FleetDemandResponse {
     pub ready_hosts: u32,
     /// Non-draining hosts the scheduler can place on.
     pub schedulable_hosts: u32,
-    /// Σ (total_mib − used_mib) over schedulable hosts — the headroom.
+    /// ADR 0046: Σ max(0, allocatable_mib − reserved) over schedulable hosts —
+    /// the host-measured headroom (nets out the daemon/OS/chunk-cache/mlock
+    /// baseline), the autoscaler's true demand signal.
     pub free_mib: u64,
     /// Σ total_mib over schedulable hosts — lets the caller derive the
     /// average per-host capacity (how much one node adds).
     pub total_mib: u64,
 }
 
-/// `GET /api/admin/fleet/demand` — the K4 node-pool autoscaler's input.
-/// Schedulable host count + free/total guest-RAM reservation, read from the
-/// in-memory registry. The coordinator is single-replica (ADR 0044), so that
-/// registry is the whole fleet.
+/// `GET /api/admin/fleet/demand` — the K4 node-pool autoscaler's input. Host
+/// counts come from the in-memory registry; `free_mib` is the host-measured
+/// allocatable minus reserved session budgets (PG, ADR 0046) so the autoscaler
+/// scales on true demand rather than the phantom `total − used(=0)`.
 pub async fn fleet_demand(State(state): State<SharedState>) -> Json<FleetDemandResponse> {
     let m = state.host_registry.fleet_metrics();
+    // On a transient query failure, fall back to total (treat as "no pressure";
+    // scale-down hysteresis rides out a single tick).
+    let free_mib = state
+        .services
+        .meta
+        .fleet_free_mib()
+        .await
+        .map(|f| f.max(0) as u64)
+        .unwrap_or(m.total_mib);
     Json(FleetDemandResponse {
         ready_hosts: m.ready_hosts,
         schedulable_hosts: m.schedulable_hosts,
-        free_mib: m.free_mib,
+        free_mib,
         total_mib: m.total_mib,
     })
 }
