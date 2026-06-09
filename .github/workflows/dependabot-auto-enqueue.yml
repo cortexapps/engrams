@@ -60,7 +60,7 @@ jobs:
     steps:
       - name: Determine eligibility
         id: gate
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const run = context.payload.workflow_run;
@@ -146,7 +146,7 @@ jobs:
       - name: Generate App token
         if: steps.gate.outputs.enqueue == 'true'
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.AUTOMERGE_APP_ID }}
           private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
