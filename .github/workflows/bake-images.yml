@@ -56,6 +56,7 @@ jobs:
       tf_or_helm: ${{ steps.lanes.outputs.tf_or_helm }}
       bundles: ${{ steps.lanes.outputs.bundles }}
       dev_image: ${{ steps.lanes.outputs.dev_image }}
+      fc_fork: ${{ steps.lanes.outputs.fc_fork }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -254,6 +255,126 @@ jobs:
           fi
           echo "Published host-binaries -> $REPO:{$SHA,$SHORT}"
 
+  # ADR 0045 Phase B: build the FORKED Firecracker (the third_party/firecracker
+  # submodule — our MAP_SHARED + Msync/MsyncAndState surface on a pinned upstream
+  # tag) as a static-musl binary and publish it to GHCR as an OCI artifact keyed
+  # by the FORK's commit SHA. publish-node-assets pulls it (by that SHA) and
+  # stages it as /opt/engram/firecracker via ENGRAM_FC_SRC — replacing the
+  # upstream-release download, with the node-assets image contract unchanged.
+  #
+  # Gated on the fc_fork lane (the submodule pointer moved), so the heavy FC
+  # compile runs ONLY when the fork actually changes; because the artifact is
+  # content-keyed by the fork SHA, every other node-assets bake reuses it. The
+  # daily rebase cron (ADR 0045 Phase B M4) bumps the submodule, which trips this
+  # lane and rolls the new binary through the existing node-assets → host fleet.
+  build-firecracker:
+    needs: detect
+    if: needs.detect.outputs.fc_fork == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    concurrency:
+      group: bake-firecracker-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          # The forked FC source lives in the submodule; fetch it. (Only THIS job
+          # checks out submodules — every other job stays on a bare checkout so it
+          # never pays the FC clone.)
+          submodules: recursive
+
+      - name: Resolve fork SHA + R2 snapshot-compat guard
+        id: fork
+        working-directory: third_party/firecracker
+        run: |
+          set -euo pipefail
+          FC_SHA="$(git rev-parse HEAD)"
+          echo "fc_sha=$FC_SHA" >> "$GITHUB_OUTPUT"
+          # R2 (ADR 0045 Phase B): the fork MUST stay snapshot-wire-compatible
+          # with stock FC — it must not touch the snapshot (de)serialization or
+          # bump SNAPSHOT_VERSION, so stock<->fork Full/Diff snapshots restore
+          # both directions (mixed fleets during a roll are then safe by
+          # construction). Compare against the upstream base tag the fork sits on
+          # (robust across the M4 auto-rebases, which move the base forward).
+          git fetch --tags --quiet origin || true
+          BASE="$(git describe --tags --abbrev=0)"
+          echo "Fork base tag: $BASE"
+          if ! git diff --quiet "$BASE"..HEAD -- src/vmm/src/snapshot/; then
+            echo "::error::R2 guard: the fork modifies src/vmm/src/snapshot/ — the snapshot wire format may diverge from stock FC. See ADR 0045 Phase B."
+            exit 1
+          fi
+          if ! grep -q 'SNAPSHOT_VERSION: Version = Version::new(4, 0, 0)' src/vmm/src/persist.rs; then
+            echo "::error::R2 guard: SNAPSHOT_VERSION changed in the fork — stock<->fork restore would break."
+            exit 1
+          fi
+          echo "R2 guard OK: snapshot/ untouched, SNAPSHOT_VERSION unchanged."
+
+      - name: Install FC build deps (cmake, clang, musl, kernel uapi headers)
+        # FC's firecracker binary pulls aws-lc-sys (needs cmake) and
+        # userfaultfd-sys (needs <linux/*.h> + bindgen/clang). Unlike
+        # publish-host-binaries we must NOT inject `-I/usr/include` globally: it
+        # leaks glibc headers into aws-lc-sys's musl build (redundant-decl
+        # -Werror). Instead expose ONLY the libc-agnostic kernel uapi dirs into
+        # musl's own sysroot, so userfaultfd-sys finds the headers and aws-lc-sys
+        # stays clean.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake clang musl-tools linux-libc-dev
+          MUSL_INC=/usr/include/x86_64-linux-musl
+          sudo ln -sfn /usr/include/linux               "$MUSL_INC/linux"
+          sudo ln -sfn /usr/include/asm-generic         "$MUSL_INC/asm-generic"
+          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm "$MUSL_INC/asm"
+
+      - name: Build forked firecracker (static musl, FC's pinned toolchain)
+        working-directory: third_party/firecracker
+        # No rust-toolchain action: cargo in this dir honors FC's own
+        # rust-toolchain.toml (it pins the exact rustc and lists the musl
+        # targets, which rustup auto-installs), so the fork builds with its
+        # blessed toolchain regardless of what engrams pins. Don't override it.
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          # bindgen (userfaultfd-sys) parses headers with libclang — point it at
+          # the system uapi headers. This is a separate step from the cc/musl
+          # compile, so it does not affect aws-lc-sys.
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+        run: |
+          set -euo pipefail
+          cargo build -p firecracker --release --target x86_64-unknown-linux-musl
+          BIN=build/cargo_target/x86_64-unknown-linux-musl/release/firecracker
+          file "$BIN" | grep -q "statically linked"
+          "$BIN" --version
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          install -m0755 "$BIN" "$GITHUB_WORKSPACE/dist/firecracker"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Publish forked firecracker to GHCR (oras), keyed by fork SHA
+        working-directory: dist
+        env:
+          FC_SHA: ${{ steps.fork.outputs.fc_sha }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${{ github.repository }}/firecracker"
+          # Tag by the FORK commit SHA (not the engrams SHA) so the artifact is
+          # reused across every engrams commit that doesn't move the submodule.
+          # `oras pull <repo>/firecracker:<fc-sha>` drops the binary into cwd.
+          oras push "$REPO:$FC_SHA" \
+            --artifact-type application/vnd.engrams.firecracker.v1 \
+            firecracker:application/octet-stream
+          echo "Published forked firecracker -> $REPO:$FC_SHA"
+
   # Compile the ops CLI + the in-guest agentd ONCE — the exact, CI-tested
   # binaries — and publish them to GHCR as an OCI artifact keyed by SHA. The
   # reusable bake-dev-image.yml workflow (and any consuming repo's dev-image
@@ -348,14 +469,16 @@ jobs:
   # publish-bundles so the bundle-*:main tags node-assets-fetch.sh pulls are
   # this run's.
   publish-node-assets:
-    needs: [detect, publish-bundles]
+    needs: [detect, publish-bundles, build-firecracker]
     if: |
       always() &&
       (needs.detect.outputs.images == 'true'
         || needs.detect.outputs.bundles == 'true'
         || github.event_name == 'workflow_dispatch') &&
       needs.publish-bundles.result != 'failure' &&
-      needs.publish-bundles.result != 'cancelled'
+      needs.publish-bundles.result != 'cancelled' &&
+      needs.build-firecracker.result != 'failure' &&
+      needs.build-firecracker.result != 'cancelled'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     concurrency:
@@ -380,13 +503,34 @@ jobs:
 
       - uses: oras-project/setup-oras@v1
 
-      # Stage firecracker (public release) + the engram guest kernel (this
-      # repo's own private release asset — GITHUB_TOKEN/contents:read reads it)
-      # + the RO session bundles (oras-pulled from bundle-*:main) into the
-      # build context.
+      # ADR 0045 Phase B: pull the FORKED firecracker binary that build-firecracker
+      # published, keyed by the submodule's gitlink SHA. We read that SHA straight
+      # from the tree (git ls-tree) — no submodule fetch/clone needed here. The
+      # artifact is guaranteed to exist: any commit that moves the submodule trips
+      # the fc_fork lane, which runs build-firecracker before this job; commits
+      # that DON'T move it reuse the artifact already published for that SHA.
+      - name: Stage the forked firecracker binary
+        id: fcfork
+        run: |
+          set -euo pipefail
+          FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
+          if [ -z "$FC_SHA" ]; then
+            echo "::error::no third_party/firecracker submodule gitlink found"; exit 1
+          fi
+          echo "Forked firecracker @ $FC_SHA"
+          mkdir -p fc-fork
+          oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output fc-fork
+          chmod +x fc-fork/firecracker
+          echo "src=$PWD/fc-fork/firecracker" >> "$GITHUB_OUTPUT"
+
+      # Stage the forked firecracker (ENGRAM_FC_SRC wins over the upstream-release
+      # download) + the engram guest kernel (this repo's own private release asset
+      # — GITHUB_TOKEN/contents:read reads it) + the RO session bundles (oras-pulled
+      # from bundle-*:main) into the build context.
       - name: Stage firecracker + guest kernel + bundles
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENGRAM_FC_SRC: ${{ steps.fcfork.outputs.src }}
         run: bash docker/node-assets-fetch.sh node-assets-ctx
 
       - uses: docker/setup-buildx-action@v3
