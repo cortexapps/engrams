@@ -298,6 +298,7 @@ jobs:
             --test checkpoint_reconcile_live_pg \
             --test enable_jobs_live_pg \
             --test enable_reuse_live_pg \
+            --test placement_reservation_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
