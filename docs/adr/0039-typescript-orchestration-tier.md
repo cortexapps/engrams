@@ -550,6 +550,51 @@ Separate logical DBs even when co-located.
   into the orchestrator or stays in the browser; migration sequencing (strangler
   vs big-bang).
 
+## Preparation: pin current session behavior before the cut
+
+Do this **first**, before any orchestrator code. The migration rewrites what
+sits under the UI — transport (SSE → Connect server-streaming, §8), the auth
+front door (§5), and the number of hops a stream crosses (one → two, §9) —
+while intending to leave *user-observable session behavior unchanged*. That
+intent is only worth something if it is a runnable assertion. So we lock today's
+behavior into an end-to-end characterization net now, against the **current
+two-tier stack**, and re-run it unchanged after the cut: green against three
+tiers means the seam preserved the contract.
+
+**Shape.** A local Playwright suite (`web/e2e/`) driving the real stack
+(`just dev`) — *not* mocked. It creates a session through the UI on a
+**no-harness / shell-only demo image**, so it needs no Claude token and runs no
+live agent (the deterministic path `deploy/dev/integration-session.sh` already
+bakes + enables that image idempotently). The suite is black-box at the browser,
+which is exactly why it survives the migration: it asserts what the user sees,
+not how the bytes arrive.
+
+**The invariant it pins** (one linear journey): land on `/` with no login →
+`+ new session` → `start →` → the URL becomes `/sessions/<id>` → the event count
+**climbs above zero** (the stream is live) → status advances toward `active` →
+the RAW tab renders event rows → the SHELL tab's WebSocket connects → the new
+row appears in the session list. Every one of these must hold identically
+whether the event feed underneath is today's hand-parsed `sse.ts` or tomorrow's
+server-streaming RPC, and whether it crosses one relay hop or two (§9).
+
+**Mechanics.** A global setup gates on three preconditions, each failing fast
+with its own fix-it line: web up on `:5173`, the control plane's health check
+green, and ≥1 enabled image (else "run `just integration-session` once" — we do
+**not** auto-bake a multi-minute image build into the test run). Traces,
+screenshots, and video are retained on failure: those artifacts are what let an
+agent self-diagnose a red run. A handful of `data-testid`s on the session row,
+the event count, and the tab buttons keep the selectors stable against copy
+drift.
+
+**Scope, honestly.** A no-harness session emits lifecycle events but no agent
+turns, so this validates the *plumbing* — create, navigate, list/detail render,
+stream flow, lifecycle, shell connect — not transcript *message* rendering,
+which stays on the `Transcript.test.tsx` unit tests with fixture events. And one
+step does change across the cut: the suite currently rides `SyntheticAdmin` (no
+login), which §5 removes — post-migration its entry step re-points at a
+better-auth dev session. The behavioral assertions are untouched; only how the
+suite gets in the door moves.
+
 ## Appendix: request flows
 
 ### A. Human chat (web UI) — near-term
