@@ -226,6 +226,27 @@ describe("buildMessages — message/part shaping", () => {
     expect((a.metadata?.custom?.run as RunFooter).interrupted).toBe(true);
   });
 
+  test("an open run on an inactive session (idle-evicted mid-run) is not running", () => {
+    // run_started with no terminal run event — the wedge case. The
+    // authoritative session.status closes it.
+    const open: SessionEvent[] = [
+      { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+      { type: "exec_started", exec_id: "x1", command: ["cargo", "test"], at: AT },
+    ];
+    // Without a status the event stream alone keeps it "running" (today's bug
+    // surface) — and idle wins.
+    expect(buildMessages(indexed(open), SID).isRunning).toBe(true);
+    expect(buildMessages(indexed(open), SID, "active").isRunning).toBe(true);
+
+    const evicted = buildMessages(indexed(open), SID, "idle");
+    expect(evicted.isRunning).toBe(false);
+    // The open assistant message's spinner is finalized as cut-short, and no
+    // trailing "pending" running placeholder is appended.
+    const a = real(evicted.messages)[0]!;
+    expect(a.status).toEqual({ type: "incomplete", reason: "cancelled" });
+    expect(evicted.messages.some((m) => m.id === "pending")).toBe(false);
+  });
+
   test("snapshot / resumed become durability system markers", () => {
     const { messages } = buildMessages(
       indexed([
