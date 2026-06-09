@@ -189,6 +189,15 @@ impl Principal {
                 .to_string()
         })
     }
+
+    /// True when this is the machine/service principal, identified by the
+    /// configured `service_email`. Used to skip git `[user]` attribution
+    /// (ADR 0031): the service email is not a real commit author — injecting it
+    /// makes GitHub reject a squash-merge — and only human-initiated sessions
+    /// should be attributed.
+    pub fn is_service(&self, service_email: &str) -> bool {
+        self.email == service_email
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +237,24 @@ mod tests {
             ..p
         };
         assert_eq!(named.git_name(), "Ada Lovelace");
+    }
+
+    #[test]
+    fn is_service_matches_only_the_configured_service_email() {
+        let svc = Principal {
+            user_id: UserId::new(),
+            email: "service@engram.local".into(),
+            display_name: Some("Engram Service".into()),
+            role: Role::Admin,
+            active: true,
+        };
+        assert!(svc.is_service("service@engram.local"));
+        assert!(!svc.is_service("ada@example.com"));
+        // A human (different email) is never the service principal, even as admin.
+        let human = Principal {
+            email: "ada@example.com".into(),
+            ..svc
+        };
+        assert!(!human.is_service("service@engram.local"));
     }
 }
