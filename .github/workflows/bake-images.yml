@@ -290,6 +290,12 @@ jobs:
           # submodule fetch authenticates.
           submodules: recursive
           token: ${{ secrets.GH_TOKEN }}
+          # Full history (main repo AND the submodule) so the R2 guard's
+          # `git describe` can walk the fork HEAD back to its upstream base tag.
+          # A shallow (depth-1) submodule has no ancestry, so describe finds no
+          # tag. build-firecracker runs rarely (fork bumps only), so the cost is
+          # fine.
+          fetch-depth: 0
 
       - name: Resolve fork SHA + R2 snapshot-compat guard
         id: fork
@@ -304,10 +310,12 @@ jobs:
           # both directions (mixed fleets during a roll are then safe by
           # construction). Compare against the upstream base tag the fork sits on
           # (robust across the M4 auto-rebases, which move the base forward).
-          # The submodule fetch may not include tags, so git describe can't find
-          # the base. Try the (authenticated) fork origin first, then fall back to
-          # upstream firecracker-microvm (public, no auth) for the release tags.
-          git fetch --tags --quiet origin || true
+          # `git describe` needs full history + the release tags. Deepen the
+          # submodule if checkout left it shallow, fetch tags from the
+          # (authenticated) fork origin, then fall back to upstream
+          # firecracker-microvm (public, no auth) if the tags still aren't found.
+          git fetch --tags --unshallow --quiet origin 2>/dev/null \
+            || git fetch --tags --quiet origin 2>/dev/null || true
           BASE="$(git describe --tags --abbrev=0 2>/dev/null || true)"
           if [ -z "$BASE" ]; then
             git fetch --tags --quiet https://github.com/firecracker-microvm/firecracker.git || true
@@ -341,6 +349,21 @@ jobs:
           sudo ln -sfn /usr/include/linux               "$MUSL_INC/linux"
           sudo ln -sfn /usr/include/asm-generic         "$MUSL_INC/asm-generic"
           sudo ln -sfn /usr/include/x86_64-linux-gnu/asm "$MUSL_INC/asm"
+
+      - name: Ensure rustup (FC's rust-toolchain.toml drives the toolchain)
+        # We deliberately don't use a rust-toolchain action (it would set a
+        # default that competes with FC's pinned toolchain). Just guarantee
+        # rustup exists with NO default toolchain, so cargo-in-the-submodule
+        # auto-installs the exact rustc + musl target FC's rust-toolchain.toml
+        # pins. (Matches the dev-vm setup that built this fork.)
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          "$HOME/.cargo/bin/rustup" --version 2>/dev/null || rustup --version
 
       - name: Build forked firecracker (static musl, FC's pinned toolchain)
         working-directory: third_party/firecracker
