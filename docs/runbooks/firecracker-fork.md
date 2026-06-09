@@ -96,12 +96,33 @@ file for post-copy) require. We host this ourselves rather than depend on
      glibc headers into `aws-lc-sys`'s musl build. Instead symlink only the
      libc-agnostic kernel uapi dirs (`linux/`, `asm/`, `asm-generic/`) into
      musl's sysroot, and keep `BINDGEN_EXTRA_CLANG_ARGS` for bindgen.
-4. **Enable the rebase cron + automated tracking (Phase B M4).** Set repo vars
-   `FC_FORK_REPO` (`cortexapps/firecracker`), `FC_FORK_BRANCH`
-   (`engram/live-migration`), `FC_UPSTREAM_BASE` (`v1` floor), and secret
-   `FC_FORK_TOKEN`. The enhanced cron tracks the newest stable upstream release
-   across major/minor/patch, rebases + build-verifies, and auto-opens & merges
-   an engrams submodule-bump PR (loud badge/issue on any failure).
+4. **Activate the automated-tracking cron (Phase B M4).** `rebase-fc-fork.yml`
+   is the self-maintaining loop: daily it picks the newest **stable** upstream
+   release (`vX.Y.Z`, semver-max across **all** majors by default), rebases the
+   patch branch onto it, **build-verifies** (static musl) *before* pushing — so
+   a broken rebase never clobbers the good branch — then opens an engrams
+   submodule-bump PR labeled `fc-fork-bump`, approves it (different identity),
+   and enables auto-merge. `auto-enqueue.yml` enqueues it on green (the rulesets
+   workaround, reusing the `engrams-automerge` App). Every green bump
+   auto-merges, majors included. A rebase **conflict** or a clean-rebase **build
+   break** is loud: a tracking issue + a red run (README badge).
+   - **To go live, set just two repo vars** — `FC_FORK_REPO`
+     (`cortexapps/firecracker`) + `FC_FORK_BRANCH` (`engram/live-migration`).
+     **No new secret:** the fork checkout + push reuse the existing cross-org
+     `GH_TOKEN` (the same PAT build-firecracker's submodule checkout uses — it
+     reads the INTERNAL fork and pushes the rebased branch), and the engrams bump
+     PR reuses the `AUTOMERGE_APP_*` App. `FC_UPSTREAM_BASE` is **optional** —
+     leave it unset to track all majors; set it to a tag prefix to pin a line
+     (`v1.` — trailing dot — stays on v1.x and won't auto-jump to v2.0). (Once
+     the fork goes public the read is tokenless, but the push still needs auth.)
+   - **First activation is a catch-up jump.** The fork sits on `v1.10.1` (prod
+     parity); the newest stable is many releases ahead. The first cron run will
+     try to rebase across that whole gap — likely a conflict or build break that
+     files the tracking issue. That's expected: do the catch-up rebase by hand
+     once (port the surface to the current API, confirm the build), push, and
+     from then on the cron handles each incremental release automatically. (Bump
+     `FC_VER` in `node-assets-fetch.sh` is no longer needed — the fork IS the
+     binary now.)
 5. **Risk R2 — snapshot wire-format compat.** ✅ Preserved by construction (see
    the note above): the fork never touches `src/vmm/src/snapshot/` and never
    bumps `SNAPSHOT_VERSION`, so stock↔fork Full/Diff snapshots restore both

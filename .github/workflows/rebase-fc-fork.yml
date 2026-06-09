@@ -1,17 +1,28 @@
-# ADR 0045 Phase B: keep the engrams Firecracker fork rebased onto upstream.
+# ADR 0045 Phase B (M4): keep the engrams Firecracker fork current with upstream
+# — automatically, across every stable release (major/minor/patch), so we ride
+# CVE fixes without anyone watching the FC release feed.
 #
-# The fork carries a small surface (MAP_SHARED memory backend + `Msync`/
-# `MsyncAndState` snapshot types) on top of a pinned upstream `v1.10.x` tag,
-# vendored into engrams as the `third_party/firecracker` submodule. A long-
-# lived fork only stays cheap if rebasing onto upstream is automated and any
-# conflict is LOUD. Daily this job rebases our patch branch onto the newest
-# upstream tag: on success it pushes the rebased branch (then bump the
-# submodule + run `build-firecracker` to roll the fleet); on conflict it
-# opens/updates a tracking issue and fails (red badge in the README).
+# Daily this job:
+#   1. Picks the newest STABLE upstream tag at/above the floor (no -dev/-rc),
+#      across all majors/minors/patches. Idempotent: it no-ops once the fork is
+#      already on that tag (so it won't re-act while a bump PR is in flight).
+#   2. Rebases our ~1-commit patch branch onto that tag. A CONFLICT is loud:
+#      tracking issue + red (README badge), no force-push of a broken branch.
+#   3. BUILD-VERIFIES the rebased fork (static-musl `cargo build -p firecracker`)
+#      BEFORE pushing — the patch surface is tiny but upstream API drift can
+#      break it; a build break is loud (tracking issue + red) and the good fork
+#      branch is never force-pushed to a non-compiling state.
+#   4. On a clean, building rebase: force-pushes the fork branch, then opens an
+#      engrams submodule-bump PR (labeled `fc-fork-bump`) via the engrams-automerge
+#      App, approves it from a different identity, and enables auto-merge. The
+#      PR's CI (build-firecracker + the stock<->fork compat test + the FC suite)
+#      is the final gate; on green, auto-enqueue.yml enqueues it (the
+#      rulesets auto-merge workaround) and it merges — rolling the new FC through
+#      the existing node-assets -> host-fleet pipeline. Every green bump
+#      auto-merges, majors included; the build + compat gate is the safety net.
 #
-# INERT until the fork is configured: the job no-ops cleanly unless the
-# `FC_FORK_REPO` repository variable is set. So this can land before the fork
-# repo exists without breaking anything.
+# INERT until configured: no-ops cleanly unless the `FC_FORK_REPO` repo variable
+# is set, so it can live on main before the fork is stood up.
 name: rebase-fc-fork
 
 on:
@@ -23,17 +34,23 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: write
 
 concurrency:
   group: rebase-fc-fork
   cancel-in-progress: false
 
 jobs:
-  rebase:
-    runs-on: ubuntu-latest
+  track-and-bump:
+    # Needs to compile Firecracker for the build-verify, so use the same
+    # runner class as build-firecracker.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
     steps:
       - name: Gate on fork configuration
         id: gate
+        env:
+          FC_FORK_REPO: ${{ vars.FC_FORK_REPO }}
         run: |
           if [ -z "${FC_FORK_REPO}" ]; then
             echo "FC_FORK_REPO is unset — the Firecracker fork isn't vendored yet (ADR 0045 Phase B). Skipping cleanly."
@@ -41,51 +58,77 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
-        env:
-          FC_FORK_REPO: ${{ vars.FC_FORK_REPO }}
 
       - name: Checkout the fork patch branch
         if: steps.gate.outputs.configured == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.FC_FORK_REPO }}
           ref: ${{ vars.FC_FORK_BRANCH || 'engram/live-migration' }}
-          token: ${{ secrets.FC_FORK_TOKEN }}
+          # The cross-org GH_TOKEN (the same PAT build-firecracker's submodule
+          # checkout + the notify job use) — it can READ the INTERNAL fork AND
+          # PUSH the rebased patch branch back. persist-credentials keeps it
+          # configured for the `git push` below. (Once the fork is public the
+          # read is tokenless, but the push still needs write auth.)
+          token: ${{ secrets.GH_TOKEN }}
+          # Full history + tags so `git describe` can find the fork's base tag
+          # and the rebase has the upstream commits to replay onto.
           fetch-depth: 0
           path: fc
 
-      - name: Rebase onto the newest upstream tag
+      - name: Find the newest upstream stable tag
         if: steps.gate.outputs.configured == 'true'
+        id: target
+        working-directory: fc
+        env:
+          FC_UPSTREAM_BASE: ${{ vars.FC_UPSTREAM_BASE }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/firecracker-microvm/firecracker.git 2>/dev/null || true
+          git fetch --tags --quiet upstream
+          # Track the newest STABLE upstream release — `vX.Y.Z`, dropping
+          # -dev/-rc/etc. — by semver-max, across ALL majors by default (so a
+          # future v2.0.0 is tracked: you chose to auto-merge majors). Set
+          # FC_UPSTREAM_BASE to a tag prefix to PIN a line and not auto-jump a
+          # major — e.g. `v1.` stays on v1.x (note the trailing dot; bare `v1`
+          # would also match v10.x/v11.x).
+          PREFIX="${FC_UPSTREAM_BASE:-v}"
+          latest="$(git tag -l "${PREFIX}*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          if [ -z "$latest" ]; then
+            echo "::error::no stable upstream tag matching ${PREFIX}*"; exit 1
+          fi
+          base="$(git describe --tags --abbrev=0)"
+          echo "Fork base: $base | newest upstream stable: $latest"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$base" ]; then
+            echo "uptodate=true" >> "$GITHUB_OUTPUT"
+            echo "Fork already on the newest stable tag — nothing to do."
+          else
+            echo "uptodate=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase onto the newest stable tag
+        if: steps.gate.outputs.configured == 'true' && steps.target.outputs.uptodate == 'false'
         id: rebase
         working-directory: fc
         run: |
           set -euo pipefail
           git config user.name "engrams-bot"
           git config user.email "noreply@anthropic.com"
-          git remote add upstream https://github.com/firecracker-microvm/firecracker.git
-          git fetch --tags --quiet upstream
-          base="${FC_UPSTREAM_BASE:-v1.10}"
-          latest="$(git tag -l "${base}*" | sort -V | tail -1)"
-          if [ -z "$latest" ]; then
-            echo "no upstream tag matching ${base}*" >&2
-            exit 1
-          fi
-          echo "latest=$latest" >> "$GITHUB_OUTPUT"
-          echo "Rebasing onto upstream $latest"
-          if git rebase "$latest"; then
+          echo "Rebasing onto ${{ steps.target.outputs.latest }}"
+          if git rebase "${{ steps.target.outputs.latest }}"; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             git rebase --abort || true
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
-        env:
-          FC_UPSTREAM_BASE: ${{ vars.FC_UPSTREAM_BASE }}
 
       - name: Conflict — open/update a tracking issue, then fail
         if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LATEST: ${{ steps.rebase.outputs.latest }}
+          LATEST: ${{ steps.target.outputs.latest }}
           FORK_REPO: ${{ vars.FC_FORK_REPO }}
           FORK_BRANCH: ${{ vars.FC_FORK_BRANCH || 'engram/live-migration' }}
         run: |
@@ -94,7 +137,7 @@ jobs:
           body=$(printf '%s\n' \
             "The daily \`rebase-fc-fork\` job could not cleanly rebase the engrams Firecracker patch branch onto upstream \`${LATEST}\`." \
             "" \
-            "Resolve by hand: rebase \`${FORK_BRANCH}\` in \`${FORK_REPO}\` onto \`${LATEST}\`, push, then re-run this workflow. Once green, bump \`third_party/firecracker\` here and let \`build-firecracker\` + the operator roll the fleet. (ADR 0045 Phase B)")
+            "Resolve by hand: rebase \`${FORK_BRANCH}\` in \`${FORK_REPO}\` onto \`${LATEST}\`, push, then re-run this workflow. Once green it bumps \`third_party/firecracker\` here and auto-merges. (ADR 0045 Phase B)")
           existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
             --search "in:title Firecracker fork: rebase" --json number -q '.[0].number // empty')
           if [ -n "$existing" ]; then
@@ -105,11 +148,144 @@ jobs:
           echo "::error::Firecracker fork rebase onto ${LATEST} has conflicts — see the tracking issue."
           exit 1
 
-      - name: Success — push the rebased branch
+      # ── Build-verify the rebased fork BEFORE pushing it ──────────────────────
+      # Same env as build-firecracker (bake-images.yml): FC pulls aws-lc-sys
+      # (cmake) + userfaultfd-sys (kernel uapi headers into musl's sysroot, NOT a
+      # global -I/usr/include which breaks aws-lc-sys), and its own pinned
+      # rust-toolchain.toml governs (just ensure rustup, don't override it).
+      - name: Install FC build deps
         if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake clang musl-tools linux-libc-dev
+          MUSL_INC=/usr/include/x86_64-linux-musl
+          sudo ln -sfn /usr/include/linux               "$MUSL_INC/linux"
+          sudo ln -sfn /usr/include/asm-generic         "$MUSL_INC/asm-generic"
+          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm "$MUSL_INC/asm"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Build-verify the rebased fork (static musl)
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true'
+        id: build
+        working-directory: fc
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+        run: |
+          set -euo pipefail
+          if cargo build -p firecracker --release --target x86_64-unknown-linux-musl; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build break — open/update a tracking issue, then fail
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.target.outputs.latest }}
+          FORK_REPO: ${{ vars.FC_FORK_REPO }}
+          FORK_BRANCH: ${{ vars.FC_FORK_BRANCH || 'engram/live-migration' }}
+        run: |
+          set -euo pipefail
+          title="Firecracker fork: clean rebase onto ${LATEST} no longer compiles"
+          body=$(printf '%s\n' \
+            "\`rebase-fc-fork\` rebased the engrams Firecracker patch branch onto upstream \`${LATEST}\` with NO conflicts, but \`cargo build -p firecracker\` then failed — upstream drifted the API the ~5-file MAP_SHARED/Msync surface touches." \
+            "" \
+            "Fix by hand: in \`${FORK_REPO}\` rebase \`${FORK_BRANCH}\` onto \`${LATEST}\`, port the surface to the new API, confirm \`cargo build -p firecracker --release --target x86_64-unknown-linux-musl\`, push, then re-run this workflow. (ADR 0045 Phase B)")
+          existing=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open \
+            --search "in:title Firecracker fork: clean rebase" --json number -q '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "${GITHUB_REPOSITORY}" --body "$body"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "$title" --body "$body"
+          fi
+          echo "::error::Firecracker fork rebased clean onto ${LATEST} but no longer compiles — see the tracking issue."
+          exit 1
+
+      # ── Clean + building rebase: push the fork, open the engrams bump PR ─────
+      - name: Push the rebased fork branch
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'true'
         working-directory: fc
         run: |
           set -euo pipefail
           git push --force-with-lease origin HEAD
-          echo "Rebased onto ${{ steps.rebase.outputs.latest }} and pushed."
-          echo "Next: bump third_party/firecracker in engrams + run build-firecracker to roll the fleet."
+          echo "Rebased onto ${{ steps.target.outputs.latest }} and pushed; fork HEAD=$(git rev-parse HEAD)"
+
+      # The engrams-automerge App (contents:write + pull_requests:write, scoped to
+      # this repo) authors the bump branch + PR and enables auto-merge — the same
+      # App auto-enqueue.yml uses to enqueue under rulesets.
+      - name: Generate App token (engrams bump PR)
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.AUTOMERGE_APP_ID }}
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+
+      - name: Checkout engrams (App identity)
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'true'
+        uses: actions/checkout@v6
+        with:
+          path: engrams
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Open the submodule-bump PR + enable auto-merge
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'true'
+        working-directory: engrams
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          APPROVE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.target.outputs.latest }}
+        run: |
+          set -euo pipefail
+          FORK_SHA="$(git -C ../fc rev-parse HEAD)"
+          BRANCH="fc-fork-bump-${LATEST}"
+          git config user.name "engrams-bot"
+          git config user.email "noreply@anthropic.com"
+
+          # Already handled? (a prior run's bump PR is still open). The fork is
+          # already on $LATEST after the push above, so the next daily run no-ops
+          # via uptodate; this guards a same-day re-dispatch.
+          if GH_TOKEN="$APP_TOKEN" gh pr list --head "$BRANCH" --state open --json number -q '.[0].number' | grep -q '[0-9]'; then
+            echo "A bump PR for $BRANCH is already open — nothing to do."
+            exit 0
+          fi
+
+          # The label is the handle auto-enqueue.yml keys on; create
+          # it once if it doesn't exist yet.
+          GH_TOKEN="$APP_TOKEN" gh label create fc-fork-bump \
+            --color 1d76db --description "Automated Firecracker-fork upstream bump (ADR 0045 Phase B)" \
+            2>/dev/null || true
+
+          git checkout -b "$BRANCH"
+          # Point the submodule gitlink at the new fork SHA WITHOUT fetching the
+          # submodule contents (a gitlink is just a commit pointer).
+          git update-index --cacheinfo "160000,${FORK_SHA},third_party/firecracker"
+          git commit -m "build(deps): bump firecracker fork to upstream ${LATEST}
+
+          Auto-generated by rebase-fc-fork: the patch branch was rebased onto
+          upstream ${LATEST}, build-verified (static musl) in the cron, and
+          pushed. This bumps the third_party/firecracker submodule to the rebased
+          fork SHA ${FORK_SHA}. On merge, build-firecracker rebuilds it and the
+          R2 diff-guard re-checks snapshot wire-compat before node-assets bakes.
+          (ADR 0045 Phase B M4)"
+          GH_TOKEN="$APP_TOKEN" git push -u origin "$BRANCH"
+
+          url=$(GH_TOKEN="$APP_TOKEN" gh pr create --base main --head "$BRANCH" \
+            --label fc-fork-bump \
+            --title "build(deps): bump firecracker fork to upstream ${LATEST}" \
+            --body "Automated Firecracker-fork bump to upstream \`${LATEST}\` (ADR 0045 Phase B M4). The patch branch rebased cleanly onto \`${LATEST}\` and **build-verified (static musl)** in \`rebase-fc-fork\` before this PR opened; this bumps the submodule. On merge, build-firecracker rebuilds the fork and the R2 diff-guard re-checks stock↔fork snapshot wire-compat before node-assets bakes — and the fleet roll stays gated on the engrams-internal nodeAssetsImage bump. Auto-merges on green; review only to hold a major.")
+          echo "Opened $url"
+
+          # Approve from github-actions[bot] (a DIFFERENT identity than the App
+          # that authored the PR — required by the 1-approval ruleset), then
+          # enable auto-merge. auto-enqueue.yml enqueues it on green.
+          GH_TOKEN="$APPROVE_TOKEN" gh pr review --approve "$url" \
+            --body "Auto-approved: automated FC-fork bump, build-verified; CI re-builds + re-proves compat before merge."
+          GH_TOKEN="$APP_TOKEN" gh pr merge --auto --squash "$url"

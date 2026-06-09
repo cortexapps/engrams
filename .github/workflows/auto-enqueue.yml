@@ -1,21 +1,28 @@
-name: Dependabot auto-enqueue
+name: Auto-enqueue green PRs
 
-# Why this exists, separate from dependabot-auto-merge.yml:
+# Enqueues green, auto-merge-enabled PRs into the merge queue — the rulesets
+# auto-merge workaround. Serves two producers that enable auto-merge elsewhere:
+#   - Dependabot patch/minor bumps (enabled by dependabot-auto-merge.yml), and
+#   - automated Firecracker-fork upstream bumps labeled `fc-fork-bump` (opened +
+#     auto-merge-enabled by rebase-fc-fork.yml, ADR 0045 Phase B M4).
+# Same mechanism for both; the eligibility gate below scopes to them.
+#
+# Why this exists:
 #   GitHub's native auto-merge only enqueues a PR into the merge queue
 #   on the pending->success transition of its required checks. On this
 #   repo every merge requirement comes from rulesets (classic branch
 #   protection was deleted for the queue migration), and auto-merge's
 #   enqueue trigger does not fire under rulesets — so an approved,
-#   green Dependabot PR sits forever with auto-merge "enabled" but is
-#   never enqueued (observed on PR #59). Known GitHub limitation, no
-#   ETA: community discussions #162623 and #190610.
+#   green PR sits forever with auto-merge "enabled" but is never
+#   enqueued (observed on PR #59). Known GitHub limitation, no ETA:
+#   community discussions #162623 and #190610.
 #
 #   Fix: when CI completes, re-check that every required status check
 #   is green and enqueue the PR ourselves via the GraphQL
 #   `enqueuePullRequest` mutation.
 #
 # Trigger choice — `workflow_run`, NOT `auto_merge_enabled`:
-#   dependabot-auto-merge.yml enables auto-merge *early*, while checks
+#   The auto-merge enablers turn auto-merge on *early*, while checks
 #   are still pending, so an `auto_merge_enabled` trigger would fire
 #   too soon and find nothing green. `workflow_run` fires when CI
 #   finishes — exactly when "are we green yet?" can first be true.
@@ -47,7 +54,7 @@ permissions:
 
 jobs:
   enqueue:
-    name: Enqueue green Dependabot PR
+    name: Enqueue green auto-merge PR
     runs-on: ubuntu-latest
     # Only PR-triggered CI runs that themselves passed: a failed run
     # can't lead to a merge, and push/merge_group runs aren't PRs. The
@@ -78,17 +85,22 @@ jobs:
               return;
             }
 
-            // Scope strictly to Dependabot PRs that already have
-            // auto-merge enabled. dependabot-auto-merge.yml only
-            // enables it for patch/minor bumps, so a null auto_merge
-            // means the semver gate intentionally left this for a
-            // human — respect that and do not enqueue.
-            if (pr.user.login !== 'dependabot[bot]') {
-              core.info(`PR #${pr.number} not authored by Dependabot — skipping.`);
+            // Scope to PRs that already have auto-merge enabled and are either:
+            //  - Dependabot PRs (dependabot-auto-merge.yml enables auto-merge only
+            //    for patch/minor, so a null auto_merge = the semver gate left it
+            //    for a human), or
+            //  - automated Firecracker-fork bumps (labeled `fc-fork-bump`),
+            //    opened + auto-merge-enabled by rebase-fc-fork.yml after the cron
+            //    rebased + build-verified the fork (ADR 0045 Phase B M4).
+            // Same enqueue mechanism for both — the rulesets auto-merge workaround.
+            const isDependabot = pr.user.login === 'dependabot[bot]';
+            const isForkBump = (pr.labels || []).some(l => l.name === 'fc-fork-bump');
+            if (!isDependabot && !isForkBump) {
+              core.info(`PR #${pr.number} is neither a Dependabot nor an fc-fork-bump PR — skipping.`);
               return;
             }
             if (!pr.auto_merge) {
-              core.info(`PR #${pr.number} has no auto-merge enabled — skipping (semver gate left it for a human).`);
+              core.info(`PR #${pr.number} has no auto-merge enabled — skipping (gate left it for a human).`);
               return;
             }
 
