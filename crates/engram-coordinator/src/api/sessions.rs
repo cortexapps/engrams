@@ -323,8 +323,13 @@ pub(crate) async fn resolve_session_env(
             match rt.users.get_user(engram_core::UserId(uuid)).await {
                 Ok(user) => {
                     let principal = user.to_principal();
-                    env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-                    env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+                    // Git [user] attribution is human-initiated sessions only —
+                    // the service principal's service_email isn't a valid commit
+                    // author (GitHub rejects the squash-merge).
+                    if !principal.is_service(&rt.config.service_email) {
+                        env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
+                        env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+                    }
                     let harness = bundle.as_ref().and_then(|b| b.manifest.harness.as_ref());
                     inject_user_claude_token(state, &principal, harness, session.mode, &mut env)
                         .await;
@@ -728,9 +733,17 @@ async fn create_session_inner(
     session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
 
     // ADR 0031: attribute git commits inside the session to the initiating
-    // user. `render_gitconfig` writes these into `/etc/gitconfig [user]`.
-    session_env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-    session_env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+    // user. `render_gitconfig` writes these into `/etc/gitconfig [user]`. Skip
+    // the service principal: its service_email isn't a valid commit author, so
+    // injecting it makes GitHub reject the squash-merge.
+    if !state
+        .auth
+        .as_ref()
+        .is_some_and(|rt| principal.is_service(&rt.config.service_email))
+    {
+        session_env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
+        session_env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+    }
 
     // ADR 0031: for built-in Claude sessions, auto-inject the user's saved
     // Claude Code OAuth token — we never prompt per-session. Best-effort: a
