@@ -284,8 +284,12 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           # The forked FC source lives in the submodule; fetch it. (Only THIS job
           # checks out submodules — every other job stays on a bare checkout so it
-          # never pays the FC clone.)
+          # never pays the FC clone.) The default GITHUB_TOKEN is scoped to THIS
+          # repo, so it can't read the INTERNAL cortexapps/firecracker submodule —
+          # use the cross-org GH_TOKEN (same PAT the notify job uses) so the
+          # submodule fetch authenticates.
           submodules: recursive
+          token: ${{ secrets.GH_TOKEN }}
 
       - name: Resolve fork SHA + R2 snapshot-compat guard
         id: fork
@@ -300,8 +304,16 @@ jobs:
           # both directions (mixed fleets during a roll are then safe by
           # construction). Compare against the upstream base tag the fork sits on
           # (robust across the M4 auto-rebases, which move the base forward).
+          # The submodule fetch may not include tags, so git describe can't find
+          # the base. Try the (authenticated) fork origin first, then fall back to
+          # upstream firecracker-microvm (public, no auth) for the release tags.
           git fetch --tags --quiet origin || true
-          BASE="$(git describe --tags --abbrev=0)"
+          BASE="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -z "$BASE" ]; then
+            git fetch --tags --quiet https://github.com/firecracker-microvm/firecracker.git || true
+            BASE="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          fi
+          [ -n "$BASE" ] || { echo "::error::R2 guard: could not determine the fork's upstream base tag"; exit 1; }
           echo "Fork base tag: $BASE"
           if ! git diff --quiet "$BASE"..HEAD -- src/vmm/src/snapshot/; then
             echo "::error::R2 guard: the fork modifies src/vmm/src/snapshot/ — the snapshot wire format may diverge from stock FC. See ADR 0045 Phase B."
