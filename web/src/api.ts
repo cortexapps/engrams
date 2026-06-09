@@ -222,6 +222,15 @@ export const sendPrompt = (sessionId: string, text: string) =>
 export const interruptSession = (sessionId: string) =>
   postJSON<{ session_id: string; note: string }>(`/sessions/${sessionId}/interrupt`, {});
 
+// ADR 0045 Phase F: teleport (live-migrate) an Active session to a chosen
+// host. Admin-only. Today it rides the snapshot-rehome evac pipeline; the
+// same verb becomes post-copy live migration once ADR 0045 Phase C lands.
+// The session flips to `evacuating`, then resumes `active` on the target.
+export const teleportSession = (sessionId: string, targetHostId: string) =>
+  postJSON<{ session_id: string; status: string }>(`/admin/sessions/${sessionId}/teleport`, {
+    target_host_id: targetHostId,
+  });
+
 // ---- Settings · Registries ---------------------------------------------
 
 export const fetchRegistries = () =>

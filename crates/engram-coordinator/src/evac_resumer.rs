@@ -179,6 +179,9 @@ async fn advance_one(
                 );
             }
         }
+        // Gave up relocating — drop any teleport pin so a later manual
+        // /resume isn't constrained to the (evidently unavailable) target.
+        state.teleport_targets.remove(&session_id);
         return Ok(());
     }
 
@@ -224,12 +227,18 @@ async fn run_resume_pipeline(
     // there fails structurally rather than burning the budget.
     let cold_boot_spec = resolve_cold_boot_spec(&state.services.meta, &session).await;
 
+    // ADR 0045 Phase F: an operator-pinned teleport destination, if any.
+    // Honored strictly (a bad pin retries then falls back to Idle, never
+    // silently lands elsewhere); cleared below once the session resolves.
+    let require_host = state.teleport_targets.get(&session_id).map(|e| *e.value());
+
     let receipt = match evacuate_dead_source(
         &state.host_registry,
         &state.services.meta,
         session.clone(),
         snapshot,
         cold_boot_spec,
+        require_host,
     )
     .await
     {
@@ -278,10 +287,15 @@ async fn run_resume_pipeline(
                     );
                 }
             }
+            // Session left Evacuating terminally — drop any teleport pin.
+            state.teleport_targets.remove(&session_id);
             return Ok(());
         }
         Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
     };
+
+    // Resolved onto a peer (Created) — the teleport pin is consumed.
+    state.teleport_targets.remove(&session_id);
 
     tracing::info!(
         %session_id,

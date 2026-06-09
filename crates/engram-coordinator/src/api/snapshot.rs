@@ -550,6 +550,7 @@ async fn resume_disk_only_cold_boot(
         relocatable,
         None,
         Some(spec),
+        None,
     )
     .await
     .map_err(|e| match &e {

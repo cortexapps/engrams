@@ -429,6 +429,15 @@ pub struct AppState {
     /// the session's `GitForge`. Cleared at terminal. In-memory (one
     /// `--mode=all` process); PG-backed is the multi-pod follow-on.
     pub git_broker_tokens: Arc<dashmap::DashMap<SessionId, String>>,
+    /// ADR 0045 Phase F (teleport): operator-pinned relocation targets
+    /// (session → destination host). Set by `POST .../sessions/:id/teleport`
+    /// before the session is marked `Evacuating`; the `evac_resumer`
+    /// scanner reads it to place on that exact host instead of the
+    /// capacity-ranked pick, and clears it once the session leaves
+    /// `Evacuating` (resolved or fell back to Idle). In-memory — the
+    /// coordinator is single-replica (ADR 0044); a coord restart loses
+    /// pending pins, which degrade to a standard any-peer move.
+    pub teleport_targets: Arc<dashmap::DashMap<SessionId, HostId>>,
     /// ADR 0023: the configured git forge authority (GitHub App, etc).
     /// Set on `main`'s run path via `run_with_registry_and_local`;
     /// `None` in tests and when `--git-forge` is unset (the forge
@@ -487,6 +496,7 @@ impl AppState {
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
             pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
+            teleport_targets: Arc::new(dashmap::DashMap::new()),
             forge: None,
             auth: None,
         }

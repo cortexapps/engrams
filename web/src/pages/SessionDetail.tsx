@@ -13,6 +13,17 @@ import { MetricRow } from "../components/MetricRow";
 import { relativeTime } from "./sessions/session-format";
 import { Sidebar, SidebarContent, SidebarProvider } from "@/components/ui/sidebar";
 import { Text } from "@/components/ui/text";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useHosts } from "../hooks/useHosts";
+import { useTeleportSession } from "../hooks/useTeleportSession";
+import { useIsAdmin } from "../auth/AuthProvider";
 import type { Session } from "../types";
 
 type ViewTab = "transcript" | "shell" | "raw";
@@ -145,6 +156,67 @@ function SessionMeta({
           <DurabilityTimeline sessionId={sessionId} />
         </div>
       </div>
+
+      {/* ADR 0045 Phase F: live-migration test surface — relocate this
+          session to a chosen host. Admin-only, Active-only. */}
+      <TeleportControl session={session} />
+    </div>
+  );
+}
+
+// ADR 0045 Phase F: teleport (live-migrate) an Active session onto a chosen
+// host. Today the verb rides the snapshot-rehome evac pipeline (a brief
+// pause); ADR 0045 Phase C swaps it to post-copy live migration under the
+// same control. Renders nothing unless the viewer is an admin and the
+// session is Active (the only relocatable state).
+function TeleportControl({ session }: { session: Session }) {
+  const isAdmin = useIsAdmin();
+  const { data: hosts } = useHosts();
+  const teleport = useTeleportSession(session.id);
+  const [target, setTarget] = useState<string>("");
+
+  if (!isAdmin || session.status !== "active") return null;
+
+  const candidates = (hosts ?? []).filter((h) => h.status === "ready" && h.id !== session.host_id);
+
+  return (
+    <div className="border-t pt-4">
+      <Text variant="label" tone="muted" className="mb-2.5 block text-[0.65rem]">
+        teleport
+      </Text>
+      {candidates.length === 0 ? (
+        <Text tone="muted" className="text-xs">
+          no other ready host available
+        </Text>
+      ) : (
+        <div className="space-y-2">
+          <Select value={target} onValueChange={setTarget}>
+            <SelectTrigger className="h-8 text-xs">
+              <SelectValue placeholder="destination host…" />
+            </SelectTrigger>
+            <SelectContent>
+              {candidates.map((h) => {
+                const freeGib = ((h.capacity_total_mib - h.capacity_used_mib) / 1024).toFixed(1);
+                const label = h.hostname || h.id.slice(0, 8);
+                return (
+                  <SelectItem key={h.id} value={h.id} className="text-xs">
+                    {label} · {freeGib} GiB free · {h.running_sandboxes} vm
+                  </SelectItem>
+                );
+              })}
+            </SelectContent>
+          </Select>
+          <Button
+            size="sm"
+            variant="secondary"
+            className="w-full"
+            disabled={!target || teleport.isPending}
+            onClick={() => teleport.mutate(target)}
+          >
+            {teleport.isPending ? "teleporting…" : "Teleport"}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

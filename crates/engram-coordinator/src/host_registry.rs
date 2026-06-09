@@ -429,6 +429,35 @@ impl HostRegistry {
         self.pick_any()
     }
 
+    /// ADR 0045 Phase F (teleport): place onto a **specific** host
+    /// instead of the capacity-ranked pick. Used by operator-pinned
+    /// teleport — the operator chose the destination, so we validate
+    /// it's a legal target (registered, not draining, not the source,
+    /// has free capacity) and return its backend, or a `PickError`
+    /// describing why it can't take the session. Not image-readiness
+    /// gated (like `pick_capture_host`): a target missing the image
+    /// lazy-materializes the rootfs from BlobStorage during restore.
+    pub fn pick_specific_host(
+        &self,
+        host_id: HostId,
+        exclude_host: Option<HostId>,
+    ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
+        if Some(host_id) == exclude_host {
+            // The chosen target is the source host — nowhere to go.
+            return Err(PickError::NoCapacity);
+        }
+        let entry = self.hosts.get(&host_id).ok_or(PickError::NoCapacity)?;
+        let st = entry.value().state.read();
+        if st.draining {
+            return Err(PickError::NoCapacity);
+        }
+        let free = st.capacity.total_mib.saturating_sub(st.capacity.used_mib);
+        if free == 0 {
+            return Err(PickError::NoCapacity);
+        }
+        Ok((host_id, entry.value().backend.clone()))
+    }
+
     /// Session scheduler. Inputs the per-host heartbeat state (capacity,
     /// local snapshots, draining, ready_images) and ranks:
     ///
@@ -1513,6 +1542,66 @@ mod tests {
             Err(other) => panic!("expected NoCapacity, got {other:?}"),
             Ok(_) => panic!("expected an error when the only host is excluded"),
         }
+    }
+
+    /// ADR 0045 Phase F: `pick_specific_host` honors an operator-pinned
+    /// teleport target and rejects every illegal destination (the source
+    /// itself, unknown, draining, full).
+    #[test]
+    fn pick_specific_host_validates_the_pinned_target() {
+        fn ready_state(total: u64, used: u64, draining: bool) -> HostState {
+            HostState {
+                capacity: HostCapacityReport {
+                    total_mib: total,
+                    used_mib: used,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining,
+                ready_images: Default::default(),
+                current_bundles: Vec::new(),
+                utilization: Default::default(),
+            }
+        }
+
+        let reg = stub_registry();
+        let (b_src, _d0) = dummy_backend();
+        let (b_tgt, _d1) = dummy_backend();
+        let source = HostId::new();
+        let target = HostId::new();
+        reg.register(source, b_src);
+        reg.register(target, b_tgt);
+        reg.update_state(source, ready_state(64_000, 0, false));
+        reg.update_state(target, ready_state(64_000, 0, false));
+
+        // Happy path: a healthy target that isn't the source.
+        let (picked, _) = reg
+            .pick_specific_host(target, Some(source))
+            .expect("healthy pinned target should be accepted");
+        assert_eq!(picked, target);
+
+        // The pin is the source host → nowhere to go.
+        assert!(matches!(
+            reg.pick_specific_host(source, Some(source)),
+            Err(PickError::NoCapacity)
+        ));
+        // Unknown host id.
+        assert!(matches!(
+            reg.pick_specific_host(HostId::new(), Some(source)),
+            Err(PickError::NoCapacity)
+        ));
+        // Draining target.
+        reg.update_state(target, ready_state(64_000, 0, true));
+        assert!(matches!(
+            reg.pick_specific_host(target, Some(source)),
+            Err(PickError::NoCapacity)
+        ));
+        // Full target (no free capacity).
+        reg.update_state(target, ready_state(64_000, 64_000, false));
+        assert!(matches!(
+            reg.pick_specific_host(target, Some(source)),
+            Err(PickError::NoCapacity)
+        ));
     }
 
     #[tokio::test]
