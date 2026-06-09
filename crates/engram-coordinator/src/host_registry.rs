@@ -458,6 +458,47 @@ impl HostRegistry {
         Ok((host_id, entry.value().backend.clone()))
     }
 
+    /// ADR 0046: the ranked candidate hosts for `ctx`, by the same soft
+    /// criteria `pick_for_session` uses — snapshot-affinity first, then any
+    /// ready non-draining host; excludes `exclude_host` and digest-unready
+    /// hosts — but WITHOUT the capacity gate, which moves to the PG
+    /// `reserve_placement` transaction (the only place that can atomically read
+    /// the reserved figure and reserve against it). Empty when nothing is ready.
+    pub fn candidates_for(&self, ctx: &ScheduleContext<'_>) -> Vec<HostId> {
+        let host_is_ready = |host_id: HostId, st: &HostState| {
+            if Some(host_id) == ctx.exclude_host {
+                return false;
+            }
+            if st.draining {
+                return false;
+            }
+            match ctx.required_image_digest.as_ref() {
+                Some(d) => st.ready_images.contains(d),
+                None => true,
+            }
+        };
+        let mut ranked: Vec<HostId> = Vec::new();
+        // 1. snapshot-affinity hosts first (zero-cost hot-tier hit).
+        if let Some(target) = ctx.prefer_snapshot_id {
+            for entry in self.hosts.iter() {
+                let st = entry.value().state.read();
+                if host_is_ready(*entry.key(), &st)
+                    && st.local_snapshots.iter().any(|s| s.snapshot_id == target)
+                {
+                    ranked.push(*entry.key());
+                }
+            }
+        }
+        // 2. then every other ready host.
+        for entry in self.hosts.iter() {
+            let st = entry.value().state.read();
+            if host_is_ready(*entry.key(), &st) && !ranked.contains(entry.key()) {
+                ranked.push(*entry.key());
+            }
+        }
+        ranked
+    }
+
     /// Session scheduler. Inputs the per-host heartbeat state (capacity,
     /// local snapshots, draining, ready_images) and ranks:
     ///
@@ -617,6 +658,24 @@ impl HostRegistry {
             .await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok((host_id, sandbox_id))
+    }
+
+    /// ADR 0046: restore the base snapshot onto an ALREADY-CHOSEN host (picked
+    /// and reserved by the PG `reserve_placement` transaction) rather than
+    /// picking here. Mirrors `restore_base_for_session` minus the pick — the
+    /// capacity decision already happened durably in Postgres.
+    pub async fn restore_base_on_host(
+        &self,
+        host_id: HostId,
+        metadata: SnapshotMetadata,
+        session_env: std::collections::HashMap<String, String>,
+    ) -> Result<SandboxId, SandboxError> {
+        let (_, backend) = self.pick_specific_host(host_id, None)?;
+        let sandbox_id = backend
+            .restore_base_for_session(metadata, session_env)
+            .await?;
+        self.sandbox_owner.insert(sandbox_id, host_id);
+        Ok(sandbox_id)
     }
 
     /// Look up the host that owns `sandbox_id`. Used by 3d migration
