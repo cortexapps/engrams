@@ -454,6 +454,89 @@ pub async fn evacuate_session(
     ))
 }
 
+#[derive(serde::Deserialize)]
+pub struct TeleportSessionRequest {
+    /// The destination host to relocate the session onto.
+    pub target_host_id: engram_core::HostId,
+}
+
+/// `POST /api/admin/sessions/:id/teleport` — relocate an Active session
+/// to a **chosen** host. ADR 0045 Phase F: the operator/test surface for
+/// live migration. Today it rides the snapshot-rehome evac pipeline
+/// (pause → flush → snapshot → restore on the pinned host, ~seconds of
+/// downtime); ADR 0045 Phase C swaps the implementation to post-copy
+/// live teleport (~10ms) under this same verb, so the surface is stable.
+///
+/// Pre: Active session with a bound sandbox; `target_host_id` is a
+/// schedulable host that isn't the source. Post: 202; the session is
+/// marked `Evacuating` with the target pinned in `state.teleport_targets`,
+/// and the `evac_resumer` scanner resumes it on that exact host.
+pub async fn teleport_session(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+    Json(req): Json<TeleportSessionRequest>,
+) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
+    let session = state.services.meta.get_session(session_id).await?;
+    if !matches!(session.status, engram_core::types::SessionState::Active) {
+        return Err(ApiError::Conflict(format!(
+            "teleport only supported for Active sessions (got {})",
+            session.status.as_str(),
+        )));
+    }
+    let Some(sandbox_id) = session.sandbox_id else {
+        return Err(ApiError::Conflict(format!(
+            "session {session_id} has no bound sandbox",
+        )));
+    };
+
+    // Fail fast with a clear error if the chosen target can't take the
+    // session right now (unknown / draining / full / is the source) —
+    // better than marking the session Evacuating and letting the scanner
+    // retry-then-Idle against an impossible pin.
+    state
+        .host_registry
+        .pick_specific_host(req.target_host_id, session.host_id)
+        .map_err(|e| {
+            ApiError::Conflict(format!(
+                "target host {} can't take this session: {e:?}",
+                req.target_host_id,
+            ))
+        })?;
+
+    // Pin the destination, then fire the same evac pipeline `evacuate`
+    // uses — the only difference is the scanner reads the pin and places
+    // on this exact host. Unwind the pin if the pipeline itself fails.
+    state
+        .teleport_targets
+        .insert(session_id, req.target_host_id);
+    if let Err(e) = crate::idle_evictor::evict_session_to_state(
+        &state,
+        session_id,
+        sandbox_id,
+        engram_core::types::SessionState::Evacuating,
+    )
+    .await
+    {
+        state.teleport_targets.remove(&session_id);
+        return Err(ApiError::Internal(format!("teleport pipeline: {e}")));
+    }
+
+    tracing::info!(
+        %session_id,
+        %sandbox_id,
+        target_host = %req.target_host_id,
+        "admin teleport: session marked Evacuating, pinned to target; scanner will resume there",
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(EvacuateSessionResponse {
+            session_id,
+            status: "evacuating",
+        }),
+    ))
+}
+
 // ---------------------------------------------------------------------
 // ADR 0044 K4 — fleet-demand signal for the node-pool autoscaler
 // ---------------------------------------------------------------------

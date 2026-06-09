@@ -225,6 +225,10 @@ pub async fn evacuate_dead_source(
     // is disk-only recoverable and this is `None`, the call fails
     // structurally with `ColdBootUnavailable`.
     cold_boot_spec: Option<engram_core::types::sandbox::SandboxSpec>,
+    // ADR 0045 Phase F (teleport): when `Some`, place onto this exact
+    // host instead of the capacity-ranked pick (operator-pinned
+    // destination). `None` keeps the standard any-peer policy.
+    require_host: Option<engram_core::HostId>,
 ) -> Result<EvacReceipt, EvacError> {
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
@@ -303,10 +307,18 @@ pub async fn evacuate_dead_source(
     // distinct typing — picker failures are `NoTargetAvailable`
     // (operator action: free capacity or wait for image prefetch);
     // backend failures are `RestoreFailed` (retry against another
-    // host or surface to user).
-    let (target_host, target_backend) = registry
-        .pick_for_session(&ctx)
-        .map_err(EvacError::NoTargetAvailable)?;
+    // host or surface to user). ADR 0045 Phase F: an operator-pinned
+    // teleport target bypasses capacity ranking and places on that
+    // exact host (still excluding the source); a bad pin retries then
+    // falls back to Idle rather than silently landing elsewhere.
+    let (target_host, target_backend) = match require_host {
+        Some(host) => registry
+            .pick_specific_host(host, session.host_id)
+            .map_err(EvacError::NoTargetAvailable)?,
+        None => registry
+            .pick_for_session(&ctx)
+            .map_err(EvacError::NoTargetAvailable)?,
+    };
 
     let new_sandbox_id = match cold_boot {
         // ADR 0028 Fix B — rung 2: no coherent memory snapshot, but
@@ -911,6 +923,7 @@ mod tests {
             session.clone(),
             Some(snapshot),
             None,
+            None,
         )
         .await
         .expect("rung-1 happy path");
@@ -966,6 +979,7 @@ mod tests {
             session.clone(),
             Some(snapshot),
             None,
+            None,
         )
         .await
         .expect("snapshot-only happy path");
@@ -1014,6 +1028,7 @@ mod tests {
             session.clone(),
             None,
             Some(test_cold_boot_spec()),
+            None,
         )
         .await
         .expect("disk-only cold-boot happy path");
@@ -1057,6 +1072,7 @@ mod tests {
             session.clone(),
             None,
             None,
+            None,
         )
         .await;
         match &result {
@@ -1082,6 +1098,7 @@ mod tests {
             &registry,
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
+            None,
             None,
             None,
         )
@@ -1111,6 +1128,7 @@ mod tests {
             session.clone(),
             None,
             Some(test_cold_boot_spec()),
+            None,
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoTargetAvailable(_))));

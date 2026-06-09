@@ -137,6 +137,10 @@ pub fn router(state: SharedState) -> Router {
             "/admin/sessions/:id/evacuate",
             post(admin::evacuate_session),
         )
+        .route(
+            "/admin/sessions/:id/teleport",
+            post(admin::teleport_session),
+        )
         .route("/admin/hosts/:id/cordon", post(admin::cordon_host))
         .route("/admin/hosts/:id/uncordon", post(admin::uncordon_host))
         .route("/admin/hosts/:id/drain", post(admin::drain_host))
