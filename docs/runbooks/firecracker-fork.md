@@ -11,23 +11,44 @@ alone).
 
 Upstream Firecracker has no live migration; its only cross-host primitive is
 snapshot-on-source → restore-on-destination, and its UFFD restore reads a
-**local** mmapped file (`MAP_PRIVATE`). The fork adds a **~4-file surface** on
-top of a pinned upstream `v1.10.x` tag:
+**local** mmapped file (`MAP_PRIVATE`). The fork adds a small surface
+(`git log v1.10.1..engram/live-migration` is the whole delta, ~140 lines) on
+top of a pinned upstream `v1.10.x` tag — **inert/opt-in: every existing path
+(boot, Full/Diff create, File/Uffd restore) is byte-identical to stock**:
 
-- `src/vmm/src/vstate/memory.rs` — a `shared: bool` that flips the guest-RAM
-  mmap to `MAP_SHARED | MAP_NORESERVE`, and an `msync(MS_SYNC)` over the
-  regions.
+- `src/vmm/src/vstate/memory.rs` — an `msync(MS_SYNC)`-over-the-regions method,
+  and thread a `shared: bool` through `from_state` so a file restore can map
+  the guest memory `MAP_SHARED | MAP_NORESERVE`. (Upstream's
+  `from_raw_regions_file` *already* carries the `shared` flag; `from_state`
+  just hardcoded `false` — so this is even smaller than the loopholelabs diff.)
 - `src/vmm/src/vmm_config/snapshot.rs` — two `SnapshotType` variants, `Msync`
-  and `MsyncAndState`, plus `shared` on the load params.
-- `src/vmm/src/persist.rs` — `create_snapshot`/restore dispatch on the new
-  types (memory-only flush; thread `shared` through).
-- `src/vmm/src/vstate/vm.rs` — branch `snapshot_memory_to_file` by type.
+  (memory-only flush, no state file) and `MsyncAndState`, plus a **top-level**
+  `shared` load param (not inside `mem_backend`, which is
+  `deny_unknown_fields`).
+- `src/vmm/src/persist.rs` — `create_snapshot` / `snapshot_memory_to_file`
+  dispatch on the new types (in-place `msync`, no separate file dump) and
+  thread `shared` into the File restore path (open the memfile read-write when
+  shared). **NB: `snapshot_memory_to_file` lives in `persist.rs`, NOT
+  `vstate/vm.rs` — the earlier draft of this runbook was wrong; vm.rs has no
+  guest-memory dump.**
+- `src/firecracker/src/api_server/...` + `src/firecracker/swagger/firecracker.yaml`
+  — surface the new `snapshot_type` values and `shared` through the HTTP API +
+  OpenAPI contract.
 
 That `MAP_SHARED` + `msync` is exactly what ADR 0045 **Phase D** (continuous
 off-pause flush) and **Phase C** (a consistent, page-readable *source* memory
 file for post-copy) require. We host this ourselves rather than depend on
 `loopholelabs/firecracker`'s `main-live-migration` branch, which is archived
 (2025-09-22), ~211 commits behind its own main, and carries unrelated PVM work.
+
+> **R2 — snapshot wire-format compat is preserved by construction.** Upstream
+> serializes machine state as bincode `SnapshotHdr{magic,version}` + CRC64 with
+> **no length prefix** (the length-prefix that motivated R2 is a *loopholelabs*
+> design we don't copy). Because this surface **never touches
+> `src/vmm/src/snapshot/` and never bumps `SNAPSHOT_VERSION`**, stock↔fork
+> Full/Diff snapshots restore in both directions — so a mixed fleet during a
+> roll is safe and live migration needn't be gated on both-hosts-forked. The
+> `build-firecracker` CI job enforces this invariant with a diff-guard.
 
 > **AGPL — read before copying a line.** silo/Drafter and the loopholelabs FC
 > branch are AGPL. Treat them as a *design reference to reimplement clean-room*
@@ -51,29 +72,42 @@ file for post-copy) require. We host this ourselves rather than depend on
   opens/updates a tracking issue and goes red (README badge). **Inert until
   `FC_FORK_REPO` is set** (the gate skips cleanly).
 
-## Standing it up (needs a fork repo + the dev-vm)
+## Standing it up
 
-1. **Create the fork repo.** `cortexapps/firecracker`, branch
-   `engram/live-migration` = the ~4-file patch series as a small commit series
-   on the pinned upstream `v1.10.x` tag. Keep the delta minimal + auditable
-   (it *is* the AGPL-review surface).
-2. **Vendor it as a submodule.** In engrams:
+1. **Create the fork repo.** ✅ Done — `cortexapps/firecracker`, branch
+   `engram/live-migration` = the surface as a single auditable commit on the
+   pinned upstream `v1.10.1` tag (`git log v1.10.1..engram/live-migration`). The
+   delta is the AGPL-review surface; keep it minimal. Built + unit-tested static
+   musl on the dev-vm (the binary runs: `firecracker --version` → v1.10.1).
+2. **Vendor it as a submodule.** ✅ Done —
    `git submodule add -b engram/live-migration https://github.com/cortexapps/firecracker third_party/firecracker`.
-   This trips the `fc_fork` lane on every bump.
-3. **Add the `build-firecracker` CI job** to `bake-images.yml`, modeled on
-   `publish-host-binaries` (musl-static build + an `oras` OCI artifact to
-   `ghcr.io/cortexapps/engrams/firecracker:<sha>`), gated `if:
-   needs.detect.outputs.fc_fork == 'true'`. Have `publish-node-assets` pull
-   that artifact and pass it as `ENGRAM_FC_SRC` to `node-assets-fetch.sh`.
-4. **Enable the rebase cron.** Set the repo variables/secrets the workflow
-   gates on: `FC_FORK_REPO` (`cortexapps/firecracker`), optional
-   `FC_FORK_BRANCH` (default `engram/live-migration`) + `FC_UPSTREAM_BASE`
-   (default `v1.10`), and `FC_FORK_TOKEN` (push access to the fork). The badge
-   goes live.
-5. **Risk R2 — snapshot wire-format skew.** The fork length-prefixes the state
-   buffer, so stock↔fork restore may be incompatible. Add a CI compat test and
-   gate live migration on both-hosts-forked if it is. Mixed fleets are
-   guaranteed transiently during a `nodeAssetsImage` digest roll.
+   Trips the `fc_fork` lane on every bump; invisible to the cargo workspace (FC
+   declares its own `[workspace]`, so `cargo metadata` / `just check` ignore it).
+3. **`build-firecracker` CI job.** ✅ Done — in `bake-images.yml`, gated `if:
+   needs.detect.outputs.fc_fork == 'true'`. Builds static musl in
+   `working-directory: third_party/firecracker` (FC's pinned `rust-toolchain.toml`
+   governs; build only `-p firecracker`), publishes
+   `ghcr.io/cortexapps/engrams/firecracker:<fork-sha>` via `oras`, and runs the
+   R2 diff-guard. `publish-node-assets` reads the submodule gitlink SHA,
+   `oras pull`s that artifact, and passes it as `ENGRAM_FC_SRC`.
+   - **Build-env gotchas (baked into the job):** FC pulls `aws-lc-sys` (needs
+     `cmake`) + `userfaultfd-sys` (needs `<linux/*.h>` + bindgen/clang). Do NOT
+     reuse `publish-host-binaries`'s global `-I/usr/include` `CFLAGS` — it leaks
+     glibc headers into `aws-lc-sys`'s musl build. Instead symlink only the
+     libc-agnostic kernel uapi dirs (`linux/`, `asm/`, `asm-generic/`) into
+     musl's sysroot, and keep `BINDGEN_EXTRA_CLANG_ARGS` for bindgen.
+4. **Enable the rebase cron + automated tracking (Phase B M4).** Set repo vars
+   `FC_FORK_REPO` (`cortexapps/firecracker`), `FC_FORK_BRANCH`
+   (`engram/live-migration`), `FC_UPSTREAM_BASE` (`v1` floor), and secret
+   `FC_FORK_TOKEN`. The enhanced cron tracks the newest stable upstream release
+   across major/minor/patch, rebases + build-verifies, and auto-opens & merges
+   an engrams submodule-bump PR (loud badge/issue on any failure).
+5. **Risk R2 — snapshot wire-format compat.** ✅ Preserved by construction (see
+   the note above): the fork never touches `src/vmm/src/snapshot/` and never
+   bumps `SNAPSHOT_VERSION`, so stock↔fork Full/Diff snapshots restore both
+   directions — mixed fleets during a `nodeAssetsImage` roll are safe, no
+   both-hosts-forked gate needed. The `build-firecracker` diff-guard enforces it;
+   the `stock_fork_snapshot_compat` test (Phase B M3) proves it end-to-end.
 
 ## The go/no-go spike (S-C1, on the dev-vm)
 
