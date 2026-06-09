@@ -37,8 +37,10 @@
 //! handler to a known target and conflate retry domains; the
 //! state-machine+scanner shape decouples them. Source writes
 //! "session is ready to be continued"; scanner finds a healthy peer.
-//! Operator-initiated drain, dead-host detector, and (future)
-//! NBD-loss trigger all land in the same lane.
+//! Operator-initiated drain (ADR 0044 K3) is the sole producer of
+//! `Evacuating` — ADR 0045 Phase A retired the reactive dead-host /
+//! NBD-loss producers (the dead-host detector now routes recoverable
+//! sessions to `Idle` for lazy `/resume`).
 //!
 //! The scanner is single-coord-pod safe because each per-session
 //! advance starts with `bump_evac_attempts` (atomic +1) followed by
@@ -63,8 +65,9 @@ use crate::state::{SessionEvent, SharedState};
 #[derive(Clone, Debug)]
 pub struct EvacResumerConfig {
     /// How often to sweep for Evacuating sessions. The scanner picks
-    /// up new entries from operator drains, the dead-host detector,
-    /// and (future) NBD-loss triggers. Default 10s matches
+    /// up new entries from operator drains (ADR 0044 K3) — the sole
+    /// producer of `Evacuating` since ADR 0045 Phase A retired the
+    /// reactive triggers. Default 10s matches
     /// `DeadHostConfig::poll_interval` so the two scanners share the
     /// same operational cadence.
     pub poll_interval: Duration,

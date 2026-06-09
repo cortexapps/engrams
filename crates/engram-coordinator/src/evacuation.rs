@@ -2,9 +2,11 @@
 //!
 //! `evacuate_dead_source` restores a session onto a peer host from
 //! already-recorded artifacts (a snapshot row and/or the live disk
-//! manifest) when the source host is gone. The two callers — the
-//! `evac_resumer` background scanner (driving `Evacuating → Created`)
-//! and the FC NBD-loss trigger — share this one implementation.
+//! manifest) when the source host is gone. Its sole caller is the
+//! `evac_resumer` background scanner (driving `Evacuating → Created`),
+//! fed by operator drain (ADR 0044 K3). ADR 0045 Phase A retired the
+//! reactive NBD-loss / dead-host producers, so this is a drain-only
+//! primitive now.
 //!
 //! The primitive leaves the session at `Created` on the new host: the
 //! restored VM has snapshotted memory but a stale harness (its vsock
@@ -176,11 +178,12 @@ fn pick_evac_disk_manifest(
     }
 }
 
-/// Mechanics for **dead-source** evacuation. Used by `dead_host.rs`'s
-/// second-stage transition (Phase B) when a host is already marked
-/// Dead and the session has been flipped to `HostLost` — the source
-/// backend is unreachable, so a fresh source-side snapshot isn't
-/// possible.
+/// Mechanics for **dead-source** evacuation. Driven by the
+/// `evac_resumer` scanner for `Evacuating` sessions (produced by
+/// operator drain, ADR 0044 K3) — restores from existing artifacts
+/// because the source backend is unreachable, so a fresh source-side
+/// snapshot isn't possible. (ADR 0045 Phase A retired the reactive
+/// dead-host / NBD-loss producers that used to feed this.)
 ///
 /// Restores from existing artifacts, rung-aware (ADR 0028 recovery
 /// ladder):
@@ -285,14 +288,13 @@ pub async fn evacuate_dead_source(
         image_version: image_tag,
         prefer_snapshot_id: snapshot.as_ref().map(|s| s.id),
         memory_mib: None,
-        // Phase C target-selection: image-cache-warm preference is a
-        // future refinement (defer when we add zone tagging to
-        // HostState). Today we accept any host that can take the
-        // work, but never the source host (exclude_host) — set to
-        // the prior owner via `session.host_id` so the NBD-loss
-        // trigger doesn't relocate back onto the degraded host. For
-        // the dead-source path the source is already unregistered;
-        // exclude_host is defensive.
+        // Target-selection: image-cache-warm preference is a future
+        // refinement (defer when we add zone tagging to HostState).
+        // Today we accept any host that can take the work, but never
+        // the source host (exclude_host) — set to the prior owner via
+        // `session.host_id` so a drain doesn't relocate back onto the
+        // host being drained. For the dead-source path the source is
+        // already unregistered; exclude_host is defensive.
         required_image_digest: None,
         exclude_host: session.host_id,
     };
@@ -376,9 +378,11 @@ pub async fn evacuate_dead_source(
     }
     registry.record_sandbox_owner(new_sandbox_id, target_host);
 
-    // PG rebind. dead_host.rs has already flipped Active → HostLost
-    // (via `mark_host_dead_and_orphan_sessions`), so we drive
-    // HostLost → Created here.
+    // PG rebind. The `evac_resumer` scanner has the session at
+    // `Evacuating` (operator drain flipped Active → Evacuating), so we
+    // drive Evacuating → Created here. (`transition_session` enforces
+    // the legality table; both Evacuating → Created and the legacy
+    // HostLost → Created are legal edges.)
     meta.assign_session_host(session_id, Some(target_host))
         .await
         .map_err(EvacError::Rebind)?;

@@ -45,11 +45,13 @@ pub enum SessionState {
     /// via `Idle → Created → Active` (the resume path re-runs the
     /// create-shape transitions on the new sandbox).
     Idle,
-    /// Heartbeat-loss against the bound host. Non-terminal: M3 wires
-    /// the heartbeat-loss cache invalidation into this transition; M4
-    /// adds re-pick on a peer host (`HostLost → Created → Active`).
-    /// Until then the reconciler moves `HostLost → Idle` (if a
-    /// snapshot exists) or `HostLost → Dead` (otherwise).
+    /// Heartbeat-loss against the bound host. Non-terminal: the
+    /// dead-host detector's second stage moves it onward —
+    /// `HostLost → Idle` when the session is recoverable (a snapshot
+    /// OR a live disk manifest exists; the user/exec `/resume`s on
+    /// next access, ADR 0045 Phase A), or `HostLost → Dead` when
+    /// there is nothing to recover. The detector no longer routes
+    /// into `Evacuating` (the reactive auto-evac is retired).
     HostLost,
     /// ADR 0018 commit 12: session is mid-relocation. The source host
     /// has paused FC, flushed dirty pages, captured a memory snapshot,
@@ -60,13 +62,14 @@ pub enum SessionState {
     /// host via the same `resume_session` machinery `/resume from
     /// Idle` uses. After 20 failed peer-pick / restore attempts
     /// (~3 min), falls back to `Idle` so a user `/resume` can drive
-    /// it forward by hand. Reached from `Active` (operator drain via
-    /// `POST /api/admin/sessions/:id/evacuate` or
-    /// `POST /api/admin/hosts/:id/drain`) or from `HostLost` (the
-    /// `dead_host.rs` second-stage routes through here instead of
-    /// the legacy `Idle` fall-through). Sandbox + host bindings are
-    /// nulled out same as `Idle` — the session is recoverable but
-    /// not running.
+    /// it forward by hand. Reached **only** from `Active` via operator
+    /// drain (`POST /api/admin/sessions/:id/evacuate` or
+    /// `POST /api/admin/hosts/:id/drain`) — ADR 0044 K3. As of ADR
+    /// 0045 Phase A the dead-host detector no longer routes here (the
+    /// reactive auto-evac is retired); the `HostLost → Evacuating`
+    /// edge is kept legal but unused (a future post-copy phase may
+    /// reuse it). Sandbox + host bindings are nulled out same as
+    /// `Idle` — the session is recoverable but not running.
     Evacuating,
     /// ADR 0034: durable idle-eviction intent marker. The candidates
     /// handler (or the PG detection backstop) transitions

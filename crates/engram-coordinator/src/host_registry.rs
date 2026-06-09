@@ -1473,10 +1473,10 @@ mod tests {
         );
     }
 
-    /// `exclude_host` with no other candidates → NoCapacity. The
-    /// evac caller (NBD-loss trigger) interprets this as
-    /// `NoTargetAvailable` and leaves the session at HostLost for a
-    /// later retry.
+    /// `exclude_host` with no other candidates → NoCapacity. The evac
+    /// caller (the `evac_resumer` scanner, draining off the excluded
+    /// host) interprets this as `NoTargetAvailable` and leaves the
+    /// session at `Evacuating` for a later retry.
     #[test]
     fn pick_for_session_with_only_excluded_host_errors() {
         let reg = stub_registry();

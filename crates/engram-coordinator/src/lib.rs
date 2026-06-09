@@ -28,7 +28,6 @@ pub mod host_registry;
 pub mod idle_detect_backstop;
 pub mod idle_evictor;
 pub mod metrics;
-pub mod nbd_loss_trigger;
 pub mod pg_listener;
 pub mod preemption_drain;
 pub mod reconcile;
