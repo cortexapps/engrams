@@ -186,6 +186,25 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
+    // ADR 0045 Phase F: freeze / unfreeze a running microVM in place.
+    async fn pause_sandbox(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner.pause(id).await.map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner.resume(id).await.map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
     async fn restore(
         &self,
         req: Request<RestoreRequest>,

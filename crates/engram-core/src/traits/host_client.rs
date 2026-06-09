@@ -168,6 +168,23 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0045 Phase F: freeze the running microVM for `sandbox_id`
+    /// *in place* — pause its vCPUs without snapshotting, destroying, or
+    /// changing session state. An admin affordance to drive + observe
+    /// the pause/flush path (and the test surface for the live-migration
+    /// work). Default no-op for harness-less fakes; the `HostRegistry`,
+    /// gRPC client, and `LocalHostClient` override it to reach the
+    /// backend's [`crate::traits::SandboxBackend::pause`].
+    async fn pause(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// ADR 0045 Phase F: unfreeze a [`Self::pause`]d microVM — resume
+    /// its vCPUs in place. Symmetric with `pause`; same overrides.
+    async fn resume(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0013 + ADR 0011 follow-up #3: pin a sandbox against idle
     /// eviction while a shell WebSocket is open. The local hub is the
     /// only source of truth for "is a shell attached to this sandbox?"

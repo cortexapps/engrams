@@ -881,6 +881,16 @@ impl HostClient for HostRegistry {
         backend.interrupt(sandbox_id).await
     }
 
+    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.pause(sandbox_id).await
+    }
+
+    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.resume(sandbox_id).await
+    }
+
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.acquire_shell(sandbox_id).await

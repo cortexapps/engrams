@@ -168,6 +168,16 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
+    // ADR 0045 Phase F: freeze/unfreeze the microVM in place — pure
+    // delegation to the inner backend (no harness involvement).
+    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.sandbox.pause(sandbox_id).await
+    }
+
+    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.sandbox.resume(sandbox_id).await
+    }
+
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.harness_hub.acquire_shell(sandbox_id);
         Ok(())
