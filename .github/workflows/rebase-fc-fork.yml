@@ -65,7 +65,12 @@ jobs:
         with:
           repository: ${{ vars.FC_FORK_REPO }}
           ref: ${{ vars.FC_FORK_BRANCH || 'engram/live-migration' }}
-          token: ${{ secrets.FC_FORK_TOKEN }}
+          # The cross-org GH_TOKEN (the same PAT build-firecracker's submodule
+          # checkout + the notify job use) — it can READ the INTERNAL fork AND
+          # PUSH the rebased patch branch back. persist-credentials keeps it
+          # configured for the `git push` below. (Once the fork is public the
+          # read is tokenless, but the push still needs write auth.)
+          token: ${{ secrets.GH_TOKEN }}
           # Full history + tags so `git describe` can find the fork's base tag
           # and the rebase has the upstream commits to replay onto.
           fetch-depth: 0

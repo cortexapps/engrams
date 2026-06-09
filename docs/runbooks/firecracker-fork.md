@@ -106,12 +106,15 @@ file for post-copy) require. We host this ourselves rather than depend on
    workaround, reusing the `engrams-automerge` App). Every green bump
    auto-merges, majors included. A rebase **conflict** or a clean-rebase **build
    break** is loud: a tracking issue + a red run (README badge).
-   - **To go live, set** repo vars `FC_FORK_REPO` (`cortexapps/firecracker`) +
-     `FC_FORK_BRANCH` (`engram/live-migration`), and secret `FC_FORK_TOKEN` (a
-     PAT/App token with push to the fork — the only new credential; the
-     `AUTOMERGE_APP_*` secrets are reused). `FC_UPSTREAM_BASE` is **optional** —
+   - **To go live, set just two repo vars** — `FC_FORK_REPO`
+     (`cortexapps/firecracker`) + `FC_FORK_BRANCH` (`engram/live-migration`).
+     **No new secret:** the fork checkout + push reuse the existing cross-org
+     `GH_TOKEN` (the same PAT build-firecracker's submodule checkout uses — it
+     reads the INTERNAL fork and pushes the rebased branch), and the engrams bump
+     PR reuses the `AUTOMERGE_APP_*` App. `FC_UPSTREAM_BASE` is **optional** —
      leave it unset to track all majors; set it to a tag prefix to pin a line
-     (`v1.` — trailing dot — stays on v1.x and won't auto-jump to v2.0).
+     (`v1.` — trailing dot — stays on v1.x and won't auto-jump to v2.0). (Once
+     the fork goes public the read is tokenless, but the push still needs auth.)
    - **First activation is a catch-up jump.** The fork sits on `v1.10.1` (prod
      parity); the newest stable is many releases ahead. The first cron run will
      try to rebase across that whole gap — likely a conflict or build break that
