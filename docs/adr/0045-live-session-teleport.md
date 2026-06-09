@@ -1,6 +1,6 @@
 # ADR 0045: Live session teleport — post-copy migration, off-pause flush, and true autoscale-down (the substrate golden state)
 
-Status: 2026-06-08 — **Proposed.** A phased roadmap and the home for the fork-gated "golden state" that ADR 0043 deferred. Phase A (retire reactive evac) is no-fork and executes now; Phase B (fork Firecracker) is the irreversible decision gate; Phases C/D (post-copy + `MAP_SHARED`) are gated behind it; Phase E (autoscale-down) and Phase F (the pause/teleport test surface) ship a no-fork form now and a live form after C. Flips toward **Accepted** phase-by-phase as the commit chain lands. Supersedes ADR 0043 Phase 3b (retire evac) and carries forward ADR 0042's Tier-3 "differentiated move."
+Status: 2026-06-08 — **Proposed** (the fork gate is unpulled). A phased roadmap and the home for the fork-gated "golden state" that ADR 0043 deferred. The no-fork increments have landed: Phase A (retire reactive evac, #136), Phase F's teleport test surface (snapshot-rehome form, #137), Phase E1's scale-down decision engine (#138), and Phase B's fork-maintenance ergonomics (#139). What remains is the fork itself — Phase B's actual port onto upstream FC + the S-C1 go/no-go spike (the irreversible decision gate) — and everything gated behind it: Phases C/D (post-copy + `MAP_SHARED`), the E1 actuator + E2, and Phase F's live path. Flips toward **Accepted** phase-by-phase as the commit chain lands. Supersedes ADR 0043 Phase 3b (retire evac) and carries forward ADR 0042's Tier-3 "differentiated move."
 
 ## Context
 
@@ -38,20 +38,22 @@ The unifying insight: **"teleport a live session" is the same operation as drain
 
 ## Phases
 
-| Phase | What | Fork? | Ships |
+| Phase | What | Fork? | Status |
 |---|---|---|---|
-| **A** | Retire *reactive* evac (dead-host auto-evac + NBD-loss); keep drain-driven evac; lazy-resume-on-next-access | no | now |
-| **B** | Fork Firecracker — port the `MAP_SHARED` + `Msync`/`MsyncAndState` surface onto upstream v1.10.x; vendored + auto-rebased + detect-changes-wired | — | gate |
-| **C** | Post-copy live migration + durable GCS fallback (live teleport) | yes | gated on B, D |
-| **D** | `MAP_SHARED` continuous off-pause memory flush | yes | gated on B |
-| **E** | True autoscale-down — E1 (no-fork, idle-only) now; E2 (aggressive) after C | E2 only | E1 now / E2 gated |
-| **F** | Admin + web UX for pause / resume / teleport — the test surface; snapshot-rehome early, live under the same verb at C | no | early |
+| **A** | Retire *reactive* evac (dead-host auto-evac + NBD-loss); keep drain-driven evac; lazy-resume-on-next-access | no | ✅ **shipped** — #136 |
+| **B** | Fork Firecracker — port the `MAP_SHARED` + `Msync`/`MsyncAndState` surface onto upstream v1.10.x; vendored + auto-rebased + detect-changes-wired | — | ◐ **ergonomics shipped** (#139: consume-seam + `fc_fork` detect lane + daily-rebase cron); fork port + S-C1 spike pending — **gate unpulled** |
+| **C** | Post-copy live migration + durable GCS fallback (live teleport) | yes | ⬜ pending — gated on B-fork, D |
+| **D** | `MAP_SHARED` continuous off-pause memory flush | yes | ⬜ pending — gated on B-fork |
+| **E** | True autoscale-down — E1 (no-fork, idle-only) now; E2 (aggressive) after C | E2 only | ◐ **E1 decision engine shipped** (#138: `desired_hosts` scale-down arm + hysteresis + `ScaleDownMode` knob, **log-only**); E1 actuator + E2 pending |
+| **F** | Admin + web UX for pause / resume / teleport — the test surface; snapshot-rehome early, live under the same verb at C | no | ◐ **teleport shipped** (#137: snapshot-rehome + web host-picker); pause/resume + live-path swap pending |
 
-**Dependencies:** `Phase 1 prefetch (shipped) + B + D → C`. A is independent and first. E1 and F's snapshot-rehome form are fork-independent (ship anytime after A); E2 and F's live path are config/impl upgrades once C lands. **B is the irreversible decision gate** — the S-C1 spike (below) is its go/no-go.
+**Dependencies:** `Phase 1 prefetch (shipped) + B + D → C`. A is independent and first (✅). E1 and F's snapshot-rehome form are fork-independent (shipped, #138/#137); E2 and F's live path are config/impl upgrades once C lands. **B is the irreversible decision gate** — its fork-maintenance ergonomics shipped (#139) so the pipeline is ready, but the fork port itself + the S-C1 spike (below) are the unpulled go/no-go.
 
 ## Phase detail
 
 ### Phase A — retire reactive evac (no fork)
+
+**Status: ✅ shipped (#136).** Landed exactly as designed below — `dead_host.rs` routes recoverable sessions to `Idle`, `nbd_loss_trigger.rs` + the `nbd_unhealthy` wire field are gone, and the live-PG routing test guards it.
 
 Retire the reactive evac, keep the drain-driven evac. **No DB migration** (`Evacuating` + `host_lost` stay valid `sessions.status` values; nothing is removed). **No new resume code** — routing a dead host's recoverable sessions to `Idle` lands them on the existing `/resume` path (`resume_session` → `resume_from_idle`).
 
@@ -63,6 +65,8 @@ Retire the reactive evac, keep the drain-driven evac. **No DB migration** (`Evac
 This is the bounded-crash-window posture ADR 0042/0043 chose for the *unplanned* case (E2B's explicit-durability stance), accepted because the reactive machinery cost more than the durability it bought.
 
 ### Phase B — fork Firecracker
+
+**Status: ◐ ergonomics/pipeline scaffolding shipped (#139); the fork port + S-C1 spike are pending — the irreversible gate is unpulled.** #139 landed the maintenance surface so a fork *can* flow through the pipeline the day it exists: the `node-assets-fetch.sh` consume-seam (`FC_SRC`/`FC_BINARY_SOURCE` override), the `fc_fork` detect-changes lane, and the daily `rebase-fc-fork.yml` cron + README badge + tracking-issue ergonomics. Not yet done: the actual ~4-file port onto upstream v1.10.x, the `build-firecracker` job that produces the binary, and the S-C1 go/no-go spike. Decision still reversible until those land.
 
 **Recommendation: port the ~4-file surface onto upstream FC v1.10.x ourselves.** Not fork-the-loopholelabs-branch (`main-live-migration` is archived 2025-09-22, ~211 commits behind their own main, carries unrelated PVM experiments + an AGPL/licensing question). Not no-fork (stock FC restore is `MAP_PRIVATE`, so an external `MAP_SHARED` mmap never sees the live VM's mutations — a continuously-consistent *source* memfile genuinely requires FC writing the file). The load-bearing diff is small and auditable: a `shared: bool` flag flipping the memory mmap to `MAP_SHARED | MAP_NORESERVE`, an `msync(MS_SYNC)` over the regions, and two `SnapshotType` variants (`Msync`, `MsyncAndState`) — in `vstate/memory.rs`, `vmm_config/snapshot.rs`, `persist.rs`, `vstate/vm.rs`.
 
@@ -76,6 +80,8 @@ This is the bounded-crash-window posture ADR 0042/0043 chose for the *unplanned*
 **Risks:** **R1 AGPL** — license-read the fork's added commits before copying a line; reimplement clean-room from the public diff if needed (the ~4-file surface makes this tractable). **R2 snapshot wire-format skew** — the fork length-prefixes the state buffer, so stock↔fork restore may be incompatible; test compat in CI and gate migration on both-hosts-forked if so (mixed fleets are guaranteed during a roll).
 
 ### Phase C — post-copy live migration + durable fallback
+
+**Status: ⬜ pending — gated on the Phase B fork + Phase D.**
 
 **Transport.** No host-to-host channel exists today (only coord↔host-agent gRPC), but `hostNetwork` on the node root netns (ADR 0044 K2) makes host-agents mutually L3-routable on node IPs. Add a dedicated **P2P page-transfer listener** (own TCP port, length-prefixed binary framing for throughput — not per-page protobuf; firewall to node-IPs + a HELLO token). The coordinator brokers a `MigrationTicket{source_addr, token, manifests, last_checkpoint}`.
 
@@ -95,6 +101,8 @@ This is the bounded-crash-window posture ADR 0042/0043 chose for the *unplanned*
 
 ### Phase D — `MAP_SHARED` continuous off-pause flush
 
+**Status: ⬜ pending — gated on the Phase B fork.**
+
 A naive FC memory snapshot is I/O-bound at ~1 s/GB (8 GB ≈ 8 s) on the pause path. mmap-ing the memory file `MAP_SHARED` lets the kernel flush dirty pages continuously, cutting snapshot-*save* to 30–100 ms and moving the bulk of I/O off the pause path (CodeSandbox's technique). Requires Phase B's `Msync`/`MsyncAndState`.
 
 **Coexistence with ADR 0022 (the central decision).** `MAP_SHARED` is the **write/save path** on the *live* per-sandbox memfile; ADR 0022's `MAP_PRIVATE` stays the **read/restore path** on the *immutable base* memfile. Different inodes, opposite directions — **no interaction**, and `MAP_SHARED` must not leak into the restore path (ADR 0043's "keep the restore-mode split as-is" still holds; the only resume-side change remains P1's non-blocking prefetch).
@@ -103,6 +111,8 @@ A naive FC memory snapshot is I/O-bound at ~1 s/GB (8 GB ≈ 8 s) on the pause p
 
 ### Phase E — true autoscale-down
 
+**Status: ◐ E1 decision engine shipped (#138); the E1 actuator + E2 are pending.** #138 landed the *decision* half: `scaler.rs::desired_hosts` grew a scale-down arm, `reconcile.rs` holds an `Ordering`-counted hysteresis streak, and `AutoscalingSpec.scale_down: Off | IdleOnly | Aggressive` (default `Off`) gates it. It is deliberately **log-only** today — a CONFIRMED scale-down logs *"would drain the least-loaded host and remove its node"* and returns without acting. Pending for E1: the actuator — `CoordClient::list_hosts()` to pick the least-loaded victim, drain that specific node, then `set_size` (order matters; see below). E2 (relax the idle-gate to consolidate active hosts) is gated on Phase C.
+
 **Two stages.** **E1 (fork-independent, ships first):** reuse today's snapshot-and-rehome drain, **gated to idle/low-activity hosts** with hard hysteresis — operator-driven cost reclamation, disruptive enough to keep off active hosts. **E2 (after Phase C):** post-copy makes the move a ~10 ms live teleport, so the idle-gate + hysteresis relax to consolidate *active* hosts continuously — a config loosening, not new mechanism.
 
 **The actuation primitive already exists.** `engram-host-operator`'s `roll_node` is already the drain-gated node-removal sequence (cordon → coord drain → gate on `running_sandboxes → 0` → delete pod → uncordon); scale-down reuses its body. **New pieces:** a scale-*down* arm + hysteresis counter in `scaler.rs` `desired_hosts` (shed only when a whole host of slack persists for N consecutive reconciles, clamped to `capacityFloor`/`minHosts`); a `CoordClient::list_hosts()` for the least-loaded victim (`GET /api/hosts` carries per-host `running_sandboxes`); an `AutoscalingSpec.scale_down: Off | IdleOnly | Aggressive` CRD knob (default `Off`, `IdleOnly` for E1, `Aggressive` for E2). **Order:** drain the specific least-loaded node *before* `set_size` (GKE `set_size` is count-only, so draining makes the drained node the safe one to lose). Scale-up stays immediate; scale-down stays slow (the cold-node problem in reverse — a fresh node pays cold chunk-cache reconstruct).
@@ -110,6 +120,8 @@ A naive FC memory snapshot is I/O-bound at ~1 s/GB (8 GB ≈ 8 s) on the pause p
 **Risks:** flapping under bursty demand (ship behind the still-off-by-default K4 actuator until calibrated); re-validate the idle-evict ↔ drain race ADR 0044 K5 caught.
 
 ### Phase F — admin + web UX for pause / resume / teleport (the test surface)
+
+**Status: ◐ teleport shipped (#137); pause/resume + the live-path swap are pending.** #137 landed the snapshot-rehome teleport end-to-end: `POST /api/admin/sessions/:id/teleport {target_host_id}` marks the session `Evacuating` with the target pinned in `state.teleport_targets`, the scanner resumes it there, and the web `useTeleportSession` host-picker drives it — prod-validated (session `688c54b0`, `ab021c17 → a51746c8`), which surfaced follow-up F1 (below). Pending: the net-new `pause`/`resume` admin passthroughs, and the live-path swap of the `teleport` verb to `migrate_session_live` once Phase C lands (the UX stays put).
 
 A thin tooling layer to drive and observe the live-migration work by hand. `EvacuateSessionRequest` already reserves a target-host field, so "teleport to a chosen host" is a small extension of the existing evacuate pipeline (pause → flush → snapshot → restore on the chosen peer) — pinning the target instead of letting the scanner pick. So F ships an early, **fork-independent** snapshot-rehome form, then the *same* `teleport` verb swaps its implementation to `migrate_session_live` (Phase C). The UX never changes.
 
@@ -149,4 +161,14 @@ Carries forward **ADR 0042** (`docs/adr/0042-substrate-architecture-survey.md` +
 
 ## Status
 
-**Proposed.** Phase A (retire reactive evac) executes now (no-fork); the commit chain is appended and the ADR flips toward Accepted phase-by-phase. Builds on ADR 0042 (survey), ADR 0043 (the shipped no-fork hardening + the precondition Phase 1), and ADR 0044 (the K8s fleet whose drain-driven evac Phase A keeps and Phase C upgrades).
+**Proposed** — the fork gate is unpulled, so the headline (live teleport) is not yet real; the ADR flips toward Accepted phase-by-phase as the commit chain lands.
+
+**Commit chain so far (all no-fork):**
+- **#136** — ADR authored + Phase A (retire reactive evac). ✅
+- **#137** — Phase F teleport test surface (snapshot-rehome + web host-picker). ◐ (pause/resume + live swap pending)
+- **#138** — Phase E1 scale-down decision engine (policy + hysteresis + `ScaleDownMode` knob, log-only). ◐ (actuator pending)
+- **#139** — Phase B fork-maintenance ergonomics (consume-seam + `fc_fork` detect lane + daily-rebase cron). ◐ (fork port + S-C1 spike pending)
+
+**Next gate:** Phase B's actual port onto upstream FC + the S-C1 two-host post-copy spike (the irreversible go/no-go). Everything fork-gated — Phases C/D, the E1 actuator, E2, and Phase F's live path — waits on it.
+
+Builds on ADR 0042 (survey), ADR 0043 (the shipped no-fork hardening + the precondition Phase 1), and ADR 0044 (the K8s fleet whose drain-driven evac Phase A keeps and Phase C upgrades).
