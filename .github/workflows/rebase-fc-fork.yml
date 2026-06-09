@@ -46,7 +46,7 @@ jobs:
 
       - name: Checkout the fork patch branch
         if: steps.gate.outputs.configured == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ vars.FC_FORK_REPO }}
           ref: ${{ vars.FC_FORK_BRANCH || 'engram/live-migration' }}
