@@ -1,6 +1,6 @@
 # ADR 0045: The unified memory substrate — one guest-memory architecture for density, lazy restore, live teleport, and fast teardown
 
-Status: 2026-06-09 — **Proposed → partially Accepted** (rewritten around the end-state substrate; see "What changed in this rewrite"). Landed: Phase A (retire reactive evac, #136), Phase F's teleport test surface (snapshot-rehome form, #137), Phase E1's scale-down decision engine (#138), and **Phase B — the fork itself**: ported onto upstream FC, vendored, drop-in-proven, self-maintaining via the tracking cron, caught up to **v1.16.0**, and **rolled to prod** (#139/#149/#151–#153/#158/#159). What remains is **Phase D — the unified memory substrate** (gated on the S0 feasibility spikes) and everything that rides it: Phase C (post-copy live teleport on the substrate), the E1 actuator + E2, and Phase F's live path. Flips fully to **Accepted** phase-by-phase as the commit chain lands. Supersedes ADR 0043 Phase 3b (retire evac) and carries forward ADR 0042's Tier-3 "differentiated move."
+Status: 2026-06-09 — **Proposed → partially Accepted** (rewritten around the end-state substrate; see "What changed in this rewrite"). Landed: Phase A (retire reactive evac, #136), Phase F's teleport test surface (snapshot-rehome form, #137), Phase E1's scale-down decision engine (#138), and **Phase B — the fork itself**: ported onto upstream FC, vendored, drop-in-proven, self-maintaining via the tracking cron, caught up to **v1.16.0**, and **rolled to prod** (#139/#149/#151–#153/#158/#159). What remains is **Phase D — the unified memory substrate** (the S0 feasibility spikes **ALL PASS** — the program is a GO; D1 fork v2 is next) and everything that rides it: Phase C (post-copy live teleport on the substrate), the E1 actuator + E2, and Phase F's live path. Flips fully to **Accepted** phase-by-phase as the commit chain lands. Supersedes ADR 0043 Phase 3b (retire evac) and carries forward ADR 0042's Tier-3 "differentiated move."
 
 ## What changed in this rewrite (2026-06-09)
 
@@ -82,13 +82,13 @@ guest RAM = MAP_SHARED of the per-template BASE shm object   (one per host; lazi
 |---|---|---|---|
 | **A** | Retire *reactive* evac (dead-host auto-evac + NBD-loss); keep drain-driven evac; lazy-resume-on-next-access | no | ✅ **shipped** — #136 |
 | **B** | Fork Firecracker — vendored + auto-rebased + detect-changes-wired; v1 surface (`MAP_SHARED`+`Msync`) superseded by D1's v2 surface | — | ✅ **done + prod-rolled at v1.16.0** (#139/#149/#151–#153/#158/#159) |
-| **D** | **The unified memory substrate** — shared base shm + UFFD `MINOR\|WP` + per-sandbox overlay; one restore path; teardown on the overlay. Gated on the **S0 spikes** | yes (v2) | ⬜ pending — S0 next |
+| **D** | **The unified memory substrate** — shared base shm + UFFD `MINOR\|WP` + per-sandbox overlay; one restore path; teardown on the overlay | yes (v2) | ◐ **S0 spikes ALL PASS** (go for the program); D1 fork v2 next |
 | **C** | Post-copy live teleport **on the substrate** (two-source overlay fill + durable GCS fallback) | yes | ⬜ pending — gated on D3 |
 | **E** | True autoscale-down — E1 (no-fork, idle-only) now; E2 (aggressive) after C | E2 only | ◐ **E1 decision engine shipped** (#138, log-only); E1 actuator + E2 pending |
 | **F** | Admin + web UX for pause / resume / teleport — the test surface; snapshot-rehome early, live under the same verb at C | no | ◐ **teleport shipped** (#137); pause/resume + live-path swap pending |
 |  |  |  |  |
 
-**Dependencies:** `B (✅) → S0 → D1 → D2 → D3 → C`; D4/D5 follow D3 and parallelize with C's build-out. A is independent and shipped. E1 and F's snapshot-rehome form are fork-independent (shipped); E2 and F's live path are config/impl upgrades once C lands. **S0 is the new decision gate**: the spikes either validate the substrate or trigger a documented fallback before any fork-v2 code is written.
+**Dependencies:** `B (✅) → S0 (✅) → D1 → D2 → D3 → C`; D4/D5 follow D3 and parallelize with C's build-out. A is independent and shipped. E1 and F's snapshot-rehome form are fork-independent (shipped); E2 and F's live path are config/impl upgrades once C lands. **S0 was the decision gate and it passed clean** — including S0.3 (carve under a live KVM memslot, reads-don't-carve), the one assumption that could have killed the design.
 
 ## Phase detail
 
@@ -128,23 +128,27 @@ This is the bounded-crash-window posture ADR 0042/0043 chose for the *unplanned*
 
 ### Phase D — the unified memory substrate
 
-**Status: ⬜ pending — gated on the S0 feasibility spikes (the program's go/no-go).**
+**Status: ◐ S0 spikes ALL PASS (the program's go/no-go — GO); D1 fork v2 is next.**
 
 The substrate as decided above; this section is the implementation ladder. Each milestone is its own PR chain with an ADR bookend update, validated on the real `engram-dev` KVM box with real Firecracker before merge, with every automatically-testable behavior wired into CI (the FC `#[ignore]` suite runs on Blacksmith).
 
-**S0 — feasibility spikes (throwaway probes on the dev VM; results recorded here before D1 starts).**
+**S0 — feasibility spikes: ✅ ALL PASS (2026-06-09, engram-dev kernel 6.8.0-1060-gcp; prod COS verified 6.12.68+).** The probes live on as the `substrate_kernel_capabilities` CI gate (below). Results:
 
-S0.0 first: the dev VM kernel must be ≥5.19 for WP-on-shmem (upgrade via Ubuntu HWE or recreate on ubuntu-2404; CI runners are already 2404). Verify GKE COS node kernels (≥6.1 expected) once via prod-ops.
-
-| Spike | Question | Pass criterion |
+| Spike | Question | Result |
 |---|---|---|
-| S0.1 | memfd/tmpfs `MAP_SHARED` + UFFD `MINOR\|WP` registration; `UFFDIO_CONTINUE`; WP fault delivery; `ZEROPAGE`-on-shmem behavior | all ioctls behave per design on the dev kernel |
-| S0.2 | the carve: `MAP_FIXED` overlay page over a shared-base mapping mid-run; VMA growth; `vm.max_map_count`; first-write fault cost | correct content post-carve; ~µs-scale; bounded VMA overhead |
-| S0.3 | **the go/no-go**: a live KVM guest (minimal, then real FC) with shm-backed memory; carve VMAs under the live memslot; guest correctness + KVM stability; snapshot capture still works | guest reads its private page; no KVM/EPT errors |
-| S0.4 | `CONTINUE` throughput + 4 KiB fault-rate vs 512 KiB chunk installs (the resume fault-storm budget) | resume-latency model ≤ today's UFFD path |
-| S0.5 | overlay-as-dirty-set correctness, cross-checked against the KVM dirty log | overlay enumerates exactly the dirty pages |
+| S0.0 | kernel floors (WP-on-shmem ≥5.19) | ✅ dev VM 6.8, prod COS 6.12.68+ — no upgrades needed |
+| S0.1 | `MAP_SHARED` memfd + UFFD registration, CONTINUE, WP delivery | ✅ — with **three protocol findings** (below) |
+| S0.2 | the carve: cost, VMA growth, `max_map_count` | ✅ 12–13 µs/carve (incl. content copy); **scattered** +0.8 VMA/carve (20k carves → 16k VMAs), **sequential carves VMA-merge to ~zero growth**; raise `vm.max_map_count` (default 65530) for >~80k-page scattered dirty sets |
+| S0.3 | **the go/no-go**: live KVM guest on the substrate, carve under the live memslot | ✅ PASS first run — guest read base (0xAB), wrote through a mid-execution carve (0xEE), re-read base still clean; **guest reads fault as reads (no carve → sharing preserved)**; exactly one carve for exactly the one written page; no KVM/EPT errors |
+| S0.4 | fault-storm budget | ✅ direct `CONTINUE` install 0.61 µs/page (**6.2 GiB/s**); blocking single-page fault round-trip 22 µs → engine policy: resolve each fault by CONTINUE-ing the whole surrounding 512 KiB chunk range (one ioctl) ≈ today's per-chunk `UFFDIO_COPY` cost; prefault floods at GiB/s |
+| S0.5 | overlay-as-dirty-set vs KVM dirty log | ✅ dirty log == carve set exactly |
 
-If S0.3 fails hard (KVM will not tolerate carving under a memslot), the documented fallbacks are: per-sandbox shm without the carve (`MINOR`-only — lazy + readable but the clean working set duplicates per session; density cost quantified before accepting), or the interim roadmap under "Interim fallbacks." The S0 probes graduate into a `#[ignore]`'d kernel-capability regression test in CI so a kernel or FC regression is caught on the runners, not in prod.
+**The three S0.1 protocol findings (load-bearing for D1/D2 — the fault engine's invariants):**
+1. **Triple registration `MISSING|MINOR|WP` is required.** Under MINOR-only, shmem *holes* zero-map silently (no fault) — lazy base population needs MISSING for the not-yet-populated case; cached pages then arrive as MINOR.
+2. **Full-range `UFFDIO_WRITEPROTECT` arming up front (`wp_unpopulated`) is required**, and it also *suppresses fault-around*: without arming, the kernel opportunistically pre-maps cache-present neighbor pages writable — guest writes would leak into the shared base unintercepted.
+3. **Every `CONTINUE` must use `MODE_WP`.** A plain CONTINUE installs a writable PTE (clearing the WP marker); writes then bypass the carve and corrupt the shared base. With CONTINUE|WP, every first write reliably traps → carve.
+
+The probes (two self-contained C programs, the exact artifacts the spikes ran) are checked in at `crates/engram-sandbox-firecracker/tests/fixtures/substrate/` and run by the `#[ignore]`'d `substrate_kernel_capabilities` test, wired into ci.yml's `test-firecracker` job — a kernel/KVM regression surfaces on the runners, not in prod. The S0.3 fallbacks (per-sandbox shm MINOR-only; the interim roadmap) were not needed.
 
 **D1 — fork v2 (`cortexapps/firecracker`, clean-room).** Construct guest memory from a configured shared base shm object (+ per-sandbox overlay path) on both the boot and restore paths; register UFFD `MINOR|WP`; extend the handler handshake mappings as needed. Snapshot create/read paths verified unchanged; R2 invariants held (never touch `src/vmm/src/snapshot/`, never bump `SNAPSHOT_VERSION`); the v1 `Msync`/`shared` surface repurposed or retired; the rebase cron stays green (the v2 surface remains a small commit series).
 
@@ -252,8 +256,8 @@ Carries forward **ADR 0042** (`docs/adr/0042-substrate-architecture-survey.md` +
 - **#139** — Phase B fork-maintenance ergonomics (consume-seam + `fc_fork` detect lane + daily-rebase cron). ✅
 - **#149 / #151–#153** — Phase B fork port + submodule vendor + `build-firecracker` job + stock↔fork compat test. ✅
 - **#158 / #159** — Phase B catch-up to upstream **v1.16.0** + the self-maintaining cron (lockstep `engram-v*` tags, version-agnostic R2 guard). ✅ → **prod-rolled 2026-06-09** (fleet on the fork at v1.16.0, all three active images smoke-tested).
-- **(this PR)** — the substrate rewrite: Phases C/D re-derived from the unified memory substrate; S0 spike ladder defined; interim fallbacks recorded.
+- **(this PR)** — the substrate rewrite: Phases C/D re-derived from the unified memory substrate; **S0 spikes run and ALL PASS** (dev VM 6.8 + prod COS 6.12 verified; three fault-engine invariants found and recorded); probes graduated into the `substrate_kernel_capabilities` CI gate.
 
-**Next gate:** the **S0 feasibility spikes** (dev VM, real KVM) — S0.3 carve-under-memslot is the program go/no-go; results land back in this document before D1 (fork v2) begins. Open follow-up: [#160](https://github.com/cortexapps/engrams/issues/160) (version-aware base-snapshot reuse), to land before the next `SNAPSHOT_VERSION`-changing FC bump.
+**Next gate:** **D1 — fork v2** (shm-backed guest memory + `MINOR|WP` registration in `cortexapps/firecracker`), carrying the three S0.1 protocol invariants into the FC/handler design. Open follow-up: [#160](https://github.com/cortexapps/engrams/issues/160) (version-aware base-snapshot reuse), to land before the next `SNAPSHOT_VERSION`-changing FC bump.
 
 Builds on ADR 0042 (survey), ADR 0043 (the shipped no-fork hardening + the precondition Phase 1), ADR 0044 (the K8s fleet whose drain-driven evac Phase A keeps and Phase C upgrades), ADR 0022/0039 (the File-mode density baseline the substrate must meet), and ADR 0028/0038 (the diff-chain durability backstop the substrate keeps).
