@@ -47,6 +47,8 @@ export function SystemMessage() {
 // ADR 0028 A.log: the honest recovery boundary. Everything above (greyed)
 // was rolled back by a rung-1 recovery; the thread resumes below. Surviving
 // outside-world side effects are called out — the platform can't undo them.
+// ADR 0045 F1: a planned operator relocation (drain / teleport) rewinds the
+// same way but no host failed, so the copy must not cry "host failure".
 function Recovery({ marker }: { marker: Extract<SystemMarker, { kind: "recovery" }> }) {
   return (
     <Card className="border-primary/40 bg-primary/5 py-0">
@@ -54,7 +56,9 @@ function Recovery({ marker }: { marker: Extract<SystemMarker, { kind: "recovery"
         <div className="flex items-center gap-2 text-xs text-primary">
           <RotateCcwIcon className="size-3.5" />
           <Text as="span" variant="label">
-            recovered from a checkpoint after a host failure
+            {marker.planned
+              ? "relocated to a new host"
+              : "recovered from a checkpoint after a host failure"}
           </Text>
           <span className="ml-auto font-mono tabular-nums text-muted-foreground">
             {hms(marker.at)}
@@ -62,7 +66,8 @@ function Recovery({ marker }: { marker: Extract<SystemMarker, { kind: "recovery"
         </div>
         <p className="text-sm text-muted-foreground">
           ~{marker.rolledBack} {marker.rolledBack === 1 ? "event" : "events"} after this point were
-          rolled back; the agent resumed from here.
+          rolled back{marker.planned ? " to the last checkpoint during the move" : ""}; the agent
+          resumed from here.
         </p>
         {marker.survivingSideEffects.length > 0 && (
           <ul className="list-disc pl-5 text-sm text-muted-foreground">

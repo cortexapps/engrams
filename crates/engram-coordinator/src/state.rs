@@ -168,8 +168,35 @@ pub enum SessionEvent {
         /// Outside-world side-effects in the rolled-back span that
         /// survive (one human-readable line each).
         surviving_side_effects: Vec<String>,
+        /// ADR 0045 F1: why the rewind happened, so the web doesn't
+        /// label a planned operator move as a host failure. `#[serde(default)]`
+        /// → events persisted before this field default to the historical
+        /// meaning (`HostFailureRecovery`).
+        #[serde(default)]
+        cause: RecoveryCause,
         at: DateTime<Utc>,
     },
+}
+
+/// ADR 0045 F1: why a rung-1 recovery rewound the transcript. Drives the
+/// web copy on the recovery boundary — a planned operator relocation
+/// (drain / teleport) must not read as "recovered after a host failure",
+/// because no host failed. Defaults to [`RecoveryCause::HostFailureRecovery`]
+/// for events persisted before this field existed (the card's original
+/// meaning) and for the unplanned `/resume`-after-death path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryCause {
+    /// An operator deliberately relocated a live session (drain or
+    /// teleport, ADR 0045 Phase F). The snapshot-rehome resumes from the
+    /// last durable checkpoint, so the post-checkpoint tail is rolled
+    /// back — but nothing failed; it was a planned move.
+    PlannedRelocation,
+    /// A host died (or a session was resumed from `Idle` after one did),
+    /// so the restored checkpoint lags the lost live head — the original
+    /// meaning of the recovery boundary.
+    #[default]
+    HostFailureRecovery,
 }
 
 impl SessionEvent {
@@ -714,6 +741,43 @@ pub(crate) mod tests {
             other => panic!("expected HarnessRunInterrupted, got {other:?}"),
         }
         assert_eq!(ev.kind(), "run_interrupted");
+    }
+
+    #[test]
+    fn recovery_cause_is_on_the_wire_and_defaults_for_legacy_rows() {
+        // ADR 0045 F1: the recovery boundary carries a machine-readable
+        // `cause` the web switches on. A planned operator relocation must
+        // serialize as `planned_relocation` so the card stops crying
+        // "host failure"; an event persisted before the field existed
+        // (no `cause` key) must read back as `HostFailureRecovery` — the
+        // card's historical meaning — so legacy transcripts are unchanged.
+        let planned = SessionEvent::RecoveredFromCheckpoint {
+            recovery_epoch: 1,
+            through_idx: 7,
+            rolled_back: 4,
+            surviving_side_effects: vec![],
+            cause: RecoveryCause::PlannedRelocation,
+            at: chrono::Utc::now(),
+        };
+        let v = serde_json::to_value(&planned).expect("serialize");
+        assert_eq!(v["type"], "recovered_from_checkpoint");
+        assert_eq!(v["cause"], "planned_relocation");
+
+        // A pre-F1 persisted payload omits `cause` entirely.
+        let legacy = serde_json::json!({
+            "type": "recovered_from_checkpoint",
+            "recovery_epoch": 1,
+            "through_idx": 7,
+            "rolled_back": 4,
+            "surviving_side_effects": [],
+            "at": chrono::Utc::now(),
+        });
+        match serde_json::from_value::<SessionEvent>(legacy).expect("deserialize legacy") {
+            SessionEvent::RecoveredFromCheckpoint { cause, .. } => {
+                assert_eq!(cause, RecoveryCause::HostFailureRecovery);
+            }
+            other => panic!("expected RecoveredFromCheckpoint, got {other:?}"),
+        }
     }
 
     fn indexed(idx: i64, event: SessionEvent) -> IndexedEvent {

@@ -349,6 +349,12 @@ export type SessionEvent =
       through_idx: number;
       rolled_back: number;
       surviving_side_effects: string[];
+      // ADR 0045 F1: why the rewind happened — `planned_relocation`
+      // (operator drain / teleport, no host failed) vs the original
+      // `host_failure_recovery`. Optional: events persisted before this
+      // field omit it, and the renderer treats a missing value as a
+      // host failure (the card's historical meaning).
+      cause?: "planned_relocation" | "host_failure_recovery";
       at: string;
     };
 

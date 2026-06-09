@@ -326,8 +326,17 @@ async fn run_resume_pipeline(
     // EvacLoss::None (memory was actually restored); a rung-2 cold
     // boot carries no cursor and skips this. No-op if the checkpoint
     // was the head.
+    // ADR 0045 F1: this path is only reached via operator drain /
+    // teleport (Phase A retired the reactive dead-host producer), so the
+    // rewind is a planned relocation, not a host failure.
     if receipt.loss == engram_core::types::evacuation::EvacLoss::None {
-        crate::api::snapshot::apply_rung1_rewind(state, session_id, rewind_cursor).await;
+        crate::api::snapshot::apply_rung1_rewind(
+            state,
+            session_id,
+            rewind_cursor,
+            crate::state::RecoveryCause::PlannedRelocation,
+        )
+        .await;
     }
 
     // Refresh the session row so finish_resume_to_active sees the
