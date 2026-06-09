@@ -650,7 +650,15 @@ impl HostRegistry {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
-        let (_, backend) = self.pick_specific_host(host_id, None)?;
+        // The capacity decision already happened in `reserve_placement`; just
+        // resolve the chosen host's backend. NO free-capacity re-gate — that
+        // would wrongly reject a host with no allocatable measurement yet (the
+        // reserve-time fallback host, plus every test fixture / brand-new host).
+        let backend = self
+            .hosts
+            .get(&host_id)
+            .map(|e| e.value().backend.clone())
+            .ok_or_else(|| SandboxError::from(PickError::NoCapacity))?;
         let sandbox_id = backend
             .restore_base_for_session(metadata, session_env)
             .await?;
