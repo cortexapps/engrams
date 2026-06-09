@@ -292,6 +292,16 @@ async fn roll_node(
 /// images (the successor has come up + run its reattach pass), or the budget
 /// elapses (the roll aborts with the host still cordoned; the next reconcile
 /// retries).
+/// The reattach gate's terminal condition: a Ready pod on `node` carrying
+/// **both** target images (so its host-agent has come up and run its reattach
+/// pass). Pure, so it's unit-tested without a cluster. A roll only uncordons
+/// once this holds — keeping the host `draining` (dead-host-detector-exempt)
+/// through the swap.
+fn successor_ready(pods: &[PodInfo], node: &str, image: &str, node_assets_image: &str) -> bool {
+    pods.iter()
+        .any(|p| p.node == node && p.ready && p.on_target(image, node_assets_image))
+}
+
 async fn gate_successor_ready(
     client: &Client,
     spec: &HostFleetSpec,
@@ -303,10 +313,7 @@ async fn gate_successor_ready(
     loop {
         let ds = ds_api.get(&spec.daemon_set.name).await?;
         let pods = list_ds_pods(client, &spec.daemon_set.namespace, &ds).await?;
-        let ready = pods.iter().any(|p| {
-            p.node == node && p.ready && p.on_target(&spec.image, &spec.node_assets_image)
-        });
-        if ready {
+        if successor_ready(&pods, node, &spec.image, &spec.node_assets_image) {
             tracing::info!(%node, "successor pod Ready on target");
             return Ok(());
         }
@@ -564,5 +571,30 @@ mod tests {
             plan_roll(&pods, NEW, NA, 1),
             RollDecision::RollNode { .. }
         ));
+    }
+
+    // ADR 0044 K3 amendment: the reattach roll uncordons only once the
+    // successor pod is Ready ON TARGET — that's what holds the host `draining`
+    // (dead-host-detector-exempt) through the swap. Lock the gate condition.
+    #[test]
+    fn successor_ready_requires_a_ready_on_target_pod_on_the_node() {
+        // The successor: Ready, both target images, right node → gate opens.
+        let pods = vec![pod("a", NEW, NA, true)];
+        assert!(successor_ready(&pods, "a", NEW, NA));
+
+        // Not yet Ready (still coming up) → keep waiting.
+        assert!(!successor_ready(&[pod("a", NEW, NA, false)], "a", NEW, NA));
+        // Ready but still on the OLD host image → not the successor yet.
+        assert!(!successor_ready(&[pod("a", OLD, NA, true)], "a", NEW, NA));
+        // Ready on target but the node-assets image drifted → not on target.
+        assert!(!successor_ready(
+            &[pod("a", NEW, "ghcr/node-assets@sha256:OLD", true)],
+            "a",
+            NEW,
+            NA
+        ));
+        // A Ready on-target pod, but on a DIFFERENT node → doesn't open this
+        // node's gate.
+        assert!(!successor_ready(&[pod("b", NEW, NA, true)], "a", NEW, NA));
     }
 }

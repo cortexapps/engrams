@@ -213,6 +213,38 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
     .expect("upsert_host");
 }
 
+/// Seed a host row with an explicit `status` + `last_heartbeat_at` so a test
+/// can stage stale / draining hosts for the dead-host detector's
+/// `list_stale_hosts` query.
+async fn seed_host_with(
+    meta: &Arc<dyn MetadataStore>,
+    host_id: HostId,
+    label: &str,
+    status: engram_core::types::HostStatus,
+    last_heartbeat_at: chrono::DateTime<Utc>,
+) {
+    use engram_core::types::host::HostRecord;
+    use engram_core::types::{HostCapacity, HostMetadata};
+    meta.upsert_host(HostRecord {
+        id: host_id,
+        hostname: format!("{label}-{host_id}"),
+        cloud_metadata: HostMetadata::default(),
+        capacity: HostCapacity {
+            total_gb: 100,
+            used_gb: 10,
+            total_mib: 65_536,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: Default::default(),
+        status,
+        last_heartbeat_at,
+        host_addr: None,
+    })
+    .await
+    .expect("upsert_host");
+}
+
 /// Mint a fresh session row at Active status with `host_id` and
 /// `sandbox_id` bound. Returns the session_id for follow-up queries.
 /// Inserts the `hosts` row first to keep PG's FK happy.
@@ -622,5 +654,54 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
     assert!(
         !registry.uncordon(HostId::new()),
         "unknown host returns false"
+    );
+}
+
+/// ADR 0044 K3 amendment: the dead-host detector must NOT strike out a
+/// `draining` host — it's operator-managed (mid image-roll, where K2 reattach
+/// keeps its VMs alive across the pod-swap heartbeat gap, or mid node-removal).
+/// So `list_stale_hosts` returns only stale `ready` hosts.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn list_stale_hosts_excludes_draining_hosts() {
+    use engram_core::types::HostStatus;
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+
+    let stale = Utc::now() - chrono::Duration::seconds(120);
+    let fresh = Utc::now();
+    let stale_ready = HostId::new();
+    let stale_draining = HostId::new();
+    let fresh_ready = HostId::new();
+    seed_host_with(&meta, stale_ready, "stale-ready", HostStatus::Ready, stale).await;
+    seed_host_with(
+        &meta,
+        stale_draining,
+        "stale-drain",
+        HostStatus::Draining,
+        stale,
+    )
+    .await;
+    seed_host_with(&meta, fresh_ready, "fresh-ready", HostStatus::Ready, fresh).await;
+
+    let stale_ids: Vec<HostId> = meta
+        .list_stale_hosts(60)
+        .await
+        .expect("list_stale_hosts")
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+
+    assert!(
+        stale_ids.contains(&stale_ready),
+        "a stale READY host is a strike-out candidate"
+    );
+    assert!(
+        !stale_ids.contains(&stale_draining),
+        "a stale DRAINING host is operator-managed — must be excluded"
+    );
+    assert!(
+        !stale_ids.contains(&fresh_ready),
+        "a fresh host is not stale"
     );
 }
