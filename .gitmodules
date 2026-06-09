@@ -1,0 +1,4 @@
+[submodule "third_party/firecracker"]
+	path = third_party/firecracker
+	url = https://github.com/cortexapps/firecracker
+	branch = engram/live-migration
