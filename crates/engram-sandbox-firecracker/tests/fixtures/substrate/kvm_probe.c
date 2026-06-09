@@ -1,25 +1,35 @@
-// S0.3 + S0.5 probe: the ADR 0045 substrate under a LIVE KVM guest.
+// S0.3 + S0.5 probe (v2b): the ADR 0045 substrate under a LIVE KVM guest.
 //
-// The go/no-go question: does KVM tolerate the substrate's mechanics —
-// guest RAM = MAP_SHARED memfd registered UFFD MISSING|MINOR|WP (armed),
-// faults resolved with CONTINUE|WP, and first-write carves that mmap a
-// per-sandbox overlay page MAP_FIXED *under a live memslot* — with the
-// guest seeing correct private values and the shared base staying clean?
+// v2b design of record (chosen after the S0.6 cross-process probe): guest
+// RAM = MAP_PRIVATE of the per-template base shm file, registered UFFD
+// MISSING|MINOR (no WP, no carve, no overlay):
+//   - base-identical reads -> MINOR fault -> CONTINUE (shared page cache,
+//     the density mechanism; MISSING for unpopulated base -> fill by
+//     path + CONTINUE)
+//   - session-divergent pages -> UFFDIO_COPY (installs private)
+//   - guest WRITES -> kernel-native COW; no handler involvement, base file
+//     stays clean, KVM dirty log tracks the write
 //
-// Also measured:
-//   - does a guest READ carve? (if KVM GUPs FOLL_WRITE for reads, every
-//     read would WP-fault -> no sharing -> design problem)
-//   - S0.5: KVM dirty log vs the carve set (overlay-as-dirty-set check)
+// (The earlier MAP_SHARED + WP + overlay-carve variant also passed all
+// probes in-process, but the carve's mmap(MAP_FIXED) cannot cross the
+// FC/handler process boundary — see uffd_probe.c, kept as the documented
+// fallback.)
 //
 // Guest (16-bit real mode @ 0x1000):
-//   mov al, [0x5000]      ; read a base page   -> MINOR fault -> CONTINUE|WP
-//   out 0x10, al          ; report it (expect 0xAB)
-//   mov [0x6000], 0xEE    ; write a base page  -> WP fault -> carve
-//   mov al, [0x6000]      ; read back through the carved overlay page
-//   out 0x10, al          ; report it (expect 0xEE)
+//   mov al, [0x5000]      ; read a base page    -> MINOR -> CONTINUE
+//   out 0x10, al          ; report (expect 0xAB)
+//   mov al, [0x7000]      ; read a DIVERGENT page -> handler COPYs 0xD7
+//   out 0x10, al          ; report (expect 0xD7)
+//   mov [0x6000], 0xEE    ; write a base page   -> native COW
+//   mov al, [0x6000]      ; read back
+//   out 0x10, al          ; report (expect 0xEE)
 //   mov al, [0x5000]      ; base page again — still clean/shared
-//   out 0x10, al          ; report it (expect 0xAB)
+//   out 0x10, al          ; report (expect 0xAB)
 //   hlt
+//
+// PASS = OUTs [ab d7 ee ab], base file clean at 0x6000/0x7000, dirty log
+// contains the written page, handler did exactly one COPY (the divergent
+// page) and zero COPYs for base reads.
 //
 // Build:  gcc -O2 -pthread -o kvm_probe kvm_probe.c
 // Run:    ./kvm_probe   (needs /dev/kvm)
@@ -43,12 +53,6 @@
 #ifndef UFFD_FEATURE_MINOR_SHMEM
 #define UFFD_FEATURE_MINOR_SHMEM (1 << 10)
 #endif
-#ifndef UFFD_FEATURE_WP_HUGETLBFS_SHMEM
-#define UFFD_FEATURE_WP_HUGETLBFS_SHMEM (1 << 12)
-#endif
-#ifndef UFFD_FEATURE_WP_UNPOPULATED
-#define UFFD_FEATURE_WP_UNPOPULATED (1 << 13)
-#endif
 #ifndef UFFDIO_REGISTER_MODE_MINOR
 #define UFFDIO_REGISTER_MODE_MINOR ((__u64)1 << 2)
 #endif
@@ -63,58 +67,24 @@ struct uffdio_continue {
 };
 #define UFFDIO_CONTINUE _IOWR(UFFDIO, 0x07, struct uffdio_continue)
 #endif
-#ifndef UFFDIO_CONTINUE_MODE_WP
-#define UFFDIO_CONTINUE_MODE_WP ((__u64)1 << 1)
-#endif
 
 #define PAGE 4096UL
-#define MEM_SIZE (2UL << 20)  // 2 MiB
+#define MEM_SIZE (2UL << 20)
 #define NPAGES (MEM_SIZE / PAGE)
 #define CODE_GPA 0x1000UL
 #define READ_GPA 0x5000UL
 #define WRITE_GPA 0x6000UL
+#define DIVERGENT_GPA 0x7000UL
 
-static int uffd = -1, base_fd = -1, overlay_fd = -1;
-static uint8_t *guest_mem = NULL;  // HVA backing the memslot
+static int uffd = -1, base_fd = -1;
+static uint8_t *guest_mem = NULL;
 
-static volatile int minor_count = 0, missing_count = 0, wp_count = 0;
+static volatile int minor_count = 0, missing_count = 0, copy_count = 0;
 static volatile int handler_error = 0;
-static volatile uint64_t carved[64];
-static volatile int carved_n = 0;
 
 static void die(const char *what) {
   fprintf(stderr, "FATAL: %s: %s\n", what, strerror(errno));
   exit(1);
-}
-
-static int uffd_continue_wp(uint64_t addr) {
-  struct uffdio_continue c;
-  memset(&c, 0, sizeof c);
-  c.range.start = addr;
-  c.range.len = PAGE;
-  c.mode = UFFDIO_CONTINUE_MODE_WP;
-  if (ioctl(uffd, UFFDIO_CONTINUE, &c) == -1) return errno;
-  return 0;
-}
-
-static int uffd_wake(uint64_t addr) {
-  struct uffdio_range r = {.start = addr, .len = PAGE};
-  if (ioctl(uffd, UFFDIO_WAKE, &r) == -1) return errno;
-  return 0;
-}
-
-static int carve_page(uint64_t addr) {
-  uint64_t off = addr - (uint64_t)guest_mem;
-  uint8_t buf[PAGE];
-  ssize_t n = pread(base_fd, buf, PAGE, off);
-  if (n < 0) return errno;
-  if (n < (ssize_t)PAGE) memset(buf + (n > 0 ? n : 0), 0, PAGE - (n > 0 ? n : 0));
-  if (pwrite(overlay_fd, buf, PAGE, off) != (ssize_t)PAGE) return errno ? errno : EIO;
-  void *p = mmap((void *)addr, PAGE, PROT_READ | PROT_WRITE,
-                 MAP_SHARED | MAP_FIXED, overlay_fd, off);
-  if (p == MAP_FAILED) return errno;
-  if (carved_n < 64) carved[carved_n++] = off;
-  return 0;
 }
 
 static void *handler_thread(void *arg) {
@@ -130,42 +100,56 @@ static void *handler_thread(void *arg) {
     if (msg.event != UFFD_EVENT_PAGEFAULT) continue;
     uint64_t addr = msg.arg.pagefault.address & ~(PAGE - 1);
     uint64_t flags = msg.arg.pagefault.flags;
-    if (flags & UFFD_PAGEFAULT_FLAG_WP) {
-      wp_count++;
-      int ce = carve_page(addr);
-      if (!ce) ce = uffd_wake(addr);
-      if (ce) { handler_error = ce; return NULL; }
-    } else if (flags & UFFD_PAGEFAULT_FLAG_MINOR) {
-      minor_count++;
-      int ce = uffd_continue_wp(addr);
-      if (ce && ce != EEXIST) { handler_error = ce; return NULL; }
-    } else {
+    uint64_t off = addr - (uint64_t)guest_mem;
+
+    // The real handler consults the session manifest here; the probe's
+    // "manifest" is: DIVERGENT_GPA is session-divergent, all else base.
+    if (off == DIVERGENT_GPA) {
+      uint8_t buf[PAGE];
+      memset(buf, 0xD7, PAGE);
+      struct uffdio_copy cp;
+      memset(&cp, 0, sizeof cp);
+      cp.dst = addr;
+      cp.src = (uint64_t)buf;
+      cp.len = PAGE;
+      copy_count++;
+      if (ioctl(uffd, UFFDIO_COPY, &cp) == -1 && errno != EEXIST) {
+        handler_error = errno;
+        return NULL;
+      }
+      continue;
+    }
+    if (!(flags & UFFD_PAGEFAULT_FLAG_MINOR)) {
       missing_count++;
-      uint64_t off = addr - (uint64_t)guest_mem;
       uint8_t buf[PAGE];
       memset(buf, 0, PAGE);
       if (pwrite(base_fd, buf, PAGE, off) != (ssize_t)PAGE) { handler_error = errno; return NULL; }
-      int ce = uffd_continue_wp(addr);
-      if (ce && ce != EEXIST) { handler_error = ce; return NULL; }
+    } else {
+      minor_count++;
+    }
+    struct uffdio_continue c;
+    memset(&c, 0, sizeof c);
+    c.range.start = addr;
+    c.range.len = PAGE;
+    if (ioctl(uffd, UFFDIO_CONTINUE, &c) == -1 && errno != EEXIST) {
+      handler_error = errno;
+      return NULL;
     }
   }
   return NULL;
 }
 
 int main(void) {
-  printf("== S0.3/S0.5 kvm substrate probe ==\n");
+  printf("== S0.3/S0.5 kvm substrate probe (v2b: MAP_PRIVATE + COW) ==\n");
 
-  // ---- backing files + content ----
   base_fd = memfd_create("s0-kvm-base", MFD_CLOEXEC);
   if (base_fd < 0) die("memfd base");
   if (ftruncate(base_fd, MEM_SIZE)) die("ftruncate base");
-  overlay_fd = memfd_create("s0-kvm-overlay", MFD_CLOEXEC);
-  if (overlay_fd < 0) die("memfd overlay");
-  if (ftruncate(overlay_fd, MEM_SIZE)) die("ftruncate overlay");
 
-  // Guest code (16-bit real mode).
   const uint8_t code[] = {
       0xA0, 0x00, 0x50,             // mov al, [0x5000]
+      0xE6, 0x10,                   // out 0x10, al
+      0xA0, 0x00, 0x70,             // mov al, [0x7000]  (divergent)
       0xE6, 0x10,                   // out 0x10, al
       0xC6, 0x06, 0x00, 0x60, 0xEE, // mov byte [0x6000], 0xEE
       0xA0, 0x00, 0x60,             // mov al, [0x6000]
@@ -175,45 +159,37 @@ int main(void) {
       0xF4,                         // hlt
   };
   if (pwrite(base_fd, code, sizeof code, CODE_GPA) != (ssize_t)sizeof code) die("pwrite code");
-  uint8_t ab = 0xAB, z0 = 0x00;
+  uint8_t ab = 0xAB, z0 = 0x00, b9 = 0xB9;
   if (pwrite(base_fd, &ab, 1, READ_GPA) != 1) die("pwrite read page");
   if (pwrite(base_fd, &z0, 1, WRITE_GPA) != 1) die("pwrite write page");
-  // Real-mode IVT/page 0 may be touched; give it content too (zeros).
+  // The divergent page HAS base content (0xB9) — the handler must shadow it
+  // with the session's 0xD7 via COPY, and the file must keep 0xB9.
+  if (pwrite(base_fd, &b9, 1, DIVERGENT_GPA) != 1) die("pwrite divergent page");
   uint8_t zeros[PAGE] = {0};
   if (pwrite(base_fd, zeros, PAGE, 0) != (ssize_t)PAGE) die("pwrite page0");
 
-  // ---- guest memory mapping ----
-  guest_mem = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, base_fd, 0);
-  if (guest_mem == MAP_FAILED) die("mmap guest_mem");
+  // v2b: MAP_PRIVATE of the base file.
+  guest_mem = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, base_fd, 0);
+  if (guest_mem == MAP_FAILED) die("mmap guest_mem MAP_PRIVATE");
 
-  // ---- uffd: register + arm BEFORE the VM touches anything ----
   uffd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
   if (uffd < 0) die("userfaultfd");
   struct uffdio_api api;
   memset(&api, 0, sizeof api);
   api.api = UFFD_API;
-  api.features = UFFD_FEATURE_MINOR_SHMEM | UFFD_FEATURE_PAGEFAULT_FLAG_WP |
-                 UFFD_FEATURE_WP_HUGETLBFS_SHMEM | UFFD_FEATURE_WP_UNPOPULATED;
+  api.features = UFFD_FEATURE_MINOR_SHMEM;
   if (ioctl(uffd, UFFDIO_API, &api) == -1) die("UFFDIO_API");
   struct uffdio_register reg;
   memset(&reg, 0, sizeof reg);
   reg.range.start = (uint64_t)guest_mem;
   reg.range.len = MEM_SIZE;
-  reg.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_MINOR |
-             UFFDIO_REGISTER_MODE_WP;
-  if (ioctl(uffd, UFFDIO_REGISTER, &reg) == -1) die("UFFDIO_REGISTER");
-  struct uffdio_writeprotect wp;
-  memset(&wp, 0, sizeof wp);
-  wp.range.start = (uint64_t)guest_mem;
-  wp.range.len = MEM_SIZE;
-  wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
-  if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1) die("UFFDIO_WRITEPROTECT");
-  printf("uffd: MISSING|MINOR|WP registered + armed over the future memslot\n");
+  reg.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_MINOR;
+  if (ioctl(uffd, UFFDIO_REGISTER, &reg) == -1) die("UFFDIO_REGISTER MISSING|MINOR on MAP_PRIVATE");
+  printf("uffd: MISSING|MINOR registered on MAP_PRIVATE base over the future memslot\n");
 
   pthread_t ht;
   if (pthread_create(&ht, NULL, handler_thread, NULL)) die("pthread handler");
 
-  // ---- KVM setup ----
   int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
   if (kvm < 0) die("open /dev/kvm");
   int vm = ioctl(kvm, KVM_CREATE_VM, 0UL);
@@ -224,10 +200,9 @@ int main(void) {
   region.guest_phys_addr = 0;
   region.memory_size = MEM_SIZE;
   region.userspace_addr = (uint64_t)guest_mem;
-  region.flags = KVM_MEM_LOG_DIRTY_PAGES;  // S0.5 cross-check
+  region.flags = KVM_MEM_LOG_DIRTY_PAGES;
   if (ioctl(vm, KVM_SET_USER_MEMORY_REGION, &region) < 0)
-    die("KVM_SET_USER_MEMORY_REGION (uffd-armed shm backing)");
-  printf("kvm: memslot set over the uffd-armed MAP_SHARED memfd + dirty log on\n");
+    die("KVM_SET_USER_MEMORY_REGION (uffd-armed MAP_PRIVATE shm backing)");
 
   int vcpu = ioctl(vm, KVM_CREATE_VCPU, 0UL);
   if (vcpu < 0) die("KVM_CREATE_VCPU");
@@ -246,7 +221,6 @@ int main(void) {
   regs.rflags = 2;
   if (ioctl(vcpu, KVM_SET_REGS, &regs) < 0) die("KVM_SET_REGS");
 
-  // ---- run: collect the three OUT values ----
   uint8_t outs[8];
   int outs_n = 0;
   int halted = 0;
@@ -270,23 +244,20 @@ int main(void) {
     }
   }
 
-  int read_carves_only_writes = 1;
-  for (int i = 0; i < carved_n; i++)
-    if (carved[i] != WRITE_GPA) read_carves_only_writes = 0;
-
-  uint8_t base_w = 0, ovl_w = 0;
+  uint8_t base_w = 0, base_d = 0;
   pread(base_fd, &base_w, 1, WRITE_GPA);
-  pread(overlay_fd, &ovl_w, 1, WRITE_GPA);
+  pread(base_fd, &base_d, 1, DIVERGENT_GPA);
 
-  printf("guest OUTs: n=%d [%02x %02x %02x] (want ab ee ab)\n", outs_n,
-         outs_n > 0 ? outs[0] : 0, outs_n > 1 ? outs[1] : 0, outs_n > 2 ? outs[2] : 0);
-  printf("faults: minor=%d missing=%d wp=%d; carved_n=%d (only the written page: %s)\n",
-         minor_count, missing_count, wp_count, carved_n,
-         read_carves_only_writes ? "yes" : "NO — reads carve too!");
-  printf("backing after run: base[0x6000]=0x%02x (clean=0x00) overlay[0x6000]=0x%02x (dirty=0xee)\n",
-         base_w, ovl_w);
+  printf("guest OUTs: n=%d [%02x %02x %02x %02x] (want ab d7 ee ab)\n", outs_n,
+         outs_n > 0 ? outs[0] : 0, outs_n > 1 ? outs[1] : 0,
+         outs_n > 2 ? outs[2] : 0, outs_n > 3 ? outs[3] : 0);
+  printf("faults: minor=%d missing=%d copies=%d (want copies==1: only the divergent page: %s)\n",
+         minor_count, missing_count, copy_count,
+         copy_count == 1 ? "yes" : "NO");
+  printf("base file after run: [0x6000]=0x%02x (COW-clean=0x00) [0x7000]=0x%02x (shadow-clean=0xb9)\n",
+         base_w, base_d);
 
-  // ---- S0.5: KVM dirty log vs the carve set ----
+  // S0.5: dirty log must contain the COW-written page.
   unsigned long bitmap_bytes = (NPAGES + 63) / 64 * 8;
   uint64_t *bitmap = calloc(1, bitmap_bytes);
   struct kvm_dirty_log dlog;
@@ -294,21 +265,20 @@ int main(void) {
   dlog.slot = 0;
   dlog.dirty_bitmap = bitmap;
   int dlog_ok = ioctl(vm, KVM_GET_DIRTY_LOG, &dlog) == 0;
+  int wrote_dirty = dlog_ok &&
+      (bitmap[(WRITE_GPA / PAGE) / 64] & (1UL << ((WRITE_GPA / PAGE) % 64)));
   int dirty_n = 0;
-  uint64_t dirty_pages[64];
   for (unsigned long pg = 0; pg < NPAGES; pg++)
-    if (bitmap[pg / 64] & (1UL << (pg % 64)))
-      if (dirty_n < 64) dirty_pages[dirty_n++] = pg * PAGE;
-  printf("S0.5: dirty log %s, %d dirty pages:", dlog_ok ? "ok" : "FAILED", dirty_n);
-  for (int i = 0; i < dirty_n; i++) printf(" 0x%lx", dirty_pages[i]);
-  printf("  | carved:");
-  for (int i = 0; i < carved_n; i++) printf(" 0x%lx", (unsigned long)carved[i]);
-  printf("\n");
+    if (bitmap[pg / 64] & (1UL << (pg % 64))) dirty_n++;
+  printf("S0.5 %s: dirty log %s; written page dirty=%d (total dirty=%d)\n",
+         (dlog_ok && wrote_dirty) ? "PASS" : "FAIL", dlog_ok ? "ok" : "FAILED",
+         wrote_dirty, dirty_n);
 
-  int pass = halted && outs_n == 3 && outs[0] == 0xAB && outs[1] == 0xEE &&
-             outs[2] == 0xAB && base_w != 0xEE && ovl_w == 0xEE &&
+  int pass = halted && outs_n == 4 && outs[0] == 0xAB && outs[1] == 0xD7 &&
+             outs[2] == 0xEE && outs[3] == 0xAB && base_w != 0xEE &&
+             base_d == 0xB9 && copy_count == 1 && dlog_ok && wrote_dirty &&
              handler_error == 0;
-  printf("S0.3 %s: live KVM guest on the substrate (halted=%d handler_error=%d)\n",
+  printf("S0.3 %s: live KVM guest on the v2b substrate (halted=%d handler_error=%d)\n",
          pass ? "PASS" : "FAIL", halted, handler_error);
   return pass ? 0 : 1;
 }

@@ -1,5 +1,12 @@
 // S0.1 + S0.2 feasibility probe (v2) for ADR 0045's unified memory substrate.
 //
+// NOTE (S0.6): the WP/carve protocol probed here (T4-T6, T7) was superseded
+// by the v2b design -- MAP_PRIVATE of the base shm + MISSING|MINOR + native
+// COW (see cross_probe.c / kvm_probe.c) -- because the carve's
+// mmap(MAP_FIXED) cannot cross the FC/handler process boundary. This probe
+// is kept as the documented fallback + the kernel-mechanics record (all
+// tests still pass and still gate CI).
+//
 // v1 findings folded in:
 //   - fault-around maps cache-present NEIGHBOR pages without faults -> write
 //     interception must come from arming UFFDIO_WRITEPROTECT over the whole

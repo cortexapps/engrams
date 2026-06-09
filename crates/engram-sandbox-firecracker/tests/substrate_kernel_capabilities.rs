@@ -1,22 +1,26 @@
 //! ADR 0045 S0 kernel-capability gate for the unified memory substrate.
 //!
-//! The substrate (shared per-template base shm + UFFD `MINOR|WP` + per-sandbox
-//! overlay with 4 KiB carve-on-first-write) rests on a handful of kernel
-//! behaviors that are NOT guaranteed by any API contract we control:
+//! The substrate — **v2b, the design of record after the S0.6 cross-process
+//! probe**: guest RAM = `MAP_PRIVATE` of the per-template base shm file,
+//! registered UFFD `MISSING|MINOR` — rests on kernel behaviors NOT
+//! guaranteed by any API contract we control:
 //!
-//!   - `MISSING|MINOR|WP` triple registration on a `MAP_SHARED` memfd mapping,
-//!     with full-range `UFFDIO_WRITEPROTECT` arming (`wp_unpopulated`)
-//!   - `UFFDIO_CONTINUE` with `MODE_WP` (a plain CONTINUE installs a WRITABLE
-//!     pte and writes leak into the shared base — found by S0 probe v2)
-//!   - write -> WP fault -> `MAP_FIXED` overlay carve -> `UFFDIO_WAKE` resumes
-//!     the stalled writer; base stays clean, overlay holds the dirty page
-//!   - KVM tolerates all of the above UNDER A LIVE MEMSLOT: guest reads fault
-//!     as reads (no carve — sharing preserved), a guest write carves exactly
-//!     one page mid-execution, and the KVM dirty log matches the carve set
+//!   - `MISSING|MINOR` registration AND cross-process `UFFDIO_CONTINUE` are
+//!     legal on a `MAP_PRIVATE` mapping of a shm file (base-identical reads
+//!     resolve against the shared page cache — the density mechanism)
+//!   - `UFFDIO_COPY` on that same mapping installs session-divergent pages
+//!     PRIVATELY (the shared base file stays clean)
+//!   - guest writes COW natively (privacy with zero handler involvement)
+//!   - KVM tolerates all of the above UNDER A LIVE MEMSLOT, and its dirty
+//!     log catches the COW writes (teardown keeps the diff chain)
 //!
-//! These were proven on engram-dev (kernel 6.8) and prod COS (6.12) on
-//! 2026-06-09; this test keeps them proven on every CI runner kernel so a
-//! kernel/KVM regression surfaces here, not in prod.
+//! The first-round WP/overlay-carve protocol (uffd_probe.c) is kept gated as
+//! the documented fallback — superseded because its `mmap(MAP_FIXED)` carve
+//! cannot cross the FC/handler process boundary.
+//!
+//! All proven on engram-dev (kernel 6.8) and prod COS (6.12) on 2026-06-09;
+//! this test keeps them proven on every CI runner kernel so a kernel/KVM
+//! regression surfaces here, not in prod.
 //!
 //! The probes are small self-contained C programs (fixtures/substrate/) —
 //! the exact artifacts the S0 spikes ran — compiled with the system gcc at
@@ -84,15 +88,57 @@ fn run_probe(src_name: &str) -> String {
     stdout
 }
 
-/// S0.1/S0.2: the userspace half — triple registration, WP arming,
-/// CONTINUE|WP, the carve protocol, scattered-carve VMA behavior, install
-/// and fault-round-trip throughput.
+/// S0.6 — the v2b design of record: MISSING|MINOR registration and
+/// cross-process CONTINUE on a MAP_PRIVATE-of-shm-file mapping; native COW
+/// for write privacy; UFFDIO_COPY installing session-divergent pages
+/// privately; sibling page-cache sharing (the density mechanism).
+#[test]
+#[ignore = "needs Linux uffd (MINOR on shmem, kernel >= 5.13); run via test-firecracker CI job or dev-vm"]
+fn substrate_cross_process_map_private() {
+    let out = run_probe("cross_probe.c");
+    for marker in [
+        "X1 PASS", // MISSING|MINOR register on MAP_PRIVATE shm
+        "X2 PASS", // cross-process CONTINUE resolves a read
+        "X3 PASS", // cross-process hole fill (pwrite-by-path + CONTINUE)
+        "X4 PASS", // native COW: private write, file clean
+        "X5 PASS", // sibling mapping shares the clean base
+        "X6 PASS", // UFFDIO_COPY installs divergent pages privately
+    ] {
+        assert!(out.contains(marker), "missing {marker:?} in probe output");
+    }
+}
+
+/// S0.3/S0.5 (v2b): a live KVM guest on the substrate — base reads CONTINUE
+/// (shared), the divergent page COPYs (exactly one), guest writes COW
+/// natively with the base file staying clean, and the KVM dirty log catches
+/// the write.
+#[test]
+#[ignore = "needs /dev/kvm; run via test-firecracker CI job or dev-vm"]
+fn substrate_kvm_capabilities() {
+    let out = run_probe("kvm_probe.c");
+    assert!(
+        out.contains("S0.3 PASS"),
+        "missing S0.3 PASS in probe output"
+    );
+    assert!(
+        out.contains("S0.5 PASS"),
+        "missing S0.5 PASS in probe output"
+    );
+    assert!(
+        out.contains("only the divergent page: yes"),
+        "base reads triggered COPYs — sharing would be lost"
+    );
+}
+
+/// The superseded WP/carve protocol (the S0.1/S0.2 first-round probe) —
+/// kept as the documented fallback: MINOR|WP triple registration, upfront
+/// WP arming (suppresses fault-around), CONTINUE|MODE_WP, and the overlay
+/// carve. Not the design of record (the carve's mmap(MAP_FIXED) can't cross
+/// the FC/handler process boundary), but the kernel behaviors stay gated.
 #[test]
 #[ignore = "needs Linux uffd (MINOR|WP on shmem, kernel >= 5.19); run via test-firecracker CI job or dev-vm"]
-fn substrate_uffd_capabilities() {
+fn substrate_uffd_carve_fallback() {
     let out = run_probe("uffd_probe.c");
-    // The load-bearing assertions, by name — so a probe edit that drops one
-    // shows up here instead of silently narrowing coverage.
     for marker in [
         "T1 PASS", // MISSING|MINOR|WP register + full-range WP arm
         "T2 PASS", // cached read -> MINOR -> CONTINUE|WP
@@ -103,20 +149,4 @@ fn substrate_uffd_capabilities() {
     ] {
         assert!(out.contains(marker), "missing {marker:?} in probe output");
     }
-}
-
-/// S0.3/S0.5: the KVM half — a live guest on the substrate, reads don't
-/// carve, a guest write carves under the live memslot, dirty log == carve set.
-#[test]
-#[ignore = "needs /dev/kvm; run via test-firecracker CI job or dev-vm"]
-fn substrate_kvm_capabilities() {
-    let out = run_probe("kvm_probe.c");
-    assert!(
-        out.contains("S0.3 PASS"),
-        "missing S0.3 PASS in probe output"
-    );
-    assert!(
-        out.contains("only the written page: yes"),
-        "guest READS carved — KVM faulted reads as writes; sharing would be lost"
-    );
 }
