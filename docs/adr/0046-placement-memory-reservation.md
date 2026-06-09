@@ -85,6 +85,38 @@ round; once autoscaling is enabled, the now-real `free_mib` scales the pool).
 reserved` over schedulable hosts) → a true demand-pressure signal for the K4
 autoscaler.
 
+### Reservation lifecycle: reserve at pick, hold through evict, release at idle
+
+The reservation *is* the session row, and it lives from pick to teardown:
+
+- **Reserve at pick.** The placement transaction inserts the session row in
+  `pending` with `host_id` + `mem_budget_mib` and `sandbox_id` NULL — *before*
+  the VM boots. This moves the insert earlier than today's "row exists only once
+  we have host_id + sandbox_id" (`create_session_inner`): the reservation must be
+  visible to concurrent placers during the boot window, which is the burst we're
+  fixing. (`sandbox_id` is already nullable and the hot paths guard on
+  `sandbox_id IS NOT NULL`, so a pending-no-sandbox row is a representable, inert
+  state — verified before relying on it.)
+- **Finalize after boot.** On a successful boot/restore the row is updated with
+  `sandbox_id` (+ status, as today). On boot failure the pending row is deleted
+  (reservation released) alongside the existing sandbox teardown.
+- **Hold through evicting.** A session keeps its reservation across
+  `pending → created → active → paused → evacuating/evicting`. The VM is fully
+  resident the entire time — and an eviction *snapshot can take minutes* (#147) —
+  so releasing at evict-*start* would re-open the over-admit during the snapshot.
+  The reserved set is "states where the VM is resident."
+- **Release at idle/terminal.** The reservation drops when the session reaches
+  `idle` (or `completed` / `failed` / `dead`) — once the sandbox is actually torn
+  down.
+
+**Accepted residual window.** Eviction is PG-first (ADR 0016 §A.1.6):
+`status→Idle` is set just before `host.destroy()`, so the budget is released a
+sub-second before the RAM is physically freed. We accept this narrow window
+rather than thread release through the async, best-effort destroy. A **periodic
+reconcile** (reserved recomputed from the resident-state sessions per host) is
+the consistency/leak backstop; if the window ever bites, release can move to fire
+right after `host.destroy()` without changing the model.
+
 ## Key decisions (and the alternatives)
 
 - **Sessions-as-ledger** over a dedicated `reservations` table — the session row
@@ -130,6 +162,37 @@ memory-placement-reservation primitive that pass will build on.
 5. `free_mib` from the same reserved figure.
 6. Tests: burst placement spreads + rejects overflow; reserved releases on
    session-leaves-host; residency floor respected.
+
+## Implementation notes (divergences from the proposal above)
+
+Two things changed while building this; both are improvements, recorded here per
+the ADR-bookend habit:
+
+1. **Host-measured `allocatable` supersedes the coordinator-estimated residency
+   floor.** The proposal subtracted `Σ enabled-image guest RAM` (a coordinator
+   estimate of the mlock'd residency). That ignored the rest of the host
+   baseline — the host-agent daemon (~5–7 GiB), the OS, kube-system pods, and
+   the chunk cache — so placement would over-admit by that much. Instead the
+   host now reports **`allocatable_mib = MemAvailable + Σ guest-resident (PSS)`**
+   in the heartbeat (`HostUtilization`, migration 0058): `MemAvailable` nets out
+   the *entire* baseline (daemon + OS + chunk cache + the mlock'd residency)
+   automatically — measured, not estimated, and drift-tracking — and adding back
+   the running VMs' resident lets placement subtract each session's full budget
+   without double-counting. So `free = allocatable − Σ(reserved budgets)`, and
+   the `enabled_residency_floor_mib` estimate is deleted. `allocatable == 0`
+   (non-Linux dev backend / pre-0058 / brand-new host) is a graceful fallback,
+   not a gate.
+
+2. **The reserve-at-pick row.** As noted in the lifecycle section, the session
+   row moves to pick time (`pending`, `sandbox_id` NULL) inside the placement
+   txn, is finalized by an upsert in `create_session_created` after boot, and is
+   deleted on boot failure — versus today's "insert only after the sandbox
+   exists." `Pending` becomes a (briefly) persisted state for the boot window;
+   the hot paths already guard on `sandbox_id IS NOT NULL`.
+
+3. **Scope:** resume/evac placement still uses the in-memory picker; making it
+   reservation-safe (re-binding an existing `idle` row) is a tracked fast-follow
+   — the incident this fixes was create-bursts.
 
 [#147]: https://github.com/cortexapps/engrams/issues/147
 [#148]: https://github.com/cortexapps/engrams/issues/148
