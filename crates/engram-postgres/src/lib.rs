@@ -174,6 +174,36 @@ impl MetadataStore for PostgresStore {
         row::session_from_row(&row)
     }
 
+    /// ADR 0046: `Σ mem_budget_mib` per host over resident-VM sessions. The
+    /// status list is the SQL twin of
+    /// `SessionState::host_memory_reserving_states()` (a test asserts they
+    /// match). Runtime query — `mem_budget_mib` lands with migration 0057.
+    async fn reserved_mib_by_host(
+        &self,
+    ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT host_id,
+                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT AS reserved_mib
+            FROM sessions
+            WHERE host_id IS NOT NULL
+              AND status IN ('pending','created','guest_ready','active',
+                             'evacuating','evicting')
+            GROUP BY host_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut by_host = std::collections::HashMap::with_capacity(rows.len());
+        for r in rows {
+            let host: uuid::Uuid = sqlx::Row::try_get(&r, "host_id").map_err(db_err)?;
+            let mib: i64 = sqlx::Row::try_get(&r, "reserved_mib").map_err(db_err)?;
+            by_host.insert(HostId(host), mib);
+        }
+        Ok(by_host)
+    }
+
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
         // Every non-terminal state except `host_lost` (limbo pending the
         // reconciler; its bindings are stale by definition).

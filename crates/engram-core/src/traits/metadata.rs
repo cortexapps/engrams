@@ -96,6 +96,19 @@ pub trait MetadataStore: Send + Sync {
     /// session with an unroutable sandbox.
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
 
+    /// ADR 0046: reserved guest-RAM (MiB) per host — `Σ mem_budget_mib` over
+    /// sessions whose VM is resident on the host
+    /// ([`crate::types::SessionState::reserves_host_memory`]). Placement
+    /// subtracts this (plus the enabled-image residency floor) from a host's
+    /// total RAM, and the autoscaler's `free_mib` uses the same figure. Only
+    /// hosts carrying a live reservation appear in the map. Default impl returns
+    /// empty (non-PG mock stores reserve nothing).
+    async fn reserved_mib_by_host(
+        &self,
+    ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
+        Ok(std::collections::HashMap::new())
+    }
+
     /// ADR 0009 reconcile pass: enumerate the `(session_id,
     /// sandbox_id)` pairs for every `status='active'` session
     /// assigned to `host_id` whose `sandbox_id` is populated. The
