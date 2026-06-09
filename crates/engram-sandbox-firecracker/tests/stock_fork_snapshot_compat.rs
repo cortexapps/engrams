@@ -37,7 +37,12 @@ use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreM
 /// Create + snapshot a microVM with `creator_bin`, then File-restore that exact
 /// snapshot with `restorer_bin`. Both backends share `work` so the restorer
 /// resolves the creator's snapshot dir + rootfs. Panics on any failure.
-async fn round_trip(creator_bin: PathBuf, restorer_bin: PathBuf, env: &common::CompatEnv, label: &str) {
+async fn round_trip(
+    creator_bin: PathBuf,
+    restorer_bin: PathBuf,
+    env: &common::CompatEnv,
+    label: &str,
+) {
     // Rootfs lives in `work` (not a per-sandbox jail dir) so it survives
     // destroy() — FC stores the absolute drive path in state.bin and reopens it
     // at restore. See tests/snapshot.rs for the full rationale.
@@ -77,15 +82,24 @@ async fn round_trip(creator_bin: PathBuf, restorer_bin: PathBuf, env: &common::C
     };
 
     // Create + snapshot with the first binary.
-    let original_id = creator.create(spec).await.unwrap_or_else(|e| panic!("{label}: create: {e:?}"));
+    let original_id = creator
+        .create(spec)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: create: {e:?}"));
     tokio::time::sleep(Duration::from_secs(2)).await; // let early boot settle
     let metadata = creator
         .snapshot(original_id)
         .await
         .unwrap_or_else(|e| panic!("{label}: snapshot: {e:?}"));
     let snap_dir = creator.snapshot_path_for(metadata.id);
-    assert!(snap_dir.join("state.bin").exists(), "{label}: state.bin missing");
-    assert!(snap_dir.join("memory.bin").exists(), "{label}: memory.bin missing");
+    assert!(
+        snap_dir.join("state.bin").exists(),
+        "{label}: state.bin missing"
+    );
+    assert!(
+        snap_dir.join("memory.bin").exists(),
+        "{label}: memory.bin missing"
+    );
     creator
         .destroy(original_id)
         .await
@@ -98,7 +112,11 @@ async fn round_trip(creator_bin: PathBuf, restorer_bin: PathBuf, env: &common::C
         Ok(id) => id,
         Err(e) => {
             // Dump firecracker.log (carries the guest console) for any preserved jail.
-            for entry in std::fs::read_dir(work.path()).into_iter().flatten().flatten() {
+            for entry in std::fs::read_dir(work.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
                 let log = entry.path().join("firecracker.log");
                 if log.exists() {
                     eprintln!(
@@ -117,7 +135,10 @@ async fn round_trip(creator_bin: PathBuf, restorer_bin: PathBuf, env: &common::C
     let st = restorer
         .snapshot_state(restored_id)
         .unwrap_or_else(|| panic!("{label}: state present after restore"));
-    assert_eq!(st.spec.image, label, "{label}: spec.image carried through restore");
+    assert_eq!(
+        st.spec.image, label,
+        "{label}: spec.image carried through restore"
+    );
 
     restorer
         .destroy(restored_id)
@@ -132,7 +153,13 @@ async fn stock_created_snapshot_restores_on_fork() {
         Some(e) => e,
         None => return,
     };
-    round_trip(env.stock_bin.clone(), env.fork_bin.clone(), &env, "compat-stock-to-fork").await;
+    round_trip(
+        env.stock_bin.clone(),
+        env.fork_bin.clone(),
+        &env,
+        "compat-stock-to-fork",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -142,5 +169,11 @@ async fn fork_created_snapshot_restores_on_stock() {
         Some(e) => e,
         None => return,
     };
-    round_trip(env.fork_bin.clone(), env.stock_bin.clone(), &env, "compat-fork-to-stock").await;
+    round_trip(
+        env.fork_bin.clone(),
+        env.stock_bin.clone(),
+        &env,
+        "compat-fork-to-stock",
+    )
+    .await;
 }
