@@ -12,6 +12,7 @@ It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to ope
 - What shipped, in order: [`docs/history.md`](./docs/history.md).
 - What's pending / deferred: [`docs/chunked-storage-rollout.md`](./docs/chunked-storage-rollout.md).
 - Operational guide for GCP: [`docs/deploy.md`](./docs/deploy.md).
+- Firecracker fork health (ADR 0045 Phase B): [![rebase-fc-fork](https://github.com/cortexapps/engrams/actions/workflows/rebase-fc-fork.yml/badge.svg)](https://github.com/cortexapps/engrams/actions/workflows/rebase-fc-fork.yml) — the vendored FC fork's daily rebase onto upstream. Red = a rebase conflict needs a hand (see the tracked issue + [`docs/runbooks/firecracker-fork.md`](./docs/runbooks/firecracker-fork.md)).
 
 ## Architecture
 

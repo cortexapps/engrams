@@ -99,6 +99,12 @@ BUNDLES_PATHS = ["deploy/bundles/"]
 # host source closures (computed below) plus the dev-orchestration inputs
 # here. Doc/TF-only pushes don't rebake it.
 DEV_IMAGE_PATHS = ["justfile", "flake.nix", "flake.lock", "Tiltfile", "deploy/dev/"]
+# ADR 0045 Phase B: the vendored Firecracker fork (a submodule + the `.gitmodules`
+# gitlink). Bumping the submodule pointer (the daily auto-rebase, or a manual
+# port) changes the FC *binary* the node-assets image stages, so it must rebuild
+# node-assets + roll the host fleet — folded into the `images` lane below.
+# Inert until the submodule exists (these paths don't change today).
+FC_FORK_PATHS = ["third_party/firecracker", ".gitmodules"]
 
 
 def cargo_meta():
@@ -187,7 +193,11 @@ def main():
     harness = release_closure(meta, SESSION_HARNESS_BINS)
     cli_tools_closure = release_closure(meta, CLI_TOOLS_BINS)
 
-    images = bool(cc & cont) or any_path(changed, IMAGES_PATHS)
+    # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
+    # FC binary in the node-assets image, so it trips the images lane (which
+    # gates publish-node-assets → the operator's drain-gated host roll).
+    fc_fork = any_path(changed, FC_FORK_PATHS)
+    images = bool(cc & cont) or any_path(changed, IMAGES_PATHS) or fc_fork
     host_binaries = bool(cc & fc) or any_path(changed, HOST_BINARIES_PATHS)
     host_base = any_path(changed, HOST_BASE_PATHS)
     # Union — gates the publish-host-binaries job so the GHCR artifact exists
@@ -218,7 +228,8 @@ def main():
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
     print(f"-> images={images} host_binaries={host_binaries} "
           f"host_base={host_base} host_image={host_image} cli_tools={cli_tools} "
-          f"tf_or_helm={tf_or_helm} bundles={bundles} dev_image={dev_image}",
+          f"tf_or_helm={tf_or_helm} bundles={bundles} dev_image={dev_image} "
+          f"fc_fork={fc_fork}",
           file=sys.stderr)
 
     out = os.environ.get("GITHUB_OUTPUT")
@@ -232,6 +243,7 @@ def main():
             f.write(f"tf_or_helm={'true' if tf_or_helm else 'false'}\n")
             f.write(f"bundles={'true' if bundles else 'false'}\n")
             f.write(f"dev_image={'true' if dev_image else 'false'}\n")
+            f.write(f"fc_fork={'true' if fc_fork else 'false'}\n")
 
 
 if __name__ == "__main__":
