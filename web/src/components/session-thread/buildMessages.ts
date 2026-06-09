@@ -81,6 +81,8 @@ export type SystemMarker =
       kind: "recovery";
       rolledBack: number;
       survivingSideEffects: string[];
+      // ADR 0045 F1: planned operator relocation vs unplanned host failure.
+      planned: boolean;
       at: string;
     };
 
@@ -397,6 +399,9 @@ export function buildMessages(
           kind: "recovery",
           rolledBack: ev.rolled_back,
           survivingSideEffects: ev.surviving_side_effects,
+          // ADR 0045 F1: a missing cause (events predating the field)
+          // reads as a host failure — the card's historical meaning.
+          planned: ev.cause === "planned_relocation",
           at: ev.at,
         });
         break;

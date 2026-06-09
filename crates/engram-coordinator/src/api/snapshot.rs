@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::host_registry::ScheduleContext;
-use crate::state::{SessionEvent, SharedState};
+use crate::state::{RecoveryCause, SessionEvent, SharedState};
 
 /// ADR 0039 follow-up #20: how long `ensure_active` will HOLD a
 /// request that arrived mid-eviction (session `Evicting`) waiting for
@@ -719,12 +719,18 @@ pub enum FinishResumeOutcome {
 /// already coherent; the worst case is a confusing-but-intact log.
 ///
 /// Shared by [`resume_from_fc_snapshot`] (manual `/resume`) and
-/// `evac_resumer::run_resume_pipeline` (dead-host warm recovery) — the
-/// two rung-1 entry points.
+/// `evac_resumer::run_resume_pipeline` (operator drain / teleport) — the
+/// two rung-1 entry points. The `cause` distinguishes them for the web
+/// copy (ADR 0045 F1): the manual-`/resume` path resumes a session that
+/// was idled after its host died, so it carries
+/// [`RecoveryCause::HostFailureRecovery`]; the evac-resumer path is an
+/// operator-initiated relocation, so it carries
+/// [`RecoveryCause::PlannedRelocation`].
 pub async fn apply_rung1_rewind(
     state: &SharedState,
     session_id: SessionId,
     events_cursor: Option<i64>,
+    cause: RecoveryCause,
 ) {
     // Only coherent checkpoints (memory present) rewind; a disk-only
     // record never reaches here (rung 2 cold-boots fresh, no rewind).
@@ -770,6 +776,7 @@ pub async fn apply_rung1_rewind(
                 through_idx: summary.through_idx,
                 rolled_back: summary.rolled_back,
                 surviving_side_effects: summary.surviving_side_effects,
+                cause,
                 at: Utc::now(),
             },
         )
@@ -1113,7 +1120,15 @@ async fn resume_from_fc_snapshot(
     // before the harness comes back, so the resumed agent's first
     // events append after an honest recovery boundary, not after
     // messages it never made. No-op for a checkpoint that was the head.
-    apply_rung1_rewind(&state, id, record.events_cursor).await;
+    // ADR 0045 F1: the manual `/resume` path only rewinds when the
+    // checkpoint lags the lost live head — an unplanned host-death case.
+    apply_rung1_rewind(
+        &state,
+        id,
+        record.events_cursor,
+        RecoveryCause::HostFailureRecovery,
+    )
+    .await;
     // Refresh the session row so finish_resume_to_active sees the
     // freshly-bound host_id + sandbox_id (the caller might've raced
     // a concurrent writer between bind_resumed_session and now).
