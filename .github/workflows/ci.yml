@@ -474,6 +474,35 @@ jobs:
           sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
           firecracker --version
 
+      - uses: oras-project/setup-oras@v1
+
+      # ADR 0045 Phase B: stage both binaries for the stock<->fork
+      # snapshot-compat test (`stock_fork_snapshot_compat`). Stock = the
+      # v1.10.1 just installed; fork = the artifact build-firecracker published,
+      # keyed by the submodule's gitlink SHA (read from the tree — no submodule
+      # fetch). Graceful: if the fork artifact isn't published yet (e.g. a
+      # submodule-bump PR before its merge builds it), leave ENGRAM_FC_FORK_BIN
+      # unset and the compat test skips cleanly via compat_preflight().
+      - name: Stage stock + forked firecracker (compat test)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "ENGRAM_FC_STOCK_BIN=/usr/local/bin/firecracker" >> "$GITHUB_ENV"
+          FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
+          if [ -z "$FC_SHA" ]; then echo "no third_party/firecracker gitlink; compat test will skip"; exit 0; fi
+          if ! echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin; then
+            echo "oras login failed; compat test will skip"; exit 0
+          fi
+          mkdir -p "$HOME/fc-fork"
+          if oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output "$HOME/fc-fork"; then
+            chmod +x "$HOME/fc-fork/firecracker"
+            echo "ENGRAM_FC_FORK_BIN=$HOME/fc-fork/firecracker" >> "$GITHUB_ENV"
+            echo "staged forked firecracker @ $FC_SHA"
+          else
+            echo "fork artifact firecracker:$FC_SHA not published yet; compat test will skip"
+          fi
+
       # Cache the kernel + ubuntu rootfs in GH Actions cache. Both
       # artifacts are version-pinned via fetch-fc-test-artifacts.sh
       # (currently vmlinux-5.10.223 + ubuntu-22.04.ext4, ~1.9 GB
@@ -594,6 +623,7 @@ jobs:
             --test aux_ro_drive \
             --test diff_snapshot \
             --test file_restore_shared_rss \
+            --test stock_fork_snapshot_compat \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
