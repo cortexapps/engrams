@@ -116,8 +116,14 @@ jobs:
           set -euo pipefail
           git config user.name "engrams-bot"
           git config user.email "noreply@anthropic.com"
-          echo "Rebasing onto ${{ steps.target.outputs.latest }}"
-          if git rebase "${{ steps.target.outputs.latest }}"; then
+          # `--onto <latest> <base>` replays ONLY our patch commits (everything
+          # after the base tag the fork sits on), NOT the merge-base..HEAD range a
+          # bare `git rebase <latest>` would — which drags in the base release's
+          # own commits (version bumps, CHANGELOG) and conflicts every time. With
+          # --onto, an incremental bump (e.g. v1.16.0 -> v1.16.1) replays our tiny
+          # surface cleanly; only genuine surface drift conflicts.
+          echo "Rebasing our patch surface from ${{ steps.target.outputs.base }} onto ${{ steps.target.outputs.latest }}"
+          if git rebase --onto "${{ steps.target.outputs.latest }}" "${{ steps.target.outputs.base }}"; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             git rebase --abort || true
