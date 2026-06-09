@@ -87,6 +87,11 @@ impl CoordClient {
     /// `POST /api/admin/hosts/:id/drain` — evacuate every active session
     /// (Evacuating = snapshot + warm-restore on a peer). Returns 202; the
     /// actual progress is observed via [`Self::host_status`].
+    ///
+    /// **Reserved for the node-removal drain path** (ADR 0045 Phase E
+    /// scale-down actuation). Image rolls reattach and never drain
+    /// (`reconcile::roll_node`), so this currently has no caller.
+    #[allow(dead_code)]
     pub async fn drain(&self, host: HostId) -> Result<(), OperatorError> {
         self.post("drain", &format!("/admin/hosts/{host}/drain"))
             .await
