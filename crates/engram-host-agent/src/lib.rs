@@ -688,12 +688,19 @@ impl HostAgent {
                     // never a stale value. Error-tolerant + non-blocking
                     // (telemetry must not gate the workload); absent on
                     // VZ/non-Linux (guest_memory_stats → None).
-                    if let Some(mem) = pooled_for_heartbeat.guest_memory_stats().await {
-                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PSS_BYTES)
-                            .set(mem.pss_bytes as f64);
-                        ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
-                            .set(mem.rss_bytes as f64);
-                    }
+                    // ADR 0046: also feed Σ guest-PSS into the heartbeat's
+                    // `allocatable_mib` (UtilizationProbe::sample = MemAvailable
+                    // + Σ guest-resident), so placement nets out the baseline.
+                    let guest_pss_mib = match pooled_for_heartbeat.guest_memory_stats().await {
+                        Some(mem) => {
+                            ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_PSS_BYTES)
+                                .set(mem.pss_bytes as f64);
+                            ::metrics::gauge!(crate::metrics::SANDBOX_GUEST_RSS_BYTES)
+                                .set(mem.rss_bytes as f64);
+                            mem.pss_bytes / (1024 * 1024)
+                        }
+                        None => 0,
+                    };
                     // ADR 0028 Fix A: re-advertise every un-acked
                     // durable checkpoint record until a coord acks it
                     // into PG. Empty when checkpointing is disabled.
@@ -716,7 +723,7 @@ impl HostAgent {
                             captured_at: r.captured_at,
                         })
                         .collect();
-                    let utilization = util_probe.sample(&util_work_dir);
+                    let utilization = util_probe.sample(&util_work_dir, guest_pss_mib);
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,

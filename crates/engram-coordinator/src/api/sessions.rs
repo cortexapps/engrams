@@ -1174,17 +1174,10 @@ async fn try_restore_base_snapshot(
     // by `create_session_created` (an upsert) after boot, or released below on
     // boot failure.
     let candidates = state.host_registry.candidates_for(&ctx);
-    let residency_floor_mib = enabled_residency_floor_mib(state).await;
     let host_id = match state
         .services
         .meta
-        .reserve_placement(
-            session_id,
-            spec,
-            memory_mib as i64,
-            residency_floor_mib,
-            &candidates,
-        )
+        .reserve_placement(session_id, spec, memory_mib as i64, &candidates)
         .await
         .map_err(|e| engram_core::SandboxError::Snapshot(format!("reserve_placement: {e}")))?
     {
@@ -1209,29 +1202,6 @@ async fn try_restore_base_snapshot(
                 );
             }
             Err(e)
-        }
-    }
-}
-
-/// ADR 0046: Σ guest-RAM (MiB) pinned resident by the enabled images' base
-/// memfiles on every host (ADR 0022) — the residency floor placement must leave
-/// as headroom on top of the per-session reservations, or it would over-admit
-/// straight back into OOM. Derived from the enabled-image set per placement
-/// (small N; cache it if it ever shows up hot). A parse/list failure degrades
-/// to 0 (no floor) rather than blocking placement.
-async fn enabled_residency_floor_mib(state: &SharedState) -> i64 {
-    match state.services.meta.list_enabled_images().await {
-        Ok(images) => images
-            .iter()
-            .map(|img| {
-                toml::from_str::<ImageManifest>(&img.manifest_toml)
-                    .map(|m| resolved_memory_mib(&m) as i64)
-                    .unwrap_or(DEFAULT_MEMORY_MIB as i64)
-            })
-            .sum(),
-        Err(e) => {
-            tracing::warn!(error = %e, "residency floor: list_enabled_images failed; using 0");
-            0
         }
     }
 }

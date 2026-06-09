@@ -92,26 +92,33 @@ fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
 /// decision the OOM incident needed.
 fn choose_placement_host(
     candidates: &[uuid::Uuid],
-    total_mib: &std::collections::HashMap<uuid::Uuid, i64>,
+    allocatable_mib: &std::collections::HashMap<uuid::Uuid, i64>,
     reserved_mib: &std::collections::HashMap<uuid::Uuid, i64>,
-    residency_floor_mib: i64,
     budget_mib: i64,
 ) -> Option<uuid::Uuid> {
-    let mut best: Option<(i64, uuid::Uuid)> = None;
+    let mut best_known: Option<(i64, uuid::Uuid)> = None;
+    let mut fallback_unknown: Option<uuid::Uuid> = None;
     for h in candidates {
-        let Some(&t) = total_mib.get(h) else {
+        let Some(&alloc) = allocatable_mib.get(h) else {
             continue; // not ready/draining at lock time → skip
         };
-        let free = t - reserved_mib.get(h).copied().unwrap_or(0) - residency_floor_mib;
+        if alloc <= 0 {
+            // No allocatable measurement yet (non-Linux dev backend, pre-0058,
+            // or a brand-new host) — don't gate on a bogus 0; keep as a
+            // last-resort fallback so dev/new hosts still take work.
+            fallback_unknown.get_or_insert(*h);
+            continue;
+        }
+        let free = alloc - reserved_mib.get(h).copied().unwrap_or(0);
         if free < budget_mib {
             continue;
         }
-        match best {
+        match best_known {
             Some((bf, _)) if bf >= free => {}
-            _ => best = Some((free, *h)),
+            _ => best_known = Some((free, *h)),
         }
     }
-    best.map(|(_, h)| h)
+    best_known.map(|(_, h)| h).or(fallback_unknown)
 }
 
 #[cfg(test)]
@@ -130,7 +137,7 @@ mod placement_tests {
         let total: HashMap<_, _> = [(h[0], 32768i64), (h[1], 32768)].into();
         let reserved: HashMap<_, _> = [(h[0], 28000i64)].into(); // h0 nearly full
         assert_eq!(
-            choose_placement_host(&h, &total, &reserved, 0, 4096),
+            choose_placement_host(&h, &total, &reserved, 4096),
             Some(h[1])
         );
     }
@@ -140,19 +147,22 @@ mod placement_tests {
         let h = ids(2);
         let total: HashMap<_, _> = [(h[0], 8192i64), (h[1], 8192)].into();
         let reserved: HashMap<_, _> = [(h[0], 6000i64), (h[1], 6000)].into();
-        assert_eq!(choose_placement_host(&h, &total, &reserved, 0, 4096), None);
+        assert_eq!(choose_placement_host(&h, &total, &reserved, 4096), None);
     }
 
     #[test]
-    fn residency_floor_is_subtracted() {
-        let h = ids(1);
-        let total: HashMap<_, _> = [(h[0], 32768i64)].into();
-        let reserved = HashMap::new();
-        // floor eats almost everything → reject.
-        assert_eq!(choose_placement_host(&h, &total, &reserved, 30000, 4096), None);
-        // smaller floor → fits.
+    fn unknown_allocatable_is_a_fallback_not_a_gate() {
+        let h = ids(2);
+        // h0 unmeasured (0), h1 measured + fits → prefer the measured host.
+        let alloc: HashMap<_, _> = [(h[0], 0i64), (h[1], 32768)].into();
         assert_eq!(
-            choose_placement_host(&h, &total, &reserved, 16384, 4096),
+            choose_placement_host(&h, &alloc, &HashMap::new(), 4096),
+            Some(h[1])
+        );
+        // only the unmeasured host (dev backend / brand-new) → fall back to it.
+        let only0: HashMap<_, _> = [(h[0], 0i64)].into();
+        assert_eq!(
+            choose_placement_host(&h[..1], &only0, &HashMap::new(), 4096),
             Some(h[0])
         );
     }
@@ -162,7 +172,7 @@ mod placement_tests {
         let h = ids(2);
         let total: HashMap<_, _> = [(h[0], 32768i64), (h[1], 32768)].into();
         assert_eq!(
-            choose_placement_host(&h, &total, &HashMap::new(), 0, 4096),
+            choose_placement_host(&h, &total, &HashMap::new(), 4096),
             Some(h[0])
         );
     }
@@ -179,7 +189,7 @@ mod placement_tests {
         let budget = 4096;
         let mut picks = Vec::new();
         for _ in 0..10 {
-            match choose_placement_host(&h, &total, &reserved, 0, budget) {
+            match choose_placement_host(&h, &total, &reserved, budget) {
                 Some(p) => {
                     *reserved.entry(p).or_default() += budget;
                     picks.push(Some(p));
@@ -276,7 +286,6 @@ impl MetadataStore for PostgresStore {
         session_id: SessionId,
         spec: &SessionSpec,
         mem_budget_mib: i64,
-        residency_floor_mib: i64,
         candidates: &[HostId],
     ) -> Result<Option<HostId>, MetaError> {
         if candidates.is_empty() {
@@ -290,7 +299,7 @@ impl MetadataStore for PostgresStore {
         // insert below (sub-ms).
         let host_rows = sqlx::query(
             r#"
-            SELECT id, util_mem_total_mib
+            SELECT id, allocatable_mib
             FROM hosts
             WHERE id = ANY($1) AND status IN ('ready','draining')
             FOR UPDATE
@@ -300,12 +309,16 @@ impl MetadataStore for PostgresStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        let mut total: std::collections::HashMap<uuid::Uuid, i64> =
+        // ADR 0046: allocatable_mib is the host-measured headroom for new
+        // sessions (MemAvailable + Σ guest-resident) — it already nets out the
+        // daemon / OS / chunk-cache / mlock'd residency baseline, so we subtract
+        // only session budgets from it. 0 = no measurement yet (dev/pre-0058).
+        let mut alloc: std::collections::HashMap<uuid::Uuid, i64> =
             std::collections::HashMap::with_capacity(host_rows.len());
         for r in &host_rows {
             let id: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
-            let t: i64 = sqlx::Row::try_get(r, "util_mem_total_mib").map_err(db_err)?;
-            total.insert(id, t);
+            let a: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
+            alloc.insert(id, a);
         }
         // Reserved within the txn — sees the committed `pending` rows of placers
         // that locked these hosts before us. Status list is the SQL twin of
@@ -333,9 +346,7 @@ impl MetadataStore for PostgresStore {
         }
         // Least-loaded-that-fits among the (ranked) candidates — see
         // `choose_placement_host` (unit-tested).
-        let Some(picked) =
-            choose_placement_host(&cand, &total, &reserved, residency_floor_mib, mem_budget_mib)
-        else {
+        let Some(picked) = choose_placement_host(&cand, &alloc, &reserved, mem_budget_mib) else {
             tx.rollback().await.map_err(db_err)?;
             return Ok(None);
         };
@@ -986,6 +997,7 @@ impl MetadataStore for PostgresStore {
                    running_sandboxes_count,
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
+                   allocatable_mib,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -1029,6 +1041,7 @@ impl MetadataStore for PostgresStore {
                       util_mem_total_mib = $8,
                       util_mem_used_mib = $9,
                       util_cpu_pct = $10,
+                      allocatable_mib = $11,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -1043,6 +1056,7 @@ impl MetadataStore for PostgresStore {
         .bind(utilization.mem_total_mib as i64)
         .bind(utilization.mem_used_mib as i64)
         .bind(utilization.cpu_pct)
+        .bind(utilization.allocatable_mib as i64)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -1065,6 +1079,7 @@ impl MetadataStore for PostgresStore {
                    running_sandboxes_count,
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
+                   allocatable_mib,
                    last_heartbeat_at, status, host_addr
               FROM hosts
              -- Only `ready` hosts are strike-out candidates. A `draining`

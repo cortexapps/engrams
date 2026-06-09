@@ -235,6 +235,7 @@ mod tests {
             disk_used_mib: 81_920,
             mem_total_mib: 32_768,
             mem_used_mib: 9_001,
+            allocatable_mib: 23_767,
             cpu_pct: 42.5,
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -243,6 +244,7 @@ mod tests {
         assert_eq!(back.utilization.disk_used_mib, 81_920);
         assert_eq!(back.utilization.mem_total_mib, 32_768);
         assert_eq!(back.utilization.mem_used_mib, 9_001);
+        assert_eq!(back.utilization.allocatable_mib, 23_767);
         assert_eq!(back.utilization.cpu_pct, 42.5);
     }
 
