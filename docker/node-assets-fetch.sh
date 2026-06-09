@@ -25,7 +25,7 @@ trap 'rm -rf "$tmp"' EXIT
 # mirrors the kernel's ENGRAM_KERNEL_SRC override, so the fork plugs in at the
 # same seam without changing the node-assets image contract (still a single
 # `$OUT/firecracker`). With ENGRAM_FC_SRC unset this is identical to before.
-FC_VER="${FC_VER:-v1.10.1}"
+FC_VER="${FC_VER:-v1.16.0}"
 if [ -n "${ENGRAM_FC_SRC:-}" ]; then
   echo "==> firecracker from ENGRAM_FC_SRC=${ENGRAM_FC_SRC} (forked build)"
   [ -f "$ENGRAM_FC_SRC" ] || { echo "ENGRAM_FC_SRC is set but not a file: $ENGRAM_FC_SRC" >&2; exit 1; }

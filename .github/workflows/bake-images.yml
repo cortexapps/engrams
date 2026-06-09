@@ -316,10 +316,12 @@ jobs:
           # firecracker-microvm (public, no auth) if the tags still aren't found.
           git fetch --tags --unshallow --quiet origin 2>/dev/null \
             || git fetch --tags --quiet origin 2>/dev/null || true
-          BASE="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          # `--match 'v[0-9]*'` finds the UPSTREAM base tag (e.g. v1.16.0) and
+          # ignores our own `engram-v*` lockstep tags, which sit on the fork HEAD.
+          BASE="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
           if [ -z "$BASE" ]; then
             git fetch --tags --quiet https://github.com/firecracker-microvm/firecracker.git || true
-            BASE="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+            BASE="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
           fi
           [ -n "$BASE" ] || { echo "::error::R2 guard: could not determine the fork's upstream base tag"; exit 1; }
           echo "Fork base tag: $BASE"
@@ -327,8 +329,11 @@ jobs:
             echo "::error::R2 guard: the fork modifies src/vmm/src/snapshot/ — the snapshot wire format may diverge from stock FC. See ADR 0045 Phase B."
             exit 1
           fi
-          if ! grep -q 'SNAPSHOT_VERSION: Version = Version::new(4, 0, 0)' src/vmm/src/persist.rs; then
-            echo "::error::R2 guard: SNAPSHOT_VERSION changed in the fork — stock<->fork restore would break."
+          # Version-agnostic: the fork's diff vs the base tag must not touch the
+          # SNAPSHOT_VERSION line (it's 10.0.0 on v1.16.0, was 4.0.0 on v1.10.1 —
+          # the point is the fork doesn't CHANGE upstream's value).
+          if git diff "$BASE"..HEAD -- src/vmm/src/persist.rs | grep -qE '^[-+].*SNAPSHOT_VERSION'; then
+            echo "::error::R2 guard: the fork changes SNAPSHOT_VERSION — stock<->fork restore would break."
             exit 1
           fi
           echo "R2 guard OK: snapshot/ untouched, SNAPSHOT_VERSION unchanged."
@@ -344,7 +349,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake clang musl-tools linux-libc-dev
+          # libseccomp-dev: FC v1.16.x statically links libseccomp (new vs v1.10).
+          sudo apt-get install -y -qq cmake clang musl-tools linux-libc-dev libseccomp-dev
           MUSL_INC=/usr/include/x86_64-linux-musl
           sudo ln -sfn /usr/include/linux               "$MUSL_INC/linux"
           sudo ln -sfn /usr/include/asm-generic         "$MUSL_INC/asm-generic"
