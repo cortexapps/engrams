@@ -8,6 +8,7 @@
 //! pod → uncordon. The DaemonSet recreates the pod on the target image; the
 //! next reconcile sees it and moves on once it's Ready.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,9 @@ pub struct Ctx {
     pub client: Client,
     /// ADR 0044 K4: actuates node-pool size changes. `NoopScaler` by default.
     pub scaler: Arc<dyn NodePoolScaler>,
+    /// ADR 0045 Phase E: consecutive reconciles the scale-down decision has
+    /// held, for anti-flap hysteresis. Reset to 0 on any hold/scale-up tick.
+    pub scaledown_ticks: AtomicU32,
 }
 
 /// A host-agent pod distilled to the fields the planner needs.
@@ -126,7 +130,7 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
 
     // ADR 0044 K4: autoscale the node pool from coordinator demand. Best-
     // effort + independent of the roll — a coord hiccup shouldn't block rolls.
-    if let Err(e) = maybe_autoscale(spec, ctx.scaler.as_ref()).await {
+    if let Err(e) = maybe_autoscale(spec, &ctx).await {
         tracing::warn!(error = %e, "autoscale step failed; continuing");
     }
 
@@ -151,31 +155,74 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     }
 }
 
-/// ADR 0044 K4: read coordinator fleet demand and drive the node-pool scaler
-/// toward the headroom target. No-op unless the CR sets `autoscaling`.
-async fn maybe_autoscale(
-    spec: &HostFleetSpec,
-    scaler: &dyn NodePoolScaler,
-) -> Result<(), OperatorError> {
+/// ADR 0044 K4 + ADR 0045 Phase E: read coordinator fleet demand and drive
+/// the node pool toward the headroom target. No-op unless the CR sets
+/// `autoscaling`.
+///
+/// **Scale-up / hold** actuate immediately via `set_size` (idempotent
+/// re-assert), and reset the scale-down hysteresis counter.
+///
+/// **Scale-down** is *never* actuated through `set_size` — that's count-only,
+/// so the cloud could remove a node with live microVMs. Instead the decision
+/// is hysteresis-gated and, once confirmed, **logged** (the safe live
+/// actuation — drain the specific least-loaded node, then remove *that* node
+/// via a node-specific cloud call — is the follow-up actuator, ADR 0045 Phase
+/// E). This mirrors how K4 scale-up first shipped behind the logging
+/// `NoopScaler`.
+async fn maybe_autoscale(spec: &HostFleetSpec, ctx: &Ctx) -> Result<(), OperatorError> {
     let Some(a) = &spec.autoscaling else {
         return Ok(());
     };
     let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
     let demand = coord.fleet_demand().await?;
+    let current = demand.schedulable_hosts;
     let policy = AutoscalePolicy {
         min_hosts: a.min_hosts,
         max_hosts: a.max_hosts,
         target_free_mib: a.target_free_mib,
+        scale_down: a.scale_down,
     };
     let desired = desired_hosts(demand, policy);
+
+    if desired < current {
+        // Scale-down pressure. Hold the hysteresis counter and only surface a
+        // CONFIRMED decision after it persists — never call set_size here.
+        let ticks = ctx.scaledown_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        let required = a.scale_down_hysteresis_ticks.max(1);
+        if ticks >= required {
+            tracing::info!(
+                node_pool = %a.node_pool,
+                current,
+                desired,
+                free_mib = demand.free_mib,
+                mode = ?a.scale_down,
+                "autoscale: scale-down CONFIRMED — would drain the least-loaded \
+                 host and remove its node (live node removal pending the \
+                 node-specific actuator; ADR 0045 Phase E)"
+            );
+        } else {
+            tracing::info!(
+                node_pool = %a.node_pool,
+                current,
+                desired,
+                ticks,
+                required,
+                "autoscale: scale-down candidate, holding for hysteresis"
+            );
+        }
+        return Ok(());
+    }
+
+    // Scale-up or hold: actuate (idempotent) and clear any scale-down streak.
+    ctx.scaledown_ticks.store(0, Ordering::Relaxed);
     tracing::info!(
         node_pool = %a.node_pool,
-        current = demand.schedulable_hosts,
+        current,
         free_mib = demand.free_mib,
         desired,
         "autoscale: computed desired host count"
     );
-    scaler.set_size(&a.node_pool, desired).await?;
+    ctx.scaler.set_size(&a.node_pool, desired).await?;
     Ok(())
 }
 

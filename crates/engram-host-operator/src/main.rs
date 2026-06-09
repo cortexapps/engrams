@@ -67,6 +67,7 @@ async fn main() -> Result<(), OperatorError> {
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         scaler: node_scaler,
+        scaledown_ticks: std::sync::atomic::AtomicU32::new(0),
     });
 
     tracing::info!("engram-host-operator starting; watching HostFleet resources");

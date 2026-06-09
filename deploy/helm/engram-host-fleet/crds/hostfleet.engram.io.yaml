@@ -51,6 +51,28 @@ spec:
                     description: The cloud node pool the scaler resizes (actuator-specific
                       identifier, e.g. a GKE node-pool name).
                     type: string
+                  scaleDown:
+                    default: 'off'
+                    description: 'ADR 0045 Phase E: whether the pool may shrink, and
+                      how aggressively. `off` (default) is K4''s scale-up-only behavior.
+                      `idleOnly` sheds only a fully-idle host; `aggressive` sheds
+                      the least-loaded host (sessions evacuate). The scale-down *decision*
+                      is computed + logged today; live node removal is the follow-up
+                      actuator (safe node-specific removal).'
+                    enum:
+                    - 'off'
+                    - idleOnly
+                    - aggressive
+                    type: string
+                  scaleDownHysteresisTicks:
+                    default: 3
+                    description: "ADR 0045 Phase E: shed only after the scale-down\
+                      \ decision holds for this many consecutive reconciles (anti-flap\
+                      \ hysteresis \u2014 scale up fast, scale down slow). Pairs with\
+                      \ the cold-node cost of re-adding a node."
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
                   targetFreeMib:
                     description: Keep at least this much free guest-RAM (MiB) across
                       the fleet.
