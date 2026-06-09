@@ -1,12 +1,15 @@
 //! ADR 0044 K3 reconcile loop: drive a host-agent DaemonSet toward the
-//! `HostFleet` CR, rolling one node at a time with a drain gate.
+//! `HostFleet` CR, rolling one node at a time.
 //!
 //! Each reconcile: (1) patch the DaemonSet images toward the CR (so
 //! successors come up on target — `OnDelete` leaves existing pods alone),
 //! (2) list the pods, (3) [`plan_roll`] picks the next action, (4) if it's a
-//! node roll, cordon → drain → gate on `running_sandboxes → 0` → delete the
-//! pod → uncordon. The DaemonSet recreates the pod on the target image; the
-//! next reconcile sees it and moves on once it's Ready.
+//! node roll, cordon → delete the pod → wait for the successor Ready on
+//! target → uncordon. The roll **reattaches, it does not evacuate**: ADR 0044
+//! K2 keeps the node's microVMs alive across the pod swap and the successor's
+//! `reattach_pass` adopts them, so an image roll is lossless (no
+//! snapshot-rehome rewind). Drain/evac is reserved for actual node removal
+//! (see [`gate_drain`]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -66,7 +69,8 @@ pub enum RollDecision {
     WaitForReady,
     /// Rolling the next stale node would drop below the capacity floor.
     BlockedByFloor { schedulable: usize, floor: u32 },
-    /// Roll this node next (drain its host, delete its pod).
+    /// Roll this node next (delete its pod; the successor reattaches the
+    /// node's still-running microVMs — no drain/evac).
     RollNode { node: String, pod: String },
 }
 
@@ -226,7 +230,24 @@ async fn maybe_autoscale(spec: &HostFleetSpec, ctx: &Ctx) -> Result<(), Operator
     Ok(())
 }
 
-/// Cordon → drain → gate → delete the pod → uncordon, for one node.
+/// Roll one node's host-agent pod onto the target image **by reattach, not
+/// evacuation**: cordon → delete the pod → wait for the successor to come up
+/// Ready on target → uncordon.
+///
+/// ADR 0044 K2 keeps the node's microVMs alive across a pod restart
+/// (`hostPID`/`hostNetwork`/cgroup-escape), and the successor's
+/// `reattach_pass` pidfd-adopts them — so an image roll is **lossless**. We
+/// deliberately do *not* drain/evacuate: snapshot-rehome evac rewinds the
+/// session to the last periodic checkpoint (the spurious "N events rolled
+/// back"), losing post-checkpoint work for no reason when the VM never died.
+/// Drain/evac is reserved for actual **node removal** (scale-down, node
+/// maintenance), where the VMs genuinely die with the node — see
+/// [`gate_drain`].
+///
+/// The cordon stays in force across the swap so the dead-host detector (which
+/// only strikes out `ready` hosts) skips this `draining` host during its brief
+/// heartbeat gap — otherwise the gap could strike the host out and route its
+/// (reattaching) sessions to Idle out from under the successor.
 async fn roll_node(
     client: &Client,
     spec: &HostFleetSpec,
@@ -236,33 +257,73 @@ async fn roll_node(
     let host_id = HostId::from_node_name(node);
     let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
 
-    tracing::info!(%node, %host_id, %pod, "rolling node: cordon + drain");
-    // The K8s node cordon is best-effort — DaemonSet pods ignore it (so the
-    // successor still comes back), but it stops any stray scheduling. The
-    // load-bearing cordon is the coordinator's (stops session placement).
+    tracing::info!(%node, %host_id, %pod, "rolling node: cordon + reattach (no drain — the node's VMs survive)");
+    // The load-bearing cordon is the coordinator's (stops new session
+    // placement); the K8s node cordon stops any stray scheduling.
     set_node_unschedulable(client, node, true).await?;
     coord.cordon(host_id).await?;
-    coord.drain(host_id).await?;
 
-    gate_drain(
-        &coord,
-        host_id,
+    // Delete the pod. With `OnDelete` the DaemonSet recreates it on the target
+    // image; the successor's `reattach_pass` adopts the still-running microVMs.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &spec.daemon_set.namespace);
+    pods.delete(pod, &DeleteParams::default()).await?;
+    tracing::info!(%node, %pod, "pod deleted; waiting for the successor to come up Ready on target + reattach");
+
+    // Gate on the successor being Ready on the target image BEFORE uncordoning
+    // — keeping the host `draining` (dead-host-detector-exempt) through the
+    // swap so the reattaching sessions are never struck out.
+    gate_successor_ready(
+        client,
+        spec,
+        node,
         Duration::from_secs(spec.drain_timeout_seconds),
     )
     .await?;
 
-    let pods: Api<Pod> = Api::namespaced(client.clone(), &spec.daemon_set.namespace);
-    pods.delete(pod, &DeleteParams::default()).await?;
-    tracing::info!(%node, %pod, "drained + pod deleted; DaemonSet will roll the successor onto target");
-
-    // The successor re-registers under the same stable HostId (GAP 1).
+    // The successor re-registered under the same stable HostId (GAP 1) and is
+    // Ready; resume scheduling.
     coord.uncordon(host_id).await?;
     set_node_unschedulable(client, node, false).await?;
+    tracing::info!(%node, %host_id, "successor Ready + reattached; uncordoned");
     Ok(())
 }
 
+/// Poll the DaemonSet's pods until a Ready pod on `node` carries the target
+/// images (the successor has come up + run its reattach pass), or the budget
+/// elapses (the roll aborts with the host still cordoned; the next reconcile
+/// retries).
+async fn gate_successor_ready(
+    client: &Client,
+    spec: &HostFleetSpec,
+    node: &str,
+    budget: Duration,
+) -> Result<(), OperatorError> {
+    let ds_api: Api<DaemonSet> = Api::namespaced(client.clone(), &spec.daemon_set.namespace);
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let ds = ds_api.get(&spec.daemon_set.name).await?;
+        let pods = list_ds_pods(client, &spec.daemon_set.namespace, &ds).await?;
+        let ready = pods.iter().any(|p| {
+            p.node == node && p.ready && p.on_target(&spec.image, &spec.node_assets_image)
+        });
+        if ready {
+            tracing::info!(%node, "successor pod Ready on target");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(OperatorError::RollTimeout {
+                node: node.to_string(),
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 /// Poll the coordinator's drain gate until the host reports
-/// `running_sandboxes == 0`, or the budget elapses.
+/// `running_sandboxes == 0`, or the budget elapses. **Reserved for the node-
+/// removal drain path** (ADR 0045 Phase E scale-down actuation) — image rolls
+/// reattach (see [`roll_node`]) and never drain.
+#[allow(dead_code)]
 async fn gate_drain(
     coord: &CoordClient,
     host: HostId,

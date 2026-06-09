@@ -820,7 +820,15 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    last_heartbeat_at, status, host_addr
               FROM hosts
-             WHERE status IN ('ready','draining')
+             -- Only `ready` hosts are strike-out candidates. A `draining`
+             -- host is operator-managed: mid image-roll (where ADR 0044 K2
+             -- reattach keeps its VMs alive across the brief pod-swap
+             -- heartbeat gap) or mid node-removal (where its sessions are
+             -- already being evacuated). The operator owns its lifecycle, so
+             -- the dead-host detector must not race a roll and route the
+             -- reattaching sessions to Idle out from under the successor.
+             -- (ADR 0044 K3: image rolls reattach, not evacuate.)
+             WHERE status = 'ready'
                AND last_heartbeat_at < NOW() - make_interval(secs => $1::bigint)
             "#,
         )

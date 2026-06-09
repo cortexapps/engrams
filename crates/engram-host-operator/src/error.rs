@@ -21,6 +21,10 @@ pub enum OperatorError {
     /// A drain did not reach `running_sandboxes == 0` within the budget;
     /// the roll is aborted and the pod left in place.
     DrainTimeout { host_id: String, remaining: u32 },
+    /// After deleting a pod for an image roll, the successor didn't come up
+    /// Ready on the target image within the budget; the roll is aborted with
+    /// the host still cordoned (the operator retries next reconcile).
+    RollTimeout { node: String },
     /// The CR or a managed object was missing an expected field.
     Invalid(String),
     /// A cloud node-pool actuator (e.g. the GKE scaler) call failed.
@@ -38,6 +42,10 @@ impl fmt::Display for OperatorError {
             Self::DrainTimeout { host_id, remaining } => write!(
                 f,
                 "drain of host {host_id} timed out with {remaining} sandbox(es) still running"
+            ),
+            Self::RollTimeout { node } => write!(
+                f,
+                "image roll of node {node} timed out waiting for the successor pod to be Ready on target"
             ),
             Self::Invalid(msg) => write!(f, "invalid host-fleet state: {msg}"),
             Self::Cloud(e) => write!(f, "cloud scaler error: {e}"),

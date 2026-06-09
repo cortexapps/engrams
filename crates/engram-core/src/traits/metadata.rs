@@ -291,11 +291,14 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), MetaError>;
 
     /// List hosts whose `last_heartbeat_at` is older than `threshold_secs`
-    /// AND whose status is `Ready` or `Draining`. The dead-host detector
-    /// polls this every ~10s and races other coordinator replicas via
-    /// `pg_try_advisory_lock` for the right to evacuate each candidate.
-    /// `Dead` rows are filtered out so a still-running coordinator
-    /// replica's detector doesn't keep trying to re-kill them.
+    /// AND whose status is `Ready`. The dead-host detector polls this every
+    /// ~10s and races other coordinator replicas via `pg_try_advisory_lock`
+    /// for the right to evict each candidate. `Dead` rows are filtered out so
+    /// a still-running replica's detector doesn't re-kill them; `Draining`
+    /// rows are filtered out because they're operator-managed (mid image-roll
+    /// — where ADR 0044 K2 reattach keeps the VMs alive across the pod-swap
+    /// heartbeat gap — or mid node-removal), so the detector must not race the
+    /// operator and route a reattaching host's sessions to Idle.
     async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError>;
 
     /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id`
