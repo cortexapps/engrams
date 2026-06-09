@@ -74,8 +74,26 @@ spec:
               cp /assets/vmlinux     /opt/engram/vmlinux
               chmod 0755 /opt/engram/firecracker
               echo "[stage-node-assets] firecracker + vmlinux -> /opt/engram"
+              # ADR 0027: stage the RO session bundles + stamp to the
+              # fleet-canonical /var/lib/engram/shared (inside the `work`
+              # hostPath the host-agent reads). The host-agent resolves aux RO
+              # drives ([git] -> skills, [browser] -> playwright) against
+              # current.json there. Graceful if a node-assets image predates
+              # bundles: the host still serves non-bundle sessions (bundle
+              # images fail loudly at capture, the same signal as before).
+              if ls /assets/bundles/*.squashfs >/dev/null 2>&1; then
+                mkdir -p /var/lib/engram/shared
+                cp /assets/bundles/*.squashfs   /var/lib/engram/shared/
+                cp /assets/bundles/current.json /var/lib/engram/shared/current.json
+                echo "[stage-node-assets] bundles + stamp -> /var/lib/engram/shared"
+              else
+                echo "[stage-node-assets] WARNING: node-assets image carries no bundles; aux-RO-drive images will fail to capture" >&2
+              fi
           volumeMounts:
             - {name: engram-assets, mountPath: /opt/engram}
+            # ADR 0027: bundles land in /var/lib/engram/shared, inside the
+            # `work` hostPath the host-agent reads.
+            - {name: work, mountPath: /var/lib/engram}
       containers:
         - name: host-agent
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"

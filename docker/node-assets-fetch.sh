@@ -56,5 +56,36 @@ else
 fi
 
 file "$OUT/vmlinux" | grep -q "ELF 64-bit" || { echo "kernel is not an ELF binary:" >&2; file "$OUT/vmlinux" >&2; exit 1; }
+
+# ── RO session bundles (ADR 0027) ───────────────────────────────────────────
+# The skills + playwright squashfs bundles + the current.json stamp
+# (drive_id -> sha256). The host-agent reads these from /var/lib/engram/shared
+# to attach aux RO drives ([git] -> skills, [browser] -> playwright); the
+# engram-host-fleet init container copies them out of this image. Pull the
+# published OCI artifacts (the publish-bundles job) at :main so a node-assets
+# bake always carries the current fleet bundles. Needs `oras` + GHCR auth.
+BUNDLE_REPO="${ENGRAM_BUNDLE_REPO:-ghcr.io/cortexapps/engrams}"
+BUNDLE_TAG="${ENGRAM_BUNDLE_TAG:-main}"
+BUNDLES_OUT="$OUT/bundles"
+mkdir -p "$BUNDLES_OUT"
+
+stage_bundle() {  # stage_bundle <drive_id>; echoes the staged sha256 on stdout
+  local name="$1"
+  echo "==> bundle ${name} (${BUNDLE_REPO}/bundle-${name}:${BUNDLE_TAG})" >&2
+  ( cd "$tmp" && rm -f "${name}.squashfs" \
+    && oras pull "${BUNDLE_REPO}/bundle-${name}:${BUNDLE_TAG}" >&2 )
+  [ -f "$tmp/${name}.squashfs" ] || { echo "oras pull yielded no ${name}.squashfs" >&2; return 1; }
+  local sha
+  sha="$(sha256sum "$tmp/${name}.squashfs" | awk '{print $1}')"
+  install -m0644 "$tmp/${name}.squashfs" "$BUNDLES_OUT/${name}-${sha}.squashfs"
+  echo "$sha"
+}
+
+skills_sha="$(stage_bundle skills)"
+playwright_sha="$(stage_bundle playwright)"
+# Stamp: drive_id -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
+printf '{"skills":"%s","playwright":"%s"}\n' "$skills_sha" "$playwright_sha" \
+  > "$BUNDLES_OUT/current.json"
+
 echo "==> staged into ${OUT}:"
-ls -la "$OUT/firecracker" "$OUT/vmlinux"
+ls -la "$OUT/firecracker" "$OUT/vmlinux" "$BUNDLES_OUT"
