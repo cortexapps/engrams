@@ -330,6 +330,10 @@ impl MetadataStore for PostgresStore {
             WHERE host_id = ANY($1)
               AND status IN ('pending','created','guest_ready','active',
                              'evacuating','evicting')
+              -- A `pending` row older than 10 min is a crash-orphaned
+              -- reservation (a boot never takes that long); don't let it leak
+              -- into the reserved figure and false-reject the host.
+              AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
             GROUP BY host_id
             "#,
         )
@@ -402,34 +406,31 @@ impl MetadataStore for PostgresStore {
         row::session_from_row(&row)
     }
 
-    /// ADR 0046: `Σ mem_budget_mib` per host over resident-VM sessions. The
-    /// status list is the SQL twin of
-    /// `SessionState::host_memory_reserving_states()` (a test asserts they
-    /// match). Runtime query — `mem_budget_mib` lands with migration 0057.
-    async fn reserved_mib_by_host(
-        &self,
-    ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
-        let rows = sqlx::query(
+    /// ADR 0046: Σ over schedulable hosts of `max(0, allocatable − reserved)` —
+    /// the real fleet free-memory signal (replaces the phantom `total − used`).
+    /// `pending` reservations older than 10 min are excluded as crash-orphaned
+    /// (a boot never takes that long), matching `reserve_placement`.
+    async fn fleet_free_mib(&self) -> Result<i64, MetaError> {
+        let free: i64 = sqlx::query_scalar(
             r#"
-            SELECT host_id,
-                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT AS reserved_mib
-            FROM sessions
-            WHERE host_id IS NOT NULL
-              AND status IN ('pending','created','guest_ready','active',
-                             'evacuating','evicting')
-            GROUP BY host_id
+            SELECT COALESCE(SUM(GREATEST(0, h.allocatable_mib - COALESCE(r.reserved, 0))), 0)::BIGINT
+            FROM hosts h
+            LEFT JOIN (
+                SELECT host_id, SUM(mem_budget_mib) AS reserved
+                FROM sessions
+                WHERE host_id IS NOT NULL
+                  AND status IN ('pending','created','guest_ready','active',
+                                 'evacuating','evicting')
+                  AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
+                GROUP BY host_id
+            ) r ON r.host_id = h.id
+            WHERE h.status IN ('ready','draining')
             "#,
         )
-        .fetch_all(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
-        let mut by_host = std::collections::HashMap::with_capacity(rows.len());
-        for r in rows {
-            let host: uuid::Uuid = sqlx::Row::try_get(&r, "host_id").map_err(db_err)?;
-            let mib: i64 = sqlx::Row::try_get(&r, "reserved_mib").map_err(db_err)?;
-            by_host.insert(HostId(host), mib);
-        }
-        Ok(by_host)
+        Ok(free)
     }
 
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {

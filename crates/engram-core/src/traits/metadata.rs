@@ -96,17 +96,15 @@ pub trait MetadataStore: Send + Sync {
     /// session with an unroutable sandbox.
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
 
-    /// ADR 0046: reserved guest-RAM (MiB) per host — `Σ mem_budget_mib` over
-    /// sessions whose VM is resident on the host
-    /// ([`crate::types::SessionState::reserves_host_memory`]). Placement
-    /// subtracts this (plus the enabled-image residency floor) from a host's
-    /// total RAM, and the autoscaler's `free_mib` uses the same figure. Only
-    /// hosts carrying a live reservation appear in the map. Default impl returns
-    /// empty (non-PG mock stores reserve nothing).
-    async fn reserved_mib_by_host(
-        &self,
-    ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
-        Ok(std::collections::HashMap::new())
+    /// ADR 0046: the fleet's schedulable free memory (MiB) — `Σ over ready /
+    /// draining hosts of max(0, allocatable_mib − Σ reserved session budgets)`.
+    /// This is the REAL demand-pressure signal the K4 autoscaler scales on
+    /// (`/admin/fleet/demand` + the `engram_fleet_free_mib` gauge), replacing the
+    /// phantom in-memory `total − used(=0)` that always read "fleet empty" (why
+    /// it never scaled during the OOM incident). Default impl (mock stores)
+    /// returns 0.
+    async fn fleet_free_mib(&self) -> Result<i64, MetaError> {
+        Ok(0)
     }
 
     /// ADR 0046: atomically pick a host from `candidates` (ranked — the

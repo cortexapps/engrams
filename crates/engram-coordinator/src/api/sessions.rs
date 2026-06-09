@@ -1105,6 +1105,9 @@ fn base_working_set_blob_key(
         .map(|m| engram_chunk_store::working_set::TraceRef::canonical(m.manifest_id).storage_key())
 }
 
+// Cohesive base-restore + reserve-at-pick context; bundling into a struct would
+// just move the arg list. (ADR 0046 added session_id + spec for reservation.)
+#[allow(clippy::too_many_arguments)]
 async fn try_restore_base_snapshot(
     state: &SharedState,
     session_id: engram_core::SessionId,

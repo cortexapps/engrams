@@ -640,26 +640,6 @@ impl HostRegistry {
         Ok((host_id, sandbox_id))
     }
 
-    /// ADR 0020 P1: restore a per-image base snapshot for a fresh
-    /// session, late-binding the session harness (option-D swap). Like
-    /// `restore_for_session` but the picked host runs the combined
-    /// restore + harness-swap op so `create_session` can route a cold
-    /// create through restore instead of a fresh kernel boot.
-    #[tracing::instrument(name = "coord.restore_base_for_session", skip_all)]
-    pub async fn restore_base_for_session(
-        &self,
-        ctx: &ScheduleContext<'_>,
-        metadata: SnapshotMetadata,
-        session_env: std::collections::HashMap<String, String>,
-    ) -> Result<(HostId, SandboxId), SandboxError> {
-        let (host_id, backend) = self.pick_for_session(ctx)?;
-        let sandbox_id = backend
-            .restore_base_for_session(metadata, session_env)
-            .await?;
-        self.sandbox_owner.insert(sandbox_id, host_id);
-        Ok((host_id, sandbox_id))
-    }
-
     /// ADR 0046: restore the base snapshot onto an ALREADY-CHOSEN host (picked
     /// and reserved by the PG `reserve_placement` transaction) rather than
     /// picking here. Mirrors `restore_base_for_session` minus the pick — the

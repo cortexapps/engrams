@@ -530,6 +530,7 @@ async fn main() -> Result<(), CoordinatorError> {
     // metrics.rs but previously never emitted.
     {
         let reg = host_registry.clone();
+        let meta = meta_arc.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             loop {
@@ -539,8 +540,13 @@ async fn main() -> Result<(), CoordinatorError> {
                     .set(m.ready_hosts as f64);
                 ::metrics::gauge!(engram_coordinator::metrics::FLEET_SCHEDULABLE_HOSTS)
                     .set(m.schedulable_hosts as f64);
-                ::metrics::gauge!(engram_coordinator::metrics::FLEET_FREE_MIB)
-                    .set(m.free_mib as f64);
+                // ADR 0046: real free_mib = Σ(allocatable − reserved) from PG,
+                // not the in-memory `total − used(=0)` phantom. Leave the gauge
+                // at its last value on a transient query error.
+                if let Ok(free) = meta.fleet_free_mib().await {
+                    ::metrics::gauge!(engram_coordinator::metrics::FLEET_FREE_MIB)
+                        .set(free.max(0) as f64);
+                }
             }
         });
     }
