@@ -121,6 +121,9 @@ fn choose_placement_host(
     best_known.map(|(_, h)| h).or(fallback_unknown)
 }
 
+// Kept beside `choose_placement_host` (the fn it exercises) rather than at the
+// file end — the `MetadataStore` impl follows.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod placement_tests {
     use super::choose_placement_host;

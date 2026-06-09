@@ -196,11 +196,11 @@ mod tests {
     fn first_cpu_sample_is_zero_then_subsequent_are_bounded() {
         let mut probe = UtilizationProbe::new();
         // First sample establishes the baseline → 0 regardless of platform.
-        let first = probe.sample(Path::new("."));
+        let first = probe.sample(Path::new("."), 0);
         assert_eq!(first.cpu_pct, 0.0);
         // Second sample must stay within [0, 100] on every platform
         // (0 on non-Linux where there's no /proc).
-        let second = probe.sample(Path::new("."));
+        let second = probe.sample(Path::new("."), 0);
         assert!((0.0..=100.0).contains(&second.cpu_pct));
     }
 
