@@ -90,6 +90,22 @@ pub struct AutoscalingSpec {
     pub max_hosts: u32,
     /// Keep at least this much free guest-RAM (MiB) across the fleet.
     pub target_free_mib: u64,
+    /// ADR 0045 Phase E: whether the pool may shrink, and how aggressively.
+    /// `off` (default) is K4's scale-up-only behavior. `idleOnly` sheds only a
+    /// fully-idle host; `aggressive` sheds the least-loaded host (sessions
+    /// evacuate). The scale-down *decision* is computed + logged today; live
+    /// node removal is the follow-up actuator (safe node-specific removal).
+    #[serde(default)]
+    pub scale_down: crate::scaler::ScaleDownMode,
+    /// ADR 0045 Phase E: shed only after the scale-down decision holds for
+    /// this many consecutive reconciles (anti-flap hysteresis — scale up fast,
+    /// scale down slow). Pairs with the cold-node cost of re-adding a node.
+    #[serde(default = "default_scale_down_hysteresis")]
+    pub scale_down_hysteresis_ticks: u32,
+}
+
+fn default_scale_down_hysteresis() -> u32 {
+    3
 }
 
 /// Reported progress. v1 leaves this for `kubectl` visibility; the operator
