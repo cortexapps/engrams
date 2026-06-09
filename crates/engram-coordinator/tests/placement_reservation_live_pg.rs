@@ -150,6 +150,12 @@ async fn fleet_free_mib_sql_runs_against_real_pg() {
     // decision fn; here we only assert the SQL — the LEFT JOIN over the
     // reserved aggregate, GREATEST(0, …), the pending age-guard, the ::BIGINT
     // cast — parses and runs against real Postgres and yields a sane figure.
-    let free = meta.fleet_free_mib().await.expect("fleet_free_mib SQL runs");
-    assert!(free >= 0, "free_mib is a non-negative MiB count; got {free}");
+    let free = meta
+        .fleet_free_mib()
+        .await
+        .expect("fleet_free_mib SQL runs");
+    assert!(
+        free >= 0,
+        "free_mib is a non-negative MiB count; got {free}"
+    );
 }
