@@ -97,7 +97,10 @@ jobs:
           if [ -z "$latest" ]; then
             echo "::error::no stable upstream tag matching ${PREFIX}*"; exit 1
           fi
-          base="$(git describe --tags --abbrev=0)"
+          # `--match 'v[0-9]*'` finds the UPSTREAM base tag and ignores our own
+          # `engram-v*` lockstep tags (which sit on the fork HEAD); without it,
+          # `git describe` would return engram-v<ver> and break the comparison.
+          base="$(git describe --tags --abbrev=0 --match 'v[0-9]*')"
           echo "Fork base: $base | newest upstream stable: $latest"
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
@@ -164,7 +167,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake clang musl-tools linux-libc-dev
+          # libseccomp-dev: FC v1.16.x statically links libseccomp (new vs v1.10).
+          sudo apt-get install -y -qq cmake clang musl-tools linux-libc-dev libseccomp-dev
           MUSL_INC=/usr/include/x86_64-linux-musl
           sudo ln -sfn /usr/include/linux               "$MUSL_INC/linux"
           sudo ln -sfn /usr/include/asm-generic         "$MUSL_INC/asm-generic"
@@ -221,7 +225,12 @@ jobs:
         run: |
           set -euo pipefail
           git push --force-with-lease origin HEAD
-          echo "Rebased onto ${{ steps.target.outputs.latest }} and pushed; fork HEAD=$(git rev-parse HEAD)"
+          # Lockstep version tag: `engram-v<upstream>` on the rebased fork HEAD, so
+          # "what FC are we on" is one `git describe`. Force-update + push (the tag
+          # moves to the new HEAD on a re-rebase of the same upstream version).
+          git tag -f "engram-${{ steps.target.outputs.latest }}" HEAD
+          git push --force origin "engram-${{ steps.target.outputs.latest }}"
+          echo "Rebased onto ${{ steps.target.outputs.latest }} and pushed; fork HEAD=$(git rev-parse HEAD), tagged engram-${{ steps.target.outputs.latest }}"
 
       # The engrams-automerge App (contents:write + pull_requests:write, scoped to
       # this repo) authors the bump branch + PR and enables auto-merge — the same

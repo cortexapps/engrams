@@ -115,12 +115,17 @@ file for post-copy) require. We host this ourselves rather than depend on
      leave it unset to track all majors; set it to a tag prefix to pin a line
      (`v1.` — trailing dot — stays on v1.x and won't auto-jump to v2.0). (Once
      the fork goes public the read is tokenless, but the push still needs auth.)
-   - **First activation is a catch-up jump.** The fork sits on `v1.10.1` (prod
-     parity); the newest stable is many releases ahead. The first cron run will
-     try to rebase across that whole gap — likely a conflict or build break that
-     files the tracking issue. That's expected: do the catch-up rebase by hand
-     once (port the surface to the current API, confirm the build), push, and
-     from then on the cron handles each incremental release automatically. (Bump
+   - **Lockstep version tags.** On each rebase the cron force-tags the fork HEAD
+     `engram-v<upstream>` (e.g. `engram-v1.16.0`) so `git describe` tells you the
+     FC version at a glance. The base-finder uses `git describe --match 'v[0-9]*'`
+     so those tags don't shadow the upstream base tag.
+   - **The first-activation catch-up is done (→ v1.16.0).** The fork started at
+     `v1.10.1` (prod parity); the cron correctly flagged the gap to current
+     stable, and the catch-up was a by-hand re-port onto v1.16.0's refactored
+     memory backend (`snapshot_memory_to_file` moved to `vstate/vm.rs`, `shared`
+     rides the `snapshot_file` builder, `SNAPSHOT_VERSION` is `10.0.0`). v1.16.x
+     also needs `libseccomp-dev` as a build dep (now in both FC build jobs). From
+     here the cron handles each release incrementally. (Bumping
      `FC_VER` in `node-assets-fetch.sh` is no longer needed — the fork IS the
      binary now.)
 5. **Risk R2 — snapshot wire-format compat.** ✅ Preserved by construction (see

@@ -460,14 +460,14 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools e2fsprogs
 
-      # Pin to v1.10 to match the `firecracker-ci/v1.10` artifact
-      # bucket that fetch-fc-test-artifacts.sh pulls from. Bumping
-      # both pins should be a coordinated change — kernel ABI between
-      # the host firecracker binary and the kernel image needs to
-      # match.
-      - name: Install firecracker (v1.10.1)
+      # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
+      # so the existing FC suite + the stock<->fork compat test exercise the
+      # version we actually ship. The cached test artifacts (our engram 6.1.102
+      # guest kernel + the ubuntu-22.04 rootfs) are validated compatible with
+      # v1.16.0 (dev-vm: the compat test boots+snapshots+restores green).
+      - name: Install firecracker (v1.16.0)
         env:
-          FC_VER: v1.10.1
+          FC_VER: v1.16.0
         run: |
           curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" -o /tmp/fc.tgz
           tar -xzf /tmp/fc.tgz -C /tmp
@@ -1292,9 +1292,9 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
               musl-tools e2fsprogs jq bc python3
 
-      - name: Install firecracker (v1.10.1)
+      - name: Install firecracker (v1.16.0)
         run: |
-          FC_VER=v1.10.1
+          FC_VER=v1.16.0
           curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" \
             -o /tmp/fc.tgz
           tar -xzf /tmp/fc.tgz -C /tmp
