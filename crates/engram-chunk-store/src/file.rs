@@ -303,7 +303,12 @@ impl ChunkStore {
                     // so reads land on real bytes (never a hole). A
                     // fresh handle per task keeps the seek+read state
                     // private.
-                    let mut diff = fs::File::open(&diff_path).await?;
+                    let mut diff = fs::File::open(&diff_path).await.map_err(|e| {
+                        crate::error::ChunkStoreError::Internal(format!(
+                            "open diff {}: {e}",
+                            diff_path.display()
+                        ))
+                    })?;
                     for &(off, len) in dirty_ranges {
                         if len == 0 {
                             continue;

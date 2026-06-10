@@ -67,6 +67,9 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     // The teleport-restore leg is UFFD by construction (the migration
     // override forces it regardless of the configured File mode), so
     // the handler binary must exist — same convention as snapshot_uffd.
+    // Low-disk hosts (the dev VM at >90% used) trip the cache's
+    // free-space floor and evict just-staged migration chunks mid-test.
+    std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
     let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
     if !handler.exists() {
         eprintln!(
