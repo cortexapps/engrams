@@ -37,3 +37,14 @@ slow-timeout = { period = "30s", terminate-after = 6 }
 [[profile.default.overrides]]
 filter = "binary(e2e_stack)"
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# ADR 0045 C1: the migration suites bake a rootfs (Docker), boot 2-3
+# microVMs, and run full capture/pull/restore cycles. On warm runners
+# they finish in 20-60s; on cold/contended Blacksmith runners the bake
+# + boots alone have been observed past the default 3-minute cap
+# (#181's migration_source TIMEOUT at 180s on a runner where the same
+# binary's heavier two-host test passed in 18s — pure runner variance).
+# Same 10-minute posture as e2e_stack.
+[[profile.default.overrides]]
+filter = "binary(migration_source) | binary(two_host_live_teleport)"
+slow-timeout = { period = "60s", terminate-after = 10 }

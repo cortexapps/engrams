@@ -121,6 +121,13 @@ pub const SESSIONS_ACTIVE: &str = "engram_sessions_active";
 /// Postgres for the slice of time both views are consistent.
 pub const HOSTS_READY: &str = "engram_hosts_ready";
 
+/// ADR 0045 C1: live-teleport leg timings. Labels: leg =
+/// capture|restore|total, outcome = success|error|fallback.
+pub const MIGRATION_LEG_SECONDS: &str = "engram_migration_leg_seconds";
+/// ADR 0045 C1: live-teleport outcomes. Labels: outcome =
+/// migrated|unsupported_fallback|aborted_to_source|parachute|fatal.
+pub const MIGRATION_TOTAL: &str = "engram_migration_total";
+
 /// Histogram (ADR 0034). Wall-clock of one successful
 /// `evict_session_to_state` pipeline run as driven by the eviction
 /// scanner — pause + snapshot + upload + record + destroy. Custom

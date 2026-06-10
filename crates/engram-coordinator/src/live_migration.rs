@@ -276,6 +276,13 @@ pub async fn migrate_session_live(
             },
         )
         .await;
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "capture")
+        .record(capture_ms as f64 / 1000.0);
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "restore")
+        .record(restore_ms as f64 / 1000.0);
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "total")
+        .record(t_total.elapsed().as_secs_f64());
+    metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "migrated").increment(1);
     tracing::info!(
         %session_id,
         old_sandbox = %sandbox_id,
@@ -502,6 +509,174 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(released, "lease must release after the fallback");
+    }
+
+    /// The dest-failure arm: capture succeeds (the source is frozen),
+    /// the destination restore fails — the verb ABORTS the source back
+    /// (un-pause in place) and walks the session to Active. Zero loss,
+    /// AbortedToSource posture.
+    #[tokio::test]
+    async fn dest_restore_failure_aborts_to_source_and_walks_back_to_active() {
+        use engram_core::types::snapshot::{MigrationCaptureOut, SnapshotMetadata};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct MigratableFlakyDest {
+            abort_called: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl engram_core::traits::SandboxBackend for MigratableFlakyDest {
+            async fn create(
+                &self,
+                _: engram_core::types::sandbox::SandboxSpec,
+            ) -> Result<SandboxId, engram_core::SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), engram_core::SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, engram_core::SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                Err(engram_core::SandboxError::NotFound)
+            }
+            async fn snapshot(
+                &self,
+                _: SandboxId,
+            ) -> Result<SnapshotMetadata, engram_core::SandboxError> {
+                Err(engram_core::SandboxError::NotFound)
+            }
+            async fn migration_capture(
+                &self,
+                _: SandboxId,
+            ) -> Result<MigrationCaptureOut, engram_core::SandboxError> {
+                let mref = engram_core::types::manifest::ManifestRef::new();
+                Ok(MigrationCaptureOut {
+                    export_id: "test-export".into(),
+                    memory_manifest_json: b"{}".to_vec(),
+                    disk_manifest_json: Vec::new(),
+                    memory_manifest_ref: mref,
+                    disk_manifest_ref: engram_core::types::manifest::ManifestRef::new(),
+                    new_memory_chunk_hashes: Vec::new(),
+                    new_disk_chunk_hashes: Vec::new(),
+                    snapshot_id: engram_core::types::SnapshotId::new(),
+                    paused_at_unix_ms: 0,
+                })
+            }
+            async fn migration_abort(
+                &self,
+                _: SandboxId,
+                _: &str,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.abort_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn restore(
+                &self,
+                _: SnapshotMetadata,
+            ) -> Result<SandboxId, engram_core::SandboxError> {
+                Err(engram_core::SandboxError::Snapshot(
+                    "injected dest failure".into(),
+                ))
+            }
+            fn snapshot_path_for(&self, _: engram_core::types::SnapshotId) -> std::path::PathBuf {
+                std::path::PathBuf::from("/nonexistent")
+            }
+        }
+
+        let session = active_session();
+        let session_id = session.id;
+        let source_host = session.host_id.expect("source host");
+        let (state, meta, target) = build_state(session);
+        // Replace the registry's target backend with the migratable
+        // flaky one — same host id, capture-capable, restore-failing.
+        let abort_called = Arc::new(AtomicBool::new(false));
+        let flaky: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(MigratableFlakyDest {
+            abort_called: abort_called.clone(),
+        });
+        state.host_registry.register(
+            target,
+            Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(flaky.clone())),
+        );
+        // Re-register resets the heartbeat state — restore capacity.
+        state.host_registry.update_state(
+            target,
+            crate::host_registry::HostState {
+                capacity: engram_protocol::heartbeat::HostCapacityReport {
+                    total_mib: 16_384,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining: false,
+                ready_images: Default::default(),
+                current_bundles: Vec::new(),
+                utilization: Default::default(),
+            },
+        );
+        // The SOURCE is resolved through services.host (the registry) by
+        // sandbox owner — record the source sandbox's owner as the same
+        // flaky backend (it serves capture + abort).
+        state
+            .host_registry
+            .record_sandbox_owner(meta.session.lock().sandbox_id.unwrap(), target);
+        // Source host row with an addr + a durable checkpoint row.
+        meta.hosts
+            .lock()
+            .push(engram_core::types::host::HostRecord {
+                id: source_host,
+                hostname: "src".into(),
+                cloud_metadata: engram_core::types::host::HostMetadata::default(),
+                capacity: engram_core::types::host::HostCapacity {
+                    total_gb: 100,
+                    used_gb: 10,
+                    total_mib: 65_536,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: Default::default(),
+                status: engram_core::types::host::HostStatus::Ready,
+                last_heartbeat_at: chrono::Utc::now(),
+                host_addr: Some("http://127.0.0.1:1".into()),
+            });
+        meta.snapshots
+            .lock()
+            .push(engram_core::types::snapshot::SnapshotRecord {
+                id: engram_core::types::SnapshotId::new(),
+                session_id: Some(session_id),
+                host_id: Some(source_host),
+                image_version: "test".into(),
+                size_bytes: 1,
+                created_at: chrono::Utc::now(),
+                last_accessed_at: chrono::Utc::now(),
+                disk_manifest: None,
+                memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
+                recoverable: true,
+                aux_bundles: Vec::new(),
+                events_cursor: None,
+            });
+
+        let err = migrate_session_live(&state, session_id, target)
+            .await
+            .expect_err("dest failure must surface");
+        assert!(
+            matches!(err, MigrateError::AbortedToSource(_)),
+            "got {err:?}",
+        );
+        assert!(
+            abort_called.load(Ordering::SeqCst),
+            "source must be aborted"
+        );
+        assert_eq!(
+            meta.get_session(session_id).await.unwrap().status,
+            SessionState::Active,
+            "session walks back to Active (zero loss)",
+        );
     }
 
     /// A held lease refuses the migration outright (Fatal, not a

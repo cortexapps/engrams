@@ -892,6 +892,9 @@ pub(crate) mod tests {
         pub(crate) events: PlMutex<Vec<PersistedEvent>>,
         next_idx: PlMutex<i64>,
         pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
+        /// ADR 0045 C1 tests: host rows for `list_active_hosts` (the
+        /// live-migration verb resolves the source's host_addr here).
+        pub(crate) hosts: PlMutex<Vec<HostRecord>>,
         /// ADR 0014 issue #1/#2 idle-evictor abort-on-failure tests:
         /// when true, the next `record_snapshot` call returns an error.
         /// Reset to false on use.
@@ -955,6 +958,7 @@ pub(crate) mod tests {
                 events: PlMutex::new(Vec::new()),
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
+                hosts: PlMutex::new(Vec::new()),
                 fail_next_record_snapshot: PlMutex::new(false),
                 session_leases: PlMutex::new(std::collections::HashMap::new()),
                 live_disk_manifests: PlMutex::new(std::collections::HashMap::new()),
@@ -1056,7 +1060,7 @@ pub(crate) mod tests {
             Ok(())
         }
         async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
-            Ok(Vec::new())
+            Ok(self.hosts.lock().clone())
         }
         async fn set_host_status(&self, _: HostId, _: HostStatus) -> Result<(), MetaError> {
             Ok(())
