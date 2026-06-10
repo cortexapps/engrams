@@ -4081,6 +4081,7 @@ impl SandboxBackend for FirecrackerBackend {
         // page-in + ready-port dial). Shared with the base-snapshot
         // capture via `wait_agent_ready`.
         self.wait_agent_ready(id).await?;
+        let t_ready = phase_start.elapsed().as_millis() as u64;
         let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.state.vsock_uds_path.clone()
@@ -4178,7 +4179,20 @@ impl SandboxBackend for FirecrackerBackend {
                 };
                 match resp {
                     engram_agentd::WireResponse::InstallHostCaAck { changed } => {
-                        tracing::debug!(sandbox_id = %id, attempt, changed, "host CA install ack");
+                        // ADR 0045 C1 instrumentation: the cross-host CA
+                        // install is the prime suspect for the in-guest
+                        // handshake tail on a teleport (the dest's CA
+                        // differs, so the guest-side hot path misses and
+                        // the full bundle regeneration runs). INFO so the
+                        // breakdown is greppable per sandbox.
+                        tracing::info!(
+                            sandbox_id = %id,
+                            attempt,
+                            changed,
+                            elapsed_ms = phase_start.elapsed().as_millis() as u64,
+                            wait_ready_ms = t_ready,
+                            "host CA install ack",
+                        );
                     }
                     engram_agentd::WireResponse::Error { kind, message } => {
                         return Err(SandboxError::Vm(

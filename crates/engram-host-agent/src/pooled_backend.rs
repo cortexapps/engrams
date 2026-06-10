@@ -934,25 +934,43 @@ impl PooledBackend {
         let handle = tokio::spawn(async move {
             let _capture_guard = capture_guard;
             // 1. Upload every pulled chunk (content-addressed,
-            //    idempotent) — memory then disk.
-            for h in mig
-                .new_memory_chunk_hashes
-                .iter()
-                .chain(mig.new_disk_chunk_hashes.iter())
+            //    idempotent). PARALLEL with bounded fan-out — the
+            //    serial loop cost ~55ms/chunk of GCS RTT (the prod
+            //    canary's 4.6s catch-up; the same lesson as ADR 0039
+            //    item #19), and puts are order-independent.
             {
-                let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
-                let bytes = cache
-                    .get(hash, || async {
-                        Err(engram_chunk_store::error::ChunkStoreError::Internal(
-                            "catch-up chunk must be cache-resident".into(),
-                        ))
-                    })
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("catch-up read {hash}: {e}")))?;
-                chunk_store
-                    .put_chunk(&bytes)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("catch-up upload {hash}: {e}")))?;
+                use futures::stream::{StreamExt, TryStreamExt};
+                futures::stream::iter(
+                    mig.new_memory_chunk_hashes
+                        .iter()
+                        .chain(mig.new_disk_chunk_hashes.iter())
+                        .copied()
+                        .collect::<Vec<_>>(),
+                )
+                .map(|h| {
+                    let cache = cache.clone();
+                    let chunk_store = chunk_store.clone();
+                    async move {
+                        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(h);
+                        let bytes = cache
+                            .get(hash, || async {
+                                Err(engram_chunk_store::error::ChunkStoreError::Internal(
+                                    "catch-up chunk must be cache-resident".into(),
+                                ))
+                            })
+                            .await
+                            .map_err(|e| {
+                                SandboxError::Snapshot(format!("catch-up read {hash}: {e}"))
+                            })?;
+                        chunk_store.put_chunk(&bytes).await.map_err(|e| {
+                            SandboxError::Snapshot(format!("catch-up upload {hash}: {e}"))
+                        })?;
+                        Ok::<(), SandboxError>(())
+                    }
+                })
+                .buffer_unordered(32)
+                .try_collect::<()>()
+                .await?;
             }
             // 2. Publish the memory manifest (session-owned lineage —
             //    no conflict possible).
