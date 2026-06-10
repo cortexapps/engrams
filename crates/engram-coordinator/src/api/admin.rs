@@ -503,6 +503,34 @@ pub async fn teleport_session(
             ))
         })?;
 
+    // ADR 0045 C1: behind ENGRAM_LIVE_TELEPORT=1, try the LIVE move
+    // first — the eager dirty-set push (no GCS on the pause path, no
+    // post-checkpoint state loss, no scanner tick). `Unsupported`
+    // (pre-C1 binaries, no chain, no host_addr) falls through to the
+    // snapshot-rehome path below; other failures surface — their
+    // recovery posture (aborted-to-source vs scanner parachute) is in
+    // the error.
+    if crate::live_migration::live_teleport_enabled() {
+        match crate::live_migration::migrate_session_live(&state, session_id, req.target_host_id)
+            .await
+        {
+            Ok(()) => {
+                return Ok((
+                    StatusCode::OK,
+                    Json(EvacuateSessionResponse {
+                        session_id,
+                        status: "migrated",
+                    }),
+                ));
+            }
+            Err(crate::live_migration::MigrateError::Unsupported(reason)) => {
+                tracing::info!(%session_id, %reason,
+                    "live teleport unsupported; falling back to snapshot-rehome");
+            }
+            Err(e) => return Err(ApiError::Internal(format!("live teleport: {e}"))),
+        }
+    }
+
     // Pin the destination, then fire the same evac pipeline `evacuate`
     // uses — the only difference is the scanner reads the pin and places
     // on this exact host. Unwind the pin if the pipeline itself fails.
