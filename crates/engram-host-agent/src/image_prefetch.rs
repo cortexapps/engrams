@@ -562,6 +562,46 @@ async fn prefetch_one(
             prefetch_manifest_chunks(memory_manifest.clone(), chunk_store, chunk_cache, semaphore)
                 .await?;
 
+        // ADR 0045 C1 (the handshake-breakdown follow-up): pre-warm the
+        // SUBSTRATE's per-image base shm file from the just-prefetched
+        // NVMe-warm chunks. Without this, the FIRST session on a
+        // freshly-rolled host pays fetch+pwrite+CONTINUE for every
+        // base page it touches (~17s of in-guest first-touch on the
+        // prod canary); with it, first sessions CONTINUE against an
+        // already-populated page cache like every later sibling.
+        // Skip-if-exists: a handler may already own (and be lazily
+        // populating) the file — both writers produce byte-identical
+        // content at the same offsets, but ceding to the lazy path
+        // keeps this arm trivially safe. Manifest-elided ranges stay
+        // HOLES (the handler's ZEROPAGE arm owns zero pages — v2b
+        // semantics). Best-effort: a tmpfs hiccup must not block image
+        // readiness; the lazy path is the backstop.
+        if let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env() {
+            let base_path = engram_sandbox_firecracker::uffd_base_path_in(&base_dir, &memory_ref);
+            if tokio::fs::metadata(&base_path).await.is_err() {
+                match prewarm_base_shm(&base_path, &memory_manifest, chunk_store, chunk_cache).await
+                {
+                    Ok(written) => {
+                        tracing::info!(
+                            image_uri = %image.image_uri,
+                            path = %base_path.display(),
+                            chunks = written,
+                            "per-image base shm pre-warmed at prefetch (ADR 0045 C1)",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            image_uri = %image.image_uri,
+                            path = %base_path.display(),
+                            error = %e,
+                            "base shm pre-warm failed; the handler's lazy path backstops",
+                        );
+                        let _ = tokio::fs::remove_file(&base_path).await;
+                    }
+                }
+            }
+        }
+
         // ADR 0022 Option A: materialize the contiguous per-template base
         // memfile (density + faster boot). The chunks are now NVMe-warm
         // from the prefetch above, so this is a local read + sequential
@@ -593,6 +633,51 @@ async fn prefetch_one(
         chunk_count: total,
         hashes: pin_hashes,
     })
+}
+
+/// ADR 0045 C1: populate a per-image base shm file from a memory
+/// manifest's chunks (NVMe-warm after the preceding prefetch). Grow-only
+/// size like the handler's `BaseShm::open`; chunk bytes land at their
+/// manifest offsets; elided ranges stay holes. Returns chunks written.
+async fn prewarm_base_shm(
+    path: &std::path::Path,
+    manifest: &Manifest,
+    chunk_store: &ChunkStore,
+    chunk_cache: &engram_chunk_store::ChunkCache,
+) -> Result<usize, String> {
+    use std::os::unix::fs::FileExt;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create base dir: {e}"))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("open base file: {e}"))?;
+    if file.metadata().map_err(|e| e.to_string())?.len() < manifest.total_bytes {
+        file.set_len(manifest.total_bytes)
+            .map_err(|e| format!("size base file: {e}"))?;
+    }
+    let file = std::sync::Arc::new(file);
+    let mut written = 0usize;
+    for chunk in &manifest.chunks {
+        let bytes = chunk_cache
+            .get(chunk.hash, || chunk_store.get_chunk(chunk.hash))
+            .await
+            .map_err(|e| format!("chunk {}: {e}", chunk.hash))?;
+        let file = file.clone();
+        let offset = chunk.offset;
+        tokio::task::spawn_blocking(move || file.write_all_at(&bytes, offset))
+            .await
+            .map_err(|e| format!("join: {e}"))?
+            .map_err(|e| format!("pwrite at {offset}: {e}"))?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 /// Pull every chunk of one chunked manifest through the tiered
@@ -1016,6 +1101,54 @@ mod tests {
         assert!(
             !readiness.contains(&img.manifest_digest),
             "a ready image with an evicted base chunk must flip to not-ready",
+        );
+    }
+}
+
+#[cfg(test)]
+mod prewarm_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// ADR 0045 C1: the pre-warm writes each manifest chunk at its
+    /// offset, sizes the file to total_bytes, and leaves elided ranges
+    /// as holes (the handler's ZEROPAGE arm owns zeros).
+    #[tokio::test]
+    async fn prewarm_base_shm_writes_chunks_and_preserves_holes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let store = ChunkStore::new(blob);
+        let cache = engram_chunk_store::ChunkCache::new(
+            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
+        );
+
+        // A sparse image: chunk at 0 (0xAA), HOLE at 4096, chunk at 8192 (0xBB).
+        let img = tmp.path().join("img.bin");
+        let mut bytes = vec![0u8; 3 * 4096];
+        bytes[..4096].fill(0xAA);
+        bytes[2 * 4096..].fill(0xBB);
+        std::fs::write(&img, &bytes).unwrap();
+        let manifest = store
+            .chunk_file(&img, engram_chunk_store::ManifestKind::Memory, Some(4096))
+            .await
+            .unwrap();
+        assert_eq!(manifest.chunks.len(), 2, "the zero chunk is elided");
+
+        let base = tmp.path().join("shm").join("base.base");
+        let written = prewarm_base_shm(&base, &manifest, &store, &cache)
+            .await
+            .expect("prewarm");
+        assert_eq!(written, 2);
+
+        let got = std::fs::read(&base).unwrap();
+        assert_eq!(got.len() as u64, manifest.total_bytes);
+        assert_eq!(&got[..4096], &bytes[..4096]);
+        assert_eq!(&got[2 * 4096..], &bytes[2 * 4096..]);
+        assert!(
+            got[4096..2 * 4096].iter().all(|b| *b == 0),
+            "hole reads as zeros"
         );
     }
 }
