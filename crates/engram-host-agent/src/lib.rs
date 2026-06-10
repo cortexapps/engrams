@@ -307,6 +307,65 @@ impl HostAgent {
                 }
                 Arc::new(p)
             };
+            // ADR 0045 C1: the migration export TTL sweep — the
+            // dumb-host rule. An export past EXPORT_TTL means the
+            // coordinator never sent commit/abort (it died mid-move):
+            // ask it who owns the sandbox now and abort-in-place /
+            // destroy / stay-paused per `migration::ttl_verdict`.
+            {
+                let pooled_for_ttl = pooled.clone();
+                let coord_for_ttl = coord_client::CoordClient::new(
+                    coord_url.clone(),
+                    self.cfg.coordinator_token.clone(),
+                );
+                let host_id_for_ttl = host_id;
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        for (sandbox_id, session, export_id) in
+                            pooled_for_ttl.expired_migration_exports()
+                        {
+                            let ownership = match session {
+                                Some(session_id) => coord_for_ttl
+                                    .sandbox_ownership(host_id_for_ttl, session_id, sandbox_id)
+                                    .await
+                                    .ok(),
+                                None => None,
+                            };
+                            let verdict = migration::ttl_verdict(session.is_some(), ownership);
+                            tracing::warn!(
+                                %sandbox_id,
+                                ?session,
+                                ?verdict,
+                                "migration export exceeded TTL with no commit/abort",
+                            );
+                            use engram_core::traits::sandbox::SandboxBackend as _;
+                            match verdict {
+                                migration::TtlVerdict::AbortInPlace => {
+                                    if let Err(e) =
+                                        pooled_for_ttl.migration_abort(sandbox_id, &export_id).await
+                                    {
+                                        tracing::warn!(%sandbox_id, error = %e,
+                                            "export TTL abort failed");
+                                    }
+                                }
+                                migration::TtlVerdict::Destroy => {
+                                    if let Err(e) = pooled_for_ttl
+                                        .migration_commit(sandbox_id, &export_id)
+                                        .await
+                                    {
+                                        tracing::warn!(%sandbox_id, error = %e,
+                                            "export TTL destroy failed");
+                                    }
+                                }
+                                migration::TtlVerdict::StayPaused => {}
+                            }
+                        }
+                    }
+                });
+            }
             // ADR 0028 Fix A: the periodic checkpoint driver. No-ops
             // when ENGRAM_CHECKPOINT_INTERVAL_SECS=0, the backend has
             // no checkpoint dir, or the backend can't do diff

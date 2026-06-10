@@ -293,6 +293,40 @@ impl CoordClient {
     }
 
     /// POST /api/v1/hosts/:id/idle-eviction-candidates
+    /// ADR 0045 C1: the export-TTL ownership check. `Ok(true)` = the
+    /// coordinator still binds this sandbox to the session (the move
+    /// never landed — abort the export, un-pause in place);
+    /// `Ok(false)` = ownership moved on (destroy the stale frozen
+    /// source); `Err` = coordinator unreachable (stay paused, retry).
+    pub async fn sandbox_ownership(
+        &self,
+        host_id: HostId,
+        session_id: engram_core::SessionId,
+        sandbox_id: engram_core::SandboxId,
+    ) -> Result<bool, CoordClientError> {
+        let url = self.endpoint(&format!(
+            "/hosts/{host_id}/sessions/{session_id}/sandboxes/{sandbox_id}/ownership"
+        ));
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            owned: bool,
+        }
+        let mut builder = self.http.get(&url);
+        if !self.auth_token.is_empty() {
+            builder = builder.bearer_auth(&self.auth_token);
+        }
+        let resp = builder.send().await.map_err(CoordClientError::Transport)?;
+        if !resp.status().is_success() {
+            return Err(CoordClientError::Http {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+                what: "sandbox_ownership",
+            });
+        }
+        let body: Resp = resp.json().await.map_err(CoordClientError::Transport)?;
+        Ok(body.owned)
+    }
+
     pub async fn push_idle_eviction_candidates(
         &self,
         host_id: HostId,

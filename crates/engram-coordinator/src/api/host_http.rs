@@ -724,6 +724,31 @@ pub async fn live_manifest_publish(
 /// re-nominates a still-Evicting sandbox on every 10s tick until the
 /// pipeline destroys it; counting those re-nominations as accepted
 /// no-ops is what keeps that loop silent and cheap.
+/// ADR 0045 C1: the migration export TTL's dumb-host ownership check.
+/// A source host-agent holding a frozen export past its TTL (no
+/// commit/abort arrived — a coordinator death mid-move) asks: "does
+/// session X still bind my sandbox Y?" `true` ⇒ the move never landed,
+/// un-pause in place (abort). `false` ⇒ the session moved on (the
+/// scanner rehomed it, or the rebind landed without the commit) —
+/// destroying the stale frozen source is safe and REQUIRED (resuming
+/// it would split state).
+pub async fn sandbox_ownership(
+    State(state): State<SharedState>,
+    Path((_host_id, session_id, sandbox_id)): Path<(HostId, SessionId, SandboxId)>,
+) -> Result<Json<SandboxOwnershipResponse>, ApiError> {
+    let owned = match state.services.meta.get_session(session_id).await {
+        Ok(s) => s.sandbox_id == Some(sandbox_id),
+        Err(engram_core::MetaError::NotFound) => false,
+        Err(e) => return Err(ApiError::Internal(format!("get_session: {e}"))),
+    };
+    Ok(Json(SandboxOwnershipResponse { owned }))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SandboxOwnershipResponse {
+    pub owned: bool,
+}
+
 pub async fn idle_eviction_candidates(
     State(state): State<SharedState>,
     Path(host_id): Path<HostId>,

@@ -97,6 +97,13 @@ impl MigrationRegistry {
         self.by_sandbox.remove(&sandbox_id).map(|(_, e)| e)
     }
 
+    /// The open export's id for a sandbox (the TTL sweep's handle).
+    pub fn export_id_of(&self, sandbox_id: SandboxId) -> Option<String> {
+        self.by_sandbox
+            .get(&sandbox_id)
+            .map(|e| e.export_id.clone())
+    }
+
     /// Exports older than [`EXPORT_TTL`] (the dumb-host sweep input).
     pub fn expired(&self) -> Vec<SandboxId> {
         self.by_sandbox
@@ -118,6 +125,37 @@ impl MigrationRegistry {
     }
 }
 
+/// ADR 0045 C1: what the TTL sweep should do with an expired export,
+/// given the coordinator's ownership answer. Pure — the decision the
+/// dumb-host rule encodes, unit-tested apart from any I/O.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TtlVerdict {
+    /// The coordinator still binds this sandbox to the session: the
+    /// move never landed. Un-pause in place (abort) — zero loss.
+    AbortInPlace,
+    /// Ownership moved on (scanner rehome, or rebind without the
+    /// commit). The frozen source is STALE — resuming it would split
+    /// state; destroy it.
+    Destroy,
+    /// Coordinator unreachable: stay paused and retry next sweep —
+    /// never guess about ownership.
+    StayPaused,
+}
+
+/// `ownership = None` ⇒ unreachable; `session_bound = false` ⇒ the
+/// export's sandbox has no session binding (anonymous — nothing can
+/// reclaim it, destroy).
+pub fn ttl_verdict(session_bound: bool, ownership: Option<bool>) -> TtlVerdict {
+    if !session_bound {
+        return TtlVerdict::Destroy;
+    }
+    match ownership {
+        Some(true) => TtlVerdict::AbortInPlace,
+        Some(false) => TtlVerdict::Destroy,
+        None => TtlVerdict::StayPaused,
+    }
+}
+
 /// Constant-time string compare (export_id nonces).
 fn constant_time_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -134,6 +172,15 @@ fn constant_time_str_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ttl_verdict_encodes_the_dumb_host_rule() {
+        assert_eq!(ttl_verdict(true, Some(true)), TtlVerdict::AbortInPlace);
+        assert_eq!(ttl_verdict(true, Some(false)), TtlVerdict::Destroy);
+        assert_eq!(ttl_verdict(true, None), TtlVerdict::StayPaused);
+        assert_eq!(ttl_verdict(false, Some(true)), TtlVerdict::Destroy);
+        assert_eq!(ttl_verdict(false, None), TtlVerdict::Destroy);
+    }
 
     #[test]
     fn export_id_is_single_use_per_sandbox_and_validated() {
