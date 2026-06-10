@@ -423,6 +423,12 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
         'RUST_LOG': 'info,engram=debug',
     }
+    # ADR 0045 substrate (v2b): dev uffd runs spawn the workspace-built
+    # handler (prod bakes it onto PATH). Conditional — an empty env var
+    # would clobber the host-agent's PATH-lookup default.
+    if env_or('ENGRAM_FC_UFFD_HANDLER_BIN', ''):
+        env['ENGRAM_FC_UFFD_HANDLER_BIN'] = env_or('ENGRAM_FC_UFFD_HANDLER_BIN', '')
+
     if nbd_csv:
         env['ENGRAM_NBD_DEVICES'] = nbd_csv
     if 'Darwin' in uname_str:
