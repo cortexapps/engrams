@@ -222,20 +222,6 @@ pub struct FirecrackerConfig {
     /// spawns engram-uffd-handler and serves pages on demand (fast,
     /// requires Linux + the handler binary on the host).
     pub restore_mode: RestoreMode,
-    /// ADR 0022 Option A: memory backend for *base `session.create`*
-    /// restores specifically (the `restore_fresh` flavor), independent
-    /// of [`Self::restore_mode`] which governs idle-resume. `None` ⇒
-    /// inherit `restore_mode` (so the default is behaviour-preserving:
-    /// base-create uses whatever the host is configured for). `Some(File)`
-    /// flips base-create to the File backend against the per-template
-    /// resident memfile — N same-template siblings `MAP_PRIVATE` one
-    /// inode (density) and the restore skips the UFFD handler spawn +
-    /// per-page fault round-trips (faster boot). `Some(Uffd)` is the
-    /// kill-switch forcing base-create back to UFFD. Resolved at startup
-    /// from `ENGRAM_FC_BASE_RESTORE_MODE` ([`base_restore_mode_from_env`]);
-    /// changing it is an env edit + host-agent restart, exactly like
-    /// `restore_mode`.
-    pub base_restore_mode: Option<RestoreMode>,
     /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
     /// creates via `MachineConfig.track_dirty_pages`, restores via
     /// `enable_diff_snapshots` at `snapshot/load` — so periodic
@@ -390,31 +376,6 @@ pub fn restore_mode_from_env() -> RestoreMode {
     }
 }
 
-/// ADR 0022 Option A / ADR 0039: pick the *base `session.create`* memory
-/// backend from `ENGRAM_FC_BASE_RESTORE_MODE` (`file` | `uffd`).
-/// **Defaults to `file`** (ADR 0039 — base templates are locally
-/// resident, so File restore is a fast local read; this promotes ADR
-/// 0022's Option A density to the default and lets the Helm chart drop
-/// the override). `uffd` is the kill-switch. Governs only the
-/// `restore_fresh` (base-create) path; idle-resume always follows
-/// `restore_mode`. Returns `Some(_)` for every input now — the
-/// historical `None` ("inherit `restore_mode`") is reachable only via
-/// direct struct construction (tests); the env path always resolves a
-/// concrete mode.
-pub fn base_restore_mode_from_env() -> Option<RestoreMode> {
-    match std::env::var("ENGRAM_FC_BASE_RESTORE_MODE") {
-        Ok(s) if s.eq_ignore_ascii_case("uffd") => Some(RestoreMode::Uffd),
-        Ok(s) if !s.is_empty() && !s.eq_ignore_ascii_case("file") => {
-            tracing::warn!(
-                value = %s,
-                "unrecognised ENGRAM_FC_BASE_RESTORE_MODE; defaulting to file",
-            );
-            Some(RestoreMode::File)
-        }
-        _ => Some(RestoreMode::File),
-    }
-}
-
 /// ADR 0045 substrate (v2b): per-template base-shm directory for
 /// Uffd-mode restores from `ENGRAM_FC_UFFD_BASE_DIR`. Unset/empty ⇒
 /// `None` (stock anonymous Uffd restore — the D2 rollout gate; the
@@ -532,9 +493,6 @@ impl FirecrackerConfig {
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
-            // ADR 0022: inherit `restore_mode` for base-create until prod
-            // opts in via ENGRAM_FC_BASE_RESTORE_MODE.
-            base_restore_mode: None,
             track_dirty_pages: false,
             host_id: None,
             uffd_cache_root: None,
@@ -921,19 +879,24 @@ impl FirecrackerBackend {
         .await
     }
 
-    /// ADR 0022 Option A: the effective memory backend for one restore.
+    /// The effective memory backend for one restore (ADR 0045 D3).
     /// `fresh` (the `swap_aux_to_current` flavor) is a base
-    /// `session.create`: it uses `base_restore_mode` when set, else
-    /// inherits `restore_mode`. Idle-resume (`fresh == false`) always
-    /// follows `restore_mode`. The two axes are kept separate on purpose
-    /// — aux-bundle freshness and memory backing are independent, so a
-    /// future resume-that-swaps or create-that-doesn't won't silently
-    /// pick the wrong backend.
+    /// `session.create`: with the substrate enabled (`uffd_base_dir`
+    /// set) it restores Uffd against the shared base shm — parity-gated
+    /// against File mode (density 35% == 35%, median 61 ms vs 56 ms,
+    /// dev VM 2026-06-10) — and without it keeps ADR 0022's File-mode
+    /// density path. Idle-resume (`fresh == false`) always follows
+    /// `restore_mode`. The per-host env is the one switch, so a fleet
+    /// roll flips fresh-create and resume together host-by-host with no
+    /// coordination (the retired `ENGRAM_FC_BASE_RESTORE_MODE` knob's
+    /// job is now derived, not configured).
     fn effective_restore_mode(&self, fresh: bool) -> RestoreMode {
         if fresh {
-            self.config
-                .base_restore_mode
-                .unwrap_or(self.config.restore_mode)
+            if self.config.uffd_base_dir.is_some() {
+                RestoreMode::Uffd
+            } else {
+                RestoreMode::File
+            }
         } else {
             self.config.restore_mode
         }
@@ -4497,7 +4460,6 @@ mod tests {
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
-            base_restore_mode: None,
             track_dirty_pages: false,
             net_pool: None,
             egress_proxy_port: None,
@@ -5005,97 +4967,20 @@ mod tests {
         }
     }
 
-    // ---- ADR 0022: base_restore_mode_from_env + effective_restore_mode ----
-
-    fn base_mode_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    struct BaseRestoreModeEnvGuard {
-        prev: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl BaseRestoreModeEnvGuard {
-        fn new() -> Self {
-            let lock = base_mode_env_lock()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let prev = std::env::var("ENGRAM_FC_BASE_RESTORE_MODE").ok();
-            // SAFETY: serialized via `lock`.
-            unsafe { std::env::remove_var("ENGRAM_FC_BASE_RESTORE_MODE") };
-            Self { prev, _lock: lock }
-        }
-        fn set(&self, value: &str) {
-            unsafe { std::env::set_var("ENGRAM_FC_BASE_RESTORE_MODE", value) };
-        }
-    }
-    impl Drop for BaseRestoreModeEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.prev.as_deref() {
-                    Some(v) => std::env::set_var("ENGRAM_FC_BASE_RESTORE_MODE", v),
-                    None => std::env::remove_var("ENGRAM_FC_BASE_RESTORE_MODE"),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn base_restore_mode_from_env_unset_defaults_to_file() {
-        // ADR 0039: unset ⇒ base-create defaults to File (ADR 0022
-        // Option A density against the resident base memfile); the Helm
-        // chart no longer needs to set ENGRAM_FC_BASE_RESTORE_MODE.
-        let _g = BaseRestoreModeEnvGuard::new();
-        assert_eq!(base_restore_mode_from_env(), Some(RestoreMode::File));
-    }
-
-    #[test]
-    fn base_restore_mode_from_env_parses_file_and_uffd_case_insensitively() {
-        let g = BaseRestoreModeEnvGuard::new();
-        for v in &["file", "File", "FILE"] {
-            g.set(v);
-            assert_eq!(
-                base_restore_mode_from_env(),
-                Some(RestoreMode::File),
-                "input={v}"
-            );
-        }
-        for v in &["uffd", "Uffd", "UFFD"] {
-            g.set(v);
-            assert_eq!(
-                base_restore_mode_from_env(),
-                Some(RestoreMode::Uffd),
-                "input={v}"
-            );
-        }
-    }
-
-    #[test]
-    fn base_restore_mode_from_env_garbage_and_empty_default_to_file() {
-        // ADR 0039: empty/garbage ⇒ File default (the resident base
-        // memfile path), same as unset.
-        let g = BaseRestoreModeEnvGuard::new();
-        for v in &["", "lazy", "nonsense"] {
-            g.set(v);
-            assert_eq!(
-                base_restore_mode_from_env(),
-                Some(RestoreMode::File),
-                "input={v}"
-            );
-        }
-    }
+    // ---- ADR 0045 D3: effective_restore_mode (substrate-aware) ----
 
     #[test]
     fn effective_restore_mode_bifurcates_create_vs_resume() {
         let (mut be, _dir) = backend();
-        // Prod-shaped config: resume on UFFD, base-create flipped to File.
+        // Default: no substrate dir — base session.create keeps ADR
+        // 0022's File-mode density path; idle-resume follows
+        // restore_mode.
         be.config.restore_mode = RestoreMode::Uffd;
-        be.config.base_restore_mode = Some(RestoreMode::File);
+        be.config.uffd_base_dir = None;
         assert_eq!(
             be.effective_restore_mode(/*fresh=*/ true),
             RestoreMode::File,
-            "base session.create uses base_restore_mode",
+            "without the substrate, base session.create stays on File",
         );
         assert_eq!(
             be.effective_restore_mode(/*fresh=*/ false),
@@ -5103,12 +4988,9 @@ mod tests {
             "idle-resume always follows restore_mode",
         );
 
-        // Kill-switch: force base-create back to UFFD.
-        be.config.base_restore_mode = Some(RestoreMode::Uffd);
-        assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
-
-        // Inert default: None inherits restore_mode for BOTH flavors.
-        be.config.base_restore_mode = None;
+        // Substrate enabled: ONE switch flips fresh-create to Uffd
+        // against the shared base shm (ADR 0045 D3 parity-gated).
+        be.config.uffd_base_dir = Some(std::path::PathBuf::from("/dev/shm/engram"));
         assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
         assert_eq!(be.effective_restore_mode(false), RestoreMode::Uffd);
     }

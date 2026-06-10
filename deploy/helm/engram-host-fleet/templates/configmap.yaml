@@ -33,6 +33,11 @@ data:
   {{- with .Values.firecracker.restoreMode }}
   ENGRAM_FC_RESTORE_MODE: {{ . | quote }}
   {{- end }}
+  {{- with .Values.firecracker.uffdBaseDir }}
+  # ADR 0045 D3: the unified memory substrate. Node-prep mounts the tmpfs;
+  # the host-agent derives everything else from this one switch.
+  ENGRAM_FC_UFFD_BASE_DIR: {{ . | quote }}
+  {{- end }}
   {{- with .Values.firecracker.vmCgroupParent }}
   # ADR 0044 K2: node-level cgroup-v2 dir the host-agent moves each VM's
   # FC + uffd-handler into, so they survive this pod's cgroup teardown on
