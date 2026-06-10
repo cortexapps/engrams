@@ -329,10 +329,13 @@ impl ChunkStore {
                     let hash = match &local_sink {
                         // Migration flavor: hash + land in the local
                         // cache only; no GCS round-trip on the pause
-                        // path. `ChunkCache::put` re-verifies the hash.
+                        // path. NO per-write eviction sweep (the prod
+                        // canary's 12.6s capture leg was mostly sweep
+                        // readdirs) — the batch-closing sweep runs
+                        // below, once.
                         Some(cache) => {
                             let hash = crate::manifest::ChunkHash::of(&slice);
-                            cache.put(hash, &slice).await?;
+                            cache.put_no_evict(hash, &slice).await?;
                             hash
                         }
                         None => store.put_chunk(&slice).await?,
@@ -365,6 +368,11 @@ impl ChunkStore {
             .iter()
             .filter_map(|off| by_offset.get(off).map(|c| c.hash))
             .collect();
+        if let Some(cache) = local_sink {
+            // The batch-closing eviction sweep (pairs with
+            // put_no_evict above).
+            cache.sweep().await?;
+        }
 
         Ok((
             Manifest {
