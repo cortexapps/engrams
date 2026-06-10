@@ -626,6 +626,7 @@ jobs:
             --test file_restore_shared_rss \
             --test stock_fork_snapshot_compat \
             --test substrate_kernel_capabilities \
+            --test substrate_uffd_base \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

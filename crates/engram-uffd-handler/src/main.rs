@@ -153,6 +153,12 @@ mod linux {
         pub cache_root: PathBuf,
         pub cache_budget_bytes: u64,
         pub recorder_window: Duration,
+        /// ADR 0045 substrate (v2b): the per-template base shm file this
+        /// handler creates, sizes, and lazily populates with canonical
+        /// chunks. The forked FC maps it MAP_PRIVATE and registers
+        /// MISSING|MINOR; canonical faults resolve via UFFDIO_CONTINUE
+        /// (shared), divergent via UFFDIO_COPY (private). Off when unset.
+        pub base_shm: Option<PathBuf>,
     }
 
     pub fn parse_args() -> Result<Args, String> {
@@ -166,6 +172,7 @@ mod linux {
         let mut cache_root: Option<PathBuf> = None;
         let mut cache_budget_bytes: u64 = DEFAULT_CACHE_BUDGET_BYTES;
         let mut recorder_window_ms: u64 = DEFAULT_RECORDER_WINDOW_MS;
+        let mut base_shm: Option<PathBuf> = None;
 
         let mut argv = std::env::args().skip(1);
         while let Some(arg) = argv.next() {
@@ -229,6 +236,12 @@ mod linux {
                         .parse::<u64>()
                         .map_err(|e| format!("--cache-budget-bytes {v:?}: {e}"))?;
                 }
+                "--base-shm" => {
+                    base_shm = Some(PathBuf::from(
+                        argv.next()
+                            .ok_or_else(|| "--base-shm requires a value".to_string())?,
+                    ));
+                }
                 "--recorder-window-ms" => {
                     let v = argv
                         .next()
@@ -263,6 +276,7 @@ mod linux {
             cache_root,
             cache_budget_bytes,
             recorder_window: Duration::from_millis(recorder_window_ms),
+            base_shm,
         })
     }
 
@@ -354,6 +368,24 @@ mod linux {
             None
         };
 
+        // ADR 0045 substrate (v2b): create + size the base shm file NOW —
+        // before run_listener binds the UDS. The host-agent orders FC's
+        // load (which open(O_RDONLY)s + mmaps this file) after the socket
+        // appears, so the file is always fully sized by then.
+        let base_shm = match args.base_shm.as_ref() {
+            Some(path) => {
+                let b = engram_uffd_handler::base_shm::BaseShm::open(path, backend.total_bytes())
+                    .map_err(|e| format!("base shm: {e}"))?;
+                tracing::info!(
+                    path = %path.display(),
+                    total_bytes = backend.total_bytes(),
+                    "substrate base shm ready (canonical -> CONTINUE, divergent -> COPY)"
+                );
+                Some(b)
+            }
+            None => None,
+        };
+
         let result = tokio::task::spawn_blocking({
             let handle = handle.clone();
             let listen = args.listen.clone();
@@ -362,7 +394,7 @@ mod linux {
             let trace_out = args.trace_output.clone();
             move || {
                 engram_uffd_handler::runtime::run_listener(
-                    listen, backend, handle, prefault, window, trace_out,
+                    listen, backend, handle, prefault, window, trace_out, base_shm,
                 )
             }
         })

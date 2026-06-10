@@ -41,6 +41,8 @@ pub mod proto;
 pub mod working_set;
 
 #[cfg(target_os = "linux")]
+pub mod base_shm;
+#[cfg(target_os = "linux")]
 pub mod runtime;
 
 pub use chunked::{ChunkedBackendError, ChunkedMemoryBackend, ResolvedPage};

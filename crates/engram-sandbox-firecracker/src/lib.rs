@@ -208,6 +208,15 @@ pub struct FirecrackerConfig {
     /// when `restore_mode == Uffd`. Defaults to `engram-uffd-handler`
     /// (resolved via PATH).
     pub uffd_handler_bin: PathBuf,
+    /// ADR 0045 unified memory substrate (v2b). When set, Uffd-mode
+    /// restores back guest memory `MAP_PRIVATE` on a per-template base
+    /// shm file under this directory (`<dir>/<manifest>-v<n>.base`,
+    /// created + lazily populated by the handler), registered
+    /// `MISSING|MINOR` by the forked FC — base-identical pages are
+    /// then shared page-cache across same-template VMs via
+    /// `UFFDIO_CONTINUE`. MUST point at a tmpfs/shmem mount (MINOR
+    /// faults are shmem-only). `None` ⇒ stock anonymous Uffd restore.
+    pub uffd_base_dir: Option<PathBuf>,
     /// How to wire memory on snapshot restore. File mode synchronously
     /// reads memory.bin (slow, simple, no extra processes). Uffd mode
     /// spawns engram-uffd-handler and serves pages on demand (fast,
@@ -406,6 +415,20 @@ pub fn base_restore_mode_from_env() -> Option<RestoreMode> {
     }
 }
 
+/// ADR 0045 substrate (v2b): per-template base-shm directory for
+/// Uffd-mode restores from `ENGRAM_FC_UFFD_BASE_DIR`. Unset/empty ⇒
+/// `None` (stock anonymous Uffd restore — the D2 rollout gate; the
+/// D3/D4 parity flips make this the one path and retire the knob).
+/// The directory must live on tmpfs/shmem (e.g. `/dev/shm/engram` on
+/// the dev VM, the node-prep tmpfs in prod) — UFFD minor faults are
+/// shmem-only.
+pub fn uffd_base_dir_from_env() -> Option<PathBuf> {
+    match std::env::var("ENGRAM_FC_UFFD_BASE_DIR") {
+        Ok(s) if !s.trim().is_empty() => Some(PathBuf::from(s)),
+        _ => None,
+    }
+}
+
 /// ADR 0009 §6 errors from `FirecrackerBackend::reattach_sandbox`.
 /// Distinct from `SandboxError` so the live-attach driver can
 /// distinguish "FC truly gone, fall through to path 2" from "operator
@@ -507,6 +530,7 @@ impl FirecrackerConfig {
             guest_otel_endpoint: None,
             firecracker_bin: PathBuf::from("firecracker"),
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
+            uffd_base_dir: None,
             restore_mode: RestoreMode::File,
             // ADR 0022: inherit `restore_mode` for base-create until prod
             // opts in via ENGRAM_FC_BASE_RESTORE_MODE.
@@ -1502,6 +1526,22 @@ impl FirecrackerBackend {
     /// Returns the live `Child` so the caller can hold it for the
     /// VM's lifetime.
     #[allow(clippy::too_many_arguments)]
+    /// ADR 0045 substrate (v2b): the per-template base shm path for a
+    /// canonical manifest, or `None` when the substrate is off. Both the
+    /// handler spawn (creates + populates it) and the FC load (maps it
+    /// `MAP_PRIVATE`) derive the path through here so they can't diverge.
+    fn uffd_base_path(
+        &self,
+        canonical_ref: &engram_core::types::manifest::ManifestRef,
+    ) -> Option<PathBuf> {
+        self.config.uffd_base_dir.as_ref().map(|dir| {
+            dir.join(format!(
+                "{}-v{}.base",
+                canonical_ref.manifest_id, canonical_ref.version
+            ))
+        })
+    }
+
     #[tracing::instrument(name = "fc.spawn_uffd_handler", skip_all)]
     async fn spawn_uffd_handler(
         &self,
@@ -1544,6 +1584,19 @@ impl FirecrackerBackend {
         // default is `/var/cache/engram/chunks`, root-only).
         if let Some(cache_root) = self.config.uffd_cache_root.as_ref() {
             cmd.arg("--cache-root").arg(cache_root);
+        }
+        // ADR 0045 substrate (v2b): the handler creates + sizes the base
+        // shm file (it knows total_bytes from the canonical manifest)
+        // BEFORE binding the UDS, and `wait_for_socket` below orders the
+        // FC load after that — so FC's O_RDONLY open of the same path
+        // always sees a fully-sized file.
+        if let Some(base) = self.uffd_base_path(&canonical_ref) {
+            if let Some(dir) = base.parent() {
+                tokio::fs::create_dir_all(dir)
+                    .await
+                    .map_err(|e| vm_err(format!("create uffd base dir {}: {e}", dir.display())))?;
+            }
+            cmd.arg("--base-shm").arg(&base);
         }
         if let Some(host) = prefault_trace_host {
             cmd.arg("--prefault-trace").arg(host.to_string());
@@ -2550,6 +2603,12 @@ impl FirecrackerBackend {
                     .await?;
                 }
                 Some((_handler, uffd_uds)) => {
+                    // ADR 0045 substrate (v2b): same canonical ref as the
+                    // handler spawn (canonical == session, ADR 0015 M5),
+                    // so the derived base path matches the handler's.
+                    let base = manifest
+                        .memory_manifest
+                        .and_then(|r| self.uffd_base_path(&r));
                     tracing::Instrument::instrument(
                         async {
                             api.load_snapshot_uffd_opts(
@@ -2557,6 +2616,7 @@ impl FirecrackerBackend {
                                 uffd_uds,
                                 /*resume_vm=*/ aux_swap_plan.is_empty(),
                                 self.config.track_dirty_pages,
+                                base.as_deref(),
                             )
                             .await
                         },
@@ -4435,6 +4495,7 @@ mod tests {
             guest_otel_endpoint: None,
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
+            uffd_base_dir: None,
             restore_mode: RestoreMode::File,
             base_restore_mode: None,
             track_dirty_pages: false,

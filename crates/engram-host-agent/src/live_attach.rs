@@ -271,6 +271,7 @@ mod tests {
             guest_otel_endpoint: None,
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
+            uffd_base_dir: None,
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
             base_restore_mode: None,
             track_dirty_pages: false,
