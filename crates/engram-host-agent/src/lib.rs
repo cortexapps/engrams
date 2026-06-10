@@ -20,6 +20,7 @@ use engram_core::SandboxId;
 use crate::image_cache::ImageCache;
 
 pub mod admin_handler;
+pub mod base_shm_gc;
 pub mod blob;
 pub mod bundles;
 pub mod checkpoint;

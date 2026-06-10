@@ -942,6 +942,33 @@ fn portable_blob_keys(
     }
 }
 
+/// ADR 0045 D4: the IMAGE's base-snapshot memory manifest for a session's
+/// image — the CANONICAL ref for substrate resumes (base-identical pages
+/// CONTINUE against the shared per-image base shm). Best-effort: any miss
+/// (image disabled, no base snapshot, no memory manifest) returns `None`
+/// and the restore falls back to canonical == session (pre-D4 behavior).
+async fn base_memory_manifest_for_image(
+    state: &SharedState,
+    image_uri: &str,
+) -> Option<engram_core::types::manifest::ManifestRef> {
+    let enabled = state
+        .services
+        .meta
+        .get_enabled_image_any(image_uri)
+        .await
+        .ok()
+        .flatten()?;
+    let base_id = enabled.base_snapshot_id?;
+    state
+        .services
+        .meta
+        .get_snapshot(base_id)
+        .await
+        .ok()
+        .flatten()?
+        .memory_manifest
+}
+
 async fn resume_from_fc_snapshot(
     state: SharedState,
     session: Session,
@@ -978,6 +1005,10 @@ async fn resume_from_fc_snapshot(
         // affinity already constrains to a host that has the bytes.
         required_image_digest: None,
         exclude_host: None,
+        // ADR 0045 D4 / ADR 0039: soft preference for the host whose
+        // chunk cache + per-image base shm are warm — the capturing
+        // host first, else wherever the session last ran.
+        prefer_host: record.host_id.or(session.host_id),
     };
     // ADR 0016 Phase B commit 6: pick the newer of
     // `session.live_disk_manifest` and `record.disk_manifest`.
@@ -1035,11 +1066,15 @@ async fn resume_from_fc_snapshot(
     // Build the SnapshotMetadata the trait now takes. The record
     // carries every field we need; we just round-trip it back into
     // the engine type the backend expects.
+    // ADR 0045 D4: hand the host the image's base manifest so resumed
+    // sessions share the per-image base shm with fresh creates.
+    let base_memory_manifest = base_memory_manifest_for_image(&state, &session.image).await;
     let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
         id: record.id,
         size_bytes: record.size_bytes,
         created_at: record.created_at,
         image_version: record.image_version.clone(),
+        base_memory_manifest,
         disk_manifest: effective_disk_manifest,
         memory_manifest: record.memory_manifest,
         // ADR 0028 cross-host recovery: a memory-bearing FC snapshot

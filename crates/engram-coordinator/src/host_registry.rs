@@ -109,6 +109,15 @@ pub struct ScheduleContext<'a> {
     /// drain, where the source is still registered but should not be
     /// reselected.
     pub exclude_host: Option<HostId>,
+    /// ADR 0039 / ADR 0045 D4: SOFT host preference — the host the
+    /// session last ran on, where the chunk cache and the per-image
+    /// base shm are warm (warm resume ≈ CONTINUE-speed vs the cold
+    /// cross-host tail). Strictly soft: falls through to capacity-fit
+    /// on any miss, and never overrides `exclude_host` or the
+    /// readiness/digest filters. Ranked below snapshot-affinity (a
+    /// host actually holding the snapshot beats one that merely ran
+    /// the session before).
+    pub prefer_host: Option<HostId>,
 }
 
 /// Why `pick_for_session` couldn't place a session. Distinguishes
@@ -568,6 +577,18 @@ impl HostRegistry {
                 }
                 if st.local_snapshots.iter().any(|s| s.snapshot_id == target) {
                     return Ok((*entry.key(), entry.value().backend.clone()));
+                }
+            }
+        }
+
+        // Host-affinity (soft): the session's previous host, if ready
+        // and it fits. Warm chunk cache + warm base shm (ADR 0045 D4).
+        if let Some(want) = ctx.prefer_host {
+            if let Some(entry) = self.hosts.get(&want) {
+                let st = entry.value().state.read();
+                let free = st.capacity.total_mib.saturating_sub(st.capacity.used_mib);
+                if host_is_ready(want, &st) && free >= ctx.memory_mib.unwrap_or(0) as u64 {
+                    return Ok((want, entry.value().backend.clone()));
                 }
             }
         }
@@ -1382,12 +1403,95 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(
             picked, h_with_snap,
             "snapshot affinity must override raw capacity"
         );
+    }
+
+    /// ADR 0045 D4 / ADR 0039: the soft host-affinity tier.
+    #[test]
+    fn prefer_host_wins_over_larger_capacity_but_loses_to_snapshot_affinity() {
+        let reg = stub_registry();
+        let (b1, _d1) = dummy_backend();
+        let (b2, _d2) = dummy_backend();
+        let h_prev = HostId::new(); // the session's previous host (small)
+        let h_big = HostId::new();
+        reg.register(h_prev, b1);
+        reg.register(h_big, b2);
+        let small = HostState {
+            capacity: HostCapacityReport {
+                total_mib: 4096,
+                used_mib: 2048,
+                running_sandboxes: 1,
+            },
+            local_snapshots: Vec::new(),
+            draining: false,
+            ready_images: Default::default(),
+            current_bundles: Vec::new(),
+            utilization: Default::default(),
+        };
+        let mut big = small.clone();
+        big.capacity = HostCapacityReport {
+            total_mib: 16_384,
+            used_mib: 0,
+            running_sandboxes: 0,
+        };
+        reg.update_state(h_prev, small.clone());
+        reg.update_state(h_big, big.clone());
+
+        // Soft preference beats raw capacity (warm cache + base shm).
+        let mut ctx = ScheduleContext {
+            repo: "r",
+            image_version: "v",
+            prefer_snapshot_id: None,
+            memory_mib: Some(1024),
+            required_image_digest: None,
+            exclude_host: None,
+            prefer_host: Some(h_prev),
+        };
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_prev, "prefer_host beats larger free capacity");
+
+        // ...but loses to snapshot affinity (a host actually holding the
+        // snapshot beats one that merely ran the session before).
+        let snap = SnapshotId::new();
+        let mut big_with_snap = big.clone();
+        big_with_snap.local_snapshots = vec![engram_protocol::heartbeat::LocalSnapshotReport {
+            snapshot_id: snap,
+            session_id: SessionId::new(),
+            size_bytes: 1,
+            replicated: false,
+            last_accessed_at: chrono::Utc::now(),
+        }];
+        reg.update_state(h_big, big_with_snap);
+        ctx.prefer_snapshot_id = Some(snap);
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_big, "snapshot affinity outranks prefer_host");
+
+        // Draining preferred host falls through to capacity.
+        ctx.prefer_snapshot_id = None;
+        let mut draining = small.clone();
+        draining.draining = true;
+        reg.update_state(h_prev, draining);
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_big, "draining prefer_host falls through");
+
+        // prefer == exclude: exclusion wins (evac must never re-pick the
+        // source even if something also prefers it).
+        reg.update_state(h_prev, small);
+        ctx.exclude_host = Some(h_prev);
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_big, "exclude_host overrides prefer_host");
+
+        // Preferred host too small for the memory hint: falls through.
+        ctx.exclude_host = None;
+        ctx.memory_mib = Some(8192);
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_big, "undersized prefer_host falls through");
     }
 
     #[test]
@@ -1438,6 +1542,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_big, "larger free capacity wins");
@@ -1492,6 +1597,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_ready);
@@ -1551,6 +1657,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: Some(source),
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(
@@ -1592,6 +1699,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: Some(lone),
+            prefer_host: None,
         };
         let res = reg.pick_for_session(&ctx);
         match res {
@@ -1732,6 +1840,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h);
@@ -1795,6 +1904,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: Some(digest),
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = match reg.pick_for_session(&ctx) {
             Ok(v) => v,
@@ -1828,6 +1938,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: Some(digest.clone()),
             exclude_host: None,
+            prefer_host: None,
         };
         match reg.pick_for_session(&ctx) {
             Err(PickError::ImageNotReady(d)) => assert_eq!(d, digest),
@@ -1852,6 +1963,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = match reg.pick_for_session(&ctx) {
             Ok(v) => v,

@@ -301,6 +301,7 @@ pub async fn evacuate_dead_source(
         // already unregistered; exclude_host is defensive.
         required_image_digest: None,
         exclude_host: session.host_id,
+        prefer_host: None,
     };
 
     // Split pick + restore so picker errors and backend errors keep
@@ -359,6 +360,21 @@ pub async fn evacuate_dead_source(
             let s = snapshot
                 .as_ref()
                 .expect("memory_manifest implies a snapshot row");
+            // ADR 0045 D4: best-effort image-base canonical ref (shared
+            // per-image base shm on the target); None falls back to
+            // canonical == session.
+            let base_memory_manifest = match meta.get_enabled_image(&session.image).await {
+                Ok(Some(img)) => match img.base_snapshot_id {
+                    Some(bid) => meta
+                        .get_snapshot(bid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|b| b.memory_manifest),
+                    None => None,
+                },
+                _ => None,
+            };
             let metadata = SnapshotMetadata {
                 id: s.id,
                 size_bytes: s.size_bytes,
@@ -366,6 +382,7 @@ pub async fn evacuate_dead_source(
                 image_version: s.image_version.clone(),
                 disk_manifest,
                 memory_manifest,
+                base_memory_manifest,
                 source_sandbox_id: None,
                 state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(s.id)),
                 sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(s.id)),
@@ -493,6 +510,7 @@ mod tests {
                 size_bytes: 1024,
                 created_at: chrono::Utc::now(),
                 image_version: "test".into(),
+                base_memory_manifest: None,
                 disk_manifest: None,
                 memory_manifest: None,
                 source_sandbox_id: None,

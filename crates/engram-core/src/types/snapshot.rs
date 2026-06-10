@@ -26,6 +26,16 @@ pub struct SnapshotMetadata {
     /// stays FC-only.
     #[serde(default)]
     pub memory_manifest: Option<super::manifest::ManifestRef>,
+    /// ADR 0045 D4: the IMAGE's base-snapshot memory manifest — the
+    /// CANONICAL ref for substrate restores. When set, the UFFD handler
+    /// resolves pages still identical to the image base via
+    /// `UFFDIO_CONTINUE` against the SHARED per-image base shm file
+    /// (one page-cache copy per host across fresh + resumed sessions),
+    /// and only session-divergent pages install privately. `None` ⇒
+    /// canonical == `memory_manifest` (the pre-D4 behavior; also the
+    /// mixed-version fallback — old coordinators simply don't send it).
+    #[serde(default)]
+    pub base_memory_manifest: Option<super::manifest::ManifestRef>,
     /// ADR 0014: source sandbox_id at snapshot time. Required for
     /// receivers to re-create canonical rootfs/harness symlinks at
     /// `<work_dir>/{rootfs,harness}/<source_sandbox_id>.{dev,ext4}`
