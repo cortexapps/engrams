@@ -289,6 +289,64 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
         "all three markers survive the sparse-built checkpoint restore",
     );
     pooled.destroy(restored2).await.expect("destroy restored2");
+
+    // ---- 9. ADR 0045 seed-at-create: a FRESH restore (the
+    // base-snapshot create path, `restore_fresh`) seeds the chain from
+    // the snapshot's manifest too — guest RAM at restore is byte-
+    // identical to that manifest, and dirty tracking runs from the
+    // restore. The session's FIRST capture must therefore be a DIFF
+    // (same manifest_id, version+1), not a Full dump+re-chunk of all
+    // guest RAM. Pre-fix, every fresh session's first eviction paid the
+    // Full-dump cost (prod canary 0daf1bcd: 130 s of upload).
+    let fresh = pooled
+        .restore_fresh(ckpt3.clone())
+        .await
+        .expect("fresh restore from checkpoint");
+    let sum4 = plant_marker(&pooled, fresh, 4).await;
+    let t = Instant::now();
+    let ckpt4 = pooled
+        .checkpoint_sandbox(fresh)
+        .await
+        .expect("checkpoint 4 (seed-at-create first capture)");
+    eprintln!(
+        "CHAIN: checkpoint 4 (seed-at-create diff) {} ms, manifest {:?}",
+        t.elapsed().as_millis(),
+        ckpt4.memory_manifest,
+    );
+    let m4 = ckpt4
+        .memory_manifest
+        .expect("seed-at-create diff must publish a memory manifest");
+    assert_eq!(
+        m4.manifest_id, m1.manifest_id,
+        "seed-at-create keeps the source manifest id — the fresh session's          first capture DIFFED instead of Full-seeding a new chain",
+    );
+    assert_eq!(
+        m4.version,
+        m3.version + 1,
+        "seed-at-create diff ticks the version"
+    );
+
+    // Byte-fidelity: restore the seed-at-create-built checkpoint and
+    // verify the fresh session's marker (and the inherited ones)
+    // survive — the diff against the create-time manifest is correct.
+    pooled.destroy(fresh).await.expect("destroy fresh");
+    let restored3 = pooled
+        .restore(ckpt4)
+        .await
+        .expect("restore from seed-at-create checkpoint");
+    let out = exec(
+        &pooled,
+        restored3,
+        "sha256sum /dev/shm/marker1 /dev/shm/marker2 /dev/shm/marker3 /dev/shm/marker4 | cut -d' ' -f1",
+    )
+    .await;
+    let sums: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(
+        sums,
+        vec![sum1.as_str(), sum2.as_str(), sum3.as_str(), sum4.as_str()],
+        "all four markers survive the seed-at-create-built checkpoint restore",
+    );
+    pooled.destroy(restored3).await.expect("destroy restored3");
 }
 
 async fn plant_marker(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, n: u32) -> String {

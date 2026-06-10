@@ -2634,8 +2634,8 @@ impl SandboxBackend for PooledBackend {
         // `metadata` is moved, then seed the chain sparse after the VM
         // is up — so the first post-resume periodic checkpoint is a
         // cheap diff, not a Full re-read of guest RAM (the UFFD fault
-        // storm). Idle-resume only; `restore_fresh` (base-create) keeps
-        // its Full seed.
+        // storm). Fresh creates seed the same way now (ADR 0045
+        // seed-at-create) — see `restore_fresh` / `restore_base_for_session`.
         let memory_ref = metadata.memory_manifest;
         let id = self.restore_with(metadata, /*fresh=*/ false).await?;
         if let Some(memory_ref) = memory_ref {
@@ -2645,7 +2645,18 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.restore_with(metadata, /*fresh=*/ true).await
+        // ADR 0045 seed-at-create: guest RAM right after a fresh restore
+        // is byte-identical to the base snapshot's memory manifest, and
+        // FC dirty-page tracking runs from the restore — exactly the
+        // resume-seeding argument. Seeding here makes the session's
+        // FIRST capture a diff (pages it actually dirtied) instead of a
+        // Full dump+re-chunk of all guest RAM.
+        let memory_ref = metadata.memory_manifest;
+        let id = self.restore_with(metadata, /*fresh=*/ true).await?;
+        if let Some(memory_ref) = memory_ref {
+            self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+        }
+        Ok(id)
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -2780,7 +2791,16 @@ impl SandboxBackend for PooledBackend {
         //    harness baked into the rootfs at /opt/engram/harness/.
         //    Fresh flavor (ADR 0035 §3): aux bundles swap to the host's
         //    current generation so new sessions run the latest skills.
+        let memory_ref = metadata.memory_manifest;
         let id = self.restore_with(metadata, /*fresh=*/ true).await?;
+        // ADR 0045 seed-at-create: the session's RAM == the base
+        // manifest at this instant (see `restore_fresh`); seed the
+        // chain so the first eviction diffs instead of Full-dumping.
+        // The env merge below dirties pages AFTER tracking started, so
+        // the diff stays correct.
+        if let Some(memory_ref) = memory_ref {
+            self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+        }
 
         // Inject the per-session env (manifest env + secrets + session
         // id). The base snapshot is shared, so per-session values can't
