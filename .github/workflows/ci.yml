@@ -66,8 +66,12 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter: STACKED PRs (base = another feature branch)
+  # must run the same checks — with the old `branches: [main]` filter
+  # they triggered no run at all, leaving the ruleset's required
+  # contexts "waiting for status to be reported" until a base retarget
+  # (whose late-fired run then built a racy stale merge ref).
   pull_request:
-    branches: [main]
   # GitHub Merge Queue fires `merge_group` events for the temporary
   # ref it builds out of (current main + queued PRs combined). Branch
   # protection blocks the queue from completing until every required
