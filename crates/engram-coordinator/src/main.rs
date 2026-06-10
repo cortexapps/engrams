@@ -599,13 +599,6 @@ async fn main() -> Result<(), CoordinatorError> {
                 // (ENGRAM_FC_RESTORE_MODE unset ⇒ uffd), so the Helm chart
                 // no longer needs to set it; `file` is the explicit opt-out.
                 fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
-                // ADR 0022 Option A / ADR 0039: *base session.create*
-                // restores against the per-template resident memfile via
-                // the File backend (density + fast local boot). Now the
-                // DEFAULT (ENGRAM_FC_BASE_RESTORE_MODE unset ⇒ file);
-                // `uffd` is the kill-switch. idle-resume stays on
-                // `restore_mode`.
-                fc_cfg.base_restore_mode = engram_sandbox_firecracker::base_restore_mode_from_env();
                 // Point the UFFD handler at the SAME chunk cache the
                 // PooledBackend restore-prefetch warms (`local_path/
                 // chunk-cache`, wired below) so on-fault `cache.get`

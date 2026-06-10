@@ -598,24 +598,26 @@ impl HostAgent {
                 self.chunk_cache.clone(),
             ) {
                 (Some(chunk_store), Some(chunk_cache)) => {
-                    // ADR 0022 Option A: when base-create is on the File
-                    // backend (ENGRAM_FC_BASE_RESTORE_MODE=file), have the
-                    // supervisor materialize each enabled image's contiguous
-                    // per-template base memfile at residency — at the SAME
-                    // path a base session.create restore reads
-                    // (`pooled.snapshot_path_for(base_snapshot_id)`), so they
-                    // agree by construction. One coherent switch: the env
-                    // that flips base-create to File also turns this on.
-                    let base_memfile_dir: Option<image_prefetch::SnapshotDirResolver> = matches!(
-                        engram_sandbox_firecracker::base_restore_mode_from_env(),
-                        Some(engram_sandbox_firecracker::RestoreMode::File)
-                    )
-                    .then(|| {
-                        let p = pooled.clone();
-                        let resolver: image_prefetch::SnapshotDirResolver =
-                            std::sync::Arc::new(move |id| p.snapshot_path_for(id));
-                        resolver
-                    });
+                    // ADR 0022 Option A / ADR 0045 D3: when base-create is
+                    // on the File backend (no substrate dir configured),
+                    // the supervisor materializes each enabled image's
+                    // contiguous per-template base memfile at residency —
+                    // at the SAME path a base session.create restore reads
+                    // (`pooled.snapshot_path_for(base_snapshot_id)`), so
+                    // they agree by construction. With the substrate
+                    // (ENGRAM_FC_UFFD_BASE_DIR set) fresh-creates go Uffd
+                    // against the lazily-populated base shm instead, and
+                    // the eager multi-second per-template materialization
+                    // is retired along with the memfile it built.
+                    let base_memfile_dir: Option<image_prefetch::SnapshotDirResolver> =
+                        engram_sandbox_firecracker::uffd_base_dir_from_env()
+                            .is_none()
+                            .then(|| {
+                                let p = pooled.clone();
+                                let resolver: image_prefetch::SnapshotDirResolver =
+                                    std::sync::Arc::new(move |id| p.snapshot_path_for(id));
+                                resolver
+                            });
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
                         chunk_store,
                         chunk_cache,

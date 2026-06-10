@@ -59,6 +59,19 @@ firecracker:
   # host-agent reads them from there (ENGRAM_FIRECRACKER_BIN + the configmap
   # ENGRAM_KERNEL_IMAGE_PATH). No node hostPath for them anymore.
   restoreMode: ""     # "" (binary default) | file | uffd
+  # ADR 0045 D3 (the unified memory substrate, v2b): a tmpfs directory for
+  # per-template base shm files. When set: node-prep mounts a tmpfs there,
+  # Uffd restores back guest memory MAP_PRIVATE on the shared base
+  # (canonical pages CONTINUE-shared across same-template VMs), and
+  # fresh-creates flip from File mode to the substrate (parity-gated:
+  # density 35%==35%, restore median 61ms vs 56ms). "" = off (File-mode
+  # fresh-creates + anonymous-Uffd resumes, today's behavior). Requires
+  # the v2 forked firecracker (engrams#164+). Under workDirHostPath so it
+  # survives pod restarts (K2 reattach).
+  uffdBaseDir: ""     # e.g. /var/lib/engram/shm
+  # tmpfs size cap for uffdBaseDir (one base per enabled template; each
+  # file is guest-RAM-sized but populated lazily + hole-punchable).
+  uffdBaseTmpfsSize: 32g
   # ADR 0044 K2 (VM-detach): a node-level cgroup-v2 dir the host-agent
   # moves each VM's FC + uffd-handler into, so they survive THIS pod's
   # cgroup teardown on a restart (hostPID keeps the PID namespace, but
