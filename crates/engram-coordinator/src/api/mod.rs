@@ -196,6 +196,10 @@ pub fn router(state: SharedState) -> Router {
             post(host_http::resolve_registry_auth),
         )
         .route(
+            "/hosts/:id/sessions/:session_id/sandboxes/:sandbox_id/ownership",
+            get(host_http::sandbox_ownership),
+        )
+        .route(
             "/hosts/:id/idle-eviction-candidates",
             post(host_http::idle_eviction_candidates),
         )

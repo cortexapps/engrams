@@ -1007,6 +1007,21 @@ impl PooledBackend {
         Ok(())
     }
 
+    /// ADR 0045 C1: expired migration exports for the TTL sweep —
+    /// `(sandbox, bound session, export_id)` per export past
+    /// [`crate::migration::EXPORT_TTL`].
+    pub fn expired_migration_exports(&self) -> Vec<(SandboxId, Option<SessionId>, String)> {
+        self.migrations
+            .expired()
+            .into_iter()
+            .filter_map(|sandbox_id| {
+                let export_id = self.migrations.export_id_of(sandbox_id)?;
+                let session = self.session_bindings.get(&sandbox_id).map(|e| *e);
+                Some((sandbox_id, session, export_id))
+            })
+            .collect()
+    }
+
     pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
