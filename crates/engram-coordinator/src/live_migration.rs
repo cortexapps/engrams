@@ -355,9 +355,18 @@ pub async fn migrate_session_live(
     Ok(())
 }
 
-/// The source host-agent's advertised gRPC address from its PG row.
+/// The source host-agent's gRPC address. The heartbeat-warmed pool is
+/// authoritative — `hosts.host_addr` in PG is written only at REGISTER,
+/// and a host-agent pod that reattaches after a roll doesn't
+/// re-register, leaving the PG row pointing at the PREVIOUS pod
+/// generation (the prod canary's dest dialed a dead pod-network IP
+/// exactly this way). PG is the fallback for a host the pool hasn't
+/// warmed since the coordinator's own restart.
 async fn source_host_addr(state: &SharedState, host_id: Option<HostId>) -> Option<String> {
     let host_id = host_id?;
+    if let Some(addr) = state.services.host_pool.current_addr(host_id) {
+        return Some(addr);
+    }
     let hosts = state.services.meta.list_active_hosts().await.ok()?;
     hosts.into_iter().find(|h| h.id == host_id)?.host_addr
 }
