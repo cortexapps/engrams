@@ -92,6 +92,33 @@ fn run_probe(src_name: &str) -> String {
 /// cross-process CONTINUE on a MAP_PRIVATE-of-shm-file mapping; native COW
 /// for write privacy; UFFDIO_COPY installing session-divergent pages
 /// privately; sibling page-cache sharing (the density mechanism).
+/// ADR 0045 Phase C2 gate-opener: the pagemap-anon dirty map + the
+/// host-agent-as-page-server read path. Proves, from the parent's seat
+/// (= the host-agent's, FC's parent, so YAMA permits readv):
+/// COPY-installed and COW pages classify as anon, clean CONTINUE pages
+/// as file-backed, untouched as absent; process_vm_readv returns
+/// correct bytes for all classes, including faulting an untouched page
+/// through the OWNER's handler. A FAIL here means C2 falls back to a
+/// KVM-dirty-bitmap fork surface.
+#[test]
+#[ignore = "Linux probe; runs in CI's test-firecracker job"]
+fn substrate_pagemap_dirty_map() {
+    let out = run_probe("pagemap_probe.c");
+    for marker in [
+        "PASS T1a", // COPY-installed => present+anon
+        "PASS T1b", // COW-written => present+anon
+        "PASS T1c", // clean CONTINUE => present+file
+        "PASS T1d", // untouched => not present
+        "PASS T2a", // readv: COPY bytes
+        "PASS T2b", // readv: COW bytes
+        "PASS T2c", // readv: base bytes
+        "PASS T3a", // readv faults through the owner's handler
+        "PASS T3b", // post-readv reclassifies to file
+    ] {
+        assert!(out.contains(marker), "missing {marker} in:\n{out}");
+    }
+}
+
 #[test]
 #[ignore = "needs Linux uffd (MINOR on shmem, kernel >= 5.13); run via test-firecracker CI job or dev-vm"]
 fn substrate_cross_process_map_private() {
