@@ -199,6 +199,45 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     .to_string();
     assert_eq!(sentinel.len(), 64);
 
+    // ---- A LIVE harness, mid-run (ADR 0045 C1: the reattach arm) ----
+    // The marquee teleport use-case is a session whose harness is
+    // ACTIVELY RUNNING. agentd must REATTACH to the moved harness on
+    // the post-move handshake — the old kill-and-respawn destroyed the
+    // very process the move preserved. A shell-loop harness writing a
+    // monotonic heartbeat stands in for claude.
+    host_a
+        .pooled
+        .start_agent(
+            vm,
+            engram_core::types::sandbox::AgentSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
+                     echo $i > /dev/shm/harness-heartbeat; sleep 0.2; done"
+                        .into(),
+                ],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: None,
+            },
+        )
+        .await
+        .expect("start the mid-run harness on A");
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let harness_pid_a = exec(&host_a.pooled, vm, "cat /dev/shm/harness-pid")
+        .await
+        .trim()
+        .to_string();
+    assert!(!harness_pid_a.is_empty(), "harness running on A");
+    let alive = exec(
+        &host_a.pooled,
+        vm,
+        &format!("test -d /proc/{harness_pid_a} && echo alive"),
+    )
+    .await;
+    assert_eq!(alive.trim(), "alive", "harness alive on A");
+
     // ---- The move, over the wire (the G1 downtime legs) ----
     let t_capture = std::time::Instant::now();
     let cap = client_a.migration_capture(vm).await.expect("capture on A");
@@ -241,6 +280,65 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         check.trim(),
         sentinel,
         "G2: post-checkpoint state survives the move (snapshot-rehome loses this)"
+    );
+
+    // ---- The reattach arm: the post-move handshake must NOT kill
+    // the mid-run harness. Same in-guest pid (pid namespaces move with
+    // the VM), exactly one instance, heartbeat still advancing.
+    host_b
+        .pooled
+        .start_agent(
+            moved,
+            engram_core::types::sandbox::AgentSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
+                     echo $i > /dev/shm/harness-heartbeat; sleep 0.2; done"
+                        .into(),
+                ],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: None,
+            },
+        )
+        .await
+        .expect("post-move handshake on B");
+    let harness_pid_b = exec(&host_b.pooled, moved, "cat /dev/shm/harness-pid")
+        .await
+        .trim()
+        .to_string();
+    let alive_b = exec(
+        &host_b.pooled,
+        moved,
+        &format!("test -d /proc/{harness_pid_b} && echo alive"),
+    )
+    .await;
+    assert_eq!(alive_b.trim(), "alive", "the moved harness is alive on B");
+    assert_eq!(
+        harness_pid_a, harness_pid_b,
+        "the moved harness must be REATTACHED (same in-guest pid), not respawned"
+    );
+    let n_instances = exec(
+        &host_b.pooled,
+        moved,
+        // `[-]` so the probe's own cmdline doesn't match itself.
+        "grep -l 'harness[-]heartbeat' /proc/*/cmdline 2>/dev/null | wc -l",
+    )
+    .await
+    .trim()
+    .to_string();
+    assert_eq!(
+        n_instances, "1",
+        "exactly one harness instance after the handshake"
+    );
+    let hb1 = exec(&host_b.pooled, moved, "cat /dev/shm/harness-heartbeat").await;
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let hb2 = exec(&host_b.pooled, moved, "cat /dev/shm/harness-heartbeat").await;
+    assert_ne!(
+        hb1.trim(),
+        hb2.trim(),
+        "the mid-run harness keeps RUNNING on the destination (heartbeat advances)"
     );
 
     // Durability catch-up on B, then B checkpoints the moved VM (the
