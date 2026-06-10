@@ -694,6 +694,38 @@ impl ChunkCache {
         fs::try_exists(self.path_for(hash)).await.unwrap_or(false)
     }
 
+    /// Like [`Self::put`] but WITHOUT the per-write eviction sweep —
+    /// for bulk staging paths (migration prestage / local-sink
+    /// re-chunk) that write dozens of chunks back-to-back: the sweep
+    /// is a full two-level readdir of the cache root + statvfs, and
+    /// paying it per chunk turned a ~94 MiB prod migration transfer
+    /// into a 70 s leg. Callers MUST call [`Self::sweep`] once after
+    /// the batch (the budget/floor invariant is per-batch, not
+    /// per-write).
+    pub async fn put_no_evict(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
+        let actual = ChunkHash::of(bytes);
+        if actual != hash {
+            return Err(ChunkStoreError::HashMismatch {
+                expected: hash.to_hex(),
+                actual: actual.to_hex(),
+            });
+        }
+        let target = self.path_for(hash);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let tmp = target.with_extension("partial");
+        fs::write(&tmp, bytes).await?;
+        fs::rename(&tmp, &target).await?;
+        Ok(())
+    }
+
+    /// One eviction sweep — the batch-closing pair of
+    /// [`Self::put_no_evict`].
+    pub async fn sweep(&self) -> Result<()> {
+        self.evict_to_budget().await
+    }
+
     /// Write bytes to the cache atomically. Used internally on
     /// miss; also exposed so the disk daemon can populate the
     /// cache directly from in-VM writes (the daemon already has

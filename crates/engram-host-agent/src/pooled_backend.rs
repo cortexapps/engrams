@@ -847,7 +847,11 @@ impl PooledBackend {
                     }
                     MigrationItem::Chunk(h) => {
                         let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
-                        cache.put(hash, &current).await.map_err(|e| {
+                        // No per-write sweep (the prod canary's 70s
+                        // prestage was ~63 sweeps of the full NVMe
+                        // cache); the batch-closing sweep runs after
+                        // the stream below.
+                        cache.put_no_evict(hash, &current).await.map_err(|e| {
                             SandboxError::Snapshot(format!("stage chunk {hash}: {e}"))
                         })?;
                     }
@@ -855,6 +859,10 @@ impl PooledBackend {
                 current = Vec::new();
                 current_idx = None;
             }
+        }
+
+        if let Err(e) = cache.sweep().await {
+            tracing::warn!(error = %e, "post-prestage cache sweep failed (non-fatal)");
         }
 
         // Stage the inline manifests: the session (memory) manifest as

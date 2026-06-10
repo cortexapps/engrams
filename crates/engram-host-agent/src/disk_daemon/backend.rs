@@ -880,12 +880,14 @@ impl ChunkedDiskBackend {
         let chunk_size = self.chunk_size;
         let mut new_hashes = Vec::with_capacity(pending.new_chunks.len());
         for (_idx, hash, bytes) in &pending.new_chunks {
+            // No per-write sweep — batch-closing sweep below.
             self.cache
-                .put(*hash, bytes)
+                .put_no_evict(*hash, bytes)
                 .await
                 .map_err(DiskBackendError::Chunk)?;
             new_hashes.push(*hash);
         }
+        self.cache.sweep().await.map_err(DiskBackendError::Chunk)?;
         let state = self.state.lock().await;
         let mut chunks: Vec<ChunkRef> = state
             .base
