@@ -641,6 +641,7 @@ jobs:
             -p engram-host-agent \
             --test checkpoint_chain \
             --test migration_source \
+            --test two_host_live_teleport \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
