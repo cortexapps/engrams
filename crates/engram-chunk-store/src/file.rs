@@ -200,6 +200,30 @@ impl ChunkStore {
         diff_path: &Path,
         dirty_ranges: &[(u64, u64)],
     ) -> Result<Manifest> {
+        let (manifest, _new) = self
+            .update_for_dirty_ranges_sparse_with_sink(prev, diff_path, dirty_ranges, None)
+            .await?;
+        Ok(manifest)
+    }
+
+    /// ADR 0045 Phase C1: sink-parameterized flavor. `local_sink = Some(cache)`
+    /// writes each rebuilt dirty chunk into the host-local NVMe
+    /// [`ChunkCache`] instead of the blob store — keeping GCS PUTs off
+    /// the migration pause path entirely (the durability catch-up
+    /// uploads them later from the returned new-hash set). `None` is
+    /// the durable flavor (`put_chunk` to the store), identical to
+    /// [`Self::update_for_dirty_ranges_sparse`].
+    ///
+    /// Returns the next manifest plus the hashes of chunks REBUILT by
+    /// this call (the migration transfer/advertise set — carried-over
+    /// chunks are durable already and excluded).
+    pub async fn update_for_dirty_ranges_sparse_with_sink(
+        &self,
+        prev: &Manifest,
+        diff_path: &Path,
+        dirty_ranges: &[(u64, u64)],
+        local_sink: Option<&crate::cache::ChunkCache>,
+    ) -> Result<(Manifest, Vec<crate::manifest::ChunkHash>)> {
         use std::collections::BTreeMap;
         use std::collections::BTreeSet;
 
@@ -256,6 +280,7 @@ impl ChunkStore {
             .map(|(offset, want, prev_hash)| {
                 let store = self.clone();
                 let diff_path = diff_path.to_path_buf();
+                let local_sink = local_sink.cloned();
                 async move {
                     let mut slice = vec![0u8; want];
 
@@ -296,7 +321,17 @@ impl ChunkStore {
                     if is_all_zero(&slice) {
                         return Ok::<_, crate::error::ChunkStoreError>((offset, None));
                     }
-                    let hash = store.put_chunk(&slice).await?;
+                    let hash = match &local_sink {
+                        // Migration flavor: hash + land in the local
+                        // cache only; no GCS round-trip on the pause
+                        // path. `ChunkCache::put` re-verifies the hash.
+                        Some(cache) => {
+                            let hash = crate::manifest::ChunkHash::of(&slice);
+                            cache.put(hash, &slice).await?;
+                            hash
+                        }
+                        None => store.put_chunk(&slice).await?,
+                    };
                     Ok((offset, Some(ChunkRef { offset, hash })))
                 }
             })
@@ -307,28 +342,38 @@ impl ChunkStore {
         // Fold the (order-independent) results into the carried-over
         // map: a `Some` replaces/inserts the chunk, a `None` (chunk
         // dirtied to all-zero) elides it — preserving the sparse
-        // invariant.
+        // invariant. Rebuilt hashes are collected for the migration
+        // transfer set (deterministic order: by offset, post-fold).
+        let mut rebuilt: BTreeSet<u64> = BTreeSet::new();
         for (offset, entry) in results {
             match entry {
                 Some(c) => {
                     by_offset.insert(offset, c);
+                    rebuilt.insert(offset);
                 }
                 None => {
                     by_offset.remove(&offset);
                 }
             }
         }
+        let new_hashes = rebuilt
+            .iter()
+            .filter_map(|off| by_offset.get(off).map(|c| c.hash))
+            .collect();
 
-        Ok(Manifest {
-            schema_version: prev.schema_version,
-            kind: prev.kind,
-            chunk_size: prev.chunk_size,
-            total_bytes,
-            chunks: by_offset.into_values().collect(),
-            parent: prev.parent,
-            working_set_trace: prev.working_set_trace,
-            annotations: prev.annotations.clone(),
-        })
+        Ok((
+            Manifest {
+                schema_version: prev.schema_version,
+                kind: prev.kind,
+                chunk_size: prev.chunk_size,
+                total_bytes,
+                chunks: by_offset.into_values().collect(),
+                parent: prev.parent,
+                working_set_trace: prev.working_set_trace,
+                annotations: prev.annotations.clone(),
+            },
+            new_hashes,
+        ))
     }
 
     /// Reconstruct a file from a manifest. Creates `dest` (or
@@ -796,6 +841,82 @@ mod tests {
         let out = work.path().join("out.bin");
         s.materialize_to_file(&got, &out).await.unwrap();
         assert_eq!(fs::read(&out).await.unwrap(), cur);
+    }
+
+    /// ADR 0045 C1: the local-cache sink produces a manifest identical
+    /// to the durable flavor, returns exactly the rebuilt hashes, lands
+    /// the bytes in the LOCAL cache, and never PUTs them to the store.
+    #[tokio::test]
+    async fn local_sink_rechunk_matches_gcs_sink_manifest_and_returns_new_hashes() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+
+        let mut prev_img = Vec::new();
+        for b in [0xAAu8, 0xBB, 0xCC, 0xDD] {
+            prev_img.extend(std::iter::repeat_n(b, cs as usize));
+        }
+        let p = work.path().join("prev.bin");
+        fs::write(&p, &prev_img).await.unwrap();
+        let prev = s
+            .chunk_file(&p, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        let diff = work.path().join("mem.diff");
+        write_sparse_diff(&diff, prev.total_bytes, &[(cs, vec![0x11u8; cs as usize])]).await;
+        let ranges = [(cs, cs)];
+
+        // Local-sink flavor FIRST — the durable run below would
+        // content-address the same hash into the store and mask the
+        // no-GCS-PUT assertion.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::ChunkCache::new(crate::cache::ChunkCacheConfig::new(
+            cache_dir.path().to_path_buf(),
+        ));
+        let (local, new_hashes) = s
+            .update_for_dirty_ranges_sparse_with_sink(&prev, &diff, &ranges, Some(&cache))
+            .await
+            .unwrap();
+        let rebuilt_early = new_hashes[0];
+        assert!(
+            s.get_chunk(rebuilt_early).await.is_err(),
+            "local sink must keep GCS PUTs off the pause path"
+        );
+
+        // Durable flavor = ground truth.
+        let durable = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &ranges)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            keys(&local),
+            keys(&durable),
+            "sink choice must not change the manifest"
+        );
+        let rebuilt = local
+            .chunks
+            .iter()
+            .find(|c| c.offset == cs)
+            .expect("dirty chunk present")
+            .hash;
+        assert_eq!(
+            new_hashes,
+            vec![rebuilt],
+            "exactly the rebuilt hash advertised"
+        );
+
+        // Bytes live in the LOCAL cache (no store fetch needed)...
+        let cached = cache
+            .get(rebuilt, || async {
+                Err(crate::error::ChunkStoreError::Internal(
+                    "must not fall through to the store".into(),
+                ))
+            })
+            .await
+            .expect("rebuilt chunk served from local cache");
+        assert_eq!(cached.as_ref(), &vec![0x11u8; cs as usize][..]);
     }
 
     /// A dirty chunk whose prev offset is ELIDED (all-zero in prev) must
