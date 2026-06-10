@@ -376,6 +376,7 @@ pub async fn evacuate_dead_source(
                 _ => None,
             };
             let metadata = SnapshotMetadata {
+                migration_source: None,
                 id: s.id,
                 size_bytes: s.size_bytes,
                 created_at: s.created_at,
@@ -511,6 +512,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 image_version: "test".into(),
                 base_memory_manifest: None,
+                migration_source: None,
                 disk_manifest: None,
                 memory_manifest: None,
                 source_sandbox_id: None,

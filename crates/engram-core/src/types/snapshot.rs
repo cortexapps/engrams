@@ -36,6 +36,13 @@ pub struct SnapshotMetadata {
     /// mixed-version fallback — old coordinators simply don't send it).
     #[serde(default)]
     pub base_memory_manifest: Option<super::manifest::ManifestRef>,
+    /// ADR 0045 C1: present when this restore is the DESTINATION leg of
+    /// a live teleport — everything the dest needs to pull the frozen
+    /// source's export and restore from not-yet-durable manifests.
+    /// serde-default ⇒ mixed-roll-safe; old hosts ignore it and the
+    /// coordinator falls back to snapshot-rehome on `InvalidSpec`.
+    #[serde(default)]
+    pub migration_source: Option<MigrationSourceInfo>,
     /// ADR 0014: source sandbox_id at snapshot time. Required for
     /// receivers to re-create canonical rootfs/harness symlinks at
     /// `<work_dir>/{rootfs,harness}/<source_sandbox_id>.{dev,ext4}`
@@ -163,6 +170,22 @@ pub struct SnapshotRecord {
     /// tombstoning".
     #[serde(default)]
     pub events_cursor: Option<i64>,
+}
+
+/// ADR 0045 C1: the destination-side rider on a migration restore's
+/// metadata. The coordinator assembles it from `MigrationCaptureOut` +
+/// the source's `host_addr`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MigrationSourceInfo {
+    pub export_id: String,
+    /// h2c URL of the source host-agent, e.g. `http://10.10.0.42:9101`.
+    pub source_addr: String,
+    pub memory_manifest_json: Vec<u8>,
+    pub disk_manifest_json: Vec<u8>,
+    pub memory_manifest_ref: super::manifest::ManifestRef,
+    pub disk_manifest_ref: super::manifest::ManifestRef,
+    pub new_memory_chunk_hashes: Vec<[u8; 32]>,
+    pub new_disk_chunk_hashes: Vec<[u8; 32]>,
 }
 
 /// ADR 0045 C1: what `migration_capture` hands the coordinator — the

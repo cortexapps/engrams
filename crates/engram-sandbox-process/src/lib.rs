@@ -396,6 +396,7 @@ impl SandboxBackend for ProcessBackend {
             // guest RAM to capture.
             memory_manifest: None,
             base_memory_manifest: None,
+            migration_source: None,
             // ADR 0014: ProcessBackend is dev/test only; no portable
             // BlobStorage upload.
             source_sandbox_id: None,
@@ -1085,6 +1086,7 @@ mod tests {
         fs::write(snap_dir.join("manifest.json"), b"not json").unwrap();
         fs::write(snap_dir.join("fs.tar.gz"), b"").unwrap();
         let meta = SnapshotMetadata {
+            migration_source: None,
             id: snap_id,
             size_bytes: 0,
             created_at: chrono::Utc::now(),

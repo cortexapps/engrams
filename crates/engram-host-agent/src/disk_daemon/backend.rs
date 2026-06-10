@@ -453,7 +453,21 @@ impl ChunkedDiskBackend {
         threshold_bytes: u64,
     ) -> Result<Self, DiskBackendError> {
         let manifest = store.get_manifest(manifest_ref).await?;
-        let base = PositionalDiskManifest::from_manifest(&manifest)?;
+        Self::from_manifest(manifest_ref, &manifest, cache, store, threshold_bytes)
+    }
+
+    /// ADR 0045 C1: construct from manifest CONTENT the caller already
+    /// holds — a migration destination attaches a not-yet-durable disk
+    /// manifest delivered inline (its chunks pre-pulled into the local
+    /// cache); the store is only the fallthrough for base chunks.
+    pub fn from_manifest(
+        manifest_ref: ManifestRef,
+        manifest: &engram_chunk_store::Manifest,
+        cache: ChunkCache,
+        store: Arc<ChunkStore>,
+        threshold_bytes: u64,
+    ) -> Result<Self, DiskBackendError> {
+        let base = PositionalDiskManifest::from_manifest(manifest)?;
         let chunk_size = base.chunk_size;
         let total_bytes = base.total_bytes;
         Ok(Self {
@@ -789,6 +803,14 @@ impl ChunkedDiskBackend {
         }
         let pending = self.flush_local().await?;
         self.flush_upload(pending).await
+    }
+
+    /// ADR 0045 C1 (destination): point the backend at the manifest
+    /// ref the durability catch-up actually published (the provisional
+    /// ref can lose the shared-lineage version race). Future flushes
+    /// chain from here.
+    pub async fn rebase_manifest_ref(&self, manifest_ref: ManifestRef) {
+        self.state.lock().await.manifest_ref = manifest_ref;
     }
 
     /// ADR 0045 C1: see `migration_fence`.

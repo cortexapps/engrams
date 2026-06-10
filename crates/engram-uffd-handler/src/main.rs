@@ -128,6 +128,11 @@ mod linux {
         pub listen: PathBuf,
         pub canonical_manifest: ManifestRef,
         pub session_manifest: ManifestRef,
+        /// ADR 0045 C1: read the SESSION manifest from this local JSON
+        /// file instead of the blob store — a migration destination
+        /// restores from a not-yet-durable manifest whose chunks the
+        /// host-agent pre-pulled into the NVMe cache.
+        pub session_manifest_json: Option<PathBuf>,
         pub prefault_trace: Option<PrefaultTraceSpec>,
         /// If `Some(host_id)`, publish the recorded trace as
         /// `traces/<session_manifest.manifest_id>/<host_id>.json` on
@@ -165,6 +170,7 @@ mod linux {
         let mut listen: Option<PathBuf> = None;
         let mut canonical_manifest: Option<ManifestRef> = None;
         let mut session_manifest: Option<ManifestRef> = None;
+        let mut session_manifest_json: Option<PathBuf> = None;
         let mut prefault_trace: Option<PrefaultTraceSpec> = None;
         let mut publish_trace_host: Option<Uuid> = None;
         let mut trace_output: Option<PathBuf> = None;
@@ -194,6 +200,12 @@ mod linux {
                         .next()
                         .ok_or_else(|| "--session-manifest requires a value".to_string())?;
                     session_manifest = Some(parse_manifest_ref(&v)?);
+                }
+                "--session-manifest-json" => {
+                    let v = argv
+                        .next()
+                        .ok_or_else(|| "--session-manifest-json requires a value".to_string())?;
+                    session_manifest_json = Some(PathBuf::from(v));
                 }
                 "--prefault-trace" => {
                     let v = argv
@@ -269,6 +281,7 @@ mod linux {
             listen,
             canonical_manifest,
             session_manifest,
+            session_manifest_json,
             prefault_trace,
             publish_trace_host,
             trace_output,
@@ -330,9 +343,10 @@ mod linux {
             .await
             .map_err(|e| format!("create cache root {}: {e}", args.cache_root.display()))?;
 
-        let backend = ChunkedMemoryBackend::from_blob(
+        let backend = ChunkedMemoryBackend::from_blob_with_session_json(
             args.canonical_manifest,
             args.session_manifest,
+            args.session_manifest_json.as_deref(),
             blob.clone(),
             &args.cache_root,
             args.cache_budget_bytes,

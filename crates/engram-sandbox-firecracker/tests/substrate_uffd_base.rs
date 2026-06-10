@@ -173,6 +173,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         disk_manifest: metadata.disk_manifest,
         memory_manifest: Some(manifest_ref),
         base_memory_manifest: None,
+        migration_source: None,
         source_sandbox_id: metadata.source_sandbox_id,
         state_blob_key: metadata.state_blob_key.clone(),
         sidecar_blob_key: metadata.sidecar_blob_key.clone(),

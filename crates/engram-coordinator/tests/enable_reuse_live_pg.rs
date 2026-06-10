@@ -285,6 +285,7 @@ impl HostClient for FakeCaptureHost {
             disk_manifest: Some(self.disk_manifest),
             memory_manifest: None, // cold-boot shape (VZ-like)
             base_memory_manifest: None,
+            migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,

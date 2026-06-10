@@ -233,9 +233,69 @@ impl ChunkedMemoryBackend {
         cache_root: &Path,
         cache_budget_bytes: u64,
     ) -> Result<Self, ChunkedBackendError> {
+        Self::from_blob_with_session_json(
+            canonical_ref,
+            session_ref,
+            None,
+            blob,
+            cache_root,
+            cache_budget_bytes,
+        )
+        .await
+    }
+
+    /// ADR 0045 C1: like [`Self::from_blob`], but when
+    /// `session_manifest_json` is `Some(path)` the SESSION manifest is
+    /// read from that local file instead of the blob store. A migration
+    /// destination restores from a manifest that is deliberately NOT
+    /// yet durable (the catch-up upload publishes it later) — its
+    /// chunks are already resident in the host NVMe cache, so the
+    /// fill path never needs the store for them. The canonical (image
+    /// base) manifest is always durable and store-resolved.
+    pub async fn from_blob_with_session_json(
+        canonical_ref: engram_core::types::manifest::ManifestRef,
+        session_ref: engram_core::types::manifest::ManifestRef,
+        session_manifest_json: Option<&Path>,
+        blob: Arc<dyn BlobStorage>,
+        cache_root: &Path,
+        cache_budget_bytes: u64,
+    ) -> Result<Self, ChunkedBackendError> {
         let store = engram_chunk_store::ChunkStore::new(blob);
-        let canonical = store.get_manifest(canonical_ref).await?;
-        let session = store.get_manifest(session_ref).await?;
+        // ADR 0045 C1: when the canonical and session refs coincide on a
+        // migration restore (no image-base rider), the canonical IS the
+        // local file too — store-fetching it would 404 (the v+1 manifest
+        // is deliberately unpublished until the catch-up).
+        let canonical = match session_manifest_json {
+            Some(path) if canonical_ref == session_ref => {
+                let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
+                let m: engram_chunk_store::Manifest =
+                    serde_json::from_slice(&bytes).map_err(|e| {
+                        ChunkedBackendError::InvalidManifest(format!(
+                            "parse local canonical manifest {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                m.validate().map_err(ChunkedBackendError::Manifest)?;
+                m
+            }
+            _ => store.get_manifest(canonical_ref).await?,
+        };
+        let session = match session_manifest_json {
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(ChunkedBackendError::Io)?;
+                let m: engram_chunk_store::Manifest =
+                    serde_json::from_slice(&bytes).map_err(|e| {
+                        ChunkedBackendError::InvalidManifest(format!(
+                            "parse local session manifest {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                m.validate().map_err(ChunkedBackendError::Manifest)?;
+                let _ = session_ref; // named by ref for logging only
+                m
+            }
+            None => store.get_manifest(session_ref).await?,
+        };
         let mut cfg = engram_chunk_store::cache::ChunkCacheConfig::new(cache_root.to_path_buf());
         cfg.budget_bytes = cache_budget_bytes;
         let cache = ChunkCache::new(cfg);
