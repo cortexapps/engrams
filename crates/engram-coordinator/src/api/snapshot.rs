@@ -963,7 +963,7 @@ fn portable_blob_keys(
 /// CONTINUE against the shared per-image base shm). Best-effort: any miss
 /// (image disabled, no base snapshot, no memory manifest) returns `None`
 /// and the restore falls back to canonical == session (pre-D4 behavior).
-async fn base_memory_manifest_for_image(
+pub(crate) async fn base_memory_manifest_for_image(
     state: &SharedState,
     image_uri: &str,
 ) -> Option<engram_core::types::manifest::ManifestRef> {

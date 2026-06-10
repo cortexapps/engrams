@@ -140,6 +140,18 @@ async fn advance_one(
     attempts: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_id = session.id;
+    // ADR 0045 C1 (the named follow-up in the module docs): take the
+    // session lease before driving a resume — a live migration's
+    // synchronous verb (or a peer pod's pipeline) may be mid-flight on
+    // this session; without the lease two actors can double-restore.
+    // Skip-if-held: the holder owns the session; we re-scan next tick.
+    let Some(_lease) = crate::idle_evictor::SessionLeaseGuard::try_acquire(state, session_id, None)
+        .await
+        .map_err(|e| format!("evac-resumer lease acquire: {e}"))?
+    else {
+        tracing::debug!(%session_id, "evac-resumer: session lease held; skipping this tick");
+        return Ok(());
+    };
     // Retry budget exhausted → fall back to Idle so the user can
     // `/resume` manually. Idle is a legal target from Evacuating per
     // the legality table; the row's snapshot lineage is already
@@ -448,6 +460,32 @@ mod tests {
             Arc::new(AppState::new_with_registry(cfg, services, host_registry)),
             meta,
         )
+    }
+
+    /// ADR 0045 C1: a held session lease (a live migration's
+    /// synchronous verb, a peer pod's pipeline) makes the scanner SKIP
+    /// the session this tick — no transition, no restore attempt, no
+    /// double-driving.
+    #[tokio::test]
+    async fn advance_one_skips_when_session_lease_held() {
+        let session = evacuating_session(None);
+        let session_id = session.id;
+        let (state, meta) = build_state(session.clone());
+        assert!(meta
+            .try_acquire_session_lease(session_id, None, "rival-pod")
+            .await
+            .unwrap());
+
+        advance_one(&EvacResumerConfig::default(), &state, session, 0)
+            .await
+            .expect("skip is not an error");
+
+        let after = meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Evacuating,
+            "lease-held session must be left untouched for the holder",
+        );
     }
 
     /// No snapshot + no live disk manifest → NoRecoverableState →
