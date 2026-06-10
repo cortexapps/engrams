@@ -383,6 +383,20 @@ pub fn restore_mode_from_env() -> RestoreMode {
 /// The directory must live on tmpfs/shmem (e.g. `/dev/shm/engram` on
 /// the dev VM, the node-prep tmpfs in prod) — UFFD minor faults are
 /// shmem-only.
+/// ADR 0045: the per-image base shm file's path under a substrate base
+/// dir — the SINGLE naming authority shared by the handler spawn, the
+/// FC load, and the host-agent's image-prefetch pre-warm (so they can't
+/// diverge).
+pub fn uffd_base_path_in(
+    dir: &Path,
+    canonical_ref: &engram_core::types::manifest::ManifestRef,
+) -> PathBuf {
+    dir.join(format!(
+        "{}-v{}.base",
+        canonical_ref.manifest_id, canonical_ref.version
+    ))
+}
+
 pub fn uffd_base_dir_from_env() -> Option<PathBuf> {
     match std::env::var("ENGRAM_FC_UFFD_BASE_DIR") {
         Ok(s) if !s.trim().is_empty() => Some(PathBuf::from(s)),
@@ -1511,12 +1525,10 @@ impl FirecrackerBackend {
         &self,
         canonical_ref: &engram_core::types::manifest::ManifestRef,
     ) -> Option<PathBuf> {
-        self.config.uffd_base_dir.as_ref().map(|dir| {
-            dir.join(format!(
-                "{}-v{}.base",
-                canonical_ref.manifest_id, canonical_ref.version
-            ))
-        })
+        self.config
+            .uffd_base_dir
+            .as_ref()
+            .map(|dir| uffd_base_path_in(dir, canonical_ref))
     }
 
     #[tracing::instrument(name = "fc.spawn_uffd_handler", skip_all)]
