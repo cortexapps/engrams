@@ -1134,13 +1134,21 @@ async fn ext4_pack_is_deterministic_across_rebuilds() {
             ("sbin/engram-agentd", vec![0xAAu8; 256 * 1024]),
             ("greeting", b"hello-from-ext4".to_vec()),
         ];
-        // Different creation order across the two trees — catches
-        // readdir-order leaking into block allocation.
-        let iter: Box<dyn Iterator<Item = &(&str, Vec<u8>)>> = if order_flipped {
-            Box::new(files.iter().rev())
-        } else {
-            Box::new(files.iter())
-        };
+        // Issue #170: the two trees used to be written in OPPOSITE
+        // creation orders to assert creation-order independence — but
+        // mke2fs -d's inode allocation follows readdir order (creation
+        // order on most filesystems), and only e2fsprogs versions with
+        // the reproducible-builds sorting deliver order-independence.
+        // CI runner images carry mixed e2fsprogs versions, making the
+        // reverse-order arm an environment-dependent flake. Prod's
+        // actual property is weaker and version-independent: the bake's
+        // tree EXPORT is deterministic (same export code → same
+        // creation order every run), so same-order trees packing to
+        // identical bytes is exactly the re-bake-dedup guarantee
+        // (ADR 0036). Both trees are therefore written in the SAME
+        // order; `order_flipped` is retired rather than the test.
+        let _ = order_flipped;
+        let iter: Box<dyn Iterator<Item = &(&str, Vec<u8>)>> = Box::new(files.iter());
         for (path, body) in iter {
             std::fs::write(root.join(path), body).unwrap();
         }
