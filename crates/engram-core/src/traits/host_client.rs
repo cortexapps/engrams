@@ -94,6 +94,49 @@ pub trait HostClient: Send + Sync {
             "this host doesn't support `snapshot_wait`".into(),
         ))
     }
+
+    /// ADR 0045 C1: see `SandboxBackend::migration_capture`. Default
+    /// errs so old hosts route the coordinator to snapshot-rehome.
+    async fn migration_capture(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::snapshot::MigrationCaptureOut, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_capture`".into(),
+        ))
+    }
+
+    /// ADR 0045 C1: see `SandboxBackend::migration_fetch`. Called by
+    /// the DESTINATION host-agent (the one host-to-host RPC).
+    async fn migration_fetch(
+        &self,
+        _export_id: &str,
+        _items: Vec<crate::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<crate::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_fetch`".into(),
+        ))
+    }
+
+    /// ADR 0045 C1: see `SandboxBackend::migration_commit`.
+    async fn migration_commit(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_commit`".into(),
+        ))
+    }
+
+    /// ADR 0045 C1: see `SandboxBackend::migration_abort`.
+    async fn migration_abort(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_abort`".into(),
+        ))
+    }
     /// ADR 0014 issue #1/#2: commit a snapshot whose post-snapshot
     /// pipeline has fully succeeded. See `SandboxBackend::commit_snapshot`
     /// for the contract. Default impl returns Ok so HostClients backed by

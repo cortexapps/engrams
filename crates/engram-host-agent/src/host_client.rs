@@ -106,6 +106,35 @@ impl HostClient for LocalHostClient {
         self.sandbox.snapshot_wait(id).await
     }
 
+    async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        self.sandbox.migration_capture(id).await
+    }
+
+    async fn migration_fetch(
+        &self,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<engram_core::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        self.sandbox.migration_fetch(export_id, items).await
+    }
+
+    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        self.sandbox.migration_commit(id, export_id).await
+    }
+
+    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        self.sandbox.migration_abort(id, export_id).await
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         self.sandbox.commit_snapshot(id).await
     }
