@@ -524,10 +524,22 @@ pub async fn teleport_session(
                 ));
             }
             Err(crate::live_migration::MigrateError::Unsupported(reason)) => {
+                metrics::counter!(crate::metrics::MIGRATION_TOTAL,
+                    "outcome" => "unsupported_fallback")
+                .increment(1);
                 tracing::info!(%session_id, %reason,
                     "live teleport unsupported; falling back to snapshot-rehome");
             }
-            Err(e) => return Err(ApiError::Internal(format!("live teleport: {e}"))),
+            Err(e) => {
+                let outcome = match &e {
+                    crate::live_migration::MigrateError::AbortedToSource(_) => "aborted_to_source",
+                    crate::live_migration::MigrateError::Parachute(_) => "parachute",
+                    _ => "fatal",
+                };
+                metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => outcome)
+                    .increment(1);
+                return Err(ApiError::Internal(format!("live teleport: {e}")));
+            }
         }
     }
 
