@@ -230,6 +230,13 @@ pub struct ChunkedDiskBackend {
     /// `u64::MAX` to disable threshold-driven wakeups (tests, or
     /// any caller that doesn't run a scheduler against this backend).
     threshold_notify: Arc<Notify>,
+    /// ADR 0045 C1: while a migration export is open on this sandbox,
+    /// `flush()` no-ops — the capture's drained manifest is the
+    /// coherence cut the destination restores from, and a concurrent
+    /// flush would publish a newer live_disk_manifest racing the
+    /// destination's rebind (split-brain). Cleared on abort; moot on
+    /// commit (sandbox destroyed).
+    migration_fence: std::sync::atomic::AtomicBool,
     threshold_bytes: u64,
     /// ADR 0018 commit 12m: in-flight request counter for the NBD
     /// daemon's serve loop. Incremented on entering a write/read
@@ -462,6 +469,7 @@ impl ChunkedDiskBackend {
             pending_uploads: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
+            migration_fence: std::sync::atomic::AtomicBool::new(false),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
@@ -493,6 +501,7 @@ impl ChunkedDiskBackend {
             pending_uploads: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
+            migration_fence: std::sync::atomic::AtomicBool::new(false),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
@@ -766,8 +775,26 @@ impl ChunkedDiskBackend {
     /// where there's no FC resume to overlap with, so the historical
     /// drain→upload→rebase behavior is preserved.
     pub async fn flush(&self) -> Result<DiskFlushOutcome, DiskBackendError> {
+        if self
+            .migration_fence
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Migration capture in flight: report a no-op flush (the
+            // scheduler skips the publish on chunks_flushed == 0).
+            return Ok(DiskFlushOutcome {
+                manifest_ref: self.state.lock().await.manifest_ref,
+                chunks_flushed: 0,
+                bytes_uploaded: 0,
+            });
+        }
         let pending = self.flush_local().await?;
         self.flush_upload(pending).await
+    }
+
+    /// ADR 0045 C1: see `migration_fence`.
+    pub fn set_migration_fence(&self, fenced: bool) {
+        self.migration_fence
+            .store(fenced, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// ADR 0038 B3 — phase 1 (runs under the FC pause on the snapshot
@@ -813,6 +840,81 @@ impl ChunkedDiskBackend {
     /// from `pending_uploads` on success (reads fall through to the now-
     /// rebased `base`). A failed upload leaves them in `pending` — reads
     /// stay correct; they're reclaimed on `destroy`.
+    /// ADR 0045 C1: the migration flavor of `flush_upload` — land the
+    /// drained chunks in the host-local NVMe cache ONLY (no GCS PUT on
+    /// the teleport pause path) and return the post-drain manifest
+    /// WITHOUT publishing or rebasing. The manifest's chunks are
+    /// reachable through the cache for the destination's pull; the
+    /// destination's durability catch-up uploads + publishes later.
+    /// The source's own `state` is untouched: on commit the VM is
+    /// destroyed; on abort call [`Self::requeue_pending`] first.
+    ///
+    /// Returns `(manifest, new_hashes)` — `new_hashes` is the
+    /// pending-tier transfer set the destination must pull.
+    pub async fn flush_to_local_cache(
+        &self,
+        pending: &PendingDiskFlush,
+    ) -> Result<(Manifest, Vec<ChunkHash>), DiskBackendError> {
+        let chunk_size = self.chunk_size;
+        let mut new_hashes = Vec::with_capacity(pending.new_chunks.len());
+        for (_idx, hash, bytes) in &pending.new_chunks {
+            self.cache
+                .put(*hash, bytes)
+                .await
+                .map_err(DiskBackendError::Chunk)?;
+            new_hashes.push(*hash);
+        }
+        let state = self.state.lock().await;
+        let mut chunks: Vec<ChunkRef> = state
+            .base
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                h.map(|hash| ChunkRef {
+                    offset: (i as u64) * chunk_size,
+                    hash,
+                })
+            })
+            .collect();
+        for (idx, hash, _bytes) in &pending.new_chunks {
+            let offset = (*idx as u64) * chunk_size;
+            if let Some(existing) = chunks.iter_mut().find(|c| c.offset == offset) {
+                existing.hash = *hash;
+            } else {
+                chunks.push(ChunkRef {
+                    offset,
+                    hash: *hash,
+                });
+            }
+        }
+        chunks.sort_by_key(|c| c.offset);
+        Ok((
+            Manifest {
+                schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+                kind: ManifestKind::Disk,
+                chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(chunk_size),
+                total_bytes: self.total_bytes,
+                chunks,
+                parent: Some(state.manifest_ref),
+                working_set_trace: None,
+                annotations: serde_json::Value::Null,
+            },
+            new_hashes,
+        ))
+    }
+
+    /// ADR 0045 C1 abort path: put the drained-but-never-uploaded
+    /// chunks back into `dirty` so the resumed guest's next flush
+    /// retries them (a newer guest write wins — same rule as the
+    /// upload-failure re-queue). Idempotent.
+    pub async fn requeue_pending(&self, pending: PendingDiskFlush) {
+        let mut dirty = self.dirty.lock().await;
+        for (idx, _hash, bytes) in pending.new_chunks {
+            dirty.entry(idx).or_insert_with(|| bytes.to_vec());
+        }
+    }
+
     pub async fn flush_upload(
         &self,
         pending: PendingDiskFlush,
@@ -2138,6 +2240,51 @@ mod tests {
     /// every dirty chunk's bytes are uploaded + retrievable, the
     /// manifest is offset-sorted, and a post-flush read serves the
     /// flushed bytes (proving the rebase saw every parallel put).
+    /// ADR 0045 C1: a fenced backend's flush is a no-op (no drain, no
+    /// publish — the scheduler skips on chunks_flushed == 0); clearing
+    /// the fence flushes the preserved dirty set; the abort re-queue
+    /// path round-trips drained chunks back into dirty.
+    #[tokio::test]
+    async fn migration_fence_noops_flush_and_requeue_restores_dirty() {
+        let chunk_size = 4096u64;
+        let base = synth_manifest(chunk_size * 4, chunk_size, vec![]);
+        let (backend, store, _dir) = build_backend(&base).await;
+        backend
+            .write(0, &vec![0x42; chunk_size as usize])
+            .await
+            .unwrap();
+
+        backend.set_migration_fence(true);
+        let fenced = backend.flush().await.unwrap();
+        assert_eq!(fenced.chunks_flushed, 0, "fenced flush must no-op");
+        assert_eq!(fenced.manifest_ref, base_ref_of(&backend).await);
+
+        // The migration path drains explicitly while fenced...
+        let pending = backend.flush_local().await.unwrap();
+        let (m, hashes) = backend.flush_to_local_cache(&pending).await.unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(m.chunks.len(), 1, "drained chunk in the local manifest");
+        assert!(
+            store.get_chunk(hashes[0]).await.is_err(),
+            "local-cache flush must not PUT to the store"
+        );
+
+        // ...and the abort path re-queues + unfences: the next flush
+        // publishes the chunk durably.
+        backend.requeue_pending(pending).await;
+        backend.set_migration_fence(false);
+        let after = backend.flush().await.unwrap();
+        assert_eq!(
+            after.chunks_flushed, 1,
+            "re-queued chunk flushes after abort"
+        );
+        assert!(store.get_chunk(hashes[0]).await.is_ok());
+    }
+
+    async fn base_ref_of(b: &ChunkedDiskBackend) -> ManifestRef {
+        b.manifest_ref().await
+    }
+
     #[tokio::test]
     async fn flush_upload_parallel_publishes_all_dirty_chunks_sorted() {
         let chunk_size = 4096u64;

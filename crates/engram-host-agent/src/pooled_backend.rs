@@ -229,6 +229,9 @@ pub struct PooledBackend {
     /// the coordinator's finalize task is the only waiter.
     snapshot_waits:
         Arc<DashMap<SandboxId, tokio::task::JoinHandle<Result<SnapshotMetadata, SandboxError>>>>,
+    /// ADR 0045 C1: open live-migration exports (frozen sandboxes
+    /// serving a move). See `crate::migration`.
+    migrations: Arc<crate::migration::MigrationRegistry>,
 }
 
 impl PooledBackend {
@@ -506,6 +509,7 @@ impl PooledBackend {
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_locks: Arc::new(DashMap::new()),
             snapshot_waits: Arc::new(DashMap::new()),
+            migrations: Arc::new(crate::migration::MigrationRegistry::default()),
         }
     }
 
@@ -2646,6 +2650,301 @@ impl SandboxBackend for PooledBackend {
             .map_err(|e| SandboxError::Snapshot(format!("snapshot upload task: {e}")))?
     }
 
+    /// ADR 0045 C1: freeze for a live move. See `crate::migration`'s
+    /// module docs for the lifecycle; the export holds the capture
+    /// lock (= the checkpoint fence) and the NBD backend's
+    /// migration_fence (= the flush/publish fence) until commit/abort.
+    async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        use engram_core::types::snapshot::MigrationCaptureOut;
+        let Some((chain_ref, chain_manifest)) = self
+            .checkpoint_chains
+            .get(&id)
+            .map(|c| (c.manifest_ref, c.manifest.clone()))
+        else {
+            // No chain (host restarted, seed failed) — the composed
+            // snapshot-rehome path handles it; signal fallback.
+            return Err(SandboxError::InvalidSpec(
+                "no checkpoint chain for this sandbox — use snapshot-rehome".into(),
+            ));
+        };
+        let Some(chunk_store) = self.chunk_store.clone() else {
+            return Err(SandboxError::InvalidSpec(
+                "no chunk store — use snapshot-rehome".into(),
+            ));
+        };
+        let Some(cache) = self.chunk_cache.clone() else {
+            return Err(SandboxError::InvalidSpec(
+                "no chunk cache — use snapshot-rehome".into(),
+            ));
+        };
+        if self.migrations.validate_open(id) {
+            return Err(SandboxError::AlreadyExists);
+        }
+
+        // Checkpoint fence: held for the export's lifetime.
+        let capture_guard = self.capture_lock(id).lock_owned().await;
+
+        match self.inner.wait_agent_ready(id).await {
+            Ok(()) => {}
+            Err(SandboxError::InvalidSpec(_)) => {}
+            Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
+        }
+        let paused_at = chrono::Utc::now();
+        self.inner
+            .pause(id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration pause: {e}")))?;
+
+        // Disk: drain under the pause, land the pending tier in the
+        // LOCAL cache, fence further flush publishes.
+        #[cfg(target_os = "linux")]
+        let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) =
+            if let Some(entry) = self.nbd_sandboxes.get(&id) {
+                entry.backend.set_migration_fence(true);
+                entry.backend.wait_idle().await;
+                let pending =
+                    entry.backend.flush_local().await.map_err(|e| {
+                        SandboxError::Snapshot(format!("migration disk drain: {e}"))
+                    })?;
+                let (m, hashes) = entry
+                    .backend
+                    .flush_to_local_cache(&pending)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("migration disk cache: {e}")))?;
+                let dref = entry.backend.manifest_ref().await.next_version();
+                (
+                    serde_json::to_vec(&m)
+                        .map_err(|e| SandboxError::Snapshot(format!("disk manifest json: {e}")))?,
+                    dref,
+                    hashes,
+                    Some(pending),
+                )
+            } else {
+                (
+                    Vec::new(),
+                    engram_core::types::manifest::ManifestRef::new(),
+                    Vec::new(),
+                    None,
+                )
+            };
+        #[cfg(not(target_os = "linux"))]
+        let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) = (
+            Vec::new(),
+            engram_core::types::manifest::ManifestRef::new(),
+            Vec::<engram_chunk_store::manifest::ChunkHash>::new(),
+            None,
+        );
+
+        // FC diff capture. `snapshot_diff` resumes the guest on
+        // success — re-pause immediately (the guest is mid-move; its
+        // post-capture execution would be discarded anyway, exactly
+        // the D5 argument).
+        let metadata = self
+            .inner
+            .snapshot_diff(id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration diff capture: {e}")))?;
+        if let Err(e) = self.inner.pause(id).await {
+            tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
+        }
+        let dest = self.inner.snapshot_path_for(metadata.id);
+
+        // Local-sink re-chunk: dirty memory chunks into the NVMe cache.
+        let diff_path = dest.join("memory.diff");
+        let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+            .map_err(|e| SandboxError::Snapshot(format!("migration dirty ranges: {e}")))?;
+        let (mem_manifest, mem_hashes) = chunk_store
+            .update_for_dirty_ranges_sparse_with_sink(
+                &chain_manifest,
+                &diff_path,
+                &ranges,
+                Some(&cache),
+            )
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration re-chunk: {e}")))?;
+        let mem_ref = chain_ref.next_version();
+        let _ = fs::remove_file(&diff_path).await;
+        patch_fc_manifest_memory_ref(&dest.join("manifest.json"), mem_ref).await?;
+
+        let export_id = crate::migration::MigrationRegistry::mint_export_id();
+        let mut allowed: std::collections::HashSet<engram_chunk_store::manifest::ChunkHash> =
+            mem_hashes.iter().copied().collect();
+        allowed.extend(disk_hashes.iter().copied());
+        let inserted = self.migrations.insert(crate::migration::MigrationExport {
+            export_id: export_id.clone(),
+            sandbox_id: id,
+            snapshot_dir: dest,
+            allowed_chunks: allowed,
+            disk_pending,
+            created_at: std::time::Instant::now(),
+            capture_guard,
+        });
+        if !inserted {
+            return Err(SandboxError::AlreadyExists);
+        }
+        tracing::info!(
+            sandbox_id = %id,
+            export_id = %export_id,
+            mem_ref = %mem_ref,
+            mem_chunks = mem_hashes.len(),
+            disk_chunks = disk_hashes.len(),
+            "migration capture complete; sandbox frozen, export open (ADR 0045 C1)",
+        );
+        Ok(MigrationCaptureOut {
+            export_id,
+            memory_manifest_json: serde_json::to_vec(&mem_manifest)
+                .map_err(|e| SandboxError::Snapshot(format!("mem manifest json: {e}")))?,
+            disk_manifest_json,
+            memory_manifest_ref: mem_ref,
+            disk_manifest_ref: disk_ref,
+            new_memory_chunk_hashes: mem_hashes.iter().map(|h| *h.as_bytes()).collect(),
+            new_disk_chunk_hashes: disk_hashes.iter().map(|h| *h.as_bytes()).collect(),
+            snapshot_id: metadata.id,
+            paused_at_unix_ms: paused_at.timestamp_millis(),
+        })
+    }
+
+    /// ADR 0045 C1: stream an export's artifacts. Allowlist-gated.
+    async fn migration_fetch(
+        &self,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<engram_core::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        use engram_core::types::snapshot::{MigrationFrame, MigrationItem};
+        // Resolve + validate under the registry ref, then drop it (the
+        // stream must not hold a dashmap guard).
+        let (snapshot_dir, allowed) = {
+            let Some(export) = self.migrations.find_by_export_id(export_id) else {
+                return Err(SandboxError::NotFound);
+            };
+            (export.snapshot_dir.clone(), export.allowed_chunks.clone())
+        };
+        for item in &items {
+            if let MigrationItem::Chunk(h) = item {
+                let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
+                if !allowed.contains(&hash) {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "chunk {hash} is not in this export's allowlist"
+                    )));
+                }
+            }
+        }
+        let cache = self.chunk_cache.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<MigrationFrame, SandboxError>>(16);
+        tokio::spawn(async move {
+            const FRAME: usize = 1024 * 1024;
+            for (idx, item) in items.into_iter().enumerate() {
+                let idx = idx as u32;
+                let bytes: Result<bytes::Bytes, SandboxError> = match item {
+                    MigrationItem::StateBin => fs::read(snapshot_dir.join("state.bin"))
+                        .await
+                        .map(bytes::Bytes::from)
+                        .map_err(|e| SandboxError::Snapshot(format!("read state.bin: {e}"))),
+                    MigrationItem::Sidecar => fs::read(snapshot_dir.join("manifest.json"))
+                        .await
+                        .map(bytes::Bytes::from)
+                        .map_err(|e| SandboxError::Snapshot(format!("read sidecar: {e}"))),
+                    MigrationItem::Chunk(h) => {
+                        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(h);
+                        match &cache {
+                            Some(cache) => cache
+                                .get(hash, || async {
+                                    Err(engram_chunk_store::error::ChunkStoreError::Internal(
+                                        "export chunk must be cache-resident".into(),
+                                    ))
+                                })
+                                .await
+                                .map_err(|e| {
+                                    SandboxError::Snapshot(format!("export chunk {hash}: {e}"))
+                                }),
+                            None => Err(SandboxError::Snapshot("no chunk cache".into())),
+                        }
+                    }
+                };
+                match bytes {
+                    Ok(bytes) => {
+                        let total = bytes.len();
+                        let mut off = 0usize;
+                        loop {
+                            let end = (off + FRAME).min(total);
+                            let frame = MigrationFrame {
+                                item_idx: idx,
+                                offset: off as u64,
+                                data: bytes.slice(off..end),
+                                last: end == total,
+                            };
+                            if tx.send(Ok(frame)).await.is_err() {
+                                return;
+                            }
+                            if end == total {
+                                break;
+                            }
+                            off = end;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        use futures::StreamExt;
+        Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
+    }
+
+    /// ADR 0045 C1: the move landed — drop the export (releasing both
+    /// fences) and destroy the frozen VM + its local snapshot dir.
+    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        if !self.migrations.validate(id, export_id) {
+            return Err(SandboxError::NotFound);
+        }
+        let export = self.migrations.remove(id).expect("validated above");
+        let snapshot_dir = export.snapshot_dir.clone();
+        drop(export); // releases the capture guard (checkpoint fence)
+        if let Err(e) = self.destroy(id).await {
+            tracing::warn!(sandbox_id = %id, error = %e,
+                "migration commit: destroy failed; orphan_reap will clean up");
+        }
+        let _ = fs::remove_dir_all(&snapshot_dir).await;
+        tracing::info!(sandbox_id = %id, "migration committed; source destroyed (ADR 0045 C1)");
+        Ok(())
+    }
+
+    /// ADR 0045 C1: the move failed — re-queue the drained disk tier,
+    /// unfence, un-pause in place. Zero loss.
+    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        if !self.migrations.validate(id, export_id) {
+            return Err(SandboxError::NotFound);
+        }
+        let export = self.migrations.remove(id).expect("validated above");
+        #[cfg(target_os = "linux")]
+        if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            if let Some(pending) = export.disk_pending {
+                entry.backend.requeue_pending(pending).await;
+            }
+            entry.backend.set_migration_fence(false);
+        }
+        let snapshot_dir = export.snapshot_dir.clone();
+        let _ = fs::remove_dir_all(&snapshot_dir).await;
+        drop(export.capture_guard);
+        self.inner
+            .resume(id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
+        tracing::info!(sandbox_id = %id, "migration aborted; guest resumed in place (ADR 0045 C1)");
+        Ok(())
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         // ADR 0014 issue #1/#2: caller's downstream pipeline
         // (record_snapshot → destroy → mark Idle) succeeded; the
@@ -3348,6 +3647,120 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
         }
+    }
+
+    /// ADR 0045 C1: migration_fetch is allowlist-gated and serves
+    /// state.bin/sidecar/chunks as offset-framed streams.
+    #[tokio::test]
+    async fn migration_fetch_rejects_unlisted_hash_and_bad_export_id() {
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let cache = engram_chunk_store::ChunkCache::new(
+            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
+        );
+        let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            tmp.path().join("sandboxes"),
+        ));
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("materialize"))
+            .with_chunk_cache(cache.clone());
+
+        // Hand-build an export: one allowed cache-resident chunk +
+        // state.bin/sidecar files.
+        let allowed_bytes = vec![0x5Au8; 8192];
+        let allowed = engram_chunk_store::manifest::ChunkHash::of(&allowed_bytes);
+        cache.put(allowed, &allowed_bytes).await.unwrap();
+        let unlisted = engram_chunk_store::manifest::ChunkHash::of(b"not-in-this-export");
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(export_dir.join("state.bin"), b"vmstate-bytes").unwrap();
+        std::fs::write(export_dir.join("manifest.json"), b"{}").unwrap();
+        let sandbox_id = SandboxId::new();
+        let export_id = crate::migration::MigrationRegistry::mint_export_id();
+        let guard_src = Arc::new(tokio::sync::Mutex::new(()));
+        assert!(pooled.migrations.insert(crate::migration::MigrationExport {
+            export_id: export_id.clone(),
+            sandbox_id,
+            snapshot_dir: export_dir,
+            allowed_chunks: [allowed].into_iter().collect(),
+            disk_pending: None,
+            created_at: std::time::Instant::now(),
+            capture_guard: guard_src.clone().try_lock_owned().unwrap(),
+        }));
+
+        // Bad export id => NotFound.
+        let Err(err) = pooled
+            .migration_fetch("0000", vec![MigrationItem::StateBin])
+            .await
+        else {
+            panic!("bad export must be refused");
+        };
+        assert!(matches!(err, SandboxError::NotFound));
+
+        // Unlisted chunk => InvalidSpec, even with a valid export id.
+        let Err(err) = pooled
+            .migration_fetch(&export_id, vec![MigrationItem::Chunk(*unlisted.as_bytes())])
+            .await
+        else {
+            panic!("unlisted hash must be refused");
+        };
+        assert!(matches!(err, SandboxError::InvalidSpec(_)));
+
+        // Valid pull: state.bin + the allowed chunk, framed in order.
+        let stream = pooled
+            .migration_fetch(
+                &export_id,
+                vec![
+                    MigrationItem::StateBin,
+                    MigrationItem::Chunk(*allowed.as_bytes()),
+                ],
+            )
+            .await
+            .expect("valid fetch");
+        let frames: Vec<_> = stream.map(|f| f.expect("frame")).collect().await;
+        let item0: Vec<u8> = frames
+            .iter()
+            .filter(|f| f.item_idx == 0)
+            .flat_map(|f| f.data.to_vec())
+            .collect();
+        assert_eq!(item0, b"vmstate-bytes");
+        let item1: Vec<u8> = frames
+            .iter()
+            .filter(|f| f.item_idx == 1)
+            .flat_map(|f| f.data.to_vec())
+            .collect();
+        assert_eq!(item1, allowed_bytes);
+        assert!(frames.iter().any(|f| f.item_idx == 1 && f.last));
+    }
+
+    /// ADR 0045 C1: capture without a checkpoint chain signals the
+    /// snapshot-rehome fallback (InvalidSpec), not a hard error.
+    #[tokio::test]
+    async fn migration_capture_without_chain_signals_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let cache = engram_chunk_store::ChunkCache::new(
+            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
+        );
+        let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            tmp.path().join("sandboxes"),
+        ));
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("materialize"))
+            .with_chunk_cache(cache)
+            .with_checkpoint_dir(tmp.path().join("checkpoints"));
+        let Err(err) = pooled.migration_capture(SandboxId::new()).await else {
+            panic!("no chain must signal fallback");
+        };
+        assert!(matches!(err, SandboxError::InvalidSpec(_)));
     }
 
     #[tokio::test]

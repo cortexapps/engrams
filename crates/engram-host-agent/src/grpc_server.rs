@@ -26,8 +26,9 @@ use engram_protocol::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
     BuildBaseSnapshotResponse, CowStateAllResponse, CowStateResponse, CreateSandboxRequest,
     CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
-    InterruptHarnessRequest, ListSandboxesResponse, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    InterruptHarnessRequest, ListSandboxesResponse, MigrationCaptureResponse, MigrationExportRef,
+    MigrationFetchRequest, MigrationFrame, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
+    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
     ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
     SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
     UnbindHarnessSessionRequest,
@@ -203,6 +204,115 @@ impl HostService for HostServiceImpl {
         }
         .instrument(span)
         .await
+    }
+
+    async fn migration_capture(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<MigrationCaptureResponse>, Status> {
+        let span = tracing::info_span!("host.migration_capture");
+        link_remote_parent(&span, &req);
+        async move {
+            let id = decode_sandbox_id(&req.into_inner().uuid)?;
+            let out = self
+                .inner
+                .migration_capture(id)
+                .await
+                .map_err(sandbox_to_status)?;
+            Ok(Response::new(MigrationCaptureResponse {
+                export_id: out.export_id,
+                memory_manifest_json: out.memory_manifest_json,
+                disk_manifest_json: out.disk_manifest_json,
+                new_memory_chunk_hashes: out
+                    .new_memory_chunk_hashes
+                    .into_iter()
+                    .map(|h| h.to_vec())
+                    .collect(),
+                new_disk_chunk_hashes: out
+                    .new_disk_chunk_hashes
+                    .into_iter()
+                    .map(|h| h.to_vec())
+                    .collect(),
+                snapshot_id: out.snapshot_id.as_uuid().as_bytes().to_vec(),
+                paused_at_unix_ms: out.paused_at_unix_ms,
+                memory_manifest_ref: encode_bincode(&out.memory_manifest_ref, "ManifestRef")?,
+                disk_manifest_ref: encode_bincode(&out.disk_manifest_ref, "ManifestRef")?,
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+
+    type MigrationFetchStream =
+        Pin<Box<dyn Stream<Item = Result<MigrationFrame, Status>> + Send + 'static>>;
+
+    async fn migration_fetch(
+        &self,
+        req: Request<MigrationFetchRequest>,
+    ) -> Result<Response<Self::MigrationFetchStream>, Status> {
+        let req = req.into_inner();
+        let items: Vec<engram_core::types::snapshot::MigrationItem> = req
+            .items
+            .into_iter()
+            .map(|item| {
+                use engram_protocol::grpc::migration_item::Kind;
+                match Kind::try_from(item.kind) {
+                    Ok(Kind::StateBin) => Ok(engram_core::types::snapshot::MigrationItem::StateBin),
+                    Ok(Kind::Sidecar) => Ok(engram_core::types::snapshot::MigrationItem::Sidecar),
+                    Ok(Kind::Chunk) => {
+                        let hash: [u8; 32] =
+                            item.hash.as_slice().try_into().map_err(|_| {
+                                Status::invalid_argument("chunk hash must be 32 bytes")
+                            })?;
+                        Ok(engram_core::types::snapshot::MigrationItem::Chunk(hash))
+                    }
+                    Err(_) => Err(Status::invalid_argument("unknown migration item kind")),
+                }
+            })
+            .collect::<Result<_, Status>>()?;
+        let inner_stream = self
+            .inner
+            .migration_fetch(&req.export_id, items)
+            .await
+            .map_err(sandbox_to_status)?;
+        use futures::StreamExt;
+        let mapped = inner_stream.map(|frame| {
+            frame
+                .map(|f| MigrationFrame {
+                    item_idx: f.item_idx,
+                    offset: f.offset,
+                    data: f.data.to_vec(),
+                    last: f.last,
+                })
+                .map_err(sandbox_to_status)
+        });
+        Ok(Response::new(Box::pin(mapped)))
+    }
+
+    async fn migration_commit(
+        &self,
+        req: Request<MigrationExportRef>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = req.into_inner();
+        let id = decode_sandbox_id(&req.sandbox_id)?;
+        self.inner
+            .migration_commit(id, &req.export_id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn migration_abort(
+        &self,
+        req: Request<MigrationExportRef>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = req.into_inner();
+        let id = decode_sandbox_id(&req.sandbox_id)?;
+        self.inner
+            .migration_abort(id, &req.export_id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
     }
 
     async fn commit_snapshot(

@@ -636,6 +636,7 @@ jobs:
           cargo nextest run \
             -p engram-host-agent \
             --test checkpoint_chain \
+            --test migration_source \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

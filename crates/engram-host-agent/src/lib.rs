@@ -31,6 +31,7 @@ pub mod egress;
 pub mod grpc_server;
 pub mod harness;
 pub mod host_client;
+pub mod migration;
 pub use host_client::LocalHostClient;
 pub mod heartbeat;
 pub mod idle_evictor;

@@ -32,10 +32,10 @@ use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
     CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    MigrationExportRef, MigrationFetchRequest, MigrationItem, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
+    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -216,6 +216,139 @@ impl GrpcHostClient {
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
         decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
+    }
+
+    /// ADR 0045 C1: freeze a sandbox for a live move (coordinator → source).
+    pub async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .migration_capture(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let to32 = |v: Vec<u8>| -> Result<[u8; 32], SandboxError> {
+            v.as_slice()
+                .try_into()
+                .map_err(|_| SandboxError::Snapshot("chunk hash must be 32 bytes".into()))
+        };
+        Ok(engram_core::types::snapshot::MigrationCaptureOut {
+            export_id: resp.export_id,
+            memory_manifest_json: resp.memory_manifest_json,
+            disk_manifest_json: resp.disk_manifest_json,
+            memory_manifest_ref: decode_bincode(&resp.memory_manifest_ref, "ManifestRef")?,
+            disk_manifest_ref: decode_bincode(&resp.disk_manifest_ref, "ManifestRef")?,
+            new_memory_chunk_hashes: resp
+                .new_memory_chunk_hashes
+                .into_iter()
+                .map(to32)
+                .collect::<Result<_, _>>()?,
+            new_disk_chunk_hashes: resp
+                .new_disk_chunk_hashes
+                .into_iter()
+                .map(to32)
+                .collect::<Result<_, _>>()?,
+            snapshot_id: engram_core::types::SnapshotId::from(
+                uuid::Uuid::from_slice(&resp.snapshot_id)
+                    .map_err(|e| SandboxError::Snapshot(format!("snapshot id decode: {e}")))?,
+            ),
+            paused_at_unix_ms: resp.paused_at_unix_ms,
+        })
+    }
+
+    /// ADR 0045 C1: pull an export's artifacts (destination host → source host).
+    pub async fn migration_fetch(
+        &self,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<engram_core::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        use crate::grpc::migration_item::Kind;
+        let wire_items = items
+            .into_iter()
+            .map(|item| match item {
+                engram_core::types::snapshot::MigrationItem::StateBin => MigrationItem {
+                    kind: Kind::StateBin as i32,
+                    hash: Vec::new(),
+                },
+                engram_core::types::snapshot::MigrationItem::Sidecar => MigrationItem {
+                    kind: Kind::Sidecar as i32,
+                    hash: Vec::new(),
+                },
+                engram_core::types::snapshot::MigrationItem::Chunk(h) => MigrationItem {
+                    kind: Kind::Chunk as i32,
+                    hash: h.to_vec(),
+                },
+            })
+            .collect();
+        let resp = self
+            .inner
+            .clone()
+            .migration_fetch(MigrationFetchRequest {
+                export_id: export_id.to_string(),
+                items: wire_items,
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        use futures::StreamExt;
+        Ok(resp
+            .map(|frame| {
+                frame
+                    .map(|f| engram_core::types::snapshot::MigrationFrame {
+                        item_idx: f.item_idx,
+                        offset: f.offset,
+                        data: bytes::Bytes::from(f.data),
+                        last: f.last,
+                    })
+                    .map_err(grpc_to_sandbox_err)
+            })
+            .boxed())
+    }
+
+    /// ADR 0045 C1.
+    pub async fn migration_commit(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<(), SandboxError> {
+        self.inner
+            .clone()
+            .migration_commit(MigrationExportRef {
+                sandbox_id: id.as_uuid().as_bytes().to_vec(),
+                export_id: export_id.to_string(),
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    /// ADR 0045 C1.
+    pub async fn migration_abort(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<(), SandboxError> {
+        self.inner
+            .clone()
+            .migration_abort(MigrationExportRef {
+                sandbox_id: id.as_uuid().as_bytes().to_vec(),
+                export_id: export_id.to_string(),
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
     }
 
     pub async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -827,6 +960,35 @@ impl HostClient for GrpcHostClient {
 
     async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         Self::snapshot_wait(self, id).await
+    }
+
+    async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        Self::migration_capture(self, id).await
+    }
+
+    async fn migration_fetch(
+        &self,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<engram_core::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        Self::migration_fetch(self, export_id, items).await
+    }
+
+    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        Self::migration_commit(self, id, export_id).await
+    }
+
+    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        Self::migration_abort(self, id, export_id).await
     }
 
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {

@@ -164,3 +164,39 @@ pub struct SnapshotRecord {
     #[serde(default)]
     pub events_cursor: Option<i64>,
 }
+
+/// ADR 0045 C1: what `migration_capture` hands the coordinator — the
+/// frozen sandbox's not-yet-durable next manifests (inline JSON; durable
+/// only after the destination's catch-up) plus the transfer set the
+/// destination must pull from the source's export.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MigrationCaptureOut {
+    pub export_id: String,
+    pub memory_manifest_json: Vec<u8>,
+    pub disk_manifest_json: Vec<u8>,
+    pub memory_manifest_ref: super::manifest::ManifestRef,
+    /// PROVISIONAL — shared-template disk lineages version-race; the
+    /// destination's catch-up publish does the conflict-retry dance.
+    pub disk_manifest_ref: super::manifest::ManifestRef,
+    pub new_memory_chunk_hashes: Vec<[u8; 32]>,
+    pub new_disk_chunk_hashes: Vec<[u8; 32]>,
+    pub snapshot_id: super::ids::SnapshotId,
+    pub paused_at_unix_ms: i64,
+}
+
+/// One artifact the destination pulls from a migration export.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MigrationItem {
+    StateBin,
+    Sidecar,
+    Chunk([u8; 32]),
+}
+
+/// A frame of `migration_fetch`'s stream.
+#[derive(Debug, Clone)]
+pub struct MigrationFrame {
+    pub item_idx: u32,
+    pub offset: u64,
+    pub data: bytes::Bytes,
+    pub last: bool,
+}
