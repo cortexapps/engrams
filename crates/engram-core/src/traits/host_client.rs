@@ -69,6 +69,31 @@ pub trait HostClient: Send + Sync {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
+    /// ADR 0045 D5: the pause-side half of an eviction snapshot — pause +
+    /// drain + FC capture, then the guest is re-paused (it's being torn
+    /// down; today's pipeline already discards post-capture execution).
+    /// The chunk+upload work runs as a host-side background task; await it via
+    /// [`Self::snapshot_wait`]. Returns the new snapshot's id once the
+    /// capture itself has succeeded — the point where the coordinator
+    /// may mark the session Idle. Default errs so non-FC hosts and
+    /// pre-D5 host-agents fall back to the composed [`Self::snapshot`].
+    async fn snapshot_begin(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::SnapshotId, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `snapshot_begin`".into(),
+        ))
+    }
+    /// ADR 0045 D5: await the background upload spawned by
+    /// [`Self::snapshot_begin`] and return the durable
+    /// [`SnapshotMetadata`]. Idempotent w.r.t. reconnects — the upload
+    /// is host-autonomous once begun.
+    async fn snapshot_wait(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `snapshot_wait`".into(),
+        ))
+    }
     /// ADR 0014 issue #1/#2: commit a snapshot whose post-snapshot
     /// pipeline has fully succeeded. See `SandboxBackend::commit_snapshot`
     /// for the contract. Default impl returns Ok so HostClients backed by

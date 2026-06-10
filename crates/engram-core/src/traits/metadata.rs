@@ -822,6 +822,22 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0045 D5 / issue #147: refresh a held lease's `locked_at` so a
+    /// long-running owner (the eviction finalize task awaiting a slow
+    /// upload) is never reaped mid-work by `sweep_stale_session_leases`.
+    /// Scoped to the holder: refreshes only the row this `locked_by`
+    /// owns, so a touch can't resurrect a lease that was reaped and
+    /// re-acquired by someone else. Returns whether a row was touched —
+    /// `false` means the lease is gone (reaped or released) and the
+    /// caller should treat its ownership as lost.
+    async fn touch_session_lease(
+        &self,
+        _session_id: SessionId,
+        _locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        Ok(true)
+    }
+
     /// Stale-lease reaper. Deletes rows where `locked_at < now() -
     /// max_age` and returns them so the caller can warn-log
     /// `(session_id, locked_by, locked_at)` per reaped row.

@@ -178,6 +178,40 @@ pub async fn evict_session_to_state(
     // host-side `idle_evictor` re-POSTs the candidate on the next tick,
     // a fresh SnapshotId is minted, and we leak ~4 GiB per retry. That
     // was the failure on `engrams-fc-xngk` (25 dirs × 4 GiB in 13 min).
+    // ADR 0045 D5: for plain idle eviction (target Idle), split the
+    // capture from the upload — the session is user-visibly Idle as soon
+    // as the pause-side capture lands, and the chunk+upload runs in a
+    // background finalize task under the (touched) lease, with the PG
+    // snapshot row written only at finalize ("row-only-at-finalize": no
+    // half-durable rows; a finalize failure means resume falls back to
+    // the prior checkpoint — the same blast radius as an active host
+    // death). Drain/teleport (target Evacuating) keeps the composed path:
+    // the evac scanner resumes from the row, so it must be durable first.
+    // Hosts that don't support the split (pre-D5, non-FC) surface
+    // InvalidSpec and fall through to the composed path too.
+    if target_state == SessionState::Idle {
+        match state.services.host.snapshot_begin(sandbox_id).await {
+            Ok(snapshot_id) => {
+                return finish_eviction_background(
+                    state,
+                    session_id,
+                    sandbox_id,
+                    snapshot_id,
+                    _guard,
+                )
+                .await;
+            }
+            Err(engram_core::SandboxError::InvalidSpec(reason)) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    %reason,
+                    "snapshot_begin unsupported; using the composed eviction pipeline",
+                );
+            }
+            Err(e) => return Err(EvictError::Sandbox(e)),
+        }
+    }
+
     let metadata = state
         .services
         .host
@@ -370,6 +404,175 @@ pub async fn evict_session_to_state(
     Ok(())
 }
 
+/// ADR 0045 D5: the fast-path tail of an idle eviction. The capture has
+/// landed (`snapshot_begin` returned), so: mark the session Idle NOW —
+/// user-visible teardown ends here — then spawn the finalize task that
+/// awaits the host's background upload under the touched lease and only
+/// then writes the snapshot row, commits, and destroys. Failure anywhere
+/// in finalize = no row + abort + destroy: resume falls back to the
+/// prior checkpoint.
+async fn finish_eviction_background(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+    snapshot_id: engram_core::types::SnapshotId,
+    lease: SessionLeaseGuard,
+) -> Result<(), EvictError> {
+    let host_id = state.host_registry.host_of(sandbox_id);
+    let now = Utc::now();
+    // The capture paused the guest moments ago; "newest event as of now"
+    // is the coherence cursor, same as the composed path.
+    let events_cursor = state
+        .services
+        .meta
+        .latest_event_idx_at_or_before(session_id, now)
+        .await
+        .unwrap_or_default();
+
+    // Idle-before-durable: in-memory unbind, PG sandbox detach, state flip.
+    state.registry.unbind(session_id);
+    if let Err(e) = state
+        .services
+        .meta
+        .assign_session_sandbox(session_id, None)
+        .await
+    {
+        tracing::warn!(session_id = %session_id, error = %e,
+            "D5 eviction: assign_session_sandbox(None) failed");
+    }
+    let prev = match state
+        .services
+        .meta
+        .transition_session(session_id, SessionState::Idle)
+        .await
+    {
+        Ok(prev) => prev,
+        Err(e) => {
+            abort_inflight_snapshot(state, session_id, sandbox_id, "transition_session (D5)").await;
+            let _ = state.services.host.destroy(sandbox_id).await;
+            return Err(EvictError::Meta(e.to_string()));
+        }
+    };
+    let _ = state
+        .emit(session_id, SessionEvent::Evicted { at: now })
+        .await;
+    let _ = state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: prev,
+                to: SessionState::Idle,
+                at: now,
+            },
+        )
+        .await;
+    tracing::info!(
+        session_id = %session_id,
+        sandbox_id = %sandbox_id,
+        snapshot_id = %snapshot_id,
+        "idle eviction: session Idle after capture; upload finalizing in background (ADR 0045 D5)",
+    );
+
+    // The finalize task. Owns the lease (touched every 60 s so the 180 s
+    // reaper never fires mid-upload — issue #147's secondary bug).
+    let state = state.clone();
+    tokio::spawn(async move {
+        let lease = lease;
+        let mut touch = tokio::time::interval(std::time::Duration::from_secs(60));
+        touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        touch.tick().await; // immediate first tick — consume it
+        let wait = state.services.host.snapshot_wait(sandbox_id);
+        tokio::pin!(wait);
+        let metadata = loop {
+            tokio::select! {
+                res = &mut wait => break res,
+                _ = touch.tick() => {
+                    if !lease.touch().await {
+                        tracing::error!(
+                            session_id = %session_id,
+                            sandbox_id = %sandbox_id,
+                            "D5 finalize: session lease lost mid-upload (reaped or \
+                             released); refusing to record the snapshot row",
+                        );
+                        abort_inflight_snapshot(&state, session_id, sandbox_id, "lease lost (D5)").await;
+                        let _ = state.services.host.destroy(sandbox_id).await;
+                        return;
+                    }
+                }
+            }
+        };
+        let metadata = match metadata {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    sandbox_id = %sandbox_id,
+                    error = %e,
+                    "D5 finalize: snapshot upload failed; no row written — \
+                     resume falls back to the prior checkpoint",
+                );
+                abort_inflight_snapshot(&state, session_id, sandbox_id, "snapshot_wait (D5)").await;
+                let _ = state.services.host.destroy(sandbox_id).await;
+                return;
+            }
+        };
+        // Row-only-at-finalize: the first and only insert, while the
+        // lease is held — a reaped lease can't fork state because the
+        // row never lands without it.
+        let record = SnapshotRecord {
+            id: metadata.id,
+            session_id: Some(session_id),
+            host_id,
+            image_version: metadata.image_version.clone(),
+            size_bytes: metadata.size_bytes,
+            created_at: metadata.created_at,
+            last_accessed_at: now,
+            disk_manifest: metadata.disk_manifest,
+            memory_manifest: metadata.memory_manifest,
+            recoverable: crate::api::snapshot::verify_snapshot_recoverable(
+                state.services.blob.as_ref(),
+                metadata.disk_manifest.as_ref(),
+                metadata.memory_manifest.as_ref(),
+            )
+            .await,
+            aux_bundles: metadata.aux_bundles.clone(),
+            events_cursor,
+        };
+        if let Err(e) = state.services.meta.record_snapshot(record).await {
+            tracing::warn!(session_id = %session_id, error = %e,
+                "D5 finalize: record_snapshot failed; aborting artifacts");
+            abort_inflight_snapshot(&state, session_id, sandbox_id, "record_snapshot (D5)").await;
+            let _ = state.services.host.destroy(sandbox_id).await;
+            return;
+        }
+        if let Err(e) = state.services.host.commit_snapshot(sandbox_id).await {
+            tracing::warn!(session_id = %session_id, sandbox_id = %sandbox_id, error = %e,
+                "D5 finalize: commit_snapshot failed; resume-time verification backstops");
+        }
+        if let Err(e) = state.services.host.destroy(sandbox_id).await {
+            tracing::warn!(session_id = %session_id, sandbox_id = %sandbox_id, error = %e,
+                "D5 finalize: destroy failed; orphan_reap will clean up");
+        }
+        let _ = state
+            .emit(
+                session_id,
+                SessionEvent::SnapshotTaken {
+                    snapshot_id: metadata.id,
+                    size_bytes: metadata.size_bytes,
+                    at: Utc::now(),
+                },
+            )
+            .await;
+        tracing::info!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            snapshot_id = %metadata.id,
+            "idle eviction finalize completed (ADR 0045 D5)",
+        );
+    });
+    Ok(())
+}
+
 /// ADR 0016 §A.1.5c: RAII guard around the `session_lease` PG
 /// row. `try_acquire` does INSERT ... ON CONFLICT DO NOTHING; on
 /// 1 row affected returns `Ok(Some(Self))`, on 0 rows affected
@@ -388,6 +591,7 @@ pub async fn evict_session_to_state(
 pub(crate) struct SessionLeaseGuard {
     meta: Arc<dyn engram_core::traits::MetadataStore>,
     session_id: SessionId,
+    locked_by: String,
 }
 
 impl SessionLeaseGuard {
@@ -405,10 +609,22 @@ impl SessionLeaseGuard {
             Ok(Some(Self {
                 meta: state.services.meta.clone(),
                 session_id,
+                locked_by: state.pod_id.to_string(),
             }))
         } else {
             Ok(None)
         }
+    }
+
+    /// ADR 0045 D5 / issue #147: refresh `locked_at` so a long-running
+    /// holder (the eviction finalize task awaiting a slow upload) is
+    /// never reaped mid-work. Returns `false` when the lease is gone —
+    /// the holder must treat its ownership as lost.
+    pub(crate) async fn touch(&self) -> bool {
+        self.meta
+            .touch_session_lease(self.session_id, &self.locked_by)
+            .await
+            .unwrap_or(false)
     }
 }
 
@@ -733,10 +949,20 @@ mod tests {
     /// Variant that also hands back the MiniMeta so tests can reach
     /// its failure-injection toggles (`fail_next_record_snapshot`).
     fn build_state_and_meta(session: Session, sandbox_root: &Path) -> (SharedState, Arc<MiniMeta>) {
-        let local_path = sandbox_root.join("local");
-        std::fs::create_dir_all(&local_path).unwrap();
         let backend: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(sandbox_root.join("sandboxes")));
+        build_state_and_meta_with_backend(session, sandbox_root, backend)
+    }
+
+    /// ADR 0045 D5: variant taking the sandbox backend, so tests can
+    /// wire one that supports the snapshot begin/wait split.
+    fn build_state_and_meta_with_backend(
+        session: Session,
+        sandbox_root: &Path,
+        backend: Arc<dyn SandboxBackend>,
+    ) -> (SharedState, Arc<MiniMeta>) {
+        let local_path = sandbox_root.join("local");
+        std::fs::create_dir_all(&local_path).unwrap();
         let meta = Arc::new(MiniMeta::new(session));
         let host_registry = Arc::new(HostRegistry::new(
             meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
@@ -795,6 +1021,206 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
         }
+    }
+
+    /// ADR 0045 D5: a backend exposing the begin/wait split, with the
+    /// upload gated on a Notify so tests can observe the Idle-before-
+    /// durable window. Delegates everything else to ProcessBackend.
+    struct D5SplitBackend {
+        inner: Arc<dyn SandboxBackend>,
+        gate: Arc<tokio::sync::Notify>,
+        stashed: Arc<PlMutex<Option<engram_core::types::snapshot::SnapshotMetadata>>>,
+        /// when true, snapshot_wait returns an error after the gate fires
+        /// (the finalize-failure path: no row, abort, destroy).
+        fail_wait: bool,
+    }
+    use engram_core::SandboxError;
+    use parking_lot::Mutex as PlMutex;
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for D5SplitBackend {
+        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            self.inner.create(spec).await
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.inner.destroy(id).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            self.inner.list().await
+        }
+        async fn exec_stream(
+            &self,
+            id: SandboxId,
+            cmd: ExecRequest,
+        ) -> Result<engram_core::types::sandbox::ExecStream, SandboxError> {
+            self.inner.exec_stream(id, cmd).await
+        }
+        async fn snapshot(
+            &self,
+            id: SandboxId,
+        ) -> Result<engram_core::types::snapshot::SnapshotMetadata, SandboxError> {
+            self.inner.snapshot(id).await
+        }
+        async fn snapshot_begin(
+            &self,
+            id: SandboxId,
+        ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+            let m = self.inner.snapshot(id).await?;
+            let sid = m.id;
+            *self.stashed.lock() = Some(m);
+            Ok(sid)
+        }
+        async fn snapshot_wait(
+            &self,
+            _id: SandboxId,
+        ) -> Result<engram_core::types::snapshot::SnapshotMetadata, SandboxError> {
+            self.gate.notified().await;
+            if self.fail_wait {
+                return Err(SandboxError::Snapshot("injected upload failure".into()));
+            }
+            Ok(self.stashed.lock().take().expect("begin ran"))
+        }
+        async fn restore(
+            &self,
+            metadata: engram_core::types::snapshot::SnapshotMetadata,
+        ) -> Result<SandboxId, SandboxError> {
+            self.inner.restore(metadata).await
+        }
+        fn snapshot_path_for(&self, id: engram_core::types::SnapshotId) -> std::path::PathBuf {
+            self.inner.snapshot_path_for(id)
+        }
+    }
+
+    fn d5_state(
+        session: Session,
+        sandbox_root: &Path,
+        fail_wait: bool,
+    ) -> (SharedState, Arc<MiniMeta>, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SandboxBackend> = Arc::new(D5SplitBackend {
+            inner: Arc::new(ProcessBackend::new(sandbox_root.join("sandboxes"))),
+            gate: gate.clone(),
+            stashed: Arc::new(PlMutex::new(None)),
+            fail_wait,
+        });
+        let (state, meta) = build_state_and_meta_with_backend(session, sandbox_root, backend);
+        (state, meta, gate)
+    }
+
+    async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The D5 fast path: the session is Idle BEFORE the upload resolves
+    /// and the snapshot row lands ONLY at finalize (row-only-at-finalize).
+    #[tokio::test]
+    async fn d5_eviction_is_idle_before_durable_and_records_at_finalize() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:d5".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, gate) = d5_state(session, sandbox_root.path(), false);
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle)
+            .await
+            .expect("evict");
+
+        // Idle immediately; NO row yet — the upload gate is still closed.
+        let m = meta.clone();
+        wait_for("session Idle", move || {
+            m.session.lock().status == SessionState::Idle
+        })
+        .await;
+        assert!(
+            meta.snapshots.lock().is_empty(),
+            "row-only-at-finalize: no snapshot row before the upload completes"
+        );
+
+        // Open the gate: finalize records the row + destroys the sandbox.
+        gate.notify_one();
+        let m = meta.clone();
+        wait_for("snapshot row recorded", move || {
+            !m.snapshots.lock().is_empty()
+        })
+        .await;
+        let st = state.clone();
+        wait_for("sandbox destroyed", move || {
+            futures::executor::block_on(st.services.host.list())
+                .map(|l| !l.contains(&sandbox_id))
+                .unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// Finalize failure: no row is ever written (resume falls back to the
+    /// prior checkpoint) and the sandbox is still destroyed.
+    #[tokio::test]
+    async fn d5_eviction_upload_failure_writes_no_row_and_destroys() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:d5-fail".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, gate) = d5_state(session, sandbox_root.path(), true);
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        evict_session_to_state(&state, session_id, sandbox_id, SessionState::Idle)
+            .await
+            .expect("evict");
+        gate.notify_one();
+        let st = state.clone();
+        wait_for("sandbox destroyed", move || {
+            futures::executor::block_on(st.services.host.list())
+                .map(|l| !l.contains(&sandbox_id))
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(
+            meta.snapshots.lock().is_empty(),
+            "a failed finalize must never write a snapshot row"
+        );
+        // Session stays Idle (resume falls back to the prior checkpoint).
+        assert_eq!(meta.session.lock().status, SessionState::Idle);
     }
 
     #[tokio::test]

@@ -234,3 +234,37 @@ async fn backstop_query_uses_newest_event() {
         "last_event_at must reflect the appended event"
     );
 }
+
+/// ADR 0045 D5 / issue #147: `touch_session_lease` refreshes only the
+/// holder's own row — a touch can't resurrect a reaped/foreign lease,
+/// and a touched lease survives the stale-reap window.
+#[tokio::test]
+#[ignore = "requires live Postgres (ENGRAM_TEST_DATABASE_URL)"]
+async fn touch_session_lease_is_holder_scoped_and_defeats_the_reaper() {
+    let Some(meta) = pg().await else { return };
+    let session_id = SessionId::new();
+
+    assert!(meta
+        .try_acquire_session_lease(session_id, None, "pod-a")
+        .await
+        .unwrap());
+
+    // Holder touch succeeds; a foreign pod's touch does not.
+    assert!(meta.touch_session_lease(session_id, "pod-a").await.unwrap());
+    assert!(!meta.touch_session_lease(session_id, "pod-b").await.unwrap());
+
+    // A touched lease is NOT reaped at a max_age its refresh stays inside.
+    assert!(meta.touch_session_lease(session_id, "pod-a").await.unwrap());
+    let reaped = meta
+        .sweep_stale_session_leases(std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(
+        !reaped.iter().any(|l| l.session_id == session_id),
+        "freshly-touched lease must survive the reaper"
+    );
+
+    // After release, touch reports the loss.
+    meta.release_session_lease(session_id).await.unwrap();
+    assert!(!meta.touch_session_lease(session_id, "pod-a").await.unwrap());
+}

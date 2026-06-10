@@ -224,6 +224,11 @@ pub struct PooledBackend {
     /// (double-pause is idempotent but concurrent NBD flushes +
     /// chain advances are not).
     capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
+    /// ADR 0045 D5: per-sandbox background upload tasks spawned by
+    /// `snapshot_begin`, awaited by `snapshot_wait`. Single-consumer:
+    /// the coordinator's finalize task is the only waiter.
+    snapshot_waits:
+        Arc<DashMap<SandboxId, tokio::task::JoinHandle<Result<SnapshotMetadata, SandboxError>>>>,
 }
 
 impl PooledBackend {
@@ -500,6 +505,7 @@ impl PooledBackend {
             checkpoint_dir: None,
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_locks: Arc::new(DashMap::new()),
+            snapshot_waits: Arc::new(DashMap::new()),
         }
     }
 
@@ -549,6 +555,203 @@ impl PooledBackend {
     }
 
     /// ADR 0028 Fix A: where un-acked durable checkpoint records live.
+    /// ADR 0045 D5: the owned, 'static bundle of everything the snapshot
+    /// POST phase (chunk + upload + chain bookkeeping) needs — so
+    /// `snapshot_begin` can run it as a background task while the
+    /// coordinator marks the session Idle. All fields are Arc-backed
+    /// clones of the PooledBackend's.
+    pub(crate) fn finisher(&self) -> SnapshotFinisher {
+        SnapshotFinisher {
+            #[cfg(target_os = "linux")]
+            nbd_sandboxes: self.nbd_sandboxes.clone(),
+            chunk_store: self.chunk_store.clone(),
+            chunk_cache: self.chunk_cache.clone(),
+            bundle_dir: self.bundle_dir.clone(),
+            inflight_snapshots: self.inflight_snapshots.clone(),
+            last_snapshot_unix_ms: self.last_snapshot_unix_ms.clone(),
+            checkpoint_chains: self.checkpoint_chains.clone(),
+            checkpoint_dir: self.checkpoint_dir.clone(),
+            session_bindings: self.session_bindings.clone(),
+        }
+    }
+
+    /// ADR 0045 D5: pause + drain + FC capture. Returns the held capture
+    /// lock (the caller decides whether the post phase runs inline or in
+    /// a background task — the lock must span it either way, so a
+    /// concurrent periodic checkpoint's `capture_in_flight` try_lock
+    /// keeps skipping until the upload completes) and the capture
+    /// artifacts the post phase consumes.
+    async fn capture_phase(
+        &self,
+        id: SandboxId,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, SnapshotCapture), SandboxError> {
+        let capture_lock = self.capture_lock(id);
+        // ADR 0038 B0: time the lock wait — the gridlock signal. With
+        // B1 periodic checkpoints skip rather than queue, so a long tail
+        // here is an eviction/drain blocked on an in-flight capture.
+        let lock_wait = std::time::Instant::now();
+        let capture_guard = capture_lock.lock_owned().await;
+        metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
+            .record(lock_wait.elapsed().as_secs_f64());
+        // Diff-mode when a checkpoint chain exists: same coherent
+        // (memory, disk) capture contract, O(dirty set) cost. The
+        // chain seeds on the first (Full) capture below — so an
+        // eviction on a long-running session is just the final diff
+        // in its checkpoint chain, collapsing the multi-GiB-dump
+        // window the cf4d4afd incident sat in.
+        let chain_prev = self
+            .checkpoint_chains
+            .get(&id)
+            .map(|c| (c.manifest_ref, c.manifest.clone()));
+
+        // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
+        // was produced but never committed (caller's downstream
+        // pipeline failed or the coord pod crashed between snapshot
+        // and commit), tear down its artifacts BEFORE we mint a fresh
+        // SnapshotId. This is the overwrite-in-place semantic that
+        // keeps the host-side disk bounded under coord-side retry
+        // storms — the prod incident on `engrams-fc-xngk` leaked
+        // ~25 dirs × 4 GiB in 13 min because each retry minted a fresh
+        // id and left the prior dir on disk.
+        if self.inflight_snapshots.contains_key(&id) {
+            if let Err(e) = self.abort_prior_inflight_snapshot(id).await {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "snapshot retry: best-effort abort of prior in-flight snapshot failed; \
+                     proceeding with fresh attempt anyway",
+                );
+            }
+        }
+
+        // ADR 0021 P1.6 follow-up: gate snapshot on agentd readiness.
+        //
+        // The pre-flush pause below freezes vCPUs. If the guest is still
+        // in early boot (kernel → engram-init → agentd start) at that
+        // moment, the snapshot captures a half-initialised kernel — in
+        // particular, agentd may not have completed `bind(AF_VSOCK)` —
+        // and the resumed kernel comes up with a half-initialised vsock
+        // driver. `panic=1 reboot=k` then trips `KVM_EXIT_SHUTDOWN`
+        // ~1 s after `load_snapshot` returns; every subsequent
+        // host→guest dial fails ECONNREFUSED.
+        //
+        // Reachable in prod via:
+        //   1. SIGTERM-during-cold-boot. `shutdown.rs` checkpoints all
+        //      sandboxes from `backend.list()` after a 5 s drain — a
+        //      sandbox still booting at SIGTERM gets snapshotted mid-
+        //      bind without this gate.
+        //   2. coord-driven `snapshot(id)` fired quickly after create
+        //      (any fast-rebake / probe path).
+        //
+        // `wait_agent_ready` blocks until agentd has dialled the host's
+        // ready port (port 1027) — proving the guest's vsock stack is
+        // operational end-to-end. On warm-restored sandboxes the watch
+        // is pre-set true (FC's `restore_in_jail`), so this is a no-op
+        // for warm re-snapshot paths. The FC backend is the only one
+        // with the per-sandbox agent_ready watch; non-FC backends
+        // (Process, future) return `InvalidSpec` from the default trait
+        // impl, which we treat as "no readiness concept here, proceed."
+        match self.inner.wait_agent_ready(id).await {
+            Ok(()) => {}
+            Err(SandboxError::InvalidSpec(_)) => {}
+            Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
+        }
+
+        // ADR 0018 commit 12m + ADR 0038 B3: snapshot ordering is
+        //   pause → wait_idle → flush_local(drain) → inner.snapshot
+        //   → [resume] → flush_upload(GCS) (in the `post` block)
+        // where inner.snapshot's internal pause/capture/resume is a
+        // no-op pause (FC's PATCH /vm is idempotent) followed by the
+        // memory dump and a resume that brings the VM back running.
+        // This guarantees memory + disk are CAPTURED at the same point
+        // in time: the explicit pause stops vCPUs, wait_idle drains any
+        // in-flight virtio writes through the NBD daemon, flush_local
+        // drains the just-quiesced dirty set locally, and inner.snapshot
+        // then captures the page cache (which agrees with that disk
+        // state). The disk GCS upload is deferred to flush_upload AFTER
+        // resume — off the frozen-guest path — but the captured *content*
+        // is fixed at the drain, so coherence is unchanged.
+        //
+        // Pre-12m ordering was flush → inner.snapshot (FC's pause
+        // happened inside the inner call AFTER our flush). Writes
+        // queued between flush and pause landed in memory but not
+        // the drained disk set — the cross-host evac canary md5
+        // mismatch on dev-vm validation was exactly this race.
+        //
+        // ADR 0028 A.log: the pause instant is the coherence cut for
+        // the (memory, disk, event-log) triple — the coord resolves
+        // the session_events cursor as "last event at or before this"
+        // when it records the checkpoint.
+        let paused_at = chrono::Utc::now();
+        self.inner
+            .pause(id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
+
+        // ADR 0038 B3: under the pause, only DRAIN the dirty buffer
+        // (+ hash + stash in the backend's pending tier) — the
+        // multi-second GCS upload is deferred to `flush_upload` after
+        // the guest resumes (the `post` block below), so the
+        // guest-visible pause is O(local copy), not O(GCS). The drain
+        // still captures disk-at-the-pause-instant (ADR 0018 §12m); the
+        // memory capture below is paired with it.
+        #[cfg(target_os = "linux")]
+        let nbd_pending_flush = if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            // Drain in-flight NBD requests so the drain sees a quiescent
+            // dirty buffer. With FC paused above, no new virtio writes
+            // are issued, and wait_idle returns once already-in-flight
+            // requests have completed through backend.write().
+            entry.backend.wait_idle().await;
+            let pending = entry
+                .backend
+                .flush_local()
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
+            Some(pending)
+        } else {
+            None
+        };
+
+        // ADR 0007 Phase 6: backend owns its staging dir; we look
+        // it up via snapshot_path_for after the inner call so we
+        // can read/patch the on-disk artifacts the inner backend
+        // wrote (memory.bin / memory.diff, manifest.json). The inner
+        // call's pause-create-resume cycle is idempotent against our
+        // earlier pause and brings the VM back to running on exit —
+        // for the diff flavor that resume lands after O(dirty set),
+        // not O(guest RAM).
+        // ADR 0038 B0: time the FC memory capture (`PUT /snapshot/
+        // create`) — the previously-invisible step that hung 60 s on the
+        // cold Full seed. After B2, `type="full"` should vanish on the
+        // resume path (chain seeded → diff).
+        let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
+        let create_start = std::time::Instant::now();
+        let create_res = if chain_prev.is_some() {
+            self.inner.snapshot_diff(id).await
+        } else {
+            self.inner.snapshot(id).await
+        };
+        metrics::histogram!(
+            crate::metrics::SNAPSHOT_CREATE_SECONDS,
+            "type" => snap_type,
+            "outcome" => if create_res.is_ok() { "success" } else { "error" },
+        )
+        .record(create_start.elapsed().as_secs_f64());
+        let metadata = create_res?;
+        let dest = self.inner.snapshot_path_for(metadata.id);
+        Ok((
+            capture_guard,
+            SnapshotCapture {
+                metadata,
+                dest,
+                chain_prev,
+                paused_at,
+                #[cfg(target_os = "linux")]
+                nbd_pending_flush,
+            },
+        ))
+    }
+
     pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
@@ -560,123 +763,14 @@ impl PooledBackend {
     /// snapshot's own durability (chunks + blobs in GCS) is already
     /// settled; everything here is acceleration (chain) or
     /// reconciliation insurance (record).
-    async fn advance_checkpoint_state(
-        &self,
-        id: SandboxId,
-        metadata: &SnapshotMetadata,
-        paused_at: chrono::DateTime<chrono::Utc>,
-        next_manifest: Option<engram_chunk_store::Manifest>,
-    ) {
-        if self.checkpoint_dir.is_none() {
-            return;
-        }
-        let Some(memory_ref) = metadata.memory_manifest else {
-            // No chunked memory (no chunk store / non-FC backend):
-            // nothing to chain, and a record without a memory
-            // manifest adds nothing over the live disk manifest.
-            return;
-        };
-
-        match next_manifest {
-            // Diff capture: the sparse re-chunk already ran in the post
-            // block; just advance the chain's manifest pointer.
-            Some(next) => {
-                if let Some(mut chain) = self.checkpoint_chains.get_mut(&id) {
-                    chain.manifest_ref = memory_ref;
-                    chain.manifest = next;
-                }
-            }
-            // Full capture: seed the chain manifest-only from the manifest
-            // we just published (ADR 0039 — no local rolling image; the
-            // memory.bin was chunked + removed in the post block).
-            // Subsequent captures ride the sparse diff path.
-            None => {
-                self.seed_checkpoint_chain_sparse(id, memory_ref).await;
-            }
-        }
-
-        // Durable record — only for session-bound sandboxes (anonymous
-        // base-snapshot captures have no session to reconcile).
-        let Some(session_id) = self.session_bindings.get(&id).map(|s| *s) else {
-            return;
-        };
-        let Some(records_dir) = self.checkpoint_records_dir() else {
-            return;
-        };
-        let record = crate::checkpoint::CheckpointRecord {
-            snapshot_id: metadata.id,
-            session_id,
-            sandbox_id: id,
-            image_version: metadata.image_version.clone(),
-            size_bytes: metadata.size_bytes,
-            disk_manifest: metadata.disk_manifest,
-            memory_manifest: metadata.memory_manifest,
-            aux_bundles: metadata.aux_bundles.clone(),
-            paused_at,
-            captured_at: metadata.created_at,
-        };
-        if let Err(e) = record.persist(&records_dir).await {
-            tracing::warn!(
-                sandbox_id = %id,
-                snapshot_id = %metadata.id,
-                error = %e,
-                "durable checkpoint record write failed; PG row (if the caller's \
-                 pipeline survives) is the only reference",
-            );
-        }
-    }
-
-    /// ADR 0038 B2 / ADR 0039: seed the checkpoint chain manifest-only
-    /// (no local rolling image — "sparse mode"). Two entry points: on
-    /// RESUME from the source's memory manifest, and after a fresh Full
-    /// capture from the just-published one. ADR 0039 retired the rolling
-    /// memfile, so this is the *only* seed. The manifest already describes
-    /// the full image in the chunk store, so the next periodic checkpoint
-    /// takes the diff path (`update_for_dirty_ranges_sparse`) instead of a
-    /// Full re-read of guest RAM — which under UFFD faults the entire
-    /// working set in from the store (the 60 s `PUT /snapshot/create`
-    /// hang).
-    ///
-    /// Best-effort: a missing/unfetchable manifest just means the next
-    /// checkpoint falls back to Full. Skips when checkpointing is
-    /// disabled, there's no chunk store, or a chain is already tracked
-    /// (a fresh `restore` mints a new sandbox id; the Full-capture caller
-    /// only reaches here when the chain was empty).
     async fn seed_checkpoint_chain_sparse(
         &self,
         id: SandboxId,
         memory_ref: engram_core::types::manifest::ManifestRef,
     ) {
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
-            return;
-        };
-        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
-            return;
-        }
-        match chunk_store.get_manifest(memory_ref).await {
-            Ok(manifest) => {
-                self.checkpoint_chains.insert(
-                    id,
-                    crate::checkpoint::CheckpointChain {
-                        manifest_ref: memory_ref,
-                        manifest,
-                    },
-                );
-                tracing::info!(
-                    sandbox_id = %id,
-                    manifest = %memory_ref,
-                    "ADR 0038/0039: seeded sparse checkpoint chain; next checkpoint will diff",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    manifest = %memory_ref,
-                    error = %e,
-                    "resume chain seed failed; first checkpoint falls back to Full",
-                );
-            }
-        }
+        self.finisher()
+            .seed_checkpoint_chain_sparse(id, memory_ref)
+            .await
     }
 
     /// Sandboxes due for a periodic checkpoint: session-bound, and no
@@ -1782,6 +1876,413 @@ async fn materialize_chunked_rootfs(
 /// are omitted from the manifest (the chunk_file primitive already
 /// short-circuits them); on restore the resolver treats absent
 /// chunk entries as zero-fill (UFFDIO_ZEROPAGE) so zero pages cost
+/// ADR 0045 D5: what `capture_phase` hands the post phase.
+pub(crate) struct SnapshotCapture {
+    metadata: SnapshotMetadata,
+    dest: PathBuf,
+    chain_prev: Option<(
+        engram_core::types::manifest::ManifestRef,
+        engram_chunk_store::Manifest,
+    )>,
+    paused_at: chrono::DateTime<chrono::Utc>,
+    #[cfg(target_os = "linux")]
+    nbd_pending_flush: Option<crate::disk_daemon::PendingDiskFlush>,
+}
+
+/// ADR 0045 D5: see [`PooledBackend::finisher`]. Owns Arc-clones of the
+/// fields the snapshot post phase + chain bookkeeping touch, so the phase
+/// can run detached from the originating RPC.
+#[derive(Clone)]
+pub(crate) struct SnapshotFinisher {
+    #[cfg(target_os = "linux")]
+    nbd_sandboxes: Arc<DashMap<SandboxId, crate::disk_daemon::NbdSandboxState>>,
+    chunk_store: Option<ChunkStore>,
+    chunk_cache: Option<ChunkCache>,
+    bundle_dir: PathBuf,
+    inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
+    last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
+    checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
+    checkpoint_dir: Option<PathBuf>,
+    session_bindings: Arc<DashMap<SandboxId, SessionId>>,
+}
+
+impl SnapshotFinisher {
+    /// ADR 0045 D5 + issue #147: the post phase — disk upload, memory
+    /// re-chunk (parallel, `buffer_unordered(32)` inside the chunk
+    /// store), portable-blob upload, bundle publish, then chain
+    /// bookkeeping / cleanup. Instrumented end-to-end (the re-chunk used
+    /// to be invisible in traces).
+    pub(crate) async fn finish(
+        &self,
+        id: SandboxId,
+        cap: SnapshotCapture,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        let finish_start = std::time::Instant::now();
+        let flavor = if cap.chain_prev.is_some() {
+            "diff"
+        } else {
+            "full"
+        };
+        // Filled by the diff branch below; consumed by the chain
+        // advance after the post-processing block succeeds.
+        let mut next_manifest_for_chain: Option<engram_chunk_store::Manifest> = None;
+
+        // ADR 0014 cleanup hygiene: from here on, FC has materialised
+        // state.bin + memory.bin in `dest` (4+ GiB). Any failure in
+        // the post-inner steps below (chunking, sidecar patch, BlobStorage
+        // upload, NBD version conflict surfaced via the caller's
+        // earlier flush) MUST rm -rf `dest` before propagating, or
+        // we leak 4 GiB per failure — idle-evict retries every ~30s
+        // and fills the host disk inside an hour.
+        let metadata = cap.metadata;
+        let dest = cap.dest;
+        let chain_prev = cap.chain_prev;
+        let paused_at = cap.paused_at;
+        #[cfg(target_os = "linux")]
+        let nbd_pending_flush = cap.nbd_pending_flush;
+        let mut metadata = metadata;
+        let post = async {
+            // ADR 0038 B3: the guest has resumed (inner.snapshot above
+            // brought it back). Upload the drained disk chunks to GCS +
+            // publish the manifest now — OFF the frozen-guest path. The
+            // operation scope makes the chunk uploads attach `chunk.flush`
+            // spans to the snapshot op's trace. Awaited here (before the
+            // snapshot is recorded) so the recorded `disk_manifest`
+            // references durable chunks; `base` is rebased only after the
+            // upload, so the background scheduler never sees a
+            // not-yet-uploaded chunk.
+            #[cfg(target_os = "linux")]
+            if let Some(pending) = nbd_pending_flush {
+                if let Some(entry) = self.nbd_sandboxes.get(&id) {
+                    entry.backend.operation_scope().begin("snapshot");
+                    let res = entry.backend.flush_upload(pending).await;
+                    entry.backend.operation_scope().end();
+                    let outcome =
+                        res.map_err(|e| SandboxError::Snapshot(format!("nbd disk upload: {e}")))?;
+                    tracing::info!(
+                        sandbox_id = %id,
+                        manifest = %outcome.manifest_ref,
+                        chunks_flushed = outcome.chunks_flushed,
+                        bytes_uploaded = outcome.bytes_uploaded,
+                        "chunked NBD disk uploaded (post-resume)",
+                    );
+                    metadata.disk_manifest = Some(outcome.manifest_ref);
+                }
+            }
+            // ADR 0007 / Phase 5: when a chunk store is wired AND the
+            // underlying backend left a memory.bin in `dest` (FC does;
+            // VZ + Process don't), chunk it into the store + patch the
+            // FC snapshot manifest so the UFFD handler can resolve
+            // session-divergent pages on restore. Skipped silently when
+            // either condition isn't met — VZ + Process paths still
+            // produce valid snapshots without a memory_manifest, and
+            // FC without a chunk_store falls back to RestoreMode::File.
+            let Some(chunk_store) = self.chunk_store.as_ref() else {
+                return Ok(metadata);
+            };
+            let manifest_ref = if let Some((prev_ref, prev_manifest)) = chain_prev.as_ref() {
+                // ADR 0028 Fix A diff path: re-chunk ONLY the chunks the
+                // dirty extents touched — the previous manifest's hashes
+                // carry over for everything else, so CPU + upload stay
+                // O(dirty set). The manifest id is stable for the chain's
+                // lifetime; only `version` ticks.
+                //
+                // ADR 0039: sparse-only. Reconstruct each dirty chunk from
+                // its prev content (warm chunk cache) + the sparse diff —
+                // no full memfile to read, keep, or overlay.
+                let diff_path = dest.join("memory.diff");
+                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+                    .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
+                let next = chunk_store
+                    .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
+                let next_ref = prev_ref.next_version();
+                chunk_store
+                    .put_manifest(next_ref, &next)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
+                // The sparse diff did its job; drop it so the local
+                // snapshot dir stays state.bin + sidecar sized.
+                let _ = fs::remove_file(&diff_path).await;
+                next_manifest_for_chain = Some(next);
+                tracing::info!(
+                    session_sandbox = %id,
+                    manifest = %next_ref,
+                    dirty_ranges = ranges.len(),
+                    "diff checkpoint re-chunked",
+                );
+                next_ref
+            } else {
+                let mem_path = dest.join("memory.bin");
+                if fs::metadata(&mem_path).await.is_err() {
+                    return Ok(metadata);
+                }
+                let mref = chunk_memory_to_store(chunk_store, &mem_path, self.chunk_cache.as_ref())
+                    .await?;
+                // ADR 0039: the dump is now durable in the chunk store and
+                // the chain seeds from the manifest (not this file) — drop
+                // the GiB-scale memory.bin so committed snapshot dirs stay
+                // state.bin + sidecar sized. A cross-host restore
+                // re-materializes it from the chunks via the manifest
+                // (restore_materializes_missing_memory_bin_from_chunks).
+                let _ = fs::remove_file(&mem_path).await;
+                tracing::info!(
+                    session_sandbox = %id,
+                    manifest = %mref,
+                    "chunked FC memory.bin → chunk store (local dump removed)",
+                );
+                mref
+            };
+            // Patch the FC sidecar JSON (`manifest.json`) so its
+            // `memory_manifest` field carries the ref the UFFD handler
+            // needs at restore time. The FC backend deserializes via
+            // serde with `#[serde(default)]`, so a JSON patch over the
+            // wire-shape stays compatible without us depending on its
+            // private struct.
+            let manifest_json = dest.join("manifest.json");
+            patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
+            metadata.memory_manifest = Some(manifest_ref);
+
+            // ADR 0014: upload state.bin + sidecar to BlobStorage so a
+            // sibling host can restore from this snapshot. memory.bin
+            // is already chunk-stored above; state.bin and sidecar are
+            // small opaque blobs (state.bin is FC VMM+device state,
+            // sidecar is `manifest.json` carrying spec + memory_manifest
+            // + source sandbox_id). Skipped silently when state.bin is
+            // missing (defensive: should always exist after FC snapshot,
+            // but the chunked-memory path already gates on memory.bin
+            // existence for the same reason).
+            let blob = chunk_store.blob_storage();
+            let state_path = dest.join("state.bin");
+            let sidecar_path = dest.join("manifest.json");
+            if fs::metadata(&state_path).await.is_ok() && fs::metadata(&sidecar_path).await.is_ok()
+            {
+                let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
+                let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &state_key,
+                    &state_path,
+                )
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &sidecar_key,
+                    &sidecar_path,
+                )
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+                metadata.state_blob_key = Some(state_key);
+                metadata.sidecar_blob_key = Some(sidecar_key);
+                metadata.source_sandbox_id = Some(id);
+                tracing::info!(
+                    source_sandbox = %id,
+                    snapshot_id = %metadata.id,
+                    "portable snapshot artifacts uploaded to BlobStorage",
+                );
+            }
+            // ADR 0035 §2: idempotently publish the pinned bundle
+            // generations. Runs on every snapshot flavor — an eviction
+            // snapshot can pin a swapped-in generation no base capture
+            // ever published. Failure fails the snapshot (a pin nothing
+            // can satisfy is worse than a retried eviction).
+            if !metadata.aux_bundles.is_empty() {
+                crate::bundles::BundleStore::new(blob.clone(), self.bundle_dir.clone())
+                    .publish(&metadata.aux_bundles)
+                    .await?;
+            }
+            Ok::<_, SandboxError>(metadata)
+        }
+        .await;
+
+        let result = match post {
+            Ok(m) => {
+                // ADR 0014 issue #1/#2: record the snapshot_id so a
+                // future commit/abort RPC can clean up the per-snapshot
+                // artifacts even though the caller only knows the
+                // sandbox_id. Also lets a retry of this same sandbox's
+                // snapshot() find and tear down the prior attempt.
+                self.inflight_snapshots.insert(id, m.id);
+                // ADR 0016 Phase A: stamp the memory-tier RPO signal
+                // the `cow_state` RPC reports. Done AFTER post-
+                // processing succeeded — a snapshot whose state.bin /
+                // sidecar upload failed isn't durable and shouldn't
+                // advance the RPO indicator on the diagnostic
+                // surface. Pre-`commit_snapshot` is fine: the row
+                // hasn't been "claimed" by PG yet but the bytes are
+                // in BlobStorage, which is what the RPO measures.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.last_snapshot_unix_ms.insert(id, now_ms);
+                // ADR 0028 Fix A: seed/advance the rolling chain +
+                // persist the durable host-owned record. Best-effort
+                // beyond the capture: a seed failure means the next
+                // capture is Full again; a record failure means only
+                // PG (if the caller's pipeline survives) knows this
+                // checkpoint. Both safe, both logged inside.
+                self.advance_checkpoint_state(id, &m, paused_at, next_manifest_for_chain)
+                    .await;
+                Ok(m)
+            }
+            Err(e) => {
+                // ADR 0014 cleanup hygiene: rm -rf the FC-written
+                // snapshot dir before propagating. Idle-evict retry
+                // (every ~30s) without this leaks 4 GiB per try and
+                // fills the host disk inside an hour.
+                match tokio::fs::remove_dir_all(&dest).await {
+                    Ok(_) => tracing::warn!(
+                        sandbox_id = %id,
+                        dest = %dest.display(),
+                        error = %e,
+                        "PooledBackend::snapshot post-inner failed; orphan dir cleaned",
+                    ),
+                    Err(rm_err) => tracing::warn!(
+                        sandbox_id = %id,
+                        dest = %dest.display(),
+                        snapshot_error = %e,
+                        rm_error = %rm_err,
+                        "PooledBackend::snapshot post-inner failed; rm -rf of orphan dir also failed",
+                    ),
+                }
+                Err(e)
+            }
+        };
+        metrics::histogram!(
+            crate::metrics::SNAPSHOT_FINISH_SECONDS,
+            "type" => flavor,
+            "outcome" => if result.is_ok() { "success" } else { "error" },
+        )
+        .record(finish_start.elapsed().as_secs_f64());
+        result
+    }
+    fn checkpoint_records_dir(&self) -> Option<PathBuf> {
+        self.checkpoint_dir.as_ref().map(|d| d.join("records"))
+    }
+
+    async fn advance_checkpoint_state(
+        &self,
+        id: SandboxId,
+        metadata: &SnapshotMetadata,
+        paused_at: chrono::DateTime<chrono::Utc>,
+        next_manifest: Option<engram_chunk_store::Manifest>,
+    ) {
+        if self.checkpoint_dir.is_none() {
+            return;
+        }
+        let Some(memory_ref) = metadata.memory_manifest else {
+            // No chunked memory (no chunk store / non-FC backend):
+            // nothing to chain, and a record without a memory
+            // manifest adds nothing over the live disk manifest.
+            return;
+        };
+
+        match next_manifest {
+            // Diff capture: the sparse re-chunk already ran in the post
+            // block; just advance the chain's manifest pointer.
+            Some(next) => {
+                if let Some(mut chain) = self.checkpoint_chains.get_mut(&id) {
+                    chain.manifest_ref = memory_ref;
+                    chain.manifest = next;
+                }
+            }
+            // Full capture: seed the chain manifest-only from the manifest
+            // we just published (ADR 0039 — no local rolling image; the
+            // memory.bin was chunked + removed in the post block).
+            // Subsequent captures ride the sparse diff path.
+            None => {
+                self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+            }
+        }
+
+        // Durable record — only for session-bound sandboxes (anonymous
+        // base-snapshot captures have no session to reconcile).
+        let Some(session_id) = self.session_bindings.get(&id).map(|s| *s) else {
+            return;
+        };
+        let Some(records_dir) = self.checkpoint_records_dir() else {
+            return;
+        };
+        let record = crate::checkpoint::CheckpointRecord {
+            snapshot_id: metadata.id,
+            session_id,
+            sandbox_id: id,
+            image_version: metadata.image_version.clone(),
+            size_bytes: metadata.size_bytes,
+            disk_manifest: metadata.disk_manifest,
+            memory_manifest: metadata.memory_manifest,
+            aux_bundles: metadata.aux_bundles.clone(),
+            paused_at,
+            captured_at: metadata.created_at,
+        };
+        if let Err(e) = record.persist(&records_dir).await {
+            tracing::warn!(
+                sandbox_id = %id,
+                snapshot_id = %metadata.id,
+                error = %e,
+                "durable checkpoint record write failed; PG row (if the caller's \
+                 pipeline survives) is the only reference",
+            );
+        }
+    }
+
+    /// ADR 0038 B2 / ADR 0039: seed the checkpoint chain manifest-only
+    /// (no local rolling image — "sparse mode"). Two entry points: on
+    /// RESUME from the source's memory manifest, and after a fresh Full
+    /// capture from the just-published one. ADR 0039 retired the rolling
+    /// memfile, so this is the *only* seed. The manifest already describes
+    /// the full image in the chunk store, so the next periodic checkpoint
+    /// takes the diff path (`update_for_dirty_ranges_sparse`) instead of a
+    /// Full re-read of guest RAM — which under UFFD faults the entire
+    /// working set in from the store (the 60 s `PUT /snapshot/create`
+    /// hang).
+    ///
+    /// Best-effort: a missing/unfetchable manifest just means the next
+    /// checkpoint falls back to Full. Skips when checkpointing is
+    /// disabled, there's no chunk store, or a chain is already tracked
+    /// (a fresh `restore` mints a new sandbox id; the Full-capture caller
+    /// only reaches here when the chain was empty).
+    async fn seed_checkpoint_chain_sparse(
+        &self,
+        id: SandboxId,
+        memory_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return;
+        };
+        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
+            return;
+        }
+        match chunk_store.get_manifest(memory_ref).await {
+            Ok(manifest) => {
+                self.checkpoint_chains.insert(
+                    id,
+                    crate::checkpoint::CheckpointChain {
+                        manifest_ref: memory_ref,
+                        manifest,
+                    },
+                );
+                tracing::info!(
+                    sandbox_id = %id,
+                    manifest = %memory_ref,
+                    "ADR 0038/0039: seeded sparse checkpoint chain; next checkpoint will diff",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    manifest = %memory_ref,
+                    error = %e,
+                    "resume chain seed failed; first checkpoint falls back to Full",
+                );
+            }
+        }
+    }
+}
+
 /// zero chunks + zero bytes of object storage.
 async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
@@ -2022,385 +2523,57 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        // ADR 0028 Fix A: serialize captures per sandbox — a periodic
-        // checkpoint and an eviction/drain/SIGTERM snapshot must never
-        // interleave (the pause is idempotent, but concurrent NBD
-        // flushes + chain advances are not).
-        let capture_lock = self.capture_lock(id);
-        // ADR 0038 B0: time the lock wait — the gridlock signal. With
-        // B1 periodic checkpoints skip rather than queue, so a long tail
-        // here is an eviction/drain blocked on an in-flight capture.
-        let lock_wait = std::time::Instant::now();
-        let _capture_guard = capture_lock.lock().await;
-        metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
-            .record(lock_wait.elapsed().as_secs_f64());
-        // Diff-mode when a checkpoint chain exists: same coherent
-        // (memory, disk) capture contract, O(dirty set) cost. The
-        // chain seeds on the first (Full) capture below — so an
-        // eviction on a long-running session is just the final diff
-        // in its checkpoint chain, collapsing the multi-GiB-dump
-        // window the cf4d4afd incident sat in.
-        let chain_prev = self
-            .checkpoint_chains
-            .get(&id)
-            .map(|c| (c.manifest_ref, c.manifest.clone()));
+        // ADR 0045 D5: composed form — capture, then run the post phase
+        // inline holding the capture lock (the periodic-checkpoint and
+        // drain flavor; eviction uses snapshot_begin/snapshot_wait).
+        let (_capture_guard, cap) = self.capture_phase(id).await?;
+        self.finisher().finish(id, cap).await
+    }
 
-        // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
-        // was produced but never committed (caller's downstream
-        // pipeline failed or the coord pod crashed between snapshot
-        // and commit), tear down its artifacts BEFORE we mint a fresh
-        // SnapshotId. This is the overwrite-in-place semantic that
-        // keeps the host-side disk bounded under coord-side retry
-        // storms — the prod incident on `engrams-fc-xngk` leaked
-        // ~25 dirs × 4 GiB in 13 min because each retry minted a fresh
-        // id and left the prior dir on disk.
-        if self.inflight_snapshots.contains_key(&id) {
-            if let Err(e) = self.abort_prior_inflight_snapshot(id).await {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    error = %e,
-                    "snapshot retry: best-effort abort of prior in-flight snapshot failed; \
-                     proceeding with fresh attempt anyway",
-                );
-            }
+    /// ADR 0045 D5: the eviction flavor. Runs the capture, re-pauses the
+    /// guest (it's being torn down — today's pipeline already discards
+    /// post-capture execution; this just stops it burning CPU during the
+    /// background upload), and spawns the post phase (chunk + upload +
+    /// chain bookkeeping) as a detached task that `snapshot_wait` awaits.
+    /// The coordinator may mark the session Idle as soon as this returns.
+    async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        let (capture_guard, cap) = self.capture_phase(id).await?;
+        // Idempotent re-pause; best-effort (a failure leaves the orphan
+        // running until destroy, which is today's behavior).
+        if let Err(e) = self.inner.pause(id).await {
+            tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
         }
-
-        // ADR 0021 P1.6 follow-up: gate snapshot on agentd readiness.
-        //
-        // The pre-flush pause below freezes vCPUs. If the guest is still
-        // in early boot (kernel → engram-init → agentd start) at that
-        // moment, the snapshot captures a half-initialised kernel — in
-        // particular, agentd may not have completed `bind(AF_VSOCK)` —
-        // and the resumed kernel comes up with a half-initialised vsock
-        // driver. `panic=1 reboot=k` then trips `KVM_EXIT_SHUTDOWN`
-        // ~1 s after `load_snapshot` returns; every subsequent
-        // host→guest dial fails ECONNREFUSED.
-        //
-        // Reachable in prod via:
-        //   1. SIGTERM-during-cold-boot. `shutdown.rs` checkpoints all
-        //      sandboxes from `backend.list()` after a 5 s drain — a
-        //      sandbox still booting at SIGTERM gets snapshotted mid-
-        //      bind without this gate.
-        //   2. coord-driven `snapshot(id)` fired quickly after create
-        //      (any fast-rebake / probe path).
-        //
-        // `wait_agent_ready` blocks until agentd has dialled the host's
-        // ready port (port 1027) — proving the guest's vsock stack is
-        // operational end-to-end. On warm-restored sandboxes the watch
-        // is pre-set true (FC's `restore_in_jail`), so this is a no-op
-        // for warm re-snapshot paths. The FC backend is the only one
-        // with the per-sandbox agent_ready watch; non-FC backends
-        // (Process, future) return `InvalidSpec` from the default trait
-        // impl, which we treat as "no readiness concept here, proceed."
-        match self.inner.wait_agent_ready(id).await {
-            Ok(()) => {}
-            Err(SandboxError::InvalidSpec(_)) => {}
-            Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
+        let snapshot_id = cap.metadata.id;
+        let finisher = self.finisher();
+        let handle = tokio::spawn(async move {
+            // The capture lock rides into the task: checkpoints stay
+            // locked out until the upload completes (chain bookkeeping
+            // is not concurrent-safe per sandbox).
+            let _capture_guard = capture_guard;
+            finisher.finish(id, cap).await
+        });
+        if let Some(prior) = self.snapshot_waits.insert(id, handle) {
+            // A prior begin whose wait never came (coordinator died).
+            // Don't await it (it may still be uploading) — just drop the
+            // handle; its artifacts are covered by the inflight tracking
+            // + abort-prior path on the next snapshot.
+            prior.abort();
+            tracing::warn!(sandbox_id = %id, "snapshot_begin superseded an unconsumed prior wait");
         }
+        Ok(snapshot_id)
+    }
 
-        // ADR 0018 commit 12m + ADR 0038 B3: snapshot ordering is
-        //   pause → wait_idle → flush_local(drain) → inner.snapshot
-        //   → [resume] → flush_upload(GCS) (in the `post` block)
-        // where inner.snapshot's internal pause/capture/resume is a
-        // no-op pause (FC's PATCH /vm is idempotent) followed by the
-        // memory dump and a resume that brings the VM back running.
-        // This guarantees memory + disk are CAPTURED at the same point
-        // in time: the explicit pause stops vCPUs, wait_idle drains any
-        // in-flight virtio writes through the NBD daemon, flush_local
-        // drains the just-quiesced dirty set locally, and inner.snapshot
-        // then captures the page cache (which agrees with that disk
-        // state). The disk GCS upload is deferred to flush_upload AFTER
-        // resume — off the frozen-guest path — but the captured *content*
-        // is fixed at the drain, so coherence is unchanged.
-        //
-        // Pre-12m ordering was flush → inner.snapshot (FC's pause
-        // happened inside the inner call AFTER our flush). Writes
-        // queued between flush and pause landed in memory but not
-        // the drained disk set — the cross-host evac canary md5
-        // mismatch on dev-vm validation was exactly this race.
-        //
-        // ADR 0028 A.log: the pause instant is the coherence cut for
-        // the (memory, disk, event-log) triple — the coord resolves
-        // the session_events cursor as "last event at or before this"
-        // when it records the checkpoint.
-        let paused_at = chrono::Utc::now();
-        self.inner
-            .pause(id)
+    /// ADR 0045 D5: await the background post phase. Single-consumer.
+    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        let (_, handle) = self.snapshot_waits.remove(&id).ok_or_else(|| {
+            SandboxError::Snapshot(format!("no snapshot_begin in flight for sandbox {id}"))
+        })?;
+        handle
             .await
-            .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
-
-        // ADR 0038 B3: under the pause, only DRAIN the dirty buffer
-        // (+ hash + stash in the backend's pending tier) — the
-        // multi-second GCS upload is deferred to `flush_upload` after
-        // the guest resumes (the `post` block below), so the
-        // guest-visible pause is O(local copy), not O(GCS). The drain
-        // still captures disk-at-the-pause-instant (ADR 0018 §12m); the
-        // memory capture below is paired with it.
-        #[cfg(target_os = "linux")]
-        let nbd_pending_flush = if let Some(entry) = self.nbd_sandboxes.get(&id) {
-            // Drain in-flight NBD requests so the drain sees a quiescent
-            // dirty buffer. With FC paused above, no new virtio writes
-            // are issued, and wait_idle returns once already-in-flight
-            // requests have completed through backend.write().
-            entry.backend.wait_idle().await;
-            let pending = entry
-                .backend
-                .flush_local()
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
-            Some(pending)
-        } else {
-            None
-        };
-
-        // ADR 0007 Phase 6: backend owns its staging dir; we look
-        // it up via snapshot_path_for after the inner call so we
-        // can read/patch the on-disk artifacts the inner backend
-        // wrote (memory.bin / memory.diff, manifest.json). The inner
-        // call's pause-create-resume cycle is idempotent against our
-        // earlier pause and brings the VM back to running on exit —
-        // for the diff flavor that resume lands after O(dirty set),
-        // not O(guest RAM).
-        // ADR 0038 B0: time the FC memory capture (`PUT /snapshot/
-        // create`) — the previously-invisible step that hung 60 s on the
-        // cold Full seed. After B2, `type="full"` should vanish on the
-        // resume path (chain seeded → diff).
-        let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
-        let create_start = std::time::Instant::now();
-        let create_res = if chain_prev.is_some() {
-            self.inner.snapshot_diff(id).await
-        } else {
-            self.inner.snapshot(id).await
-        };
-        metrics::histogram!(
-            crate::metrics::SNAPSHOT_CREATE_SECONDS,
-            "type" => snap_type,
-            "outcome" => if create_res.is_ok() { "success" } else { "error" },
-        )
-        .record(create_start.elapsed().as_secs_f64());
-        let mut metadata = create_res?;
-        let dest = self.inner.snapshot_path_for(metadata.id);
-        // Filled by the diff branch below; consumed by the chain
-        // advance after the post-processing block succeeds.
-        let mut next_manifest_for_chain: Option<engram_chunk_store::Manifest> = None;
-
-        // ADR 0014 cleanup hygiene: from here on, FC has materialised
-        // state.bin + memory.bin in `dest` (4+ GiB). Any failure in
-        // the post-inner steps below (chunking, sidecar patch, BlobStorage
-        // upload, NBD version conflict surfaced via the caller's
-        // earlier flush) MUST rm -rf `dest` before propagating, or
-        // we leak 4 GiB per failure — idle-evict retries every ~30s
-        // and fills the host disk inside an hour.
-        let post = async {
-            // ADR 0038 B3: the guest has resumed (inner.snapshot above
-            // brought it back). Upload the drained disk chunks to GCS +
-            // publish the manifest now — OFF the frozen-guest path. The
-            // operation scope makes the chunk uploads attach `chunk.flush`
-            // spans to the snapshot op's trace. Awaited here (before the
-            // snapshot is recorded) so the recorded `disk_manifest`
-            // references durable chunks; `base` is rebased only after the
-            // upload, so the background scheduler never sees a
-            // not-yet-uploaded chunk.
-            #[cfg(target_os = "linux")]
-            if let Some(pending) = nbd_pending_flush {
-                if let Some(entry) = self.nbd_sandboxes.get(&id) {
-                    entry.backend.operation_scope().begin("snapshot");
-                    let res = entry.backend.flush_upload(pending).await;
-                    entry.backend.operation_scope().end();
-                    let outcome =
-                        res.map_err(|e| SandboxError::Snapshot(format!("nbd disk upload: {e}")))?;
-                    tracing::info!(
-                        sandbox_id = %id,
-                        manifest = %outcome.manifest_ref,
-                        chunks_flushed = outcome.chunks_flushed,
-                        bytes_uploaded = outcome.bytes_uploaded,
-                        "chunked NBD disk uploaded (post-resume)",
-                    );
-                    metadata.disk_manifest = Some(outcome.manifest_ref);
-                }
-            }
-            // ADR 0007 / Phase 5: when a chunk store is wired AND the
-            // underlying backend left a memory.bin in `dest` (FC does;
-            // VZ + Process don't), chunk it into the store + patch the
-            // FC snapshot manifest so the UFFD handler can resolve
-            // session-divergent pages on restore. Skipped silently when
-            // either condition isn't met — VZ + Process paths still
-            // produce valid snapshots without a memory_manifest, and
-            // FC without a chunk_store falls back to RestoreMode::File.
-            let Some(chunk_store) = self.chunk_store.as_ref() else {
-                return Ok(metadata);
-            };
-            let manifest_ref = if let Some((prev_ref, prev_manifest)) = chain_prev.as_ref() {
-                // ADR 0028 Fix A diff path: re-chunk ONLY the chunks the
-                // dirty extents touched — the previous manifest's hashes
-                // carry over for everything else, so CPU + upload stay
-                // O(dirty set). The manifest id is stable for the chain's
-                // lifetime; only `version` ticks.
-                //
-                // ADR 0039: sparse-only. Reconstruct each dirty chunk from
-                // its prev content (warm chunk cache) + the sparse diff —
-                // no full memfile to read, keep, or overlay.
-                let diff_path = dest.join("memory.diff");
-                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
-                    .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
-                let next = chunk_store
-                    .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
-                let next_ref = prev_ref.next_version();
-                chunk_store
-                    .put_manifest(next_ref, &next)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
-                // The sparse diff did its job; drop it so the local
-                // snapshot dir stays state.bin + sidecar sized.
-                let _ = fs::remove_file(&diff_path).await;
-                next_manifest_for_chain = Some(next);
-                tracing::info!(
-                    session_sandbox = %id,
-                    manifest = %next_ref,
-                    dirty_ranges = ranges.len(),
-                    "diff checkpoint re-chunked",
-                );
-                next_ref
-            } else {
-                let mem_path = dest.join("memory.bin");
-                if fs::metadata(&mem_path).await.is_err() {
-                    return Ok(metadata);
-                }
-                let mref = chunk_memory_to_store(chunk_store, &mem_path, self.chunk_cache.as_ref())
-                    .await?;
-                // ADR 0039: the dump is now durable in the chunk store and
-                // the chain seeds from the manifest (not this file) — drop
-                // the GiB-scale memory.bin so committed snapshot dirs stay
-                // state.bin + sidecar sized. A cross-host restore
-                // re-materializes it from the chunks via the manifest
-                // (restore_materializes_missing_memory_bin_from_chunks).
-                let _ = fs::remove_file(&mem_path).await;
-                tracing::info!(
-                    session_sandbox = %id,
-                    manifest = %mref,
-                    "chunked FC memory.bin → chunk store (local dump removed)",
-                );
-                mref
-            };
-            // Patch the FC sidecar JSON (`manifest.json`) so its
-            // `memory_manifest` field carries the ref the UFFD handler
-            // needs at restore time. The FC backend deserializes via
-            // serde with `#[serde(default)]`, so a JSON patch over the
-            // wire-shape stays compatible without us depending on its
-            // private struct.
-            let manifest_json = dest.join("manifest.json");
-            patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
-            metadata.memory_manifest = Some(manifest_ref);
-
-            // ADR 0014: upload state.bin + sidecar to BlobStorage so a
-            // sibling host can restore from this snapshot. memory.bin
-            // is already chunk-stored above; state.bin and sidecar are
-            // small opaque blobs (state.bin is FC VMM+device state,
-            // sidecar is `manifest.json` carrying spec + memory_manifest
-            // + source sandbox_id). Skipped silently when state.bin is
-            // missing (defensive: should always exist after FC snapshot,
-            // but the chunked-memory path already gates on memory.bin
-            // existence for the same reason).
-            let blob = chunk_store.blob_storage();
-            let state_path = dest.join("state.bin");
-            let sidecar_path = dest.join("manifest.json");
-            if fs::metadata(&state_path).await.is_ok() && fs::metadata(&sidecar_path).await.is_ok()
-            {
-                let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
-                let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &state_key,
-                    &state_path,
-                )
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &sidecar_key,
-                    &sidecar_path,
-                )
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
-                metadata.state_blob_key = Some(state_key);
-                metadata.sidecar_blob_key = Some(sidecar_key);
-                metadata.source_sandbox_id = Some(id);
-                tracing::info!(
-                    source_sandbox = %id,
-                    snapshot_id = %metadata.id,
-                    "portable snapshot artifacts uploaded to BlobStorage",
-                );
-            }
-            // ADR 0035 §2: idempotently publish the pinned bundle
-            // generations. Runs on every snapshot flavor — an eviction
-            // snapshot can pin a swapped-in generation no base capture
-            // ever published. Failure fails the snapshot (a pin nothing
-            // can satisfy is worse than a retried eviction).
-            if !metadata.aux_bundles.is_empty() {
-                crate::bundles::BundleStore::new(blob.clone(), self.bundle_dir.clone())
-                    .publish(&metadata.aux_bundles)
-                    .await?;
-            }
-            Ok::<_, SandboxError>(metadata)
-        }
-        .await;
-
-        match post {
-            Ok(m) => {
-                // ADR 0014 issue #1/#2: record the snapshot_id so a
-                // future commit/abort RPC can clean up the per-snapshot
-                // artifacts even though the caller only knows the
-                // sandbox_id. Also lets a retry of this same sandbox's
-                // snapshot() find and tear down the prior attempt.
-                self.inflight_snapshots.insert(id, m.id);
-                // ADR 0016 Phase A: stamp the memory-tier RPO signal
-                // the `cow_state` RPC reports. Done AFTER post-
-                // processing succeeded — a snapshot whose state.bin /
-                // sidecar upload failed isn't durable and shouldn't
-                // advance the RPO indicator on the diagnostic
-                // surface. Pre-`commit_snapshot` is fine: the row
-                // hasn't been "claimed" by PG yet but the bytes are
-                // in BlobStorage, which is what the RPO measures.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                self.last_snapshot_unix_ms.insert(id, now_ms);
-                // ADR 0028 Fix A: seed/advance the rolling chain +
-                // persist the durable host-owned record. Best-effort
-                // beyond the capture: a seed failure means the next
-                // capture is Full again; a record failure means only
-                // PG (if the caller's pipeline survives) knows this
-                // checkpoint. Both safe, both logged inside.
-                self.advance_checkpoint_state(id, &m, paused_at, next_manifest_for_chain)
-                    .await;
-                Ok(m)
-            }
-            Err(e) => {
-                // ADR 0014 cleanup hygiene: rm -rf the FC-written
-                // snapshot dir before propagating. Idle-evict retry
-                // (every ~30s) without this leaks 4 GiB per try and
-                // fills the host disk inside an hour.
-                match tokio::fs::remove_dir_all(&dest).await {
-                    Ok(_) => tracing::warn!(
-                        sandbox_id = %id,
-                        dest = %dest.display(),
-                        error = %e,
-                        "PooledBackend::snapshot post-inner failed; orphan dir cleaned",
-                    ),
-                    Err(rm_err) => tracing::warn!(
-                        sandbox_id = %id,
-                        dest = %dest.display(),
-                        snapshot_error = %e,
-                        rm_error = %rm_err,
-                        "PooledBackend::snapshot post-inner failed; rm -rf of orphan dir also failed",
-                    ),
-                }
-                Err(e)
-            }
-        }
+            .map_err(|e| SandboxError::Snapshot(format!("snapshot upload task: {e}")))?
     }
 
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {

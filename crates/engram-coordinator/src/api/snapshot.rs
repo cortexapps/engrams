@@ -365,18 +365,34 @@ async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotRes
     // resume makes resume + eviction mutually exclusive per session. The
     // lease's `sandbox_id` is a diagnostic-only column; resume has no sandbox
     // at acquire time (it's about to create one), so we pass `None`.
-    let _lease = match crate::idle_evictor::SessionLeaseGuard::try_acquire(&state, id, None).await {
-        Ok(Some(guard)) => guard,
-        Ok(None) => {
-            return Err(ApiError::Conflict(format!(
-                "session {id} is already mid-resume or mid-eviction; retry shortly",
-            )))
+    // ADR 0045 D5: an eviction's finalize task holds the lease while its
+    // upload completes in the background (typically seconds for a
+    // diff-chain capture). A resume landing in that window WAITS briefly
+    // instead of 409ing — the common evict-then-immediately-resume shape
+    // — and only surfaces the Conflict if the lease stays held (a long
+    // full-seed upload, or a genuinely concurrent resume).
+    let mut lease = None;
+    for attempt in 0..8u32 {
+        match crate::idle_evictor::SessionLeaseGuard::try_acquire(&state, id, None).await {
+            Ok(Some(guard)) => {
+                lease = Some(guard);
+                break;
+            }
+            Ok(None) if attempt < 7 => {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "resume lease acquire failed: {e}"
+                )))
+            }
         }
-        Err(e) => {
-            return Err(ApiError::Internal(format!(
-                "resume lease acquire failed: {e}"
-            )))
-        }
+    }
+    let Some(_lease) = lease else {
+        return Err(ApiError::Conflict(format!(
+            "session {id} is already mid-resume or mid-eviction; retry shortly",
+        )));
     };
 
     let session = state.services.meta.get_session(id).await?;
