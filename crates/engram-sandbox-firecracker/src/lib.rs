@@ -942,7 +942,17 @@ impl FirecrackerBackend {
         let jail_dir = self.work_dir.join(sandbox_id.to_string());
         // ADR 0022: base-create (swap_aux_to_current) may use File; resume
         // follows restore_mode.
-        let restore_mode = self.effective_restore_mode(swap_aux_to_current);
+        //
+        // ADR 0045 C1: a migration restore is UFFD-shaped by
+        // construction — its memory is the staged local session
+        // manifest + cache-resident chunks, and there is deliberately
+        // NO memory.bin to File-load. Override whatever the host's
+        // configured mode says.
+        let restore_mode = if src.join("migration-session-manifest.json").exists() {
+            RestoreMode::Uffd
+        } else {
+            self.effective_restore_mode(swap_aux_to_current)
+        };
 
         match self
             .restore_in_jail(
@@ -1510,11 +1520,19 @@ impl FirecrackerBackend {
     }
 
     #[tracing::instrument(name = "fc.spawn_uffd_handler", skip_all)]
+    // 8 args: the migration manifest file is a restore-time input
+    // orthogonal to the trace/publish hosts; a params struct is the
+    // cleanup when the next arg arrives.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_uffd_handler(
         &self,
         uffd_uds: &Path,
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
+        // ADR 0045 C1: when a migration pre-staged the (not-yet-durable)
+        // session manifest as a local JSON file, the handler reads it
+        // from disk instead of the blob store.
+        session_manifest_json: Option<&Path>,
         prefault_trace_host: Option<uuid::Uuid>,
         publish_trace_host: Option<uuid::Uuid>,
         jail_dir: &Path,
@@ -1544,6 +1562,9 @@ impl FirecrackerBackend {
             .arg(canonical_ref.to_string())
             .arg("--session-manifest")
             .arg(session_ref.to_string());
+        if let Some(path) = session_manifest_json {
+            cmd.arg("--session-manifest-json").arg(path);
+        }
         // ADR 0007 Phase 5: hand the handler a work_dir-local
         // chunk cache root. `FirecrackerBackend::new` populates a
         // default; callers using `FirecrackerConfig` directly can
@@ -2472,6 +2493,14 @@ impl FirecrackerBackend {
                     let canonical_ref = base_memory_manifest.unwrap_or(session_ref);
                     let uffd_uds = jail_dir.join("uffd.sock");
                     let _ = tokio::fs::remove_file(&uffd_uds).await;
+                    // ADR 0045 C1: a migration destination pre-stages the
+                    // not-yet-durable session manifest as a local file in
+                    // the snapshot dir (the catch-up upload publishes it
+                    // later); when present, the handler resolves the
+                    // session manifest from disk instead of the store.
+                    let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
+                    let migration_manifest =
+                        migration_manifest.exists().then_some(migration_manifest);
                     // ADR 0007 Phase 5: prefault host from the sidecar (capture
                     // host); publish under THIS host so later restores here use
                     // the local trace.
@@ -2482,6 +2511,7 @@ impl FirecrackerBackend {
                             &uffd_uds,
                             canonical_ref,
                             session_ref,
+                            migration_manifest.as_deref(),
                             prefault_host,
                             publish_host,
                             jail_dir,
@@ -4406,6 +4436,7 @@ impl FirecrackerBackend {
             // dev/test paths don't need a chunk-store wiring.
             memory_manifest: None,
             base_memory_manifest: None,
+            migration_source: None,
             // ADR 0014: portable-snapshot fields are populated by
             // `PooledBackend::snapshot` after the inner backend
             // returns. Bare FC stays BlobStorage-agnostic.
@@ -4682,6 +4713,7 @@ mod tests {
         // with a Snapshot error.
         let (b, _d) = backend();
         let metadata = SnapshotMetadata {
+            migration_source: None,
             id: SnapshotId::new(),
             size_bytes: 0,
             created_at: Utc::now(),
@@ -4795,6 +4827,7 @@ mod tests {
         .await
         .unwrap();
         let metadata = SnapshotMetadata {
+            migration_source: None,
             id: snapshot_id,
             size_bytes: 0,
             created_at: Utc::now(),

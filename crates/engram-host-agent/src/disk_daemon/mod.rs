@@ -60,6 +60,6 @@ pub use slot::{NbdSlot, NbdSlotAllocator};
 
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    attach_manifest, recover_stuck_nbd_devices, spawn, NbdHandle, NbdRuntimeError, NbdSandboxState,
-    NBD_BLOCK_SIZE,
+    attach_manifest, attach_manifest_content, recover_stuck_nbd_devices, spawn, NbdHandle,
+    NbdRuntimeError, NbdSandboxState, NBD_BLOCK_SIZE,
 };

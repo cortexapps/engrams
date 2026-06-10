@@ -544,6 +544,33 @@ pub async fn attach_manifest(
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
     let backend =
         ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?;
+    attach_backend(backend, slot_pool).await
+}
+
+/// ADR 0045 C1: attach from manifest CONTENT delivered inline (a
+/// migration destination's not-yet-durable disk manifest).
+pub async fn attach_manifest_content(
+    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
+    manifest: &engram_chunk_store::Manifest,
+    cache: engram_chunk_store::cache::ChunkCache,
+    store: Arc<engram_chunk_store::ChunkStore>,
+    slot_pool: &Arc<NbdSlotAllocator>,
+    threshold_bytes: u64,
+) -> Result<NbdSandboxState, NbdRuntimeError> {
+    let backend = ChunkedDiskBackend::from_manifest(
+        disk_manifest_ref,
+        manifest,
+        cache,
+        store,
+        threshold_bytes,
+    )?;
+    attach_backend(backend, slot_pool).await
+}
+
+async fn attach_backend(
+    backend: ChunkedDiskBackend,
+    slot_pool: &Arc<NbdSlotAllocator>,
+) -> Result<NbdSandboxState, NbdRuntimeError> {
     let backend = Arc::new(backend);
     let slot = slot_pool.acquire().await;
     let handle = spawn(backend.clone(), slot.path()).await?;

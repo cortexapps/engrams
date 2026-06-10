@@ -8,7 +8,13 @@
 //!      markers written before the capture survive, the guest accepts
 //!      new exec, and the next checkpoint diffs on the intact chain
 //!      (the aborted capture's unpublished v+1 ref is safely re-minted).
-//!   3. `migration_commit` (second VM) destroys the frozen source.
+//!   3. The FULL same-host teleport loop over real gRPC (ADR 0045 C1
+//!      PR3): capture VM2 -> destination-style restore with a
+//!      `migration_source` rider pulls the export over a live tonic
+//!      HostService on loopback -> the moved VM carries the
+//!      post-checkpoint marker -> `snapshot_wait` drives the durability
+//!      catch-up -> commit destroys the frozen source. The two-host
+//!      integration's same-host precursor.
 //!
 //! Wired into ci.yml's `test-firecracker` job.
 
@@ -58,6 +64,17 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         eprintln!("SKIP: musl engram-agentd not built at {}", agent.display());
         return;
     }
+    // The teleport-restore leg is UFFD by construction (the migration
+    // override forces it regardless of the configured File mode), so
+    // the handler binary must exist — same convention as snapshot_uffd.
+    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
+    if !handler.exists() {
+        eprintln!(
+            "SKIP: engram-uffd-handler not built at {} — run `cargo build -p engram-uffd-handler`",
+            handler.display()
+        );
+        return;
+    }
 
     // ---- 1. Bake an agentd-injected rootfs ----
     let src = tempfile::tempdir().expect("source dir");
@@ -94,7 +111,15 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     // ---- 2. PooledBackend (FC inner, chunked, dirty tracking) ----
     let mut cfg = FirecrackerConfig::with_kernel(kernel);
     cfg.net_pool = None;
+    // File for ordinary creates/restores — the migration restore must
+    // OVERRIDE to Uffd on its own (the product fix this test pins).
     cfg.restore_mode = RestoreMode::File;
+    cfg.uffd_handler_bin = handler;
+    // The handler subprocess must reach the SAME blob store + NVMe
+    // chunk cache the host-agent uses (prod wires both to shared
+    // paths; the dest pull stages divergent chunks into this cache).
+    cfg.uffd_blob_root = Some(work.path().join("blob"));
+    cfg.uffd_cache_root = Some(work.path().join("chunk-cache"));
     cfg.track_dirty_pages = true;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
     let inner = Arc::new(FirecrackerBackend::new(work.path(), cfg));
@@ -191,20 +216,85 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     );
     pooled.destroy(vm).await.expect("destroy vm1");
 
-    // ---- 5. Commit destroys the frozen source ----
+    // ---- 5. The full same-host teleport loop over real gRPC ----
+    // Serve THIS PooledBackend as a HostService on loopback — the
+    // "source host". The destination pull dials it exactly as a peer
+    // host-agent would.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener); // free the port for tonic (test-local race is fine)
+    let serve_inner: Arc<dyn engram_core::traits::HostClient> =
+        Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(pooled.clone()));
+    tokio::spawn(engram_host_agent::grpc_server::boot(
+        addr,
+        serve_inner,
+        None,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
     let vm2 = pooled.create(spec).await.expect("create vm2");
     let _ = exec(&pooled, vm2, "true").await;
-    let _ = pooled
+    let ckpt_v2 = pooled
         .checkpoint_sandbox(vm2)
         .await
         .expect("vm2 seed checkpoint");
+    let moved_sum = plant_marker(&pooled, vm2, 7).await;
     let out2 = pooled.migration_capture(vm2).await.expect("capture vm2");
+
+    // Build the destination restore metadata the coordinator (PR4)
+    // will assemble: the captured snapshot + the migration rider.
+    let mut metadata = ckpt_v2.clone();
+    metadata.id = out2.snapshot_id;
+    metadata.memory_manifest = Some(out2.memory_manifest_ref);
+    metadata.disk_manifest =
+        (!out2.disk_manifest_json.is_empty()).then_some(out2.disk_manifest_ref);
+    metadata.state_blob_key = None;
+    metadata.sidecar_blob_key = None;
+    metadata.migration_source = Some(engram_core::types::snapshot::MigrationSourceInfo {
+        export_id: out2.export_id.clone(),
+        source_addr: format!("http://{addr}"),
+        memory_manifest_json: out2.memory_manifest_json.clone(),
+        disk_manifest_json: out2.disk_manifest_json.clone(),
+        memory_manifest_ref: out2.memory_manifest_ref,
+        disk_manifest_ref: out2.disk_manifest_ref,
+        new_memory_chunk_hashes: out2.new_memory_chunk_hashes.clone(),
+        new_disk_chunk_hashes: out2.new_disk_chunk_hashes.clone(),
+    });
+
+    let moved = pooled.restore(metadata).await.expect("teleport restore");
+    let check = exec(&pooled, moved, "sha256sum /dev/shm/marker7 | cut -d' ' -f1").await;
+    assert_eq!(
+        check.trim(),
+        moved_sum,
+        "the post-checkpoint marker survives the move — the behavioral \
+         differentiator vs snapshot-rehome"
+    );
+
+    // Durability catch-up: snapshot_wait returns the row metadata once
+    // chunks + manifests are store-durable.
+    let row = pooled.snapshot_wait(moved).await.expect("catch-up");
+    assert_eq!(row.memory_manifest, Some(out2.memory_manifest_ref));
+    chunk_store
+        .get_manifest(out2.memory_manifest_ref)
+        .await
+        .expect("memory manifest durable after catch-up");
+    for h in &out2.new_memory_chunk_hashes {
+        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
+        chunk_store
+            .get_chunk(hash)
+            .await
+            .expect("transfer chunk durable after catch-up");
+    }
+
+    // Commit destroys the frozen source; the moved VM lives on.
     pooled
         .migration_commit(vm2, &out2.export_id)
         .await
         .expect("commit");
     let listed = pooled.list().await.expect("list");
     assert!(!listed.contains(&vm2), "committed source must be destroyed");
+    assert!(listed.contains(&moved), "the moved VM survives the commit");
+    pooled.destroy(moved).await.expect("destroy moved");
 }
 
 async fn plant_marker(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, n: u32) -> String {

@@ -1142,6 +1142,7 @@ async fn try_restore_base_snapshot(
         // canonical == session by construction; the host's fallback does
         // exactly that.
         base_memory_manifest: None,
+        migration_source: None,
         id: snapshot_id,
         size_bytes: record.size_bytes,
         created_at: record.created_at,

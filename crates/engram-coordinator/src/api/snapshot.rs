@@ -1091,6 +1091,7 @@ async fn resume_from_fc_snapshot(
         created_at: record.created_at,
         image_version: record.image_version.clone(),
         base_memory_manifest,
+        migration_source: None,
         disk_manifest: effective_disk_manifest,
         memory_manifest: record.memory_manifest,
         // ADR 0028 cross-host recovery: a memory-bearing FC snapshot

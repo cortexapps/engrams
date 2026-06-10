@@ -232,6 +232,11 @@ pub struct PooledBackend {
     /// ADR 0045 C1: open live-migration exports (frozen sandboxes
     /// serving a move). See `crate::migration`.
     migrations: Arc<crate::migration::MigrationRegistry>,
+    /// ADR 0045 C1 (destination): inline, not-yet-durable disk
+    /// manifests staged by a migration pull, consumed by
+    /// `prepare_resume_nbd_attach` (keyed by the provisional ref).
+    inline_disk_manifests:
+        Arc<DashMap<engram_core::types::manifest::ManifestRef, engram_chunk_store::Manifest>>,
 }
 
 impl PooledBackend {
@@ -510,6 +515,7 @@ impl PooledBackend {
             capture_locks: Arc::new(DashMap::new()),
             snapshot_waits: Arc::new(DashMap::new()),
             migrations: Arc::new(crate::migration::MigrationRegistry::default()),
+            inline_disk_manifests: Arc::new(DashMap::new()),
         }
     }
 
@@ -754,6 +760,251 @@ impl PooledBackend {
                 nbd_pending_flush,
             },
         ))
+    }
+
+    /// ADR 0045 C1 (destination): pull the frozen source's export —
+    /// state.bin + sidecar into the local snapshot dir, every transfer
+    /// chunk into the NVMe cache (hash-verified by `cache.put`), the
+    /// inline session manifest as a local file the handler resolves
+    /// from disk, and the inline disk manifest staged for
+    /// `prepare_resume_nbd_attach`.
+    async fn migration_prestage(
+        &self,
+        metadata: &SnapshotMetadata,
+        mig: &engram_core::types::snapshot::MigrationSourceInfo,
+    ) -> Result<(), SandboxError> {
+        use engram_core::types::snapshot::MigrationItem;
+        let Some(cache) = self.chunk_cache.clone() else {
+            return Err(SandboxError::InvalidSpec(
+                "migration restore needs a chunk cache".into(),
+            ));
+        };
+        let dest = self.inner.snapshot_path_for(metadata.id);
+        fs::create_dir_all(&dest)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("create snapshot dir: {e}")))?;
+
+        let channel = tonic::transport::Endpoint::from_shared(mig.source_addr.clone())
+            .map_err(|e| SandboxError::InvalidSpec(format!("bad source_addr: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("dial migration source: {e}")))?;
+        let source = engram_protocol::grpc_client::GrpcHostClient::new(channel);
+
+        let mut items = vec![MigrationItem::StateBin, MigrationItem::Sidecar];
+        items.extend(
+            mig.new_memory_chunk_hashes
+                .iter()
+                .map(|h| MigrationItem::Chunk(*h)),
+        );
+        items.extend(
+            mig.new_disk_chunk_hashes
+                .iter()
+                .map(|h| MigrationItem::Chunk(*h)),
+        );
+        let item_specs = items.clone();
+        let mut stream = source
+            .migration_fetch(&mig.export_id, items)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration fetch: {e}")))?;
+
+        use futures::StreamExt;
+        let mut current: Vec<u8> = Vec::new();
+        let mut current_idx: Option<u32> = None;
+        while let Some(frame) = stream.next().await {
+            let frame = frame.map_err(|e| SandboxError::Snapshot(format!("fetch frame: {e}")))?;
+            if current_idx != Some(frame.item_idx) {
+                if current_idx.is_some() && !current.is_empty() {
+                    return Err(SandboxError::Snapshot(
+                        "migration fetch: item switched before its last frame".into(),
+                    ));
+                }
+                current_idx = Some(frame.item_idx);
+                current.clear();
+            }
+            if frame.offset != current.len() as u64 {
+                return Err(SandboxError::Snapshot(
+                    "migration fetch: out-of-order frame".into(),
+                ));
+            }
+            current.extend_from_slice(&frame.data);
+            if frame.last {
+                let idx = frame.item_idx as usize;
+                let spec = item_specs.get(idx).ok_or_else(|| {
+                    SandboxError::Snapshot("migration fetch: unknown item index".into())
+                })?;
+                match spec {
+                    MigrationItem::StateBin => {
+                        fs::write(dest.join("state.bin"), &current)
+                            .await
+                            .map_err(|e| SandboxError::Snapshot(format!("write state.bin: {e}")))?;
+                    }
+                    MigrationItem::Sidecar => {
+                        fs::write(dest.join("manifest.json"), &current)
+                            .await
+                            .map_err(|e| SandboxError::Snapshot(format!("write sidecar: {e}")))?;
+                    }
+                    MigrationItem::Chunk(h) => {
+                        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
+                        cache.put(hash, &current).await.map_err(|e| {
+                            SandboxError::Snapshot(format!("stage chunk {hash}: {e}"))
+                        })?;
+                    }
+                }
+                current = Vec::new();
+                current_idx = None;
+            }
+        }
+
+        // Stage the inline manifests: the session (memory) manifest as
+        // the local file `restore_in_jail` auto-detects; the disk
+        // manifest for the NBD attach.
+        fs::write(
+            dest.join("migration-session-manifest.json"),
+            &mig.memory_manifest_json,
+        )
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("write migration manifest: {e}")))?;
+        if !mig.disk_manifest_json.is_empty() {
+            let disk: engram_chunk_store::Manifest =
+                serde_json::from_slice(&mig.disk_manifest_json)
+                    .map_err(|e| SandboxError::Snapshot(format!("parse disk manifest: {e}")))?;
+            self.inline_disk_manifests
+                .insert(mig.disk_manifest_ref, disk);
+        }
+        tracing::info!(
+            snapshot_id = %metadata.id,
+            export = %mig.export_id,
+            mem_chunks = mig.new_memory_chunk_hashes.len(),
+            disk_chunks = mig.new_disk_chunk_hashes.len(),
+            "migration prestage complete (ADR 0045 C1)",
+        );
+        Ok(())
+    }
+
+    /// ADR 0045 C1 (destination): post-restore — seed the chain from
+    /// the inline v+1 content, fence checkpoints + disk publishes
+    /// until durability, and spawn the catch-up (chunks → manifests)
+    /// into the `snapshot_wait` slot for the coordinator's
+    /// row-only-at-finalize.
+    async fn migration_finish_restore(
+        &self,
+        id: SandboxId,
+        mig: engram_core::types::snapshot::MigrationSourceInfo,
+        mut row_template: SnapshotMetadata,
+    ) -> Result<(), SandboxError> {
+        let mem_manifest: engram_chunk_store::Manifest =
+            serde_json::from_slice(&mig.memory_manifest_json)
+                .map_err(|e| SandboxError::Snapshot(format!("parse mem manifest: {e}")))?;
+        self.checkpoint_chains.insert(
+            id,
+            crate::checkpoint::CheckpointChain {
+                manifest_ref: mig.memory_manifest_ref,
+                manifest: mem_manifest.clone(),
+            },
+        );
+        // Fences: the capture lock blocks checkpoints (a dest
+        // checkpoint pre-durability would publish a v+2 referencing
+        // not-yet-uploaded chunks); the NBD migration_fence blocks
+        // disk publishes for the same reason.
+        let capture_guard = self.capture_lock(id).lock_owned().await;
+        #[cfg(target_os = "linux")]
+        if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            entry.backend.set_migration_fence(true);
+        }
+
+        let Some(chunk_store) = self.chunk_store.clone() else {
+            return Err(SandboxError::InvalidSpec("no chunk store".into()));
+        };
+        let Some(cache) = self.chunk_cache.clone() else {
+            return Err(SandboxError::InvalidSpec("no chunk cache".into()));
+        };
+        #[cfg(target_os = "linux")]
+        let nbd = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
+        let inline_disks = self.inline_disk_manifests.clone();
+        let handle = tokio::spawn(async move {
+            let _capture_guard = capture_guard;
+            // 1. Upload every pulled chunk (content-addressed,
+            //    idempotent) — memory then disk.
+            for h in mig
+                .new_memory_chunk_hashes
+                .iter()
+                .chain(mig.new_disk_chunk_hashes.iter())
+            {
+                let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
+                let bytes = cache
+                    .get(hash, || async {
+                        Err(engram_chunk_store::error::ChunkStoreError::Internal(
+                            "catch-up chunk must be cache-resident".into(),
+                        ))
+                    })
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("catch-up read {hash}: {e}")))?;
+                chunk_store
+                    .put_chunk(&bytes)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("catch-up upload {hash}: {e}")))?;
+            }
+            // 2. Publish the memory manifest (session-owned lineage —
+            //    no conflict possible).
+            chunk_store
+                .put_manifest(mig.memory_manifest_ref, &mem_manifest)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("publish mem manifest: {e}")))?;
+            // 3. Publish the disk manifest with the shared-lineage
+            //    conflict-retry (mirror flush_upload's rule).
+            let mut disk_ref_final = None;
+            if let Some((_, disk_manifest)) = inline_disks.remove(&mig.disk_manifest_ref) {
+                let mut attempt_ref = mig.disk_manifest_ref;
+                for _ in 0..5 {
+                    match chunk_store.put_manifest(attempt_ref, &disk_manifest).await {
+                        Ok(()) => {
+                            disk_ref_final = Some(attempt_ref);
+                            break;
+                        }
+                        Err(engram_chunk_store::error::ChunkStoreError::VersionConflict {
+                            latest,
+                            ..
+                        }) => {
+                            attempt_ref.version = latest + 1;
+                        }
+                        Err(e) => {
+                            return Err(SandboxError::Snapshot(format!(
+                                "publish disk manifest: {e}"
+                            )))
+                        }
+                    }
+                }
+                let Some(final_ref) = disk_ref_final else {
+                    return Err(SandboxError::Snapshot(
+                        "disk manifest publish: version conflict retries exhausted".into(),
+                    ));
+                };
+                #[cfg(target_os = "linux")]
+                if let Some(nbd) = &nbd {
+                    nbd.rebase_manifest_ref(final_ref).await;
+                    nbd.set_migration_fence(false);
+                }
+                row_template.disk_manifest = Some(final_ref);
+            } else {
+                #[cfg(target_os = "linux")]
+                if let Some(nbd) = &nbd {
+                    nbd.set_migration_fence(false);
+                }
+            }
+            row_template.memory_manifest = Some(mig.memory_manifest_ref);
+            tracing::info!(
+                sandbox_id = %id,
+                mem_ref = %mig.memory_manifest_ref,
+                "migration durability catch-up complete (ADR 0045 C1)",
+            );
+            Ok(row_template)
+        });
+        if let Some(prior) = self.snapshot_waits.insert(id, handle) {
+            prior.abort();
+        }
+        Ok(())
     }
 
     pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
@@ -3005,10 +3256,31 @@ impl SandboxBackend for PooledBackend {
         // cheap diff, not a Full re-read of guest RAM (the UFFD fault
         // storm). Fresh creates seed the same way now (ADR 0045
         // seed-at-create) — see `restore_fresh` / `restore_base_for_session`.
+        //
+        // ADR 0045 C1: a migration restore pulls the frozen source's
+        // export FIRST (state.bin + sidecar + chunks into the local
+        // cache, inline manifests staged), restores from those local
+        // artifacts, then seeds the chain from the inline v+1 content
+        // and spawns the durability catch-up (awaited by the
+        // coordinator via the existing `snapshot_wait`).
+        let mut metadata = metadata;
+        let migration = metadata.migration_source.take();
+        if let Some(mig) = &migration {
+            self.migration_prestage(&metadata, mig).await?;
+        }
         let memory_ref = metadata.memory_manifest;
+        let row_template = migration.as_ref().map(|_| metadata.clone());
         let id = self.restore_with(metadata, /*fresh=*/ false).await?;
-        if let Some(memory_ref) = memory_ref {
-            self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+        match migration {
+            Some(mig) => {
+                self.migration_finish_restore(id, mig, row_template.expect("set above"))
+                    .await?;
+            }
+            None => {
+                if let Some(memory_ref) = memory_ref {
+                    self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+                }
+            }
         }
         Ok(id)
     }
@@ -3521,7 +3793,24 @@ impl PooledBackend {
         //      rebased on `disk_ref` and starts the daemon. The
         //      returned NbdSandboxState carries scheduler=None;
         //      install_flush_scheduler runs post-restore.
+        //
+        // ADR 0045 C1: a migration restore staged its (not-yet-durable)
+        // disk manifest inline — attach from that content; the store
+        // would 404 on the provisional ref.
         let store_arc = Arc::new(chunk_store.clone());
+        if let Some(inline) = self.inline_disk_manifests.get(&disk_ref) {
+            let state = crate::disk_daemon::attach_manifest_content(
+                disk_ref,
+                inline.value(),
+                chunk_cache.clone(),
+                store_arc,
+                pool,
+                self.flush_config.dirty_threshold_bytes,
+            )
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("nbd attach (migration): {e}")))?;
+            return Ok(Some(state));
+        }
         let state = crate::disk_daemon::attach_manifest(
             disk_ref,
             chunk_cache.clone(),
@@ -3930,6 +4219,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
                     sidecar_blob_key: None,
@@ -4068,6 +4358,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
                     sidecar_blob_key: None,
@@ -4206,6 +4497,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
                     sidecar_blob_key: None,
@@ -4440,6 +4732,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: Some(manifest_ref),
             base_memory_manifest: None,
+            migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -4568,6 +4861,7 @@ mod tests {
             disk_manifest: None,
             memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
             base_memory_manifest: None,
+            migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -5055,6 +5349,7 @@ mod tests {
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
+                    migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
                     sidecar_blob_key: None,
