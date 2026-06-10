@@ -395,6 +395,7 @@ impl SandboxBackend for ProcessBackend {
             // No memory snapshot in ProcessBackend — there's no
             // guest RAM to capture.
             memory_manifest: None,
+            base_memory_manifest: None,
             // ADR 0014: ProcessBackend is dev/test only; no portable
             // BlobStorage upload.
             source_sandbox_id: None,
@@ -1090,6 +1091,7 @@ mod tests {
             image_version: "test".into(),
             disk_manifest: None,
             memory_manifest: None,
+            base_memory_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,

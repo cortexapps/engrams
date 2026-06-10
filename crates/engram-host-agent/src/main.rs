@@ -332,6 +332,10 @@ async fn main() -> Result<(), HostAgentError> {
             // page-cache copy per host (the D2 rollout gate; D3/D4
             // parity flips retire the knob).
             fc_cfg.uffd_base_dir = engram_sandbox_firecracker::uffd_base_dir_from_env();
+            // ADR 0045 D4: GC unreferenced base shm files (disabled
+            // images, pre-D4 session-keyed leftovers). Live files are
+            // protected by the handlers' open fds; see base_shm_gc.
+            let _base_shm_gc = engram_host_agent::base_shm_gc::spawn(fc_cfg.uffd_base_dir.clone());
             // ADR 0014 M1.12: each FC host maintains a 16 MiB empty
             // ext4 stub harness that warm-pool restore points the
             // harness symlink at. Content-identical to the one the

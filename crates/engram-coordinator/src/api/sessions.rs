@@ -1138,6 +1138,10 @@ async fn try_restore_base_snapshot(
     // manifests come off the snapshots row. Together this is the full
     // portable metadata the host's cross-host restore path consumes.
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
+        // ADR 0045 D4: fresh creates restore FROM the base snapshot, so
+        // canonical == session by construction; the host's fallback does
+        // exactly that.
+        base_memory_manifest: None,
         id: snapshot_id,
         size_bytes: record.size_bytes,
         created_at: record.created_at,
@@ -1170,6 +1174,7 @@ async fn try_restore_base_snapshot(
         // the restore path; no host needs to have prefetched the image.
         required_image_digest: None,
         exclude_host: None,
+        prefer_host: None,
     };
     // ADR 0046: reserve at pick. Rank candidates in-memory (affinity /
     // readiness), then atomically pick + reserve in Postgres so a concurrent

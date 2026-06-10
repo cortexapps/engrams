@@ -284,6 +284,7 @@ impl HostClient for FakeCaptureHost {
             image_version: "reuse-fixture".into(),
             disk_manifest: Some(self.disk_manifest),
             memory_manifest: None, // cold-boot shape (VZ-like)
+            base_memory_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,

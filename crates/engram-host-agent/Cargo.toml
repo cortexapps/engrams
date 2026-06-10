@@ -81,6 +81,8 @@ tempfile = "3"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+# base_shm_gc tests backdate mtimes
+filetime = "0.2"
 engram-harness-noop.workspace = true
 engram-sandbox-process.workspace = true
 tempfile = "3"

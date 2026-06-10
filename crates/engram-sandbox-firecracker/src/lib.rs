@@ -875,6 +875,9 @@ impl FirecrackerBackend {
             &manifest,
             /*swap_aux_to_current=*/ false,
             self.effective_restore_mode(/*fresh=*/ false),
+            // Reattach has no coordinator metadata; canonical falls back
+            // to the session ref (unshared but correct — rare path).
+            None,
         )
         .await
     }
@@ -949,6 +952,7 @@ impl FirecrackerBackend {
                 &manifest,
                 swap_aux_to_current,
                 restore_mode,
+                metadata.base_memory_manifest,
             )
             .await
         {
@@ -2219,6 +2223,10 @@ impl FirecrackerBackend {
     /// `state.bin`/`memory.bin` into it. Symmetric with `create_in_jail`
     /// — same outer cleanup contract on error.
     #[tracing::instrument(name = "fc.restore_in_jail", skip_all, fields(sandbox_id = %sandbox_id))]
+    // 8 args: the D4 canonical ref is a restore-time input that can't ride
+    // the capture-time sidecar; bundling into a params struct is the cleanup
+    // when the next one arrives.
+    #[allow(clippy::too_many_arguments)]
     async fn restore_in_jail(
         &self,
         sandbox_id: SandboxId,
@@ -2231,6 +2239,12 @@ impl FirecrackerBackend {
         // caller via `effective_restore_mode` rather than read from
         // `self.config.restore_mode`, which is now resume-only.
         restore_mode: RestoreMode,
+        // ADR 0045 D4: the IMAGE's base manifest from the coordinator's
+        // restore metadata (a restore-time input — the capture-time
+        // sidecar can't know it). `Some` ⇒ substrate restores CONTINUE
+        // base-identical pages against the shared per-image base shm;
+        // `None` ⇒ canonical == session (old coordinators, reattach).
+        base_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
     ) -> Result<(), SandboxError> {
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
@@ -2447,8 +2461,15 @@ impl FirecrackerBackend {
                                 .into(),
                         )
                     })?;
-                    // ADR 0015 M5: canonical_ref == session_ref.
-                    let canonical_ref = session_ref;
+                    // ADR 0045 D4: the canonical ref is the IMAGE's base
+                    // manifest when the coordinator supplies it — resumed
+                    // sessions then CONTINUE base-identical pages against
+                    // the SHARED per-image base shm (density across fresh +
+                    // resumed sessions, and resumes stop minting
+                    // session-keyed base files). Fallback (old coordinator
+                    // or fresh create, where the snapshot IS the base):
+                    // canonical == session, the ADR 0015 M5 behavior.
+                    let canonical_ref = base_memory_manifest.unwrap_or(session_ref);
                     let uffd_uds = jail_dir.join("uffd.sock");
                     let _ = tokio::fs::remove_file(&uffd_uds).await;
                     // ADR 0007 Phase 5: prefault host from the sidecar (capture
@@ -2566,11 +2587,12 @@ impl FirecrackerBackend {
                     .await?;
                 }
                 Some((_handler, uffd_uds)) => {
-                    // ADR 0045 substrate (v2b): same canonical ref as the
-                    // handler spawn (canonical == session, ADR 0015 M5),
-                    // so the derived base path matches the handler's.
-                    let base = manifest
-                        .memory_manifest
+                    // ADR 0045 substrate: same canonical ref as the handler
+                    // spawn (D4: the image base manifest when supplied, else
+                    // the session manifest), so the derived base path always
+                    // matches the handler's.
+                    let base = base_memory_manifest
+                        .or(manifest.memory_manifest)
                         .and_then(|r| self.uffd_base_path(&r));
                     tracing::Instrument::instrument(
                         async {
@@ -4383,6 +4405,7 @@ impl FirecrackerBackend {
             // way the FC backend stays chunk-store-agnostic and
             // dev/test paths don't need a chunk-store wiring.
             memory_manifest: None,
+            base_memory_manifest: None,
             // ADR 0014: portable-snapshot fields are populated by
             // `PooledBackend::snapshot` after the inner backend
             // returns. Bare FC stays BlobStorage-agnostic.
@@ -4665,6 +4688,7 @@ mod tests {
             image_version: "test:1".into(),
             disk_manifest: None,
             memory_manifest: None,
+            base_memory_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -4777,6 +4801,7 @@ mod tests {
             image_version: "test:1".into(),
             disk_manifest: None,
             memory_manifest: None,
+            base_memory_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,

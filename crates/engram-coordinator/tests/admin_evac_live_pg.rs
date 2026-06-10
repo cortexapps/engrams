@@ -123,6 +123,7 @@ impl HostClient for FakeBackend {
             image_version: "test".into(),
             disk_manifest: None,
             memory_manifest: None,
+            base_memory_manifest: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -610,6 +611,7 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
         memory_mib: None,
         required_image_digest: None,
         exclude_host: None,
+        prefer_host: None,
     };
     let (first_pick, _) = registry.pick_for_session(&ctx).expect("pick succeeds");
     assert!(first_pick == cordoned || first_pick == healthy);
@@ -637,6 +639,7 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
         memory_mib: None,
         required_image_digest: None,
         exclude_host: Some(healthy),
+        prefer_host: None,
     };
     let (picked, _) = registry
         .pick_for_session(&exclude_healthy_ctx)
