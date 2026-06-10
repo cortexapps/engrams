@@ -773,6 +773,16 @@ impl PooledBackend {
             .await
     }
 
+    async fn seed_checkpoint_chain_forked(
+        &self,
+        id: SandboxId,
+        src_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        self.finisher()
+            .seed_checkpoint_chain_forked(id, src_ref)
+            .await
+    }
+
     /// Sandboxes due for a periodic checkpoint: session-bound, and no
     /// successful capture (of any flavor) within `interval`. Empty
     /// when checkpointing is disabled.
@@ -2229,6 +2239,66 @@ impl SnapshotFinisher {
         }
     }
 
+    /// ADR 0045 seed-at-create: seed the chain by FORKING the source
+    /// lineage — publish the source manifest's content under a fresh
+    /// manifest id @v1, and chain on that. Required because fresh
+    /// creates seed from the SHARED per-image base manifest: chaining
+    /// directly on it makes every session's first diff race to publish
+    /// `base_id@v2` (the e2e-caught version conflict). The fork gives
+    /// each session a lineage it solely owns; the diff path then ticks
+    /// versions unchanged. One small manifest-JSON PUT (no chunk
+    /// uploads — the content is byte-identical to the source).
+    /// Best-effort like the sparse seed: failure → no chain → the next
+    /// capture is Full.
+    async fn seed_checkpoint_chain_forked(
+        &self,
+        id: SandboxId,
+        src_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return;
+        };
+        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
+            return;
+        }
+        let manifest = match chunk_store.get_manifest(src_ref).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    manifest = %src_ref,
+                    error = %e,
+                    "seed-at-create: source manifest fetch failed; first checkpoint falls back to Full",
+                );
+                return;
+            }
+        };
+        let fork_ref = engram_core::types::manifest::ManifestRef::new();
+        if let Err(e) = chunk_store.put_manifest(fork_ref, &manifest).await {
+            tracing::warn!(
+                sandbox_id = %id,
+                src = %src_ref,
+                fork = %fork_ref,
+                error = %e,
+                "seed-at-create: fork manifest publish failed; first checkpoint falls back to Full",
+            );
+            return;
+        }
+        self.checkpoint_chains.insert(
+            id,
+            crate::checkpoint::CheckpointChain {
+                manifest_ref: fork_ref,
+                manifest,
+            },
+        );
+        tracing::info!(
+            sandbox_id = %id,
+            src = %src_ref,
+            fork = %fork_ref,
+            "ADR 0045 seed-at-create: chain seeded on a forked lineage; first checkpoint will diff",
+        );
+    }
+
     /// ADR 0038 B2 / ADR 0039: seed the checkpoint chain manifest-only
     /// (no local rolling image — "sparse mode"). Two entry points: on
     /// RESUME from the source's memory manifest, and after a fresh Full
@@ -2634,8 +2704,8 @@ impl SandboxBackend for PooledBackend {
         // `metadata` is moved, then seed the chain sparse after the VM
         // is up — so the first post-resume periodic checkpoint is a
         // cheap diff, not a Full re-read of guest RAM (the UFFD fault
-        // storm). Idle-resume only; `restore_fresh` (base-create) keeps
-        // its Full seed.
+        // storm). Fresh creates seed the same way now (ADR 0045
+        // seed-at-create) — see `restore_fresh` / `restore_base_for_session`.
         let memory_ref = metadata.memory_manifest;
         let id = self.restore_with(metadata, /*fresh=*/ false).await?;
         if let Some(memory_ref) = memory_ref {
@@ -2645,7 +2715,20 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.restore_with(metadata, /*fresh=*/ true).await
+        // ADR 0045 seed-at-create: guest RAM right after a fresh restore
+        // is byte-identical to the base snapshot's memory manifest, and
+        // FC dirty-page tracking runs from the restore — exactly the
+        // resume-seeding argument. Seeding here makes the session's
+        // FIRST capture a diff (pages it actually dirtied) instead of a
+        // Full dump+re-chunk of all guest RAM. FORKED seed: the source
+        // manifest is shared across sessions, so the chain must own a
+        // fresh lineage (see seed_checkpoint_chain_forked).
+        let memory_ref = metadata.memory_manifest;
+        let id = self.restore_with(metadata, /*fresh=*/ true).await?;
+        if let Some(memory_ref) = memory_ref {
+            self.seed_checkpoint_chain_forked(id, memory_ref).await;
+        }
+        Ok(id)
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -2780,7 +2863,18 @@ impl SandboxBackend for PooledBackend {
         //    harness baked into the rootfs at /opt/engram/harness/.
         //    Fresh flavor (ADR 0035 §3): aux bundles swap to the host's
         //    current generation so new sessions run the latest skills.
+        let memory_ref = metadata.memory_manifest;
         let id = self.restore_with(metadata, /*fresh=*/ true).await?;
+        // ADR 0045 seed-at-create: the session's RAM == the base
+        // manifest at this instant (see `restore_fresh`); seed the
+        // chain so the first eviction diffs instead of Full-dumping.
+        // FORKED: the base manifest is shared across every session of
+        // the image — each chain must own its own lineage. The env
+        // merge below dirties pages AFTER tracking started, so the
+        // diff stays correct.
+        if let Some(memory_ref) = memory_ref {
+            self.seed_checkpoint_chain_forked(id, memory_ref).await;
+        }
 
         // Inject the per-session env (manifest env + secrets + session
         // id). The base snapshot is shared, so per-session values can't
