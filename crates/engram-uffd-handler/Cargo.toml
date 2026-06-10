@@ -58,7 +58,9 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # itself doesn't gate by target_os; we do here so a workspace-wide
 # `cargo check` on macOS doesn't try to build it.
 [target.'cfg(target_os = "linux")'.dependencies]
-userfaultfd = "0.9"
+# linux5_13: Uffd::continue_ (UFFDIO_CONTINUE) for the ADR 0045 substrate's
+# shared-base installs (MINOR-fault resolution against the base shm file).
+userfaultfd = { version = "0.9", features = ["linux5_13"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -93,6 +93,8 @@ pub enum HandlerError {
         mappings_total: u64,
         manifest_total: u64,
     },
+    /// ADR 0045 substrate: the base shm file couldn't be written/probed.
+    BaseShm(crate::base_shm::BaseShmError),
 }
 
 impl std::fmt::Display for HandlerError {
@@ -116,6 +118,7 @@ impl std::fmt::Display for HandlerError {
                 "FC mappings sum to {mappings_total} bytes; manifests describe \
                  {manifest_total} bytes — refusing to serve a mismatched memory layout"
             ),
+            Self::BaseShm(e) => write!(f, "base shm: {e}"),
         }
     }
 }
@@ -226,6 +229,19 @@ pub struct Runtime {
     /// even if the run loop hangs on a stale userfaultfd that the
     /// kernel never closes after FC dies.
     trace_output: Option<PathBuf>,
+    /// ADR 0045 unified memory substrate (v2b). When set, guest memory
+    /// is `MAP_PRIVATE` of this per-template base shm file (registered
+    /// `MISSING|MINOR` by the forked FC) and canonical chunks install
+    /// via populate-the-base + `UFFDIO_CONTINUE` — one page-cache copy
+    /// shared by every same-template VM on the host — instead of a
+    /// private `UFFDIO_COPY`. Session-divergent chunks keep COPY.
+    /// `None` ⇒ stock Route-B behavior, byte-identical.
+    base_shm: Option<crate::base_shm::BaseShm>,
+    /// Whether `UFFDIO_ZEROPAGE` works on the substrate's MAP_PRIVATE
+    /// file-backed mapping (kernel-version dependent). Starts `true`;
+    /// flips to `false` on the first EINVAL and zero chunks fall back
+    /// to a private COPY of a zeroed buffer.
+    zeropage_ok: std::sync::atomic::AtomicBool,
 }
 
 impl Runtime {
@@ -242,6 +258,7 @@ impl Runtime {
         backend: Arc<ChunkedMemoryBackend>,
         handle: TokioHandle,
         recorder_window: Duration,
+        base_shm: Option<crate::base_shm::BaseShm>,
     ) -> Result<Self, HandlerError> {
         let mappings_total: u64 = mappings.iter().map(|m| m.size as u64).sum();
         if mappings_total != backend.total_bytes() {
@@ -272,6 +289,8 @@ impl Runtime {
             installed: Mutex::new(vec![false; chunk_count]),
             page_size,
             trace_output: None,
+            base_shm,
+            zeropage_ok: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -332,6 +351,29 @@ impl Runtime {
                 // Trace mentions a hash the session no longer needs
                 // (rewritten / GC'd). Cheap to skip.
                 skipped += 1;
+                continue;
+            }
+            // ADR 0045 substrate: canonical positions must install via the
+            // shared base + CONTINUE — a prefault COPY here would privately
+            // duplicate exactly the hot pages the substrate exists to share.
+            if let Some(base) = self.base_shm.as_ref() {
+                for byte_offset in positions {
+                    let shared = matches!(
+                        self.backend.resolve(byte_offset),
+                        Some(ResolvedPage::Canonical { canonical_offset })
+                            if self.backend.canonical_chunk_hash(canonical_offset)
+                                == Some(*hash)
+                    );
+                    let did = if shared {
+                        self.install_canonical_shared(base, byte_offset, *hash, false)?
+                    } else {
+                        let bytes = self.handle.block_on(self.backend.fetch_chunk(*hash))?;
+                        self.install_chunk_at(byte_offset, bytes, false)?
+                    };
+                    if did {
+                        installed += 1;
+                    }
+                }
                 continue;
             }
             let bytes = self.handle.block_on(self.backend.fetch_chunk(*hash))?;
@@ -442,6 +484,129 @@ impl Runtime {
         Ok(true)
     }
 
+    /// ADR 0045 substrate (v2b): install a canonical chunk by ensuring the
+    /// base shm file holds its bytes, then `UFFDIO_CONTINUE`-ing the range —
+    /// the kernel maps the base file's page-cache pages (write-protected
+    /// MAP_PRIVATE; guest writes COW), so every same-template VM on the host
+    /// shares one physical copy. The fetch is skipped entirely when a
+    /// sibling already populated the range (`SEEK_HOLE` probe).
+    fn install_canonical_shared(
+        &self,
+        base: &crate::base_shm::BaseShm,
+        byte_offset: u64,
+        hash: engram_chunk_store::ChunkHash,
+        wake: bool,
+    ) -> Result<bool, HandlerError> {
+        let chunk_size = self.backend.chunk_size();
+        let chunk_idx = (byte_offset / chunk_size) as usize;
+        {
+            let mut installed = self.installed.lock().expect("installed bitmap poisoned");
+            if let Some(slot) = installed.get_mut(chunk_idx) {
+                if *slot {
+                    return Ok(false);
+                }
+                *slot = true;
+            }
+        }
+
+        let (_m, host_va, room_to_eom) = locate_offset(&self.mappings, byte_offset)
+            .ok_or(HandlerError::AddressOutsideRegions(byte_offset))?;
+        let populate_len = std::cmp::min(
+            chunk_size,
+            self.backend.total_bytes().saturating_sub(byte_offset),
+        );
+        if !base.is_populated(byte_offset, populate_len) {
+            let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+            base.write_chunk(byte_offset, &bytes)
+                .map_err(HandlerError::BaseShm)?;
+        }
+
+        let install_len =
+            std::cmp::min(std::cmp::min(chunk_size, room_to_eom), populate_len) as usize;
+        debug_assert!(install_len.is_multiple_of(self.page_size as usize));
+        // CONTINUE the whole range in one ioctl; the kernel may map a prefix
+        // and return EAGAIN-with-progress (surfaced by the crate as
+        // Ok(mapped < len)) — loop the remainder. EEXIST means a racing
+        // prefault/fault already mapped a page; treat as installed.
+        let mut done: u64 = 0;
+        while (done as usize) < install_len {
+            let start = host_va + done;
+            let len = install_len as u64 - done;
+            // (`Uffd::continue` is a safe wrapper — the range lies inside a
+            // UFFD-registered region whose backing pages we just ensured
+            // are present in the base file's page cache.)
+            match self
+                .uffd
+                .r#continue(start as *mut std::ffi::c_void, len as usize, wake)
+            {
+                Ok(0) => break, // defensive: no progress
+                Ok(mapped) => done += mapped,
+                Err(userfaultfd::Error::SystemError(e)) if e as i32 == libc::EEXIST => {
+                    // Page(s) already mapped (racing fault). The kernel
+                    // stops at the first conflict without reporting
+                    // progress; skip one page and keep going.
+                    done += self.page_size;
+                }
+                Err(e) => return Err(HandlerError::Uffd(e)),
+            }
+        }
+        Ok(true)
+    }
+
+    /// ADR 0045 substrate (v2b): zero canonical chunks. Try
+    /// `UFFDIO_ZEROPAGE` (maps the kernel zero page — zero RAM until the
+    /// guest writes); some kernels reject it on MAP_PRIVATE file-backed
+    /// mappings, in which case fall back to a private COPY of a zeroed
+    /// buffer (correct, costs one private page per touched page).
+    fn install_zero_substrate(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
+        let chunk_size = self.backend.chunk_size();
+        let chunk_idx = (byte_offset / chunk_size) as usize;
+        {
+            let mut installed = self.installed.lock().expect("installed bitmap poisoned");
+            if let Some(slot) = installed.get_mut(chunk_idx) {
+                if *slot {
+                    return Ok(false);
+                }
+                *slot = true;
+            }
+        }
+        let (_m, host_va, room_to_eom) = locate_offset(&self.mappings, byte_offset)
+            .ok_or(HandlerError::AddressOutsideRegions(byte_offset))?;
+        let install_len = std::cmp::min(chunk_size, room_to_eom) as usize;
+
+        use std::sync::atomic::Ordering;
+        if self.zeropage_ok.load(Ordering::Relaxed) {
+            // SAFETY: range is inside a registered region (as above).
+            match unsafe {
+                self.uffd
+                    .zeropage(host_va as *mut std::ffi::c_void, install_len, wake)
+            } {
+                Ok(_) => return Ok(true),
+                Err(userfaultfd::Error::ZeropageFailed(errno))
+                    if errno as i32 == libc::EINVAL || errno as i32 == libc::EOPNOTSUPP =>
+                {
+                    self.zeropage_ok.store(false, Ordering::Relaxed);
+                    tracing::info!(
+                        "UFFDIO_ZEROPAGE unsupported on the substrate mapping;                          falling back to COPY-of-zeros"
+                    );
+                }
+                Err(e) => return Err(HandlerError::Uffd(e)),
+            }
+        }
+        let zeros = bytes::Bytes::from(vec![0u8; install_len]);
+        // SAFETY: zeroed buffer of install_len; same contract as
+        // install_chunk_at's copy.
+        unsafe {
+            self.uffd.copy(
+                zeros.as_ptr() as *const _,
+                host_va as *mut std::ffi::c_void,
+                install_len,
+                wake,
+            )?;
+        }
+        Ok(true)
+    }
+
     /// Run forever, draining events from the UFFD and serving each
     /// page fault. Returns `Ok(())` cleanly when the UFFD is closed
     /// (Firecracker exited / sandbox destroyed).
@@ -520,8 +685,18 @@ impl Runtime {
                                 r.observe(hash);
                             }
                         }
-                        let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                        let installed = self.install_chunk_at(chunk_byte_offset, bytes, true)?;
+                        let installed = match self.base_shm.as_ref() {
+                            // ADR 0045 substrate: shared install via the
+                            // base shm + CONTINUE (one physical copy per
+                            // host); guest writes COW privately.
+                            Some(base) => {
+                                self.install_canonical_shared(base, chunk_byte_offset, hash, true)?
+                            }
+                            None => {
+                                let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                                self.install_chunk_at(chunk_byte_offset, bytes, true)?
+                            }
+                        };
                         if !installed {
                             // Already installed: wake the vCPU since the
                             // kernel may have queued the fault before our
@@ -530,7 +705,11 @@ impl Runtime {
                         }
                     }
                     None => {
-                        let installed = self.install_zero_at(chunk_byte_offset, true)?;
+                        let installed = if self.base_shm.is_some() {
+                            self.install_zero_substrate(chunk_byte_offset, true)?
+                        } else {
+                            self.install_zero_at(chunk_byte_offset, true)?
+                        };
                         if !installed {
                             self.wake_page(page_aligned, page_size)?;
                         }
@@ -604,6 +783,7 @@ pub fn run_listener(
     prefault_trace: Option<WorkingSetTrace>,
     recorder_window: Duration,
     trace_output: Option<PathBuf>,
+    base_shm: Option<crate::base_shm::BaseShm>,
 ) -> Result<WorkingSetTrace, HandlerError> {
     let pid = std::process::id();
     let _ = std::fs::remove_file(&listen);
@@ -622,7 +802,7 @@ pub fn run_listener(
         total_bytes = total,
         "handshake complete",
     );
-    let mut rt = Runtime::new(mappings, uffd, backend, handle, recorder_window)?;
+    let mut rt = Runtime::new(mappings, uffd, backend, handle, recorder_window, base_shm)?;
     if let Some(path) = trace_output {
         rt.set_trace_output(path);
     }
@@ -775,6 +955,7 @@ mod tests {
                 backend,
                 tokio::runtime::Handle::current(),
                 Duration::ZERO,
+                None,
             )
             .unwrap(),
         );

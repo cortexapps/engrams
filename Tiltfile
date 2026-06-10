@@ -397,6 +397,12 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         # where the handler is present. (Base-create stays code-default
         # `file`, which needs no handler.)
         'ENGRAM_FC_RESTORE_MODE': env_or('ENGRAM_FC_RESTORE_MODE', 'file'),
+        # ADR 0045 substrate (v2b): point at a tmpfs dir (e.g.
+        # /dev/shm/engram) to back Uffd restores with a shared
+        # per-template base shm. Empty = off (stock anonymous Uffd).
+        # Must be listed here: the host-agent runs under sudo
+        # --preserve-env=<these keys>, which scrubs unlisted vars.
+        'ENGRAM_FC_UFFD_BASE_DIR': env_or('ENGRAM_FC_UFFD_BASE_DIR', ''),
         # gRPC plumbing — coord dials advertise, host-agent listens on
         # bind. Same machine in dev, so loopback works for both.
         'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:' + grpc_port,

@@ -331,6 +331,13 @@ async fn main() -> Result<(), HostAgentError> {
             if let Ok(p) = std::env::var("ENGRAM_FC_UFFD_HANDLER_BIN") {
                 fc_cfg.uffd_handler_bin = p.into();
             }
+            // ADR 0045 unified memory substrate (v2b): when
+            // ENGRAM_FC_UFFD_BASE_DIR points at a tmpfs dir, Uffd-mode
+            // restores back guest memory MAP_PRIVATE on a per-template
+            // base shm file there — canonical pages become one shared
+            // page-cache copy per host (the D2 rollout gate; D3/D4
+            // parity flips retire the knob).
+            fc_cfg.uffd_base_dir = engram_sandbox_firecracker::uffd_base_dir_from_env();
             // ADR 0014 M1.12: each FC host maintains a 16 MiB empty
             // ext4 stub harness that warm-pool restore points the
             // harness symlink at. Content-identical to the one the
