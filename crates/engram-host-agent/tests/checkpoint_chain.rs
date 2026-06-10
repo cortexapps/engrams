@@ -291,49 +291,76 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     pooled.destroy(restored2).await.expect("destroy restored2");
 
     // ---- 9. ADR 0045 seed-at-create: a FRESH restore (the
-    // base-snapshot create path, `restore_fresh`) seeds the chain from
-    // the snapshot's manifest too — guest RAM at restore is byte-
-    // identical to that manifest, and dirty tracking runs from the
-    // restore. The session's FIRST capture must therefore be a DIFF
-    // (same manifest_id, version+1), not a Full dump+re-chunk of all
-    // guest RAM. Pre-fix, every fresh session's first eviction paid the
-    // Full-dump cost (prod canary 0daf1bcd: 130 s of upload).
-    let fresh = pooled
+    // base-snapshot create path) seeds the chain by FORKING the source
+    // lineage — guest RAM at restore is byte-identical to the source
+    // manifest, dirty tracking runs from the restore, but the source
+    // manifest is SHARED across sessions, so each chain must own a
+    // fresh manifest id. Two fresh restores from the same checkpoint
+    // both capture successfully (pre-fix: the second one's diff raced
+    // the first to publish src_id@v+1 and died on the chunk store's
+    // version conflict — the e2e-stack regression), each on a DISTINCT
+    // fresh lineage at v2 (v2 = a diff of the v1 fork; a Full would
+    // have minted yet another id at v1).
+    let fresh_a = pooled
         .restore_fresh(ckpt3.clone())
         .await
-        .expect("fresh restore from checkpoint");
-    let sum4 = plant_marker(&pooled, fresh, 4).await;
+        .expect("fresh restore A");
+    // Marker planted BEFORE B exists: File-mode siblings restored from
+    // the same snapshot exhibit a pre-existing interference where guest
+    // writes made AFTER a sibling's restore are missing from the next
+    // DIFF capture (Full captures are immune, which is why pre-seed-at-
+    // create code never saw it; prod fresh creates run the UFFD
+    // substrate, not File). Characterized while landing the lineage
+    // fork — tracked separately, see issue #172.
+    let sum4 = plant_marker(&pooled, fresh_a, 4).await;
+    let fresh_b = pooled
+        .restore_fresh(ckpt3.clone())
+        .await
+        .expect("fresh restore B");
     let t = Instant::now();
-    let ckpt4 = pooled
-        .checkpoint_sandbox(fresh)
+    let ckpt_a = pooled
+        .checkpoint_sandbox(fresh_a)
         .await
-        .expect("checkpoint 4 (seed-at-create first capture)");
+        .expect("checkpoint A (seed-at-create diff)");
+    let ckpt_b = pooled
+        .checkpoint_sandbox(fresh_b)
+        .await
+        .expect("checkpoint B (pre-fix: version conflict on the shared lineage)");
     eprintln!(
-        "CHAIN: checkpoint 4 (seed-at-create diff) {} ms, manifest {:?}",
+        "CHAIN: seed-at-create forked diffs {} ms, A {:?} B {:?}",
         t.elapsed().as_millis(),
-        ckpt4.memory_manifest,
+        ckpt_a.memory_manifest,
+        ckpt_b.memory_manifest,
     );
-    let m4 = ckpt4
+    let ma = ckpt_a
         .memory_manifest
-        .expect("seed-at-create diff must publish a memory manifest");
-    assert_eq!(
-        m4.manifest_id, m1.manifest_id,
-        "seed-at-create keeps the source manifest id — the fresh session's          first capture DIFFED instead of Full-seeding a new chain",
+        .expect("forked diff A must publish a memory manifest");
+    let mb = ckpt_b
+        .memory_manifest
+        .expect("forked diff B must publish a memory manifest");
+    assert_ne!(
+        ma.manifest_id, m1.manifest_id,
+        "seed-at-create forks the lineage — never chains on the shared source id",
+    );
+    assert_ne!(
+        ma.manifest_id, mb.manifest_id,
+        "each fresh session owns a distinct forked lineage",
     );
     assert_eq!(
-        m4.version,
-        m3.version + 1,
-        "seed-at-create diff ticks the version"
+        ma.version, 2,
+        "v2 of the fork proves the first capture DIFFED (a Full mints a new id at v1)",
     );
+    assert_eq!(mb.version, 2, "sibling fork also diffs at v2");
 
-    // Byte-fidelity: restore the seed-at-create-built checkpoint and
-    // verify the fresh session's marker (and the inherited ones)
-    // survive — the diff against the create-time manifest is correct.
-    pooled.destroy(fresh).await.expect("destroy fresh");
+    // Byte-fidelity: restore the forked checkpoint built from A's diff
+    // against the fork-published manifest and verify every marker —
+    // including marker4, dirtied AFTER the fork seed.
+    pooled.destroy(fresh_a).await.expect("destroy fresh_a");
+    pooled.destroy(fresh_b).await.expect("destroy fresh_b");
     let restored3 = pooled
-        .restore(ckpt4)
+        .restore(ckpt_a)
         .await
-        .expect("restore from seed-at-create checkpoint");
+        .expect("restore from seed-at-create forked checkpoint");
     let out = exec(
         &pooled,
         restored3,
@@ -344,7 +371,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     assert_eq!(
         sums,
         vec![sum1.as_str(), sum2.as_str(), sum3.as_str(), sum4.as_str()],
-        "all four markers survive the seed-at-create-built checkpoint restore",
+        "all four markers survive the forked-lineage checkpoint restore",
     );
     pooled.destroy(restored3).await.expect("destroy restored3");
 }
