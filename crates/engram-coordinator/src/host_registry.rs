@@ -861,6 +861,19 @@ impl HostClient for HostRegistry {
         backend.snapshot(id).await
     }
 
+    async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.snapshot_begin(id).await
+    }
+
+    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.snapshot_wait(id).await
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
         backend.commit_snapshot(id).await

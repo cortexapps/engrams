@@ -95,6 +95,17 @@ impl HostClient for LocalHostClient {
         self.sandbox.snapshot(id).await
     }
 
+    async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        self.sandbox.snapshot_begin(id).await
+    }
+
+    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        self.sandbox.snapshot_wait(id).await
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         self.sandbox.commit_snapshot(id).await
     }

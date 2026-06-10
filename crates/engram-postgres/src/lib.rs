@@ -2359,6 +2359,23 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn touch_session_lease(
+        &self,
+        session_id: SessionId,
+        locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_lease SET locked_at = now() \
+             WHERE session_id = $1 AND locked_by = $2",
+        )
+        .bind(session_id.as_uuid())
+        .bind(locked_by)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
     async fn sweep_stale_session_leases(
         &self,
         max_age: std::time::Duration,

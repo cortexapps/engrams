@@ -181,6 +181,43 @@ impl GrpcHostClient {
         decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
     }
 
+    /// ADR 0045 D5. An `Unimplemented` status from a pre-D5 host-agent
+    /// maps to `InvalidSpec` (same shape as the trait default), which the
+    /// coordinator treats as "fall back to the composed snapshot()".
+    pub async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .snapshot_begin(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let uuid = uuid::Uuid::from_slice(&resp.snapshot_id)
+            .map_err(|e| SandboxError::Snapshot(format!("snapshot_begin id decode: {e}")))?;
+        Ok(engram_core::types::SnapshotId::from(uuid))
+    }
+
+    /// ADR 0045 D5: await the host-side background upload.
+    pub async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .snapshot_wait(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
+    }
+
     pub async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         let req = SandboxIdMessage {
             uuid: id.as_uuid().as_bytes().to_vec(),
@@ -781,6 +818,17 @@ impl HostClient for GrpcHostClient {
         Self::snapshot(self, id).await
     }
 
+    async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        Self::snapshot_begin(self, id).await
+    }
+
+    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        Self::snapshot_wait(self, id).await
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         Self::commit_snapshot(self, id).await
     }
@@ -899,6 +947,12 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
         Code::DeadlineExceeded | Code::Aborted => SandboxError::Timeout,
         Code::ResourceExhausted => SandboxError::LimitExceeded(status.message().to_string()),
         Code::InvalidArgument => SandboxError::InvalidSpec(status.message().to_string()),
+        // ADR 0045 D5: a pre-D5 host-agent answers the new
+        // SnapshotBegin/SnapshotWait RPCs with Unimplemented; map to the
+        // same InvalidSpec shape the trait defaults use so the
+        // coordinator's "unsupported -> composed snapshot()" fallback
+        // fires uniformly for old binaries and non-FC backends alike.
+        Code::Unimplemented => SandboxError::InvalidSpec(status.message().to_string()),
         // Unavailable = host disconnected mid-call / channel evicted.
         // Surfacing as `Vm` rather than a dedicated variant matches
         // the WS path's `ConnectionError::Closed` mapping.

@@ -34,6 +34,16 @@ service HostService {
   // sidecar.json, working_set.json) so they don't accumulate as
   // 4 GiB-per-attempt leaks during retry storms. Idempotent.
   rpc AbortSnapshot(SandboxIdMessage) returns (Empty);
+  // ADR 0045 D5: the teardown reorder. SnapshotBegin runs only the
+  // pause-side capture (pause -> NBD drain -> FC create; for eviction
+  // the VM stays paused) and spawns the chunk+upload work as a host-side
+  // background task; SnapshotWait awaits that task and returns the
+  // durable SnapshotMetadata. The coordinator marks the session Idle
+  // between the two — user-visible teardown ends at Begin. The legacy
+  // Snapshot RPC stays as the composed begin+wait (periodic checkpoints,
+  // drain paths, old coordinators).
+  rpc SnapshotBegin(SandboxIdMessage) returns (SnapshotBeginResponse);
+  rpc SnapshotWait(SandboxIdMessage) returns (SnapshotResponse);
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
   // ADR 0045 Phase F: freeze / unfreeze a running microVM *in place* —
@@ -166,6 +176,13 @@ message ListSandboxesResponse {
 }
 
 // --- Snapshot ---
+
+message SnapshotBeginResponse {
+  // Correlates Begin with the eventual Wait result; also proves the
+  // capture itself (pause + FC create) succeeded before the coordinator
+  // marks the session Idle.
+  bytes snapshot_id = 1;
+}
 
 message SnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.

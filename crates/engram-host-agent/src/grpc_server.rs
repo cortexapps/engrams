@@ -29,7 +29,8 @@ use engram_protocol::grpc::{
     InterruptHarnessRequest, ListSandboxesResponse, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
     ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -154,6 +155,48 @@ impl HostService for HostServiceImpl {
         async move {
             let id = decode_sandbox_id(&req.into_inner().uuid)?;
             let metadata = self.inner.snapshot(id).await.map_err(sandbox_to_status)?;
+            Ok(Response::new(SnapshotResponse {
+                metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn snapshot_begin(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<SnapshotBeginResponse>, Status> {
+        let span = tracing::info_span!("host.snapshot_begin");
+        link_remote_parent(&span, &req);
+        async move {
+            let id = decode_sandbox_id(&req.into_inner().uuid)?;
+            let snapshot_id = self
+                .inner
+                .snapshot_begin(id)
+                .await
+                .map_err(sandbox_to_status)?;
+            Ok(Response::new(SnapshotBeginResponse {
+                snapshot_id: snapshot_id.as_uuid().as_bytes().to_vec(),
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn snapshot_wait(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<SnapshotResponse>, Status> {
+        let span = tracing::info_span!("host.snapshot_wait");
+        link_remote_parent(&span, &req);
+        async move {
+            let id = decode_sandbox_id(&req.into_inner().uuid)?;
+            let metadata = self
+                .inner
+                .snapshot_wait(id)
+                .await
+                .map_err(sandbox_to_status)?;
             Ok(Response::new(SnapshotResponse {
                 metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
             }))

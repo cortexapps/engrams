@@ -210,6 +210,26 @@ pub trait SandboxBackend: Send + Sync {
     /// coord persists to the `snapshots` row.
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
 
+    /// ADR 0045 D5: the pause-side half of an eviction snapshot — see
+    /// `HostClient::snapshot_begin`. Backends that can't background the
+    /// upload keep the default (callers fall back to [`Self::snapshot`]).
+    async fn snapshot_begin(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::SnapshotId, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `snapshot_begin`".into(),
+        ))
+    }
+
+    /// ADR 0045 D5: await the background upload spawned by
+    /// [`Self::snapshot_begin`]; returns the durable metadata.
+    async fn snapshot_wait(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `snapshot_wait`".into(),
+        ))
+    }
+
     /// ADR 0028 Fix A: diff-flavored sibling of [`Self::snapshot`].
     /// Same snapshot-dir + sidecar + vmstate contract, but the memory
     /// artifact is `memory.diff` — a sparse file holding ONLY the

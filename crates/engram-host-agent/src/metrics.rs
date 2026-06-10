@@ -121,6 +121,10 @@ pub const SANDBOX_GUEST_RSS_BYTES: &str = "engram_sandbox_guest_rss_bytes";
 ///
 /// This is the authoritative signal that the 60 s hang is gone.
 pub const SNAPSHOT_CREATE_SECONDS: &str = "engram_snapshot_create_seconds";
+/// ADR 0045 D5 + issue #147: wall-clock of the snapshot POST phase (disk
+/// upload + memory re-chunk + portable blobs) — the previously-invisible
+/// half of "the snapshot is just slow". Labels: type=full|diff, outcome.
+pub const SNAPSHOT_FINISH_SECONDS: &str = "engram_snapshot_finish_seconds";
 
 /// ADR 0038 B0: histogram of how long a capture waited to acquire the
 /// per-sandbox capture lock. The gridlock signal — the 5fadd364
