@@ -464,11 +464,15 @@ jobs:
         run: |
           if [ -d crates/engram-protocol/proto/engram/app ]; then
             buf generate
-            # `git add -N` (intent-to-add) makes brand-new generated files
-            # visible to `git diff` — without it the check misses UNTRACKED
-            # output, only catching edits to already-committed bindings.
-            git add -N -- web/src/gen orchestrator/src/gen
-            git diff --exit-code -- web/src/gen orchestrator/src/gen
+            # Assert porcelain-clean rather than `git diff --exit-code`:
+            # plain diff misses UNTRACKED new bindings, and `add -N` would
+            # stage (and so hide) DELETIONS that `clean: true` performs on
+            # proto removals — porcelain catches edits, adds, and deletes.
+            if [ -n "$(git status --porcelain -- web/src/gen orchestrator/src/gen)" ]; then
+              git status --porcelain -- web/src/gen orchestrator/src/gen
+              echo "generated bindings drifted — run 'just gen-proto' and commit the result"
+              exit 1
+            fi
           else
             echo "engram/app contract not present yet (ADR 0039 Tasks 4-5) — skipping codegen drift check"
           fi
