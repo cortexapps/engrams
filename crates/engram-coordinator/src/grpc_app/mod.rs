@@ -13,6 +13,7 @@
 pub mod auth;
 mod convert;
 mod session;
+mod shell_relay;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use engram_protocol::app;
 use tonic::{Request, Response, Status};
 
 pub use session::AppSessionService;
+pub use shell_relay::AppShellRelayService;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
@@ -117,10 +119,12 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
             },
         ))
         .add_service(
-            app::shell_relay_service_server::ShellRelayServiceServer::new(AppShellRelayService {
-                state: state.clone(),
-                auth: auth.clone(),
-            }),
+            app::shell_relay_service_server::ShellRelayServiceServer::new(
+                shell_relay::AppShellRelayService {
+                    state: state.clone(),
+                    auth: auth.clone(),
+                },
+            ),
         )
         .add_service(app::fleet_service_server::FleetServiceServer::new(
             AppFleetService {
@@ -137,26 +141,6 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
         .add_service(app::secret_service_server::SecretServiceServer::new(
             AppSecretService { state, auth },
         ))
-}
-
-pub struct AppShellRelayService {
-    #[allow(dead_code)]
-    pub state: SharedState,
-    pub auth: Arc<auth::BearerAuth>,
-}
-
-// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
-#[tonic::async_trait]
-impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService {
-    type RelayStream = BoxStream<app::RelayShellResponse>;
-
-    async fn relay(
-        &self,
-        req: Request<tonic::Streaming<app::RelayShellRequest>>,
-    ) -> Result<Response<Self::RelayStream>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
 }
 
 pub struct AppFleetService {
@@ -510,6 +494,7 @@ mod convention {
     const SOURCES: &[(&str, &str)] = &[
         ("mod.rs", include_str!("mod.rs")),
         ("session.rs", include_str!("session.rs")),
+        ("shell_relay.rs", include_str!("shell_relay.rs")),
     ];
 
     /// The auth line that must open every RPC body. The trailing `;` is
