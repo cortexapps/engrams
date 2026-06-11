@@ -3128,6 +3128,7 @@ fn persist_sandbox_manifest(
         network,
         netns,
         uffd_handler: uffd_pid.map(process_record),
+        migration_role: None,
     };
     let path = sandbox_manifest::manifest_path(work_dir, sandbox_id);
     if let Err(e) = sandbox_manifest::write_manifest(&path, &m) {
@@ -3616,6 +3617,23 @@ impl SandboxBackend for FirecrackerBackend {
                     .join(WORKING_SET_TRACE_FILE),
             ),
         }
+    }
+
+    /// ADR 0045 C2: rewrite the sandbox manifest with the post-copy
+    /// role (atomic tmp+rename, same discipline as the original
+    /// write). A missing manifest is an error — the role fence must
+    /// not silently fail to persist for a reattachable sandbox.
+    async fn set_manifest_migration_role(
+        &self,
+        id: SandboxId,
+        role: Option<&str>,
+    ) -> Result<(), SandboxError> {
+        let path = sandbox_manifest::manifest_path(&self.work_dir, id);
+        let mut m = sandbox_manifest::read_manifest(&path)
+            .map_err(|e| SandboxError::Vm(format!("read sandbox manifest: {e}").into()))?;
+        m.migration_role = role.map(|r| r.to_string());
+        sandbox_manifest::write_manifest(&path, &m)
+            .map_err(|e| SandboxError::Vm(format!("write sandbox manifest: {e}").into()))
     }
 
     fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {

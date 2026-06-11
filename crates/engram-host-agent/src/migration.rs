@@ -18,6 +18,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -25,8 +27,41 @@ use engram_chunk_store::manifest::ChunkHash;
 use engram_core::SandboxId;
 
 /// No commit/abort within this window triggers the coordinator
-/// ownership check (see module docs).
+/// ownership check (see module docs). For post-copy exports the clock
+/// runs from the LAST page-serving activity, not creation — an
+/// actively-draining export is alive by definition; 120 s of silence
+/// is the trigger.
 pub const EXPORT_TTL: Duration = Duration::from_secs(120);
+
+/// ADR 0045 C2: a sandbox's role in an in-flight post-copy migration.
+/// Both roles fence the normal lifecycle drivers: the SOURCE is a
+/// frozen page server (never idle-evicted, never checkpointed, NEVER
+/// self-resumed once state has shipped); the DEST is live but its
+/// durability machinery stays gated until the drain + catch-up land.
+/// Persisted into the FC sandbox manifest so a host-agent restart's
+/// reattach pass (ADR 0044 K2) re-learns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationRole {
+    PostCopySource,
+    PostCopyDest,
+}
+
+impl MigrationRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PostCopySource => "post-copy-source",
+            Self::PostCopyDest => "post-copy-dest",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "post-copy-source" => Some(Self::PostCopySource),
+            "post-copy-dest" => Some(Self::PostCopyDest),
+            _ => None,
+        }
+    }
+}
 
 /// One frozen sandbox's transferable artifact set.
 pub struct MigrationExport {
@@ -42,10 +77,31 @@ pub struct MigrationExport {
     /// re-queue (`ChunkedDiskBackend::requeue_pending`).
     pub disk_pending: Option<crate::disk_daemon::PendingDiskFlush>,
     pub created_at: Instant,
+    /// ADR 0045 C2: this export serves a post-copy move (the guest
+    /// already resumed on the dest; this frozen source is a page
+    /// server). Changes the TTL clock (last_activity, not created_at)
+    /// and FORBIDS the abort-unpause arm once `state_served` is set.
+    pub post_copy: bool,
+    /// ADR 0045 C2 split-brain guard: set the moment `state.bin`
+    /// leaves this host (`MigrationFetch` StateBin). From then on the
+    /// dest may be running this state — the source must NEVER
+    /// self-resume, even if the coordinator says we still own the
+    /// session (`ttl_verdict` returns StayPaused, converging via the
+    /// scanner within one cycle).
+    pub state_served: Arc<AtomicBool>,
+    /// Last page/artifact-serving activity (the post-copy TTL clock).
+    pub last_activity: Arc<std::sync::Mutex<Instant>>,
     /// The sandbox's capture lock, held for the export's lifetime —
     /// this IS the checkpoint fence (the periodic driver's
     /// `capture_in_flight` try_lock keeps skipping).
     pub capture_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl MigrationExport {
+    /// Refresh the activity clock (every artifact/page serve).
+    pub fn touch(&self) {
+        *self.last_activity.lock().expect("last_activity poisoned") = Instant::now();
+    }
 }
 
 /// Per-host registry of open exports. One per sandbox at most (the
@@ -105,12 +161,30 @@ impl MigrationRegistry {
     }
 
     /// Exports older than [`EXPORT_TTL`] (the dumb-host sweep input).
+    /// Post-copy exports age from their last serving activity (an
+    /// actively-draining export is alive); C1 exports from creation.
     pub fn expired(&self) -> Vec<SandboxId> {
         self.by_sandbox
             .iter()
-            .filter(|e| e.created_at.elapsed() > EXPORT_TTL)
+            .filter(|e| {
+                let anchor = if e.post_copy {
+                    *e.last_activity.lock().expect("last_activity poisoned")
+                } else {
+                    e.created_at
+                };
+                anchor.elapsed() > EXPORT_TTL
+            })
             .map(|e| e.sandbox_id)
             .collect()
+    }
+
+    /// The split-brain flag for a sandbox's open export (TTL sweep
+    /// input). `false` when no export is open.
+    pub fn state_served(&self, sandbox_id: SandboxId) -> bool {
+        self.by_sandbox
+            .get(&sandbox_id)
+            .map(|e| e.state_served.load(Ordering::SeqCst))
+            .unwrap_or(false)
     }
 
     pub fn mint_export_id() -> String {
@@ -145,11 +219,20 @@ pub enum TtlVerdict {
 /// `ownership = None` ⇒ unreachable; `session_bound = false` ⇒ the
 /// export's sandbox has no session binding (anonymous — nothing can
 /// reclaim it, destroy).
-pub fn ttl_verdict(session_bound: bool, ownership: Option<bool>) -> TtlVerdict {
+///
+/// ADR 0045 C2: `state_served` FORBIDS the yes⇒un-pause arm. Once
+/// state.bin has shipped, the dest may be running this state — an
+/// un-pause would be the split-brain. Stay paused instead; if the
+/// rebind never landed the session sits Evacuating, the scanner (lease
+/// expired) rehomes it from the durable row, the ownership answer
+/// flips to `false`, and the NEXT sweep destroys this corpse — paused
+/// ≤ one scanner cycle, never a zombie.
+pub fn ttl_verdict(session_bound: bool, ownership: Option<bool>, state_served: bool) -> TtlVerdict {
     if !session_bound {
         return TtlVerdict::Destroy;
     }
     match ownership {
+        Some(true) if state_served => TtlVerdict::StayPaused,
         Some(true) => TtlVerdict::AbortInPlace,
         Some(false) => TtlVerdict::Destroy,
         None => TtlVerdict::StayPaused,
@@ -175,11 +258,32 @@ mod tests {
 
     #[test]
     fn ttl_verdict_encodes_the_dumb_host_rule() {
-        assert_eq!(ttl_verdict(true, Some(true)), TtlVerdict::AbortInPlace);
-        assert_eq!(ttl_verdict(true, Some(false)), TtlVerdict::Destroy);
-        assert_eq!(ttl_verdict(true, None), TtlVerdict::StayPaused);
-        assert_eq!(ttl_verdict(false, Some(true)), TtlVerdict::Destroy);
-        assert_eq!(ttl_verdict(false, None), TtlVerdict::Destroy);
+        assert_eq!(
+            ttl_verdict(true, Some(true), false),
+            TtlVerdict::AbortInPlace
+        );
+        assert_eq!(ttl_verdict(true, Some(false), false), TtlVerdict::Destroy);
+        assert_eq!(ttl_verdict(true, None, false), TtlVerdict::StayPaused);
+        assert_eq!(ttl_verdict(false, Some(true), false), TtlVerdict::Destroy);
+        assert_eq!(ttl_verdict(false, None, false), TtlVerdict::Destroy);
+    }
+
+    /// ADR 0045 C2: once state.bin shipped, yes⇒un-pause is FORBIDDEN
+    /// (split-brain); everything else is unchanged.
+    #[test]
+    fn ttl_verdict_state_served_forbids_unpause() {
+        assert_eq!(ttl_verdict(true, Some(true), true), TtlVerdict::StayPaused);
+        assert_eq!(ttl_verdict(true, Some(false), true), TtlVerdict::Destroy);
+        assert_eq!(ttl_verdict(true, None, true), TtlVerdict::StayPaused);
+        assert_eq!(ttl_verdict(false, Some(true), true), TtlVerdict::Destroy);
+    }
+
+    #[test]
+    fn migration_role_round_trips_persistence_strings() {
+        for role in [MigrationRole::PostCopySource, MigrationRole::PostCopyDest] {
+            assert_eq!(MigrationRole::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(MigrationRole::parse("garbage"), None);
     }
 
     #[test]
@@ -201,6 +305,9 @@ mod tests {
             allowed_chunks: HashSet::new(),
             disk_pending: None,
             created_at: Instant::now(),
+            post_copy: false,
+            state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
             capture_guard: guard,
         }));
         assert!(reg.validate(id, &eid));
@@ -218,6 +325,9 @@ mod tests {
             allowed_chunks: HashSet::new(),
             disk_pending: None,
             created_at: Instant::now(),
+            post_copy: false,
+            state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
             capture_guard: g2,
         }));
 

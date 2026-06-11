@@ -241,6 +241,12 @@ pub struct PooledBackend {
     /// host-agent startup when the 9102 listener is configured; the C2
     /// capture registers `PeerExport`s here after its pagemap scan.
     migrate_peer: Arc<std::sync::OnceLock<Arc<crate::migrate_peer::PeerServer>>>,
+    /// ADR 0045 C2: sandboxes currently playing a post-copy role. Both
+    /// roles fence the normal lifecycle drivers (idle-evict nomination
+    /// skips them; checkpoints/flush are already fenced by the capture
+    /// guard + migration fence). Mirrored into the FC sandbox manifest
+    /// for reattach (ADR 0044 K2).
+    migration_roles: Arc<DashMap<SandboxId, crate::migration::MigrationRole>>,
 }
 
 impl PooledBackend {
@@ -521,6 +527,7 @@ impl PooledBackend {
             migrations: Arc::new(crate::migration::MigrationRegistry::default()),
             inline_disk_manifests: Arc::new(DashMap::new()),
             migrate_peer: Arc::new(std::sync::OnceLock::new()),
+            migration_roles: Arc::new(DashMap::new()),
         }
     }
 
@@ -535,6 +542,54 @@ impl PooledBackend {
     /// ADR 0045 C2: the page server, when the host runs one.
     pub fn migrate_peer_server(&self) -> Option<Arc<crate::migrate_peer::PeerServer>> {
         self.migrate_peer.get().cloned()
+    }
+
+    /// ADR 0045 C2: a sandbox's in-flight post-copy role, if any.
+    /// Lifecycle drivers (idle-evict nomination) skip roled sandboxes.
+    pub fn migration_role(&self, id: SandboxId) -> Option<crate::migration::MigrationRole> {
+        self.migration_roles.get(&id).map(|r| *r)
+    }
+
+    /// In-memory-only role note (reattach re-arming: the manifest
+    /// already carries the role; no rewrite needed).
+    pub fn note_migration_role(
+        &self,
+        id: SandboxId,
+        role: Option<crate::migration::MigrationRole>,
+    ) {
+        match role {
+            Some(r) => {
+                self.migration_roles.insert(id, r);
+            }
+            None => {
+                self.migration_roles.remove(&id);
+            }
+        }
+    }
+
+    /// Set/clear a sandbox's post-copy role, mirroring it into the FC
+    /// sandbox manifest (best-effort) so a host-agent restart's
+    /// reattach pass re-learns it.
+    pub async fn set_migration_role(
+        &self,
+        id: SandboxId,
+        role: Option<crate::migration::MigrationRole>,
+    ) {
+        self.note_migration_role(id, role);
+        if let Err(e) = self
+            .inner
+            .set_manifest_migration_role(id, role.map(|r| r.as_str()))
+            .await
+        {
+            tracing::warn!(sandbox_id = %id, error = %e,
+                "persisting migration role to the sandbox manifest failed (reattach blind spot)");
+        }
+    }
+
+    /// ADR 0045 C2: the split-brain flag of a sandbox's open export
+    /// (the TTL sweep's third verdict input).
+    pub fn migration_state_served(&self, id: SandboxId) -> bool {
+        self.migrations.state_served(id)
     }
 
     /// ADR 0028 Fix A: enable checkpoint chains, rooted at `dir`
@@ -1181,6 +1236,12 @@ impl PooledBackend {
                 Some((sandbox_id, session, export_id))
             })
             .collect()
+    }
+
+    /// The session a sandbox is bound to, when known (populated by
+    /// `notify_session_policy` / registration rehydration).
+    pub fn session_for_sandbox(&self, id: SandboxId) -> Option<SessionId> {
+        self.session_bindings.get(&id).map(|e| *e)
     }
 
     pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
@@ -3238,6 +3299,12 @@ impl SandboxBackend for PooledBackend {
             allowed_chunks: allowed,
             disk_pending,
             created_at: std::time::Instant::now(),
+            // C1 stop-and-copy export: the guest stays frozen and the
+            // dest pulls eagerly; post-copy captures (C2) construct
+            // their own export with post_copy: true.
+            post_copy: false,
+            state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
             capture_guard,
         });
         if !inserted {
@@ -3290,6 +3357,16 @@ impl SandboxBackend for PooledBackend {
             let Some(export) = self.migrations.find_by_export_id(export_id) else {
                 return Err(SandboxError::NotFound);
             };
+            // ADR 0045 C2: every serve refreshes the post-copy TTL
+            // clock, and StateBin leaving a post-copy export arms the
+            // split-brain guard (the source must never self-resume —
+            // the dest may be running this state).
+            export.touch();
+            if export.post_copy && items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
+                export
+                    .state_served
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             (export.snapshot_dir.clone(), export.allowed_chunks.clone())
         };
         for item in &items {
@@ -4298,6 +4375,9 @@ mod tests {
             allowed_chunks: [allowed].into_iter().collect(),
             disk_pending: None,
             created_at: std::time::Instant::now(),
+            post_copy: false,
+            state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
             capture_guard: guard_src.clone().try_lock_owned().unwrap(),
         }));
 

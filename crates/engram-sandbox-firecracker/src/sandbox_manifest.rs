@@ -69,6 +69,15 @@ pub struct SandboxManifest {
     /// comm) on reattach. Like FC, the handler is detached (not
     /// killed) on host-agent shutdown and re-adopted by the successor.
     pub uffd_handler: Option<ProcessRecord>,
+    /// ADR 0045 C2: the sandbox's in-flight post-copy migration role
+    /// (`"post-copy-source"` / `"post-copy-dest"`), persisted so a
+    /// host-agent restart's reattach pass re-learns the lifecycle
+    /// fences. A reattached SOURCE is never resumed (the dumb-host
+    /// ownership rule decides destroy-vs-stay-paused); a reattached
+    /// DEST mid-drain is reaped (its drain state died with the old
+    /// host-agent generation). Cleared at commit/abort/drain-done.
+    #[serde(default)]
+    pub migration_role: Option<String>,
 }
 
 /// Three-axis pid identity. Phase 6 reattach verifies all three
@@ -326,6 +335,7 @@ mod tests {
             network: None,
             netns: None,
             uffd_handler: None,
+            migration_role: None,
         }
     }
 

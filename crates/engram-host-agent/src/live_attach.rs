@@ -74,6 +74,40 @@ impl ReattachReport {
     }
 }
 
+/// ADR 0045 C2: scan the work dir's sandbox manifests for persisted
+/// post-copy migration roles — sandboxes that were mid-move when the
+/// previous host-agent generation died. The startup pass re-arms the
+/// lifecycle fences from this: a reattached SOURCE stays paused under
+/// the dumb-host ownership rule (NEVER resumed — state may have
+/// shipped); a reattached DEST is reaped (its drain state died with
+/// the old generation; the coordinator rewinds the session).
+pub fn scan_migration_roles(
+    work_dir: &Path,
+) -> Vec<(engram_core::SandboxId, crate::migration::MigrationRole)> {
+    use engram_sandbox_firecracker::sandbox_manifest;
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(work_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("sandbox.json");
+        if !path.exists() {
+            continue;
+        }
+        let Ok(m) = sandbox_manifest::read_manifest(&path) else {
+            continue;
+        };
+        if let Some(role) = m
+            .migration_role
+            .as_deref()
+            .and_then(crate::migration::MigrationRole::parse)
+        {
+            out.push((m.sandbox_id, role));
+        }
+    }
+    out
+}
+
 /// Run the reattach pass against `work_dir`. The `backend` is the
 /// concrete `FirecrackerBackend` — we downcast through `Any` since
 /// the trait doesn't expose `reattach_sandbox`. (Phase 6 is FC-only;
@@ -360,6 +394,7 @@ mod tests {
             network: None,
             netns: None,
             uffd_handler: None,
+            migration_role: None,
         };
         engram_sandbox_firecracker::sandbox_manifest::write_manifest(&manifest_path, &manifest)
             .unwrap();

@@ -497,6 +497,18 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
+    /// ADR 0045 C2: persist (or clear, `None`) the sandbox's post-copy
+    /// migration role into the backend's reattach manifest so a
+    /// host-agent restart re-learns the lifecycle fences. No-op for
+    /// backends with no reattach story (VZ, process).
+    async fn set_manifest_migration_role(
+        &self,
+        _id: SandboxId,
+        _role: Option<&str>,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0014 issue #1/#2: commit a snapshot that was just produced
     /// by [`Self::snapshot`]. Signals to the backend that the caller's
     /// downstream pipeline (`record_snapshot` → `destroy` → mark Idle)
