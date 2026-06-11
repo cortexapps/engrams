@@ -831,14 +831,60 @@ pub async fn drain_host(
         ));
     }
 
-    // Fan out per-session evictions. JoinSet so we collect outcomes
+    // Fan out per-session moves. JoinSet so we collect outcomes
     // without giving up on the first error.
+    //
+    // ADR 0045 C1: LIVE-FIRST. A drain is the teleport's marquee
+    // use-case — move each session losslessly to a peer; only fall
+    // back to the evict-to-Evacuating snapshot-rehome (the pre-C1
+    // behavior, loses post-checkpoint state) when the live move
+    // can't run (flag off, no peer capacity, pre-C1 host) or fails
+    // back to the source. A Parachute failure already left the
+    // session Evacuating with the scanner armed — same end state as
+    // the fallback, so it counts as evacuating.
     let mut tasks = tokio::task::JoinSet::new();
     for (session_id, sandbox_id) in &assignments {
         let st = state.clone();
         let sid = *session_id;
         let sb = *sandbox_id;
         tasks.spawn(async move {
+            if crate::live_migration::live_teleport_enabled() {
+                let target = match st.services.meta.get_session(sid).await {
+                    Ok(session) => {
+                        let (repo, tag) =
+                            engram_core::types::session::split_image_ref(&session.image);
+                        let ctx = crate::host_registry::ScheduleContext {
+                            repo,
+                            image_version: tag,
+                            prefer_snapshot_id: None,
+                            memory_mib: None,
+                            required_image_digest: None,
+                            exclude_host: Some(host_id),
+                            prefer_host: None,
+                        };
+                        st.host_registry.pick_for_session(&ctx).ok().map(|(h, _)| h)
+                    }
+                    Err(_) => None,
+                };
+                if let Some(target) = target {
+                    match crate::live_migration::migrate_session_live(&st, sid, target).await {
+                        Ok(()) => return (sid, Ok(())),
+                        Err(crate::live_migration::MigrateError::Parachute(e)) => {
+                            tracing::warn!(
+                                %sid, %host_id, error = %e,
+                                "drain: live move parachuted; scanner rehome armed",
+                            );
+                            return (sid, Ok(()));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                %sid, %host_id, error = %e,
+                                "drain: live move failed; falling back to snapshot-rehome",
+                            );
+                        }
+                    }
+                }
+            }
             let outcome = crate::idle_evictor::evict_session_to_state(
                 &st,
                 sid,
