@@ -7,6 +7,12 @@
 //! §2.1: attribution leaves the contract). Timestamps cross as ISO-8601
 //! strings, exactly as the JSON wire serializes them; the string-literal
 //! status/mode unions stay strings via the core types' `as_str()`.
+//!
+//! **Totality is enforced in BOTH directions.** Every converter that reads
+//! from a source struct must exhaustively destructure it so that a field
+//! added later breaks the build here instead of being silently dropped on
+//! the floor. Deliberately-unused fields are bound as `field: _` with a
+//! comment explaining the intentional drop.
 
 use engram_protocol::app;
 
@@ -15,55 +21,101 @@ use crate::error::ApiError;
 use engram_core::types::session::SessionMode;
 
 /// `engram_core::types::Session` → proto `Session`. Drops `user_id`
-/// (off-contract) and `live_disk_manifest` (not on the wire shape).
+/// (off-contract per ADR 0039 §2.1: attribution leaves the contract) and
+/// `live_disk_manifest` (internal coord state, not on the wire shape).
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `engram_core::types::Session` without updating this converter,
+/// the build will fail here rather than silently drop the new field.
 pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session {
+    let engram_core::types::Session {
+        id,
+        user_id: _, // ADR 0039 §2.1: attribution is off-contract; intentionally dropped.
+        status,
+        host_id,
+        sandbox_id,
+        image,
+        mode,
+        created_at,
+        last_active_at,
+        live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
+    } = s;
     app::Session {
-        id: s.id.to_string(),
-        status: s.status.as_str().to_string(),
-        host_id: s.host_id.map(|h| h.to_string()),
-        sandbox_id: s.sandbox_id.map(|sb| sb.to_string()),
-        image: s.image.clone(),
-        mode: s.mode.as_str().to_string(),
+        id: id.to_string(),
+        status: status.as_str().to_string(),
+        host_id: host_id.map(|h| h.to_string()),
+        sandbox_id: sandbox_id.map(|sb| sb.to_string()),
+        image: image.clone(),
+        mode: mode.as_str().to_string(),
         // ISO-8601, matching the JSON wire (chrono's Serialize is RFC3339).
-        created_at: s.created_at.to_rfc3339(),
-        last_active_at: s.last_active_at.to_rfc3339(),
+        created_at: created_at.to_rfc3339(),
+        last_active_at: last_active_at.to_rfc3339(),
     }
 }
 
 /// api `SessionListItem` → proto `SessionListItem`. `owner_kind` is a
 /// TS-mirror-only field — left unset from Rust (the api type has no such
 /// field).
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `SessionListItem` without updating this converter, the build
+/// will fail here rather than silently drop the new field.
 pub(crate) fn session_list_item_to_proto(item: SessionListItem) -> app::SessionListItem {
+    let SessionListItem {
+        session,
+        owner_email,
+        owner_name,
+    } = item;
     app::SessionListItem {
-        session: Some(session_to_proto(&item.session)),
-        owner_email: item.owner_email,
-        owner_name: item.owner_name,
-        owner_kind: None,
+        session: Some(session_to_proto(&session)),
+        owner_email,
+        owner_name,
+        owner_kind: None, // TS-mirror-only field; no Rust equivalent in SessionListItem.
     }
 }
 
 /// api `ListSessionsResponse` → proto `ListSessionsResponse`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `ListSessionsResponse` without updating this converter, the
+/// build will fail here.
 pub(crate) fn list_sessions_to_proto(resp: ListSessionsResponse) -> app::ListSessionsResponse {
+    let ListSessionsResponse { sessions } = resp;
     app::ListSessionsResponse {
-        sessions: resp
-            .sessions
-            .into_iter()
-            .map(session_list_item_to_proto)
-            .collect(),
+        sessions: sessions.into_iter().map(session_list_item_to_proto).collect(),
     }
 }
 
 /// proto `CreateSessionRequest` → api `CreateSessionRequest`. The
 /// `mode` string parses to [`SessionMode`] (empty defaults to `Agent`,
 /// matching the axum `#[serde(default)]`); an unknown mode is a
-/// `BadRequest`. `harness_secret_id` is intentionally dropped here — its
-/// unsealing lands in Task 13 with SecretService; the proto field is
-/// accepted on the wire but not yet acted on (gRPC create works for
-/// no-harness / pre-authed images until then).
+/// `BadRequest`.
+///
+/// `harness_secret_id` is read and rejected at the RPC layer (in
+/// `grpc_app/session.rs`) before this function is called — if the caller
+/// passes a non-empty value they get `Status::Unimplemented` immediately.
+/// It is NOT bound in the destructure here (the caller has already handled
+/// it); to keep the totality guard intact the proto struct is destructured
+/// exhaustively, binding `harness_secret_id: _` as the signal that the
+/// caller has taken responsibility for it.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `app::CreateSessionRequest` without updating this converter,
+/// the build will fail here rather than silently drop the new field.
 pub(crate) fn create_request_from_proto(
     r: app::CreateSessionRequest,
 ) -> Result<CreateSessionRequest, ApiError> {
-    let mode = match r.mode.as_str() {
+    // Totality guard: destructure ALL proto fields. `harness_secret_id` is
+    // checked and rejected by the caller (create_session RPC) before this
+    // function is reached; bind it as `_` here to acknowledge the drop.
+    let app::CreateSessionRequest {
+        image_uri,
+        mode,
+        prompt,
+        harness_secret_id: _, // Checked + rejected at RPC layer (Task 13 wires it via SecretService).
+        secrets,
+    } = r;
+    let mode = match mode.as_str() {
         "" | "agent" => SessionMode::Agent,
         "dev_vm" => SessionMode::DevVm,
         other => {
@@ -72,15 +124,15 @@ pub(crate) fn create_request_from_proto(
             )))
         }
     };
-    let secrets = if r.secrets.is_empty() {
+    let secrets = if secrets.is_empty() {
         None
     } else {
-        Some(r.secrets.into_iter().collect())
+        Some(secrets.into_iter().collect())
     };
     Ok(CreateSessionRequest {
-        image: r.image_uri,
+        image: image_uri,
         mode,
-        prompt: r.prompt,
+        prompt,
         secrets,
     })
 }

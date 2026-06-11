@@ -60,8 +60,11 @@ fn bearer_interceptor(
 /// no no-harness image is enabled. The smoke prints a skip notice in that
 /// case.
 async fn find_no_harness_image() -> Option<String> {
-    // Derive the HTTP addr from the smoke addr: use 8090 (the dev HTTP port).
-    let http_addr = "http://127.0.0.1:8090";
+    // HTTP base address for the coordinator REST surface, read from
+    // `ENGRAM_SMOKE_HTTP` (default: http://127.0.0.1:8090 — the dev HTTP
+    // port set by Tiltfile). Override when the coordinator listens elsewhere.
+    let http_addr = std::env::var("ENGRAM_SMOKE_HTTP")
+        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
     let url = format!("{http_addr}/api/v1/enabled-images");
 
     let resp = match reqwest::get(&url).await {
@@ -129,9 +132,11 @@ async fn session_crud_smoke() {
         return;
     };
 
-    // Connect to the gRPC server.
+    // Connect to the gRPC server with a 5-second connect timeout so a
+    // wedged or unreachable stack fails loudly instead of hanging forever.
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-        .expect("valid gRPC endpoint");
+        .expect("valid gRPC endpoint")
+        .connect_timeout(std::time::Duration::from_secs(5));
     let channel = endpoint
         .connect()
         .await
@@ -139,15 +144,21 @@ async fn session_crud_smoke() {
 
     let mut client = SessionServiceClient::with_interceptor(channel, bearer_interceptor(token));
 
+    // Per-RPC timeout: 30 s is generous enough for a cold create (image
+    // pull + sandbox boot) while still ensuring a wedged call fails loudly.
+    let rpc_timeout = std::time::Duration::from_secs(30);
+
     // ---- 1. CreateSession (no-harness image, mode: agent) ----
+    let mut create_req = tonic::Request::new(app::CreateSessionRequest {
+        image_uri: image_uri.clone(),
+        mode: String::new(), // default = agent
+        prompt: None,
+        secrets: std::collections::HashMap::new(),
+        harness_secret_id: None,
+    });
+    create_req.set_timeout(rpc_timeout);
     let create_resp = client
-        .create_session(app::CreateSessionRequest {
-            image_uri: image_uri.clone(),
-            mode: String::new(), // default = agent
-            prompt: None,
-            secrets: std::collections::HashMap::new(),
-            harness_secret_id: None,
-        })
+        .create_session(create_req)
         .await
         .expect("CreateSession must succeed over gRPC")
         .into_inner();
@@ -160,8 +171,10 @@ async fn session_crud_smoke() {
     assert!(!session_id.is_empty(), "session_id must not be empty");
 
     // ---- 2. ListSessions — find our session ----
+    let mut list_req = tonic::Request::new(app::ListSessionsRequest::default());
+    list_req.set_timeout(rpc_timeout);
     let list_resp = client
-        .list_sessions(app::ListSessionsRequest::default())
+        .list_sessions(list_req)
         .await
         .expect("ListSessions must succeed")
         .into_inner();
@@ -178,10 +191,12 @@ async fn session_crud_smoke() {
     println!("smoke: ListSessions returned {} rows, found our session", list_resp.sessions.len());
 
     // ---- 3. GetSession ----
+    let mut get_req = tonic::Request::new(app::GetSessionRequest {
+        session_id: session_id.clone(),
+    });
+    get_req.set_timeout(rpc_timeout);
     let get_resp = client
-        .get_session(app::GetSessionRequest {
-            session_id: session_id.clone(),
-        })
+        .get_session(get_req)
         .await
         .expect("GetSession must succeed")
         .into_inner();
@@ -192,10 +207,12 @@ async fn session_crud_smoke() {
     println!("smoke: GetSession ok (status={})", session.status);
 
     // ---- 4. DeleteSession ----
+    let mut del_req = tonic::Request::new(app::DeleteSessionRequest {
+        session_id: session_id.clone(),
+    });
+    del_req.set_timeout(rpc_timeout);
     client
-        .delete_session(app::DeleteSessionRequest {
-            session_id: session_id.clone(),
-        })
+        .delete_session(del_req)
         .await
         .expect("DeleteSession must succeed");
     println!("smoke: DeleteSession ok");
@@ -204,10 +221,12 @@ async fn session_crud_smoke() {
     // terminal (Completed or Failed). Delete transitions the FSM to a
     // terminal state but does NOT hard-delete the row (audit trail).
     // Verify the session is terminal, not that it's missing.
+    let mut post_req = tonic::Request::new(app::GetSessionRequest {
+        session_id: session_id.clone(),
+    });
+    post_req.set_timeout(rpc_timeout);
     let post_delete = client
-        .get_session(app::GetSessionRequest {
-            session_id: session_id.clone(),
-        })
+        .get_session(post_req)
         .await
         .expect("GetSession after delete must still return the row (terminal state, not gone)")
         .into_inner();

@@ -23,6 +23,7 @@ use tonic::{Request, Response, Status};
 
 pub use session::AppSessionService;
 
+use crate::error::ApiError;
 use crate::state::SharedState;
 
 /// Boxed response stream for the server-streaming RPCs. The concrete
@@ -44,6 +45,47 @@ pub(crate) const UNIMPLEMENTED: &str = "ADR 0039 phase 2";
 pub(crate) fn parse_session_id(s: &str) -> Result<engram_core::SessionId, Status> {
     s.parse()
         .map_err(|_| Status::invalid_argument(format!("malformed session_id: {s:?}")))
+}
+
+/// Map an [`ApiError`] to a gRPC [`Status`], exhaustively over every
+/// variant (so a new `ApiError` arm is a compile error here, not a
+/// silent `internal`). The HTTP→gRPC code mapping follows the standard
+/// google.rpc.Code correspondence; the [`ApiError::slug`] rides along as
+/// `engram-error-slug` Status metadata so the web can distinguish slugs
+/// that share an HTTP code (`snapshot_invalidated` vs `host_lost`, both
+/// 410) and the orchestrator can relay it.
+///
+/// Placed in `mod.rs` (not `session.rs`) because Tasks 11-13 import it
+/// from every per-service file; it is service-agnostic.
+//
+// `clippy::result_large_err`: `tonic::Status` is the unavoidable RPC error
+// type — the `?` at each call site flows straight into a
+// `Result<_, Status>`, so boxing here would just force an unbox. Same
+// rationale as `auth::BearerAuth::check`.
+#[allow(clippy::result_large_err)]
+pub(crate) fn into_status(err: ApiError) -> Status {
+    use tonic::Code;
+    let code = match err {
+        ApiError::NotFound(_) => Code::NotFound,
+        ApiError::Forbidden(_) => Code::PermissionDenied,
+        ApiError::Unauthorized(_) => Code::Unauthenticated,
+        ApiError::BadRequest(_) => Code::InvalidArgument,
+        ApiError::Conflict(_) => Code::FailedPrecondition,
+        ApiError::Gone(_) | ApiError::HostLost(_) => Code::FailedPrecondition,
+        ApiError::Unavailable(_) => Code::Unavailable,
+        ApiError::Unsupported(_) => Code::Unimplemented,
+        ApiError::PayloadTooLarge(_) | ApiError::TooManyRequests(_) => Code::ResourceExhausted,
+        ApiError::Internal(_) => Code::Internal,
+    };
+    let slug = err.slug();
+    let mut status = Status::new(code, err.message().to_string());
+    // Best-effort: the slug is a static ASCII identifier, so the parse
+    // never fails; guard anyway so a future non-ASCII slug can't panic
+    // the RPC.
+    if let Ok(val) = slug.parse() {
+        status.metadata_mut().insert("engram-error-slug", val);
+    }
+    status
 }
 
 /// ADR 0039 §9.4: keepalive PINGs so a dead orchestrator's streams
@@ -352,6 +394,93 @@ impl app::secret_service_server::SecretService for AppSecretService {
     ) -> Result<Response<app::DeleteSecretResponse>, Status> {
         self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
+    }
+}
+
+#[cfg(test)]
+mod into_status_tests {
+    use super::*;
+
+    #[test]
+    fn into_status_maps_codes_and_attaches_slug() {
+        use tonic::Code;
+        let cases = [
+            (ApiError::NotFound("x".into()), Code::NotFound, "not_found"),
+            (
+                ApiError::Forbidden("x".into()),
+                Code::PermissionDenied,
+                "forbidden",
+            ),
+            (
+                ApiError::Unauthorized("x".into()),
+                Code::Unauthenticated,
+                "unauthorized",
+            ),
+            (
+                ApiError::BadRequest("x".into()),
+                Code::InvalidArgument,
+                "bad_request",
+            ),
+            (
+                ApiError::Conflict("x".into()),
+                Code::FailedPrecondition,
+                "conflict",
+            ),
+            (
+                ApiError::Gone("x".into()),
+                Code::FailedPrecondition,
+                "snapshot_invalidated",
+            ),
+            (
+                ApiError::HostLost("x".into()),
+                Code::FailedPrecondition,
+                "host_lost",
+            ),
+            (
+                ApiError::Unavailable("x".into()),
+                Code::Unavailable,
+                "unavailable",
+            ),
+            (
+                ApiError::Unsupported("x".into()),
+                Code::Unimplemented,
+                "unsupported",
+            ),
+            (
+                ApiError::PayloadTooLarge("x".into()),
+                Code::ResourceExhausted,
+                "payload_too_large",
+            ),
+            (
+                ApiError::TooManyRequests("x".into()),
+                Code::ResourceExhausted,
+                "too_many_requests",
+            ),
+            (ApiError::Internal("x".into()), Code::Internal, "internal"),
+        ];
+        for (err, code, slug) in cases {
+            let st = into_status(err);
+            assert_eq!(st.code(), code, "code for slug {slug}");
+            assert_eq!(
+                st.metadata().get("engram-error-slug").map(|v| v.as_bytes()),
+                Some(slug.as_bytes()),
+                "slug metadata for {slug}",
+            );
+            assert_eq!(st.message(), "x");
+        }
+    }
+
+    // `Gone` and `HostLost` share a gRPC code but carry distinct slugs —
+    // the whole reason the slug rides in metadata.
+    #[test]
+    fn gone_and_host_lost_share_code_but_differ_by_slug() {
+        let gone = into_status(ApiError::Gone("g".into()));
+        let lost = into_status(ApiError::HostLost("l".into()));
+        assert_eq!(gone.code(), lost.code());
+        assert_ne!(
+            gone.metadata().get("engram-error-slug").unwrap().as_bytes(),
+            lost.metadata().get("engram-error-slug").unwrap().as_bytes(),
+        );
     }
 }
 

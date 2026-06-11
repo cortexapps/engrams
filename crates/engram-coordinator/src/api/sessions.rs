@@ -806,9 +806,7 @@ async fn create_session_compute(
     // (no calling user — Task 13's SecretService injects via
     // `harness_secret_id` instead). Folded in here so they reach the
     // harness / `/exec` / shell exactly as before.
-    for (k, v) in &identity_env {
-        session_env.insert(k.clone(), v.clone());
-    }
+    session_env.extend(identity_env);
 
     let mut agent_for_session = resolve_harness(
         state,
