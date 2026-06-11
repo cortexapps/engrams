@@ -259,6 +259,11 @@ impl GrpcHostClient {
                     .map_err(|e| SandboxError::Snapshot(format!("snapshot id decode: {e}")))?,
             ),
             paused_at_unix_ms: resp.paused_at_unix_ms,
+            hot_chunks: resp
+                .hot_chunks
+                .into_iter()
+                .map(to32)
+                .collect::<Result<_, _>>()?,
         })
     }
 

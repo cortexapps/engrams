@@ -186,6 +186,12 @@ pub struct MigrationSourceInfo {
     pub disk_manifest_ref: super::manifest::ManifestRef,
     pub new_memory_chunk_hashes: Vec<[u8; 32]>,
     pub new_disk_chunk_hashes: Vec<[u8; 32]>,
+    /// ADR 0045 C2 (E2B fold): the source guest's hot set in fault
+    /// order — the destination pulls these FIRST. Best-effort rider
+    /// (empty when the source had no trace); serde-default keeps
+    /// mixed rolls safe.
+    #[serde(default)]
+    pub hot_chunks: Vec<[u8; 32]>,
 }
 
 /// ADR 0045 C1: what `migration_capture` hands the coordinator — the
@@ -203,6 +209,9 @@ pub struct MigrationCaptureOut {
     pub disk_manifest_ref: super::manifest::ManifestRef,
     pub new_memory_chunk_hashes: Vec<[u8; 32]>,
     pub new_disk_chunk_hashes: Vec<[u8; 32]>,
+    /// ADR 0045 C2 (E2B fold): see `MigrationSourceInfo::hot_chunks`.
+    #[serde(default)]
+    pub hot_chunks: Vec<[u8; 32]>,
     pub snapshot_id: super::ids::SnapshotId,
     pub paused_at_unix_ms: i64,
 }

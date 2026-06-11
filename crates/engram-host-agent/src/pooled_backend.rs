@@ -789,6 +789,44 @@ impl PooledBackend {
     /// ADR 0045 C1: pull a chunk set from a live migration export over
     /// the source host's gRPC channel into the local cache. Used by the
     /// background divergence pull (LAN beats GCS by ~20x for the session
+    /// ADR 0045 C2 (E2B fold): read the sandbox's per-jail working-set
+    /// trace (fault-order hot set) for the migration rider. Best-effort
+    /// by design: an absent/corrupt file (handler predates the dump,
+    /// guest never faulted, bake-profile override) returns empty.
+    fn read_hot_chunks(&self, id: SandboxId) -> Vec<[u8; 32]> {
+        let Some(path) = self.inner.working_set_trace_path(id) else {
+            return Vec::new();
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Vec::new();
+        };
+        match serde_json::from_slice::<engram_chunk_store::working_set::WorkingSetTrace>(&bytes) {
+            Ok(trace) => trace.chunks.iter().map(|h| *h.as_bytes()).collect(),
+            Err(e) => {
+                tracing::debug!(sandbox_id = %id, error = %e, "hot-set trace parse failed; empty rider");
+                Vec::new()
+            }
+        }
+    }
+
+    /// ADR 0045 C2 (E2B fold): order a pull set hot-first — chunks in
+    /// the source's fault-order hot set come first (in that order),
+    /// the rest keep their manifest order behind them.
+    fn order_hot_first(
+        remaining: Vec<engram_chunk_store::manifest::ChunkHash>,
+        hot: &[[u8; 32]],
+    ) -> Vec<engram_chunk_store::manifest::ChunkHash> {
+        if hot.is_empty() || remaining.is_empty() {
+            return remaining;
+        }
+        let rank: std::collections::HashMap<&[u8; 32], usize> =
+            hot.iter().enumerate().map(|(i, h)| (h, i)).collect();
+        let mut remaining = remaining;
+        // Stable: non-hot chunks keep their relative manifest order.
+        remaining.sort_by_key(|h| rank.get(h.as_bytes()).copied().unwrap_or(usize::MAX));
+        remaining
+    }
+
     /// chain). Returns the number of chunks landed.
     async fn pull_chunks_from_source(
         source_addr: &str,
@@ -3213,6 +3251,11 @@ impl SandboxBackend for PooledBackend {
             disk_chunks = disk_hashes.len(),
             "migration capture complete; sandbox frozen, export open (ADR 0045 C1)",
         );
+        // ADR 0045 C2 (E2B fold): the source guest's hot set in fault
+        // order, from the handler's per-jail trace dump. Best-effort —
+        // an absent/stale/corrupt file just means an empty rider.
+        let hot_chunks = self.read_hot_chunks(id);
+
         Ok(MigrationCaptureOut {
             export_id,
             memory_manifest_json: serde_json::to_vec(&mem_manifest)
@@ -3222,6 +3265,7 @@ impl SandboxBackend for PooledBackend {
             disk_manifest_ref: disk_ref,
             new_memory_chunk_hashes: mem_hashes.iter().map(|h| *h.as_bytes()).collect(),
             new_disk_chunk_hashes: disk_hashes.iter().map(|h| *h.as_bytes()).collect(),
+            hot_chunks,
             snapshot_id: metadata.id,
             paused_at_unix_ms: paused_at.timestamp_millis(),
         })
@@ -3405,6 +3449,10 @@ impl SandboxBackend for PooledBackend {
         self.abort_prior_inflight_snapshot(id).await
     }
 
+    fn working_set_trace_path(&self, id: SandboxId) -> Option<std::path::PathBuf> {
+        self.inner.working_set_trace_path(id)
+    }
+
     fn snapshot_path_for(&self, snapshot_id: engram_core::types::SnapshotId) -> std::path::PathBuf {
         self.inner.snapshot_path_for(snapshot_id)
     }
@@ -3473,6 +3521,9 @@ impl SandboxBackend for PooledBackend {
                         .map(|c| c.hash)
                         .filter(|h| !staged.contains(h) && !cache.contains_on_disk(*h))
                         .collect();
+                    // Hot set first: the guest's wake-up working set
+                    // lands on NVMe before the long tail (E2B fold).
+                    let remaining = Self::order_hot_first(remaining, &mig.hot_chunks);
                     if !remaining.is_empty() {
                         let n = remaining.len();
                         let t = std::time::Instant::now();
@@ -4186,6 +4237,24 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
         }
+    }
+
+    /// ADR 0045 C2 (E2B fold): hot chunks lead the pull set in fault
+    /// order; the cold tail keeps its manifest order; unknown hot
+    /// hashes (chunks already staged/cached) are simply absent.
+    #[test]
+    fn order_hot_first_leads_with_the_hot_set() {
+        use engram_chunk_store::manifest::ChunkHash;
+        let h = |b: u8| ChunkHash::of(&[b]);
+        let remaining = vec![h(1), h(2), h(3), h(4), h(5)];
+        // Hot order: 4 first, then 2; 9 is not in the pull set at all.
+        let hot = vec![*h(4).as_bytes(), *h(9).as_bytes(), *h(2).as_bytes()];
+        let got = PooledBackend::order_hot_first(remaining, &hot);
+        assert_eq!(got, vec![h(4), h(2), h(1), h(3), h(5)]);
+
+        // Empty hot set: untouched.
+        let got = PooledBackend::order_hot_first(vec![h(7), h(6)], &[]);
+        assert_eq!(got, vec![h(7), h(6)]);
     }
 
     /// ADR 0045 C1: migration_fetch is allowlist-gated and serves

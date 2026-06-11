@@ -229,6 +229,7 @@ pub async fn migrate_session_live(
             disk_manifest_ref: capture.disk_manifest_ref,
             new_memory_chunk_hashes: capture.new_memory_chunk_hashes,
             new_disk_chunk_hashes: capture.new_disk_chunk_hashes,
+            hot_chunks: capture.hot_chunks,
         }),
         disk_manifest: has_disk.then_some(capture.disk_manifest_ref),
         memory_manifest: Some(capture.memory_manifest_ref),
@@ -693,6 +694,7 @@ mod tests {
                     new_memory_chunk_hashes: Vec::new(),
                     new_disk_chunk_hashes: Vec::new(),
                     snapshot_id: engram_core::types::SnapshotId::new(),
+                    hot_chunks: vec![],
                     paused_at_unix_ms: 0,
                 })
             }
@@ -863,6 +865,7 @@ mod tests {
                     new_memory_chunk_hashes: Vec::new(),
                     new_disk_chunk_hashes: Vec::new(),
                     snapshot_id: engram_core::types::SnapshotId::new(),
+                    hot_chunks: vec![],
                     paused_at_unix_ms: 0,
                 })
             }

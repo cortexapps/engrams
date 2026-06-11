@@ -215,6 +215,12 @@ message MigrationCaptureResponse {
   // version-conflict retry dance (shared-template disk lineages).
   bytes memory_manifest_ref = 8;
   bytes disk_manifest_ref = 9;
+  // ADR 0045 C2 (E2B fold): the source guest's hot set in FAULT ORDER
+  // (the handler's working-set recorder, dumped per-jail). The
+  // destination pulls/prefaults these FIRST so the post-move re-fault
+  // storm hits warm NVMe. 32-byte raw hashes; empty when the source
+  // had no trace (best-effort rider, never load-bearing).
+  repeated bytes hot_chunks = 10;
 }
 
 message MigrationExportRef {

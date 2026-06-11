@@ -260,6 +260,11 @@ pub struct Runtime {
     peer: Option<std::sync::Arc<crate::peer::PeerSession>>,
     /// One-way progress/failure reports to the host-agent (peer mode).
     control: Option<std::sync::Arc<crate::peer::ControlTx>>,
+    /// ADR 0045 C2 (E2B fold): one-shot trace dump when the recorder
+    /// window closes — the migration capture reads the per-jail trace
+    /// file LIVE, so waiting for handler exit (the publish channel) is
+    /// too late. Set once the close-dump has fired.
+    window_dump_done: std::sync::atomic::AtomicBool,
 }
 
 impl Runtime {
@@ -311,6 +316,7 @@ impl Runtime {
             zeropage_ok: std::sync::atomic::AtomicBool::new(true),
             peer: None,
             control: None,
+            window_dump_done: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -769,6 +775,22 @@ impl Runtime {
                         // same log-cadence so a hung run loop still
                         // produces a usable file. Cheap (~1 KiB
                         // serialize + fs::write).
+                        self.dump_trace_output();
+                    }
+                    // ADR 0045 C2 (E2B fold): one-shot dump on the first
+                    // fault AFTER the recorder window closes, so the
+                    // complete hot set is on disk ~window-length after
+                    // restore — a live migration capture reads it from
+                    // the jail. (The power-of-two cadence alone can
+                    // leave the file stale mid-window.)
+                    if !self
+                        .window_dump_done
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        && !self.recorder.lock().expect("recorder poisoned").is_open()
+                        && !self
+                            .window_dump_done
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
                         self.dump_trace_output();
                     }
                 }

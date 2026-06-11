@@ -182,6 +182,11 @@ const FIRST_GUEST_CID: u32 = 3;
 /// snapshot time without making a single destroy feel slow.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// ADR 0045 C2 (E2B fold): per-jail working-set trace dump filename —
+/// the uffd-handler's fault-order hot set, read best-effort by the
+/// migration capture for the `hot_chunks` rider.
+pub const WORKING_SET_TRACE_FILE: &str = "working-set-trace.json";
+
 /// Host-wide knobs for `FirecrackerBackend`. The kernel image lives
 /// here rather than on `SandboxSpec` because it's tied to the host
 /// kernel ABI, not to a specific image — every sandbox on this host
@@ -1606,10 +1611,19 @@ impl FirecrackerBackend {
         }
         // ADR 0014 M1.14: bake's profile pass sets this so the
         // image-builder can read the trace file back without going
-        // through BlobStorage. Production warm-restore leaves it
-        // None — the publish-trace-host path is the runtime channel.
-        if let Some(path) = self.config.working_set_trace_output.as_ref() {
-            cmd.arg("--trace-output").arg(path);
+        // through BlobStorage. ADR 0045 C2 (E2B fold): production
+        // spawns now default to a PER-JAIL trace file — the migration
+        // capture reads it to ship the `hot_chunks` rider (the
+        // publish-trace-host channel only lands at handler EXIT, which
+        // is too late for a live move).
+        match self.config.working_set_trace_output.as_ref() {
+            Some(path) => {
+                cmd.arg("--trace-output").arg(path);
+            }
+            None => {
+                cmd.arg("--trace-output")
+                    .arg(jail_dir.join(WORKING_SET_TRACE_FILE));
+            }
         }
         if let Some(path) = self.config.uffd_blob_root.as_ref() {
             cmd.arg("--blob-root").arg(path);
@@ -3588,6 +3602,20 @@ impl SandboxBackend for FirecrackerBackend {
     /// so non-dirty-tracking hosts never run it.
     fn supports_diff_checkpoints(&self) -> bool {
         self.config.track_dirty_pages
+    }
+
+    /// ADR 0045 C2 (E2B fold): the per-jail trace dump the spawn wires
+    /// via `--trace-output` (unless the bake's profile pass overrode
+    /// the path — that mode never migrates).
+    fn working_set_trace_path(&self, id: SandboxId) -> Option<PathBuf> {
+        match self.config.working_set_trace_output.as_ref() {
+            Some(_) => None,
+            None => Some(
+                self.work_dir
+                    .join(id.to_string())
+                    .join(WORKING_SET_TRACE_FILE),
+            ),
+        }
     }
 
     fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {

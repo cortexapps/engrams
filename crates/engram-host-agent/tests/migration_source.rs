@@ -262,6 +262,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         disk_manifest_ref: out2.disk_manifest_ref,
         new_memory_chunk_hashes: out2.new_memory_chunk_hashes.clone(),
         new_disk_chunk_hashes: out2.new_disk_chunk_hashes.clone(),
+        hot_chunks: vec![],
     });
 
     let moved = pooled.restore(metadata).await.expect("teleport restore");

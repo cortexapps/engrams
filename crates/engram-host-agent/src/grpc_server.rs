@@ -237,6 +237,7 @@ impl HostService for HostServiceImpl {
                 paused_at_unix_ms: out.paused_at_unix_ms,
                 memory_manifest_ref: encode_bincode(&out.memory_manifest_ref, "ManifestRef")?,
                 disk_manifest_ref: encode_bincode(&out.disk_manifest_ref, "ManifestRef")?,
+                hot_chunks: out.hot_chunks.into_iter().map(|h| h.to_vec()).collect(),
             }))
         }
         .instrument(span)

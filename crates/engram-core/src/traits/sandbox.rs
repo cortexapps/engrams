@@ -488,6 +488,15 @@ pub trait SandboxBackend: Send + Sync {
     /// files before reading.
     fn snapshot_path_for(&self, snapshot_id: crate::types::SnapshotId) -> PathBuf;
 
+    /// ADR 0045 C2 (E2B fold): where this sandbox's uffd-handler dumps
+    /// its working-set trace (fault-order hot set), when the backend
+    /// runs one. The migration capture reads it best-effort to ship a
+    /// `hot_chunks` rider so the destination warms the guest's hot set
+    /// first. `None` = backend has no per-sandbox trace (VZ, process).
+    fn working_set_trace_path(&self, _id: SandboxId) -> Option<PathBuf> {
+        None
+    }
+
     /// ADR 0014 issue #1/#2: commit a snapshot that was just produced
     /// by [`Self::snapshot`]. Signals to the backend that the caller's
     /// downstream pipeline (`record_snapshot` → `destroy` → mark Idle)
