@@ -681,13 +681,14 @@ struct FcSnapshotManifest {
     /// source sandbox booted without a harness substrate.
     #[serde(default)]
     source_harness_canonical: Option<PathBuf>,
-    /// The exact `vsock.uds_path` the bake's FC `PUT /vsock`'d, baked
-    /// into state.bin. FC `load_snapshot` recreates the vsock UDS at
-    /// this path; the host-agent must then dial that same path to
-    /// reach the guest. Without this the host-agent dials
-    /// `<host_work_dir>/<source_id>.vsock` which doesn't exist on a
-    /// cross-host restore (the file FC actually opened lives at the
-    /// bake-side path).
+    /// The exact `vsock.uds_path` the source VM had open at capture,
+    /// as embedded in state.bin. LINEAGE METADATA ONLY since the
+    /// vsock re-key: restores pass the fork's `vsock_override` keyed
+    /// to the new live sandbox id, so FC never binds this path.
+    /// (Inheriting it was the pre-re-key behavior — and the root of
+    /// the 2026-06-11 same-image UDS collision, since every VM
+    /// descended from one base capture shared this one absolute
+    /// path.) Still stamped at snapshot for debuggability.
     #[serde(default)]
     source_vsock_canonical: Option<PathBuf>,
 }
@@ -2669,6 +2670,20 @@ impl FirecrackerBackend {
         // ceiling only bites File mode; tune up for huge VMs.)
         let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
 
+        // Re-key the vsock UDS to THIS sandbox's id via the fork's
+        // `vsock_override` load param. Without the override FC binds the
+        // ancestor path embedded in state.bin (`source_vsock_canonical`),
+        // which is shared by EVERY VM descended from the same base
+        // capture — two same-image VMs on one host then fight over one
+        // absolute path, and exec/harness traffic silently follows the
+        // last binder (the 2026-06-11 cross-session misroute: a teleport
+        // dest, an idle-resume, and a warm-pool refill of one image took
+        // turns stealing each other's channels). Per-sandbox keying makes
+        // the path unique by construction; the unlink below only ever
+        // touches OUR OWN id-keyed path, never a live sibling's.
+        let vsock_uds_path = paths::vsock_uds_path(&self.work_dir, sandbox_id);
+        let _ = tokio::fs::remove_file(&vsock_uds_path).await;
+
         // The UFFD handler was already spawned concurrently in leg 2
         // (`uffd_leg`); the gate just dials it. File mode loads memory.bin
         // synchronously; Uffd returns immediately and pages fault lazily.
@@ -2697,6 +2712,7 @@ impl FirecrackerBackend {
                                 &paths,
                                 /*resume_vm=*/ aux_swap_plan.is_empty(),
                                 self.config.track_dirty_pages,
+                                Some(&vsock_uds_path),
                             )
                             .await
                         },
@@ -2754,6 +2770,7 @@ impl FirecrackerBackend {
                                 /*resume_vm=*/ aux_swap_plan.is_empty(),
                                 self.config.track_dirty_pages,
                                 base.as_deref(),
+                                Some(&vsock_uds_path),
                             )
                             .await
                         },
@@ -2823,25 +2840,17 @@ impl FirecrackerBackend {
         // the original VM had attached — Firecracker reopens that
         // path on load, so it must still be valid on disk.
         let rootfs_path = manifest.spec.rootfs_source.clone().unwrap_or_default();
-        // FC `load_snapshot` reads vsock config from state.bin and
-        // binds the host-side UDS at the bake-side path. FC's vsock
-        // state machine refuses any reconfiguration after load (PUT
-        // /vsock returns 400 both pre-load — "configuring boot
-        // resources before load" — and post-load — "not supported
-        // after starting the microVM"), so we MUST dial the bake's
-        // path. `source_vsock_canonical` carries that path. Fall back
-        // to the host-derived layout for legacy snapshots / same-host
-        // idle resume.
-        let vsock_uds_path = manifest
-            .source_vsock_canonical
-            .clone()
-            .unwrap_or_else(|| self.work_dir.join(format!("{}.vsock", manifest.sandbox_id)));
+        // `vsock_uds_path` was re-keyed to THIS sandbox's id before the
+        // load (the fork's `vsock_override` rewrote the device state, so
+        // FC bound it — NOT the `source_vsock_canonical` ancestor path
+        // that PUT /vsock's post-load 400 used to force us to inherit).
+        // The manifest's `source_vsock_canonical` is lineage metadata
+        // only from here on.
         let vsock_cid = self.next_cid.fetch_add(1, Ordering::Relaxed);
-        // Re-spawn the harness accept loop for the restored VM. FC
-        // restored its vsock device pointing at the snapshot-time UDS
-        // (manifest.sandbox_id-derived path), but the host-side accept
-        // loop that originally bound `<uds>_1026` died with the
-        // pre-snapshot sandbox. Without this, the in-VM adapter's
+        // Re-spawn the harness accept loop for the restored VM at the
+        // re-keyed base. The host-side accept loop that originally bound
+        // `<uds>_1026` died with the pre-snapshot sandbox (or never
+        // existed on this host). Without this, the in-VM adapter's
         // post-resume reconnect dial finds no listener.
         self.spawn_harness_listener(sandbox_id, &vsock_uds_path)
             .await?;
@@ -3101,25 +3110,14 @@ async fn restore_canonical_symlinks(
             }
         }
     }
-    // FC `load_snapshot` re-creates the vsock UDS at the path embedded
-    // in state.bin (the bake's `<work_dir>/<id>.vsock`). The bake's
-    // tempdir is long gone on a cross-host restore, so the bind would
-    // fail silently — FC reports load success, then our CONNECT
-    // returns "early eof" because there's no listener. Pre-create the
-    // parent directory so FC can bind.
-    if let Some(source_vsock) = manifest.source_vsock_canonical.as_ref() {
-        if let Some(parent) = source_vsock.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                vm_err(format!(
-                    "create source vsock canonical parent {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
-        // Stale UDS file from a prior restore on this host blocks the
-        // bind. Best-effort remove; missing file is fine.
-        let _ = tokio::fs::remove_file(source_vsock).await;
-    }
+    // Vsock: nothing to recreate. The load passes `vsock_override`
+    // keyed to the NEW live sandbox id, so FC never binds the
+    // state.bin-embedded ancestor path. The old arm here unlinked
+    // `source_vsock_canonical` pre-load — on a host where a same-image
+    // sibling VM was LIVE on that shared path, that unlink stole its
+    // socket (the 2026-06-11 cross-session misroute). Deliberately
+    // gone; the per-sandbox path's stale-file unlink happens at the
+    // load site in `restore_in_jail`.
     // ADR 0021 P1.5: no harness canonical symlink to restore — the
     // harness binary lives in the rootfs at the manifest-declared
     // `[harness] exec` path, so there's nothing for the host to
@@ -3946,26 +3944,18 @@ impl SandboxBackend for FirecrackerBackend {
             net::teardown_netns(netns_setup, &self.net_allocator).await;
         }
 
-        // ADR 0018 cross-host evac safety: do NOT unlink the base
-        // vsock UDS file at `live.state.vsock_uds_path` on destroy.
-        // FC's snapshot embeds the source sandbox's UDS path
-        // verbatim (`source_vsock_canonical` in the manifest), and
-        // `load_snapshot` re-binds that exact path on the receiving
-        // host. On shared-filesystem deployments (dev-vm running
-        // multiple host-agents, future co-located scheduler
-        // experiments) the source's destroy and the target's
-        // load-snapshot race on the same path; if destroy wins it
-        // unlinks the dentry while the target's FC is still bound,
-        // and host-side `connect(path)` then fails ENOENT even
-        // though the kernel binding survives via the FD. Leaving
-        // the file behind is safe: the per-port UDS files
-        // (`<base>_<port>`, host-agent's accept listeners) already
-        // orphan on destroy by the same logic, and `create_in_jail`
-        // does `remove_file` of any stale UDS before binding, so a
-        // future sandbox at the same UUID path picks up clean. In
-        // production deployments with separate filesystems per
-        // host the orphan is a 0-byte file on the source host
-        // only — bounded by sandbox creation rate.
+        // Do NOT unlink the base vsock UDS file at
+        // `live.state.vsock_uds_path` on destroy. Historically (ADR
+        // 0018 cross-host evac safety) this guarded the
+        // shared-filesystem race where a receiver's `load_snapshot`
+        // re-bound the SAME canonical path the source's destroy was
+        // unlinking. Since the vsock re-key the path is per-sandbox
+        // (restores pass `vsock_override`), so the cross-host race is
+        // gone — but leaving the file behind stays the safe default:
+        // create/restore `remove_file` any stale UDS before binding,
+        // so a future sandbox at the same UUID path picks up clean,
+        // and the orphan is a 0-byte file bounded by sandbox
+        // creation rate.
         //
         // The per-sandbox jail dir + canonical symlinks below are
         // still removed; those are deterministic per local sandbox
@@ -4679,10 +4669,10 @@ impl FirecrackerBackend {
         // Recomputing off `id` stamped a path nobody recreates on the
         // next restore → ENOENT (rootfs) / EADDRINUSE (vsock). Anchoring
         // to the embedded path keeps the whole snapshot lineage
-        // consistent across arbitrarily many chained restores. Vsock
-        // can't be re-pointed (PUT /vsock 400 post-load), so this
-        // carry-forward is the ONLY correct option there — rootfs uses
-        // the same mechanism for uniformity.
+        // consistent across arbitrarily many chained restores. (Vsock is
+        // re-keyed per-sandbox at load via the fork's `vsock_override`
+        // these days, so its stamp below is lineage metadata; the live
+        // value is still the honest one to record.)
         let source_rootfs_canonical = if spec.rootfs_source.is_some() {
             Some(live_rootfs_canonical)
         } else {

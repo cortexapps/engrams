@@ -275,7 +275,7 @@ impl FirecrackerClient {
     /// eviction-resume. Use [`Self::load_snapshot_uffd`] in
     /// production-grade resume paths.
     pub async fn load_snapshot(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
-        self.load_snapshot_inner(paths, /*resume_vm=*/ true, /*track=*/ false)
+        self.load_snapshot_inner(paths, /*resume_vm=*/ true, /*track=*/ false, None)
             .await
     }
 
@@ -284,22 +284,27 @@ impl FirecrackerClient {
     /// option-D restore path where a `patch_drive` happens between
     /// load and resume.
     pub async fn load_snapshot_paused(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
-        self.load_snapshot_inner(paths, /*resume_vm=*/ false, /*track=*/ false)
-            .await
+        self.load_snapshot_inner(
+            paths, /*resume_vm=*/ false, /*track=*/ false, None,
+        )
+        .await
     }
 
     /// File-backed load with explicit `resume_vm` /
     /// `enable_diff_snapshots` knobs. ADR 0028: restored VMs have no
     /// `machine-config` PUT, so `enable_diff_snapshots: true` here is
     /// the only way to (re-)arm KVM dirty tracking for subsequent
-    /// `SnapshotType::Diff` captures.
+    /// `SnapshotType::Diff` captures. `vsock_uds_override` re-keys the
+    /// vsock UDS to a per-sandbox path (upstream FC ≥1.16; see
+    /// [`SnapshotLoadBody::vsock_override`]).
     pub async fn load_snapshot_opts(
         &self,
         paths: &SnapshotPaths,
         resume_vm: bool,
         enable_diff_snapshots: bool,
+        vsock_uds_override: Option<&Path>,
     ) -> Result<(), SandboxError> {
-        self.load_snapshot_inner(paths, resume_vm, enable_diff_snapshots)
+        self.load_snapshot_inner(paths, resume_vm, enable_diff_snapshots, vsock_uds_override)
             .await
     }
 
@@ -308,6 +313,7 @@ impl FirecrackerClient {
         paths: &SnapshotPaths,
         resume_vm: bool,
         enable_diff_snapshots: bool,
+        vsock_uds_override: Option<&Path>,
     ) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {
             snapshot_path: paths.state_path.to_string_lossy().into_owned(),
@@ -319,6 +325,9 @@ impl FirecrackerClient {
             resume_vm,
             // Substrate base backing is a Uffd-mode concept (ADR 0045 v2b).
             uffd_base_file: None,
+            vsock_override: vsock_uds_override.map(|p| VsockOverrideBody {
+                uds_path: p.to_string_lossy().into_owned(),
+            }),
         };
         self.put("/snapshot/load", &body).await
     }
@@ -342,6 +351,7 @@ impl FirecrackerClient {
             /*resume_vm=*/ true,
             false,
             None,
+            None,
         )
         .await
     }
@@ -364,13 +374,16 @@ impl FirecrackerClient {
             /*resume_vm=*/ false,
             false,
             None,
+            None,
         )
         .await
     }
 
     /// UFFD-backed load with explicit `resume_vm` /
     /// `enable_diff_snapshots` knobs (ADR 0028; see
-    /// [`Self::load_snapshot_opts`]).
+    /// [`Self::load_snapshot_opts`]). `vsock_uds_override` re-keys the
+    /// vsock UDS to a per-sandbox path (upstream FC ≥1.16; see
+    /// [`SnapshotLoadBody::vsock_override`]).
     pub async fn load_snapshot_uffd_opts(
         &self,
         state_path: &Path,
@@ -378,6 +391,7 @@ impl FirecrackerClient {
         resume_vm: bool,
         enable_diff_snapshots: bool,
         uffd_base_file: Option<&Path>,
+        vsock_uds_override: Option<&Path>,
     ) -> Result<(), SandboxError> {
         self.load_snapshot_uffd_inner(
             state_path,
@@ -385,6 +399,7 @@ impl FirecrackerClient {
             resume_vm,
             enable_diff_snapshots,
             uffd_base_file,
+            vsock_uds_override,
         )
         .await
     }
@@ -396,6 +411,7 @@ impl FirecrackerClient {
         resume_vm: bool,
         enable_diff_snapshots: bool,
         uffd_base_file: Option<&Path>,
+        vsock_uds_override: Option<&Path>,
     ) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {
             snapshot_path: state_path.to_string_lossy().into_owned(),
@@ -406,6 +422,9 @@ impl FirecrackerClient {
             enable_diff_snapshots,
             resume_vm,
             uffd_base_file: uffd_base_file.map(|p| p.to_string_lossy().into_owned()),
+            vsock_override: vsock_uds_override.map(|p| VsockOverrideBody {
+                uds_path: p.to_string_lossy().into_owned(),
+            }),
         };
         self.put("/snapshot/load", &body).await
     }
@@ -776,6 +795,24 @@ struct SnapshotLoadBody {
     /// `deny_unknown_fields` this struct).
     #[serde(skip_serializing_if = "Option::is_none")]
     uffd_base_file: Option<String>,
+    /// Re-key the vsock backend UDS to a per-sandbox path at load,
+    /// instead of the ancestor path embedded in `state.bin`. Without
+    /// this, every VM descended from one base capture binds the SAME
+    /// absolute UDS path — two same-image VMs on one host then fight
+    /// over it and exec/harness traffic silently follows the last
+    /// binder (the 2026-06-11 cross-session misroute). Upstream FC
+    /// ≥1.16 (so every engrams build since the Phase B roll) rewrites
+    /// the device state pre-build (`persist.rs` vsock_override), so FC
+    /// binds this path and derives the `_<port>` dial-out paths from
+    /// it too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vsock_override: Option<VsockOverrideBody>,
+}
+
+/// `vsock_override` member of [`SnapshotLoadBody`].
+#[derive(Debug, Serialize)]
+struct VsockOverrideBody {
+    uds_path: String,
 }
 
 /// How memory is supplied during snapshot load.
@@ -1208,6 +1245,7 @@ mod tests {
             enable_diff_snapshots: false,
             resume_vm: true,
             uffd_base_file: None,
+            vsock_override: None,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["snapshot_path"], "/snap/state.bin");
@@ -1215,6 +1253,27 @@ mod tests {
         assert_eq!(v["mem_backend"]["backend_path"], "/snap/memory.bin");
         assert_eq!(v["enable_diff_snapshots"], false);
         assert_eq!(v["resume_vm"], true);
+        // Unset override is OMITTED — body stays byte-identical to
+        // stock (deny_unknown_fields posture, same as uffd_base_file).
+        assert!(v.get("vsock_override").is_none());
+
+        let body = SnapshotLoadBody {
+            snapshot_path: "/snap/state.bin".into(),
+            mem_backend: MemBackend {
+                backend_type: MemBackendType::Uffd,
+                backend_path: "/snap/uffd.sock".into(),
+            },
+            enable_diff_snapshots: false,
+            resume_vm: true,
+            uffd_base_file: None,
+            vsock_override: Some(VsockOverrideBody {
+                uds_path: "/work/abc.vsock".into(),
+            }),
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        // Wire shape matches the fork's swagger: a nested object with
+        // `uds_path` (vsock re-key at load).
+        assert_eq!(v["vsock_override"]["uds_path"], "/work/abc.vsock");
     }
 
     #[test]
