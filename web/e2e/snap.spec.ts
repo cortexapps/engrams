@@ -12,7 +12,7 @@ import { test } from "@playwright/test";
 // Self-skips when SNAP_PATHS is unset so `just e2e` (the characterization
 // net) never runs the harness; `just snap` always sets it.
 const raw = process.env.SNAP_PATHS;
-const paths = (raw ?? "/").split(",");
+const paths = (raw ?? "/").split(",").map((p) => p.trim());
 
 for (const p of paths) {
   const slug = p === "/" ? "root" : p.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "");

@@ -17,13 +17,15 @@ test("create a session and watch it come alive", async ({ page }) => {
     .getByRole("option", { name: /integration/ })
     .first()
     .click();
-  // Pin that we really picked the harness-less image (the token-gated Link
-  // never appears for it): the dialog echoes the image's harness state.
-  await expect(page.getByText(/no baked harness/i)).toBeVisible();
+  // Pin that we really picked the harness-less image (the token-gated submit
+  // never appears for it): the dialog exposes the image's harness state
+  // structurally via data-harness ("" = no baked harness), so this survives
+  // copy changes.
+  await expect(page.getByTestId("image-harness-state")).toHaveAttribute("data-harness", "");
   await page.getByTestId("start-session").click();
 
   await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+/, { timeout: 30_000 });
-  const id = page.url().split("/sessions/")[1];
+  const id = page.url().match(/\/sessions\/([0-9a-f-]+)/)![1];
 
   // The stream is live: the event count climbs above zero.
   await expect
@@ -44,6 +46,8 @@ test("create a session and watch it come alive", async ({ page }) => {
   // SHELL tab's WebSocket connects. Predicate-filter (vite HMR also opens a
   // websocket); 'websocket' fires on creation, so also await a received
   // frame (ttyd handshakes promptly) to pin "connected".
+  // The "/shell" substring is sanctioned characterization of the WS URL
+  // contract — the migration must keep serving the shell relay under /shell.
   const wsPromise = page.waitForEvent("websocket", {
     predicate: (ws) => ws.url().includes("/shell"),
     timeout: 30_000,
@@ -53,7 +57,10 @@ test("create a session and watch it come alive", async ({ page }) => {
   await ws.waitForEvent("framereceived", { timeout: 15_000 });
 
   // The new row appears in the list. (Post-migration this list shows TASKS —
-  // the testid survives the noun change; assert on testid, never copy.)
+  // the testid + data-session-id survive the noun change; assert on
+  // attributes, never copy or display formatting.)
   await page.goto("/");
-  await expect(page.getByTestId("session-row").filter({ hasText: id.slice(0, 8) })).toBeVisible();
+  await expect(
+    page.getByTestId("session-row").and(page.locator(`[data-session-id="${id}"]`)),
+  ).toBeVisible();
 });

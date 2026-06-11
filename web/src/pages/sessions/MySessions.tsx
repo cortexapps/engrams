@@ -19,7 +19,10 @@ export function MySessions() {
         title="Sessions"
         description="Bounded units of agent work: launch, watch, resume."
         actions={
-          <NewSessionDialog onCreated={(id) => navigate({ to: "/sessions/$id", params: { id } })} />
+          <NewSessionDialog
+            triggerTestId="new-session"
+            onCreated={(id) => navigate({ to: "/sessions/$id", params: { id } })}
+          />
         }
       />
 

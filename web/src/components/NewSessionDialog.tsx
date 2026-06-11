@@ -38,6 +38,7 @@ export function NewSessionDialog({
   onCreated,
   variant,
   className,
+  triggerTestId,
   open: openProp,
   onOpenChange,
   showTrigger = true,
@@ -47,6 +48,10 @@ export function NewSessionDialog({
    * passes `secondary` + `w-full` so it reads quietly beside the active row. */
   variant?: ComponentProps<typeof Button>["variant"];
   className?: string;
+  /** Test id for the trigger button. Pass it from at most ONE mounted instance
+   * per page (the header actions today) — a second instance with the same id
+   * breaks strict-mode getByTestId when both render (e.g. empty list + header). */
+  triggerTestId?: string;
   /** Controlled open state. Omit for the self-contained trigger usage; pass it
    * (with `showTrigger={false}`) for the global, keyboard/palette-driven mount
    * in RootLayout. */
@@ -104,7 +109,7 @@ export function NewSessionDialog({
     <Dialog open={open} onOpenChange={setOpen}>
       {showTrigger && (
         <DialogTrigger asChild>
-          <Button data-testid="new-session" variant={variant} className={className}>
+          <Button data-testid={triggerTestId} variant={variant} className={className}>
             New session
           </Button>
         </DialogTrigger>
@@ -157,7 +162,13 @@ export function NewSessionDialog({
                         ))}
                       </SelectContent>
                     </Select>
-                    <FieldDescription>
+                    {/* data-harness carries the machine-readable harness state
+                        ("" = harness-less) so tests pin it structurally
+                        instead of coupling to the prose. */}
+                    <FieldDescription
+                      data-testid="image-harness-state"
+                      data-harness={harnessName ?? ""}
+                    >
                       {harnessName
                         ? `Baked harness: ${harnessName}`
                         : "No baked harness — shell-only image"}
