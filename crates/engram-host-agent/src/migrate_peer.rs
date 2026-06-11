@@ -167,6 +167,9 @@ pub struct PeerServer {
     /// The port the listener binds (presetup advertises it to the
     /// coordinator, which pairs it with the source's host address).
     port: u16,
+    /// How long an unknown-export `Hello` parks awaiting the capture's
+    /// registration (export-TTL scale in production; tests shrink it).
+    park_budget: std::time::Duration,
     exports: DashMap<String, Arc<PeerExport>>,
     /// `GetChunk` backing. `None` ⇒ `GetChunk` answers `Error` (the dest
     /// falls back to GCS) — hosts without chunk machinery can't be
@@ -177,8 +180,19 @@ pub struct PeerServer {
 
 impl PeerServer {
     pub fn new(port: u16, cache: Option<ChunkCache>, store: Option<ChunkStore>) -> Arc<Self> {
+        Self::new_with_park_budget(port, cache, store, std::time::Duration::from_secs(120))
+    }
+
+    /// Test seam: shrink the unknown-export park window.
+    pub fn new_with_park_budget(
+        port: u16,
+        cache: Option<ChunkCache>,
+        store: Option<ChunkStore>,
+        park_budget: std::time::Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             port,
+            park_budget,
             exports: DashMap::new(),
             cache,
             store,
@@ -272,15 +286,33 @@ impl PeerServer {
                     )?;
                     return Ok(());
                 }
-                let Some(export) = self.get(&export_id) else {
-                    write_frame(
-                        &mut stream,
-                        &FromSource::Error {
-                            req_id: None,
-                            message: "unknown export".into(),
-                        },
-                    )?;
-                    return Ok(());
+                // ADR 0045 C2: PARK an unknown export instead of
+                // rejecting — the destination handler is spawned (and
+                // dials) BEFORE the source pauses; its export appears
+                // only when the capture registers it. Poll-park up to
+                // the export-TTL scale; sub-ms wakeup once the seal
+                // lands keeps the blackout honest. Bounded + VPC-
+                // internal + one-migration-per-host (R8), so the
+                // parked-conn surface is tiny. (Found by prod-probing
+                // the Hello path: the reject made every first-attempt
+                // C2 move fail by construction.)
+                let park_budget = self.park_budget;
+                let parked_at = std::time::Instant::now();
+                let export = loop {
+                    if let Some(export) = self.get(&export_id) {
+                        break export;
+                    }
+                    if parked_at.elapsed() > park_budget {
+                        write_frame(
+                            &mut stream,
+                            &FromSource::Error {
+                                req_id: None,
+                                message: "unknown export (park budget exhausted)".into(),
+                            },
+                        )?;
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 };
                 // Hash-then-compare: constant-time without a new dep.
                 let got = Sha256::digest(token.as_bytes());
@@ -546,7 +578,12 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_export_and_bad_token_are_rejected() {
-        let server = PeerServer::new(9102, None, None);
+        let server = PeerServer::new_with_park_budget(
+            9102,
+            None,
+            None,
+            std::time::Duration::from_millis(50),
+        );
         server.register(test_export("right"));
 
         let got = talk(server.clone(), vec![hello("nope", "right")], 1).await;
@@ -649,6 +686,29 @@ mod tests {
         assert!(
             matches!(&got[2], FromSource::Error { req_id: Some(9), message } if message.contains("allowlist"))
         );
+    }
+
+    /// ADR 0045 C2: the pre-staged destination dials BEFORE the
+    /// capture registers the export — the server PARKS the Hello and
+    /// completes the handshake the moment registration lands. (The
+    /// immediate-reject this replaces made every first-attempt
+    /// post-copy move fail by construction; found prod-probing.)
+    #[tokio::test]
+    async fn early_hello_parks_until_the_export_registers() {
+        let server = PeerServer::new(9102, None, None);
+        let registrar = server.clone();
+        // Register 150ms AFTER the Hello is in flight.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            registrar.register(test_export("t"));
+        });
+        let got = talk(server, vec![hello("exp-1", "t")], 2).await;
+        assert!(
+            matches!(&got[0], FromSource::HelloAck { .. }),
+            "parked hello must ack once the export registers, got {:?}",
+            got[0]
+        );
+        assert!(matches!(&got[1], FromSource::Seal { .. }));
     }
 
     #[tokio::test]
