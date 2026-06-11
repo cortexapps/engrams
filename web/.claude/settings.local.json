@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams add docs/superpowers/specs/2026-06-03-tanstack-router-migration-design.md)",
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams commit -q -m 'spec: migrate engrams-web to TanStack Router \\(code-based, beforeLoad guards\\) *)",
+      "Bash(pnpm test *)",
+      "Bash(pnpm build *)",
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams add web/package.json web/pnpm-lock.yaml pnpm-lock.yaml package.json)",
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams add -A web/package.json)",
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams status --short)",
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams add web/pnpm-lock.yaml)",
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams commit -q -m 'build\\(web\\): add @tanstack/react-router dependency *)",
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams add web/src/router.tsx)",
+      "Bash(git -C /Users/ganeshdatta/Documents/engrams status)",
+      "Bash(pnpm vitest *)"
+    ]
+  }
+}

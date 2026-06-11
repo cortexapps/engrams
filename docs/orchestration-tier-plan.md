@@ -4,89 +4,147 @@
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 > Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Split the web-application layer out of the Rust coordinator into a new
-TypeScript orchestration tier per [ADR 0039](adr/0039-typescript-orchestration-tier.md),
-leaving user-observable session behavior unchanged (verified by a Playwright
-characterization net written first).
+**Written against [ADR 0039](adr/0039-typescript-orchestration-tier.md) as
+revised 2026-06-10** (authz in the orchestrator, AWS-style control plane,
+task model). This plan supersedes the 2026-06-09 version (commit `727c380`),
+which targeted the pre-revision ADR.
 
-**Architecture:** Three tiers. The Rust coordinator grows a tonic gRPC "app
-contract" (ADR 0039 §2.3) and eventually sheds cookies/OIDC. A new `orchestrator/`
-service (Hono on Node) owns human auth (better-auth), mints short-lived
-forward-auth JWTs downstream, and forwards RPCs to the control plane through a
-**generic Connect passthrough** — no hand-written per-endpoint handlers. The
-browser keeps **SSE** for the event feed and **WebSocket** for the shell, both
-now terminated at the orchestrator.
+**Goal:** Split the web-application layer out of the Rust coordinator into a
+TypeScript orchestration tier, leaving user-observable session behavior
+unchanged (verified by a Playwright characterization net written first, plus
+visual screenshot validation at every UI-touching task).
 
-**Tech Stack:** Rust (tonic 0.12 / prost 0.13 — already used for the host
-fabric), Buf (codegen + breaking-change CI), TypeScript on Node ≥ 22 (Hono,
-`@hono/node-server` ≥ 1.13, `@hono/node-ws`, `@connectrpc/connect` v2 +
-`@connectrpc/connect-node`, `@bufbuild/protobuf` v2, better-auth, drizzle-orm,
-Postgres), React (`@connectrpc/connect-query` v2), Playwright.
+**Architecture:** Three tiers. The Rust coordinator becomes an AWS-style raw
+resource API — tonic gRPC, **ServiceBearer machine auth only, no users, no
+per-user authz** — plus a KEK-sealed `SecretService`. The new `orchestrator/`
+(Hono on Node) owns human auth (better-auth + its **admin plugin** for roles),
+**all authorization** (a CASL ability + a policy gate on the generic Connect
+passthrough), and the **task model** (`task`/`task_session`; TaskService
+implemented natively). The browser keeps SSE for events and WebSocket for the
+shell, both terminated at the orchestrator; the UI's primary list becomes
+tasks.
 
-**This plan was adversarially reviewed task-by-task before finalization;
-corrections are inlined.** Where a step says "verified: X", a reviewer checked X
-against the codebase or the installed library — don't re-litigate, but do trust
-the compiler over the plan if they disagree.
+**Tech Stack:** Rust (tonic 0.12 / prost 0.13), Buf, TypeScript on Node ≥ 22
+(Hono, `@hono/node-server` ≥ 1.13, `@hono/node-ws`, `@connectrpc/connect` v2 +
+`@connectrpc/connect-node`, `@bufbuild/protobuf` v2, better-auth + admin
+plugin, **@casl/ability**, drizzle-orm, Postgres), React
+(`@connectrpc/connect-query` v2), Playwright.
+
+**This plan's predecessor was adversarially reviewed task-by-task; the
+corrections that survive the ADR revision are kept inline** (marked
+"verified"). Trust the compiler over the plan if they disagree.
 
 ---
 
-## Amendments to ADR 0039 (decisions made in review, binding for this plan)
+## Decisions this plan encodes (from the revised ADR)
 
-These supersede the corresponding ADR text:
+1. **Control plane sheds identity entirely** (ADR §2.1/§5/§6): no `users`
+   table, no `sessions.user_id` (made nullable mid-migration, dropped at
+   cutover), no `require_admin`/`require_session_owner` on the gRPC path, no
+   JWKS/forward-auth. The app-gRPC surface authenticates a **static service
+   bearer** and trusts the caller fully.
+2. **Orchestrator owns authz** (ADR §6): CASL ability (one file, shared with
+   React), roles from better-auth's admin plugin, ownership via the task
+   join. The passthrough gains a per-method **policy gate** that fails closed.
+3. **Task model** (ADR §3): `task` + `task_session` in the orchestrator's
+   Postgres; **TaskService is orchestrator-native** (same proto package,
+   implemented on the Connect router, never proxied). The UI's "new session"
+   becomes `CreateTask(type:'chat')`; the sessions list becomes a task list.
+   Chat = degenerate task, no DBOS.
+4. **Secrets** (ADR §2.3): `SecretService` (PutSecret/HasSecret/DeleteSecret,
+   opaque keys, KEK-sealed in Rust) replaces `/me/claude-token` storage. The
+   orchestrator keys entries by its user id and relays opaquely — it is **not**
+   in the passthrough surface (the key must come from the session, never the
+   client). Existing saved Claude tokens are **not migrated** — users re-save
+   once (small user base; re-keying old coordinator user ids to better-auth
+   ids isn't worth the machinery).
+5. Carried from the previous round: Hono on Node; generic passthrough; SSE
+   browser event leg with the hand-built `{idx, kind, payload_json}` envelope;
+   `ShellRelayService` as its own service; protos at `proto/engram/app/v1/`;
+   `Exec` and `GetArtifact` are streaming RPCs; event payload typing deferred
+   (union pinned by a fixture contract test).
+6. **`webhooks/`, `integrations/`, `workflows/` directories stay uncreated**
+   (reserved for the DBOS fast-follows; YAGNI).
 
-1. **Runtime: Hono on Node, not Bun/Elysia** (amends §7, §8). DBOS — the
-   intended fast-follow workflow engine (§3) — requires Node; Node's mature
-   HTTP/2 client also de-risks the gRPC bidi shell leg. Hono is fetch-native
-   and has first-class better-auth support.
-2. **Generic passthrough, not hand-written RPCs** (amends §2.2/§2.3 reading).
-   The UI-facing Connect surface and the control-plane tonic surface are the
-   *same* generated service definitions. The orchestrator forwards them with
-   one generic handler whose interceptor swaps cookie → forward-auth JWT.
-   Bespoke orchestrator endpoints exist only where there is real aggregation —
-   near-term that is exactly three: the SSE event leg, the WS shell leg, and
-   the artifact byte route (browsers consume artifacts via `<img src>`, not
-   RPCs).
-3. **Browser event leg stays SSE** (amends §8/§9.3 primary choice; it was the
-   ADR's recorded alternative). The `data:` payload is a small hand-built JSON
-   envelope (`{idx, kind, payload_json}`) derived from the generated
-   `SessionEvent` message; `EventSource` gives reconnect + `Last-Event-ID` for
-   free.
-4. **Event payload typing is deferred** (consistent with the ADR's deferred
-   list). The proto envelope is `SessionEvent { idx, kind, payload_json }`,
-   where `payload_json` is **normatively** the same JSON object today's SSE
-   `data:` field carries — i.e. the event payload *with `_recovery_epoch` /
-   `_rewound` folded in* (`api/events.rs:144` `with_rewind_meta`), for both
-   replayed and live events. The existing discriminated union for payload
-   shapes moves to a trimmed `web/src/events.ts` — the one hand-maintained
-   type file that survives this plan — and is pinned by a fixture contract
-   test (Task 24). Fully typed event protos ride with the transcript-shaping
-   decision later.
-5. **Shell double relay is kept for now**: browser WS → orchestrator →
-   control-plane gRPC bidi → host-agent. The orchestrator's shell code is
-   isolated in one module (`routes/shell.ts`) so a later swap to a
-   direct/ticket model touches nothing else. The orchestrator-facing bidi RPC
-   lives in its own `ShellRelayService` (not inside `SessionService`, and not
-   named `ProxyShell` — avoids both the host-contract name collision and
-   shipping a browser-uncallable method in the UI surface).
-6. **`GetMe` joins the contract.** The ADR excludes `/me` from the gRPC
-   contract, but the web's `AuthProvider` needs role / `has_claude_token` /
-   admin-ness, which only the control plane knows (roles are authoritative
-   there, §6). A self-scoped `UserService.GetMe` (no id parameter; answers for
-   the asserted principal) replaces `/me`'s data half; better-auth replaces its
-   authentication half.
-7. **Module layout** is fixed (below); the `webhooks/`, `integrations/`, and
-   `workflows/` directories are *reserved names* for the Slack/Linear/DBOS
-   fast-follows and must not be created or stubbed in this plan (YAGNI).
+## Out of scope (fast-follows)
 
-## Out of scope (fast-follows, not in this plan)
+DBOS and workflows; Slack/Linear webhooks + the `connections` store; per-ticket
+on-behalf-of attribution; typed event payloads / transcript shaping; team or
+sharing semantics (the OpenFGA trigger, ADR §6); task types beyond `chat`;
+per-type task status machines and the task activity table; full rolling-deploy
+stream draining (basic SIGTERM-close only).
 
-DBOS and workflows (§3); Slack/Linear webhooks, the `connections` store, and
-integrations (§4); per-ticket on-behalf-of attribution; typed event payloads /
-server-side transcript shaping; **full rolling-deploy stream draining** (an ADR
-"Implications" item — deliberately deferred: the event cursor + EventSource
-reconnect make SSE restarts nearly free and shells are non-replayable anyway;
-Task 15 ships basic SIGTERM-close only, and the residual drain work needs its
-own plan).
+## Visual validation protocol (use throughout)
+
+UI-touching tasks carry a **Visual check** step. The mechanism:
+
+- `web/e2e/snap.spec.ts` (created in Task 2) navigates a comma-separated
+  `SNAP_PATHS` env list using the suite's auth storageState and writes
+  full-page screenshots to `web/e2e/__shots__/<slug>.png`.
+  `just snap "/path1,/path2"` wraps it.
+- **Phase 0 captures the baseline** into `web/e2e/__shots__/baseline/`
+  (committed): the task/sessions list, a session detail in each tab
+  (transcript/raw/shell), Fleet, Storage, Settings, Members, and the
+  new-session form.
+- At each Visual check, the executing agent re-snaps the affected paths and
+  **reads both PNGs** (current vs baseline), verifying the named assertions in
+  the step — e.g. "rows render with status chips, no unstyled fallback text,
+  admin nav present for admin / absent for member." Visual diffs that are
+  *intended* (e.g. the list becoming a task list, the login page existing)
+  are named in the step; anything else is a regression — stop and fix.
+- The shots directory (except `baseline/`) is gitignored.
+
+## Stage smoke gates (`just smoke-*`)
+
+Every phase ends with a runnable smoke against the live dev stack, layered so
+each stage's gate exercises the deepest seam that exists so far. The merge
+gate for any task = `just e2e` + every `smoke-*` recipe that exists at that
+point. Umbrella: `just smoke` runs all of them in order.
+
+| Recipe | Exists from | What it proves |
+|---|---|---|
+| `just e2e` | Task 2 | the user-observable journey (browser-black-box) |
+| `just smoke-control-plane` | Task 10 | the tonic surface live: bearer accepted/rejected, create→list→get→stream-events→snapshot→delete on a no-harness image, secret put/has/delete (extends as Tasks 11–13 land — it is simply `cargo test -p engram-coordinator --test grpc_smoke -- --ignored` over the env-gated live tests, one recipe, one entry point) |
+| `just smoke-orchestrator` | Task 18 | the orchestrator live, end to end: healthz+DB, sign-up/sign-in, the **authz matrix** (anon→401, member-on-other's-session→404, member→ListHosts 403, admin→200), CreateTask→SSE-event-flows→DeleteTask once Task 19/20 land (env-gated vitest file `orchestrator/src/smoke.live.test.ts`, recipe = `SMOKE=1 pnpm -C orchestrator vitest run smoke.live`) |
+| `just smoke-parity` | end of Phase 3 | **the passthrough is faithful**: differential old-vs-new (below) |
+| `just snap …` | Task 2 | visual regression (protocol above) |
+
+**How we validate that things actually pass through** — three layers, each
+catching what the previous can't:
+
+1. **Reflection-driven conformance (in-process, every method, automatic).**
+   The passthrough is generic, so its test must be too — a hand-written test
+   per RPC would rot the moment the contract grows. Task 18's conformance
+   test iterates `SURFACE` × `service.methods` and, for each method: builds a
+   **fully-populated request** via schema reflection (every field set with
+   deterministic values — see Task 18 Step 6), sends it through the
+   orchestrator as an admin (so the policy gate passes and transport fidelity
+   is tested orthogonally to authz), and asserts (a) the fake upstream
+   received a **byte-identical** request (`toBinary` equality), (b) the
+   client received the byte-identical fully-populated response the fake sent,
+   (c) response headers/trailers survived, (d) the bearer was present.
+   Server-streaming methods assert two messages arrive in order. A new RPC
+   added to the proto is covered with zero new test code — and a field the
+   filler can't populate or that doesn't round-trip fails loudly.
+2. **Differential parity, old vs new (live, scaffolding — Phases 3–4 only).**
+   Conformance proves the *orchestrator* relays faithfully; it cannot prove
+   the *Rust cores + `convert.rs`* preserve today's semantics — that's where
+   a mechanically-extracted core can silently default a field. While both
+   stacks serve the same data (legacy axum REST until Task 32, new
+   `/rpc` from Phase 3), `orchestrator/scripts/parity.ts` reads the same
+   resources through **both** paths and diffs normalized JSON: ListSessions
+   vs `GET /api/v1/sessions`, hosts, storage summary, enabled-images,
+   registries, and per-session cow-state/checkpoints. Normalization:
+   camelCase↔snake_case key folding, arrays sorted by id, a per-probe
+   drop-list for volatile fields (ages, timestamps). Run via
+   `just smoke-parity` with the dev stack up; **deleted in Task 28** when the
+   REST side dies — it is scaffolding by design, and its value window is
+   exactly the migration window. Streaming parity: subscribe the legacy SSE
+   and the new SSE for the same session simultaneously and assert identical
+   `idx` sequences + payloads for the first N events (same script).
+3. **The e2e net + visual sweep (black-box).** Proves the composed system
+   behaves identically where it matters — the browser — regardless of how
+   the bytes arrived.
 
 ## Orchestrator file layout (target state at end of Phase 3)
 
@@ -96,84 +154,86 @@ orchestrator/
   src/
     index.ts                # entry: config, server, listen, SIGTERM close
     server.ts               # one Node http server: /rpc → Connect adapter, else → Hono
-    config.ts               # env: ORCHESTRATOR_DATABASE_URL, CONTROL_PLANE_GRPC_URL, ports
+    config.ts               # env: ORCHESTRATOR_DATABASE_URL, CONTROL_PLANE_GRPC_URL,
+                            #      CONTROL_PLANE_BEARER, ports
     auth/
-      better-auth.ts        # better-auth instance: drizzle adapter + JWT plugin (serves JWKS)
-      token.ts              # kAuthToken context key + per-request token supplier
+      better-auth.ts        # better-auth + admin plugin (roles)
       iap.ts                # IAP trusted-SSO bridge (Task 29)
+    authz/
+      ability.ts            # THE CASL policy — one file, shared with React
+      policy-map.ts         # method → {action, subject, extract} for the gate
+      resolve.ts            # sessionId → task row (the ownership join), cached
     control-plane/
-      transport.ts          # gRPC transport to tonic + bearer interceptor + h2 keepalives
-      client.ts             # typed clients for orchestrator-initiated calls (SSE/WS/artifact legs)
+      transport.ts          # gRPC transport + service-bearer interceptor + h2 keepalives
+      client.ts             # typed clients (sessions, shellRelay, secrets, images…)
     rpc/
-      passthrough.ts        # the generic forwarder
-      surface.ts            # the allowlist: which services the UI may reach
+      passthrough.ts        # generic forwarder + policy gate
+      surface.ts            # allowlist + per-method policy entries
+      tasks.ts              # TaskService — NATIVE implementation (not proxied)
     routes/
       events.ts             # SSE browser leg ⇄ upstream StreamEvents
       artifacts.ts          # HTTP byte route ⇄ upstream GetArtifact stream
       shell.ts              # WS browser leg ⇄ upstream ShellRelayService bidi
+      me.ts                 # GET/POST /api/v1/me/claude-token → SecretService (opaque relay)
       health.ts
     db/
-      schema.ts  client.ts  # drizzle (better-auth tables)
+      schema.ts  client.ts  # drizzle: better-auth tables + task + task_session
     gen/                    # buf output — never hand-edited
 ```
 
 ## Sequencing
 
 ```
-Phase 0 (e2e net, vs TODAY's stack)
-   └─► Phase 1 (protos + codegen) ─► Phase 2 (coordinator tonic server)
-                                  └► Phase 3 (orchestrator)
-Phase 2 + 3 ─► Phase 4 (web migration; e2e re-pointed at better-auth)
-Phase 4 ─► Phase 5 (scripts/CLI auth port → IAP bridge → coordinator auth
-                    collapse → legacy route removal)
+Phase 0 (e2e net + visual baseline, vs TODAY's stack)
+   └─► Phase 1 (protos + codegen) ─► Phase 2 (coordinator: bearer + tonic surface)
+                                  └► Phase 3 (orchestrator: authz, tasks, routes)
+Phase 2 + 3 ─► Phase 4 (web migration; tasks UI; e2e re-pointed at better-auth)
+Phase 4 ─► Phase 5 (scripts/CLI port → IAP → coordinator sheds users/auth → route removal)
 ```
 
-- Phase 0 must merge first — it is the safety net the ADR's Preparation section
-  demands. **Gate protocol:** `just e2e` is run manually before merging any
-  Phase ≥ 1 task (it needs a live stack, so it is deliberately not in CI); the
-  person merging runs it. In-flight UI redesign branches must carry the Phase 0
-  `data-testid`s forward — the testids are the contract, the components aren't.
-- Phases 2 and 3 can proceed in parallel after Phase 1. Phase 3 tasks each have
-  an **in-process fake-upstream test** (needs only Phase 1) and a **live
-  Outcome** (needs a specific Phase 2 task: Task 19 ← Task 10, Task 20 ← Task 11,
-  Task 21 ← Task 13, artifacts ← Task 12). When running phases in parallel,
-  stop at the fake test and defer the live Outcome.
-- **Deploy posture:** Tasks 22–30 are a single non-deployable span for any
-  OIDC/IAP production environment. The intermediate states are runnable **in
-  dev only**, because the coordinator keeps `AuthMode::None` + SyntheticAdmin
-  until Task 30: between Tasks 23 and 27, sessions created via `/rpc` are owned
-  by the better-auth JIT-upserted user while events/shell still ride the
-  coordinator under SyntheticAdmin — coherent only because the synthetic
-  principal is an admin who sees every session. Don't "fix" this mid-phase.
+- Phase 0 merges first. **Gate protocol:** `just e2e` runs manually before
+  merging any Phase ≥ 1 task (needs a live stack; deliberately not in CI).
+  In-flight UI redesign branches must carry the Phase 0 `data-testid`s
+  forward — testids are the contract, components aren't.
+- Phases 2 and 3 parallelize after Phase 1. Phase 3 tasks each have an
+  **in-process fake-upstream test** (needs only Phase 1) and a **live
+  Outcome** (needs Phase 2: Task 17 ← Task 9, Task 19/20 ← Tasks 10/12/13,
+  Task 21 ← Task 11, Task 22 ← Task 13). Stop at the fake test when running
+  in parallel.
+- **Deploy posture:** Tasks 23–32 are a single non-deployable span for any
+  production environment. Intermediate states are runnable **in dev only**:
+  the coordinator keeps `AuthMode::None` + SyntheticAdmin on its legacy axum
+  routes until Task 32, while the new gRPC surface runs bearer-auth from
+  birth. Mid-phase, tasks created via the orchestrator and legacy
+  axum-created sessions coexist; legacy ones render as *unattributed*
+  (admin-only) in the new task list — expected, don't "fix" it.
 
-Dev ports (existing + new): web `:5173`, coordinator HTTP `127.0.0.1:8090`,
-Postgres `localhost:5435`, **coordinator app-gRPC `127.0.0.1:50061` (new)**,
+Dev ports: web `:5173`, coordinator HTTP `127.0.0.1:8090`, Postgres
+`localhost:5435`, **coordinator app-gRPC `127.0.0.1:50061` (new)**,
 **orchestrator HTTP `127.0.0.1:8787` (new)**.
 
 ---
 
-# Phase 0 — Characterization net (against the current two-tier stack)
+# Phase 0 — Characterization net + visual baseline (against the current stack)
 
 Implements the ADR's **Preparation** section. Runs against `just dev` today
-(SyntheticAdmin, no login); Task 22 later re-points only the entry step, and
-Task 27 the precondition probe.
+(SyntheticAdmin, no login); Task 23 later re-points only the entry step, and
+Task 29 the precondition probe.
 
 ### Task 1: Playwright scaffold + precondition gate
 
-**Goal:** `pnpm e2e` exists in `web/`, fails fast with a fix-it line per missing
-precondition (web up, control plane healthy, a **no-harness demo image**
-enabled).
+**Goal:** `pnpm e2e` exists in `web/`, fails fast with a fix-it line per
+missing precondition (web up, control plane healthy, a **no-harness demo
+image** enabled).
 
-**Outcome:** With the stack down, `cd web && pnpm e2e` exits non-zero printing
-the `run \`just dev\` first` fix-it. With the stack up and preconditions met it
-reaches Playwright's `Error: No tests found` (exit 1 — expected until Task 2;
-verified that globalSetup runs *before* the no-tests check, so the gate is
-exercised either way).
+**Outcome:** Stack down → exit non-zero with the `run \`just dev\` first`
+fix-it. Stack up + preconditions met → Playwright's `Error: No tests found`
+(exit 1 — expected until Task 2; verified globalSetup runs *before* the
+no-tests check, so the gate is exercised either way).
 
 **Files:**
 - Modify: `web/package.json` (devDependency `@playwright/test`, script `"e2e": "playwright test"`)
-- Create: `web/playwright.config.ts`
-- Create: `web/e2e/global-setup.ts`
+- Create: `web/playwright.config.ts`, `web/e2e/global-setup.ts`
 - Modify: `deploy/dev/integration-session.sh` (arch fix, Step 4)
 
 **Steps:**
@@ -188,8 +248,7 @@ export default defineConfig({
   testDir: './e2e',
   globalSetup: './e2e/global-setup.ts',
   // Generous: the journey's sequential assertion budgets (30+60+90+30s)
-  // must fit inside this, or a slow boot dies as a generic test-timeout
-  // instead of the targeted assertion message.
+  // must fit inside this, or a slow boot dies as a generic test-timeout.
   timeout: 240_000,
   retries: 0,                  // characterization: flake is signal, not noise
   use: {
@@ -201,10 +260,8 @@ export default defineConfig({
 });
 ```
 
-- [ ] **Step 3:** Create `web/e2e/global-setup.ts`. Each precondition fails fast
-  with its own fix-it line. Note the third check: not "any image" — a
-  **no-harness** image (`harness_name === null`), because the journey must not
-  require a Claude token (ADR Preparation):
+- [ ] **Step 3:** Create `web/e2e/global-setup.ts` — note the third check is a
+  **no-harness** image (the journey must not require a Claude token):
 
 ```ts
 // Preconditions for the e2e characterization net (ADR 0039 "Preparation").
@@ -228,24 +285,20 @@ export default async function globalSetup() {
   await mustFetch(`${WEB}/`, 'run `just dev` first');
   await mustFetch(`${COORD}/healthz`, 'coordinator down/unhealthy — check Tilt (http://localhost:10350)');
   const res = await mustFetch(`${WEB}/api/v1/enabled-images`, 'run `just dev` first');
-  // Shape: ListEnabledImagesResponse (web/src/types.ts:500) — { images: EnabledImageSummary[] }
+  // Shape: ListEnabledImagesResponse (web/src/types.ts:500) — { images: [...] }
   const body = (await res.json()) as { images?: { image_uri: string; harness_name: string | null }[] };
   if (!body.images?.some((i) => i.harness_name === null)) {
-    throw new Error('no NO-HARNESS image enabled — run `just integration-session` once (bakes+enables the demo image)');
+    throw new Error('no NO-HARNESS image enabled — run `just integration-session` once');
   }
 }
 ```
 
-- [ ] **Step 4:** Fix `deploy/dev/integration-session.sh` for macOS/arm64 dev
-  boxes: it hardcodes `cargo build --target x86_64-unknown-linux-musl -p engram-agentd`
-  (lines 52-53), which bakes an unbootable image on the VZ/arm64 backend. Port
-  the arch detection from `deploy/dev/bake-demo.sh:45-57` (which already does
-  this right). Verify by running `just integration-session` on this machine and
-  confirming the baked image boots.
-- [ ] **Step 5:** Run `cd web && pnpm e2e` with the stack **down** → exit 1 with
-  the fix-it line. Then with the stack up (`just dev`, plus
-  `just integration-session` once if the gate demands it) → globalSetup passes,
-  then `Error: No tests found`, exit 1 — both expected.
+- [ ] **Step 4:** Fix `deploy/dev/integration-session.sh` for macOS/arm64: it
+  hardcodes `cargo build --target x86_64-unknown-linux-musl -p engram-agentd`
+  (lines 52-53) — unbootable on the VZ/arm64 backend. Port the arch detection
+  from `deploy/dev/bake-demo.sh:45-57`. Verify the baked image boots locally.
+- [ ] **Step 5:** Run with the stack down → fix-it + exit 1. With the stack up →
+  globalSetup passes, then `No tests found` (exit 1) — both expected.
 - [ ] **Step 6:** Commit:
 
 ```bash
@@ -253,43 +306,46 @@ git add web/package.json web/pnpm-lock.yaml web/playwright.config.ts web/e2e/glo
 git commit -m "test(e2e): playwright scaffold + stack precondition gate (ADR 0039 prep)"
 ```
 
-### Task 2: The journey spec + `data-testid`s + `just e2e`
+### Task 2: The journey spec + `data-testid`s + snap harness + visual baseline
 
-**Goal:** Pin the ADR's single linear journey: land with no login → `+ new
-session` → select the demo image → `start` → URL `/sessions/<id>` → event count
-climbs above zero → status advances toward `active` → RAW tab renders event
-rows → SHELL tab's WebSocket connects → new row appears in the session list.
+**Goal:** Pin the ADR's single linear journey, and stand up the **visual
+validation protocol**: a parameterized screenshot spec plus committed baseline
+shots of every major view.
 
-**Outcome:** `just e2e` passes against `just dev` on the no-harness demo image.
-Selectors use `data-testid`, immune to copy drift.
+**Outcome:** `just e2e` passes against `just dev` on the no-harness demo
+image; `just snap "/"` writes `web/e2e/__shots__/root.png`;
+`web/e2e/__shots__/baseline/` holds committed baselines for: list, session
+detail (transcript/raw/shell tabs), new-session form, Fleet, Storage,
+Settings, Members.
 
 **Files** (testids live where the elements actually render — verified):
 - Modify: `web/src/pages/Sessions.tsx` — `data-testid="new-session"` on the
   new-session button.
-- Modify: `web/src/components/NewSessionForm.tsx` — `data-testid="image-select"`
-  on the image `<select>` (`NewSessionForm.tsx:168-179` — it is a native
-  select; Playwright cannot click `<option>`s, use `selectOption`), and
-  `data-testid="start-session"` on the submit button. **Caution:** when the
-  selected image has a Claude harness and no token is saved, the submit button
-  is replaced by a Link (`NewSessionForm.tsx:260-269`) — selecting the demo
-  image first avoids this entirely.
-- Modify: `web/src/components/SessionManifest.tsx` — `data-testid="session-row"`
-  on each `SessionRow`.
-- Modify: `web/src/components/TabRow.tsx` — `data-testid={`tab-${t.id}`}` on the
-  tab buttons (SessionDetail's tabs render through this shared component).
-- Modify: `web/src/pages/SessionDetail.tsx` — wrap the `{events.length}` in the
-  header prose (`SessionDetail.tsx:81`) in its own
-  `<span data-testid="event-count">{events.length}</span>` so `textContent` is
-  a bare number (tagging the surrounding prose makes `Number(textContent)`
-  return `NaN` and the poll can never pass); `data-testid="session-status"` on
-  the status chip; `data-testid="event-row"` on each raw event row.
-- Create: `web/e2e/session-journey.spec.ts`
-- Modify: `justfile` — `e2e` recipe.
+- Modify: `web/src/components/NewSessionForm.tsx` —
+  `data-testid="image-select"` on the image `<select>` (native select —
+  Playwright can't click `<option>`s, use `selectOption`) and
+  `data-testid="start-session"` on the submit button. **Caution:** a
+  Claude-harness image with no saved token replaces the submit button with a
+  Link (`NewSessionForm.tsx:260-269`) — selecting the demo image first avoids
+  this.
+- Modify: `web/src/components/SessionManifest.tsx` —
+  `data-testid="session-row"` on each `SessionRow`.
+- Modify: `web/src/components/TabRow.tsx` — `data-testid={`tab-${t.id}`}` on
+  the tab buttons (SessionDetail's tabs render through this shared component).
+- Modify: `web/src/pages/SessionDetail.tsx` — wrap `{events.length}`
+  (`SessionDetail.tsx:81`) in its own
+  `<span data-testid="event-count">{events.length}</span>` (tagging the
+  surrounding prose makes `Number(textContent)` return `NaN` — the poll could
+  never pass); `data-testid="session-status"` on the status chip;
+  `data-testid="event-row"` on each raw event row.
+- Create: `web/e2e/session-journey.spec.ts`, `web/e2e/snap.spec.ts`
+- Modify: `justfile` (`e2e` + `snap` recipes), `web/.gitignore`
+  (`e2e/__shots__/*` except `baseline/`)
 
 **Steps:**
 
-- [ ] **Step 1:** Add the testids above. Inert attributes; `pnpm -C web test`
-  still green.
+- [ ] **Step 1:** Add the testids. Inert attributes; `pnpm -C web test` still
+  green.
 - [ ] **Step 2:** Create `web/e2e/session-journey.spec.ts`:
 
 ```ts
@@ -332,9 +388,9 @@ test('create a session and watch it come alive', async ({ page }) => {
   await page.getByTestId('tab-raw').click();
   await expect(page.getByTestId('event-row').first()).toBeVisible();
 
-  // SHELL tab's WebSocket connects. Predicate-filter: vite's HMR websocket
-  // would otherwise be captured. 'websocket' fires on creation, so also wait
-  // for a received frame (ttyd handshakes promptly) to pin "connected".
+  // SHELL tab's WebSocket connects. Predicate-filter (vite HMR also opens a
+  // websocket); 'websocket' fires on creation, so also await a received
+  // frame (ttyd handshakes promptly) to pin "connected".
   const wsPromise = page.waitForEvent('websocket', {
     predicate: (ws) => ws.url().includes('/shell'),
     timeout: 30_000,
@@ -343,32 +399,63 @@ test('create a session and watch it come alive', async ({ page }) => {
   const ws = await wsPromise;
   await ws.waitForEvent('framereceived', { timeout: 15_000 });
 
-  // The new row appears in the session list.
+  // The new row appears in the list. (Post-migration this list shows TASKS —
+  // the testid survives the noun change; assert on testid, never copy.)
   await page.goto('/');
   await expect(page.getByTestId('session-row').filter({ hasText: id.slice(0, 8) })).toBeVisible();
 });
 ```
 
-  The demo-image option filter and the status regex are the two places reality
-  may differ — adjust to what the UI renders (read `NewSessionForm.tsx` /
-  `SessionDetail.tsx`), keeping the *assertions* intact.
-- [ ] **Step 3:** Run against a live stack: `just dev`, then `cd web && pnpm e2e`
-  → PASS.
-- [ ] **Step 4:** Add to `justfile` (near `integration-session`, justfile:~204):
+  The demo-image filter and status regex are the two places reality may
+  differ — adjust to what the UI renders, keeping the assertions intact.
+- [ ] **Step 3:** Create `web/e2e/snap.spec.ts` — the vision harness:
 
-```make
-# ADR 0039 characterization net. Requires `just dev` running and the
-# no-harness demo image enabled (`just integration-session` once).
-# Run this manually before merging any task of the ADR 0039 plan.
-e2e:
-    cd web && pnpm e2e
+```ts
+import { test } from '@playwright/test';
+
+// Screenshot harness for the visual validation protocol (plan header).
+// SNAP_PATHS="/,/sessions/abc?tab=raw" pnpm exec playwright test snap
+// Writes web/e2e/__shots__/<slug>.png; an agent then READS the images and
+// compares against e2e/__shots__/baseline/.
+const paths = (process.env.SNAP_PATHS ?? '/').split(',');
+
+for (const p of paths) {
+  const slug = p === '/' ? 'root' : p.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '');
+  test(`snap ${p}`, async ({ page }) => {
+    await page.goto(p);
+    await page.waitForLoadState('networkidle');
+    await page.screenshot({ path: `e2e/__shots__/${slug}.png`, fullPage: true });
+  });
+}
 ```
 
-- [ ] **Step 5:** `just e2e` → PASS. Commit:
+- [ ] **Step 4:** `justfile` recipes (near `integration-session`, ~:204):
+
+```make
+# ADR 0039 characterization net. Requires `just dev` and the no-harness
+# demo image (`just integration-session` once). Run before merging any
+# task of the ADR 0039 plan.
+e2e:
+    cd web && pnpm e2e
+
+# Visual validation protocol: full-page screenshots of the given paths.
+# Usage: just snap "/,/sessions/<id>"
+snap paths="/":
+    cd web && SNAP_PATHS="{{paths}}" pnpm exec playwright test snap --reporter=list
+```
+
+- [ ] **Step 5:** `just e2e` → PASS. Then capture the baseline: create a demo
+  session, `just snap "/,/sessions/<id>,/fleet,/storage,/settings,/members"`,
+  click into each tab variant (raw/shell) via `SNAP_PATHS` query params or a
+  manual re-run, and copy the results into `web/e2e/__shots__/baseline/`.
+  **Visual check (the protocol's first use):** read each baseline PNG and
+  confirm it shows a fully rendered view (no spinners, no error states) —
+  these are the reference images every later Visual check compares against.
+- [ ] **Step 6:** Commit:
 
 ```bash
-git add web/src justfile web/e2e/session-journey.spec.ts
-git commit -m "test(e2e): pin the session journey — the ADR 0039 characterization net"
+git add web/src web/e2e justfile web/.gitignore
+git commit -m "test(e2e): journey spec + snap harness + visual baseline (ADR 0039 prep)"
 ```
 
 ---
@@ -380,23 +467,18 @@ git commit -m "test(e2e): pin the session journey — the ADR 0039 characterizat
 **Goal:** `buf` owns the proto tree; CI fails on breaking changes; one command
 regenerates all TS bindings.
 
-**Outcome:** `buf lint` and a local `buf breaking --against '.git#branch=main'`
-run clean; the CI job is green on the PR that adds it.
-
-**Files:**
-- Create: `crates/engram-protocol/proto/buf.yaml`
-- Create: `buf.gen.yaml` (repo root)
-- Modify: `justfile` (`gen-proto`), the existing CI workflow (one new job)
+**Outcome:** `buf lint` and `buf breaking --against '.git#branch=main'` clean
+locally; the CI job is green on the PR that adds it.
 
 **Steps:**
 
-- [ ] **Step 1:** Install buf (`brew install bufbuild/buf/buf`, or via the Nix
+- [ ] **Step 1:** Install buf (`brew install bufbuild/buf/buf`, or the Nix
   devshell if `flake.nix` provides it).
 - [ ] **Step 2:** Create `crates/engram-protocol/proto/buf.yaml`. Verified:
   `host_service.proto` fails **PACKAGE_DIRECTORY_MATCH**,
   **RPC_REQUEST_RESPONSE_UNIQUE**, **RPC_REQUEST_STANDARD_NAME**, and
-  **RPC_RESPONSE_STANDARD_NAME** under STANDARD — scope the exceptions to that
-  legacy file only, so the new app files stay fully strict:
+  **RPC_RESPONSE_STANDARD_NAME** under STANDARD — scope exceptions to the
+  legacy file only:
 
 ```yaml
 version: v2
@@ -418,10 +500,8 @@ breaking:
 ```
 
 - [ ] **Step 3:** `cd crates/engram-protocol/proto && buf lint` → clean.
-- [ ] **Step 4:** Create repo-root `buf.gen.yaml`. Two plugins: `es` (messages +
-  service descriptors) and `query-es` (per-method connect-query exports, web
-  only). `paths` values are cwd-relative and include the input-directory prefix
-  (verified empirically):
+- [ ] **Step 4:** Repo-root `buf.gen.yaml` (verified: `paths` values are
+  cwd-relative and include the input-directory prefix):
 
 ```yaml
 version: v2
@@ -441,19 +521,10 @@ plugins:
     opt: target=ts
 ```
 
-- [ ] **Step 5:** `justfile`:
-
-```make
-# Regenerate TS protobuf bindings (web + orchestrator). Rust regenerates
-# via build.rs.
-gen-proto:
-    buf generate
-```
-
-- [ ] **Step 6:** CI job in the existing workflow. Two corrections vs the naive
-  setup (verified): buf-action runs `buf format` by default and the legacy
-  proto fails it — disable; and `.git#branch=main` doesn't resolve on PR
-  runners (origin refs) — use the action's default PR-base behavior:
+- [ ] **Step 5:** `justfile`: `gen-proto:` → `buf generate`.
+- [ ] **Step 6:** CI job (verified corrections: buf-action runs `buf format`
+  by default and the legacy proto fails it — disable; `.git#branch=main`
+  doesn't resolve on PR runners — use the action's default PR-base behavior):
 
 ```yaml
   buf:
@@ -464,13 +535,10 @@ gen-proto:
         with:
           input: crates/engram-protocol/proto
           format: false        # host_service.proto predates buf format
-      # Generated-code drift gate (web/src/gen + orchestrator/src/gen are committed):
       - run: buf generate && git diff --exit-code -- web/src/gen orchestrator/src/gen
 ```
 
-- [ ] **Step 7:** Exclude `src/gen` from web's lint/test globs if eslint or
-  vitest pick it up (check `web/eslint.config.*` and `vite.config.ts` test
-  include).
+- [ ] **Step 7:** Exclude `src/gen` from web's eslint/vitest globs if picked up.
 - [ ] **Step 8:** Commit:
 
 ```bash
@@ -480,16 +548,11 @@ git commit -m "build(proto): buf lint + breaking-change CI + gen-proto recipe (A
 
 ### Task 4: `engram/app/v1/session.proto` — SessionService + ShellRelayService
 
-**Goal:** The orchestrator-facing session contract (ADR §2.3 first table) as
-protobuf, lint-clean under STANDARD (files live at `proto/engram/app/v1/` to
-satisfy PACKAGE_DIRECTORY_MATCH; every RPC gets a unique wrapped
-`XxxRequest`/`XxxResponse`).
-
-**Outcome:** `buf lint` clean; every RPC from the ADR's SessionService table
-exists. Message fields use snake_case names mirroring `web/src/types.ts`
-field-for-field. (Note: this does **not** make generated TS or proto-JSON match
-today's wire format — generated TS is camelCase and that churn is paid in
-Task 23. The snake_case is simply proto convention + a 1:1 transcription aid.)
+**Goal:** The session contract (ADR §2.3), lint-clean under STANDARD (files at
+`proto/engram/app/v1/`, every RPC with unique wrapped Request/Response).
+**Revision deltas:** `ListSessions` has **no scope param** (trusted caller
+gets everything; the orchestrator filters via tasks); `CreateSession` takes
+`harness_secret_id` instead of resolving a principal's token.
 
 **Files:**
 - Create: `crates/engram-protocol/proto/engram/app/v1/session.proto`
@@ -504,20 +567,20 @@ syntax = "proto3";
 
 package engram.app.v1;
 
-// The orchestrator-facing app contract (ADR 0039 §2.3). One RPC per
-// current /api/v1 session route. Forwarded verbatim to the UI by the
-// orchestrator's generic passthrough.
+// The orchestrator-facing app contract (ADR 0039 §2.3, rev 2026-06-10).
+// The caller is a single trusted service (bearer-authed); there is no
+// per-user anything here. Attribution and authz live in the orchestrator.
 service SessionService {
+  // Returns ALL sessions. The orchestrator filters by task ownership.
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
   rpc SendPrompt(SendPromptRequest) returns (SendPromptResponse);
   rpc Interrupt(InterruptRequest) returns (InterruptResponse);
-  // Server-streaming replacement for SSE GET /sessions/:id/events.
   rpc StreamEvents(StreamEventsRequest) returns (stream SessionEvent);
-  // Replaces POST /sessions/:id/exec[/stream]. One streaming RPC; the
-  // unary HTTP route's semantics are the degenerate collected case.
+  // One streaming RPC; the unary HTTP route's semantics are the
+  // degenerate collected case.
   rpc Exec(ExecRequest) returns (stream ExecOutput);
   rpc GetLog(GetLogRequest) returns (GetLogResponse);
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
@@ -525,45 +588,52 @@ service SessionService {
   rpc EvictLocal(EvictLocalRequest) returns (EvictLocalResponse);
   rpc GetCowState(GetCowStateRequest) returns (GetCowStateResponse);
   rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
-  // STREAMING: artifacts are up to 512 MiB (MAX_ARTIFACT_BYTES) and the
-  // browser consumes them as <img src> bytes — a unary response would
-  // blow the 4 MiB message cap. First message carries metadata only.
+  // STREAMING: artifacts run to 512 MiB (MAX_ARTIFACT_BYTES); a unary
+  // response would blow the 4 MiB message cap. First message = metadata.
   rpc GetArtifact(GetArtifactRequest) returns (stream GetArtifactResponse);
   rpc CreateArtifactFromPath(CreateArtifactFromPathRequest) returns (CreateArtifactFromPathResponse);
 }
 
-// The browser-shell relay (ADR §8), its own service: keeps the bidi
-// (browser-uncallable) method out of SessionService's UI surface, and
-// avoids colliding with host_service.proto's ProxyShell.
+// Browser-shell relay (ADR §8), its own service: keeps the bidi
+// (browser-uncallable) method out of the UI surface and avoids colliding
+// with host_service.proto's ProxyShell.
 service ShellRelayService {
   rpc Relay(stream RelayShellRequest) returns (stream RelayShellResponse);
 }
 
-message ListSessionsRequest {
-  // "mine" (default) or "all" (admin-gated in the control plane).
-  string scope = 1;
+message ListSessionsRequest {}
+
+message CreateSessionRequest {
+  string image_uri = 1;
+  string mode = 2;
+  optional string prompt = 3;
+  // Sealed-secret reference (SecretService key). When set and the image's
+  // builtin harness wants a token, the control plane unseals + injects it.
+  // Replaces "auto-inject the calling user's token" — there is no calling
+  // user here (ADR §2.1).
+  optional string harness_secret_id = 4;
+  // ...overrides transcribed in Step 2
 }
 
-// The typed event ENVELOPE (plan amendment 4). payload_json is
-// NORMATIVELY the JSON object today's SSE `data:` carries: the event
-// payload with _recovery_epoch/_rewound folded in via with_rewind_meta
+// The typed event ENVELOPE. payload_json is NORMATIVELY the JSON object
+// today's SSE `data:` carries: the event payload with
+// _recovery_epoch/_rewound folded in via with_rewind_meta
 // (api/events.rs:144) — on BOTH the replay and live arms.
 message SessionEvent {
   // optional: a broadcast-lag notification has no idx (today's SSE emits
-  // `event: lagged` with NO id: line so it never disturbs Last-Event-ID;
-  // the proxy must preserve that — see kind below).
+  // `event: lagged` with NO id: line so it never disturbs Last-Event-ID).
   optional int64 idx = 1;
-  // The event's "type" discriminant. Special value "lagged": the
-  // subscriber missed events; idx is unset; payload_json = {"missed": n}.
+  // The event's "type" discriminant. Special value "lagged": idx unset,
+  // payload_json = {"missed": n}.
   string kind = 2;
   string payload_json = 3;
 }
 
 message StreamEventsRequest {
   string session_id = 1;
-  // Resume cursor: replay strictly-after this idx, then tail.
-  // UNSET = from the start (callers translate the HTTP -1 sentinel to
-  // unset; proto3 default 0 would silently skip idx 0).
+  // Replay strictly-after this idx, then tail. UNSET = from the start
+  // (callers translate the HTTP -1 sentinel to unset; proto3 default 0
+  // would silently skip idx 0).
   optional int64 since = 2;
 }
 
@@ -585,9 +655,9 @@ message ArtifactMetadata {
   string file_name = 3;
 }
 
-// Frame kinds mirror the WS frames / host ProxyShellMessage 1:1.
-// Request and response carry the same set; defined separately to satisfy
-// RPC_REQUEST_RESPONSE_UNIQUE and to mark directionality.
+// Frame kinds mirror the WS frames / host ProxyShellMessage 1:1. Request
+// and response are separate types (RPC_REQUEST_RESPONSE_UNIQUE) and mark
+// directionality.
 message RelayShellRequest {
   oneof frame {
     ShellOpen open = 1;   // first client frame: which session's shell
@@ -619,46 +689,40 @@ message ShellClose {
 }
 ```
 
-- [ ] **Step 2:** Transcribe the remaining messages **field-for-field** from the
-  authoritative sources below. Rules: same snake_case name per field;
-  `T | null` / optional → `optional`; arrays → `repeated`;
-  `Record<string,string>` → `map<string, string>`; string-literal unions (e.g.
-  `SessionState`) → `string` (NOT proto enums); internally-tagged serde unions
-  → `oneof` (see `AddRegistryAuth` note in Task 5). Wrap top-level entities in
-  the response message (`GetSessionResponse { Session session = 1; }`).
+- [ ] **Step 2:** Transcribe the remaining messages **field-for-field** from
+  the sources below. Rules: same snake_case names; `T | null`/optional →
+  `optional`; arrays → `repeated`; `Record<string,string>` →
+  `map<string,string>`; string-literal unions → `string` (NOT enums);
+  internally-tagged serde unions → `oneof`. Wrap entities in the response
+  (`GetSessionResponse { Session session = 1; }`).
 
   | Proto message | Transcribe from |
   |---|---|
-  | `Session`, `ListSessionsResponse` | `web/src/types.ts:70` (`Session`), `:84` (`SessionListItem` — fold its extras into `Session` as `optional`), `:92` |
-  | `CreateSessionRequest` | `CreateSessionInput`, `web/src/api.ts:205` (note `secrets` → `map<string,string>`) |
+  | `Session`, `ListSessionsResponse` | `web/src/types.ts:70` (`Session`), `:84` (`SessionListItem` — fold extras in as `optional`), `:92`. **Omit `user_id`** — it leaves the contract (ADR §2.1) |
+  | `CreateSessionRequest` overrides | `CreateSessionInput`, `web/src/api.ts:205` (`secrets` → `map<string,string>`) |
   | `CreateSessionResponse` | `web/src/types.ts:232` |
-  | `SendPrompt*` / `Interrupt*` | serde structs at `crates/engram-coordinator/src/api/prompt.rs:21/26` and `api/interrupt.rs:26` |
-  | `ExecRequest`, `ExecOutput` | **`engram_core::types::ExecEvent`** (imported at `api/exec.rs:18`) is the authoritative streaming wire type — `web/src/types.ts:242`'s `ExecRusage` is explicitly non-exhaustive; the unary shapes at `api/exec.rs:27/39` inform `ExecRequest` |
+  | `SendPrompt*` / `Interrupt*` | serde structs at `api/prompt.rs:21/26`, `api/interrupt.rs:26` |
+  | `ExecRequest`, `ExecOutput` | **`engram_core::types::ExecEvent`** (imported at `api/exec.rs:18`) is authoritative for the stream; `api/exec.rs:27/39` informs `ExecRequest` (`web/src/types.ts:242`'s `ExecRusage` is explicitly non-exhaustive) |
   | `GetLog*` | the `/sessions/:id/log` handler in `api/sessions_inspect.rs` |
   | `Snapshot/Resume/EvictLocal` | `api/snapshot.rs` handlers |
-  | `GetCowStateResponse` | wraps `web/src/types.ts:217` (+ `CowStateView` `:159`, `DurabilityRow` `:194`) |
-  | `ListCheckpointsResponse` | wraps `web/src/types.ts:370` + `CheckpointSummary` `:358` |
-  | `CreateArtifactFromPath*` | the artifact-from-path handler (ADR 0026; `git grep -n "artifact" crates/engram-coordinator/src/api/` to locate) |
+  | `GetCowStateResponse` | wraps `web/src/types.ts:217` (+ `:159`, `:194`) |
+  | `ListCheckpointsResponse` | wraps `web/src/types.ts:370` + `:358` |
+  | `CreateArtifactFromPath*` | the artifact-from-path handler (ADR 0026) |
   | `GetSessionRequest`/`DeleteSession*` | `{ string session_id = 1; }`; delete response mirrors `api/sessions.rs:1277` |
 
-- [ ] **Step 3:** `buf lint` → clean (the new file must pass full STANDARD — no
-  new `ignore_only` entries).
-- [ ] **Step 4:** Commit:
+- [ ] **Step 3:** `buf lint` → clean (full STANDARD, no new exceptions). Commit:
 
 ```bash
 git add crates/engram-protocol/proto/engram/app/v1/session.proto
-git commit -m "feat(proto): app/v1 SessionService + ShellRelayService (ADR 0039 §2.3)"
+git commit -m "feat(proto): app/v1 SessionService + ShellRelayService (ADR 0039 §2.3 rev)"
 ```
 
-### Task 5: `fleet.proto`, `image.proto`, `user.proto`
+### Task 5: `fleet.proto`, `image.proto`, `secret.proto`, `task.proto`
 
-**Goal:** The remaining services from ADR §2.3 + the `GetMe` amendment, same
-rules as Task 4.
-
-**Outcome:** `buf lint` clean; all RPCs exist incl. `GetMe`.
-
-**Files:**
-- Create: `crates/engram-protocol/proto/engram/app/v1/{fleet,image,user}.proto`
+**Goal:** The remaining contract files. **Revision deltas:** no `user.proto`
+(users/roles are better-auth's); new **`secret.proto`** (control-plane sealed
+store) and **`task.proto`** (orchestrator-NATIVE — same package for uniform
+clients; the coordinator never implements it).
 
 **Steps:**
 
@@ -675,8 +739,8 @@ service FleetService {
   // Soft drain — the member-facing POST /hosts/:id/drain (status flip,
   // the one the web calls: web/src/api.ts:176).
   rpc DrainHost(DrainHostRequest) returns (DrainHostResponse);
-  // ADR-0018 cordon+evacuate — the admin POST /admin/hosts/:id/drain.
-  // Two distinct semantics today; kept distinct here.
+  // ADR-0018 cordon+evacuate — POST /admin/hosts/:id/drain. Two distinct
+  // semantics today; kept distinct.
   rpc AdminDrainHost(AdminDrainHostRequest) returns (AdminDrainHostResponse);
   rpc CordonHost(CordonHostRequest) returns (CordonHostResponse);
   rpc UncordonHost(UncordonHostRequest) returns (UncordonHostResponse);
@@ -689,82 +753,115 @@ service FleetService {
 }
 ```
 
-  Each GC request carries `bool dry_run = 1` (today: two routes; here: one
-  flag). Transcribe `HostView` from `web/src/types.ts:130`,
-  `ListHostsResponse` `:149`, `StorageSummaryResponse` `:206`,
-  `HostCowStateResponse` from `api/hosts.rs:67`; admin/GC bodies from
-  `api/admin.rs`, `api/hosts.rs`, `api/storage.rs`.
-  **Intentional drops (record, don't port):** `GET /admin/chunk-gc/candidates`
-  and `/admin/reap-materialize-dir` get no RPC — no web caller today; they are
-  operator endpoints that Task 31 must keep or consciously delete (noted
-  there).
-- [ ] **Step 2:** `image.proto` — RPCs: `ListEnabledImages`, `EnableImage`,
+  GC requests carry `bool dry_run = 1`. Transcribe `HostView`
+  (`web/src/types.ts:130`), `ListHostsResponse` (`:149`),
+  `StorageSummaryResponse` (`:206`), `HostCowStateResponse`
+  (`api/hosts.rs:67`); admin/GC bodies from `api/admin.rs`/`api/hosts.rs`/
+  `api/storage.rs`. **Intentional drops (record):**
+  `GET /admin/chunk-gc/candidates` and `/admin/reap-materialize-dir` get no
+  RPC — no web caller; Task 33 decides keep-behind-bearer vs delete.
+- [ ] **Step 2:** `image.proto` — `ListEnabledImages`, `EnableImage`,
   `DisableImage`, `RefreshImage`, `ListEnableJobs`, `GetEnableJob`,
-  `RetryEnableJob`, `ListRegistries`, `AddRegistry`, `DeleteRegistry`, each
-  with wrapped Request/Response. Transcribe from `web/src/types.ts`
-  (`EnabledImageSummary :455`, `EnableJob :483`, `ListEnableJobsResponse :496`,
-  `ListEnabledImagesResponse :500`, `AddRegistryRequest :411`,
-  `AddRegistryResponse :416`, `RegistryCredentialSummary :428`,
-  `ListRegistriesResponse :437`) and `api/enabled_images.rs` /
+  `RetryEnableJob`, `ListRegistries`, `AddRegistry`, `DeleteRegistry`, wrapped
+  Request/Response each. Sources: `web/src/types.ts` (`:455`, `:483`, `:496`,
+  `:500`, `:411`, `:416`, `:428`, `:437`) + `api/enabled_images.rs`,
   `api/registries.rs`. **`AddRegistryAuth` (`types.ts:406`) is an
-  internally-tagged serde union** — map it to
-  `oneof auth { StaticAuth static = 1; GcpWorkloadIdentityAuth gcp_workload_identity = 2; AnonymousAuth anonymous = 3; }`
-  (exact variant names from the Rust enum in `api/registries.rs`); the Task 14
-  convert layer maps the serde enum explicitly.
-- [ ] **Step 3:** `user.proto`:
+  internally-tagged serde union** → `oneof auth { ... }` with variant names
+  from the Rust enum; the Task 13 convert layer maps it explicitly.
+- [ ] **Step 3:** `secret.proto`:
 
 ```proto
 syntax = "proto3";
 package engram.app.v1;
 
-service UserService {
-  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);     // admin-gated
-  rpc PatchUser(PatchUserRequest) returns (PatchUserResponse);     // admin-gated; role authoritative here (ADR 0031)
-  // SELF-scoped: answers for the asserted principal (no id param).
-  // Replaces GET /me's data half (role, admin-ness, has_claude_token) —
-  // plan amendment 6. better-auth replaces its authentication half.
-  rpc GetMe(GetMeRequest) returns (GetMeResponse);
-  // The storage half of POST /me/claude-token: the orchestrator relays
-  // the raw token OPAQUELY — never logged, never persisted there. KEK
-  // sealing + CreateSession auto-injection stay in the control plane.
-  rpc SaveClaudeToken(SaveClaudeTokenRequest) returns (SaveClaudeTokenResponse);
+// KEK-sealed opaque secret store (ADR §2.3). Keys are caller-supplied and
+// never interpreted (the orchestrator uses its better-auth user ids).
+// Replaces the storage half of /me/claude-token; sealing stays in Rust.
+service SecretService {
+  rpc PutSecret(PutSecretRequest) returns (PutSecretResponse);
+  rpc HasSecret(HasSecretRequest) returns (HasSecretResponse);
+  rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse);
 }
 
-message GetMeRequest {}
-
-message SaveClaudeTokenRequest {
-  string token = 1;
+message PutSecretRequest {
+  string key = 1;
+  string value = 2;   // plaintext in transit (TLS/private net); sealed at rest
 }
+message PutSecretResponse {}
+message HasSecretRequest { string key = 1; }
+message HasSecretResponse { bool exists = 1; }
+message DeleteSecretRequest { string key = 1; }
+message DeleteSecretResponse {}
 ```
 
-  Transcribe `AdminUser` from `web/src/types.ts:119`; `GetMeResponse` from the
-  web `Principal` (`types.ts:101`) minus the orchestrator-owned bits
-  (`can_sign_out` is computed by the orchestrator, not asserted by the control
-  plane); `PatchUserRequest` from `api/principal.rs:512` (**note: the user
-  handlers live in `api/principal.rs`, not `api/admin.rs`** — `list_users`
-  `:501`, `patch_user` `:521`, `save_claude_token` `:296`).
-- [ ] **Step 4:** `buf lint` → clean. Commit:
+- [ ] **Step 4:** `task.proto` — **implemented by the orchestrator only**
+  (excluded from the Rust build in Task 6; it lives here so web gets one
+  uniform generated API):
+
+```proto
+syntax = "proto3";
+package engram.app.v1;
+
+// The application aggregate root (ADR §3). ORCHESTRATOR-NATIVE: the
+// control plane neither implements nor knows about tasks.
+service TaskService {
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+}
+
+message Task {
+  string id = 1;
+  string type = 2;            // 'chat' now; linear_issue/dependabot/incident later
+  optional string title = 3;
+  string status = 4;          // open | working | awaiting_review | done | failed
+  optional string created_by_user_id = 5;
+  string source_json = 6;     // type-specific trigger ref (jsonb passthrough)
+  repeated TaskSessionRef sessions = 7;
+  string created_at = 8;      // RFC3339
+}
+
+message TaskSessionRef {
+  string session_id = 1;
+  optional string role = 2;
+  // Denormalized from the control plane at read time (state, image, …):
+  optional Session session = 3;
+}
+
+message CreateTaskRequest {
+  string type = 1;            // 'chat' is the only accepted value for now
+  string image_uri = 2;
+  optional string prompt = 3;
+  optional string title = 4;
+}
+message CreateTaskResponse { Task task = 1; }
+message ListTasksRequest {}
+message ListTasksResponse { repeated Task tasks = 1; }
+message GetTaskRequest { string task_id = 1; }
+message GetTaskResponse { Task task = 1; }
+message DeleteTaskRequest { string task_id = 1; }
+message DeleteTaskResponse {}
+```
+
+  (`Task.sessions[].session` imports `Session` from `session.proto` — add the
+  import. `ListTasksRequest` is empty: the server scopes by the *caller's*
+  ability, never by a client-supplied filter.)
+- [ ] **Step 5:** `buf lint` → clean. Commit:
 
 ```bash
 git add crates/engram-protocol/proto/engram/app/v1/
-git commit -m "feat(proto): app/v1 Fleet/Image/User services + GetMe (ADR 0039 §2.3)"
+git commit -m "feat(proto): app/v1 Fleet/Image/Secret services + native TaskService (ADR 0039 rev)"
 ```
 
 ### Task 6: Rust bindings for `engram.app.v1`
 
-**Goal:** tonic server + client types compile inside `engram-protocol`.
-
-**Outcome:** `cargo build -p engram-protocol` succeeds;
-`engram_protocol::app::session_service_server::SessionService` is nameable.
-
-**Files:**
-- Modify: `crates/engram-protocol/build.rs`
-- Create: `crates/engram-protocol/src/app.rs`
-- Modify: `crates/engram-protocol/src/lib.rs` (`pub mod app;`)
+**Goal:** tonic types for the services the coordinator implements.
+`task.proto` is **excluded** — the coordinator must not accrete task concepts.
 
 **Steps:**
 
-- [ ] **Step 1:** Extend the proto list in `build.rs`:
+- [ ] **Step 1:** Extend `crates/engram-protocol/build.rs`:
 
 ```rust
 let protos = [
@@ -772,47 +869,33 @@ let protos = [
     "proto/engram/app/v1/session.proto",
     "proto/engram/app/v1/fleet.proto",
     "proto/engram/app/v1/image.proto",
-    "proto/engram/app/v1/user.proto",
+    "proto/engram/app/v1/secret.proto",
+    // task.proto is deliberately absent: orchestrator-native (ADR §3).
 ];
 ```
 
-- [ ] **Step 2:** `src/app.rs`, mirroring `src/grpc.rs:14`'s include pattern:
-
-```rust
-//! Generated bindings for the orchestrator-facing app contract
-//! (ADR 0039 §2.3): engram.app.v1.
-tonic::include_proto!("engram.app.v1");
-```
-
-- [ ] **Step 3:** `pub mod app;` in `src/lib.rs`; `cargo build -p engram-protocol`
-  → success.
-- [ ] **Step 4:** Commit:
+- [ ] **Step 2:** `src/app.rs` mirroring `src/grpc.rs:14`'s include pattern
+  (`tonic::include_proto!("engram.app.v1");`), `pub mod app;` in `lib.rs`.
+- [ ] **Step 3:** `cargo build -p engram-protocol` → success. Commit:
 
 ```bash
 git add crates/engram-protocol/
-git commit -m "feat(proto): rust tonic bindings for engram.app.v1"
+git commit -m "feat(proto): rust tonic bindings for engram.app.v1 (task.proto excluded)"
 ```
 
 ### Task 7: TS bindings generation
 
-**Goal:** `just gen-proto` emits committed TS bindings into `web/src/gen` and
-`orchestrator/src/gen` (paths include the proto dir structure:
-`web/src/gen/engram/app/v1/session_pb.ts`).
-
-**Outcome:** Generated files exist and export the service descriptors
-(`SessionService` etc.) plus connect-query method exports for web;
-`pnpm -C web build` clean (gen is additive).
+**Goal:** `just gen-proto` emits committed bindings into
+`web/src/gen/engram/app/v1/` and `orchestrator/src/gen/engram/app/v1/`
+(all five protos, including task).
 
 **Steps:**
 
-- [ ] **Step 1:** `cd web && pnpm add @bufbuild/protobuf@^2 @connectrpc/connect@^2 @connectrpc/connect-query@^2`
-  (runtime deps of the generated code).
-- [ ] **Step 2:** `just gen-proto` → files under `web/src/gen/engram/app/v1/`
-  (both `*_pb.ts` and `*-SessionService_connectquery.ts`) and
-  `orchestrator/src/gen/engram/app/v1/` (the orchestrator package doesn't exist
-  yet — the directory is inert until Task 15; that's fine, it's committed so
-  the CI drift gate covers it).
-- [ ] **Step 3:** `pnpm -C web build` → clean. Commit:
+- [ ] **Step 1:** `cd web && pnpm add @bufbuild/protobuf@^2 @connectrpc/connect@^2 @connectrpc/connect-query@^2`.
+- [ ] **Step 2:** `just gen-proto` → `*_pb.ts` + `*-…_connectquery.ts` files in
+  both gen dirs (the orchestrator package doesn't exist yet — inert until
+  Task 14; committed so the CI drift gate covers it).
+- [ ] **Step 3:** `pnpm -C web build` → clean (gen is additive). Commit:
 
 ```bash
 git add web/src/gen orchestrator/src/gen web/package.json web/pnpm-lock.yaml
@@ -823,24 +906,25 @@ git commit -m "feat(proto): generated connect-es + connect-query bindings for ap
 
 # Phase 2 — Control-plane gRPC server (coordinator)
 
+> Much smaller than the pre-revision plan: no JWKS, no VerifierChain, no
+> per-user principal, no owner-check extraction. The surface trusts one
+> bearer-authed caller. The axum routes keep their existing middleware
+> untouched until Phase 5 deletes them.
+
 ### Task 8: tonic app-server scaffold
 
-**Goal:** The coordinator serves tonic on `APP_GRPC_ADDR` alongside axum, all
-services registered as `UNIMPLEMENTED` stubs, with graceful shutdown and HTTP/2
-keepalives (ADR §9.4) from day one.
+**Goal:** tonic serves on `APP_GRPC_ADDR` beside axum — SessionService,
+ShellRelayService, FleetService, ImageService, SecretService as
+`UNIMPLEMENTED` stubs — with graceful shutdown and HTTP/2 keepalives
+(ADR §9.4) from day one.
 
 **Outcome:** A Rust smoke test gets `Code::Unimplemented` from `ListSessions`;
 `just e2e` still green.
 
-**Files:**
-- Create: `crates/engram-coordinator/src/grpc_app/mod.rs`
-- Modify: `crates/engram-coordinator/src/main.rs` (clap flag),
-  `src/config.rs` (thread the addr through `CoordinatorConfig`),
-  `src/lib.rs` (spawn — see Step 3)
-
 **Steps:**
 
-- [ ] **Step 1:** Clap arg in `main.rs` (pattern-match `bind_addr`, main.rs:22):
+- [ ] **Step 1:** Clap arg in `main.rs` (pattern-match `bind_addr`, main.rs:22),
+  threaded through `CoordinatorConfig`:
 
 ```rust
 /// Address the orchestrator-facing app gRPC server binds to (ADR 0039).
@@ -848,9 +932,8 @@ keepalives (ADR §9.4) from day one.
 app_grpc_addr: std::net::SocketAddr,
 ```
 
-  Thread it into `CoordinatorConfig` (config.rs) like the other addrs.
-- [ ] **Step 2:** `grpc_app/mod.rs`. **Note: the shared state handle is
-  `SharedState = Arc<AppState>` (state.rs:373/:543) — `AppState` itself is not
+- [ ] **Step 2:** `grpc_app/mod.rs`. **The shared handle is
+  `SharedState = Arc<AppState>` (state.rs:373/:543) — `AppState` is not
   `Clone`:**
 
 ```rust
@@ -862,6 +945,7 @@ use tonic::{Request, Response, Status};
 
 pub struct AppSessionService {
     pub state: crate::state::SharedState,
+    pub auth: std::sync::Arc<BearerAuth>,   // Task 9
 }
 
 #[tonic::async_trait]
@@ -872,32 +956,26 @@ impl app::session_service_server::SessionService for AppSessionService {
     ) -> Result<Response<app::ListSessionsResponse>, Status> {
         Err(Status::unimplemented("ADR 0039 phase 2"))
     }
-    // ... a stub per RPC (the compiler enumerates them). For the
-    // streaming RPCs define the associated types, e.g.:
+    // ... a stub per RPC (the compiler enumerates them). Streaming RPCs
+    // need their associated types, e.g.:
     // type StreamEventsStream = std::pin::Pin<Box<dyn tokio_stream::Stream<
     //     Item = Result<app::SessionEvent, Status>> + Send>>;
-    // and return Err(unimplemented) before yielding anything.
 }
 ```
 
-  Same for `AppFleetService`, `AppImageService`, `AppUserService`,
-  `AppShellRelayService`.
-- [ ] **Step 3:** Spawn the server **inside `run_with_registry_and_local`**
-  (lib.rs — `AppState` is constructed at lib.rs:132-135; `main.rs` never sees
-  it), right after `let state = Arc::new(app)`, sharing the same shutdown
-  signal the axum side uses (`with_graceful_shutdown(shutdown_signal())` at
-  lib.rs:369):
+- [ ] **Step 3:** Spawn **inside `run_with_registry_and_local`** (lib.rs —
+  `AppState` is built at lib.rs:132-135; `main.rs` never sees it), right after
+  `let state = Arc::new(app)`, sharing the axum side's shutdown signal
+  (lib.rs:369):
 
 ```rust
 let app_grpc = tonic::transport::Server::builder()
-    // ADR §9.4: HTTP/2 keepalive PINGs so a dead orchestrator's streams
-    // are detected and torn down (releases leases/subscriptions).
+    // ADR §9.4: keepalive PINGs so a dead orchestrator's streams are
+    // detected and torn down (releases leases/subscriptions).
     .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
     .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
-    .add_service(app::session_service_server::SessionServiceServer::new(
-        grpc_app::AppSessionService { state: state.clone() },
-    ))
-    // ... the other four services
+    .add_service(app::session_service_server::SessionServiceServer::new(/* … */))
+    // ... shell relay, fleet, image, secret
     .serve_with_shutdown(cfg.app_grpc_addr, shutdown_signal());
 tokio::spawn(async move {
     if let Err(e) = app_grpc.await {
@@ -906,403 +984,291 @@ tokio::spawn(async move {
 });
 ```
 
-- [ ] **Step 4:** Smoke test. `crates/engram-coordinator/tests/api.rs` already
-  builds a full `AppState` from mocks (`MockMetadataStore`, `MockCloud`,
-  `ProcessBackend`, `InMemorySecretStore`, `AppState::new(cfg, services)`) —
-  but those helpers live inside that test binary and are **not importable**
-  from a new test file. Extract the state-builder into a shared
-  `#[cfg(test)]`-free test-support module (e.g. `src/test_support.rs` behind a
-  `test-support` feature) or duplicate the minimal builder in
-  `tests/grpc_app.rs`. The test: serve on an ephemeral port, tonic client
-  calls `list_sessions`, assert `Code::Unimplemented`. (No `grpcurl`: tonic
-  doesn't serve reflection by default and we don't add `tonic-reflection` for
-  this.)
-- [ ] **Step 5:** `just check` and `just e2e` green. Commit:
+- [ ] **Step 4:** Smoke test. `tests/api.rs` already builds a full `AppState`
+  from mocks (`MockMetadataStore`, `MockCloud`, `ProcessBackend`,
+  `InMemorySecretStore`) — but those helpers live inside that test binary and
+  are **not importable**; extract a shared test-support builder or duplicate
+  the minimal one in `tests/grpc_app.rs`. Serve on an ephemeral port, call
+  `list_sessions`, assert `Code::Unimplemented`. (No `grpcurl` — tonic serves
+  no reflection by default.)
+- [ ] **Step 5:** `just check` + `just e2e` green. Commit:
 
 ```bash
 git add crates/engram-coordinator/
 git commit -m "feat(coordinator): tonic app-gRPC scaffold with keepalives + graceful shutdown (ADR 0039 §2)"
 ```
 
-### Task 9: gRPC forward-auth — JWT → Principal
+### Task 9: Service-bearer auth on the app surface
 
-**Goal:** Every app-gRPC call authenticates a `Bearer` JWT via the **existing
-auth chain** — verification, JIT upsert, `bootstrap_admins` promotion, and the
-inactive-user gate all come from `engram-auth`, not a reimplementation.
+**Goal:** Every app-gRPC call authenticates a static bearer token —
+machine identity for exactly one caller (ADR §5). **Deliberately a separate
+credential** from the host-agents' `ENGRAM_AUTH_TOKENS` (`api/auth.rs` — do
+not touch that file; it guards host ingest): different caller, different
+blast radius, independently rotatable.
 
-**Outcome:** With a test JWKS: a signed JWT yields a `Principal` whose role
-comes from the `users` table; missing/expired/garbage → `unauthenticated`;
-an inactive user → `permission_denied`.
+**Outcome:** Correct token → call proceeds; missing/wrong →
+`unauthenticated`; **no tokens configured → all calls rejected (fail closed),
+boot unaffected**.
 
 **Files:**
 - Create: `crates/engram-coordinator/src/grpc_app/auth.rs`
-- Modify: `main.rs`/`config.rs` (flags `--app-auth-jwks-url`,
-  `--app-auth-issuer`, `--app-auth-audience`; envs `APP_AUTH_*`)
-- Modify: `Tiltfile` — add `APP_AUTH_JWKS_URL=http://127.0.0.1:8787/api/auth/jwks`
-  (+ issuer/audience) to `coord_env` **now**, so Phase 3/4 live checks work
-  without a later wiring task
+- Modify: `main.rs`/`config.rs` (`--app-grpc-tokens`, env `APP_GRPC_TOKENS`,
+  comma-separated to allow rotation overlap)
+- Modify: `Tiltfile` — generate/set a dev token in `coord_env` **and** export
+  it for the orchestrator resource (`CONTROL_PLANE_BEARER`) **now**, so
+  Phase 3/4 live checks need no later wiring task
 
 **Steps:**
 
-- [ ] **Step 1:** Read the real APIs first — the shapes matter (verified):
-  - `ForwardAuthVerifier` implements
-    `IdentityVerifier::verify(&self, input: &VerifyInput) -> Result<Option<Verified>, AuthError>`
-    (forward.rs:59). It reads the assertion from a **configured header name**
-    (`cfg.header`) out of `VerifyInput { headers, cookies }` — it does NOT
-    take a token string and does NOT strip `Bearer `.
-  - The JIT upsert is `VerifierChain::jit_upsert` (chain.rs:74), reached via
-    `chain.resolve()` — **not** in forward.rs and not in `build_chain`
-    (config.rs:122 only assembles the chain).
-- [ ] **Step 2:** Failing tests first, in `grpc_app/auth.rs`'s test module:
-  reuse `forward.rs`'s own test fixtures if present (read its tests); otherwise
-  mint **RS256** JWTs (the same alg Task 17 pins on the orchestrator — keep
-  the two in lockstep so the suites exercise the real pairing) against a local
-  JWKS served from a test listener. Tests: valid → Principal with that email;
-  expired → `unauthenticated`; inactive user row → `permission_denied`.
-- [ ] **Step 3:** Implement `GrpcAuth` holding a `VerifierChain` built via
-  `engram_auth::build_chain` with a ForwardAuth-only `AuthConfig`:
+- [ ] **Step 1:** Failing tests first in `grpc_app/auth.rs`: right token →
+  Ok; wrong/missing → `unauthenticated`; empty token set → `unauthenticated`
+  (NOT accept-everything — note this is the opposite of `api/auth.rs`'s
+  `accepts_anything()` dev posture, on purpose: this surface is born strict).
+- [ ] **Step 2:** Implement:
 
 ```rust
-//! Bearer-JWT → Principal for the app-gRPC surface. The orchestrator is
-//! just another trusted forward-auth upstream (ADR 0039 §5); we build a
-//! ForwardAuth-only VerifierChain so JIT upsert, bootstrap_admins, and
-//! the inactive gate are the same code the axum chain runs.
-//
-// Why a per-RPC helper and not a tonic interceptor: tonic interceptors
-// are synchronous; this path does an async JWKS fetch + a DB upsert.
-// Do not "DRY this up" into an interceptor — it cannot work there.
-impl GrpcAuth {
-    pub async fn principal_from_metadata<T>(
-        &self,
-        req: &tonic::Request<T>,
-    ) -> Result<Principal, tonic::Status> {
-        let token = req
+//! Machine auth for the app-gRPC surface (ADR 0039 §5): one trusted
+//! caller (the orchestrator), one static bearer, constant-time compare.
+//! Fail closed: no configured tokens = reject everything.
+pub struct BearerAuth {
+    tokens: Vec<String>,   // >1 only during rotation overlap
+}
+
+impl BearerAuth {
+    pub fn check<T>(&self, req: &tonic::Request<T>) -> Result<(), tonic::Status> {
+        let presented = req
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| tonic::Status::unauthenticated("missing bearer token"))?;
-        let input = VerifyInput {
-            headers: [(self.header_name.clone(), token.to_string())].into(),
-            cookies: Default::default(),
-        };
-        match self.chain.resolve(&input).await {
-            Ok(Some(principal)) => Ok(principal),
-            Ok(None) => Err(tonic::Status::unauthenticated("invalid assertion")),
-            Err(AuthError::Inactive) => Err(tonic::Status::permission_denied("inactive user")),
-            Err(_) => Err(tonic::Status::unauthenticated("invalid assertion")),
+        if self.tokens.iter().any(|t| constant_time_eq(t.as_bytes(), presented.as_bytes())) {
+            Ok(())
+        } else {
+            Err(tonic::Status::unauthenticated("invalid bearer token"))
         }
     }
 }
 ```
 
-  (Adapt names to the actual `VerifierChain` API — Step 1 is the map.)
-  **Lazy verification:** the JWKS is fetched per-validation/cached, never at
-  boot — the coordinator must start fine when the orchestrator isn't up yet
-  (Phases 2∥3). If the config flags are unset, the gRPC surface rejects all
-  calls with `unauthenticated` (fail closed), it does not crash.
-- [ ] **Step 4:** Tests green (`just test-pkg engram-coordinator`); thread
-  `GrpcAuth` into the service structs; call it in `list_sessions` (still
-  returning unimplemented after auth). `just check` green.
-- [ ] **Step 5:** Commit:
+  (Use the same constant-time comparison `api/auth.rs` uses — read it for the
+  helper, copy the call, leave the file alone.) Call `self.auth.check(&req)?`
+  at the top of every RPC. This is sync — unlike the pre-revision JWT design,
+  a plain check works fine per-RPC; don't bother with a tower layer.
+- [ ] **Step 3:** Tests green; `just check` green. Commit:
 
 ```bash
 git add crates/engram-coordinator/ Tiltfile
-git commit -m "feat(coordinator): forward-auth on app-gRPC via the existing VerifierChain"
+git commit -m "feat(coordinator): service-bearer auth on app-gRPC — fail-closed machine identity (ADR 0039 §5)"
 ```
 
-### Task 10: SessionService core — extract-and-delegate for the unary six
+### Task 10: SessionService — extract-and-delegate, the unary six
 
 **Goal:** `ListSessions`, `CreateSession`, `GetSession`, `DeleteSession`,
-`SendPrompt`, `Interrupt` over gRPC by extracting transport-agnostic cores that
-axum and tonic both call. **The critical subtlety: today the owner check is
-route-layer middleware (`require_session_owner`, api/mod.rs:42-75), so the
-handler bodies for get/delete/prompt/interrupt contain ZERO authz** — naively
-extracting "the exact body" ships an authz hole where any member can read,
-delete, or prompt any session. The cores must carry the check themselves.
+`SendPrompt`, `Interrupt` over gRPC via transport-agnostic cores both axum and
+tonic call. **Revision note:** the cores carry **no principal and no authz**
+(the caller is trusted; authz happens in the orchestrator). The axum shims
+keep their existing `CurrentUser`/middleware behavior untouched — where a
+handler body used the principal (list scoping, `user_id` stamping), the core
+takes the *data* as a plain parameter and the axum shim supplies it from its
+extractor.
 
-**Outcome:** gRPC integration test: create → list → get → delete works; **a
-member-role JWT calling `GetSession` on another user's session gets
-`not_found`** (the anti-enumeration semantics below); `just e2e` green.
+**Sizing note:** land as ~3 PRs: (a) list/get/delete + `into_status` +
+converters, (b) `create_session` + the `user_id`-nullable migration,
+(c) prompt + interrupt.
 
-**Sizing note:** land as ~3 PRs: (a) owner-check core + `into_status` +
-converters + list/get/delete, (b) `create_session`, (c) prompt + interrupt.
-
-**Files:**
-- Modify: `crates/engram-coordinator/src/api/sessions.rs`
-  (`create_session:498`, `get_session:1176`, `list_sessions:1213`,
-  `delete_session:1277`), `api/prompt.rs`, `api/interrupt.rs`,
-  `api/principal.rs`, `src/error.rs`
-- Create: `crates/engram-coordinator/src/grpc_app/convert.rs`
+**Outcome:** gRPC integration test: create → list → get → delete end-to-end;
+`just e2e` green (axum path unchanged by construction).
 
 **Steps:**
 
-- [ ] **Step 1:** Build the shared authz core FIRST, replicating
-  `require_session_owner` (`api/principal.rs:177`) **exactly**: admin bypasses;
-  owner-mismatch and not-found are BOTH `NotFound("session not found")` — 404,
-  never 403, so existence can't be probed. Have it return the session row
-  (saves a second lookup):
+- [ ] **Step 1:** `into_status` in `grpc_app/mod.rs` — **exhaustive** over
+  `ApiError`'s 12 variants (`src/error.rs`): `NotFound→not_found`,
+  `Forbidden→permission_denied`, `Unauthorized→unauthenticated`,
+  `BadRequest→invalid_argument`, `Conflict→failed_precondition`,
+  `Gone/HostLost→failed_precondition`, `Unavailable→unavailable`,
+  `Unsupported→unimplemented`, `PayloadTooLarge/TooManyRequests→resource_exhausted`,
+  rest → `internal`. Make `ApiError::slug()` `pub` and attach it as
+  `engram-error-slug` Status metadata — the web distinguishes slugs sharing
+  an HTTP code (e.g. `snapshot_invalidated` vs `host_lost`, both 410) and the
+  orchestrator relays it.
+- [ ] **Step 2:** Extraction template — `list_sessions` first. Real signatures
+  (verified): handlers use the `CurrentUser` extractor; the query is
+  `ListSessionsParams { scope: Option<String> }` (sessions.rs:1201). The core
+  returns **all** sessions; the axum shim keeps today's principal-scoped
+  filtering on its side:
 
 ```rust
-/// gRPC-path equivalent of the require_session_owner middleware.
-/// EVERY session-scoped core starts with this. 404 on mismatch — never
-/// 403 (anti-enumeration, same as the middleware).
-pub(crate) async fn require_session_owner_core(
-    state: &SharedState,
-    principal: &Principal,
-    session_id: &str,
-) -> Result<Session, ApiError> { /* mirror principal.rs:177 */ }
-```
-
-- [ ] **Step 2:** `into_status` in `grpc_app/mod.rs` — **exhaustive** over
-  `ApiError`'s 12 variants (`src/error.rs`), not a 4-arm sketch:
-  `NotFound→not_found`, `Forbidden→permission_denied`,
-  `Unauthorized→unauthenticated`, `BadRequest→invalid_argument`,
-  `Conflict→failed_precondition` (interrupt/prompt "no live sandbox"),
-  `Gone/HostLost→failed_precondition`, `Unavailable→unavailable` (capacity,
-  retryable), `Unsupported→unimplemented`,
-  `PayloadTooLarge/TooManyRequests→resource_exhausted`, rest → `internal`.
-  Additionally: make `ApiError::slug()` `pub` and attach it as
-  `engram-error-slug` metadata on the `Status` — the web distinguishes slugs
-  that share an HTTP code (e.g. `snapshot_invalidated` vs `host_lost`, both
-  410) and the orchestrator/UI needs it to reconstruct today's error envelope.
-- [ ] **Step 3:** Extraction template — `list_sessions` first. Real signatures
-  (verified): handlers use the `CurrentUser` extractor (not
-  `Extension<Principal>`), and the list query is
-  `ListSessionsParams { scope: Option<String> }` (sessions.rs:1201):
-
-```rust
+// Transport-agnostic core: returns ALL sessions (the gRPC caller is a
+// trusted service; filtering/authz is the orchestrator's job, ADR §6).
+// The axum shim applies today's principal scoping before returning.
 pub(crate) async fn list_sessions_core(
     state: &SharedState,
-    principal: &Principal,
-    scope: Option<&str>,
-) -> Result<ListSessionsResponse, ApiError> { /* the body, extractors unwrapped */ }
+) -> Result<ListSessionsResponse, ApiError> { /* body, extractors unwrapped, scoping removed */ }
 ```
 
-  Axum shim calls the core; tonic method = `principal_from_metadata` →
-  `convert` → core → `convert`.
-- [ ] **Step 4:** Repeat for the rest. Per-handler notes:
-  - `create_session` is a metrics wrapper around `create_session_inner`
-    (sessions.rs:497-534) — extract the core *inside* the wrapper so gRPC
-    creations are counted too.
-  - `get_session`/`delete_session`/prompt/interrupt cores start with
-    `require_session_owner_core` (Step 1) — their axum bodies have no check
-    to extract.
-  - prompt: the auto-resume-on-idle behavior must live in the core, not the
-    axum shim.
+- [ ] **Step 3:** `create_session`: it is a metrics wrapper around
+  `create_session_inner` (sessions.rs:497-534) — extract the core *inside*
+  the wrapper so gRPC creations are counted. The core takes
+  `owner: Option<String>` (axum passes the principal's id as today;
+  **gRPC passes `None`**) and `harness_secret_id: Option<String>` (axum
+  passes the legacy per-user lookup; gRPC passes the request field — actual
+  unsealing lands in Task 13 with SecretService; until then gRPC create
+  works for no-harness images). Ship a sqlx migration making
+  **`sessions.user_id` nullable** (dropped entirely in Task 32).
+- [ ] **Step 4:** `get_session` / `delete_session` / prompt / interrupt: their
+  axum bodies contain no authz (it's route middleware — verified) so
+  extraction is mechanical; prompt's auto-resume-on-idle lives in the core.
 - [ ] **Step 5:** `convert.rs` mappers — dumb, total field copies; unit-test by
   round-tripping populated structs.
-- [ ] **Step 6:** Integration tests follow the repo's existing live-test idiom
+- [ ] **Step 6:** Integration tests follow the repo's live-test idiom
   (verified: `tests/*_live_pg.rs` are `#[ignore]`d AND env-gated with a
-  graceful eprintln-skip, e.g. `users_live_pg.rs:6-13`) — gate on an env var
-  pointing at the dev coordinator's gRPC addr. Include the member-vs-other-
-  user's-session `not_found` test here (not deferred to Task 14).
-- [ ] **Step 7:** `just check` + `just e2e` green. Commit per PR boundary:
+  graceful skip) — gate on an env var with the gRPC addr + bearer. House them
+  all in **one test binary, `tests/grpc_smoke.rs`** — this is the
+  `just smoke-control-plane` stage gate (see "Stage smoke gates"). Add the
+  recipe now:
 
-```bash
-git add crates/engram-coordinator/
-git commit -m "feat(coordinator): SessionService unary RPCs via transport-agnostic cores + owner-check core"
+```make
+# Live smoke of the app-gRPC surface. Requires `just dev` running.
+# APP_GRPC_TOKENS' dev token is read from the same env Tilt sets.
+smoke-control-plane:
+    ENGRAM_SMOKE_GRPC=127.0.0.1:50061 cargo test -p engram-coordinator --test grpc_smoke -- --ignored --nocapture
+
+# Umbrella stage gate. Each task that adds a smoke-* recipe appends it
+# here (a just recipe can't reference recipes that don't exist yet).
+smoke: smoke-control-plane
 ```
+
+  Tasks 11–13 extend this same binary (stream-events replay/tail check,
+  snapshot→evict→resume, secret put/has/delete, bearer-rejected check) rather
+  than scattering new ones. The `smoke` umbrella grows in Task 18
+  (`smoke-orchestrator`) and Task 21b (`smoke-parity`), and shrinks in
+  Task 28 when parity is deleted.
+- [ ] **Step 7:** `just check` + `just e2e` green. Commit per PR boundary.
 
 ### Task 11: `StreamEvents` server-stream
 
-**Goal:** Replay-then-tail with semantics identical to the SSE handler
-(`api/events.rs:43`). **Correction to the ADR (§9.3 says events auto-resume
-idle sessions — the code does not):** the events handler only does
-`get_session`; `ensure_active` is called by prompt/shell/exec, never here.
-Do NOT add auto-resume — merely viewing an idle session must not resurrect its
-microVM.
+**Goal:** Replay-then-tail identical to the SSE handler (`api/events.rs:43`).
+**Do NOT add auto-resume** — the events handler has never resumed idle
+sessions (only prompt/shell/exec do); merely viewing an idle session must not
+resurrect its microVM.
 
-**Outcome:** `StreamEvents(id, since unset)` on a live session yields the same
-`idx` sequence as the SSE feed; reopen with `since=last_idx` → no gap, no dupe.
-
-**Files:**
-- Modify: `crates/engram-coordinator/src/api/events.rs` (extract core),
-  `grpc_app/mod.rs`
+**Outcome:** `StreamEvents(id, since unset)` yields the same `idx` sequence as
+the SSE feed; reopen with `since=last_idx` → no gap, no dupe.
 
 **Steps:**
 
-- [ ] **Step 1:** Extract the sequencing-sensitive setup into a shared core —
-  owner check, **subscribe-before-query** (`state.events.subscribe(id)` at
-  events.rs:67 *before* the log query; the rule at events.rs:15), replay query
-  (`REPLAY_LIMIT` = 1000):
+- [ ] **Step 1:** Extract the sequencing-sensitive core — existence check,
+  **subscribe-before-query** (`state.events.subscribe(id)` at events.rs:67
+  *before* the log query; rule at events.rs:15), replay (`REPLAY_LIMIT`
+  = 1000):
 
 ```rust
 pub(crate) async fn events_core(
     state: &SharedState,
-    principal: &Principal,
     id: &str,
     since: Option<i64>,
 ) -> Result<(Vec<PersistedEvent>, broadcast::Receiver<IndexedEvent>), ApiError>
 ```
 
-- [ ] **Step 2:** tonic method maps both arms to `app::SessionEvent`, carrying
-  three wire details the SSE path has (verified in events.rs):
-  - **`with_rewind_meta` (events.rs:144) applies to BOTH arms** — replay
-    events carry rewind/epoch from DB columns, live ones from the broadcast;
-    payload_json is the folded object (plan amendment 4).
-  - **Replay→live dedupe:** drop live events with `idx <= replay high water`
-    (events.rs:98-101 — copy the exact rule).
-  - **Broadcast `Lagged`** (events.rs:102-106) → `SessionEvent { kind: "lagged",
-    idx: unset, payload_json: {"missed": n} }` — idx stays unset so proxies
-    don't disturb reconnect cursors.
-- [ ] **Step 3:** Confirm RAII teardown: client disconnect drops the stream
-  future → the broadcast receiver drops with it. Add a `tracing::debug!` in a
-  guard's `Drop` and watch it fire in the manual check.
-- [ ] **Step 4:** Manual verification against `just dev` (env-gated live test
-  per the Task 10 idiom; record the commands in its doc comment).
-- [ ] **Step 5:** `just check` green. Commit:
+- [ ] **Step 2:** The tonic method maps both arms to `app::SessionEvent`,
+  carrying three wire details (verified in events.rs):
+  **`with_rewind_meta` (events.rs:144) applies to BOTH arms**; replay→live
+  dedupe drops live events with `idx <= replay high water`
+  (events.rs:98-101 — copy the exact rule); broadcast **`Lagged`**
+  (events.rs:102-106) → `SessionEvent { kind: "lagged", idx: unset,
+  payload_json: {"missed": n} }`.
+- [ ] **Step 3:** Confirm RAII teardown (client disconnect → future drop →
+  receiver drop) with a `tracing::debug!` in a guard's `Drop`.
+- [ ] **Step 4:** Env-gated live test; `just check` green. Commit:
 
 ```bash
 git add crates/engram-coordinator/
 git commit -m "feat(coordinator): StreamEvents sharing the SSE replay+tail core (no auto-resume — matches today)"
 ```
 
-### Task 12: Remaining SessionService RPCs
+### Task 12: Remaining SessionService RPCs + ShellRelay
 
 **Goal:** `Exec` (streaming), `GetLog`, `Snapshot`, `Resume`, `EvictLocal`,
-`GetCowState`, `ListCheckpoints`, `GetArtifact` (streaming), and
-`CreateArtifactFromPath` — same pattern as Task 10.
+`GetCowState`, `ListCheckpoints`, `GetArtifact` (streaming),
+`CreateArtifactFromPath`, and `ShellRelayService.Relay`.
 
-**Sizing note:** two PRs — (a) `Exec` + `GetArtifact` (the streaming/tricky
-two), (b) the mechanical rest.
-
-**Outcome:** Every SessionService RPC returns real data over gRPC; `just e2e`
-green.
-
-**Files:**
-- Modify: `api/exec.rs`, `api/sessions_inspect.rs`, `api/snapshot.rs`,
-  `api/upload.rs`, `grpc_app/mod.rs`, `grpc_app/convert.rs`
+**Sizing note:** three PRs — (a) `Exec` + `GetArtifact`, (b) the mechanical
+rest, (c) `Relay`.
 
 **Steps:**
 
-- [ ] **Step 1:** `Exec`: there are **two distinct handlers** — `exec`
-  (exec.rs:147, unary + rusage) and `exec_stream` (exec.rs:260, streamed
-  frames). Verify they're semantically unifiable behind one streaming core
-  before merging them; if not, extract two cores and have the proto `Exec` use
-  the streaming one (the unary axum route keeps its own core until Task 31
-  deletes it).
-- [ ] **Step 2:** `GetArtifact`: the source handler is `serve_artifact`
-  (upload.rs:542) — it *streams* media up to `MAX_ARTIFACT_BYTES` (512 MiB,
-  `engram-harness-proto/src/lib.rs:370`). The gRPC method emits
-  `GetArtifactResponse{metadata}` first, then `chunk` frames (64 KiB is fine).
-  All session-scoped cores start with `require_session_owner_core`.
-- [ ] **Step 3:** The mechanical six, with converters + unit tests as before.
-- [ ] **Step 4:** Extend the env-gated live test: snapshot → evict-local →
-  resume on a demo session; cow-state and checkpoints non-error.
-- [ ] **Step 5:** `just check` + `just e2e` green; commit per PR boundary.
+- [ ] **Step 1:** `Exec`: **two distinct handlers** exist — `exec`
+  (exec.rs:147, unary + rusage) and `exec_stream` (exec.rs:260). Verify
+  they're unifiable behind one streaming core; if not, two cores, proto `Exec`
+  uses the streaming one.
+- [ ] **Step 2:** `GetArtifact`: source is `serve_artifact` (upload.rs:542),
+  which *streams* up to 512 MiB. Emit `metadata` first, then 64 KiB `chunk`
+  frames.
+- [ ] **Step 3:** The mechanical six: cores + converters + unit tests.
+- [ ] **Step 4:** `Relay`. Map of the real code (verified): the WS handler
+  bridges `engram_core::types::shell::ShellFrame`
+  (`{Text, Binary, Ping, Pong, Close}`, shell.rs:29) over
+  `HostClient::proxy_shell`'s `ShellTunnel` channels — it never touches
+  `ProxyShellMessage` (that lives below `HostClient`). Core:
+  `ensure_active` (shells DO auto-resume, shell.rs:42) → `registry.get` →
+  `acquire_shell` → `proxy_shell` → pump → `release_shell`. Preserve:
+  no-sandbox-after-resume → `Conflict`/`failed_precondition`
+  (shell.rs:46-53); **`acquire_shell` failure is non-fatal**
+  (warn-and-continue, shell.rs:62-68). First inbound frame must be `open`
+  (else `invalid_argument`). **Teardown under tonic is new code**: the WS
+  handler releases after its bridge completes (shell.rs:94) and is never
+  cancelled mid-bridge; tonic *does* drop the future on disconnect — wrap the
+  lease in a guard whose `Drop` spawns the async release (`Drop` can't
+  `await`), explicit release on the normal path.
+- [ ] **Step 5:** Env-gated live tests (incl. open-Relay → type `echo hi` →
+  output frames → drop client → lease-release debug log fires). `just check`
+  + `just e2e` green. Commit per PR boundary.
 
-### Task 13: `ShellRelayService.Relay` bidi
+### Task 13: Fleet/Image services + SecretService + harness injection
 
-**Goal:** The orchestrator-facing bidi relay with the same lifecycle as the WS
-handler. **Map of the real code (verified — the plan's reviewers corrected an
-earlier sketch):** the WS handler already bridges
-`engram_core::types::shell::ShellFrame` (`{Text, Binary, Ping, Pong,
-Close(Option<ShellClose>)}`, shell.rs:29) over `HostClient::proxy_shell`'s
-`ShellTunnel` mpsc channels — it never touches `ProxyShellMessage` (that
-mapping lives below `HostClient` in the protocol layer). So the core is:
-`ensure_active` (shells DO auto-resume, shell.rs:42 — unlike events) →
-`registry.get` → `acquire_shell` → `proxy_shell` → pump `ShellFrame`s →
-`release_shell`. The gRPC method just maps proto frames ⇄
-`engram_core` `ShellFrame` (careful: the proto messages and the Rust type
-share names — alias imports).
-
-**Outcome:** A Rust test client opens `Relay`, sends `ShellOpen`, sends
-`echo hi\n` as text, receives output frames; dropping the client releases the
-lease (debug-log check).
-
-**Files:**
-- Modify: `crates/engram-coordinator/src/api/shell.rs`, `grpc_app/mod.rs`
+**Goal:** The remaining services. **No admin gating anywhere** — the caller is
+trusted; gating moved to the orchestrator's policy gate (Task 18).
 
 **Steps:**
 
-- [ ] **Step 1:** Extract the acquire→pump→release core from the WS handler,
-  parameterized over a frame source/sink of `engram_core` `ShellFrame`s.
-  Preserve three existing behaviors: auto-resume (`ensure_active`);
-  no-sandbox-after-resume → `Conflict`/409 → `failed_precondition`
-  (shell.rs:46-53); **`acquire_shell` failure is deliberately non-fatal**
-  (warn-and-continue, shell.rs:62-68) — the relay must not fail the stream on
-  it.
-- [ ] **Step 2:** tonic bidi method: first inbound frame must be `open` (else
-  `invalid_argument`); auth + `require_session_owner_core` on
-  `ShellOpen.session_id`; then the core.
-- [ ] **Step 3:** Teardown under tonic is **new code, not a copy**: the WS
-  handler releases explicitly after its bridge future completes (shell.rs:94),
-  which is safe because `on_upgrade` tasks aren't cancelled mid-bridge — but
-  tonic *does* drop the handler future on client disconnect. Wrap the lease in
-  a guard whose `Drop` spawns the async release (`Drop` can't `await`, ADR
-  §9.4), with the explicit release on the normal exit path so the spawn is the
-  exceptional case only.
-- [ ] **Step 4:** Env-gated live test per the repo idiom. `just check` +
-  `just e2e` green. Commit:
-
-```bash
-git add crates/engram-coordinator/
-git commit -m "feat(coordinator): ShellRelayService bidi sharing the WS acquire/pump/release core"
-```
-
-### Task 14: Fleet/Image/User services + `GetMe` + `SaveClaudeToken`
-
-**Goal:** The remaining services, extract-and-delegate. **Gating is per-RPC,
-not per-service** (verified against api/mod.rs:88-92): `ListEnabledImages`,
-`ListEnableJobs`, `GetEnableJob` are **member-level** (the create-session form
-depends on the first); everything else in Fleet/Image is admin;
-`ListUsers`/`PatchUser` admin; `GetMe`/`SaveClaudeToken` self-scoped.
-
-**Sizing note:** one PR per service.
-
-**Outcome:** Every RPC returns real data; a member JWT gets `permission_denied`
-on `ListUsers` but succeeds on `ListEnabledImages` and `GetMe`.
-
-**Files:**
-- Modify: `api/hosts.rs`, `api/admin.rs`, `api/storage.rs`,
-  `api/enabled_images.rs`, `api/registries.rs`,
-  **`api/principal.rs` (the user surface lives here: `list_users:501`,
-  `patch_user:521`, `save_claude_token:296`, and the `/me` handler `GetMe`
-  derives from)**, `grpc_app/mod.rs`, `grpc_app/auth.rs`, `grpc_app/convert.rs`
-
-**Steps:**
-
-- [ ] **Step 1:** Add `fn require_admin_grpc(p: &Principal) -> Result<(), Status>`
-  to `grpc_app/auth.rs` (mirrors `require_admin`, principal.rs:160). Apply it
-  per the gating map above — enumerated, not blanket.
-- [ ] **Step 2:** FleetService: cores + converters. `DrainHost` = the soft
+- [ ] **Step 1:** FleetService cores + converters. `DrainHost` = the soft
   member-facing `hosts::drain`; `AdminDrainHost` = `admin::drain_host`
-  (cordon+evacuate) — two RPCs, two handlers, don't conflate.
-- [ ] **Step 3:** ImageService: cores + converters; the `AddRegistryAuth` serde
-  enum ⇄ proto `oneof` mapping is explicit in `convert.rs`.
-- [ ] **Step 4:** UserService: `ListUsers`/`PatchUser`; `GetMe` builds the
-  response from the already-resolved `Principal` (+ the `has_claude_token`
-  lookup the `/me` handler does); `SaveClaudeToken` delegates to the existing
-  sealing+storage path — the token is never logged (check the handler's
-  redaction discipline and keep it).
-- [ ] **Step 5:** Tests: converter round-trips; member-vs-admin matrix
-  (`permission_denied` on `ListUsers`, success on `ListEnabledImages`/`GetMe`).
-- [ ] **Step 6:** `just check` green; commit per service.
+  (cordon+evacuate) — two RPCs, two handlers, don't conflate. GC RPCs take
+  `dry_run`.
+- [ ] **Step 2:** ImageService cores + converters; the `AddRegistryAuth`
+  serde-enum ⇄ proto-`oneof` mapping is explicit in `convert.rs`.
+- [ ] **Step 3:** `SecretService`: new sqlx migration —
+  `sealed_secrets(key TEXT PRIMARY KEY, ciphertext BYTEA, created_at)`.
+  Reuse the exact KEK sealing path the current `/me/claude-token` handler
+  uses (`api/principal.rs:296` — read it; the sealing helper moves or is
+  shared, the per-user row in `users` is NOT reused). `PutSecret` seals +
+  upserts; never log the value (keep the handler's redaction discipline).
+- [ ] **Step 4:** `CreateSession` harness injection: when
+  `harness_secret_id` is set and the image's builtin harness wants a token,
+  unseal from `sealed_secrets` and inject exactly as the legacy per-user path
+  did (find the injection site via the ADR 0031 wiring in
+  `create_session_inner`). Legacy axum create keeps the old per-user lookup
+  until Task 32. Existing tokens are **not migrated** — users re-save
+  (decision 4 in the header).
+- [ ] **Step 5:** Tests: secret round-trip (put → has → create-with-injection
+  → delete); converter round-trips. `just check` green. Commit per service.
 
 ---
 
 # Phase 3 — The orchestrator service
 
-> `orchestrator/` is a **standalone pnpm package** (verified: the repo has no
-> root package.json / pnpm-workspace.yaml; `web/` is standalone too). Commit
-> `orchestrator/pnpm-lock.yaml`. CI: add a job running
-> `pnpm -C orchestrator install --frozen-lockfile && pnpm -C orchestrator test && pnpm -C orchestrator typecheck`
-> in Task 15 — don't leave orchestrator tests CI-less until the final gate.
+> `orchestrator/` is a **standalone pnpm package** (verified: no root
+> pnpm-workspace; `web/` is standalone too). Commit `orchestrator/pnpm-lock.yaml`.
+> CI: Task 14 adds `pnpm -C orchestrator install --frozen-lockfile && pnpm -C orchestrator test && pnpm -C orchestrator typecheck`.
 
-### Task 15: Scaffold — Hono on Node, config, health, SIGTERM, Tilt wiring
+### Task 14: Scaffold — Hono on Node, config, health, SIGTERM, Tilt wiring
 
-**Goal:** One Node HTTP server: `/rpc/*` → Connect adapter (empty routes for
-now), everything else → Hono; `/healthz`; basic graceful shutdown; Tilt runs it
-under `just dev`.
+**Goal:** One Node HTTP server: `/rpc/*` → Connect adapter (empty routes),
+everything else → Hono; `/healthz`; SIGTERM close; Tilt resource.
 
 **Outcome:** `curl http://127.0.0.1:8787/healthz` → `200 {"ok":true}` under
-`just dev`; SIGTERM closes the listener cleanly.
-
-**Files:**
-- Create: `orchestrator/package.json`, `tsconfig.json`, `vitest.config.ts`,
-  `src/index.ts`, `src/server.ts`, `src/config.ts`, `src/routes/health.ts`
-- Modify: `Tiltfile`
+`just dev`.
 
 **Steps:**
 
@@ -1310,18 +1276,16 @@ under `just dev`.
 
 ```bash
 pnpm add hono @hono/node-server @hono/node-ws \
-  @connectrpc/connect @connectrpc/connect-node @bufbuild/protobuf
+  @connectrpc/connect @connectrpc/connect-node @bufbuild/protobuf @casl/ability
 pnpm add -D typescript tsx vitest @types/node
 ```
 
   Scripts: `"dev": "tsx watch src/index.ts"`, `"test": "vitest run"`,
-  `"typecheck": "tsc --noEmit"`. Pin `@hono/node-server` ≥ 1.13 (the version
-  that wires client-disconnect → `c.req.raw.signal` abort, which Task 20
-  depends on — verified the wiring exists in current versions).
-- [ ] **Step 2:** `tsconfig.json` — load-bearing because the committed
-  `src/gen` uses `.js`-suffixed relative imports and
-  `@bufbuild/protobuf/codegenv1` subpath imports (classic `node` resolution
-  fails):
+  `"typecheck": "tsc --noEmit"`. Pin `@hono/node-server` ≥ 1.13 (wires
+  client-disconnect → `c.req.raw.signal` abort; Task 21 depends on it).
+- [ ] **Step 2:** `tsconfig.json` — load-bearing: the committed `src/gen` uses
+  `.js`-suffixed relative imports + `@bufbuild/protobuf/codegenv1` subpaths
+  (classic `node` resolution fails):
 
 ```jsonc
 {
@@ -1337,26 +1301,25 @@ pnpm add -D typescript tsx vitest @types/node
 }
 ```
 
-- [ ] **Step 3:** `src/config.ts` — one validated singleton (every later task
-  imports `config`; don't mix factory and singleton styles):
+- [ ] **Step 3:** `src/config.ts` — one validated **singleton** (every later
+  snippet imports `config`; don't mix factory and singleton styles):
 
 ```ts
 export interface Config {
   port: number;                 // ORCHESTRATOR_PORT, default 8787
-  databaseUrl: string;          // ORCHESTRATOR_DATABASE_URL (required from Task 16)
+  databaseUrl: string;          // ORCHESTRATOR_DATABASE_URL (required from Task 15)
   controlPlaneGrpcUrl: string;  // CONTROL_PLANE_GRPC_URL, default http://127.0.0.1:50061
-  authIssuer: string;           // APP_AUTH_ISSUER, default http://127.0.0.1:8787
-  authAudience: string;         // APP_AUTH_AUDIENCE, default engram-control-plane
+  controlPlaneBearer: string;   // CONTROL_PLANE_BEARER (required) — the Task 9 token
+  trustedOrigins: string[];     // TRUSTED_ORIGINS, dev: http://localhost:5173
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   /* read + validate; throw naming the missing var */
 }
-
 export const config: Config = loadConfig();
 ```
 
-- [ ] **Step 4:** `src/server.ts`:
+- [ ] **Step 4:** `src/server.ts` (options verified against connect-node v2):
 
 ```ts
 import { createServer } from 'node:http';
@@ -1366,9 +1329,7 @@ import type { ConnectRouter } from '@connectrpc/connect';
 import type { Hono } from 'hono';
 
 // One process, one port: Connect RPCs under /rpc, everything else
-// (better-auth, SSE, WS upgrade, health) is Hono. ADR 0039 §7.
-// connectNodeAdapter's `requestPathPrefix` and `contextValues` options
-// verified against @connectrpc/connect-node v2 types.
+// (better-auth, SSE, WS upgrade, artifacts, health) is Hono. ADR §7.
 export function buildServer(
   app: Hono,
   routes: (r: ConnectRouter) => void,
@@ -1382,258 +1343,312 @@ export function buildServer(
 }
 ```
 
-- [ ] **Step 5:** `src/routes/health.ts` + `src/index.ts` (build, `listen(config.port)`,
-  and `process.on('SIGTERM', () => server.close(() => process.exit(0)))` —
-  cheap shutdown; full stream-draining is explicitly deferred, see Out of
-  scope).
-- [ ] **Step 6:** Vitest: build with a stub Hono app on an ephemeral port;
-  `/healthz` → 200; `/rpc/anything` → handled by the adapter (404/unimplemented,
-  not the Hono app). → PASS.
-- [ ] **Step 7:** Tilt: mirror the web resource's pattern (Tiltfile:489 —
-  including `pnpm install --silent &&` in `serve_cmd`, or a fresh checkout
-  breaks):
-  `local_resource('orchestrator', serve_cmd='cd orchestrator && pnpm install --silent && pnpm dev', resource_deps=['postgres'], ...)`.
-  `just dev` → healthz 200.
-- [ ] **Step 8:** Add the orchestrator CI job (see phase preamble). Commit:
+- [ ] **Step 5:** `src/routes/health.ts` + `src/index.ts` (listen +
+  `process.on('SIGTERM', () => server.close(() => process.exit(0)))`).
+- [ ] **Step 6:** Vitest: stub app on an ephemeral port; `/healthz` 200;
+  `/rpc/x` handled by the adapter, not Hono.
+- [ ] **Step 7:** Tilt: mirror the web resource (Tiltfile:489 — including
+  `pnpm install --silent &&` in `serve_cmd`, or fresh checkouts break);
+  `resource_deps=['postgres']`; env: `CONTROL_PLANE_BEARER` from Task 9's
+  Tilt wiring. `just dev` → healthz 200.
+- [ ] **Step 8:** Add the orchestrator CI job. Commit:
 
 ```bash
 git add orchestrator/ Tiltfile .github/workflows/
 git commit -m "feat(orchestrator): scaffold — hono on node, /rpc connect seam, tilt + ci (ADR 0039)"
 ```
 
-### Task 16: Orchestrator database + drizzle
+### Task 15: Orchestrator database + drizzle (incl. task tables)
 
-**Goal:** Separate `engram_orchestrator` DB on the existing dev Postgres
-(ADR §10), drizzle-owned, env-configured; migrations wired into dev.
+**Goal:** Separate `engram_orchestrator` DB (ADR §10), drizzle-owned, with the
+**task model schema from day one**.
 
-**Outcome:** `pnpm drizzle-kit migrate` applies; `/healthz` includes a DB ping;
-a fresh `just dev` brings the schema up without manual steps.
-
-**Files:**
-- Create: `orchestrator/drizzle.config.ts`, `src/db/schema.ts`, `src/db/client.ts`
-- Modify: `deploy/docker-compose.dev.yml` (initdb script — none exists today,
-  verified), `Tiltfile`, `orchestrator/src/config.ts`
+**Outcome:** Migrations apply; `/healthz` includes a DB ping; fresh `just dev`
+brings the schema up unattended.
 
 **Steps:**
 
 - [ ] **Step 1:** `pnpm add drizzle-orm pg && pnpm add -D drizzle-kit @types/pg`.
 - [ ] **Step 2:** `drizzle.config.ts` (dialect postgresql, schema
-  `src/db/schema.ts`, out `drizzle/`, url from `ORCHESTRATOR_DATABASE_URL`);
-  empty `schema.ts`; `client.ts` exports `pg.Pool` + drizzle instance.
-- [ ] **Step 3:** Database creation, two paths (the compose volume persists, so
-  initdb alone is NOT enough — verified `just db-down` keeps the volume):
-  - *Fresh machines:* mount an init script into `docker-entrypoint-initdb.d`
-    with `CREATE DATABASE engram_orchestrator;`.
-  - *Existing dev machines (primary path):*
-    `docker compose -f deploy/docker-compose.dev.yml exec postgres createdb -U engram engram_orchestrator`
-    (idempotent-ish: ignore "already exists"). Put this in a `just` recipe or
-    the Tilt migrate resource's command. (`just db-reset` also works but is
-    destructive — say so wherever it's suggested.)
-- [ ] **Step 4:** Wire migrations into dev: Tilt one-shot
-  `local_resource('orchestrator-migrate', cmd='cd orchestrator && pnpm drizzle-kit migrate', resource_deps=['postgres'])`,
-  and make the `orchestrator` resource depend on it.
-- [ ] **Step 5:** DB ping in `/healthz` (`select 1` → 500 on failure); vitest
-  against the local DB with the env-gated graceful-skip idiom. Commit:
+  `src/db/schema.ts`, out `drizzle/`, url from env); `src/db/client.ts`
+  (pg Pool + drizzle).
+- [ ] **Step 3:** `src/db/schema.ts` — the task model (ADR §3; better-auth
+  tables join in Task 16):
+
+```ts
+import { pgTable, text, jsonb, timestamp, primaryKey, index } from 'drizzle-orm/pg-core';
+
+export const task = pgTable('task', {
+  id: text('id').primaryKey(),                       // nanoid/uuid
+  type: text('type').notNull(),                      // 'chat' only for now
+  title: text('title'),
+  status: text('status').notNull().default('open'),  // open|working|awaiting_review|done|failed
+  createdByUserId: text('created_by_user_id'),       // better-auth user id; null = automation (future)
+  source: jsonb('source'),                           // type-specific trigger ref
+  workflowRunId: text('workflow_run_id'),            // DBOS run — null for chat (ADR §4)
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+});
+
+export const taskSession = pgTable('task_session', {
+  taskId: text('task_id').notNull().references(() => task.id, { onDelete: 'cascade' }),
+  sessionId: text('session_id').notNull(),           // control-plane session id
+  role: text('role'),                                // nullable until multi-session types exist
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.taskId, t.sessionId] }),
+  index('task_session_session_idx').on(t.sessionId), // the authz join (ADR §6) hits this
+]);
+```
+
+- [ ] **Step 4:** Database creation, two paths (verified: the compose volume
+  persists `just db-down`, so initdb alone is NOT enough): fresh machines get
+  a `docker-entrypoint-initdb.d` script (`CREATE DATABASE engram_orchestrator;`);
+  existing machines run
+  `docker compose -f deploy/docker-compose.dev.yml exec postgres createdb -U engram engram_orchestrator`
+  (ignore "already exists") — put it in the Tilt migrate resource's command.
+- [ ] **Step 5:** Tilt one-shot
+  `local_resource('orchestrator-migrate', cmd='… createdb …; cd orchestrator && pnpm drizzle-kit migrate', resource_deps=['postgres'])`;
+  the `orchestrator` resource depends on it. DB ping in `/healthz`. Env-gated
+  vitest against the local DB. Commit:
 
 ```bash
 git add orchestrator/ deploy/ Tiltfile
-git commit -m "feat(orchestrator): separate engram_orchestrator db via drizzle (ADR 0039 §10)"
+git commit -m "feat(orchestrator): engram_orchestrator db via drizzle — task model schema (ADR 0039 §3/§10)"
 ```
 
-### Task 17: better-auth — login, session, JWT plugin, JWKS
+### Task 16: better-auth + admin plugin (roles)
 
-**Goal:** better-auth with the drizzle adapter and JWT plugin: email+password
-(dev/self-hosted; IAP bridge is Task 29), JWKS served for the control plane.
+**Goal:** better-auth with the drizzle adapter and the **admin plugin** —
+which owns the role (`admin`/`user`; we read `user` as "member"), ban, and
+set-role APIs. **No JWT plugin, no JWKS** — nothing downstream consumes user
+identity anymore (ADR §5).
 
-**Outcome:** Sign-up → session cookie works; `GET /api/auth/jwks` returns keys;
-the minted JWT verifies against it **with RS256** (see Step 2).
-
-**Files:**
-- Create: `orchestrator/src/auth/better-auth.ts`
-- Modify: `src/db/schema.ts` (generated tables), `src/index.ts` (mount),
-  `src/config.ts` (`BETTER_AUTH_SECRET`, `TRUSTED_ORIGINS`)
+**Outcome:** Sign-up → session cookie works; an admin-plugin
+`setRole`-promoted user reads back `role: 'admin'` via `getSession`.
 
 **Steps:**
 
-- [ ] **Step 1:** `pnpm add better-auth`.
-- [ ] **Step 2:** `src/auth/better-auth.ts`. Two non-obvious, verified settings:
-  better-auth's JWKS defaults to **EdDSA/Ed25519**, but the Rust verifier
-  resolves keys via `jsonwebtoken`'s `from_jwk` whose Ed25519 support is
-  unproven here — **pin RS256**, the alg Task 9's fixtures use, so the test
-  suites exercise the real pairing. And the browser reaches this through the
-  vite proxy with `Origin: http://localhost:5173` — without `trustedOrigins`,
-  better-auth 403s every non-GET auth route (CSRF protection):
+- [ ] **Step 1:** `pnpm add better-auth`. `src/auth/better-auth.ts`:
 
 ```ts
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
-import { jwt } from 'better-auth/plugins';
+import { admin } from 'better-auth/plugins';
 import { db } from '../db/client';
 import { config } from '../config';
 
 export const auth = betterAuth({
-  baseURL: config.authIssuer,
-  trustedOrigins: config.trustedOrigins,        // dev: ['http://localhost:5173']
+  baseURL: `http://127.0.0.1:${config.port}`,
+  // The browser reaches this through the vite proxy with
+  // Origin: http://localhost:5173 — without trustedOrigins, better-auth
+  // 403s every non-GET auth route (CSRF protection). Verified.
+  trustedOrigins: config.trustedOrigins,
   database: drizzleAdapter(db, { provider: 'pg' }),
-  // Dev/self-hosted door. NOTE: public sign-up + the control plane's
-  // JIT-upsert = open registration. Acceptable in dev only; production
-  // posture is decided in Task 22 (disable sign-up / allowlist) — do not
-  // ship this default past Phase 4 without that decision.
+  // Dev/self-hosted door. NOTE: public sign-up = open registration.
+  // Acceptable in dev only; production posture (disable sign-up /
+  // allowlist) is decided in Task 23 — do not deploy past Phase 4
+  // without it.
   emailAndPassword: { enabled: true },
   plugins: [
-    jwt({
-      jwks: { keyPairConfig: { alg: 'RS256' } },  // match the Rust verifier
-      jwt: {
-        issuer: config.authIssuer,
-        audience: config.authAudience,
-        expirationTime: '60s',                    // ADR §5: short-lived assertion
-        definePayload: ({ user }) => ({ email: user.email }),
-      },
-    }),
+    admin(),   // role field ('admin'|'user'), setRole/ban/list APIs → Members UI
   ],
 });
 ```
 
-- [ ] **Step 3:** Generate schema: `pnpm dlx @better-auth/cli@latest generate`
-  (needs `ORCHESTRATOR_DATABASE_URL` + `BETTER_AUTH_SECRET` in env — the
-  config import is eager); merge into `src/db/schema.ts`;
-  `pnpm drizzle-kit generate && pnpm drizzle-kit migrate`.
-- [ ] **Step 4:** Mount: `app.on(['GET','POST'], '/api/auth/*', (c) => auth.handler(c.req.raw))`.
-- [ ] **Step 5:** Verify: curl sign-up → cookie; `curl :8787/api/auth/jwks` →
-  RS256 key present. Vitest: sign-up → sign-in → `auth.api.getSession` round
-  trip (env-gated on the local DB). Commit:
+- [ ] **Step 2:** Generate schema: `pnpm dlx @better-auth/cli@latest generate`
+  (needs the DB env vars — the config import is eager); merge into
+  `src/db/schema.ts`; `pnpm drizzle-kit generate && pnpm drizzle-kit migrate`.
+- [ ] **Step 3:** Mount: `app.on(['GET','POST'], '/api/auth/*', (c) => auth.handler(c.req.raw))`.
+- [ ] **Step 4:** Dev admin bootstrap: a `just dev-admin` recipe that
+  promotes a dev email:
+  `psql $ORCHESTRATOR_DATABASE_URL -c "UPDATE \"user\" SET role='admin' WHERE email='dev@engram.local'"`.
+  Nothing else ever makes a user admin — without this, every admin surface in
+  Phase 4 is untestable.
+- [ ] **Step 5:** Verify by curl (sign-up → cookie → getSession shows role);
+  env-gated vitest round-trip. Commit:
 
 ```bash
-git add orchestrator/
-git commit -m "feat(orchestrator): better-auth with drizzle adapter + RS256 jwt/jwks (ADR 0039 §5)"
+git add orchestrator/ justfile
+git commit -m "feat(orchestrator): better-auth + admin plugin — users and roles live here (ADR 0039 §5)"
 ```
 
-### Task 18: Per-request token supplier + control-plane transport
+### Task 17: Control-plane transport — service bearer + clients
 
-**Goal:** Every upstream call carries a fresh ~60s JWT for the request's user
-via a `kAuthToken` context value + transport interceptor. Fail **closed and
-correctly typed**: no session → `Code.Unauthenticated` (Connect maps it to
-HTTP 401; a bare `throw` would surface as `internal`/500 — verified).
+**Goal:** The upstream gRPC transport with the static bearer and the ADR §9.4
+HTTP/2 keepalives. Radically simpler than the pre-revision per-user JWT
+design: no context keys, no per-request minting — one header, set once.
 
-**Outcome:** Vitest: bearer attached from context; no-session →
-`ConnectError` code `unauthenticated`; missing supplier → code `internal`.
-
-**Files:**
-- Create: `orchestrator/src/auth/token.ts`, `src/control-plane/transport.ts`,
-  `src/control-plane/client.ts`
+**Outcome:** Vitest (in-process Connect fake): bearer header lands on every
+call. Live (needs Task 10): `sessions.listSessions({})` returns data.
 
 **Steps:**
 
-- [ ] **Step 1:** `src/auth/token.ts`:
-
-```ts
-import { createContextKey, ConnectError, Code } from '@connectrpc/connect';
-import { auth } from './better-auth';
-
-// A supplier, not a token: minted lazily per upstream call so the 60s
-// exp is always fresh, closed over the inbound request's headers.
-export type TokenSupplier = () => Promise<string>;
-export const kAuthToken = createContextKey<TokenSupplier | undefined>(undefined);
-
-export function tokenSupplierFromRequest(headers: Headers): TokenSupplier {
-  return async () => {
-    try {
-      const { token } = await auth.api.getToken({ headers });
-      return token;
-    } catch {
-      // Maps to HTTP 401 on the Connect protocol — the contract the UI
-      // relies on. A bare rethrow would surface as internal/500.
-      throw new ConnectError('unauthenticated', Code.Unauthenticated);
-    }
-  };
-}
-```
-
-- [ ] **Step 2:** `src/control-plane/transport.ts` — bearer interceptor + the
-  ADR §9.4 HTTP/2 keepalives (options verified in connect-node v2:
-  `pingIntervalMs`, `pingTimeoutMs`, `pingIdleConnection`):
+- [ ] **Step 1:** `src/control-plane/transport.ts`:
 
 ```ts
 import { createGrpcTransport } from '@connectrpc/connect-node';
-import { ConnectError, Code, type Interceptor } from '@connectrpc/connect';
-import { kAuthToken } from '../auth/token';
+import type { Interceptor } from '@connectrpc/connect';
 import { config } from '../config';
 
-const bearer: Interceptor = (next) => async (req) => {
-  const supply = req.contextValues.get(kAuthToken);
-  if (!supply) {
-    // Programming error (route forgot contextValues), not a user error.
-    throw new ConnectError('no auth token supplier on call context', Code.Internal);
-  }
-  req.header.set('authorization', `Bearer ${await supply()}`);
+// Machine identity (ADR §5): one trusted caller, one static credential.
+const bearer: Interceptor = (next) => (req) => {
+  req.header.set('authorization', `Bearer ${config.controlPlaneBearer}`);
   return next(req);
 };
 
 export const controlPlaneTransport = createGrpcTransport({
   baseUrl: config.controlPlaneGrpcUrl,   // HTTP/2; also carries the Relay bidi
   interceptors: [bearer],
-  // ADR §9.4: detect half-open connections (slept laptops, dead peers)
-  // so leases/subscriptions don't ghost.
+  // ADR §9.4: detect half-open connections so leases don't ghost.
   pingIntervalMs: 20_000,
   pingTimeoutMs: 10_000,
   pingIdleConnection: true,
 });
 ```
 
-- [ ] **Step 3:** `src/control-plane/client.ts`:
-
-```ts
-import { createClient } from '@connectrpc/connect';
-import { SessionService, ShellRelayService } from '../gen/engram/app/v1/session_pb';
-import { controlPlaneTransport } from './transport';
-
-export const sessions = createClient(SessionService, controlPlaneTransport);
-export const shellRelay = createClient(ShellRelayService, controlPlaneTransport);
-```
-
-- [ ] **Step 4:** Tests (in-process Connect server capturing headers): bearer
-  lands; the two failure codes as in the Outcome. Commit:
+- [ ] **Step 2:** `src/control-plane/client.ts` — typed clients for
+  `SessionService`, `ShellRelayService`, `SecretService`, `ImageService`,
+  `FleetService` via `createClient(Svc, controlPlaneTransport)`.
+- [ ] **Step 3:** Tests (fake upstream captures headers). Commit:
 
 ```bash
 git add orchestrator/
-git commit -m "feat(orchestrator): per-request jwt supplier + bearer interceptor + h2 keepalives"
+git commit -m "feat(orchestrator): control-plane transport — service bearer + h2 keepalives (ADR 0039 §5)"
 ```
 
-### Task 19: The generic passthrough + the surface allowlist
+### Task 18: CASL ability + the policy gate + the generic passthrough
 
-**Goal:** One forwarder for every passthrough RPC (plan amendment 2),
-preserving response headers/trailers.
+**Goal:** The authorization core (ADR §6) and the forwarder it guards. The
+gate **fails closed**: a method with no policy entry is denied even if it's in
+the surface.
 
-**Outcome:** Fake-upstream vitest green (no Phase 2 needed). Live (needs
-Task 10): `curl -X POST :8787/rpc/engram.app.v1.SessionService/ListSessions -H 'content-type: application/json' -b <cookie> -d '{}'`
-returns sessions; without a cookie → HTTP 401 (via Task 18's typed error).
+**Outcome:** Fake-upstream vitest matrix green: member reads own session ✓,
+member reads another's session ✗ (`permission_denied`), member calls
+`ListHosts` ✗, admin calls anything ✓, unauthenticated → 401, method without
+a policy entry → denied. Live (needs Task 10): the curl checks below.
 
 **Files:**
-- Create: `orchestrator/src/rpc/passthrough.ts`, `src/rpc/surface.ts`
+- Create: `orchestrator/src/authz/ability.ts`, `src/authz/policy-map.ts`,
+  `src/authz/resolve.ts`, `src/rpc/passthrough.ts`, `src/rpc/surface.ts`
 - Modify: `src/index.ts`
 
 **Steps:**
 
-- [ ] **Step 1:** Failing test: in-process Connect server (fake control plane)
-  implements `ListSessions` returning a sentinel + a response header; build the
-  orchestrator router with `registerPassthrough` → client call → sentinel comes
-  back, fake saw the bearer, **response header survived the hop**.
-- [ ] **Step 2:** Implement (Transport call shapes verified against
-  @connectrpc/connect v2; `methodKind` is `'server_streaming'`, snake_case):
+- [ ] **Step 1:** `src/authz/ability.ts` — THE policy, one file, exported for
+  the web too (it will be copied/shared via the contract-test convention —
+  Task 26 wires the web copy):
+
+```ts
+import { AbilityBuilder, createMongoAbility, type MongoAbility } from '@casl/ability';
+
+export type Actions = 'create' | 'read' | 'prompt' | 'shell' | 'delete' | 'manage';
+export type Subjects = 'Task' | 'Session' | 'EnabledImage' | 'Fleet' | 'Registry' | 'all';
+export type AppAbility = MongoAbility<[Actions, Subjects]>;
+
+export interface AbilityUser { id: string; role: string }   // role: 'admin' | 'user'
+
+// ADR §6: two roles, one ownership relation. Ownership is resolved via
+// the task join (authz/resolve.ts) and passed in as the subject's
+// `createdByUserId`. If this file grows team/sharing semantics, that is
+// the OpenFGA trigger — stop and write the ADR first.
+export function abilityFor(user: AbilityUser): AppAbility {
+  const { can, build } = new AbilityBuilder<AppAbility>(createMongoAbility);
+  can('create', 'Task');
+  can('manage', 'Task',    { createdByUserId: user.id });
+  can(['read', 'prompt', 'shell', 'delete'], 'Session', { createdByUserId: user.id });
+  can('read', 'EnabledImage');   // the create form needs images + enable-job reads
+  if (user.role === 'admin') can('manage', 'all');
+  return build();
+}
+```
+
+- [ ] **Step 2:** `src/authz/resolve.ts` — the ownership join:
+
+```ts
+// sessionId → the owning task's createdByUserId (or null: unattributed —
+// admin-only by construction, since no ownership condition can match).
+// One indexed lookup (task_session_session_idx); cache briefly (5s LRU)
+// because the SSE/WS/artifact routes hit it per-connection, not per-frame.
+export async function sessionOwner(sessionId: string): Promise<{ createdByUserId: string | null } | null>
+```
+
+- [ ] **Step 3:** `src/authz/policy-map.ts` — per-method entries; **no entry =
+  deny**:
+
+```ts
+import type { DescMethod } from '@bufbuild/protobuf';
+
+export interface PolicyEntry {
+  action: 'read' | 'prompt' | 'shell' | 'delete' | 'manage';
+  subject: 'Session' | 'EnabledImage' | 'Fleet' | 'Registry' | 'all';
+  // For session-scoped RPCs: pull the session id out of the request so
+  // the gate can resolve ownership. Field name per request type.
+  sessionIdField?: string;
+}
+
+// SessionService: session-scoped, member-reachable when owner.
+// ListSessions/CreateSession are NOT here: the UI goes through
+// TaskService (native); raw list/create is admin-only via 'manage all'.
+export const POLICY: Record<string, PolicyEntry> = {
+  'SessionService.GetSession':       { action: 'read',   subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.DeleteSession':    { action: 'delete', subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.SendPrompt':       { action: 'prompt', subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.Interrupt':        { action: 'prompt', subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.GetLog':           { action: 'read',   subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.GetCowState':      { action: 'read',   subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.ListCheckpoints':  { action: 'read',   subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.Exec':             { action: 'shell',  subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.Snapshot':         { action: 'manage', subject: 'all' },
+  'SessionService.Resume':           { action: 'read',   subject: 'Session', sessionIdField: 'sessionId' },
+  'SessionService.EvictLocal':       { action: 'manage', subject: 'all' },
+  'SessionService.ListSessions':     { action: 'manage', subject: 'all' },   // admin raw view
+  'SessionService.CreateSession':    { action: 'manage', subject: 'all' },   // UI uses CreateTask
+  'ImageService.ListEnabledImages':  { action: 'read',   subject: 'EnabledImage' },
+  'ImageService.ListEnableJobs':     { action: 'read',   subject: 'EnabledImage' },
+  'ImageService.GetEnableJob':       { action: 'read',   subject: 'EnabledImage' },
+  // everything else on Image/Fleet: admin
+  'ImageService.EnableImage':        { action: 'manage', subject: 'all' },
+  'ImageService.DisableImage':       { action: 'manage', subject: 'all' },
+  'ImageService.RefreshImage':       { action: 'manage', subject: 'all' },
+  'ImageService.RetryEnableJob':     { action: 'manage', subject: 'all' },
+  'ImageService.ListRegistries':     { action: 'manage', subject: 'all' },
+  'ImageService.AddRegistry':        { action: 'manage', subject: 'all' },
+  'ImageService.DeleteRegistry':     { action: 'manage', subject: 'all' },
+  'FleetService.ListHosts':          { action: 'manage', subject: 'all' },
+  // ... every FleetService method: { action: 'manage', subject: 'all' }
+};
+
+export const policyKey = (svc: string, m: DescMethod) =>
+  `${svc.split('.').pop()}.${m.name}`;
+```
+
+  (GetArtifact and StreamEvents are session-scoped too but are served by the
+  Hono routes, not the passthrough — their handlers call the same
+  `sessionOwner` + `ability.can` directly. They get NO policy-map entry and
+  are excluded from the surface.)
+- [ ] **Step 4:** `src/rpc/passthrough.ts` — the forwarder with the gate
+  (Transport call shapes verified against connect v2; `methodKind` is
+  `'server_streaming'`, snake_case):
 
 ```ts
 import type { ConnectRouter, Transport, HandlerContext } from '@connectrpc/connect';
+import { ConnectError, Code } from '@connectrpc/connect';
+import { subject } from '@casl/ability';
 import type { DescService } from '@bufbuild/protobuf';
+import { POLICY, policyKey } from '../authz/policy-map';
+import { abilityFor } from '../authz/ability';
+import { sessionOwner } from '../authz/resolve';
+import { auth } from '../auth/better-auth';
 
 export interface PassthroughSpec {
   service: DescService;
-  methods?: string[];   // subset by method name; default: all
+  methods?: string[];
 }
 
-// One forwarder for every passthrough RPC (plan amendment 2). AuthZ is
-// NOT here — the control plane re-checks owner/admin on every call
-// (ADR §6). This only relabels identity: cookie in, bearer JWT out (the
-// interceptor on `upstream` reads kAuthToken from ctx.values).
+// One forwarder for every passthrough RPC + THE authz boundary (ADR §6).
+// The control plane trusts us completely — there is no re-check below.
+// Fail closed: no session → 401; no policy entry → deny.
 export function registerPassthrough(
   router: ConnectRouter,
   specs: PassthroughSpec[],
@@ -1643,15 +1658,39 @@ export function registerPassthrough(
     const impl: Record<string, unknown> = {};
     for (const m of service.methods) {
       if (methods && !methods.includes(m.name)) continue;
+      if (m.methodKind !== 'unary' && m.methodKind !== 'server_streaming') continue;
+
+      const gate = async (req: unknown, ctx: HandlerContext) => {
+        const session = await auth.api.getSession({ headers: headersOf(ctx) });
+        if (!session) throw new ConnectError('unauthenticated', Code.Unauthenticated);
+        const entry = POLICY[policyKey(service.typeName, m)];
+        if (!entry) throw new ConnectError('forbidden', Code.PermissionDenied);
+        const ability = abilityFor({ id: session.user.id, role: session.user.role ?? 'user' });
+        if (entry.sessionIdField) {
+          const sid = (req as Record<string, string>)[entry.sessionIdField];
+          const owner = await sessionOwner(sid);
+          // Unattributed (no task row / unknown): only 'manage all' passes,
+          // because the ownership condition can never match null.
+          if (!ability.can(entry.action, subject('Session', { createdByUserId: owner?.createdByUserId ?? null }))) {
+            // 404-shape, not 403: don't confirm existence to non-owners.
+            throw new ConnectError('not found', Code.NotFound);
+          }
+        } else if (!ability.can(entry.action, entry.subject)) {
+          throw new ConnectError('forbidden', Code.PermissionDenied);
+        }
+      };
+
       if (m.methodKind === 'unary') {
         impl[m.localName] = async (req: unknown, ctx: HandlerContext) => {
+          await gate(req, ctx);
           const res = await upstream.unary(m, ctx.signal, undefined, undefined, req, ctx.values);
           copyHeaders(res.header, ctx.responseHeader);
           copyHeaders(res.trailer, ctx.responseTrailer);
           return res.message;
         };
-      } else if (m.methodKind === 'server_streaming') {
+      } else {
         impl[m.localName] = async function* (req: unknown, ctx: HandlerContext) {
+          await gate(req, ctx);
           const res = await upstream.stream(
             m, ctx.signal, undefined, undefined,
             (async function* () { yield req; })(), ctx.values,
@@ -1660,108 +1699,202 @@ export function registerPassthrough(
           yield* res.message;
         };
       }
-      // client/bidi streaming: never passthrough — the shell has its own
-      // WS route, and browsers can't send these over Connect anyway.
     }
     router.service(service, impl as never);
   }
 }
-
-function copyHeaders(from: Headers, to: Headers) {
-  from.forEach((v, k) => to.set(k, v));
-}
 ```
 
-- [ ] **Step 3:** `src/rpc/surface.ts` — clean now that the shell relay is its
-  own service:
+  Write the small `headersOf(ctx)` / `copyHeaders` helpers (the request
+  headers come off the handler context; check the installed types). The
+  anti-enumeration choice (NotFound for unowned sessions) mirrors what the
+  coordinator middleware did — keep it.
+- [ ] **Step 5:** `src/rpc/surface.ts`:
 
 ```ts
-import { SessionService } from '../gen/engram/app/v1/session_pb';
-import { FleetService } from '../gen/engram/app/v1/fleet_pb';
-import { ImageService } from '../gen/engram/app/v1/image_pb';
-import { UserService } from '../gen/engram/app/v1/user_pb';
-import type { PassthroughSpec } from './passthrough';
-
-// The entire "what does the app API expose" decision, in one file.
-// ShellRelayService is deliberately absent (WS route owns that leg).
+// What the UI may reach via passthrough. Absent on purpose:
+// ShellRelayService (WS route), SecretService (keys must come from the
+// session — routes/me.ts), TaskService (native impl, Task 19),
+// StreamEvents/GetArtifact (Hono routes own them).
 export const SURFACE: PassthroughSpec[] = [
-  { service: SessionService },
+  { service: SessionService, methods: SessionService.methods
+      .filter((m) => !['StreamEvents', 'GetArtifact'].includes(m.name)).map((m) => m.name) },
   { service: FleetService },
   { service: ImageService },
-  { service: UserService },
 ];
 ```
 
-- [ ] **Step 4:** Wire in `index.ts`:
-  `buildServer(app, (r) => registerPassthrough(r, SURFACE, controlPlaneTransport), (req) => createContextValues().set(kAuthToken, tokenSupplierFromRequest(headersFromNodeReq(req))))`
-  — write the small `headersFromNodeReq(req: IncomingMessage): Headers` helper.
-- [ ] **Step 5:** Tests green; live Outcome when Task 10 is in. Commit:
+- [ ] **Step 6:** The **passthrough conformance test**
+  (`src/rpc/passthrough.conformance.test.ts`) — the generic fidelity proof
+  (see "Stage smoke gates" layer 1). One reflection-based filler, every
+  method covered automatically:
+
+```ts
+import { create, toBinary, type DescMessage, type DescField } from '@bufbuild/protobuf';
+
+// Deterministically populate EVERY field of a message: string → field
+// name, numbers → field number, bool → true, bytes → [0xAB], enum →
+// first non-zero value, repeated → [one element], map → one entry,
+// nested message → recurse (depth-capped at 3), oneof → first case.
+// If a field kind isn't handled, THROW — an unpopulatable field is a
+// finding, not a skip.
+function populate(schema: DescMessage, depth = 0): unknown { /* ~50 lines */ }
+
+for (const { service, methods } of SURFACE) {
+  for (const m of service.methods.filter(/* surface filter */)) {
+    test(`${service.typeName}/${m.name} passes through faithfully`, async () => {
+      const req = populate(m.input);
+      const expectedRes = populate(m.output);
+      // fake upstream: capture the request, reply with expectedRes
+      // (server-streaming: yield it twice), set a response header.
+      const captured = await callThroughOrchestratorAsAdmin(m, req);
+      expect(toBinary(m.input, captured.upstreamSawRequest)).toEqual(toBinary(m.input, req));
+      expect(toBinary(m.output, captured.clientGotResponse)).toEqual(toBinary(m.output, expectedRes));
+      expect(captured.upstreamSawHeaders.get('authorization')).toMatch(/^Bearer /);
+      expect(captured.clientGotHeaders.get('x-fake-upstream')).toBe('1');
+    });
+  }
+}
+```
+
+  Run as an admin user so the policy gate passes — transport fidelity and
+  authz are tested orthogonally (authz is Step 7's matrix). A future RPC
+  added to the contract is covered with zero new test code.
+- [ ] **Step 7:** Tests — the authz Outcome matrix, with an in-process fake
+  upstream + a seeded local DB (two users, one admin; two tasks). Wire into
+  `index.ts`. Also create `orchestrator/src/smoke.live.test.ts` (env-gated,
+  `SMOKE=1`) + the `just smoke-orchestrator` recipe, and append it to the
+  `smoke` umbrella — the live half of this task's Outcome, extended by
+  Tasks 19/20 with the CreateTask→SSE→delete flow. Live curls when Task 10
+  lands:
+  member cookie + own session `GetSession` → 200; another's → 404 (NotFound);
+  `ListHosts` → 403; no cookie → 401. Commit:
 
 ```bash
 git add orchestrator/
-git commit -m "feat(orchestrator): generic connect passthrough + surface allowlist (plan amendment 2)"
+git commit -m "feat(orchestrator): CASL ability + fail-closed policy gate on the generic passthrough (ADR 0039 §6)"
 ```
 
-### Task 20: SSE events route + artifact byte route
+### Task 19: TaskService — the native implementation
 
-**Goal:** The two browser-native HTTP legs: `GET /api/v1/sessions/:id/events`
-(SSE over upstream `StreamEvents`) and
-`GET /api/v1/sessions/:id/artifacts/:artifact_id` (bytes over upstream
-`GetArtifact` — `<img src>`/`<a href>` can't speak Connect; without this route
-every artifact 404s at the Task 27 proxy flip).
+**Goal:** The aggregate root's API (ADR §3): `CreateTask` (chat) does upstream
+`CreateSession` + the two inserts; `ListTasks`/`GetTask` join task rows with
+live control-plane session state; `DeleteTask` deletes the session(s) then the
+rows.
 
-**Outcome:** The SSE curl streams the same events as today's coordinator SSE
-(new envelope frame format — see Step 2); reconnect with `Last-Event-ID`
-replays from the cursor; the artifact route streams an image with the right
-`content-type`. Live Outcome needs Tasks 11/12.
+**Outcome:** Vitest (fake upstream + local DB): create → list shows the task
+with its session ref; member sees only their tasks, admin sees all (incl. an
+unattributed session surfaced as a synthetic admin-only row); delete cascades.
+Live: a task created via curl appears with real session state.
 
 **Files:**
-- Create: `orchestrator/src/routes/events.ts`, `src/routes/artifacts.ts`
-- Modify: `src/index.ts`
+- Create: `orchestrator/src/rpc/tasks.ts`
+- Modify: `src/index.ts` (register on the same ConnectRouter as the
+  passthrough — one `/rpc` surface)
 
 **Steps:**
 
-- [ ] **Step 1:** Auth guard first, both routes: `await auth.api.getSession({
-  headers: c.req.raw.headers })` → 401 before any upstream work.
-- [ ] **Step 2:** `routes/events.ts`. The envelope on the wire is
-  **hand-built JSON**, not `toJsonString` — protobuf-JSON would emit
-  lowerCamelCase (`payloadJson`) and int64-as-string, which the Task 24 parser
-  (and human curls) shouldn't have to know about:
+- [ ] **Step 1:** Implement against the generated `TaskService` descriptor:
 
 ```ts
-import { Hono } from 'hono';
-import { streamSSE } from 'hono/streaming';
-import { createContextValues } from '@connectrpc/connect';
-import { sessions } from '../control-plane/client';
-import { kAuthToken, tokenSupplierFromRequest } from '../auth/token';
+// TaskService — orchestrator-NATIVE (ADR §3). Same Connect router as the
+// passthrough, so the web sees one uniform generated API; never proxied.
+export function registerTasks(router: ConnectRouter) {
+  router.service(TaskService, {
+    async createTask(req, ctx) {
+      const user = await requireUser(ctx);                  // 401 if no session
+      if (req.type !== 'chat') throw new ConnectError('only chat tasks exist yet', Code.InvalidArgument);
+      if (!abilityFor(user).can('create', 'Task')) throw new ConnectError('forbidden', Code.PermissionDenied);
+      // Harness token: keyed by user id in the sealed store (Task 20's
+      // routes/me.ts writes it). HasSecret decides whether to pass the ref.
+      const { exists } = await secrets.hasSecret({ key: user.id });
+      const created = await sessions.createSession({
+        imageUri: req.imageUri,
+        mode: 'agent',
+        prompt: req.prompt,
+        harnessSecretId: exists ? user.id : undefined,
+      });
+      const id = crypto.randomUUID();
+      await db.transaction(async (tx) => {
+        await tx.insert(task).values({
+          id, type: 'chat', title: req.title ?? null, status: 'open',
+          createdByUserId: user.id, source: {},
+        });
+        await tx.insert(taskSession).values({ taskId: id, sessionId: created.sessionId, role: 'primary' });
+      });
+      return { task: await loadTask(id, user) };
+    },
+    async listTasks(_req, ctx) { /* rows scoped by ability (member: own; admin: all
+      + synthetic rows for unattributed control-plane sessions) joined with
+      upstream ListSessions for live state */ },
+    async getTask(req, ctx)  { /* ability-checked single row + session join */ },
+    async deleteTask(req, ctx) { /* ability 'delete' on the task → upstream
+      DeleteSession per task_session row → delete task (cascade) */ },
+  });
+}
+```
 
-export const events = new Hono();
+  Failure ordering in `createTask`: if the upstream create succeeds but the
+  insert fails, delete the session before rethrowing (compensation — chat has
+  no DBOS to lean on, so don't leave orphans).
+- [ ] **Step 2:** `loadTask`/`listTasks` join shape: one upstream
+  `ListSessions({})` per list call (the trusted caller gets everything; match
+  rows in memory), `GetSession` per `getTask`. Status for chat tasks derives
+  from the session state (map `active/idle/… → working`, terminal → `done`).
+- [ ] **Step 3:** The Outcome test matrix; live check. Commit:
 
-events.get('/api/v1/sessions/:id/events', (c) =>
-  streamSSE(c, async (stream) => {
+```bash
+git add orchestrator/
+git commit -m "feat(orchestrator): native TaskService — tasks own sessions (ADR 0039 §3)"
+```
+
+### Task 20: SSE events route + artifact byte route + `/me/claude-token`
+
+**Goal:** The browser-native HTTP legs, each gated by the same ability checks
+as the passthrough: SSE events, artifact bytes (browsers consume artifacts as
+`<img src>`, not RPCs — without this route every artifact 404s at the Task 29
+proxy flip), and the secret-relay route (`SecretService` is not in the
+passthrough surface — the key must be the *session's* user id, never
+client-supplied).
+
+**Outcome:** SSE curl streams today's events in the envelope frame format;
+reconnect with `Last-Event-ID` replays from the cursor; the artifact route
+streams an image with the right content-type; `POST /api/v1/me/claude-token`
+flips `HasSecret`. Live Outcomes need Tasks 11/12/13.
+
+**Steps:**
+
+- [ ] **Step 1:** Shared guard helper: resolve the better-auth session → 401;
+  resolve `sessionOwner(sessionId)` → `abilityFor(user).can('read', subject('Session', …))`
+  → 404 on failure (same anti-enumeration shape as Task 18).
+- [ ] **Step 2:** `routes/events.ts`. The wire envelope is **hand-built JSON**
+  (protobuf-JSON would emit lowerCamel `payloadJson` + int64-as-string — the
+  parser shouldn't have to know):
+
+```ts
+events.get('/api/v1/sessions/:id/events', async (c) => {
+  const user = await guardSession(c, 'read');          // Step 1 helper; throws 401/404
+  return streamSSE(c, async (stream) => {
     // Cursor: max(?since, Last-Event-ID), NaN-guarded — matches the
-    // coordinator's "never goes backward across a reconnect" rule
-    // (web/src/sse.ts:5-9). -1 / absent → unset (replay from start).
+    // coordinator's "never goes backward" rule (web/src/sse.ts:5-9).
     const nums = [c.req.query('since'), c.req.header('last-event-id')]
-      .map((v) => Number(v))
-      .filter((n) => Number.isFinite(n) && n >= 0);
+      .map(Number).filter((n) => Number.isFinite(n) && n >= 0);
     const since = nums.length ? BigInt(Math.max(...nums)) : undefined;
 
-    const ctx = createContextValues().set(kAuthToken, tokenSupplierFromRequest(c.req.raw.headers));
     const upstream = sessions.streamEvents(
       { sessionId: c.req.param('id'), since },
-      { signal: c.req.raw.signal, contextValues: ctx },  // browser close → RST upstream
+      { signal: c.req.raw.signal },                     // browser close → RST upstream
     );
-    // Keepalive: the coordinator emits SSE comments every 15s (axum
-    // KeepAlive, api/events.rs:78-81). hono's writeSSE can't emit
-    // comments; an empty `event: ping` frame is functionally equivalent
-    // (sse.ts listens per-kind and ignores unknown events).
+    // Keepalive: coordinator emits SSE comments every 15s (axum KeepAlive,
+    // api/events.rs:78-81). hono's writeSSE can't emit comments; an empty
+    // `event: ping` frame is functionally equivalent (sse.ts listens
+    // per-kind and ignores unknown events).
     const ping = setInterval(() => void stream.writeSSE({ data: '', event: 'ping' }), 15_000);
     try {
       for await (const ev of upstream) {
         await stream.writeSSE({
-          // lagged frames have no idx — omit id: so reconnect cursors
-          // are never disturbed (mirrors api/events.rs:103-105).
+          // lagged frames have no idx — omit id: so reconnect cursors are
+          // never disturbed (mirrors api/events.rs:103-105).
           ...(ev.idx !== undefined ? { id: String(ev.idx) } : {}),
           event: ev.kind,
           data: JSON.stringify({
@@ -1774,158 +1907,199 @@ events.get('/api/v1/sessions/:id/events', (c) =>
     } finally {
       clearInterval(ping);
     }
-  }),
-);
+  });
+});
 ```
 
-- [ ] **Step 3:** `routes/artifacts.ts`: open upstream `getArtifact`, read the
-  first message (`metadata`) → set `content-type`/`content-length`, then pipe
-  `chunk` frames into the response stream. Abort upstream on client disconnect
-  (same `signal` pattern).
-- [ ] **Step 4:** Tests with a fake upstream: 3 events → 3 `id:` lines in
-  order; a `lagged` event → frame with no `id:`; client abort cancels the fake
-  (onAbort flag); artifact route: metadata-then-chunks → correct headers+body.
-- [ ] **Step 5:** Live checks (Outcome). Commit:
+- [ ] **Step 3:** `routes/artifacts.ts`: guard → upstream `getArtifact` →
+  first message (`metadata`) sets content-type/length → pipe `chunk` frames;
+  abort upstream on client disconnect (same signal pattern).
+- [ ] **Step 4:** `routes/me.ts`: `POST /api/v1/me/claude-token` →
+  `secrets.putSecret({ key: user.id, value: body.token })` — **opaque relay**:
+  never logged, never persisted locally; `GET` → `hasSecret`; `DELETE` →
+  `deleteSecret`.
+- [ ] **Step 5:** Tests (fake upstream): 3 events → 3 ordered `id:` lines;
+  a lagged event → no `id:`; client abort cancels the fake (onAbort flag);
+  artifact metadata-then-chunks; token route 401 without cookie. Commit:
 
 ```bash
 git add orchestrator/
-git commit -m "feat(orchestrator): SSE event leg + artifact byte route (plan amendments 2/3)"
+git commit -m "feat(orchestrator): SSE event leg + artifact bytes + claude-token relay (ADR 0039 §8)"
 ```
 
 ### Task 21: Shell WS route
 
-**Goal:** `GET /api/v1/sessions/:id/shell` ⇄ upstream `ShellRelayService.Relay`.
-Teardown bidirectional; **no unhandled rejections** (the pump must catch — an
-uncaught abort error in a void'd async IIFE kills the Node process on every
-normal browser disconnect); ping/pong relayed; WS keepalive per ADR §9.4.
+**Goal:** `GET /api/v1/sessions/:id/shell` ⇄ upstream `ShellRelayService.Relay`,
+ability-gated (`'shell'`), with the corrections the review round established:
+**no unhandled rejections** (a bare abort error in a void'd async IIFE kills
+Node on every normal tab close), ping/pong relayed, WS keepalive, backpressure.
 
-**Outcome:** Terminal works through the relay (`websocat` now, UI in Task 25);
-killing the client releases the coordinator lease (Task 13 debug log) **and
-the orchestrator process survives** (test asserts it).
-
-**Files:**
-- Create: `orchestrator/src/routes/shell.ts`
-- Modify: `src/index.ts`, `src/server.ts` (inject `@hono/node-ws` upgrade)
+**Outcome:** Terminal works through the relay; killing the client releases the
+coordinator lease (Task 12's debug log) **and the orchestrator process
+survives** (test asserts no unhandledRejection).
 
 **Steps:**
 
 - [ ] **Step 1:** Wire `createNodeWebSocket({ app })` →
-  `{ upgradeWebSocket, injectWebSocket }`; call `injectWebSocket(server)` in
-  `index.ts` (have `buildServer` return the raw server pre-`listen`).
-- [ ] **Step 2:** The bridge. Key corrections baked in: auth gate **before**
-  upgrade; `catch` around the pump (swallow `Code.Canceled`/`Code.Aborted`,
-  log others, `ws.close(1011)`); answer upstream `ping` frames with `pong`
-  (browser JS cannot send WS pongs — the orchestrator answers on its behalf;
-  the host side uses these for liveness, shell.rs:119/142); handle Node
-  `Buffer` message data (not browser `ArrayBuffer`); periodic WS ping to the
-  browser with a pong-deadline close:
+  `{ upgradeWebSocket, injectWebSocket }`; inject on the raw server in
+  `index.ts`.
+- [ ] **Step 2:** The bridge — auth+ability gate **before** upgrade (401/404
+  pre-upgrade, same guard as Task 20); `catch` around the pump (swallow
+  `Code.Canceled`/`Code.Aborted`, log others, `ws.close(1011)`); answer
+  upstream `ping` frames with `pong` (browser JS cannot send WS pongs; the
+  host side uses these for liveness — shell.rs:119/142); handle Node `Buffer`
+  message data (not browser `ArrayBuffer`):
 
 ```ts
-export const shell = (upgradeWebSocket: UpgradeWebSocket) => {
-  const app = new Hono();
-  app.get('/api/v1/sessions/:id/shell', async (c, next) => {
-    const session = await auth.api.getSession({ headers: c.req.raw.headers });
-    if (!session) return c.text('unauthenticated', 401);   // gate BEFORE upgrade
-    return next();
-  });
-  app.get('/api/v1/sessions/:id/shell', upgradeWebSocket((c) => {
-    const abort = new AbortController();
-    const inbound = pushableQueue<RelayShellRequest>();    // bounded asyncIterable queue, this file
-    return {
-      onOpen: (_e, ws) => {
-        inbound.push(openFrame(c.req.param('id')));
-        void (async () => {
-          try {
-            const ctx = createContextValues().set(kAuthToken, tokenSupplierFromRequest(c.req.raw.headers));
-            for await (const f of shellRelay.relay(inbound, { signal: abort.signal, contextValues: ctx })) {
-              switch (f.frame.case) {
-                case 'text':   ws.send(f.frame.value); break;
-                case 'binary': ws.send(f.frame.value); break;
-                case 'ping':   inbound.push(pongFrame(f.frame.value)); break;  // answer for the browser
-                case 'close':  ws.close(f.frame.value.code, f.frame.value.reason); break;
-              }
+app.get('/api/v1/sessions/:id/shell', upgradeWebSocket((c) => {
+  const abort = new AbortController();
+  const inbound = pushableQueue<RelayShellRequest>();   // bounded async-iterable queue, this file
+  return {
+    onOpen: (_e, ws) => {
+      inbound.push(openFrame(c.req.param('id')));
+      void (async () => {
+        try {
+          for await (const f of shellRelay.relay(inbound, { signal: abort.signal })) {
+            switch (f.frame.case) {
+              case 'text':   ws.send(f.frame.value); break;
+              case 'binary': ws.send(f.frame.value); break;
+              case 'ping':   inbound.push(pongFrame(f.frame.value)); break;
+              case 'close':  ws.close(f.frame.value.code, f.frame.value.reason); break;
             }
-          } catch (e) {
-            if (!isAbortLike(e)) {                          // Canceled/Aborted = normal teardown
-              log.warn({ err: e }, 'shell relay error');
-              ws.close(1011, 'upstream error');
-            }
-          } finally {
-            ws.close();                                     // upstream end → browser close
           }
-        })();
-      },
-      onMessage: (e) => inbound.push(frameFromWsEvent(e)),  // string | Buffer | ArrayBuffer
-      onClose: () => { abort.abort(); inbound.end(); },     // browser close → upstream abort
-    };
-  }));
-  return app;
-};
+        } catch (e) {
+          if (!isAbortLike(e)) {                         // Canceled/Aborted = normal teardown
+            log.warn({ err: e }, 'shell relay error');
+            ws.close(1011, 'upstream error');
+          }
+        } finally {
+          ws.close();                                    // upstream end → browser close
+        }
+      })();
+    },
+    onMessage: (e) => inbound.push(frameFromWsEvent(e)), // string | Buffer | ArrayBuffer
+    onClose: () => { abort.abort(); inbound.end(); },    // browser close → upstream abort
+  };
+}));
 ```
 
-- [ ] **Step 3:** Helpers + tests: `pushableQueue` (give it a cap — input is
-  typing-rate but don't rely on it) with push/iterate/end ordering tests
-  including a binary `Buffer` round-trip; `frameFromWsEvent`. Backpressure on
-  the output side: check `ws.raw.bufferedAmount` against a high-water mark and
-  pause the pump (a `cat bigfile` must not balloon orchestrator memory).
-- [ ] **Step 4:** WS keepalive: `ws.raw.ping()` every 20s, close on missed pong
-  (§9.4 half-open). Subprotocol: the web client opens
+- [ ] **Step 3:** Helpers + tests: `pushableQueue` (capped) with a binary
+  `Buffer` round-trip; output backpressure via `ws.raw.bufferedAmount`
+  high-water pause (a `cat bigfile` must not balloon memory).
+- [ ] **Step 4:** WS keepalive: `ws.raw.ping()` every 20s, close on missed
+  pong (§9.4 half-open). Subprotocol: the client opens
   `new WebSocket(url, 'tty')` (`TerminalPane.tsx:170`) — verify the upgrade
-  response echoes `Sec-WebSocket-Protocol: tty` (browsers hard-fail otherwise).
-- [ ] **Step 5:** The process-survives test: open against a fake upstream,
-  close the client, assert no unhandledRejection (vitest
-  `process.on('unhandledRejection')` trap). Live check vs Task 13 when
-  available. Commit:
+  response echoes `Sec-WebSocket-Protocol: tty` (browsers hard-fail
+  otherwise).
+- [ ] **Step 5:** Process-survives test (vitest traps `unhandledRejection`;
+  open against a fake upstream, close client, assert alive). Live check vs
+  Task 12. Commit:
 
 ```bash
 git add orchestrator/
 git commit -m "feat(orchestrator): browser WS shell leg over ShellRelayService bidi"
 ```
 
+### Task 21b: Cross-stack parity smoke (scaffolding — lives Phases 3→4, dies in Task 28)
+
+**Goal:** The differential old-vs-new check ("Stage smoke gates" layer 2):
+while the legacy axum REST and the new gated `/rpc` both serve the same data,
+read every overlapping resource through both paths and diff. This is the only
+test that catches a Rust core extraction or `convert.rs` copy silently
+defaulting a field — conformance (Task 18) can't see below the orchestrator.
+
+**Outcome:** `just smoke-parity` (dev stack up, one session existing) prints a
+per-probe ✓/✗ table and exits non-zero on any diff; the SSE probe confirms
+identical `idx` sequences + payloads for the first 20 events on both feeds.
+
+**Files:**
+- Create: `orchestrator/scripts/parity.ts`
+- Modify: `justfile` (`smoke-parity` recipe: `cd orchestrator && pnpm tsx scripts/parity.ts`)
+
+**Steps:**
+
+- [ ] **Step 1:** The probe table — one entry per overlapping read surface:
+
+```ts
+interface Probe {
+  name: string;
+  rest: string;                       // legacy: http://127.0.0.1:8090/api/v1/...
+  rpc: () => Promise<unknown>;        // new: via /rpc with an admin cookie
+  volatile?: string[];                // per-probe drop-list (ages, timestamps)
+}
+const PROBES: Probe[] = [
+  { name: 'sessions',      rest: '/sessions',        rpc: () => rpcList('SessionService/ListSessions'), volatile: ['age_s', 'updated_at'] },
+  { name: 'hosts',         rest: '/hosts',           rpc: () => rpcList('FleetService/ListHosts'),      volatile: ['last_heartbeat'] },
+  { name: 'storage',       rest: '/storage/summary', rpc: () => rpcList('FleetService/GetStorageSummary') },
+  { name: 'images',        rest: '/enabled-images',  rpc: () => rpcList('ImageService/ListEnabledImages') },
+  { name: 'registries',    rest: '/registries',      rpc: () => rpcList('ImageService/ListRegistries') },
+  { name: 'cow-state',     rest: `/sessions/${SID}/cow-state`,   rpc: () => …, volatile: ['…'] },
+  { name: 'checkpoints',   rest: `/sessions/${SID}/checkpoints`, rpc: () => … },
+];
+```
+
+- [ ] **Step 2:** Normalization before diffing: fold camelCase↔snake_case keys
+  to one convention, sort arrays by `id`/primary key, apply the volatile
+  drop-list, stringify-stable, diff. The legacy REST runs unauthenticated
+  (dev `AuthMode::None`); the `/rpc` side signs in as the bootstrap admin
+  (Task 16 recipe) and reuses the Task 22 sign-in helper once it exists.
+- [ ] **Step 3:** The SSE probe: open the coordinator's legacy
+  `/api/v1/sessions/:id/events` and the orchestrator's new SSE for the same
+  session, collect 20 events each from `since=-1`, compare `(idx, kind,
+  payload)` triples (the new feed wraps in the envelope — unwrap before
+  comparing).
+- [ ] **Step 4:** Run it; fix what it finds (expect converter-level findings —
+  that is its job). Append `smoke-parity` to the `smoke` umbrella.
+  **Mark with a `// SCAFFOLDING: delete in Task 28` header** — when the
+  legacy REST dies there is nothing left to compare against.
+- [ ] **Step 5:** Commit:
+
+```bash
+git add orchestrator/scripts justfile
+git commit -m "test(parity): differential old-vs-new smoke across the migration window"
+```
+
 ---
 
 # Phase 4 — Web migration
 
-> **Posture (read first):** every task in this phase is runnable in dev only
-> because the coordinator stays `AuthMode::None` + SyntheticAdmin until
-> Task 30. Mixed states (RPC data as the better-auth user, events/shell as
-> SyntheticAdmin) are expected mid-phase — see "Sequencing". **Deviation note:**
-> per plan amendments 3/4, events keep a hand-typed payload union
-> (`web/src/events.ts`) — the one surviving hand-mirror, pinned by Task 24's
-> fixture contract test rather than codegen.
+> **Posture (read first):** runnable in dev only — the coordinator keeps
+> `AuthMode::None` + SyntheticAdmin on its legacy axum routes until Task 32.
+> Mid-phase, RPC data flows as the better-auth user while events/shell still
+> ride the coordinator under SyntheticAdmin until Tasks 27/28 — expected.
+> **Deviation note:** events keep a hand-typed payload union
+> (`web/src/events.ts`), pinned by Task 27's fixture contract test rather
+> than codegen.
 
-### Task 22: better-auth client, login page, `/me` replacement, e2e entry
+### Task 22: better-auth client, login page, AuthProvider, e2e entry
 
-**Goal:** Auth front door moves to the orchestrator. `AuthProvider` keeps its
-**external interface** (`principal` with `role` / `is_admin` /
-`has_claude_token` / `display_name`, `refresh()`, the admin gate) but is
-internally recomposed: better-auth session = authentication; the new
-`UserService.GetMe` (via `/rpc` passthrough) = the role/token data `/me`
-provided. (`GET /me` itself dies in Task 31; a better-auth session alone
-carries no role — roles are authoritative in the control plane, ADR §6.)
+**Goal:** The auth front door moves to the orchestrator. `AuthProvider` keeps
+its external interface (`principal` with `is_admin` / `has_claude_token` /
+`display_name`, `refresh()`) but recomposes internally: **role comes straight
+off the better-auth session** (admin plugin — no control-plane call, unlike
+the pre-revision GetMe design) and `has_claude_token` from
+`GET /api/v1/me/claude-token`.
 
 **Sizing note:** two PRs — (a) login + proxy + e2e entry, (b) the
-AuthProvider/GetMe recomposition.
+AuthProvider recomposition.
 
-**Outcome:** `just e2e` passes, entering through better-auth (the one
-sanctioned entry-step change from the ADR Preparation section); admin nav still
-gates correctly; sign-out works.
+**Outcome:** `just e2e` passes entering through better-auth (the one
+sanctioned entry-step change); admin nav gates off the better-auth role;
+sign-out works. **Visual check:** snap `/login` (new page — intended diff:
+it didn't exist in baseline) and `/` post-login vs baseline: identical chrome,
+no auth-flash/spinner stuck states.
 
 **Files:**
-- Modify: `web/vite.config.ts` — add `/api/auth` and `/rpc` →
+- Modify: `web/vite.config.ts` — `/api/auth` + `/rpc` →
   `http://127.0.0.1:8787` **before** the existing `/api` rule (vite matches in
   insertion order — verified); `/api/v1` keeps targeting the coordinator until
-  Task 27.
+  Task 29.
 - Create: `web/src/pages/Login.tsx`, `web/src/lib/auth-client.ts`
-- Modify: `web/src/auth/AuthProvider.tsx` (recompose; also: `logout()`
-  currently POSTs the coordinator's `/auth/logout` and the 401 path
-  hard-navigates to `/api/v1/auth/login` — swap to `authClient.signOut()` and
-  an SPA `/login` redirect), `web/src/App.tsx` (route `/login`)
+- Modify: `web/src/auth/AuthProvider.tsx` (also: `logout()` POSTs the
+  coordinator's `/auth/logout` and the 401 path hard-navigates to
+  `/api/v1/auth/login` — swap to `authClient.signOut()` + an SPA `/login`
+  redirect), `web/src/App.tsx` (route `/login`)
 - Modify: `web/e2e/global-setup.ts`, `web/playwright.config.ts`
-- Modify: `Tiltfile` — add the e2e/dev user's email to the coordinator's
-  **bootstrap-admins env** (config.rs:156-160): JIT-upserted users default to
-  `member`, and nothing else ever makes the dev user an admin → Task 26's
-  admin pages and today's admin-visible e2e flows would silently break.
 
 **Steps:**
 
@@ -1933,22 +2107,21 @@ gates correctly; sign-out works.
 
 ```ts
 import { createAuthClient } from 'better-auth/react';
+import { adminClient } from 'better-auth/client/plugins';
 // Same-origin: the vite proxy (dev) / fronting LB (prod) routes /api/auth
 // to the orchestrator. Don't set a cross-origin baseURL — cookie scoping.
-export const authClient = createAuthClient();
+export const authClient = createAuthClient({ plugins: [adminClient()] });
 ```
 
-- [ ] **Step 2:** `Login.tsx` (email+password via `authClient.signIn.email`,
-  plus dev sign-up); unauthenticated users route here.
-- [ ] **Step 3:** Recompose `AuthProvider`: better-auth `useSession` for
-  authn; `GetMe` (generated connect-query hook through `/rpc`) for
-  role/token data; keep the exported `AuthState` shape so `UserChip`,
-  `ProfilePanel`, `TokensPanel` (`refresh()` after token save),
-  `NewSessionForm`, `Members`, `Sessions`, `RequireAdmin` don't churn.
-  **Decision to record in code comment:** public sign-up + JIT-upsert = open
-  registration; fine for dev, production needs sign-up disabled or an
-  allowlist before this deploys anywhere reachable (the old `NotMemberError`
-  screen's job).
+- [ ] **Step 2:** `Login.tsx` (email+password sign-in, dev sign-up);
+  unauthenticated users route here. **Production decision recorded here in a
+  comment:** public sign-up is dev-only; production disables it or gates on
+  an allowlist (replacing the old `NotMemberError` screen's job).
+- [ ] **Step 3:** Recompose `AuthProvider`: `authClient.useSession()` for
+  authn + role (`session.user.role === 'admin'` → `is_admin`); token presence
+  via the Task 20 route; keep the exported `AuthState` shape so `UserChip`,
+  `ProfilePanel`, `TokensPanel`, `NewSessionForm`, `Members`, `RequireAdmin`
+  don't churn.
 - [ ] **Step 4:** e2e entry via Playwright's request context (don't hand-roll
   set-cookie parsing):
 
@@ -1957,228 +2130,243 @@ import { request } from '@playwright/test';
 // in globalSetup, after the precondition gate:
 const ctx = await request.newContext({ baseURL: 'http://localhost:5173' });
 await ctx.post('/api/auth/sign-up/email', { data: { email: E2E_EMAIL, password: E2E_PW, name: 'e2e' } })
-  .catch(() => {});                                  // idempotent: exists already
+  .catch(() => {});                                  // idempotent
 const res = await ctx.post('/api/auth/sign-in/email', { data: { email: E2E_EMAIL, password: E2E_PW } });
-if (!res.ok()) throw new Error('better-auth sign-in failed — is the orchestrator up on :8787?');
+if (!res.ok()) throw new Error('better-auth sign-in failed — orchestrator up on :8787?');
 await ctx.storageState({ path: 'e2e/.auth-state.json' });
 ```
 
-  Reference it via `use.storageState` in `playwright.config.ts`; the journey
-  spec body is untouched.
-- [ ] **Step 5:** `just e2e` → PASS. Commit per PR boundary:
+  Reference via `use.storageState`; promote the e2e user with the Task 16
+  admin recipe (the journey exercises admin-visible surfaces today). Journey
+  spec body untouched.
+- [ ] **Step 5:** `just e2e` → PASS. **Visual check** per the Outcome. Commit
+  per PR boundary.
 
-```bash
-git add web/ Tiltfile
-git commit -m "feat(web): better-auth front door + GetMe-backed AuthProvider (ADR 0039 §5)"
-```
+### Task 23: The task list + CreateTask flow
 
-### Task 23: Sessions list/detail → connect-query
+**Goal:** The UI's primary noun becomes the task (ADR §3): the list page reads
+`TaskService.ListTasks`; the create flow calls `CreateTask(type:'chat')`.
+Chat-only, so rows look essentially like today's session rows — by design.
 
-**Goal:** Session hooks call the orchestrator's Connect surface. **The
-migration is NOT a mechanical one-liner per hook** — three things must be
-carried deliberately:
-1. **Query options:** today's hooks poll (`useSessions` 1s, detail 2s,
-   checkpoints 5s, cow-state 2s) with `placeholderData: (prev) => prev` —
-   dropping them freezes the status chip and fails the Phase 0 net. Pass each
-   hook's existing TanStack options through as connect-query's options arg,
-   verbatim.
-2. **Response unwrapping:** current hooks return `r.sessions` etc.; either
-   keep consumers on `data.sessions` or use `select` — pick one and apply
-   consistently.
-3. **Cache keys:** manual string keys die. The three cross-hook invalidation
-   edges (verified): `useDrainHost` → optimistic ops on `['hosts']`;
-   `useEnableJobs` ↔ `['enabled-images']`; `useEnableImage` →
-   `['enable-jobs']`. Rebuild them with `createConnectQueryKey` from the
-   method descriptors (Task 26 inherits this note).
-
-**Outcome:** Sessions + SessionDetail render identically; network tab shows
-`/rpc/engram.app.v1.SessionService/*`; `pnpm -C web test` + `just e2e` green.
+**Outcome:** The list renders tasks (chat tasks ≈ session rows; unattributed
+legacy sessions visible to the admin e2e user); create → navigates to
+`/sessions/<id>` exactly as today; `just e2e` green **unchanged** (testids
+survive the noun change). **Visual check:** snap `/` and the new-session form
+vs baseline — intended diffs: none visible for chat-only rows (title chip if
+`title` set); anything else (missing status chips, unstyled rows, empty
+list with sessions present) is a regression.
 
 **Files:**
-- Modify: `web/src/App.tsx` — `TransportProvider` wraps alongside the existing
-  `QueryClientProvider` (it lives here, not `main.tsx` — verified; connect-query
-  rides the same QueryClient)
-- Modify: `web/src/hooks/useSessions.ts`, `useCheckpoints.ts`, `useCowState.ts`,
-  `web/src/hooks/useSessionEvents.ts` consumers as needed
-- Modify: `web/src/components/NewSessionForm.tsx` (`createSession` call site),
-  `web/src/components/PromptComposer.tsx` (`sendPrompt`), the interrupt call
-  site in `SessionDetail.tsx` (there is **no** delete-session call in the web
-  today — don't invent one)
-- Modify: `web/src/test-utils.tsx` (add a `TransportProvider` backed by
+- Modify: `web/src/App.tsx` — `TransportProvider` with
+  `createConnectTransport({ baseUrl: '/rpc' })` wraps alongside the existing
+  `QueryClientProvider` (it lives in `App.tsx`, not `main.tsx` — verified)
+- Modify: `web/src/pages/Sessions.tsx`, `web/src/hooks/useSessions.ts` →
+  `useTasks` on `listTasks`; `web/src/components/SessionManifest.tsx` rows
+  take task objects (keep `data-testid="session-row"`)
+- Modify: `web/src/components/NewSessionForm.tsx` —
+  `useMutation(createTask)`; image options still via
+  `ImageService.ListEnabledImages` (member-level passthrough)
+- Modify: `web/src/test-utils.tsx` (TransportProvider backed by
   `createRouterTransport` fakes), `web/src/components/NewSessionForm.test.tsx`
   (it mocks `globalThis.fetch` on REST URLs today — replace fetch-spying with
   `createRouterTransport` service fakes)
 
 **Steps:**
 
-- [ ] **Step 1:** `pnpm -C web add @connectrpc/connect-web` (connect +
-  connect-query landed in Task 7). Wire `TransportProvider` with
-  `createConnectTransport({ baseUrl: '/rpc' })` in `App.tsx`.
-- [ ] **Step 2:** Migrate `useSessions` as the template (generated method
-  export from the `query-es` plugin):
+- [ ] **Step 1:** `pnpm -C web add @connectrpc/connect-web`. Wire
+  `TransportProvider`.
+- [ ] **Step 2:** `useTasks` — **carry each old hook's TanStack options
+  verbatim** (the old `useSessions` polls at 1s with
+  `placeholderData: (prev) => prev`; dropping them freezes the list and fails
+  the Phase 0 net):
 
 ```ts
 import { useQuery } from '@connectrpc/connect-query';
-import { listSessions } from '../gen/engram/app/v1/session-SessionService_connectquery';
+import { listTasks } from '../gen/engram/app/v1/task-TaskService_connectquery';
 
-export function useSessions(scope: 'mine' | 'all' = 'mine') {
-  return useQuery(listSessions, { scope }, {
-    refetchInterval: 1_000,                  // carried over from the old hook
+export function useTasks() {
+  return useQuery(listTasks, {}, {
+    refetchInterval: 1_000,                  // carried from useSessions
     placeholderData: (prev) => prev,
   });
 }
 ```
 
-  Generated TS is camelCase (`imageUri` not `image_uri`) — fix call sites as
-  the compiler surfaces them; that's the hand-mirror debt being paid, not
-  avoidable churn.
-- [ ] **Step 3:** Repeat for detail/checkpoints/cow-state; mutations via
-  `useMutation(createSession)` etc. in the component files listed above,
-  preserving each one's invalidation edges via `createConnectQueryKey`.
-- [ ] **Step 4:** Fix the test harness (`test-utils.tsx`,
-  `NewSessionForm.test.tsx`) with `createRouterTransport`. `pnpm -C web test`
-  green.
-- [ ] **Step 5:** `just e2e` green. Commit:
+  Generated TS is camelCase (`imageUri`) — fix call sites as the compiler
+  surfaces them; that's the hand-mirror debt being paid.
+- [ ] **Step 3:** Create flow → `useMutation(createTask)`; invalidate the
+  tasks query via `createConnectQueryKey` (manual string keys die with
+  `api.ts`).
+- [ ] **Step 4:** Fix the test harness (`createRouterTransport` fakes for
+  TaskService + ImageService). `pnpm -C web test` green.
+- [ ] **Step 5:** `just e2e` green. **Visual check** per the Outcome. Commit:
 
 ```bash
 git add web/
-git commit -m "feat(web): sessions list/detail on connect-query via the orchestrator"
+git commit -m "feat(web): task list + CreateTask flow — tasks are the primary noun (ADR 0039 §3)"
 ```
 
-### Task 24: Events → orchestrator SSE envelope
+### Task 24: Session detail data → connect-query
 
-**Goal:** `useSessionEvents` consumes the orchestrator's SSE leg: still
-`EventSource` (native reconnect — verified `sse.ts` has no custom retry loop),
-new envelope parse; payload union isolated in `web/src/events.ts` and pinned by
-a fixture contract test.
+**Goal:** SessionDetail's data hooks (`useSession`-equivalent via `GetSession`,
+`useCheckpoints`, `useCowState`) and the prompt/interrupt mutations move to
+the passthrough.
 
-**Outcome:** Event count/status/RAW behave identically; reconnect resumes from
-`Last-Event-ID` without gap. (Caveat for the manual check: while the
-orchestrator is *down*, the vite proxy answers 502 — EventSource treats HTTP
-errors as fatal and stops retrying; native retry covers network blips and
-stream drops, which is what production sees. The ADR's reconnect-with-cursor
-wrapper remains the recorded fallback if this bites.)
-
-**Files:**
-- Create: `web/src/events.ts` (move the `SessionEvent` union from
-  `web/src/types.ts:250` and `IndexedEvent` from `:384`, unchanged)
-- Modify: `web/src/sse.ts` (`subscribeSession`, `:21-98`) — same EventSource +
-  cursor logic, new frame parse
-- Modify: `web/src/hooks/useSessionEvents.ts` + consumers importing the union
-- Create: `web/src/events.contract.test.ts`
+**Outcome:** Detail renders identically; network tab shows
+`/rpc/engram.app.v1.SessionService/*`; `pnpm -C web test` + `just e2e` green.
+**Visual check:** snap `/sessions/<id>` (transcript + raw tabs) vs baseline —
+intended diffs: none.
 
 **Steps:**
 
-- [ ] **Step 1:** Move the union; mechanical import updates.
-- [ ] **Step 2:** Rework the frame parse in `subscribeSession`, keeping its
-  signature. The wire is Task 20's hand-built envelope —
-  `{ idx: number|null, kind: string, payload_json: string }` (snake_case,
-  numeric idx; deliberately NOT protobuf-JSON):
-  - parse the envelope, then `JSON.parse(payload_json)` typed as the
-    `events.ts` union;
-  - **preserve the `_rewound`/`_recovery_epoch` lifting** the current code
-    does (`sse.ts:36-44`) — the payload object carries them (plan
-    amendment 4) and transcript greying depends on it;
-  - `lagged` frames arrive as `kind: "lagged"` with `idx: null` and no SSE
-    `id:` — keep the existing `onLagged` hook behavior;
-  - cursor continues to come from `Last-Event-ID` semantics exactly as today.
-- [ ] **Step 3:** The contract test (`events.contract.test.ts`): a small set of
-  checked-in fixture lines captured from the live wire (one per major event
-  kind + one rewound event + one lagged frame), parsed through
-  `subscribeSession`'s parser and type-asserted against the `events.ts` union.
-  This is the pin replacing codegen for the surviving hand-mirror (Phase 4
-  deviation note).
-- [ ] **Step 4:** `pnpm -C web test` (Transcript fixtures updated to the
-  envelope where they faked the wire) + live reconnect check + `just e2e`.
-  Commit:
+- [ ] **Step 1:** Migrate hooks per the Task 23 pattern — carry polling
+  options (detail 2s, checkpoints 5s, cow-state 2s) and either keep consumers
+  on `data.session` etc. or use `select`; pick one convention and apply it
+  everywhere.
+- [ ] **Step 2:** Mutations: `sendPrompt` lives in
+  `web/src/components/PromptComposer.tsx`, interrupt in `SessionDetail.tsx`
+  (there is **no** delete-session call in the web today — don't invent one;
+  task deletion arrives with task UI later).
+- [ ] **Step 3:** Tests + `just e2e` + **Visual check**. Commit:
+
+```bash
+git add web/
+git commit -m "feat(web): session detail on connect-query via the gated passthrough"
+```
+
+### Task 25: Admin pages + ability-shared UI gating
+
+**Goal:** Fleet/Storage/Settings/Members on the new stack, with UI affordances
+driven by **the same ability file the server enforces** (ADR §6).
+
+**Outcome:** Admin user: all four pages render live data. Member user: admin
+nav hidden, member-visible pages render, no dead buttons. **Visual check:**
+snap `/fleet`, `/storage`, `/settings`, `/members` as admin vs baseline
+(intended diffs: none) AND as a member (intended diff: admin nav/sections
+absent — capture this as a new member-baseline for future tasks).
+
+**Files:**
+- Create: `web/src/lib/ability.ts` — re-export/copy of
+  `orchestrator/src/authz/ability.ts` (`pnpm -C web add @casl/ability`;
+  packages aren't workspace-linked — copy the file verbatim and add a
+  comment + a CI-able `diff` check in the contract test so drift is caught)
+- Modify: `web/src/hooks/useHosts.ts`, `useDrainHost.ts`,
+  `useStorageSummary.ts`, `useEnabledImages.ts`, `useEnableJobs.ts`,
+  `useRegistries.ts` → connect-query (carry options; rebuild the three
+  cross-hook invalidation edges — `useDrainHost`→`['hosts']`,
+  `useEnableJobs`↔`['enabled-images']`, `useEnableImage`→`['enable-jobs']` —
+  with `createConnectQueryKey`)
+- Modify: `web/src/pages/Fleet.tsx`, `Storage.tsx`, `Settings.tsx`,
+  `Members.tsx`, `web/src/auth/RequireAdmin.tsx`
+
+**Steps:**
+
+- [ ] **Step 1:** Hooks migration per the Task 23 pattern; GC buttons pass
+  `dryRun`; Fleet drain uses `DrainHost` (the soft one the page calls today).
+- [ ] **Step 2:** Members page → **better-auth admin client**
+  (`authClient.admin.listUsers/setRole/banUser`) — replaces the old
+  coordinator `/admin/users` surface; roles changed here are the same roles
+  the ability reads.
+- [ ] **Step 3:** Settings token form → the Task 20 `/api/v1/me/claude-token`
+  routes; verify nothing logs the request body.
+- [ ] **Step 4:** UI gating: `RequireAdmin` + nav + per-button affordances
+  read `abilityFor(user).can(...)` from `web/src/lib/ability.ts`.
+- [ ] **Step 5:** Tests; `just e2e`; **Visual check** per Outcome (both
+  roles). Commit:
+
+```bash
+git add web/
+git commit -m "feat(web): admin pages on the gated passthrough; ability-shared UI gating (ADR 0039 §6)"
+```
+
+### Task 26: Events → orchestrator SSE envelope
+
+**Goal:** `useSessionEvents` consumes the orchestrator's SSE leg: still
+`EventSource` (native reconnect — verified `sse.ts` has no custom retry loop),
+new envelope parse; payload union isolated in `web/src/events.ts` and pinned
+by a fixture contract test.
+
+**Outcome:** Event count/status/RAW identical; reconnect resumes from
+`Last-Event-ID` without gap. (Manual-check caveat: while the orchestrator is
+*down* the vite proxy answers 502, which EventSource treats as fatal — native
+retry covers network blips and stream drops, which is what production sees.)
+
+**Steps:**
+
+- [ ] **Step 1:** Move the `SessionEvent` union (`web/src/types.ts:250`) and
+  `IndexedEvent` (`:384`) to `web/src/events.ts`, unchanged; mechanical
+  import updates.
+- [ ] **Step 2:** Rework the frame parse in `subscribeSession`
+  (`web/src/sse.ts:21-98`), keeping its signature. The wire is Task 20's
+  hand-built envelope — `{ idx: number|null, kind, payload_json }`
+  (snake_case, numeric idx — deliberately NOT protobuf-JSON). Preserve the
+  **`_rewound`/`_recovery_epoch` lifting** the current code does
+  (`sse.ts:36-44`) — transcript greying depends on it. `lagged` arrives as
+  `kind:"lagged"` with no SSE `id:` — keep the `onLagged` behavior. Point the
+  EventSource path at the orchestrator-proxied route.
+- [ ] **Step 3:** `web/src/events.contract.test.ts`: checked-in fixture lines
+  captured from the live wire (one per major event kind + one rewound + one
+  lagged), parsed through `subscribeSession`'s parser, type-asserted against
+  the union. Also the ability-file drift check from Task 25 lives here.
+- [ ] **Step 4:** `pnpm -C web test` (Transcript fixtures updated where they
+  faked the wire) + live reconnect check + `just e2e`. Commit:
 
 ```bash
 git add web/
 git commit -m "feat(web): event feed via orchestrator SSE envelope; union pinned by contract test"
 ```
 
-### Task 25: Shell → orchestrator WS
+### Task 27: Shell → orchestrator WS
 
 **Goal:** `TerminalPane`'s WebSocket rides the orchestrator.
 
 **Outcome:** SHELL tab works end-to-end; e2e shell step green; the `tty`
-subprotocol is echoed (browser hard-fails otherwise — Task 21 Step 4 owns the
-server side; this task verifies it from the client).
+subprotocol is echoed. **Visual check:** snap the shell tab vs baseline —
+intended diffs: none (a blank/unstyled terminal pane = regression).
 
 **Steps:**
 
-- [ ] **Step 1:** Point the `/api/v1/sessions/:id/shell` proxy entry (`ws: true`)
-  at the orchestrator in `web/vite.config.ts`; `TerminalPane` itself shouldn't
-  change (same path).
-- [ ] **Step 2:** Manual: open shell, `echo hi`, check the response headers for
-  `Sec-WebSocket-Protocol: tty`, kill the tab, confirm lease release in
-  coordinator logs.
-- [ ] **Step 3:** `just e2e` green. Commit:
+- [ ] **Step 1:** Point the `/api/v1/sessions/:id/shell` proxy entry
+  (`ws: true`) at the orchestrator; `TerminalPane` itself shouldn't change
+  (same path).
+- [ ] **Step 2:** Manual: `echo hi`; check `Sec-WebSocket-Protocol: tty` in
+  the upgrade response; kill tab → lease release in coordinator logs.
+- [ ] **Step 3:** `just e2e` green; **Visual check**. Commit:
 
 ```bash
 git add web/
 git commit -m "feat(web): shell websocket via the orchestrator relay"
 ```
 
-### Task 26: Admin pages → connect-query
-
-**Goal:** Fleet/Storage/Settings/Members on generated clients through the
-passthrough, observing the Task 23 rules (options/unwrap/keys).
-
-**Outcome:** All four pages render with live data **as the bootstrap-admin dev
-user** (Task 22's Tilt env made the e2e user admin — without it this Outcome is
-untestable); a non-admin user sees member-scoped results (control plane
-re-checks, ADR §6).
-
-**Files:**
-- Modify: `web/src/hooks/useHosts.ts`, `useDrainHost.ts`, `useStorageSummary.ts`,
-  `useEnabledImages.ts`, `useEnableJobs.ts`, `useRegistries.ts`
-- Modify: `web/src/pages/Fleet.tsx`, `Storage.tsx`, `Settings.tsx`, `Members.tsx`
-
-**Steps:**
-
-- [ ] **Step 1:** Migrate hooks per the Task 23 template, carrying each one's
-  polling/optimistic-update behavior (the `useDrainHost` optimistic ops and
-  the two enable-images/jobs invalidation edges use `createConnectQueryKey`).
-  GC buttons pass `dryRun` on the single RPC. Fleet drain uses `DrainHost`
-  (the soft one — that's what the page calls today).
-- [ ] **Step 2:** Members: `ListUsers`/`PatchUser`. Settings token form:
-  `SaveClaudeToken` — verify orchestrator logging never dumps RPC payloads
-  (the token transits opaquely).
-- [ ] **Step 3:** `pnpm -C web test` + page-by-page manual check (admin and
-  non-admin) + `just e2e`. Commit:
-
-```bash
-git add web/
-git commit -m "feat(web): admin pages on generated clients via passthrough"
-```
-
-### Task 27: Delete the hand-mirrored layer + flip the proxy
+### Task 28: Delete the hand-mirrored layer + flip the proxy
 
 **Goal:** Remove `web/src/api.ts` and `web/src/types.ts`; flip `/api`
 wholesale to the orchestrator; fix the e2e precondition probe (it queries
-`/api/v1/enabled-images`, which the orchestrator doesn't serve — left as-is,
+`/api/v1/enabled-images`, which the orchestrator doesn't serve — left as-is
 the gate dies before any test runs).
 
-**Outcome:** No imports of `./api` or `./types` remain (`git grep -nE "from '\.\.?/(api|types)'" web/src` → empty); `pnpm -C web build` clean;
-`just e2e` green; the coordinator receives no browser traffic.
+**Outcome:** `git grep -nE "from '\.\.?/(api|types)'" web/src` → empty;
+`pnpm -C web build` clean; `just e2e` green; the coordinator receives no
+browser traffic. **Visual check:** full snap sweep (all baseline paths) —
+intended diffs: none beyond those already accepted in Tasks 22–27.
 
 **Steps:**
 
 - [ ] **Step 1:** Flip the vite proxy: `/api` + `/rpc` → `:8787` only.
-- [ ] **Step 2:** Sweep the long tail (verified list of `api.ts` dependents
-  beyond the hooks): `API_BASE` is imported by `sse.ts`, `TerminalPane.tsx`,
-  and `ArtifactCard.tsx` (artifact URLs now resolve against the orchestrator's
-  Task 20 byte route — same path, no logic change; give `API_BASE` a new home,
-  e.g. `web/src/lib/base.ts`); `logout()`/`redirectToLogin` died in Task 22;
-  pure-UI helper types from `types.ts` move next to their single consumer or
-  into `events.ts`.
-- [ ] **Step 3:** Re-point the e2e precondition: sign in first (Task 22's
+- [ ] **Step 2:** Sweep the long tail (verified dependents beyond hooks):
+  `API_BASE` is imported by `sse.ts`, `TerminalPane.tsx`, `ArtifactCard.tsx`
+  (artifact URLs resolve against the Task 20 byte route — same path; give
+  `API_BASE` a home in `web/src/lib/base.ts`); `logout()`/`redirectToLogin`
+  died in Task 22; pure-UI helper types move next to their single consumer or
+  into `events.ts`. **Run `just smoke-parity` one final time, then delete
+  `orchestrator/scripts/parity.ts` + the recipe** (Task 21b scaffolding — its
+  comparison target dies with the legacy REST).
+- [ ] **Step 3:** Re-point the e2e precondition: sign in first (the Task 22
   request-context), then probe
   `POST /rpc/engram.app.v1.ImageService/ListEnabledImages` with the captured
   cookie; keep the no-harness-image assertion.
-- [ ] **Step 4:** `pnpm -C web build && pnpm -C web test && just e2e` — all
-  green. Commit:
+- [ ] **Step 4:** `pnpm -C web build && pnpm -C web test && just e2e` green;
+  **Visual check** sweep. Commit:
 
 ```bash
 git add -A web/
@@ -2189,152 +2377,131 @@ git commit -m "feat(web)!: retire hand-mirrored api.ts/types.ts — generated co
 
 # Phase 5 — Cutover and shedding the coordinator's web identity
 
-> Order matters: scripts/CLI first (28), then the IAP door (29), **then** auth
-> collapse (30) and route removal (31) — never remove a door before its
+> Order: scripts/CLI first (29), then the IAP door (30), **then** auth+identity
+> collapse (31) and route removal (32) — never remove a door before its
 > replacement exists.
 
-### Task 28: Port scripts, CLI, and CI off the cookie/synthetic auth
+### Task 29: Port scripts, CLI, and CI off the cookie/synthetic auth
 
-**Goal:** Everything non-browser that consumes the web API today keeps working
-when SyntheticAdmin and the web routes go. **Inventory (verified):**
-`engram-cli` is a full REST client of the web surface (sessions, hosts, drain,
-registries, admin flush — `crates/engram-cli/src/main.rs:514-1236`);
-`deploy/dev/tilt-up-ci.sh:60-65` polls admin-gated `GET /api/v1/hosts`; the CI
-e2e lane seeds GHCR creds via `engram-cli registry add`;
-`integration-session.sh`/`integration-test.sh`/`integration-bake-demo.sh` curl
-the API unauthenticated.
+**Goal:** Everything non-browser that consumes the web API keeps working when
+SyntheticAdmin and the web routes go. **Inventory (verified):** `engram-cli`
+is a full REST client (sessions, hosts, drain, registries, admin flush —
+`crates/engram-cli/src/main.rs:514-1236`); `deploy/dev/tilt-up-ci.sh:60-65`
+polls `GET /api/v1/hosts`; the CI e2e lane seeds GHCR creds via
+`engram-cli registry add`; the `integration-*.sh` scripts curl unauthenticated.
 
-**Outcome:** `just integration-session`, `integration-test.sh`, and the CI lane
-all pass with the coordinator's gRPC surface (or an explicit bearer), no
-synthetic admin involved.
+**Outcome:** `just integration-session`, `integration-test.sh`, and the CI
+lane pass against the app-gRPC surface with the Task 9 bearer; sessions they
+create render as *unattributed* (admin-only) in the task UI — expected.
 
 **Steps:**
 
-- [ ] **Step 1:** Decide the mechanism per consumer and write it down in the
-  task PR: the clean target is the app-gRPC surface with a long-lived
-  **service-bearer** (`ServiceBearer` already exists for host-agents); a
-  retained, bearer-authed REST sliver is the fallback for `curl`-heavy
-  scripts.
-- [ ] **Step 2:** Port `engram-cli`'s commands to tonic clients
-  (`engram-protocol` is already a dependency of the workspace) or to bearer
-  REST — whichever Step 1 chose. Port the scripts.
-- [ ] **Step 3:** **The bearer blast radius (do atomically):** today
-  `ENGRAM_AUTH_TOKENS` is empty in dev/CI and `require_bearer` passes
-  everything (`api/auth.rs:37-39,77` `accepts_anything`). The moment tokens
-  become non-empty, the *internal host-ingest router* starts enforcing — so
-  setting a token means simultaneously: coordinator env, **both** Tilt
-  host-agent resources' env, `ENGRAM_TOKEN` in all four `deploy/dev` scripts,
-  the CI lane, and prod deploy values. Checklist them in the PR; partial
-  rollout bricks host registration.
-- [ ] **Step 4:** Run all three integration scripts + the CI lane. Commit:
+- [ ] **Step 1:** Port `engram-cli`'s commands to tonic clients
+  (`engram-protocol` is already a workspace dependency) using
+  `APP_GRPC_TOKENS`/`ENGRAM_APP_TOKEN` env; port the scripts' curls to
+  `engram-cli` invocations (one auth mechanism, not two).
+- [ ] **Step 2:** **Do not touch `ENGRAM_AUTH_TOKENS`** (the host-ingest
+  bearer, `api/auth.rs` — verified: dev/CI run it empty and
+  `accepts_anything()` passes hosts through; flipping it non-empty bricks
+  host registration unless coordinator + both Tilt host-agent resources +
+  all four deploy/dev scripts + CI + prod values change atomically). The app
+  surface's token (Task 9) is already separate — this task needs only it.
+- [ ] **Step 3:** Run all three integration scripts + the CI lane. Commit:
 
 ```bash
 git add crates/engram-cli deploy/ .github/
-git commit -m "feat(cli,ci): port scripts and engram-cli off synthetic/cookie auth (ADR 0039 prep for cutover)"
+git commit -m "feat(cli,ci): port scripts and engram-cli to app-gRPC + bearer (ADR 0039 cutover prep)"
 ```
 
-### Task 29: IAP bridge middleware (before the doors close)
+### Task 30: IAP bridge middleware (before the doors close)
 
 **Goal:** Behind GCP IAP, a verified `X-Goog-IAP-JWT-Assertion` creates a
-better-auth session (ADR §5's second path). Sequenced **before** Task 30 so an
-IAP production deploy always has a working door.
+better-auth session (ADR §5). Sequenced **before** Task 31 so an IAP
+production deploy always has a working door.
 
-**Outcome:** Unit tests: valid ES256 IAP JWT (test-key-signed; the real JWKS is
-ES256 at `https://www.gstatic.com/iap/verify/public_key-jwk`,
-`iss=https://cloud.google.com/iap` — matches the preset in
-`engram-auth/src/config.rs:63-68`) → better-auth session for that email;
-invalid → 401; middleware inert when `IAP_AUDIENCE` unset. **Plus a local
-smoke:** sign with a test ES256 key, point `IAP_JWKS_URL` at a local fixture
-server, drive a request end-to-end.
-
-**Files:**
-- Create: `orchestrator/src/auth/iap.ts`
-- Modify: `src/config.ts` (`IAP_AUDIENCE`, `IAP_JWKS_URL`), `src/index.ts`,
-  `src/server.ts`
+**Outcome:** Unit tests: valid ES256 IAP JWT (the real JWKS is ES256 at
+`https://www.gstatic.com/iap/verify/public_key-jwk`,
+`iss=https://cloud.google.com/iap`) → better-auth session for that email;
+invalid → 401; inert when `IAP_AUDIENCE` unset. Plus a local smoke: sign with
+a test ES256 key, point `IAP_JWKS_URL` at a local fixture server, drive a
+request end-to-end.
 
 **Steps:**
 
 - [ ] **Step 1 (placement — the subtle part):** the bridge must cover **every
   entry path**, and `server.ts` routes `/rpc/*` around Hono — Hono-only
-  middleware never runs for RPCs, so an IAP browser whose only traffic is
-  Connect calls would 401 forever. Hoist the bridge to the raw-server level
-  (a wrapper around both handlers in `buildServer`) or make
-  `tokenSupplierFromRequest` IAP-aware. Pick the wrapper: one place, both
-  stacks.
+  middleware never runs for RPCs. Hoist the bridge to the raw-server level (a
+  wrapper around both handlers in `buildServer`): one place, both stacks.
 - [ ] **Step 2 (spike, timeboxed):** better-auth has no public "create a
   session for an arbitrary verified user" one-liner — pin the mechanism
-  (server-side `auth.api` calls / internal adapter session-create) against the
-  installed version before writing the middleware, and record it in the file's
-  doc comment. Semantics: create the better-auth session once on first
-  IAP-verified request (JIT user create), set the cookie on the response;
-  subsequent requests ride the cookie and skip verification.
+  (server-side `auth.api` / internal adapter session-create) against the
+  installed version before writing the middleware; record it in the file's
+  doc comment. Semantics: create the session once on first verified request
+  (JIT user create, default role `user`), set the cookie; subsequent requests
+  ride the cookie.
 - [ ] **Step 3:** Implement with `jose` (`createRemoteJWKSet` + `jwtVerify`,
-  check `iss` + audience), mirroring `forward.rs`'s claim handling. Tests +
-  the local ES256 smoke. Commit:
+  check `iss` + audience). Tests + the ES256 fixture smoke. Commit:
 
 ```bash
 git add orchestrator/
 git commit -m "feat(orchestrator): IAP trusted-SSO bridge into better-auth sessions (ADR 0039 §5)"
 ```
 
-### Task 30: Coordinator auth collapse — forward-auth + service-bearer only
+### Task 31: Coordinator sheds human auth AND identity
 
-**Goal:** Remove the human cookie/OIDC/synthetic machinery (ADR §5: three modes
-collapse to one). **File map (verified — an earlier draft of this task named
-the wrong files):** what goes is `CookieSession`
+**Goal:** Remove the human cookie/OIDC/synthetic machinery and the identity
+data (ADR §5/§6/§10). **File map (verified):** what goes is `CookieSession`
 (`crates/engram-auth/src/cookie.rs`), `SyntheticAdmin` (`synthetic.rs`), the
 OIDC endpoints `principal::login/callback` (api/mod.rs:209-210) +
-`principal::logout` (`:96`), the `WebSessionStore` plumbing, and the
-`AuthMode::Oidc`/`None` arms in `build_chain` (config.rs:122-158). **Do NOT
-touch** `api/auth.rs` (that's `require_bearer` — the deployment-bearer
-middleware for the internal host-ingest router) or `api/session_auth.rs`
-(the ADR 0023/0026 per-session broker-token check for in-guest forge/upload) —
-both are load-bearing for non-web traffic.
+`principal::logout` (`:96`), the `WebSessionStore` plumbing, the
+`AuthMode::Oidc`/`None` arms in `build_chain` (config.rs:122-158),
+`require_admin`/`require_session_owner` (principal.rs:160/:177), and —
+**migrations** — the `users` table and `sessions.user_id` (nullable since
+Task 10). **Do NOT touch** `api/auth.rs` (host-ingest bearer) or
+`api/session_auth.rs` (ADR 0023/0026 per-session broker tokens for in-guest
+forge/upload) — both are load-bearing for non-web traffic.
 
-**Outcome:** The coordinator's human-auth surface is exactly: forward-auth
-(orchestrator JWKS) on gRPC + remaining web-era routes; `ServiceBearer` for
-hosts; broker tokens for in-guest seams. `just dev` + `just e2e` +
+**Outcome:** The coordinator's auth surface is exactly: app-gRPC bearer
+(Task 9), host-ingest bearer, broker tokens. `just dev` + `just e2e` +
 `just integration-session` green with the orchestrator as the only human door.
 
 **Steps:**
 
-- [ ] **Step 1:** Inventory: `git grep -n "SyntheticAdmin\|CookieSession\|AuthMode::" crates/ deploy/`
-  — every dependent must be already ported (Task 28) or part of this change.
-  (Note: host ingest never rode `AuthMode` — it's `require_bearer`, a separate
-  mechanism; `AuthMode::None` existed solely to inject SyntheticAdmin into the
-  human chain.)
-- [ ] **Step 2:** Remove the modes + files; fix compilation; update tests.
-- [ ] **Step 3:** Tilt env flips to forward-auth (the JWKS env vars landed in
-  Task 9). Fresh `just dev`; full gate sweep (Outcome). Commit:
+- [ ] **Step 1:** Inventory first:
+  `git grep -n "SyntheticAdmin\|CookieSession\|AuthMode::\|require_admin\|require_session_owner\|user_id" crates/ deploy/`
+  — every dependent must be already ported (Tasks 24–29) or part of this
+  change. The legacy per-user Claude-token lookup in `create_session_inner`
+  dies here too (the `harness_secret_id` path from Task 13 is the only one
+  left).
+- [ ] **Step 2:** Remove code + ship the drop migrations; fix compilation;
+  update tests.
+- [ ] **Step 3:** Fresh `just dev`; full gate sweep (Outcome). Commit:
 
 ```bash
-git add crates/ Tiltfile deploy/
-git commit -m "feat(coordinator)!: collapse human auth to forward-auth — cookies/OIDC/synthetic-admin leave (ADR 0039 §5)"
+git add crates/ deploy/ Tiltfile
+git commit -m "feat(coordinator)!: shed human auth and identity — users table and owner-scoping leave Rust (ADR 0039 §5/§6)"
 ```
 
-### Task 31: Remove the coordinator's legacy web routes
+### Task 32: Remove the coordinator's legacy web routes
 
-**Goal:** Delete the web-facing `/api/v1` axum routes. **Retain (verified
-inventory — the ADR's list of six ingest routes is incomplete):** all
-**eight** internal ingest routes incl. `/hosts/forge` and `/hosts/upload`
-(api/mod.rs:183-184); the broker-token forge seam
-`/sessions/:id/git-credential` + `/sessions/:id/pull-request` (api/mod.rs:216-221
-— in-guest, NOT web routes despite the path shape); `/healthz` + `/readyz`;
-anything Task 28 chose to keep as a bearer-authed REST sliver. Decide
-explicitly for the operator-only endpoints with no RPC
-(`/admin/chunk-gc/candidates`, `/admin/reap-materialize-dir`): keep behind
-bearer or delete with a note.
+**Goal:** Delete the web-facing `/api/v1` axum routes. **Retain (verified —
+the naive list is incomplete):** all **eight** internal ingest routes incl.
+`/hosts/forge` and `/hosts/upload` (api/mod.rs:183-184); the broker-token
+forge seam `/sessions/:id/git-credential` + `/sessions/:id/pull-request`
+(api/mod.rs:216-221 — in-guest, NOT web routes despite the path shape);
+`/healthz` + `/readyz`. Decide explicitly for the operator endpoints with no
+RPC (`/admin/chunk-gc/candidates`, `/admin/reap-materialize-dir`): keep
+behind the host bearer or delete with a note.
 
-**Outcome:** The route table is host-ingest + broker-seam + health (+ the
-documented sliver); the handler *bodies* survive as `*_core` functions serving
-gRPC; `just check` + `just e2e` + `just integration-session` + the CI lane
-green.
+**Outcome:** Route table = host-ingest + broker-seam + health; handler bodies
+survive as the `*_core` functions serving gRPC; `just check` + `just e2e` +
+`just integration-session` + the CI lane green.
 
 **Steps:**
 
-- [ ] **Step 1:** Route-by-route deletion in `api/mod.rs:33-241` per the retain
-  list; delete now-unreferenced axum shims (cores stay).
-- [ ] **Step 2:** Clippy's dead-code flags: remove, don't `allow`.
+- [ ] **Step 1:** Route-by-route deletion in `api/mod.rs:33-241` per the
+  retain list; delete now-unreferenced axum shims (cores stay).
+- [ ] **Step 2:** Clippy dead-code flags: remove, don't `allow`.
 - [ ] **Step 3:** Full gates (Outcome). Commit:
 
 ```bash
@@ -2344,23 +2511,34 @@ git commit -m "feat(coordinator)!: shed the web-server identity — app surface 
 
 ---
 
-## Final validation gate (after Task 31)
+## Final validation gate (after Task 32)
 
 - [ ] `just check` — Rust gates green.
+- [ ] `just smoke` — the umbrella: `smoke-control-plane` +
+  `smoke-orchestrator` (parity is gone by design — deleted in Task 28).
 - [ ] `pnpm -C web build && pnpm -C web test`; `pnpm -C orchestrator test && pnpm -C orchestrator typecheck`.
-- [ ] `just e2e` — **the Phase 0 characterization net, with its two sanctioned
-  setup edits (better-auth entry, Task 22; precondition probe via `/rpc`,
-  Task 27) and otherwise byte-for-byte the same assertions, green across three
-  tiers.** This is the ADR's definition of done.
+- [ ] `just e2e` — **the Phase 0 net, with its two sanctioned setup edits
+  (better-auth entry, Task 22; precondition probe via `/rpc`, Task 28) and
+  otherwise byte-for-byte the same assertions, green across three tiers.**
+  This is the ADR's definition of done.
+- [ ] **Visual sweep:** `just snap` over every baseline path as admin AND as a
+  member; read all PNGs against `baseline/` (+ the member-baseline from
+  Task 25). Accepted diffs: login page exists; Members page is the
+  better-auth admin UI; everything else pixel-equivalent in structure.
 - [ ] `just integration-session` + `deploy/dev/integration-test.sh` + the CI
-  e2e lane — green post-Task-28 auth.
-- [ ] Negative checks: unauthenticated `POST /rpc/...ListSessions` → 401; a
-  deleted web route on the coordinator → 404; a member JWT vs an admin JWT
-  through the passthrough behave per the Task 14 gating map.
-- [ ] IAP: the Task 29 local ES256 fixture smoke passes (staging verification
-  is a deploy-checklist item, not a repo gate).
+  e2e lane — green post-Task-29 auth.
+- [ ] **AuthZ negative checks (the boundary moved — test it like it's new):**
+  unauthenticated `/rpc` → 401; member `GetSession` on another's session →
+  404 (not 403 — anti-enumeration); member `ListHosts` → 403; a method
+  missing from the policy map → denied; raw `grpcurl`-style call to the
+  control plane without the bearer → `unauthenticated`; with the bearer →
+  succeeds (documents that the control plane trusts the credential, per
+  ADR §6's caveat).
+- [ ] IAP: the Task 30 ES256 fixture smoke passes (staging verification is a
+  deploy-checklist item).
 - [ ] `buf breaking --against '.git#branch=main'` clean locally;
   `buf generate && git diff --exit-code -- web/src/gen orchestrator/src/gen`
   clean.
-- [ ] Walk ADR 0039 §2.3's tables + this plan's amendments: every RPC exists
-  and is reachable through the passthrough (15 min, by hand, dev stack).
+- [ ] Walk the revised ADR §2.3 tables + §3: every RPC exists and is reachable
+  (passthrough or native); the task→session join is the only place ownership
+  lives (15 min, by hand, dev stack).
