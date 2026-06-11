@@ -4250,15 +4250,12 @@ impl SandboxBackend for PooledBackend {
         if !self.migrations.validate(id, export_id) {
             return Err(SandboxError::NotFound);
         }
-        // ADR 0045 C2 split-brain guard: once state.bin shipped off a
-        // post-copy export the dest may be RUNNING this state — an
-        // abort-unpause would fork it. Refuse; the TTL sweep's
-        // StayPaused/Destroy arms own the endgame.
-        if self.migrations.state_served(id) {
-            return Err(SandboxError::InvalidSpec(
-                "post-copy abort refused: state already served (split-brain guard)".into(),
-            ));
-        }
+        // ADR 0045 C2 split-brain note: an EXPLICIT abort carries the
+        // coordinator's knowledge that the dest provably never loaded
+        // the shipped state (the postcopy-never-loaded marker), so it
+        // is allowed even after StateBin was fetched. The forbidden
+        // arm is the dumb-host TTL's self-resume — gated by
+        // `ttl_verdict`'s state_served input, never reaching this RPC.
         let export = self.migrations.remove(id).expect("validated above");
         if let Some(peer) = self.migrate_peer_server() {
             peer.remove(export_id);

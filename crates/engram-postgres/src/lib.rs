@@ -818,6 +818,33 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    async fn rebind_session(
+        &self,
+        id: SessionId,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+    ) -> Result<(), MetaError> {
+        // ADR 0045 C2: ONE UPDATE — the ownership oracle
+        // (`session.sandbox_id == sandbox`) flips atomically with the
+        // host rebind (the post-copy `Committing` persist).
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions SET host_id = $2, sandbox_id = $3, updated_at = NOW() WHERE id = $1
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(host_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn assign_session_host(
         &self,
         id: SessionId,

@@ -272,6 +272,23 @@ pub trait MetadataStore: Send + Sync {
         sandbox_id: Option<SandboxId>,
     ) -> Result<(), MetaError>;
 
+    /// ADR 0045 C2: the `Committing` persist — rebind a session's host
+    /// AND sandbox in one step. The ownership oracle
+    /// (`sandbox_ownership`: `session.sandbox_id == sandbox`) must flip
+    /// atomically with the rebind, which is the entire semantic content
+    /// of post-copy ownership transfer. The default is the sequential
+    /// two-step (mock/test stores); the Postgres store overrides with a
+    /// single UPDATE.
+    async fn rebind_session(
+        &self,
+        id: SessionId,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+    ) -> Result<(), MetaError> {
+        self.assign_session_host(id, Some(host_id)).await?;
+        self.assign_session_sandbox(id, Some(sandbox_id)).await
+    }
+
     /// ADR 0015 M3: PG-authoritative lookup for "which host owns this
     /// sandbox right now, and what state is its session in?"
     /// `HostRegistry` calls this on cache miss (or after the per-host

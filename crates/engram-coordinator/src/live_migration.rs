@@ -1,21 +1,34 @@
-//! ADR 0045 C1: the live-teleport coordinator verb.
+//! ADR 0045 C2: the POST-COPY live-teleport coordinator verb (the
+//! clean-break replacement of C1's stop-and-copy; snapshot-rehome is
+//! the only fallback).
 //!
-//! `migrate_session_live` drives the eager dirty-set push synchronously
-//! under the session lease: freeze the source (`migration_capture`, no
-//! GCS on the pause path) → mark `Evacuating` (the crash parachute: if
-//! this coordinator dies anywhere past here, the lease expires and the
-//! existing evac scanner snapshot-rehomes from the last DURABLE
-//! checkpoint row — rung-1 semantics with zero new recovery code) →
-//! restore on the pinned destination (the dest pulls the export
-//! host-to-host) → rebind → harness rebuild → commit the source → spawn
-//! the durability catch-up finalize (row-only-at-finalize via the
-//! dest's `snapshot_wait`).
+//! `migrate_session_live` under the session lease + the R8 host gate:
+//! `migration_presetup` on the source (pre-pause: export identity +
+//! the dest's restore package) → SPAWN the dest restore as a task (it
+//! pre-stages netns/FC/handler concurrently with everything below; its
+//! handler parks at the source's page server until the SEAL, and its
+//! FC load gates on `state.bin` landing) → mark `Evacuating` (the
+//! crash parachute) → `migration_capture_postcopy` (THE BLACKOUT:
+//! pause → NBD drain → fork-v3 vmstate-only → pagemap seal) → await
+//! the restore task → the `Committing` persist (one atomic
+//! `rebind_session` UPDATE — the ownership oracle flips with it) →
+//! emit `evacuating → active` (post-blackout; the prompt-hold keeps
+//! "messages deliver" honest through the harness rebuild) → finalize
+//! task: `migration_drain_wait` (the dest pulls every sealed chunk) →
+//! commit (destroy) the source → a FULL checkpoint on the dest (the
+//! dest seeds NO chain, so its first checkpoint is a safe Full — that
+//! IS the memory durability catch-up) → row-only-at-finalize.
 //!
-//! Failure arms: anything before the dest restore lands ⇒
-//! `migration_abort` un-pauses the source in place (zero loss) and the
-//! session returns to `Active`. A pre-C1 source/dest surfaces
-//! `InvalidSpec` from capture ⇒ [`MigrateError::Unsupported`] and the
-//! caller falls back to the snapshot-rehome teleport.
+//! Failure arms: presetup/dest-prep failures before the pause ⇒
+//! `Unsupported`/`Fatal`, session untouched (snapshot-rehome fallback).
+//! Capture failure ⇒ best-effort resume-in-place + walk back to Active
+//! (zero loss). Dest restore failing with the `postcopy-never-loaded`
+//! marker (its FC load gate timed out — the dest PROVABLY never ran
+//! the shipped state) ⇒ `migration_abort` un-pauses the source (zero
+//! loss); any other/ambiguous restore failure ⇒ parachute (scanner
+//! rehome from the durable row, or kill when none exists). PeerLost
+//! mid-drain ⇒ the finalize destroys the poisoned dest and re-arms
+//! `Evacuating` (rung-1 rewind).
 
 use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_core::types::SessionState;
@@ -57,6 +70,50 @@ pub fn live_teleport_enabled() -> bool {
     std::env::var("ENGRAM_LIVE_TELEPORT")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// ADR 0045 C2 (R8): at most ONE in-flight migration per host endpoint
+/// — a consolidation wave would otherwise double P2P+GCS pressure on a
+/// single source/dest. Process-local (coordinator pods are effectively
+/// singular today; the session lease already serializes per-session).
+static MIGRATION_GATE: std::sync::LazyLock<dashmap::DashMap<HostId, SessionId>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Both-endpoint claim; `Drop` releases both. Holds source AND dest for
+/// the whole move INCLUDING the finalize drain (the guard rides into
+/// the finalize task).
+struct MigrationGateGuard {
+    hosts: Vec<HostId>,
+}
+
+impl MigrationGateGuard {
+    fn claim(source: Option<HostId>, dest: HostId, session: SessionId) -> Option<Self> {
+        let mut claimed = Vec::new();
+        for host in source.into_iter().chain([dest]) {
+            match MIGRATION_GATE.entry(host) {
+                dashmap::mapref::entry::Entry::Vacant(v) => {
+                    v.insert(session);
+                    claimed.push(host);
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    // Roll back partial claims.
+                    for h in claimed {
+                        MIGRATION_GATE.remove(&h);
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(Self { hosts: claimed })
+    }
+}
+
+impl Drop for MigrationGateGuard {
+    fn drop(&mut self) {
+        for h in &self.hosts {
+            MIGRATION_GATE.remove(h);
+        }
+    }
 }
 
 pub async fn migrate_session_live(
@@ -153,58 +210,50 @@ pub async fn migrate_session_live(
         Err(e) => return Err(MigrateError::Fatal(format!("resolve source host: {e}"))),
     };
 
-    // ---- 1. Freeze the source (downtime clock starts) ----
-    let t_capture = std::time::Instant::now();
-    let capture = match source_backend.migration_capture(sandbox_id).await {
-        Ok(c) => c,
+    // ---- R8 gate: one in-flight migration per host endpoint ----
+    let Some(gate_guard) = MigrationGateGuard::claim(session.host_id, target_host_id, session_id)
+    else {
+        return Err(MigrateError::Fatal(
+            "another migration is in flight on the source or destination host (R8)".into(),
+        ));
+    };
+
+    // ---- 1. Presetup on the source (NO pause — the guest runs) ----
+    let t_presetup = std::time::Instant::now();
+    let presetup = match source_backend.migration_presetup(sandbox_id).await {
+        Ok(p) => p,
         Err(SandboxError::InvalidSpec(reason)) => {
             return Err(MigrateError::Unsupported(reason));
         }
-        Err(e) => return Err(MigrateError::Fatal(format!("migration capture: {e}"))),
+        Err(e) => return Err(MigrateError::Fatal(format!("migration presetup: {e}"))),
     };
-    let capture_ms = t_capture.elapsed().as_millis();
+    let presetup_ms = t_presetup.elapsed().as_millis();
 
-    // ---- 2. Arm the parachute ----
-    // From here until the dest rebind, a coordinator death leaves the
-    // session Evacuating: lease expiry → scanner snapshot-rehome from
-    // `durable_row` (the capture's v+1 is never visible to it — it was
-    // deliberately not published). The frozen source self-cleans via
-    // the export TTL.
-    if let Err(e) = state
-        .services
-        .meta
-        .transition_session(session_id, SessionState::Evacuating)
-        .await
-    {
-        let _ = source_backend
-            .migration_abort(sandbox_id, &capture.export_id)
-            .await;
-        return Err(MigrateError::AbortedToSource(format!("transition: {e}")));
-    }
-    state.teleport_targets.insert(session_id, target_host_id);
-    // Observer-facing truth: the session leaves `active` NOW (the
-    // guest is frozen). The matching `evacuating -> active` is emitted
-    // only after the harness rebuild on the dest — `active` again
-    // means "messages actually flow" (the intermediate Created hop is
-    // suppressed in finish_resume_to_active for this path).
-    let _ = state
-        .emit(
-            session_id,
-            SessionEvent::StatusChanged {
-                from: SessionState::Active,
-                to: SessionState::Evacuating,
-                at: chrono::Utc::now(),
-            },
-        )
-        .await;
+    // The page-server address: the source's advertised gRPC host with
+    // the presetup's peer port (default 9102).
+    let peer_addr = {
+        let hostpart = source_addr
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+        let host = hostpart
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(hostpart);
+        format!("{host}:{}", presetup.peer_port)
+    };
 
-    // ---- 3. Restore on the destination (pull + UFFD bring-up) ----
-    let t_restore = std::time::Instant::now();
+    // ---- 2. Spawn the destination restore (pre-stage) ----
+    // Runs CONCURRENTLY with the blackout below: netns + FC spawn +
+    // handler bring-up happen while the guest still runs; the handler
+    // parks at the page server for the SEAL and the FC load gates on
+    // `state.bin` (landed by the dest's fetch poller once the capture
+    // opens the export). No artifacts exist yet by design.
     let base_memory_manifest =
         crate::api::snapshot::base_memory_manifest_for_image(state, &session.image).await;
-    let has_disk = !capture.disk_manifest_json.is_empty();
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
-        id: capture.snapshot_id,
+        // The restore stages under a FRESH id (post-copy mints no
+        // capture-time snapshot id the dest could collide on).
+        id: engram_core::types::SnapshotId::new(),
         size_bytes: durable_row.as_ref().map(|r| r.size_bytes).unwrap_or(0),
         created_at: chrono::Utc::now(),
         image_version: durable_row
@@ -221,22 +270,24 @@ pub async fn migrate_session_live(
             }),
         base_memory_manifest,
         migration_source: Some(MigrationSourceInfo {
-            export_id: capture.export_id.clone(),
-            source_addr,
-            memory_manifest_json: capture.memory_manifest_json,
-            disk_manifest_json: capture.disk_manifest_json,
-            memory_manifest_ref: capture.memory_manifest_ref,
-            disk_manifest_ref: capture.disk_manifest_ref,
-            new_memory_chunk_hashes: capture.new_memory_chunk_hashes,
-            new_disk_chunk_hashes: capture.new_disk_chunk_hashes,
-            hot_chunks: capture.hot_chunks,
-            post_copy: false,
-            peer_addr: None,
-            peer_token: None,
-            sidecar_json: Vec::new(),
+            export_id: presetup.export_id.clone(),
+            source_addr: source_addr.clone(),
+            memory_manifest_json: presetup.memory_manifest_json.clone(),
+            disk_manifest_json: Vec::new(),
+            memory_manifest_ref: presetup.memory_manifest_ref,
+            disk_manifest_ref: presetup
+                .disk_manifest_ref
+                .unwrap_or_else(engram_core::types::manifest::ManifestRef::new),
+            new_memory_chunk_hashes: Vec::new(),
+            new_disk_chunk_hashes: Vec::new(),
+            hot_chunks: presetup.hot_chunks.clone(),
+            post_copy: true,
+            peer_addr: Some(peer_addr),
+            peer_token: Some(presetup.peer_token.clone()),
+            sidecar_json: presetup.sidecar_json.clone(),
         }),
-        disk_manifest: has_disk.then_some(capture.disk_manifest_ref),
-        memory_manifest: Some(capture.memory_manifest_ref),
+        disk_manifest: presetup.disk_manifest_ref,
+        memory_manifest: Some(presetup.memory_manifest_ref),
         source_sandbox_id: None,
         state_blob_key: None,
         sidecar_blob_key: None,
@@ -248,19 +299,88 @@ pub async fn migrate_session_live(
             .or_else(|| base_row.as_ref().map(|r| r.aux_bundles.clone()))
             .unwrap_or_default(),
     };
-    let new_sandbox_id = match dest_backend.restore(metadata).await {
-        Ok(id) => id,
+    let restore_task = {
+        let dest = dest_backend.clone();
+        tokio::spawn(async move { dest.restore(metadata).await })
+    };
+
+    // ---- 3. Arm the parachute ----
+    // From here until the rebind, a coordinator death leaves the
+    // session Evacuating: lease expiry → scanner snapshot-rehome from
+    // `durable_row`. The frozen source self-cleans via the export TTL
+    // (whose yes⇒un-pause arm is FORBIDDEN once state.bin shipped).
+    if let Err(e) = state
+        .services
+        .meta
+        .transition_session(session_id, SessionState::Evacuating)
+        .await
+    {
+        restore_task.abort();
+        return Err(MigrateError::Fatal(format!("transition: {e}")));
+    }
+    state.teleport_targets.insert(session_id, target_host_id);
+    // Observer-facing truth: the session leaves `active` as the
+    // blackout begins.
+    let _ = state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Active,
+                to: SessionState::Evacuating,
+                at: chrono::Utc::now(),
+            },
+        )
+        .await;
+
+    // ---- 4. THE BLACKOUT: vmstate-only capture + pagemap seal ----
+    let t_blackout = std::time::Instant::now();
+    let capture = match source_backend
+        .migration_capture_postcopy(sandbox_id, &presetup.export_id)
+        .await
+    {
+        Ok(c) => c,
         Err(e) => {
-            // Dest failure pre-rebind: un-pause the source in place and
-            // walk the session back to Active. Zero loss.
-            let abort_ok = source_backend
-                .migration_abort(sandbox_id, &capture.export_id)
-                .await
-                .is_ok();
+            // Nothing shipped; the guest may or may not be paused
+            // depending on where capture failed — resume is the
+            // conservative un-freeze (idempotent enough: resuming a
+            // running VM is a benign FC error).
+            restore_task.abort();
+            let _ = source_backend.resume(sandbox_id).await;
             state.teleport_targets.remove(&session_id);
-            if abort_ok {
-                let back = walk_back_to_active(state, session_id).await;
-                if back {
+            if walk_back_to_active(state, session_id).await {
+                return Err(MigrateError::AbortedToSource(format!(
+                    "post-copy capture: {e}"
+                )));
+            }
+            return Err(parachute_or_kill(
+                state,
+                session_id,
+                durable_row.is_some(),
+                format!("post-copy capture: {e}"),
+            )
+            .await);
+        }
+    };
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "capture_postcopy")
+        .record(t_blackout.elapsed().as_secs_f64());
+
+    // ---- 5. Await the destination (load + resume) ----
+    let t_restore = std::time::Instant::now();
+    let new_sandbox_id = match restore_task.await {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => {
+            state.teleport_targets.remove(&session_id);
+            // The load-gate marker proves the dest never ran the
+            // shipped state — un-pausing the source is zero-loss
+            // sound. Anything else is ambiguous: parachute.
+            if e.to_string().contains("postcopy-never-loaded") {
+                let abort_ok = source_backend
+                    .migration_abort(sandbox_id, &presetup.export_id)
+                    .await
+                    .is_ok();
+                if abort_ok && walk_back_to_active(state, session_id).await {
+                    metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "aborted_to_source")
+                        .increment(1);
                     return Err(MigrateError::AbortedToSource(format!("dest restore: {e}")));
                 }
             }
@@ -272,27 +392,34 @@ pub async fn migrate_session_live(
             )
             .await);
         }
+        Err(join_err) => {
+            state.teleport_targets.remove(&session_id);
+            return Err(parachute_or_kill(
+                state,
+                session_id,
+                durable_row.is_some(),
+                format!("dest restore task: {join_err}"),
+            )
+            .await);
+        }
     };
     let restore_ms = t_restore.elapsed().as_millis();
 
-    // ---- 4. Rebind + reactivate (mirrors the evacuation tail) ----
+    // ---- 6. The Committing persist + reactivate ----
     state.host_registry.invalidate_sandbox(sandbox_id);
     state
         .host_registry
         .record_sandbox_owner(new_sandbox_id, target_host_id);
     let rebind = async {
+        // ONE atomic UPDATE: the ownership oracle (`sandbox_ownership`)
+        // flips with it — the post-copy ownership transfer point. The
+        // source's TTL answer goes `false` from here.
         state
             .services
             .meta
-            .assign_session_host(session_id, Some(target_host_id))
+            .rebind_session(session_id, target_host_id, new_sandbox_id)
             .await
-            .map_err(|e| format!("assign host: {e}"))?;
-        state
-            .services
-            .meta
-            .assign_session_sandbox(session_id, Some(new_sandbox_id))
-            .await
-            .map_err(|e| format!("assign sandbox: {e}"))?;
+            .map_err(|e| format!("rebind: {e}"))?;
         state
             .services
             .meta
@@ -303,14 +430,24 @@ pub async fn migrate_session_live(
     }
     .await;
     if let Err(e) = rebind {
-        // The dest VM exists but PG didn't take the rebind — leave the
-        // parachute armed (scanner rehome); the dest orphan falls to
-        // orphan_reap, the frozen source to the export TTL.
         let _ = dest_backend.destroy(new_sandbox_id).await;
         state.teleport_targets.remove(&session_id);
         return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
     }
     crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id).await;
+    // D12: `evacuating → active` emits POST-BLACKOUT (the guest is
+    // executing on the dest). The prompt-hold (session lease) keeps
+    // "messages deliver" honest through the harness rebuild below.
+    let _ = state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Evacuating,
+                to: SessionState::Active,
+                at: chrono::Utc::now(),
+            },
+        )
+        .await;
     let session_refreshed = state
         .services
         .meta
@@ -325,65 +462,144 @@ pub async fn migrate_session_live(
     )
     .await
     {
-        // Harness rebuild failed; session sits at Created — the same
-        // posture the evac resumer leaves on this failure. The move
-        // itself landed; don't abort the source back.
         tracing::warn!(%session_id, error = %e,
-            "live migration: finish_resume_to_active failed; session left at Created");
+            "post-copy migration: finish_resume_to_active failed; session left at Created");
     }
     state.teleport_targets.remove(&session_id);
 
-    // ---- 5. Commit the source + finalize durability in background ----
-    // Via the pre-freeze handle: the registry can no longer route the
-    // old sandbox id (invalidated at step 4, and PG points at the new
-    // sandbox), so sandbox-routed dispatch would land "sandbox not
-    // found" and leave the source frozen until the export TTL.
-    if let Err(e) = source_backend
-        .migration_commit(sandbox_id, &capture.export_id)
-        .await
-    {
-        tracing::warn!(%session_id, %sandbox_id, error = %e,
-            "live migration: source commit failed; export TTL will clean up");
-    }
-    let _ = state
-        .emit(
-            session_id,
-            SessionEvent::StatusChanged {
-                from: SessionState::Evacuating,
-                to: SessionState::Active,
-                at: chrono::Utc::now(),
-            },
-        )
-        .await;
-    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "capture")
-        .record(capture_ms as f64 / 1000.0);
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "presetup")
+        .record(presetup_ms as f64 / 1000.0);
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "restore")
         .record(restore_ms as f64 / 1000.0);
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "total")
         .record(t_total.elapsed().as_secs_f64());
-    metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "migrated").increment(1);
+    metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "migrated_postcopy")
+        .increment(1);
     tracing::info!(
         %session_id,
         old_sandbox = %sandbox_id,
         new_sandbox = %new_sandbox_id,
         target_host = %target_host_id,
-        capture_ms,
-        restore_ms,
+        presetup_ms,
+        sealed_chunks = capture.sealed_chunks,
+        total_chunks = capture.total_chunks,
+        scan_ms = capture.scan_ms,
+        blackout_ms = t_blackout.elapsed().as_millis() as u64,
+        restore_await_ms = restore_ms,
         total_ms = t_total.elapsed().as_millis(),
-        "live teleport complete (ADR 0045 C1); durability catch-up finalizing",
+        "post-copy live teleport landed (ADR 0045 C2); drain + durability finalizing",
     );
 
-    // Row-only-at-finalize (the D5 pattern): the dest's catch-up makes
-    // the v+1 manifests + chunks durable, then the row lands. Failure ⇒
-    // no row; the previous checkpoint stays the fallback and the dest's
-    // chain was dropped host-side (next checkpoint goes Full).
+    // ---- 7. Finalize: drain → commit source → Full checkpoint → row ----
+    // The lease + the R8 gate ride into the task. The dest keeps
+    // serving the user throughout; the SOURCE stays alive as a page
+    // server until DrainDone.
     let state2 = state.clone();
+    let export_id = presetup.export_id.clone();
     let row_at = chrono::Utc::now();
     tokio::spawn(async move {
-        let lease = lease; // held + touched until the row lands
+        let lease = lease;
+        let _gate_guard = gate_guard;
         let mut touch = tokio::time::interval(std::time::Duration::from_secs(60));
         touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         touch.tick().await;
+
+        // 7a. The drain: every sealed chunk lands on the dest.
+        let t_drain = std::time::Instant::now();
+        let drain = state2.services.host.migration_drain_wait(new_sandbox_id);
+        tokio::pin!(drain);
+        let drain = loop {
+            tokio::select! {
+                res = &mut drain => break res,
+                _ = touch.tick() => {
+                    if !lease.touch().await {
+                        tracing::error!(%session_id, "post-copy finalize: lease lost mid-drain");
+                        return;
+                    }
+                }
+            }
+        };
+        match drain {
+            Ok(engram_core::types::snapshot::DrainOutcome::Done {
+                pulled,
+                alt_sourced,
+                zero_chunks,
+                ms,
+            }) => {
+                metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "drain")
+                    .record(t_drain.elapsed().as_secs_f64());
+                tracing::info!(
+                    %session_id, pulled, alt_sourced, zero_chunks, ms,
+                    "post-copy drain complete; releasing the source",
+                );
+            }
+            Ok(engram_core::types::snapshot::DrainOutcome::PeerLost { remaining, detail }) => {
+                // Rung-1 rewind: the dest holds unfillable state (the
+                // host-agent already poisoned/paused it). Destroy it,
+                // re-arm Evacuating, and let the scanner rehome from
+                // the durable row (or kill when none exists). The
+                // frozen source: ownership now answers `false`
+                // (rebind landed), so its TTL destroys it.
+                metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "peer_lost_rewind")
+                    .increment(1);
+                tracing::error!(%session_id, remaining, %detail,
+                    "post-copy drain lost its peer — rewinding the whole VM (rung-1)");
+                let _ = state2.services.host.destroy(new_sandbox_id).await;
+                state2.host_registry.invalidate_sandbox(new_sandbox_id);
+                if state2
+                    .services
+                    .meta
+                    .transition_session(session_id, SessionState::Evacuating)
+                    .await
+                    .is_ok()
+                {
+                    let _ = state2
+                        .emit(
+                            session_id,
+                            SessionEvent::StatusChanged {
+                                from: SessionState::Active,
+                                to: SessionState::Evacuating,
+                                at: chrono::Utc::now(),
+                            },
+                        )
+                        .await;
+                }
+                let _ = parachute_or_kill(
+                    &state2,
+                    session_id,
+                    durable_row.is_some(),
+                    format!("peer lost mid-drain: {detail}"),
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                tracing::error!(%session_id, error = %e,
+                    "post-copy drain_wait failed; leaving the source to its TTL");
+                return;
+            }
+        }
+
+        // 7b. Release the source (destroy; the export retires with it).
+        if let Err(e) = source_backend
+            .migration_commit(sandbox_id, &export_id)
+            .await
+        {
+            tracing::warn!(%session_id, %sandbox_id, error = %e,
+                "post-copy source commit failed; export TTL will clean up");
+        }
+
+        // 7c. Memory durability catch-up: the dest has NO chain, so
+        // this is a FULL checkpoint (sealed pages included by
+        // construction). Row-only-at-finalize; on any failure the
+        // previous checkpoint stays the recovery point and the next
+        // periodic checkpoint (also a Full) retries durability.
+        let t_full = std::time::Instant::now();
+        if let Err(e) = state2.services.host.snapshot_begin(new_sandbox_id).await {
+            tracing::warn!(%session_id, error = %e,
+                "post-copy finalize: full-checkpoint begin failed; next periodic covers");
+            return;
+        }
         let wait = state2.services.host.snapshot_wait(new_sandbox_id);
         tokio::pin!(wait);
         let row_meta = loop {
@@ -391,7 +607,7 @@ pub async fn migrate_session_live(
                 res = &mut wait => break res,
                 _ = touch.tick() => {
                     if !lease.touch().await {
-                        tracing::error!(%session_id, "live migration finalize: lease lost; no row");
+                        tracing::error!(%session_id, "post-copy finalize: lease lost; no row");
                         return;
                     }
                 }
@@ -401,10 +617,12 @@ pub async fn migrate_session_live(
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(%session_id, error = %e,
-                    "live migration finalize: catch-up failed; previous checkpoint stays the fallback");
+                    "post-copy finalize: full checkpoint failed; previous checkpoint stays the fallback");
                 return;
             }
         };
+        metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "full_checkpoint")
+            .record(t_full.elapsed().as_secs_f64());
         let record = engram_core::types::snapshot::SnapshotRecord {
             id: row_meta.id,
             session_id: Some(session_id),
@@ -425,11 +643,11 @@ pub async fn migrate_session_live(
             events_cursor: None,
         };
         if let Err(e) = state2.services.meta.record_snapshot(record).await {
-            tracing::warn!(%session_id, error = %e, "live migration finalize: record_snapshot failed");
+            tracing::warn!(%session_id, error = %e, "post-copy finalize: record_snapshot failed");
             return;
         }
         tracing::info!(%session_id, snapshot_id = %row_meta.id,
-            "live migration durability finalized (row-only-at-finalize)");
+            "post-copy migration durability finalized (Full checkpoint, row-only-at-finalize)");
     });
     Ok(())
 }
@@ -650,7 +868,7 @@ mod tests {
     /// AbortedToSource posture.
     #[tokio::test]
     async fn dest_restore_failure_aborts_to_source_and_walks_back_to_active() {
-        use engram_core::types::snapshot::{MigrationCaptureOut, SnapshotMetadata};
+        use engram_core::types::snapshot::SnapshotMetadata;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         struct MigratableFlakyDest {
@@ -684,23 +902,40 @@ mod tests {
             ) -> Result<SnapshotMetadata, engram_core::SandboxError> {
                 Err(engram_core::SandboxError::NotFound)
             }
-            async fn migration_capture(
+            async fn migration_presetup(
                 &self,
                 _: SandboxId,
-            ) -> Result<MigrationCaptureOut, engram_core::SandboxError> {
-                let mref = engram_core::types::manifest::ManifestRef::new();
-                Ok(MigrationCaptureOut {
+            ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, engram_core::SandboxError>
+            {
+                Ok(engram_core::types::snapshot::MigrationPresetupOut {
                     export_id: "test-export".into(),
+                    peer_token: "test-token".into(),
+                    peer_port: 9102,
+                    sidecar_json: b"{}".to_vec(),
                     memory_manifest_json: b"{}".to_vec(),
-                    disk_manifest_json: Vec::new(),
-                    memory_manifest_ref: mref,
-                    disk_manifest_ref: engram_core::types::manifest::ManifestRef::new(),
-                    new_memory_chunk_hashes: Vec::new(),
-                    new_disk_chunk_hashes: Vec::new(),
-                    snapshot_id: engram_core::types::SnapshotId::new(),
+                    memory_manifest_ref: engram_core::types::manifest::ManifestRef::new(),
+                    disk_manifest_ref: None,
                     hot_chunks: vec![],
+                })
+            }
+            async fn migration_capture_postcopy(
+                &self,
+                _: SandboxId,
+                _: &str,
+            ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, engram_core::SandboxError>
+            {
+                Ok(engram_core::types::snapshot::PostCopyCaptureOut {
+                    sealed_chunks: 3,
+                    total_chunks: 16,
+                    scan_ms: 1,
+                    disk_manifest_json: Vec::new(),
+                    disk_manifest_ref: None,
+                    new_disk_chunk_hashes: vec![],
                     paused_at_unix_ms: 0,
                 })
+            }
+            async fn resume(&self, _: SandboxId) -> Result<(), engram_core::SandboxError> {
+                Ok(())
             }
             async fn migration_abort(
                 &self,
@@ -714,8 +949,10 @@ mod tests {
                 &self,
                 _: SnapshotMetadata,
             ) -> Result<SandboxId, engram_core::SandboxError> {
+                // The load-gate marker: the dest provably never ran the
+                // shipped state — the coordinator's zero-loss abort arm.
                 Err(engram_core::SandboxError::Snapshot(
-                    "injected dest failure".into(),
+                    "postcopy-never-loaded: injected dest failure".into(),
                 ))
             }
             fn snapshot_path_for(&self, _: engram_core::types::SnapshotId) -> std::path::PathBuf {
@@ -821,7 +1058,7 @@ mod tests {
     /// handle it resolved before freezing.
     #[tokio::test]
     async fn commit_reaches_the_frozen_source_after_rebind() {
-        use engram_core::types::snapshot::{MigrationCaptureOut, SnapshotMetadata};
+        use engram_core::types::snapshot::SnapshotMetadata;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         struct MigratableHappyPath {
@@ -855,22 +1092,48 @@ mod tests {
             ) -> Result<SnapshotMetadata, engram_core::SandboxError> {
                 Err(engram_core::SandboxError::NotFound)
             }
-            async fn migration_capture(
+            async fn migration_presetup(
                 &self,
                 _: SandboxId,
-            ) -> Result<MigrationCaptureOut, engram_core::SandboxError> {
-                let mref = engram_core::types::manifest::ManifestRef::new();
-                Ok(MigrationCaptureOut {
+            ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, engram_core::SandboxError>
+            {
+                Ok(engram_core::types::snapshot::MigrationPresetupOut {
                     export_id: "test-export".into(),
+                    peer_token: "test-token".into(),
+                    peer_port: 9102,
+                    sidecar_json: b"{}".to_vec(),
                     memory_manifest_json: b"{}".to_vec(),
-                    disk_manifest_json: Vec::new(),
-                    memory_manifest_ref: mref,
-                    disk_manifest_ref: engram_core::types::manifest::ManifestRef::new(),
-                    new_memory_chunk_hashes: Vec::new(),
-                    new_disk_chunk_hashes: Vec::new(),
-                    snapshot_id: engram_core::types::SnapshotId::new(),
+                    memory_manifest_ref: engram_core::types::manifest::ManifestRef::new(),
+                    disk_manifest_ref: None,
                     hot_chunks: vec![],
+                })
+            }
+            async fn migration_capture_postcopy(
+                &self,
+                _: SandboxId,
+                _: &str,
+            ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, engram_core::SandboxError>
+            {
+                Ok(engram_core::types::snapshot::PostCopyCaptureOut {
+                    sealed_chunks: 3,
+                    total_chunks: 16,
+                    scan_ms: 1,
+                    disk_manifest_json: Vec::new(),
+                    disk_manifest_ref: None,
+                    new_disk_chunk_hashes: vec![],
                     paused_at_unix_ms: 0,
+                })
+            }
+            async fn migration_drain_wait(
+                &self,
+                _: SandboxId,
+            ) -> Result<engram_core::types::snapshot::DrainOutcome, engram_core::SandboxError>
+            {
+                Ok(engram_core::types::snapshot::DrainOutcome::Done {
+                    pulled: 3,
+                    alt_sourced: 0,
+                    zero_chunks: 0,
+                    ms: 5,
                 })
             }
             async fn migration_commit(
@@ -964,10 +1227,21 @@ mod tests {
         migrate_session_live(&state, session_id, target)
             .await
             .expect("happy-path migration must succeed");
+        // C2: the commit rides the FINALIZE task (after the drain) —
+        // poll for it instead of asserting synchronously.
+        let mut committed = false;
+        for _ in 0..60 {
+            if commit_called.load(Ordering::SeqCst) {
+                committed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(
-            commit_called.load(Ordering::SeqCst),
-            "the frozen source must receive migration_commit even though \
-             the old sandbox id is unroutable after the rebind",
+            committed,
+            "the frozen source must receive migration_commit (post-drain, \
+             via the pre-resolved handle — the old sandbox id is \
+             unroutable after the rebind)",
         );
         let after = meta.get_session(session_id).await.unwrap();
         assert_eq!(after.host_id, Some(target), "session rebound to dest");
@@ -980,6 +1254,32 @@ mod tests {
 
     /// A held lease refuses the migration outright (Fatal, not a
     /// fallback — the rival owns the session right now).
+    /// R8: at most one in-flight migration per host endpoint; a second
+    /// claim sharing EITHER endpoint refuses, and Drop releases both
+    /// (including partial-claim rollback).
+    #[test]
+    fn migration_gate_claims_both_endpoints_and_releases_on_drop() {
+        let (a, b, c) = (HostId::new(), HostId::new(), HostId::new());
+        let s1 = SessionId::new();
+        let g = MigrationGateGuard::claim(Some(a), b, s1).expect("first claim");
+        // Shares the source.
+        assert!(MigrationGateGuard::claim(Some(a), c, SessionId::new()).is_none());
+        // Shares the dest.
+        assert!(MigrationGateGuard::claim(Some(c), b, SessionId::new()).is_none());
+        // Disjoint hosts coexist.
+        let g2 = MigrationGateGuard::claim(None, c, SessionId::new()).expect("disjoint claim");
+        drop(g);
+        // Released: both endpoints reusable; the partial-rollback path
+        // is exercised by the shares-the-dest refusal above (its `a`
+        // claim must have been rolled back).
+        let g3 = MigrationGateGuard::claim(Some(a), b, SessionId::new()).expect("after release");
+        drop(g2);
+        drop(g3);
+        // (No global-emptiness assert: the gate is a process-global and
+        // sibling tests claim it concurrently; release is proven by the
+        // successful re-claim above.)
+    }
+
     #[tokio::test]
     async fn held_lease_refuses_migration() {
         let session = active_session();

@@ -2717,8 +2717,15 @@ impl FirecrackerBackend {
                         let started = std::time::Instant::now();
                         while !(uffd_uds.exists() && state_path.exists()) {
                             if started.elapsed() > budget {
+                                // The "postcopy-never-loaded" marker is
+                                // LOAD-BEARING: the coordinator's abort-
+                                // to-source arm keys on it (the timeout
+                                // PRECEDES the FC load, so the dest
+                                // provably never ran this state and an
+                                // un-pause of the source is zero-loss
+                                // sound).
                                 return Err(SandboxError::Snapshot(format!(
-                                    "post-copy load gate timed out after {budget:?} \
+                                    "postcopy-never-loaded: load gate timed out after {budget:?} \
                                      (uds: {}, state.bin: {})",
                                     uffd_uds.exists(),
                                     state_path.exists(),
