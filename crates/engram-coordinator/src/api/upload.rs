@@ -502,6 +502,7 @@ pub async fn create_artifact_from_path_core(
 /// channel (works in-proc + split mode — no new gRPC surface), so the
 /// body never buffers host-side. A missing/unreadable path surfaces as a
 /// non-zero `cat` exit → the stream errors and the upload aborts.
+// Mirrored by create_artifact_from_path_core() (gRPC) — see its DRIFT WARNING; changes here must be reflected there until Task 32.
 pub async fn create_from_path(
     State(state): State<SharedState>,
     Path(session): Path<SessionId>,
@@ -627,7 +628,7 @@ pub async fn get_artifact_core(
             }
             other => ApiError::Internal(format!("read artifact blob: {other}")),
         })?;
-    let file_ext = ext_for_media_str(&row.media_type);
+    let file_ext = ext_for_media(&row.media_type);
     let meta = ArtifactMeta {
         file_name: format!("{}.{}", aid.simple(), file_ext),
         media_type: row.media_type,
@@ -643,13 +644,6 @@ pub struct ArtifactMeta {
     pub file_name: String,
 }
 
-/// Helper: file extension for a MIME type — used in both the axum serve
-/// path and the gRPC `GetArtifact` metadata frame. Delegates to
-/// [`ext_for_media`] (private) via this `pub(crate)` shim.
-fn ext_for_media_str(media_type: &str) -> &'static str {
-    ext_for_media(media_type)
-}
-
 /// `GET /sessions/:id/artifacts/:artifact_id` — stream an artifact back
 /// to the dashboard. Mounted in the bearer-authed group (in prod the
 /// browser reaches it via the IAP cookie at the LB; nginx stamps the
@@ -662,6 +656,7 @@ fn ext_for_media_str(media_type: &str) -> &'static str {
 /// (a scriptless, opaque-origin context even if the bytes are somehow an
 /// HTML document), and `no-store`. This — not the upload allowlist — is
 /// what makes serving attacker-controlled bytes to operators safe.
+// Mirrored by get_artifact_core() (gRPC) — see its DRIFT WARNING; changes here must be reflected there until Task 32.
 pub async fn serve_artifact(
     State(state): State<SharedState>,
     Path((session, artifact_id)): Path<(SessionId, String)>,

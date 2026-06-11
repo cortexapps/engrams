@@ -107,6 +107,7 @@ pub async fn checkpoints_core(
     Ok(resp.0.checkpoints)
 }
 
+// Mirrored by get_log_core() (gRPC) — see its DRIFT WARNING; changes here must be reflected there until Task 32.
 pub async fn log(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,

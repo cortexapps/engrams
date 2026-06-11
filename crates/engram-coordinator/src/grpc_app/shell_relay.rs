@@ -185,15 +185,9 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
         // The lease guard ensures release_shell runs even if tonic cancels.
         let lease = ShellLeaseGuard::new(host.clone(), sandbox_id);
 
-        let (outbound_stream, inbound_stream) =
-            build_relay_stream(session_id, sandbox_id, inbound, tunnel, lease);
+        let relay_stream = build_relay_stream(session_id, sandbox_id, inbound, tunnel, lease);
 
-        // `outbound_stream` and `inbound_stream` are conceptually one
-        // merged stream for our response.  We build the final stream in
-        // build_relay_stream above.
-        Ok(Response::new(Box::pin(
-            outbound_stream.chain(inbound_stream),
-        )))
+        Ok(Response::new(Box::pin(relay_stream)))
     }
 }
 
@@ -254,10 +248,9 @@ fn shell_frame_to_proto(frame: ShellFrame) -> app::RelayShellResponse {
     app::RelayShellResponse { frame: Some(f) }
 }
 
-/// Build the two halves of the bidi bridge as a single chained stream.
+/// Build the bidi bridge as a single stream.
 ///
-/// Returns `(ttyd_to_client_stream, empty_end_stream)`.  The actual
-/// pump runs inside an async task; the returned stream drains a
+/// The pump runs inside an async task; the returned stream drains a
 /// `tokio::sync::mpsc` that the pump fills.  When the pump finishes
 /// (either side closes), the channel closes and the stream ends.
 fn build_relay_stream(
@@ -266,10 +259,7 @@ fn build_relay_stream(
     mut grpc_inbound: tonic::Streaming<app::RelayShellRequest>,
     tunnel: ShellTunnel,
     lease: ShellLeaseGuard,
-) -> (
-    impl futures::stream::Stream<Item = Result<app::RelayShellResponse, Status>> + Send,
-    futures::stream::Empty<Result<app::RelayShellResponse, Status>>,
-) {
+) -> impl futures::stream::Stream<Item = Result<app::RelayShellResponse, Status>> + Send {
     // Channel capacity: 64 frames, matching ShellTunnel's own capacity.
     let (resp_tx, resp_rx) =
         tokio::sync::mpsc::channel::<Result<app::RelayShellResponse, Status>>(64);
@@ -349,12 +339,9 @@ fn build_relay_stream(
             %sandbox_id,
             "ShellRelay: bridge ended, lease released",
         );
-        // g2t_resp_tx clone was dropped; resp_rx will drain and end.
-        let _ = g2t_resp_tx;
     });
 
-    let out_stream = tokio_stream::wrappers::ReceiverStream::new(resp_rx);
-    (out_stream, futures::stream::empty())
+    tokio_stream::wrappers::ReceiverStream::new(resp_rx)
 }
 
 #[cfg(test)]

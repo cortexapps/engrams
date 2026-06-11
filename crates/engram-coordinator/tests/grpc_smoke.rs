@@ -893,7 +893,7 @@ async fn get_artifact_not_found_smoke() {
 /// Mirrored from `web/src/components/TerminalPane.tsx`:
 /// - First frame (text, JSON): `{"AuthToken":"","columns":80,"rows":24}`
 ///   — ttyd requires this to initialize the PTY.
-/// - Subsequent input (text): `"0"` + raw bytes  (ASCII 0x30 = output)
+/// - Subsequent input (text): `"0"` + raw bytes  (ASCII 0x30 = INPUT)
 /// - Server output (binary): byte 0x30 (`'0'`) + terminal bytes
 /// - Server title/prefs (binary): bytes 0x31/0x32 + payload (ignored here)
 ///

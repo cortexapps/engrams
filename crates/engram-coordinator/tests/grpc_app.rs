@@ -415,6 +415,38 @@ async fn app_grpc_rejects_missing_and_wrong_bearer() {
     server.abort();
 }
 
+/// CreateSession must loudly refuse `harness_secret_id: Some(_)` until Task 13
+/// wires SecretService (ADR 0039 Task 13). The RPC handler checks the field
+/// and returns `Unimplemented` before delegating to `create_request_from_proto`.
+/// Exercises the full in-process RPC path rather than just inspecting a struct.
+#[tokio::test]
+async fn create_session_rejects_harness_secret_id() {
+    let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
+    let channel = dial(addr).await;
+
+    let err = app::session_service_client::SessionServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    )
+    .create_session(app::CreateSessionRequest {
+        image_uri: "localhost:5001/demo:warm".into(),
+        mode: "agent".into(),
+        prompt: None,
+        harness_secret_id: Some("secret-abc-123".into()),
+        secrets: std::collections::HashMap::new(),
+    })
+    .await
+    .expect_err("harness_secret_id must be rejected until Task 13");
+    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
+    assert!(
+        err.message()
+            .contains("harness_secret_id lands with SecretService"),
+        "rejection message must name the pending task: {err:?}"
+    );
+
+    server.abort();
+}
+
 /// Task 9 fail-closed: a server built with ZERO configured tokens
 /// rejects everything — even a syntactically valid bearer. This is the
 /// deliberate opposite of the axum surface's empty-list dev bypass; a

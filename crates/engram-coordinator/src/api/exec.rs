@@ -293,6 +293,7 @@ pub enum ExecStreamEvent {
     },
 }
 
+// Mirrored by exec_stream_core() (gRPC) — see its DRIFT WARNING; changes here must be reflected there until Task 32.
 pub async fn exec(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
@@ -406,6 +407,7 @@ pub async fn exec(
 /// Streaming exec: returns SSE so each stdout/stderr chunk arrives at
 /// the client as the underlying process produces it. Also publishes
 /// every event into the session-wide bus so other subscribers see it.
+// Mirrored by exec_stream_core() (gRPC) — see its DRIFT WARNING; changes here must be reflected there until Task 32.
 pub async fn exec_stream(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,

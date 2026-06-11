@@ -16,6 +16,7 @@
 
 use engram_protocol::app;
 
+use crate::api::exec::ExecRequest as ApiExecRequest;
 use crate::api::sessions::{CreateSessionRequest, ListSessionsResponse, SessionListItem};
 use crate::cow_state::CowStateView;
 use crate::error::ApiError;
@@ -141,6 +142,32 @@ pub(crate) fn create_request_from_proto(
     })
 }
 
+/// proto `ExecRequest` → api `ExecRequest`.
+///
+/// `argv` wins when non-empty; `command` wins otherwise — matching the
+/// `build_exec` validation in `api/exec.rs` which errors on neither-or-both.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `app::ExecRequest` without updating this converter, the build
+/// will fail here rather than silently drop the new field.
+pub(crate) fn exec_request_from_proto(r: app::ExecRequest) -> ApiExecRequest {
+    let app::ExecRequest {
+        session_id: _, // Routing field consumed by the caller before conversion.
+        command,
+        argv,
+        env,
+        workdir,
+        timeout_secs,
+    } = r;
+    ApiExecRequest {
+        command,
+        argv: if argv.is_empty() { None } else { Some(argv) },
+        env,
+        workdir,
+        timeout_secs,
+    }
+}
+
 /// [`CowStateView`] → proto [`CowStateView`] (session.proto).
 ///
 /// Exhaustive destructure below is the totality guard — a new field on
@@ -259,7 +286,9 @@ pub(crate) fn artifact_meta_to_proto(m: crate::api::upload::ArtifactMeta) -> app
     } = m;
     app::ArtifactMetadata {
         media_type,
-        size_bytes: size_bytes as u64,
+        // size_bytes comes from the DB as i64; DB constraint ensures non-negative.
+        // 0 = corrupt row, which is better than a huge wrapping value.
+        size_bytes: size_bytes.try_into().unwrap_or(0),
         file_name,
     }
 }
@@ -412,5 +441,47 @@ mod tests {
         assert_eq!(p.media_type, "image/png");
         assert_eq!(p.size_bytes, 4096u64);
         assert_eq!(p.file_name, "abc123.png");
+    }
+
+    /// `exec_request_from_proto` maps all fields and applies the
+    /// argv-wins-when-non-empty rule. Population test per Fix 1.
+    #[test]
+    fn exec_request_from_proto_maps_all_fields() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+
+        // argv non-empty: argv wins, command is still passed through.
+        let r = app::ExecRequest {
+            session_id: "ignored-by-converter".to_string(),
+            command: Some("sh -c echo".to_string()),
+            argv: vec!["echo".to_string(), "hello".to_string()],
+            env: env.clone(),
+            workdir: Some("/tmp".to_string()),
+            timeout_secs: Some(30),
+        };
+        let api = exec_request_from_proto(r);
+        assert_eq!(
+            api.argv,
+            Some(vec!["echo".to_string(), "hello".to_string()])
+        );
+        assert_eq!(api.command, Some("sh -c echo".to_string()));
+        assert_eq!(api.env.get("FOO").map(|s| s.as_str()), Some("bar"));
+        assert_eq!(api.workdir.as_deref(), Some("/tmp"));
+        assert_eq!(api.timeout_secs, Some(30));
+
+        // argv empty: argv maps to None.
+        let r2 = app::ExecRequest {
+            session_id: "ignored".to_string(),
+            command: Some("ls".to_string()),
+            argv: vec![],
+            env: std::collections::HashMap::new(),
+            workdir: None,
+            timeout_secs: None,
+        };
+        let api2 = exec_request_from_proto(r2);
+        assert_eq!(api2.argv, None);
+        assert_eq!(api2.command, Some("ls".to_string()));
+        assert_eq!(api2.workdir, None);
+        assert_eq!(api2.timeout_secs, None);
     }
 }

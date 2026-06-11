@@ -219,20 +219,10 @@ impl app::session_service_server::SessionService for AppSessionService {
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
 
-        // Map proto ExecRequest → api ExecRequest. argv wins when
-        // non-empty; command wins otherwise (mirroring build_exec logic
-        // which errors on neither-or-both).
-        let api_req = crate::api::exec::ExecRequest {
-            command: r.command,
-            argv: if r.argv.is_empty() {
-                None
-            } else {
-                Some(r.argv)
-            },
-            env: r.env,
-            workdir: r.workdir,
-            timeout_secs: r.timeout_secs,
-        };
+        // Map proto ExecRequest → api ExecRequest via the totality-enforced
+        // converter in convert.rs (exhaustive destructure, same pattern as
+        // all other converters in that module).
+        let api_req = super::convert::exec_request_from_proto(r);
 
         let (exec_id, body_stream) = crate::api::exec::exec_stream_core(&self.state, id, api_req)
             .await
@@ -464,26 +454,36 @@ impl app::session_service_server::SessionService for AppSessionService {
 
 #[cfg(test)]
 mod tests {
-    use engram_protocol::app;
-
-    /// `create_session` must loudly refuse `harness_secret_id: Some(_)` until
-    /// Task 13 wires SecretService. Validates Change 2 of the review fixes.
-    /// The RPC body checks `r.harness_secret_id.is_some()` and returns
-    /// `Status::unimplemented(...)` before delegating to convert.rs.
+    /// `create_request_from_proto` must NOT map `harness_secret_id` into the
+    /// api request — it is intentionally dropped (bind as `_` in convert.rs).
+    /// The RPC layer (create_session above) rejects it before convert.rs is
+    /// reached; this test confirms the converter itself does not surface the
+    /// field on the output struct (i.e., `CreateSessionRequest` has no such
+    /// field, proving the totality drop is correct).
+    ///
+    /// The in-process rejection path (RPC layer → Unimplemented) is exercised
+    /// in `tests/grpc_app.rs::create_session_rejects_harness_secret_id`.
     #[test]
-    fn create_request_from_proto_rejects_harness_secret_id() {
+    fn create_request_from_proto_does_not_map_harness_secret_id() {
+        use engram_protocol::app;
+        // A proto request carrying harness_secret_id: the converter must
+        // succeed (field dropped as `_`) and produce an api request that has
+        // no such field — confirmed by the type: CreateSessionRequest has no
+        // harness_secret_id.
         let r = app::CreateSessionRequest {
             image_uri: "localhost:5001/demo:warm".into(),
-            mode: String::new(),
+            mode: "agent".into(),
             prompt: None,
             harness_secret_id: Some("secret-abc-123".into()),
             secrets: std::collections::HashMap::new(),
         };
-        // Verify the field is detectable — the RPC layer (create_session)
-        // checks this and short-circuits with Status::unimplemented.
-        assert!(
-            r.harness_secret_id.is_some(),
-            "harness_secret_id must be detected as Some(_) so the RPC rejects it"
-        );
+        // Intentionally bypass the RPC-layer rejection: call convert directly.
+        let api = super::super::convert::create_request_from_proto(r)
+            .expect("converter must succeed; rejection is the RPC layer's job");
+        // The api struct has image, mode, prompt, secrets — no harness_secret_id.
+        assert_eq!(api.image, "localhost:5001/demo:warm");
+        // harness_secret_id does not exist on CreateSessionRequest — the type
+        // system is the assertion. If it were added and mistakenly mapped,
+        // this file would not compile without a matching field read.
     }
 }
