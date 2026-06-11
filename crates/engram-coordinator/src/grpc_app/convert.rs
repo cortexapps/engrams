@@ -17,6 +17,7 @@
 use engram_protocol::app;
 
 use crate::api::sessions::{CreateSessionRequest, ListSessionsResponse, SessionListItem};
+use crate::cow_state::CowStateView;
 use crate::error::ApiError;
 use engram_core::types::session::SessionMode;
 
@@ -138,6 +139,41 @@ pub(crate) fn create_request_from_proto(
         prompt,
         secrets,
     })
+}
+
+/// [`CowStateView`] → proto [`CowStateView`] (session.proto).
+///
+/// Exhaustive destructure below is the totality guard — a new field on
+/// `CowStateView` must be handled here or the build fails.
+pub(crate) fn cow_state_to_proto(v: &CowStateView) -> app::CowStateView {
+    let CowStateView {
+        sandbox_id,
+        session_id,
+        disk_manifest_id,
+        disk_manifest_version,
+        dirty_chunks,
+        dirty_bytes,
+        last_flush_at,
+        base_chunks,
+        base_chunks_local,
+        memory_manifest_id,
+        memory_manifest_version,
+        last_snapshot_at,
+    } = v;
+    app::CowStateView {
+        sandbox_id: sandbox_id.to_string(),
+        session_id: session_id.map(|s| s.to_string()),
+        disk_manifest_id: disk_manifest_id.clone(),
+        disk_manifest_version: *disk_manifest_version,
+        dirty_chunks: *dirty_chunks,
+        dirty_bytes: *dirty_bytes,
+        last_flush_at: last_flush_at.map(|t| t.to_rfc3339()),
+        base_chunks: *base_chunks,
+        base_chunks_local: *base_chunks_local,
+        memory_manifest_id: memory_manifest_id.clone(),
+        memory_manifest_version: *memory_manifest_version,
+        last_snapshot_at: last_snapshot_at.map(|t| t.to_rfc3339()),
+    }
 }
 
 #[cfg(test)]

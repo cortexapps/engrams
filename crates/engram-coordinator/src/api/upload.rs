@@ -440,6 +440,51 @@ pub struct FromPathResponse {
     pub size_bytes: u64,
 }
 
+/// Transport-agnostic `CreateArtifactFromPath` core (ADR 0039, Task 12).
+///
+/// Ensures the session is active, streams `cat <path>` from the guest,
+/// and stores the result via [`process_upload`]. Returns a
+/// [`SharedArtifact`] that both the axum handler and the gRPC handler
+/// can encode into their respective wire shapes. The axum handler
+/// remains independent and unchanged.
+pub async fn create_artifact_from_path_core(
+    state: &SharedState,
+    session: SessionId,
+    path: &str,
+    caption: Option<String>,
+) -> Result<SharedArtifact, ApiError> {
+    crate::api::snapshot::ensure_active(state, session).await?;
+    let sandbox_id = state.registry.get(session).ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox — create a new session or resume from snapshot".into(),
+        )
+    })?;
+    let exec_req = ExecRequest {
+        command: vec!["cat".into(), "--".into(), path.to_owned()],
+        stdin: None,
+        env: std::collections::HashMap::new(),
+        workdir: None,
+        timeout: Some(std::time::Duration::from_secs(600)),
+    };
+    let stream = state
+        .services
+        .host
+        .exec_stream(sandbox_id, exec_req)
+        .await?;
+    let body = exec_stdout_bytestream(stream.events);
+    let ext = ext_from_path(path);
+    process_upload(
+        state,
+        session,
+        body,
+        &ext,
+        sanitize_caption(caption),
+        Trust::Trusted,
+    )
+    .await
+    .map_err(ApiError::from)
+}
+
 /// `POST /sessions/:id/artifacts/from-path` — ADR 0026 trusted operator
 /// file pull. Mounted in the bearer/IAP group (NOT broker-token-authed):
 /// a trusted operator can capture **any** file in the session, with no
@@ -526,6 +571,70 @@ fn exec_stdout_bytestream(events: ExecEventStream) -> ByteStream {
 }
 
 // ---- serve (web UI) ----------------------------------------------------
+
+/// Transport-agnostic artifact-read core (ADR 0039, Task 12).
+///
+/// Looks up the artifact metadata for `(session, artifact_id)` and
+/// returns the [`ArtifactRow`] together with a [`ByteStream`] that
+/// yields the raw bytes from BlobStorage.  The gRPC `GetArtifact`
+/// handler maps these into proto `GetArtifactResponse` frames
+/// (metadata first, then 64 KiB chunks); the axum `serve_artifact`
+/// handler remains independent and unchanged (identical wire behaviour).
+///
+/// `artifact_id` is the UUID string as received from the caller; an
+/// unparseable value maps to `ApiError::BadRequest`.
+pub async fn get_artifact_core(
+    state: &SharedState,
+    session: SessionId,
+    artifact_id: &str,
+) -> Result<
+    (
+        crate::api::upload::ArtifactMeta,
+        engram_core::traits::storage::ByteStream,
+    ),
+    ApiError,
+> {
+    let aid = uuid::Uuid::parse_str(artifact_id)
+        .map_err(|_| ApiError::BadRequest("invalid artifact id".into()))?;
+    let row = state
+        .services
+        .meta
+        .get_artifact(session, aid)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("artifact not found".into()))?;
+    let stream = state
+        .services
+        .blob
+        .get_streaming(&row.blob_key)
+        .await
+        .map_err(|e| match e {
+            engram_core::error::BlobError::NotFound => {
+                ApiError::NotFound("artifact blob missing".into())
+            }
+            other => ApiError::Internal(format!("read artifact blob: {other}")),
+        })?;
+    let file_ext = ext_for_media_str(&row.media_type);
+    let meta = ArtifactMeta {
+        file_name: format!("{}.{}", aid.simple(), file_ext),
+        media_type: row.media_type,
+        size_bytes: row.size_bytes,
+    };
+    Ok((meta, stream))
+}
+
+/// Artifact metadata returned by [`get_artifact_core`].
+pub struct ArtifactMeta {
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub file_name: String,
+}
+
+/// Helper: file extension for a MIME type — used in both the axum serve
+/// path and the gRPC `GetArtifact` metadata frame. Delegates to
+/// [`ext_for_media`] (private) via this `pub(crate)` shim.
+fn ext_for_media_str(media_type: &str) -> &'static str {
+    ext_for_media(media_type)
+}
 
 /// `GET /sessions/:id/artifacts/:artifact_id` — stream an artifact back
 /// to the dashboard. Mounted in the bearer-authed group (in prod the
