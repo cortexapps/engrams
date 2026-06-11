@@ -24,20 +24,24 @@ type BoxStream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> +
 
 const UNIMPLEMENTED: &str = "ADR 0039 phase 2";
 
+/// ADR 0039 §9.4: keepalive PINGs so a dead orchestrator's streams
+/// are detected and torn down (releasing leases/subscriptions)
+/// instead of leaking until TCP gives up.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Build the tonic server for the app surface: all five services on
-/// one listener, HTTP/2 keepalives per ADR 0039 §9.4 so a dead
-/// orchestrator's streams are detected and torn down (releasing
-/// leases/subscriptions) instead of leaking until TCP gives up.
+/// one listener, HTTP/2 keepalives per [`KEEPALIVE_INTERVAL`] /
+/// [`KEEPALIVE_TIMEOUT`].
 ///
-/// Returns the un-bound router; the caller picks the bind strategy
-/// (`serve_with_shutdown` in lib.rs, `serve_with_incoming` on an
+/// Returns the un-bound router; the caller binds the listener and
+/// picks the serve strategy (`serve_with_incoming_shutdown` over an
+/// eagerly bound listener in lib.rs, `serve_with_incoming` on an
 /// ephemeral port in tests).
 pub fn server(state: SharedState) -> tonic::transport::server::Router {
     tonic::transport::Server::builder()
-        // ADR §9.4: keepalive PINGs so a dead orchestrator's streams
-        // are detected and torn down (releases leases/subscriptions).
-        .http2_keepalive_interval(Some(Duration::from_secs(20)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .add_service(app::session_service_server::SessionServiceServer::new(
             AppSessionService {
                 state: state.clone(),

@@ -99,7 +99,7 @@ struct Cli {
     harness_listen_addr: std::net::SocketAddr,
 
     /// Address the orchestrator-facing app gRPC server binds to (ADR 0039).
-    #[arg(long, env = "APP_GRPC_ADDR", default_value = "127.0.0.1:50061")]
+    #[arg(long, env = "ENGRAM_APP_GRPC_ADDR", default_value = "127.0.0.1:50061")]
     app_grpc_addr: std::net::SocketAddr,
 
     /// Address the Prometheus `/metrics` exporter listens on.

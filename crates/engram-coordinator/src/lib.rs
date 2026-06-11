@@ -364,22 +364,34 @@ pub async fn run_with_registry_and_local(
 
     // ADR 0039 §2.3: the orchestrator-facing app gRPC server, beside
     // the axum API for the duration of the migration (the axum web
-    // routes retire in Phase 5). Spawned rather than joined so an app
-    // gRPC bind/serve failure doesn't take the web surface down with
-    // it. Awaits the same `shutdown_signal()` future the axum side
-    // uses below — tokio signal listeners are multi-subscriber, so one
-    // SIGTERM/ctrl-c gracefully closes both servers.
-    {
-        let app_grpc = grpc_app::server(state.clone())
-            .serve_with_shutdown(cfg.app_grpc_addr, shutdown_signal());
-        let addr = cfg.app_grpc_addr;
+    // routes retire in Phase 5). The listener is bound eagerly so a
+    // bad/conflicting ENGRAM_APP_GRPC_ADDR fails startup loudly,
+    // exactly like the axum bind below; only the serve loop is
+    // spawned, so a runtime serve crash doesn't take the web surface
+    // down with it (the task just logs). Awaits the same
+    // `shutdown_signal()` future the axum side uses below — tokio
+    // signal listeners are multi-subscriber, so one SIGTERM/ctrl-c
+    // gracefully closes both servers — and the JoinHandle is awaited
+    // after axum returns so shutdown drains BOTH servers before the
+    // process exits.
+    let app_grpc = {
+        let grpc_listener = tokio::net::TcpListener::bind(cfg.app_grpc_addr)
+            .await
+            .map_err(CoordinatorError::Io)?;
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(grpc_listener, true, None)
+                .map_err(|e| {
+                    CoordinatorError::Config(format!("app gRPC listener setup failed: {e}"))
+                })?;
+        tracing::info!(addr = %cfg.app_grpc_addr, "app gRPC server listening");
+        let serve = grpc_app::server(state.clone())
+            .serve_with_incoming_shutdown(incoming, shutdown_signal());
         tokio::spawn(async move {
-            tracing::info!(addr = %addr, "app gRPC server listening");
-            if let Err(e) = app_grpc.await {
+            if let Err(e) = serve.await {
                 tracing::error!(error = %e, "app gRPC server exited");
             }
-        });
-    }
+        })
+    };
 
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())
@@ -389,7 +401,16 @@ pub async fn run_with_registry_and_local(
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(CoordinatorError::Io)
+        .map_err(CoordinatorError::Io)?;
+
+    // Graceful shutdown drains both servers: axum has returned, now
+    // wait for the app gRPC serve loop to finish its own drain. A
+    // JoinError here means the spawned task panicked — log it rather
+    // than turning a clean web-side shutdown into a process error.
+    if let Err(e) = app_grpc.await {
+        tracing::error!(error = %e, "app gRPC server task panicked");
+    }
+    Ok(())
 }
 
 /// Read every active session and re-bind its `sandbox_id`/`host_id`
