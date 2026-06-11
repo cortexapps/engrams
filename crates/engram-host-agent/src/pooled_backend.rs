@@ -768,6 +768,63 @@ impl PooledBackend {
     /// inline session manifest as a local file the handler resolves
     /// from disk, and the inline disk manifest staged for
     /// `prepare_resume_nbd_attach`.
+    /// ADR 0045 C1: pull a chunk set from a live migration export over
+    /// the source host's gRPC channel into the local cache. Used by the
+    /// background divergence pull (LAN beats GCS by ~20x for the session
+    /// chain). Returns the number of chunks landed.
+    async fn pull_chunks_from_source(
+        source_addr: &str,
+        export_id: &str,
+        hashes: &[engram_chunk_store::manifest::ChunkHash],
+        cache: &ChunkCache,
+    ) -> Result<usize, SandboxError> {
+        use engram_core::types::snapshot::MigrationItem;
+        let channel = tonic::transport::Endpoint::from_shared(source_addr.to_string())
+            .map_err(|e| SandboxError::InvalidSpec(format!("bad source_addr: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("dial source: {e}")))?;
+        let source = engram_protocol::grpc_client::GrpcHostClient::new(channel);
+        let items: Vec<MigrationItem> = hashes
+            .iter()
+            .map(|h| MigrationItem::Chunk(*h.as_bytes()))
+            .collect();
+        let mut stream = source
+            .migration_fetch(export_id, items)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("divergence fetch: {e}")))?;
+        use futures::StreamExt;
+        let mut current: Vec<u8> = Vec::new();
+        let mut current_idx: Option<u32> = None;
+        let mut landed = 0usize;
+        while let Some(frame) = stream.next().await {
+            let frame = frame.map_err(|e| SandboxError::Snapshot(format!("fetch frame: {e}")))?;
+            if current_idx != Some(frame.item_idx) {
+                current_idx = Some(frame.item_idx);
+                current.clear();
+            }
+            current.extend_from_slice(&frame.data);
+            if frame.last {
+                let idx = frame.item_idx as usize;
+                let hash = hashes.get(idx).ok_or_else(|| {
+                    SandboxError::Snapshot("divergence fetch: unknown item index".into())
+                })?;
+                cache
+                    .put_no_evict(*hash, &current)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("land chunk {hash}: {e}")))?;
+                landed += 1;
+                current = Vec::new();
+                current_idx = None;
+            }
+        }
+        if let Err(e) = cache.sweep().await {
+            tracing::warn!(error = %e, "post-pull cache sweep failed (non-fatal)");
+        }
+        Ok(landed)
+    }
+
     async fn migration_prestage(
         &self,
         metadata: &SnapshotMetadata,
@@ -3084,8 +3141,17 @@ impl SandboxBackend for PooledBackend {
         patch_fc_manifest_memory_ref(&dest.join("manifest.json"), mem_ref).await?;
 
         let export_id = crate::migration::MigrationRegistry::mint_export_id();
+        // Allowlist the FULL session manifest, not just the chunks new
+        // since the last durable row: the destination pulls the whole
+        // divergent set host-to-host (LAN) in the background instead of
+        // faulting/prefetching ~hundreds of chunks from GCS — the last
+        // tail of the post-teleport crawl (prod canary 52d6d808: a 959-
+        // chunk inline prefetch took 115 s via GCS). The fetch handler
+        // serves cache-resident chunks directly and falls back to the
+        // store for anything evicted.
         let mut allowed: std::collections::HashSet<engram_chunk_store::manifest::ChunkHash> =
             mem_hashes.iter().copied().collect();
+        allowed.extend(mem_manifest.chunks.iter().map(|c| c.hash));
         allowed.extend(disk_hashes.iter().copied());
         let inserted = self.migrations.insert(crate::migration::MigrationExport {
             export_id: export_id.clone(),
@@ -3153,6 +3219,7 @@ impl SandboxBackend for PooledBackend {
             }
         }
         let cache = self.chunk_cache.clone();
+        let store_fallback = self.chunk_store.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<MigrationFrame, SandboxError>>(16);
         tokio::spawn(async move {
             const FRAME: usize = 1024 * 1024;
@@ -3172,9 +3239,19 @@ impl SandboxBackend for PooledBackend {
                         match &cache {
                             Some(cache) => cache
                                 .get(hash, || async {
-                                    Err(engram_chunk_store::error::ChunkStoreError::Internal(
-                                        "export chunk must be cache-resident".into(),
-                                    ))
+                                    // Full-manifest pulls may name a chunk
+                                    // this host evicted; it's durable in
+                                    // the store (only the NEW chunks are
+                                    // cache-only, and those were pinned by
+                                    // the local-sink re-chunk).
+                                    match &store_fallback {
+                                        Some(cs) => cs.get_chunk(hash).await,
+                                        None => Err(
+                                            engram_chunk_store::error::ChunkStoreError::Internal(
+                                                "export chunk must be cache-resident".into(),
+                                            ),
+                                        ),
+                                    }
                                 })
                                 .await
                                 .map_err(|e| {
@@ -3331,55 +3408,59 @@ impl SandboxBackend for PooledBackend {
         if let Some(mig) = &migration {
             self.migration_prestage(&metadata, mig).await?;
             // Warm the FULL session-manifest chunk set in the
-            // background. The generic restore prefetch can't serve a
-            // migration (the v+1 manifest is unpublished by design —
-            // it 404s and falls back to on-demand), so the chain's
-            // PRIOR-version chunks were faulting in cold from GCS one
-            // at a time through the handler: the residual post-
-            // teleport crawl after the base prewarm + eager sweep
-            // (prod canary 973b2225, 11s handshake). Parse the INLINE
-            // manifest instead; the cache's parallel prefetch skips
-            // chunks the prestage already landed.
-            if let (Some(cs), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone()) {
-                match serde_json::from_slice::<engram_chunk_store::Manifest>(
+            // background, pulling from the SOURCE host (LAN) rather
+            // than GCS: the chain's prior-version chunks otherwise
+            // fault in cold (the residual post-teleport crawl; a 959-
+            // chunk GCS prefetch measured 115 s on canary 52d6d808).
+            // The export stays open until the coordinator's commit —
+            // which lands after the handshake — so the pull window is
+            // exactly the window that matters; anything unfinished
+            // falls back to per-fault GCS serving, correct as ever.
+            if let Some(cache) = self.chunk_cache.clone() {
+                if let Ok(m) = serde_json::from_slice::<engram_chunk_store::Manifest>(
                     &mig.memory_manifest_json,
                 ) {
-                    Ok(m) => {
-                        let hashes: Vec<_> = m.chunks.iter().map(|c| c.hash).collect();
+                    let staged: std::collections::HashSet<_> = mig
+                        .new_memory_chunk_hashes
+                        .iter()
+                        .map(|h| engram_chunk_store::manifest::ChunkHash::from_bytes(*h))
+                        .collect();
+                    let remaining: Vec<_> = m
+                        .chunks
+                        .iter()
+                        .map(|c| c.hash)
+                        .filter(|h| !staged.contains(h) && !cache.contains_on_disk(*h))
+                        .collect();
+                    if !remaining.is_empty() {
+                        let source_addr = mig.source_addr.clone();
+                        let export_id = mig.export_id.clone();
                         tokio::spawn(tracing::Instrument::instrument(
                             async move {
-                                let n = hashes.len();
-                                let store = cs.clone();
-                                match cache
-                                    .prefetch_chunks_parallel(
-                                        hashes,
-                                        MEMORY_PREFETCH_CONCURRENCY,
-                                        move |hash| {
-                                            let s = store.clone();
-                                            async move { s.get_chunk(hash).await }
-                                        },
-                                    )
-                                    .await
+                                let n = remaining.len();
+                                let t = std::time::Instant::now();
+                                match Self::pull_chunks_from_source(
+                                    &source_addr,
+                                    &export_id,
+                                    &remaining,
+                                    &cache,
+                                )
+                                .await
                                 {
-                                    Ok(()) => tracing::info!(
-                                        chunks = n,
-                                        "migration inline-manifest prefetch complete (ADR 0045 C1)"
+                                    Ok(pulled) => tracing::info!(
+                                        pulled,
+                                        of = n,
+                                        elapsed_ms = t.elapsed().as_millis() as u64,
+                                        "migration divergence pulled from source (ADR 0045 C1)"
                                     ),
                                     Err(e) => tracing::warn!(
                                         error = %e,
-                                        "migration inline-manifest prefetch failed; \
-                                         faults serve on-demand"
+                                        of = n,
+                                        "source divergence pull failed; faults serve via GCS"
                                     ),
                                 }
                             },
-                            tracing::info_span!("restore.migration_prefetch_bg"),
+                            tracing::info_span!("restore.migration_pull_bg"),
                         ));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "inline memory manifest unparseable; skipping prefetch"
-                        );
                     }
                 }
             }
