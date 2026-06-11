@@ -405,41 +405,90 @@ impl Runtime {
     /// against the fault loop via the `installed` bitmap; `wake=false`
     /// (no vCPU waits on a page it hasn't faulted).
     pub fn sweep_all(&self) -> Result<(), HandlerError> {
+        if std::env::var("ENGRAM_UFFD_EAGER_SWEEP")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            tracing::info!("eager sweep disabled via ENGRAM_UFFD_EAGER_SWEEP=0");
+            return Ok(());
+        }
+        // Time-box: each per-chunk install completes atomically (the
+        // `installed` bit and the bytes land together), so stopping
+        // BETWEEN chunks is always safe — the rest serve on-demand. A
+        // stuck origin fetch inside one chunk is the dangerous case
+        // (its bit is set; a faulting vCPU would wake onto a missing
+        // page), which is why fetches go through the cache's bounded
+        // path — the budget here is the backstop that keeps a slow
+        // sweep from monopolizing I/O long past its usefulness.
+        let budget = std::time::Duration::from_secs(
+            std::env::var("ENGRAM_UFFD_EAGER_SWEEP_BUDGET_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        );
+        let started = std::time::Instant::now();
         let chunk_size = self.backend.chunk_size();
         let total = self.backend.total_bytes();
         let mut installed = 0usize;
-        let mut offset: u64 = 0;
-        while offset < total {
-            let did = match self.backend.resolve(offset) {
-                Some(ResolvedPage::Canonical { canonical_offset }) => {
-                    match self.backend.canonical_chunk_hash(canonical_offset) {
-                        Some(hash) => match self.base_shm.as_ref() {
-                            Some(base) => {
-                                self.install_canonical_shared(base, offset, hash, false)?
-                            }
-                            None => {
-                                let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                                self.install_chunk_at(offset, bytes, false)?
-                            }
-                        },
-                        None => self.install_zero_substrate(offset, false)?,
+        let mut deferred = 0usize;
+        // Two passes, divergent first: those are the chunks an
+        // on-demand fault pays a fetch for (the post-teleport crawl);
+        // canonical pages CONTINUE from the (pre-warmed) base for
+        // near-free, and ZERO chunks are skipped entirely — eagerly
+        // installing them would privately materialize every untouched
+        // page of guest RAM (UFFDIO_ZEROPAGE is rejected on the
+        // substrate's MAP_PRIVATE file mapping, so each would COPY a
+        // zeroed buffer), defeating the density the substrate exists
+        // for. A zero fault is already served with no fetch.
+        for pass in ["divergent", "canonical"] {
+            let mut offset: u64 = 0;
+            while offset < total {
+                if started.elapsed() > budget {
+                    tracing::warn!(
+                        pass,
+                        installed,
+                        deferred,
+                        "eager sweep budget exhausted; remaining chunks serve on-demand"
+                    );
+                    return Ok(());
+                }
+                let did = match (pass, self.backend.resolve(offset)) {
+                    ("divergent", Some(ResolvedPage::Chunk { hash })) => {
+                        let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                        self.install_chunk_at(offset, bytes, false)?
                     }
+                    ("canonical", Some(ResolvedPage::Canonical { canonical_offset })) => {
+                        match self.backend.canonical_chunk_hash(canonical_offset) {
+                            Some(hash) => match self.base_shm.as_ref() {
+                                Some(base) => {
+                                    self.install_canonical_shared(base, offset, hash, false)?
+                                }
+                                None => {
+                                    let bytes =
+                                        self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                                    self.install_chunk_at(offset, bytes, false)?
+                                }
+                            },
+                            None => {
+                                deferred += 1;
+                                false
+                            }
+                        }
+                    }
+                    _ => false,
+                };
+                if did {
+                    installed += 1;
                 }
-                Some(ResolvedPage::Chunk { hash }) => {
-                    let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-                    self.install_chunk_at(offset, bytes, false)?
-                }
-                None => false,
-            };
-            if did {
-                installed += 1;
+                offset += chunk_size;
             }
-            offset += chunk_size;
         }
         tracing::info!(
             installed,
+            zero_skipped = deferred,
+            elapsed_ms = started.elapsed().as_millis() as u64,
             total_chunks = total.div_ceil(chunk_size),
-            "eager full sweep complete (ADR 0045 C1)"
+            "eager sweep complete (ADR 0045 C1)"
         );
         Ok(())
     }
