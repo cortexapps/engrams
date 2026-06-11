@@ -4233,9 +4233,20 @@ impl SandboxBackend for FirecrackerBackend {
 
         // Harness spawn: connect to agentd-1024 and round-trip SpawnHarness.
         // Separate span so the (usually fast) spawn is distinct from the wait.
+        let t_spawn = std::time::Instant::now();
         let resp: engram_agentd::WireResponse = tracing::Instrument::instrument(
             async {
                 let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
+                // ADR 0045 C1 tail diagnosis: split the handshake into
+                // host-visible sub-legs — a slow CONNECT means the guest
+                // isn't accepting (vCPUs starved / vsock not settled); a
+                // slow round-trip after a fast CONNECT means agentd
+                // itself is stuck past accept.
+                tracing::info!(
+                    sandbox_id = %id,
+                    connect_ms = t_spawn.elapsed().as_millis() as u64,
+                    "spawn-harness vsock connected",
+                );
                 engram_agentd::write_msg(&mut conn, &req)
                     .await
                     .map_err(|e| SandboxError::Vm(format!("write SpawnHarness: {e}").into()))?;
@@ -4262,6 +4273,20 @@ impl SandboxBackend for FirecrackerBackend {
                     pid = ?pid,
                     "fc agent handshake complete",
                 );
+                // Slow-handshake forensics without a jail shell: surface
+                // the uffd handler's own log tail into the host-agent's
+                // (pod-visible) logs. The handler runs detached with its
+                // stderr in the jail — invisible exactly when we need to
+                // see whether the eager sweep / fault loop was the stall.
+                if elapsed > 5.0 {
+                    let log_path = self.work_dir.join(id.to_string()).join("uffd-handler.log");
+                    if let Ok(contents) = std::fs::read_to_string(&log_path) {
+                        let tail: Vec<&str> = contents.lines().rev().take(30).collect();
+                        for line in tail.iter().rev() {
+                            tracing::info!(sandbox_id = %id, "uffd-handler.log| {line}");
+                        }
+                    }
+                }
                 Ok(())
             }
             engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
