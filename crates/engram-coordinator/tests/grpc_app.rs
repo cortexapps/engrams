@@ -1,9 +1,13 @@
-//! Smoke test for the ADR 0039 app gRPC scaffold (plan Task 8).
+//! Smoke test for the ADR 0039 app gRPC scaffold (plan Tasks 8 + 9).
 //!
 //! Serves the real `grpc_app::server` router on an ephemeral port and
-//! asserts a tonic client gets `Code::Unimplemented` back — proving
-//! the five services are mounted and answering, without any business
-//! logic behind them yet (that's Tasks 10-13).
+//! asserts, through a real tonic client:
+//!  - no/wrong bearer → `Code::Unauthenticated` (Task 9);
+//!  - valid bearer → `Code::Unimplemented` "ADR 0039 phase 2",
+//!    proving the five services are mounted and answering, without
+//!    any business logic behind them yet (that's Tasks 10-13);
+//!  - a server configured with ZERO tokens rejects everything
+//!    (fail closed — the opposite of the axum surface's dev bypass).
 //!
 //! The `StubMeta` mock below is a deliberate duplicate of the
 //! minimal-mock pattern in `dead_host_mock.rs` — the richer fixtures
@@ -219,7 +223,9 @@ impl MetadataStore for StubMeta {
 
 /// Minimal fully-wired `AppState`, mirroring the in-memory fixture in
 /// `api.rs::build_app_with_tokens` (which isn't importable from here).
-fn test_state() -> Arc<AppState> {
+/// `app_grpc_tokens` is the Task 9 service-bearer allow-list; empty =
+/// fail closed.
+fn test_state(app_grpc_tokens: Vec<String>) -> Arc<AppState> {
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
     let blob = || {
         Arc::new(engram_storage_local::LocalBlobStorage::new(
@@ -245,18 +251,56 @@ fn test_state() -> Arc<AppState> {
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
     };
-    Arc::new(AppState::new(CoordinatorConfig::default(), services))
+    let cfg = CoordinatorConfig {
+        app_grpc_tokens,
+        ..CoordinatorConfig::default()
+    };
+    Arc::new(AppState::new(cfg, services))
 }
 
-#[tokio::test]
-async fn app_grpc_scaffold_answers_unimplemented() {
+/// Token the test server is configured with — the happy-path credential.
+const TEST_TOKEN: &str = "test-app-grpc-token";
+
+/// Bring up the app-gRPC server on an ephemeral port; returns the dial
+/// address and the join handle so the caller can `abort()` it.
+async fn serve(state: Arc<AppState>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
         .expect("tcp incoming from listener");
-    let server = tokio::spawn(grpc_app::server(test_state()).serve_with_incoming(incoming));
+    let handle = tokio::spawn(async move {
+        let _ = grpc_app::server(state).serve_with_incoming(incoming).await;
+    });
+    (addr, handle)
+}
+
+/// tonic interceptor that stamps `Authorization: Bearer <token>` onto
+/// every outbound request — the only way to set per-call metadata short
+/// of hand-building each request.
+// `result_large_err`: the `Result<_, tonic::Status>` shape is what
+// tonic's `with_interceptor` requires; can't box it away.
+#[allow(clippy::result_large_err)]
+fn bearer(
+    token: &'static str,
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
+    move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii header"),
+        );
+        Ok(req)
+    }
+}
+
+/// Happy path: a server configured with `TEST_TOKEN`, called with a
+/// matching bearer, passes auth and reaches the Task 8 stub on all five
+/// services — `Unimplemented` "ADR 0039 phase 2". Proves auth lets the
+/// right caller through and that every service is mounted.
+#[tokio::test]
+async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
+    let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
 
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint uri")
@@ -264,11 +308,15 @@ async fn app_grpc_scaffold_answers_unimplemented() {
         .await
         .expect("dial app gRPC");
 
-    // The plan's Task 8 outcome: ListSessions answers Unimplemented.
-    let err = app::session_service_client::SessionServiceClient::new(channel.clone())
-        .list_sessions(app::ListSessionsRequest::default())
-        .await
-        .expect_err("scaffold must refuse ListSessions");
+    // The plan's Task 8 outcome, now gated behind auth: ListSessions
+    // answers Unimplemented for an authenticated caller.
+    let err = app::session_service_client::SessionServiceClient::with_interceptor(
+        channel.clone(),
+        bearer(TEST_TOKEN),
+    )
+    .list_sessions(app::ListSessionsRequest::default())
+    .await
+    .expect_err("scaffold must refuse ListSessions");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
 
@@ -276,34 +324,106 @@ async fn app_grpc_scaffold_answers_unimplemented() {
     // the one listener (an unmounted service would answer
     // `Unimplemented` too via tonic's fallback — but with a different
     // message, so the message assert above plus these keep us honest).
-    let err = app::fleet_service_client::FleetServiceClient::new(channel.clone())
-        .list_hosts(app::ListHostsRequest::default())
-        .await
-        .expect_err("scaffold must refuse ListHosts");
+    let err = app::fleet_service_client::FleetServiceClient::with_interceptor(
+        channel.clone(),
+        bearer(TEST_TOKEN),
+    )
+    .list_hosts(app::ListHostsRequest::default())
+    .await
+    .expect_err("scaffold must refuse ListHosts");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
 
-    let err = app::image_service_client::ImageServiceClient::new(channel.clone())
-        .list_enabled_images(app::ListEnabledImagesRequest::default())
-        .await
-        .expect_err("scaffold must refuse ListEnabledImages");
+    let err = app::image_service_client::ImageServiceClient::with_interceptor(
+        channel.clone(),
+        bearer(TEST_TOKEN),
+    )
+    .list_enabled_images(app::ListEnabledImagesRequest::default())
+    .await
+    .expect_err("scaffold must refuse ListEnabledImages");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
 
-    let err = app::secret_service_client::SecretServiceClient::new(channel.clone())
-        .has_secret(app::HasSecretRequest::default())
-        .await
-        .expect_err("scaffold must refuse HasSecret");
+    let err = app::secret_service_client::SecretServiceClient::with_interceptor(
+        channel.clone(),
+        bearer(TEST_TOKEN),
+    )
+    .has_secret(app::HasSecretRequest::default())
+    .await
+    .expect_err("scaffold must refuse HasSecret");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
 
     let outbound = tokio_stream::iter(Vec::<app::RelayShellRequest>::new());
-    let err = app::shell_relay_service_client::ShellRelayServiceClient::new(channel)
-        .relay(outbound)
-        .await
-        .expect_err("scaffold must refuse Relay");
+    let err = app::shell_relay_service_client::ShellRelayServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    )
+    .relay(outbound)
+    .await
+    .expect_err("scaffold must refuse Relay");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
+
+    server.abort();
+}
+
+/// Task 9: on a token-configured server, a call with no bearer and a
+/// call with the wrong bearer are both rejected `Unauthenticated` —
+/// the check fires before the stub, so we never see `Unimplemented`.
+#[tokio::test]
+async fn app_grpc_rejects_missing_and_wrong_bearer() {
+    let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint uri")
+        .connect()
+        .await
+        .expect("dial app gRPC");
+
+    // No Authorization metadata at all.
+    let err = app::session_service_client::SessionServiceClient::new(channel.clone())
+        .list_sessions(app::ListSessionsRequest::default())
+        .await
+        .expect_err("missing bearer must be refused");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err:?}");
+
+    // A bearer that isn't in the allow-list.
+    let err = app::session_service_client::SessionServiceClient::with_interceptor(
+        channel,
+        bearer("not-the-token"),
+    )
+    .list_sessions(app::ListSessionsRequest::default())
+    .await
+    .expect_err("wrong bearer must be refused");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err:?}");
+
+    server.abort();
+}
+
+/// Task 9 fail-closed: a server built with ZERO configured tokens
+/// rejects everything — even a syntactically valid bearer. This is the
+/// deliberate opposite of the axum surface's empty-list dev bypass; a
+/// deployment that forgets `ENGRAM_APP_GRPC_TOKENS` serves a closed
+/// door, not an open admin plane.
+#[tokio::test]
+async fn app_grpc_fails_closed_with_no_tokens_configured() {
+    let (addr, server) = serve(test_state(vec![])).await;
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint uri")
+        .connect()
+        .await
+        .expect("dial app gRPC");
+
+    let err = app::session_service_client::SessionServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    )
+    .list_sessions(app::ListSessionsRequest::default())
+    .await
+    .expect_err("fail-closed: no tokens means reject everything");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err:?}");
 
     server.abort();
 }

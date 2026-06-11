@@ -102,6 +102,21 @@ struct Cli {
     #[arg(long, env = "ENGRAM_APP_GRPC_ADDR", default_value = "127.0.0.1:50061")]
     app_grpc_addr: std::net::SocketAddr,
 
+    /// Comma-separated bearer tokens accepted on the app gRPC surface
+    /// (ADR 0039 §5) — the orchestrator's machine credential, separate
+    /// from `--auth-tokens` (different caller, different blast radius,
+    /// independently rotatable; >1 entry only during rotation overlap).
+    /// Unlike `--auth-tokens`, empty does NOT disable auth: the app
+    /// surface fails closed and rejects every call until a token is
+    /// configured. Boot is unaffected.
+    #[arg(
+        long,
+        env = "ENGRAM_APP_GRPC_TOKENS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    app_grpc_tokens: Vec<String>,
+
     /// Address the Prometheus `/metrics` exporter listens on.
     /// Separate port from the main API so scrapers reach a
     /// bearer-free endpoint without going through nginx + IAP.
@@ -429,6 +444,16 @@ async fn main() -> Result<(), CoordinatorError> {
         auth: build_auth_config(&cli)?,
         harness_listen_addr: cli.harness_listen_addr,
         app_grpc_addr: cli.app_grpc_addr,
+        // Same empty-entry stripping as `auth_tokens` above (clap's
+        // value_delimiter turns an unset env into one "" entry), plus
+        // trim so `a, b` rotation lists don't mint a " b" token. An
+        // empty result fails closed in grpc_app — never auth-off.
+        app_grpc_tokens: cli
+            .app_grpc_tokens
+            .iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
     };
 
     let pg = PostgresStore::connect(&cfg.database_url)

@@ -39,6 +39,16 @@ pub struct CoordinatorConfig {
     /// the only intended caller and co-locates with the coordinator
     /// in dev.
     pub app_grpc_addr: std::net::SocketAddr,
+    /// Bearer tokens accepted on the app gRPC surface (ADR 0039 §5).
+    /// Machine identity for exactly one caller (the orchestrator) —
+    /// deliberately a separate credential from `auth_tokens` above
+    /// (different caller, different blast radius, independently
+    /// rotatable). More than one entry only during rotation overlap.
+    ///
+    /// Unlike `auth_tokens`, empty does NOT mean "auth disabled":
+    /// this surface fails closed — no configured tokens, every call
+    /// answers `unauthenticated` (boot is unaffected).
+    pub app_grpc_tokens: Vec<String>,
 }
 
 impl Default for CoordinatorConfig {
@@ -62,6 +72,9 @@ impl Default for CoordinatorConfig {
             app_grpc_addr: "127.0.0.1:50061"
                 .parse()
                 .expect("default app_grpc_addr must parse"),
+            // Empty = fail closed (every app-gRPC call rejected), NOT
+            // auth-off. Populated from `ENGRAM_APP_GRPC_TOKENS`.
+            app_grpc_tokens: Vec::new(),
         }
     }
 }

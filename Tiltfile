@@ -251,6 +251,18 @@ bin_dir = env_or('ENGRAM_INTEG_BIN_DIR', '')
 # to ship spans elsewhere (or to '' to disable export entirely).
 otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 
+# ADR 0039 §5: the app-gRPC surface fails closed — it serves
+# `unauthenticated` until a bearer is configured. This is the
+# orchestrator's machine credential, deliberately separate from the
+# host-agents' ENGRAM_AUTH_TOKENS (different caller, different blast
+# radius). A fixed dev literal is fine here: deterministic across
+# restarts, never leaves loopback, never ships. The SAME value is
+# exported as CONTROL_PLANE_BEARER for the (future) orchestrator
+# resource (Task 14) so the two ends agree with no later wiring task —
+# Task 14 just reads `app_grpc_dev_token` / sets CONTROL_PLANE_BEARER.
+app_grpc_dev_token = env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token')
+control_plane_bearer = app_grpc_dev_token  # orchestrator (Task 14) → CONTROL_PLANE_BEARER
+
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
     'ENGRAM_BIND_ADDR': '127.0.0.1:8090',
@@ -271,6 +283,10 @@ coord_env = {
     'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
     'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
     'RUST_LOG': 'info,engram=debug',
+    # ADR 0039 §5: app-gRPC service-bearer allow-list (comma-separated
+    # to allow rotation overlap). Fail-closed surface — must be set or
+    # every orchestrator call gets `unauthenticated`.
+    'ENGRAM_APP_GRPC_TOKENS': app_grpc_dev_token,
 }
 
 # Kernel env var only applies to a real-virt backend (mode=all + vz, or

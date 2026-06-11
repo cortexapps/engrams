@@ -5,11 +5,15 @@
 //! Task 8 scaffold: every RPC answers `Code::Unimplemented`. Tasks
 //! 10-13 replace the stubs service-by-service with extract-and-delegate
 //! implementations over the same `AppState` the axum handlers use.
-//! The caller is a single trusted service (the orchestrator,
-//! bearer-authed from Task 9); per-user authz lives over there, not
-//! here.
+//! The caller is a single trusted service (the orchestrator),
+//! authenticated per-RPC by a static bearer ([`auth::BearerAuth`],
+//! ADR 0039 §5 — fail closed when no tokens are configured); per-user
+//! authz lives over there, not here.
+
+pub mod auth;
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use engram_protocol::app;
@@ -39,31 +43,39 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// eagerly bound listener in lib.rs, `serve_with_incoming` on an
 /// ephemeral port in tests).
 pub fn server(state: SharedState) -> tonic::transport::server::Router {
+    // One shared allow-list snapshot for all five services, taken from
+    // config at construction time (no hot-reload; rotation = overlap
+    // both tokens, restart, drop the old one).
+    let auth = Arc::new(auth::BearerAuth::new(state.cfg.app_grpc_tokens.clone()));
     tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .add_service(app::session_service_server::SessionServiceServer::new(
             AppSessionService {
                 state: state.clone(),
+                auth: auth.clone(),
             },
         ))
         .add_service(
             app::shell_relay_service_server::ShellRelayServiceServer::new(AppShellRelayService {
                 state: state.clone(),
+                auth: auth.clone(),
             }),
         )
         .add_service(app::fleet_service_server::FleetServiceServer::new(
             AppFleetService {
                 state: state.clone(),
+                auth: auth.clone(),
             },
         ))
         .add_service(app::image_service_server::ImageServiceServer::new(
             AppImageService {
                 state: state.clone(),
+                auth: auth.clone(),
             },
         ))
         .add_service(app::secret_service_server::SecretServiceServer::new(
-            AppSecretService { state },
+            AppSecretService { state, auth },
         ))
 }
 
@@ -71,50 +83,56 @@ pub struct AppSessionService {
     // Consumed from Task 10 onward; the scaffold only carries it.
     #[allow(dead_code)]
     pub state: SharedState,
-    // auth field arrives in Task 9
+    pub auth: Arc<auth::BearerAuth>,
 }
 
 #[tonic::async_trait]
 impl app::session_service_server::SessionService for AppSessionService {
     async fn list_sessions(
         &self,
-        _req: Request<app::ListSessionsRequest>,
+        req: Request<app::ListSessionsRequest>,
     ) -> Result<Response<app::ListSessionsResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn create_session(
         &self,
-        _req: Request<app::CreateSessionRequest>,
+        req: Request<app::CreateSessionRequest>,
     ) -> Result<Response<app::CreateSessionResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn get_session(
         &self,
-        _req: Request<app::GetSessionRequest>,
+        req: Request<app::GetSessionRequest>,
     ) -> Result<Response<app::GetSessionResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn delete_session(
         &self,
-        _req: Request<app::DeleteSessionRequest>,
+        req: Request<app::DeleteSessionRequest>,
     ) -> Result<Response<app::DeleteSessionResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn send_prompt(
         &self,
-        _req: Request<app::SendPromptRequest>,
+        req: Request<app::SendPromptRequest>,
     ) -> Result<Response<app::SendPromptResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn interrupt(
         &self,
-        _req: Request<app::InterruptRequest>,
+        req: Request<app::InterruptRequest>,
     ) -> Result<Response<app::InterruptResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
@@ -122,8 +140,9 @@ impl app::session_service_server::SessionService for AppSessionService {
 
     async fn stream_events(
         &self,
-        _req: Request<app::StreamEventsRequest>,
+        req: Request<app::StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
@@ -131,50 +150,57 @@ impl app::session_service_server::SessionService for AppSessionService {
 
     async fn exec(
         &self,
-        _req: Request<app::ExecRequest>,
+        req: Request<app::ExecRequest>,
     ) -> Result<Response<Self::ExecStream>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn get_log(
         &self,
-        _req: Request<app::GetLogRequest>,
+        req: Request<app::GetLogRequest>,
     ) -> Result<Response<app::GetLogResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn snapshot(
         &self,
-        _req: Request<app::SnapshotRequest>,
+        req: Request<app::SnapshotRequest>,
     ) -> Result<Response<app::SnapshotResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn resume(
         &self,
-        _req: Request<app::ResumeRequest>,
+        req: Request<app::ResumeRequest>,
     ) -> Result<Response<app::ResumeResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn evict_local(
         &self,
-        _req: Request<app::EvictLocalRequest>,
+        req: Request<app::EvictLocalRequest>,
     ) -> Result<Response<app::EvictLocalResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn get_cow_state(
         &self,
-        _req: Request<app::GetCowStateRequest>,
+        req: Request<app::GetCowStateRequest>,
     ) -> Result<Response<app::GetCowStateResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn list_checkpoints(
         &self,
-        _req: Request<app::ListCheckpointsRequest>,
+        req: Request<app::ListCheckpointsRequest>,
     ) -> Result<Response<app::ListCheckpointsResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
@@ -182,15 +208,17 @@ impl app::session_service_server::SessionService for AppSessionService {
 
     async fn get_artifact(
         &self,
-        _req: Request<app::GetArtifactRequest>,
+        req: Request<app::GetArtifactRequest>,
     ) -> Result<Response<Self::GetArtifactStream>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn create_artifact_from_path(
         &self,
-        _req: Request<app::CreateArtifactFromPathRequest>,
+        req: Request<app::CreateArtifactFromPathRequest>,
     ) -> Result<Response<app::CreateArtifactFromPathResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 }
@@ -198,6 +226,7 @@ impl app::session_service_server::SessionService for AppSessionService {
 pub struct AppShellRelayService {
     #[allow(dead_code)]
     pub state: SharedState,
+    pub auth: Arc<auth::BearerAuth>,
 }
 
 #[tonic::async_trait]
@@ -206,8 +235,9 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
 
     async fn relay(
         &self,
-        _req: Request<tonic::Streaming<app::RelayShellRequest>>,
+        req: Request<tonic::Streaming<app::RelayShellRequest>>,
     ) -> Result<Response<Self::RelayStream>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 }
@@ -215,98 +245,112 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
 pub struct AppFleetService {
     #[allow(dead_code)]
     pub state: SharedState,
+    pub auth: Arc<auth::BearerAuth>,
 }
 
 #[tonic::async_trait]
 impl app::fleet_service_server::FleetService for AppFleetService {
     async fn list_hosts(
         &self,
-        _req: Request<app::ListHostsRequest>,
+        req: Request<app::ListHostsRequest>,
     ) -> Result<Response<app::ListHostsResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn get_host(
         &self,
-        _req: Request<app::GetHostRequest>,
+        req: Request<app::GetHostRequest>,
     ) -> Result<Response<app::GetHostResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn get_host_cow_state(
         &self,
-        _req: Request<app::GetHostCowStateRequest>,
+        req: Request<app::GetHostCowStateRequest>,
     ) -> Result<Response<app::GetHostCowStateResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn drain_host(
         &self,
-        _req: Request<app::DrainHostRequest>,
+        req: Request<app::DrainHostRequest>,
     ) -> Result<Response<app::DrainHostResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn admin_drain_host(
         &self,
-        _req: Request<app::AdminDrainHostRequest>,
+        req: Request<app::AdminDrainHostRequest>,
     ) -> Result<Response<app::AdminDrainHostResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn cordon_host(
         &self,
-        _req: Request<app::CordonHostRequest>,
+        req: Request<app::CordonHostRequest>,
     ) -> Result<Response<app::CordonHostResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn uncordon_host(
         &self,
-        _req: Request<app::UncordonHostRequest>,
+        req: Request<app::UncordonHostRequest>,
     ) -> Result<Response<app::UncordonHostResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn get_storage_summary(
         &self,
-        _req: Request<app::GetStorageSummaryRequest>,
+        req: Request<app::GetStorageSummaryRequest>,
     ) -> Result<Response<app::GetStorageSummaryResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn flush_session(
         &self,
-        _req: Request<app::FlushSessionRequest>,
+        req: Request<app::FlushSessionRequest>,
     ) -> Result<Response<app::FlushSessionResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn evacuate_session(
         &self,
-        _req: Request<app::EvacuateSessionRequest>,
+        req: Request<app::EvacuateSessionRequest>,
     ) -> Result<Response<app::EvacuateSessionResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn chunk_gc(
         &self,
-        _req: Request<app::ChunkGcRequest>,
+        req: Request<app::ChunkGcRequest>,
     ) -> Result<Response<app::ChunkGcResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn bundle_gc(
         &self,
-        _req: Request<app::BundleGcRequest>,
+        req: Request<app::BundleGcRequest>,
     ) -> Result<Response<app::BundleGcResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn snapshot_blob_gc(
         &self,
-        _req: Request<app::SnapshotBlobGcRequest>,
+        req: Request<app::SnapshotBlobGcRequest>,
     ) -> Result<Response<app::SnapshotBlobGcResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 }
@@ -314,77 +358,88 @@ impl app::fleet_service_server::FleetService for AppFleetService {
 pub struct AppImageService {
     #[allow(dead_code)]
     pub state: SharedState,
+    pub auth: Arc<auth::BearerAuth>,
 }
 
 #[tonic::async_trait]
 impl app::image_service_server::ImageService for AppImageService {
     async fn list_enabled_images(
         &self,
-        _req: Request<app::ListEnabledImagesRequest>,
+        req: Request<app::ListEnabledImagesRequest>,
     ) -> Result<Response<app::ListEnabledImagesResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn enable_image(
         &self,
-        _req: Request<app::EnableImageRequest>,
+        req: Request<app::EnableImageRequest>,
     ) -> Result<Response<app::EnableImageResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn disable_image(
         &self,
-        _req: Request<app::DisableImageRequest>,
+        req: Request<app::DisableImageRequest>,
     ) -> Result<Response<app::DisableImageResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn refresh_image(
         &self,
-        _req: Request<app::RefreshImageRequest>,
+        req: Request<app::RefreshImageRequest>,
     ) -> Result<Response<app::RefreshImageResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn list_enable_jobs(
         &self,
-        _req: Request<app::ListEnableJobsRequest>,
+        req: Request<app::ListEnableJobsRequest>,
     ) -> Result<Response<app::ListEnableJobsResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn get_enable_job(
         &self,
-        _req: Request<app::GetEnableJobRequest>,
+        req: Request<app::GetEnableJobRequest>,
     ) -> Result<Response<app::GetEnableJobResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn retry_enable_job(
         &self,
-        _req: Request<app::RetryEnableJobRequest>,
+        req: Request<app::RetryEnableJobRequest>,
     ) -> Result<Response<app::RetryEnableJobResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn list_registries(
         &self,
-        _req: Request<app::ListRegistriesRequest>,
+        req: Request<app::ListRegistriesRequest>,
     ) -> Result<Response<app::ListRegistriesResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn add_registry(
         &self,
-        _req: Request<app::AddRegistryRequest>,
+        req: Request<app::AddRegistryRequest>,
     ) -> Result<Response<app::AddRegistryResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn delete_registry(
         &self,
-        _req: Request<app::DeleteRegistryRequest>,
+        req: Request<app::DeleteRegistryRequest>,
     ) -> Result<Response<app::DeleteRegistryResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 }
@@ -392,28 +447,32 @@ impl app::image_service_server::ImageService for AppImageService {
 pub struct AppSecretService {
     #[allow(dead_code)]
     pub state: SharedState,
+    pub auth: Arc<auth::BearerAuth>,
 }
 
 #[tonic::async_trait]
 impl app::secret_service_server::SecretService for AppSecretService {
     async fn put_secret(
         &self,
-        _req: Request<app::PutSecretRequest>,
+        req: Request<app::PutSecretRequest>,
     ) -> Result<Response<app::PutSecretResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn has_secret(
         &self,
-        _req: Request<app::HasSecretRequest>,
+        req: Request<app::HasSecretRequest>,
     ) -> Result<Response<app::HasSecretResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 
     async fn delete_secret(
         &self,
-        _req: Request<app::DeleteSecretRequest>,
+        req: Request<app::DeleteSecretRequest>,
     ) -> Result<Response<app::DeleteSecretResponse>, Status> {
+        self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
     }
 }
