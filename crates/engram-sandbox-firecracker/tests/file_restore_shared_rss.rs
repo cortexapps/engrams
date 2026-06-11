@@ -301,6 +301,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
     let cache = ChunkCache::new(ChunkCacheConfig {
         root: store_root.path().join("cache"),
         budget_bytes: 4 * 1024 * 1024 * 1024,
+        sweep_debounce_ms: 0,
     });
     let memory_manifest = chunk_store
         .chunk_file(&mem_path, ManifestKind::Memory, None)
