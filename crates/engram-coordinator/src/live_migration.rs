@@ -117,9 +117,23 @@ pub async fn migrate_session_live(
             )
         })?;
 
+    // Resolve the source's backend handle ONCE, pre-freeze, and use it
+    // for capture, the failure-arm aborts, AND the post-rebind commit.
+    // Commit cannot route by sandbox id: step 4's
+    // `invalidate_sandbox(sandbox_id)` drops the old route on purpose
+    // (the old sandbox must stop serving exec), and the PG read-through
+    // finds nothing because the session row already points at the new
+    // sandbox — prod canary 5fa742b7 hit exactly this ("sandbox not
+    // found" on commit; the source stayed frozen until the export TTL
+    // destroyed it ~2 min later).
+    let source_backend = match state.host_registry.resolve_owner(sandbox_id).await {
+        Ok((_, backend)) => backend,
+        Err(e) => return Err(MigrateError::Fatal(format!("resolve source host: {e}"))),
+    };
+
     // ---- 1. Freeze the source (downtime clock starts) ----
     let t_capture = std::time::Instant::now();
-    let capture = match state.services.host.migration_capture(sandbox_id).await {
+    let capture = match source_backend.migration_capture(sandbox_id).await {
         Ok(c) => c,
         Err(SandboxError::InvalidSpec(reason)) => {
             return Err(MigrateError::Unsupported(reason));
@@ -140,9 +154,7 @@ pub async fn migrate_session_live(
         .transition_session(session_id, SessionState::Evacuating)
         .await
     {
-        let _ = state
-            .services
-            .host
+        let _ = source_backend
             .migration_abort(sandbox_id, &capture.export_id)
             .await;
         return Err(MigrateError::AbortedToSource(format!("transition: {e}")));
@@ -184,9 +196,7 @@ pub async fn migrate_session_live(
         Err(e) => {
             // Dest failure pre-rebind: un-pause the source in place and
             // walk the session back to Active. Zero loss.
-            let abort_ok = state
-                .services
-                .host
+            let abort_ok = source_backend
                 .migration_abort(sandbox_id, &capture.export_id)
                 .await
                 .is_ok();
@@ -257,9 +267,11 @@ pub async fn migrate_session_live(
     state.teleport_targets.remove(&session_id);
 
     // ---- 5. Commit the source + finalize durability in background ----
-    if let Err(e) = state
-        .services
-        .host
+    // Via the pre-freeze handle: the registry can no longer route the
+    // old sandbox id (invalidated at step 4, and PG points at the new
+    // sandbox), so sandbox-routed dispatch would land "sandbox not
+    // found" and leave the source frozen until the export TTL.
+    if let Err(e) = source_backend
         .migration_commit(sandbox_id, &capture.export_id)
         .await
     {
@@ -685,6 +697,170 @@ mod tests {
             meta.get_session(session_id).await.unwrap().status,
             SessionState::Active,
             "session walks back to Active (zero loss)",
+        );
+    }
+
+    /// The commit-routing regression (prod canary 5fa742b7): step 4's
+    /// `invalidate_sandbox` + the PG rebind make the OLD sandbox id
+    /// unroutable, so a sandbox-routed `migration_commit` lands
+    /// "sandbox not found" and the frozen source lingers until the
+    /// export TTL. The verb must commit through the source backend
+    /// handle it resolved before freezing.
+    #[tokio::test]
+    async fn commit_reaches_the_frozen_source_after_rebind() {
+        use engram_core::types::snapshot::{MigrationCaptureOut, SnapshotMetadata};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct MigratableHappyPath {
+            commit_called: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl engram_core::traits::SandboxBackend for MigratableHappyPath {
+            async fn create(
+                &self,
+                _: engram_core::types::sandbox::SandboxSpec,
+            ) -> Result<SandboxId, engram_core::SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), engram_core::SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, engram_core::SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                Err(engram_core::SandboxError::NotFound)
+            }
+            async fn snapshot(
+                &self,
+                _: SandboxId,
+            ) -> Result<SnapshotMetadata, engram_core::SandboxError> {
+                Err(engram_core::SandboxError::NotFound)
+            }
+            async fn migration_capture(
+                &self,
+                _: SandboxId,
+            ) -> Result<MigrationCaptureOut, engram_core::SandboxError> {
+                let mref = engram_core::types::manifest::ManifestRef::new();
+                Ok(MigrationCaptureOut {
+                    export_id: "test-export".into(),
+                    memory_manifest_json: b"{}".to_vec(),
+                    disk_manifest_json: Vec::new(),
+                    memory_manifest_ref: mref,
+                    disk_manifest_ref: engram_core::types::manifest::ManifestRef::new(),
+                    new_memory_chunk_hashes: Vec::new(),
+                    new_disk_chunk_hashes: Vec::new(),
+                    snapshot_id: engram_core::types::SnapshotId::new(),
+                    paused_at_unix_ms: 0,
+                })
+            }
+            async fn migration_commit(
+                &self,
+                _: SandboxId,
+                _: &str,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.commit_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn restore(
+                &self,
+                _: SnapshotMetadata,
+            ) -> Result<SandboxId, engram_core::SandboxError> {
+                Ok(SandboxId::new())
+            }
+            fn snapshot_path_for(&self, _: engram_core::types::SnapshotId) -> std::path::PathBuf {
+                std::path::PathBuf::from("/nonexistent")
+            }
+        }
+
+        let session = active_session();
+        let session_id = session.id;
+        let source_host = session.host_id.expect("source host");
+        let old_sandbox = session.sandbox_id.expect("source sandbox");
+        let (state, meta, target) = build_state(session);
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let happy: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(MigratableHappyPath {
+            commit_called: commit_called.clone(),
+        });
+        state.host_registry.register(
+            target,
+            Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(happy.clone())),
+        );
+        // Re-register resets the heartbeat state — restore capacity.
+        state.host_registry.update_state(
+            target,
+            crate::host_registry::HostState {
+                capacity: engram_protocol::heartbeat::HostCapacityReport {
+                    total_mib: 16_384,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining: false,
+                ready_images: Default::default(),
+                current_bundles: Vec::new(),
+                utilization: Default::default(),
+            },
+        );
+        // The source resolves through the recorded sandbox owner (the
+        // same fake backend serves both roles, as in the abort test).
+        state
+            .host_registry
+            .record_sandbox_owner(old_sandbox, target);
+        meta.hosts
+            .lock()
+            .push(engram_core::types::host::HostRecord {
+                id: source_host,
+                hostname: "src".into(),
+                cloud_metadata: engram_core::types::host::HostMetadata::default(),
+                capacity: engram_core::types::host::HostCapacity {
+                    total_gb: 100,
+                    used_gb: 10,
+                    total_mib: 65_536,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: Default::default(),
+                status: engram_core::types::host::HostStatus::Ready,
+                last_heartbeat_at: chrono::Utc::now(),
+                host_addr: Some("http://127.0.0.1:1".into()),
+            });
+        meta.snapshots
+            .lock()
+            .push(engram_core::types::snapshot::SnapshotRecord {
+                id: engram_core::types::SnapshotId::new(),
+                session_id: Some(session_id),
+                host_id: Some(source_host),
+                image_version: "test".into(),
+                size_bytes: 1,
+                created_at: chrono::Utc::now(),
+                last_accessed_at: chrono::Utc::now(),
+                disk_manifest: None,
+                memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
+                recoverable: true,
+                aux_bundles: Vec::new(),
+                events_cursor: None,
+            });
+
+        migrate_session_live(&state, session_id, target)
+            .await
+            .expect("happy-path migration must succeed");
+        assert!(
+            commit_called.load(Ordering::SeqCst),
+            "the frozen source must receive migration_commit even though \
+             the old sandbox id is unroutable after the rebind",
+        );
+        let after = meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.host_id, Some(target), "session rebound to dest");
+        assert_ne!(
+            after.sandbox_id,
+            Some(old_sandbox),
+            "session points at the new sandbox",
         );
     }
 
