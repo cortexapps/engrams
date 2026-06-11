@@ -95,6 +95,46 @@ impl HostClient for LocalHostClient {
         self.sandbox.snapshot(id).await
     }
 
+    async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        self.sandbox.snapshot_begin(id).await
+    }
+
+    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        self.sandbox.snapshot_wait(id).await
+    }
+
+    async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        self.sandbox.migration_capture(id).await
+    }
+
+    async fn migration_fetch(
+        &self,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<engram_core::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        self.sandbox.migration_fetch(export_id, items).await
+    }
+
+    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        self.sandbox.migration_commit(id, export_id).await
+    }
+
+    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        self.sandbox.migration_abort(id, export_id).await
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         self.sandbox.commit_snapshot(id).await
     }
@@ -166,6 +206,16 @@ impl HostClient for LocalHostClient {
             .interrupt(sandbox_id)
             .await
             .map_err(harness_err_to_sandbox)
+    }
+
+    // ADR 0045 Phase F: freeze/unfreeze the microVM in place — pure
+    // delegation to the inner backend (no harness involvement).
+    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.sandbox.pause(sandbox_id).await
+    }
+
+    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.sandbox.resume(sandbox_id).await
     }
 
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {

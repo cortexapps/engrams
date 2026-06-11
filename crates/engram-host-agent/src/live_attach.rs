@@ -1,21 +1,25 @@
-//! ADR 0009 Phase 6: live-VM reattach pass.
+//! Live-VM reattach pass (ADR 0009 §6, made load-bearing by ADR 0044 K2).
 //!
-//! Run once at host-agent startup (before dialing the coord) when
-//! the backend is Firecracker AND `ENGRAM_LIVE_ATTACH=1`. Scans the
-//! work_dir for `<sandbox_id>/sandbox.json` manifests and, for each:
+//! Run once at host-agent startup (before dialing the coord) when the
+//! backend is Firecracker. Scans the work_dir for
+//! `<sandbox_id>/sandbox.json` manifests and, for each:
 //!
-//!   - Path 1 (this phase): pidfd-attach the still-live FC process.
-//!     Three-axis identity verification + FC API liveness + TAP
-//!     check. On success the sandbox rejoins `backend.list()` and
-//!     reconcile will see it on the next heartbeat — no flip.
-//!   - Path 2 (Phase 8): NVMe local-snapshot restore. Not implemented
-//!     yet; this driver reports the path-1 failure cause so the
-//!     Phase 8 layering knows what to look at.
-//!   - Path 3 (this phase + Phase 10): orphan-reap. On any verification
-//!     failure that isn't "FC alive but elsewhere" we delete the
-//!     manifest and let the jail_dir get reaped by the existing
-//!     `engram-host-agent/src/orphan_reap.rs` machinery. The reconcile
-//!     pass then transitions the owning session per ADR 0009 §3.
+//! - Reattach: pidfd-attach the still-live FC (and uffd-handler)
+//!   process(es). Three-axis identity verification + FC API liveness +
+//!   TAP check. On success the sandbox rejoins `backend.list()`, so the
+//!   very first heartbeat re-advertises it — the coord never sees it
+//!   missing, no session flip. This is the routine path under ADR 0044
+//!   K2: a host-agent restart *detaches* its VMs (leaves them running
+//!   under hostPID) and the successor re-adopts them here.
+//! - Orphan-reap: when the FC process is truly gone (or identity
+//!   fails), delete the manifest and let `orphan_reap.rs` reap the
+//!   jail_dir. Reconcile then transitions the owning session, which
+//!   warm-recovers elsewhere from its last periodic checkpoint.
+//!
+//! There is deliberately no "restore from a SIGTERM checkpoint" path:
+//! ADR 0044 K2 removed the on-shutdown checkpoint entirely. Durability
+//! for an uncontrolled node loss rides the always-on periodic
+//! checkpoint; controlled drains migrate sessions off the node first.
 //!
 //! The driver itself is backend-agnostic in shape — currently only
 //! the FC backend implements `reattach_sandbox`. VZ + process get a
@@ -143,43 +147,31 @@ pub async fn reattach_pass(
                 });
             }
             Err(path1_err) => {
+                // Reattach failed: the FC exited, its identity didn't match, a
+                // dead API socket, or an unrecoverable network state. ADR 0044
+                // K2 has no local restore fallback — drop the manifest and let
+                // reconcile transition the owning session, which warm-recovers
+                // elsewhere from its last periodic checkpoint.
                 let reason = format!("{path1_err}");
                 tracing::info!(
                     sandbox_id = %sandbox_id_str,
                     error = %reason,
-                    "reattach pass: path 1 failed; trying path 2 (NVMe local-snapshot restore)"
+                    "reattach pass: FC unreattachable; orphan-reaping (session reconciles)"
                 );
-                // ADR 0009 Phase 8 path 2: when path 1 fails AND
-                // the manifest carries a SIGTERM checkpoint
-                // reference, re-spawn FC from the local snapshot
-                // preserving the original sandbox_id. The coord's
-                // routing then continues working without flipping
-                // the session.
-                match try_path2_restore(backend, &manifest).await {
-                    Some(Ok(())) => {
-                        tracing::info!(
-                            sandbox_id = %sandbox_id_str,
-                            "reattach pass: path 2 success (NVMe local-snapshot restore)"
-                        );
-                        report.reattached.push(ReattachOutcome::Reattached {
-                            sandbox_id: sandbox_id_str,
-                            pid: 0,
-                        });
-                        continue;
-                    }
-                    Some(Err(path2_err)) => {
-                        tracing::warn!(
-                            sandbox_id = %sandbox_id_str,
-                            error = %path2_err,
-                            "reattach pass: path 2 failed; falling through to orphan-reap"
-                        );
-                    }
-                    None => {
-                        tracing::debug!(
-                            sandbox_id = %sandbox_id_str,
-                            "reattach pass: no last_local_snapshot in manifest; path 2 not applicable"
-                        );
-                    }
+                // ADR 0044 K2: don't leak a still-running microVM. The FC may
+                // have died (then the pid is harmless), but it may also be
+                // ALIVE-but-unreattachable — leaving it running orphans a
+                // microVM that no host-agent owns, burning the node's RAM. Kill
+                // the FC + its uffd-handler IFF they're still the recorded
+                // processes (start-time identity match); a recycled pid is left
+                // untouched.
+                reap_orphan_if_alive(
+                    manifest.firecracker.process.pid,
+                    manifest.firecracker.process.start_time_jiffies,
+                    "firecracker",
+                );
+                if let Some(uffd) = manifest.uffd_handler.as_ref() {
+                    reap_orphan_if_alive(uffd.pid, uffd.start_time_jiffies, "uffd-handler");
                 }
                 engram_sandbox_firecracker::sandbox_manifest::delete_manifest(&manifest_path);
                 report.orphaned.push(ReattachOutcome::Orphaned {
@@ -194,22 +186,33 @@ pub async fn reattach_pass(
     Ok(report)
 }
 
-/// ADR 0009 Phase 8: path 2 NVMe restore. Returns `Some(Ok)` on
-/// successful restore, `Some(Err)` on failure (FC restore errored
-/// out — caller falls through to orphan), `None` when the manifest
-/// has no `last_local_snapshot` (no SIGTERM checkpoint was taken;
-/// path 2 isn't applicable — caller orphans).
-async fn try_path2_restore(
-    backend: &Arc<engram_sandbox_firecracker::FirecrackerBackend>,
-    manifest: &engram_sandbox_firecracker::sandbox_manifest::SandboxManifest,
-) -> Option<Result<(), engram_core::SandboxError>> {
-    let local = manifest.last_local_snapshot.as_ref()?;
-    let snapshot_id = local.snapshot_id?;
-    Some(
-        backend
-            .restore_as_sandbox_id(manifest.sandbox_id, snapshot_id)
-            .await,
-    )
+/// ADR 0044 K2: SIGKILL a manifest-recorded process IFF it's still the
+/// original — verified by `/proc` start-time identity, so a recycled pid is
+/// never signalled (the kernel reuses pids but not `(pid, start_time)` pairs).
+/// The orphan-reap uses this to stop a leaked, unreattachable microVM (FC +
+/// uffd-handler) from burning the node's RAM with no owner. On non-Linux
+/// `read_proc_start_time_jiffies` returns `None`, so this is a no-op.
+fn reap_orphan_if_alive(pid: u32, manifest_start_jiffies: u64, what: &str) {
+    let live = engram_sandbox_firecracker::sandbox_manifest::read_proc_start_time_jiffies(pid);
+    if live == Some(manifest_start_jiffies) {
+        // SAFETY: SIGKILL on a pid whose `/proc` start-time we just verified
+        // matches the manifest — provably the recorded process, not a recycled
+        // pid. `libc::kill` with a recorded pid is the established pattern in
+        // the FC backend's own teardown.
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        tracing::info!(
+            pid,
+            what,
+            rc,
+            "ADR 0044 K2: SIGKILL'd leaked orphan microVM process (identity-matched)"
+        );
+    } else {
+        tracing::debug!(
+            pid,
+            what,
+            "orphan-reap: process gone or recycled; not signalling"
+        );
+    }
 }
 
 /// Trait-level entry point that takes any `SandboxBackend` and
@@ -268,8 +271,8 @@ mod tests {
             guest_otel_endpoint: None,
             firecracker_bin: PathBuf::from("/nonexistent/firecracker"),
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
+            uffd_base_dir: None,
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
-            base_restore_mode: None,
             track_dirty_pages: false,
             net_pool: None,
             egress_proxy_port: None,
@@ -281,6 +284,7 @@ mod tests {
             uffd_blob_root: None,
             cpu_template: None,
             bundle_dir: work_dir.join("bundles"),
+            vm_cgroup_parent: None,
         };
         Arc::new(FirecrackerBackend::new(work_dir, cfg))
     }
@@ -354,8 +358,8 @@ mod tests {
                 vsock_cid: 3,
             },
             network: None,
+            netns: None,
             uffd_handler: None,
-            last_local_snapshot: None,
         };
         engram_sandbox_firecracker::sandbox_manifest::write_manifest(&manifest_path, &manifest)
             .unwrap();

@@ -1,0 +1,31 @@
+{{- if and .Values.operator.enabled .Values.operator.createHostFleet -}}
+# ADR 0044 K3: the HostFleet CR for this release. Its target images mirror the
+# chart's host-agent + node-assets images, so a `helm upgrade` that bumps
+# image.tag updates both the DaemonSet template (no roll — OnDelete) AND this
+# CR; the operator then drain-gates the actual pod roll.
+apiVersion: engram.io/v1alpha1
+kind: HostFleet
+metadata:
+  name: {{ include "hostfleet.fullname" . }}
+  labels:
+    {{- include "hostfleet.operator.labels" . | nindent 4 }}
+spec:
+  daemonSet:
+    namespace: {{ .Release.Namespace }}
+    name: {{ include "hostfleet.hostAgent.fullname" . }}
+  image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+  nodeAssetsImage: "{{ .Values.nodeAssets.image.repository }}:{{ .Values.nodeAssets.image.tag }}"
+  coordinatorUrl: {{ required "operator.coordinatorUrl is required when the operator is enabled" .Values.operator.coordinatorUrl | quote }}
+  capacityFloor: {{ .Values.operator.capacityFloor }}
+  drainTimeoutSeconds: {{ .Values.operator.drainTimeoutSeconds }}
+  {{- if .Values.operator.autoscaling.enabled }}
+  # ADR 0044 K4: node-pool autoscaling. The operator sizes the pool to hold
+  # targetFreeMib of headroom (scale-up only in v1). With the default noop
+  # scaler it only logs the desired size; a GKE actuator is the follow-up.
+  autoscaling:
+    nodePool: {{ required "operator.autoscaling.nodePool is required when autoscaling is enabled" .Values.operator.autoscaling.nodePool | quote }}
+    minHosts: {{ .Values.operator.autoscaling.minHosts }}
+    maxHosts: {{ .Values.operator.autoscaling.maxHosts }}
+    targetFreeMib: {{ .Values.operator.autoscaling.targetFreeMib }}
+  {{- end }}
+{{- end }}

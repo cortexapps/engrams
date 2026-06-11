@@ -1,0 +1,196 @@
+name: Auto-enqueue green PRs
+
+# Enqueues green, auto-merge-enabled PRs into the merge queue — the rulesets
+# auto-merge workaround. Serves two producers that enable auto-merge elsewhere:
+#   - Dependabot patch/minor bumps (enabled by dependabot-auto-merge.yml), and
+#   - automated Firecracker-fork upstream bumps labeled `fc-fork-bump` (opened +
+#     auto-merge-enabled by rebase-fc-fork.yml, ADR 0045 Phase B M4).
+# Same mechanism for both; the eligibility gate below scopes to them.
+#
+# Why this exists:
+#   GitHub's native auto-merge only enqueues a PR into the merge queue
+#   on the pending->success transition of its required checks. On this
+#   repo every merge requirement comes from rulesets (classic branch
+#   protection was deleted for the queue migration), and auto-merge's
+#   enqueue trigger does not fire under rulesets — so an approved,
+#   green PR sits forever with auto-merge "enabled" but is never
+#   enqueued (observed on PR #59). Known GitHub limitation, no ETA:
+#   community discussions #162623 and #190610.
+#
+#   Fix: when CI completes, re-check that every required status check
+#   is green and enqueue the PR ourselves via the GraphQL
+#   `enqueuePullRequest` mutation.
+#
+# Trigger choice — `workflow_run`, NOT `auto_merge_enabled`:
+#   The auto-merge enablers turn auto-merge on *early*, while checks
+#   are still pending, so an `auto_merge_enabled` trigger would fire
+#   too soon and find nothing green. `workflow_run` fires when CI
+#   finishes — exactly when "are we green yet?" can first be true.
+#   Both CI workflows re-trigger this job; if the other is still
+#   pending we exit and its completion re-runs us.
+#
+# Token choice (two identities, least privilege):
+#   - Read/eligibility work uses the default GITHUB_TOKEN.
+#   - The enqueue mutation uses a dedicated GitHub App token
+#     (engrams-automerge). GITHUB_TOKEN-enqueued entries do NOT trigger
+#     `merge_group` workflows (community #70310), so the queue entry
+#     would time out and be dropped; an App token does trigger them.
+#     The App holds only contents:write + pull_requests:write, scoped
+#     to this repo alone.
+#
+# NOTE: `workflow_run` workflows only run from the version on the
+# default branch, so this activates once merged to main — it can't be
+# exercised on its own PR.
+
+on:
+  workflow_run:
+    workflows: ["CI", "CI (macOS arm64 / VZ)"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  enqueue:
+    name: Enqueue green auto-merge PR
+    runs-on: ubuntu-latest
+    # Only PR-triggered CI runs that themselves passed: a failed run
+    # can't lead to a merge, and push/merge_group runs aren't PRs. The
+    # head-repository guard rejects fork runs.
+    if: >
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+
+    steps:
+      - name: Determine eligibility
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = run.head_sha;
+
+            // Map the CI run back to its PR by head commit.
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner, repo, commit_sha: headSha,
+            });
+            const pr = prs.find(p => p.state === 'open' && p.base.ref === 'main');
+            if (!pr) {
+              core.info('No open PR against main for this commit — nothing to do.');
+              return;
+            }
+
+            // Scope to PRs that already have auto-merge enabled and are either:
+            //  - Dependabot PRs (dependabot-auto-merge.yml enables auto-merge only
+            //    for patch/minor, so a null auto_merge = the semver gate left it
+            //    for a human), or
+            //  - automated Firecracker-fork bumps (labeled `fc-fork-bump`),
+            //    opened + auto-merge-enabled by rebase-fc-fork.yml after the cron
+            //    rebased + build-verified the fork (ADR 0045 Phase B M4).
+            // Same enqueue mechanism for both — the rulesets auto-merge workaround.
+            const isDependabot = pr.user.login === 'dependabot[bot]';
+            const isForkBump = (pr.labels || []).some(l => l.name === 'fc-fork-bump');
+            if (!isDependabot && !isForkBump) {
+              core.info(`PR #${pr.number} is neither a Dependabot nor an fc-fork-bump PR — skipping.`);
+              return;
+            }
+            if (!pr.auto_merge) {
+              core.info(`PR #${pr.number} has no auto-merge enabled — skipping (gate left it for a human).`);
+              return;
+            }
+
+            // Authoritative required checks come from the branch
+            // ruleset, so this workflow can never drift from the
+            // protection config. Fail closed if we can't read it.
+            const rules = await github.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
+              owner, repo, branch: 'main',
+            });
+            const required = rules.data
+              .filter(r => r.type === 'required_status_checks')
+              .flatMap(r => r.parameters.required_status_checks.map(c => c.context));
+            if (required.length === 0) {
+              core.setFailed('Could not read required status checks from ruleset — failing closed.');
+              return;
+            }
+
+            // Latest check run per name on the PR head SHA.
+            const checks = await github.paginate(github.rest.checks.listForRef, {
+              owner, repo, ref: headSha, per_page: 100,
+            });
+            const latest = new Map();
+            for (const c of checks) {
+              const prev = latest.get(c.name);
+              if (!prev || new Date(c.started_at) > new Date(prev.started_at)) {
+                latest.set(c.name, c);
+              }
+            }
+
+            const missing = [], pending = [], failed = [];
+            for (const name of required) {
+              const c = latest.get(name);
+              if (!c) { missing.push(name); continue; }
+              if (c.status !== 'completed') { pending.push(name); continue; }
+              if (!['success', 'skipped', 'neutral'].includes(c.conclusion)) {
+                failed.push(`${name} (${c.conclusion})`);
+              }
+            }
+
+            if (failed.length) {
+              core.info(`Required checks failed: ${failed.join(', ')} — not enqueuing.`);
+              return;
+            }
+            if (pending.length || missing.length) {
+              core.info(`Not all green yet (pending: ${pending.join(', ') || 'none'}; missing: ${missing.join(', ') || 'none'}). The other CI workflow's completion will re-run this.`);
+              return;
+            }
+
+            core.info(`All ${required.length} required checks green on PR #${pr.number} — eligible to enqueue.`);
+            core.setOutput('enqueue', 'true');
+            core.setOutput('pr_node_id', pr.node_id);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('pr_number', String(pr.number));
+
+      - name: Generate App token
+        if: steps.gate.outputs.enqueue == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.AUTOMERGE_APP_ID }}
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+
+      - name: Enqueue into merge queue
+        if: steps.gate.outputs.enqueue == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_ID: ${{ steps.gate.outputs.pr_node_id }}
+          HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.gate.outputs.pr_number }}
+          MUTATION: |-
+            mutation ($id: ID!, $oid: GitObjectID!) {
+              enqueuePullRequest(input: { pullRequestId: $id, expectedHeadOid: $oid }) {
+                mergeQueueEntry { position }
+              }
+            }
+        run: |
+          # expectedHeadOid guards against a push landing between the
+          # green-check above and this enqueue: the mutation fails
+          # atomically rather than queuing a stale tree (and a new push
+          # would spawn fresh CI that re-triggers this workflow).
+          if out=$(gh api graphql -f query="$MUTATION" -f id="$PR_ID" -f oid="$HEAD_SHA" 2>&1); then
+            echo "Enqueued PR #${PR_NUMBER}: ${out}"
+          else
+            # Idempotent / benign races are not failures: already
+            # queued, or briefly ineligible. Anything else is loud.
+            case "$out" in
+              *already*|*"not eligible"*|*"merge queue"*|*Unprocessable*|*"head OID"*)
+                echo "Enqueue skipped (expected): ${out}" ;;
+              *)
+                echo "Enqueue failed: ${out}" >&2
+                exit 1 ;;
+            esac
+          fi

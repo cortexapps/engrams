@@ -128,6 +128,11 @@ mod linux {
         pub listen: PathBuf,
         pub canonical_manifest: ManifestRef,
         pub session_manifest: ManifestRef,
+        /// ADR 0045 C1: read the SESSION manifest from this local JSON
+        /// file instead of the blob store — a migration destination
+        /// restores from a not-yet-durable manifest whose chunks the
+        /// host-agent pre-pulled into the NVMe cache.
+        pub session_manifest_json: Option<PathBuf>,
         pub prefault_trace: Option<PrefaultTraceSpec>,
         /// If `Some(host_id)`, publish the recorded trace as
         /// `traces/<session_manifest.manifest_id>/<host_id>.json` on
@@ -153,12 +158,19 @@ mod linux {
         pub cache_root: PathBuf,
         pub cache_budget_bytes: u64,
         pub recorder_window: Duration,
+        /// ADR 0045 substrate (v2b): the per-template base shm file this
+        /// handler creates, sizes, and lazily populates with canonical
+        /// chunks. The forked FC maps it MAP_PRIVATE and registers
+        /// MISSING|MINOR; canonical faults resolve via UFFDIO_CONTINUE
+        /// (shared), divergent via UFFDIO_COPY (private). Off when unset.
+        pub base_shm: Option<PathBuf>,
     }
 
     pub fn parse_args() -> Result<Args, String> {
         let mut listen: Option<PathBuf> = None;
         let mut canonical_manifest: Option<ManifestRef> = None;
         let mut session_manifest: Option<ManifestRef> = None;
+        let mut session_manifest_json: Option<PathBuf> = None;
         let mut prefault_trace: Option<PrefaultTraceSpec> = None;
         let mut publish_trace_host: Option<Uuid> = None;
         let mut trace_output: Option<PathBuf> = None;
@@ -166,6 +178,7 @@ mod linux {
         let mut cache_root: Option<PathBuf> = None;
         let mut cache_budget_bytes: u64 = DEFAULT_CACHE_BUDGET_BYTES;
         let mut recorder_window_ms: u64 = DEFAULT_RECORDER_WINDOW_MS;
+        let mut base_shm: Option<PathBuf> = None;
 
         let mut argv = std::env::args().skip(1);
         while let Some(arg) = argv.next() {
@@ -187,6 +200,12 @@ mod linux {
                         .next()
                         .ok_or_else(|| "--session-manifest requires a value".to_string())?;
                     session_manifest = Some(parse_manifest_ref(&v)?);
+                }
+                "--session-manifest-json" => {
+                    let v = argv
+                        .next()
+                        .ok_or_else(|| "--session-manifest-json requires a value".to_string())?;
+                    session_manifest_json = Some(PathBuf::from(v));
                 }
                 "--prefault-trace" => {
                     let v = argv
@@ -229,6 +248,12 @@ mod linux {
                         .parse::<u64>()
                         .map_err(|e| format!("--cache-budget-bytes {v:?}: {e}"))?;
                 }
+                "--base-shm" => {
+                    base_shm = Some(PathBuf::from(
+                        argv.next()
+                            .ok_or_else(|| "--base-shm requires a value".to_string())?,
+                    ));
+                }
                 "--recorder-window-ms" => {
                     let v = argv
                         .next()
@@ -256,6 +281,7 @@ mod linux {
             listen,
             canonical_manifest,
             session_manifest,
+            session_manifest_json,
             prefault_trace,
             publish_trace_host,
             trace_output,
@@ -263,6 +289,7 @@ mod linux {
             cache_root,
             cache_budget_bytes,
             recorder_window: Duration::from_millis(recorder_window_ms),
+            base_shm,
         })
     }
 
@@ -316,9 +343,10 @@ mod linux {
             .await
             .map_err(|e| format!("create cache root {}: {e}", args.cache_root.display()))?;
 
-        let backend = ChunkedMemoryBackend::from_blob(
+        let backend = ChunkedMemoryBackend::from_blob_with_session_json(
             args.canonical_manifest,
             args.session_manifest,
+            args.session_manifest_json.as_deref(),
             blob.clone(),
             &args.cache_root,
             args.cache_budget_bytes,
@@ -354,6 +382,24 @@ mod linux {
             None
         };
 
+        // ADR 0045 substrate (v2b): create + size the base shm file NOW —
+        // before run_listener binds the UDS. The host-agent orders FC's
+        // load (which open(O_RDONLY)s + mmaps this file) after the socket
+        // appears, so the file is always fully sized by then.
+        let base_shm = match args.base_shm.as_ref() {
+            Some(path) => {
+                let b = engram_uffd_handler::base_shm::BaseShm::open(path, backend.total_bytes())
+                    .map_err(|e| format!("base shm: {e}"))?;
+                tracing::info!(
+                    path = %path.display(),
+                    total_bytes = backend.total_bytes(),
+                    "substrate base shm ready (canonical -> CONTINUE, divergent -> COPY)"
+                );
+                Some(b)
+            }
+            None => None,
+        };
+
         let result = tokio::task::spawn_blocking({
             let handle = handle.clone();
             let listen = args.listen.clone();
@@ -362,7 +408,7 @@ mod linux {
             let trace_out = args.trace_output.clone();
             move || {
                 engram_uffd_handler::runtime::run_listener(
-                    listen, backend, handle, prefault, window, trace_out,
+                    listen, backend, handle, prefault, window, trace_out, base_shm,
                 )
             }
         })

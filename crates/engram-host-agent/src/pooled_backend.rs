@@ -45,6 +45,15 @@ fn nbd_state_none() -> NbdStateSlot {
 #[cfg(not(target_os = "linux"))]
 fn nbd_state_none() -> NbdStateSlot {}
 
+/// ADR 0039 item #19: bounded concurrency for the cold-restore memory
+/// chunk prefetch. Raised from 8 — single-stream GCS ~80 MB/s on the
+/// prod n2-standard-8 hosts left ~90 % of the 10 Gbps line rate idle
+/// while a cold resume blocked 66.5 s on this prefetch (traced). 32
+/// (~2.5 GB/s aggregate) saturates closer to line rate without tripping
+/// GCS per-object rate limits. Mirrors the re-chunk/upload bound so the
+/// save and load paths use the same fleet-tuned fan-out.
+const MEMORY_PREFETCH_CONCURRENCY: usize = 32;
+
 /// Return the cached image's legacy `rootfs.ext4` path or a
 /// typed error when neither it nor a bundle is present.
 ///
@@ -215,6 +224,19 @@ pub struct PooledBackend {
     /// (double-pause is idempotent but concurrent NBD flushes +
     /// chain advances are not).
     capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
+    /// ADR 0045 D5: per-sandbox background upload tasks spawned by
+    /// `snapshot_begin`, awaited by `snapshot_wait`. Single-consumer:
+    /// the coordinator's finalize task is the only waiter.
+    snapshot_waits:
+        Arc<DashMap<SandboxId, tokio::task::JoinHandle<Result<SnapshotMetadata, SandboxError>>>>,
+    /// ADR 0045 C1: open live-migration exports (frozen sandboxes
+    /// serving a move). See `crate::migration`.
+    migrations: Arc<crate::migration::MigrationRegistry>,
+    /// ADR 0045 C1 (destination): inline, not-yet-durable disk
+    /// manifests staged by a migration pull, consumed by
+    /// `prepare_resume_nbd_attach` (keyed by the provisional ref).
+    inline_disk_manifests:
+        Arc<DashMap<engram_core::types::manifest::ManifestRef, engram_chunk_store::Manifest>>,
 }
 
 impl PooledBackend {
@@ -238,20 +260,45 @@ impl PooledBackend {
         // prefetch / state materialize / NBD attach) alongside the
         // `fc.restore_in_jail` legs, so one trace shows where the whole
         // `host.restore_base_for_session` window goes. Pure observability.
-        let prefetch_start = std::time::Instant::now();
-        let prefetched_chunks = tracing::Instrument::instrument(
-            self.prefetch_memory_chunks(&metadata),
-            tracing::info_span!("restore.prefetch_memory"),
-        )
-        .await;
-        if let Err(e) = prefetched_chunks.as_ref() {
-            tracing::warn!(
-                error = %e,
-                snapshot_id = %metadata.id,
-                "chunked restore memory chunk prefetch failed; falling back to serial fault path",
-            );
+        // ADR 0043 P1: warm the memory-chunk cache before the handler faults
+        // from it. On a File base-create (`fresh`) the serial
+        // `materialize_memory_if_missing` below reads the warmed cache, so the
+        // prefetch stays on the critical path (awaited). On a UFFD resume
+        // (`!fresh`) the chunks are consumed only by the handler's lazy faults
+        // AFTER `inner.restore`, so warming need not block resume: spawn it and
+        // let restore proceed immediately. The handler faults from the same
+        // cancel-safe single-flight cache, so a fault that races ahead of the
+        // background prefetch just fetches its one chunk itself. (Pairs with
+        // the handler-side background prefault — ADR 0043 P1 / ADR 0039 #19.)
+        if fresh {
+            let prefetched_chunks = tracing::Instrument::instrument(
+                self.prefetch_memory_chunks(&metadata),
+                tracing::info_span!("restore.prefetch_memory"),
+            )
+            .await;
+            if let Err(e) = prefetched_chunks.as_ref() {
+                tracing::warn!(
+                    error = %e,
+                    snapshot_id = %metadata.id,
+                    "chunked restore memory chunk prefetch failed; falling back to serial fault path",
+                );
+            }
+        } else if let (Some(cs), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone())
+        {
+            let md = metadata.clone();
+            tokio::spawn(tracing::Instrument::instrument(
+                async move {
+                    if let Err(e) = Self::prefetch_memory_chunks_inner(&cs, &cache, &md).await {
+                        tracing::warn!(
+                            error = %e,
+                            snapshot_id = %md.id,
+                            "background memory prefetch failed; UFFD faults serve on-demand",
+                        );
+                    }
+                },
+                tracing::info_span!("restore.prefetch_memory_bg"),
+            ));
         }
-        let _ = (prefetched_chunks, prefetch_start);
 
         // ADR 0007 Phase 5+6: cross-host memory.bin materialization.
         // The backend owns its staging dir layout (Phase 6); we ask
@@ -466,6 +513,9 @@ impl PooledBackend {
             checkpoint_dir: None,
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_locks: Arc::new(DashMap::new()),
+            snapshot_waits: Arc::new(DashMap::new()),
+            migrations: Arc::new(crate::migration::MigrationRegistry::default()),
+            inline_disk_manifests: Arc::new(DashMap::new()),
         }
     }
 
@@ -515,14 +565,491 @@ impl PooledBackend {
     }
 
     /// ADR 0028 Fix A: where un-acked durable checkpoint records live.
-    pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
-        self.checkpoint_dir.as_ref().map(|d| d.join("records"))
+    /// ADR 0045 D5: the owned, 'static bundle of everything the snapshot
+    /// POST phase (chunk + upload + chain bookkeeping) needs — so
+    /// `snapshot_begin` can run it as a background task while the
+    /// coordinator marks the session Idle. All fields are Arc-backed
+    /// clones of the PooledBackend's.
+    pub(crate) fn finisher(&self) -> SnapshotFinisher {
+        SnapshotFinisher {
+            #[cfg(target_os = "linux")]
+            nbd_sandboxes: self.nbd_sandboxes.clone(),
+            chunk_store: self.chunk_store.clone(),
+            chunk_cache: self.chunk_cache.clone(),
+            bundle_dir: self.bundle_dir.clone(),
+            inflight_snapshots: self.inflight_snapshots.clone(),
+            last_snapshot_unix_ms: self.last_snapshot_unix_ms.clone(),
+            checkpoint_chains: self.checkpoint_chains.clone(),
+            checkpoint_dir: self.checkpoint_dir.clone(),
+            session_bindings: self.session_bindings.clone(),
+        }
     }
 
-    fn checkpoint_rolling_path(&self, id: SandboxId) -> Option<PathBuf> {
-        self.checkpoint_dir
-            .as_ref()
-            .map(|d| d.join("rolling").join(format!("{id}.memory.bin")))
+    /// ADR 0045 D5: pause + drain + FC capture. Returns the held capture
+    /// lock (the caller decides whether the post phase runs inline or in
+    /// a background task — the lock must span it either way, so a
+    /// concurrent periodic checkpoint's `capture_in_flight` try_lock
+    /// keeps skipping until the upload completes) and the capture
+    /// artifacts the post phase consumes.
+    async fn capture_phase(
+        &self,
+        id: SandboxId,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, SnapshotCapture), SandboxError> {
+        let capture_lock = self.capture_lock(id);
+        // ADR 0038 B0: time the lock wait — the gridlock signal. With
+        // B1 periodic checkpoints skip rather than queue, so a long tail
+        // here is an eviction/drain blocked on an in-flight capture.
+        let lock_wait = std::time::Instant::now();
+        let capture_guard = capture_lock.lock_owned().await;
+        metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
+            .record(lock_wait.elapsed().as_secs_f64());
+        // Diff-mode when a checkpoint chain exists: same coherent
+        // (memory, disk) capture contract, O(dirty set) cost. The
+        // chain seeds on the first (Full) capture below — so an
+        // eviction on a long-running session is just the final diff
+        // in its checkpoint chain, collapsing the multi-GiB-dump
+        // window the cf4d4afd incident sat in.
+        let chain_prev = self
+            .checkpoint_chains
+            .get(&id)
+            .map(|c| (c.manifest_ref, c.manifest.clone()));
+
+        // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
+        // was produced but never committed (caller's downstream
+        // pipeline failed or the coord pod crashed between snapshot
+        // and commit), tear down its artifacts BEFORE we mint a fresh
+        // SnapshotId. This is the overwrite-in-place semantic that
+        // keeps the host-side disk bounded under coord-side retry
+        // storms — the prod incident on `engrams-fc-xngk` leaked
+        // ~25 dirs × 4 GiB in 13 min because each retry minted a fresh
+        // id and left the prior dir on disk.
+        if self.inflight_snapshots.contains_key(&id) {
+            if let Err(e) = self.abort_prior_inflight_snapshot(id).await {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "snapshot retry: best-effort abort of prior in-flight snapshot failed; \
+                     proceeding with fresh attempt anyway",
+                );
+            }
+        }
+
+        // ADR 0021 P1.6 follow-up: gate snapshot on agentd readiness.
+        //
+        // The pre-flush pause below freezes vCPUs. If the guest is still
+        // in early boot (kernel → engram-init → agentd start) at that
+        // moment, the snapshot captures a half-initialised kernel — in
+        // particular, agentd may not have completed `bind(AF_VSOCK)` —
+        // and the resumed kernel comes up with a half-initialised vsock
+        // driver. `panic=1 reboot=k` then trips `KVM_EXIT_SHUTDOWN`
+        // ~1 s after `load_snapshot` returns; every subsequent
+        // host→guest dial fails ECONNREFUSED.
+        //
+        // Reachable in prod via:
+        //   1. SIGTERM-during-cold-boot. `shutdown.rs` checkpoints all
+        //      sandboxes from `backend.list()` after a 5 s drain — a
+        //      sandbox still booting at SIGTERM gets snapshotted mid-
+        //      bind without this gate.
+        //   2. coord-driven `snapshot(id)` fired quickly after create
+        //      (any fast-rebake / probe path).
+        //
+        // `wait_agent_ready` blocks until agentd has dialled the host's
+        // ready port (port 1027) — proving the guest's vsock stack is
+        // operational end-to-end. On warm-restored sandboxes the watch
+        // is pre-set true (FC's `restore_in_jail`), so this is a no-op
+        // for warm re-snapshot paths. The FC backend is the only one
+        // with the per-sandbox agent_ready watch; non-FC backends
+        // (Process, future) return `InvalidSpec` from the default trait
+        // impl, which we treat as "no readiness concept here, proceed."
+        match self.inner.wait_agent_ready(id).await {
+            Ok(()) => {}
+            Err(SandboxError::InvalidSpec(_)) => {}
+            Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
+        }
+
+        // ADR 0018 commit 12m + ADR 0038 B3: snapshot ordering is
+        //   pause → wait_idle → flush_local(drain) → inner.snapshot
+        //   → [resume] → flush_upload(GCS) (in the `post` block)
+        // where inner.snapshot's internal pause/capture/resume is a
+        // no-op pause (FC's PATCH /vm is idempotent) followed by the
+        // memory dump and a resume that brings the VM back running.
+        // This guarantees memory + disk are CAPTURED at the same point
+        // in time: the explicit pause stops vCPUs, wait_idle drains any
+        // in-flight virtio writes through the NBD daemon, flush_local
+        // drains the just-quiesced dirty set locally, and inner.snapshot
+        // then captures the page cache (which agrees with that disk
+        // state). The disk GCS upload is deferred to flush_upload AFTER
+        // resume — off the frozen-guest path — but the captured *content*
+        // is fixed at the drain, so coherence is unchanged.
+        //
+        // Pre-12m ordering was flush → inner.snapshot (FC's pause
+        // happened inside the inner call AFTER our flush). Writes
+        // queued between flush and pause landed in memory but not
+        // the drained disk set — the cross-host evac canary md5
+        // mismatch on dev-vm validation was exactly this race.
+        //
+        // ADR 0028 A.log: the pause instant is the coherence cut for
+        // the (memory, disk, event-log) triple — the coord resolves
+        // the session_events cursor as "last event at or before this"
+        // when it records the checkpoint.
+        let paused_at = chrono::Utc::now();
+        self.inner
+            .pause(id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
+
+        // ADR 0038 B3: under the pause, only DRAIN the dirty buffer
+        // (+ hash + stash in the backend's pending tier) — the
+        // multi-second GCS upload is deferred to `flush_upload` after
+        // the guest resumes (the `post` block below), so the
+        // guest-visible pause is O(local copy), not O(GCS). The drain
+        // still captures disk-at-the-pause-instant (ADR 0018 §12m); the
+        // memory capture below is paired with it.
+        #[cfg(target_os = "linux")]
+        let nbd_pending_flush = if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            // Drain in-flight NBD requests so the drain sees a quiescent
+            // dirty buffer. With FC paused above, no new virtio writes
+            // are issued, and wait_idle returns once already-in-flight
+            // requests have completed through backend.write().
+            entry.backend.wait_idle().await;
+            let pending = entry
+                .backend
+                .flush_local()
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
+            Some(pending)
+        } else {
+            None
+        };
+
+        // ADR 0007 Phase 6: backend owns its staging dir; we look
+        // it up via snapshot_path_for after the inner call so we
+        // can read/patch the on-disk artifacts the inner backend
+        // wrote (memory.bin / memory.diff, manifest.json). The inner
+        // call's pause-create-resume cycle is idempotent against our
+        // earlier pause and brings the VM back to running on exit —
+        // for the diff flavor that resume lands after O(dirty set),
+        // not O(guest RAM).
+        // ADR 0038 B0: time the FC memory capture (`PUT /snapshot/
+        // create`) — the previously-invisible step that hung 60 s on the
+        // cold Full seed. After B2, `type="full"` should vanish on the
+        // resume path (chain seeded → diff).
+        let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
+        let create_start = std::time::Instant::now();
+        let create_res = if chain_prev.is_some() {
+            self.inner.snapshot_diff(id).await
+        } else {
+            self.inner.snapshot(id).await
+        };
+        metrics::histogram!(
+            crate::metrics::SNAPSHOT_CREATE_SECONDS,
+            "type" => snap_type,
+            "outcome" => if create_res.is_ok() { "success" } else { "error" },
+        )
+        .record(create_start.elapsed().as_secs_f64());
+        let metadata = create_res?;
+        let dest = self.inner.snapshot_path_for(metadata.id);
+        Ok((
+            capture_guard,
+            SnapshotCapture {
+                metadata,
+                dest,
+                chain_prev,
+                paused_at,
+                #[cfg(target_os = "linux")]
+                nbd_pending_flush,
+            },
+        ))
+    }
+
+    /// ADR 0045 C1 (destination): pull the frozen source's export —
+    /// state.bin + sidecar into the local snapshot dir, every transfer
+    /// chunk into the NVMe cache (hash-verified by `cache.put`), the
+    /// inline session manifest as a local file the handler resolves
+    /// from disk, and the inline disk manifest staged for
+    /// `prepare_resume_nbd_attach`.
+    async fn migration_prestage(
+        &self,
+        metadata: &SnapshotMetadata,
+        mig: &engram_core::types::snapshot::MigrationSourceInfo,
+    ) -> Result<(), SandboxError> {
+        use engram_core::types::snapshot::MigrationItem;
+        let Some(cache) = self.chunk_cache.clone() else {
+            return Err(SandboxError::InvalidSpec(
+                "migration restore needs a chunk cache".into(),
+            ));
+        };
+        let dest = self.inner.snapshot_path_for(metadata.id);
+        fs::create_dir_all(&dest)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("create snapshot dir: {e}")))?;
+
+        let channel = tonic::transport::Endpoint::from_shared(mig.source_addr.clone())
+            .map_err(|e| SandboxError::InvalidSpec(format!("bad source_addr: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("dial migration source: {e}")))?;
+        let source = engram_protocol::grpc_client::GrpcHostClient::new(channel);
+
+        let mut items = vec![MigrationItem::StateBin, MigrationItem::Sidecar];
+        items.extend(
+            mig.new_memory_chunk_hashes
+                .iter()
+                .map(|h| MigrationItem::Chunk(*h)),
+        );
+        items.extend(
+            mig.new_disk_chunk_hashes
+                .iter()
+                .map(|h| MigrationItem::Chunk(*h)),
+        );
+        let item_specs = items.clone();
+        let mut stream = source
+            .migration_fetch(&mig.export_id, items)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration fetch: {e}")))?;
+
+        use futures::StreamExt;
+        let mut current: Vec<u8> = Vec::new();
+        let mut current_idx: Option<u32> = None;
+        while let Some(frame) = stream.next().await {
+            let frame = frame.map_err(|e| SandboxError::Snapshot(format!("fetch frame: {e}")))?;
+            if current_idx != Some(frame.item_idx) {
+                if current_idx.is_some() && !current.is_empty() {
+                    return Err(SandboxError::Snapshot(
+                        "migration fetch: item switched before its last frame".into(),
+                    ));
+                }
+                current_idx = Some(frame.item_idx);
+                current.clear();
+            }
+            if frame.offset != current.len() as u64 {
+                return Err(SandboxError::Snapshot(
+                    "migration fetch: out-of-order frame".into(),
+                ));
+            }
+            current.extend_from_slice(&frame.data);
+            if frame.last {
+                let idx = frame.item_idx as usize;
+                let spec = item_specs.get(idx).ok_or_else(|| {
+                    SandboxError::Snapshot("migration fetch: unknown item index".into())
+                })?;
+                match spec {
+                    MigrationItem::StateBin => {
+                        fs::write(dest.join("state.bin"), &current)
+                            .await
+                            .map_err(|e| SandboxError::Snapshot(format!("write state.bin: {e}")))?;
+                    }
+                    MigrationItem::Sidecar => {
+                        fs::write(dest.join("manifest.json"), &current)
+                            .await
+                            .map_err(|e| SandboxError::Snapshot(format!("write sidecar: {e}")))?;
+                    }
+                    MigrationItem::Chunk(h) => {
+                        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
+                        // No per-write sweep (the prod canary's 70s
+                        // prestage was ~63 sweeps of the full NVMe
+                        // cache); the batch-closing sweep runs after
+                        // the stream below.
+                        cache.put_no_evict(hash, &current).await.map_err(|e| {
+                            SandboxError::Snapshot(format!("stage chunk {hash}: {e}"))
+                        })?;
+                    }
+                }
+                current = Vec::new();
+                current_idx = None;
+            }
+        }
+
+        if let Err(e) = cache.sweep().await {
+            tracing::warn!(error = %e, "post-prestage cache sweep failed (non-fatal)");
+        }
+
+        // Stage the inline manifests: the session (memory) manifest as
+        // the local file `restore_in_jail` auto-detects; the disk
+        // manifest for the NBD attach.
+        fs::write(
+            dest.join("migration-session-manifest.json"),
+            &mig.memory_manifest_json,
+        )
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("write migration manifest: {e}")))?;
+        if !mig.disk_manifest_json.is_empty() {
+            let disk: engram_chunk_store::Manifest =
+                serde_json::from_slice(&mig.disk_manifest_json)
+                    .map_err(|e| SandboxError::Snapshot(format!("parse disk manifest: {e}")))?;
+            self.inline_disk_manifests
+                .insert(mig.disk_manifest_ref, disk);
+        }
+        tracing::info!(
+            snapshot_id = %metadata.id,
+            export = %mig.export_id,
+            mem_chunks = mig.new_memory_chunk_hashes.len(),
+            disk_chunks = mig.new_disk_chunk_hashes.len(),
+            "migration prestage complete (ADR 0045 C1)",
+        );
+        Ok(())
+    }
+
+    /// ADR 0045 C1 (destination): post-restore — seed the chain from
+    /// the inline v+1 content, fence checkpoints + disk publishes
+    /// until durability, and spawn the catch-up (chunks → manifests)
+    /// into the `snapshot_wait` slot for the coordinator's
+    /// row-only-at-finalize.
+    async fn migration_finish_restore(
+        &self,
+        id: SandboxId,
+        mig: engram_core::types::snapshot::MigrationSourceInfo,
+        mut row_template: SnapshotMetadata,
+    ) -> Result<(), SandboxError> {
+        let mem_manifest: engram_chunk_store::Manifest =
+            serde_json::from_slice(&mig.memory_manifest_json)
+                .map_err(|e| SandboxError::Snapshot(format!("parse mem manifest: {e}")))?;
+        self.checkpoint_chains.insert(
+            id,
+            crate::checkpoint::CheckpointChain {
+                manifest_ref: mig.memory_manifest_ref,
+                manifest: mem_manifest.clone(),
+            },
+        );
+        // Fences: the capture lock blocks checkpoints (a dest
+        // checkpoint pre-durability would publish a v+2 referencing
+        // not-yet-uploaded chunks); the NBD migration_fence blocks
+        // disk publishes for the same reason.
+        let capture_guard = self.capture_lock(id).lock_owned().await;
+        #[cfg(target_os = "linux")]
+        if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            entry.backend.set_migration_fence(true);
+        }
+
+        let Some(chunk_store) = self.chunk_store.clone() else {
+            return Err(SandboxError::InvalidSpec("no chunk store".into()));
+        };
+        let Some(cache) = self.chunk_cache.clone() else {
+            return Err(SandboxError::InvalidSpec("no chunk cache".into()));
+        };
+        #[cfg(target_os = "linux")]
+        let nbd = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
+        let inline_disks = self.inline_disk_manifests.clone();
+        let handle = tokio::spawn(async move {
+            let _capture_guard = capture_guard;
+            // 1. Upload every pulled chunk (content-addressed,
+            //    idempotent). PARALLEL with bounded fan-out — the
+            //    serial loop cost ~55ms/chunk of GCS RTT (the prod
+            //    canary's 4.6s catch-up; the same lesson as ADR 0039
+            //    item #19), and puts are order-independent.
+            {
+                use futures::stream::{StreamExt, TryStreamExt};
+                futures::stream::iter(
+                    mig.new_memory_chunk_hashes
+                        .iter()
+                        .chain(mig.new_disk_chunk_hashes.iter())
+                        .copied()
+                        .collect::<Vec<_>>(),
+                )
+                .map(|h| {
+                    let cache = cache.clone();
+                    let chunk_store = chunk_store.clone();
+                    async move {
+                        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(h);
+                        let bytes = cache
+                            .get(hash, || async {
+                                Err(engram_chunk_store::error::ChunkStoreError::Internal(
+                                    "catch-up chunk must be cache-resident".into(),
+                                ))
+                            })
+                            .await
+                            .map_err(|e| {
+                                SandboxError::Snapshot(format!("catch-up read {hash}: {e}"))
+                            })?;
+                        chunk_store.put_chunk(&bytes).await.map_err(|e| {
+                            SandboxError::Snapshot(format!("catch-up upload {hash}: {e}"))
+                        })?;
+                        Ok::<(), SandboxError>(())
+                    }
+                })
+                .buffer_unordered(32)
+                .try_collect::<()>()
+                .await?;
+            }
+            // 2. Publish the memory manifest (session-owned lineage —
+            //    no conflict possible).
+            chunk_store
+                .put_manifest(mig.memory_manifest_ref, &mem_manifest)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("publish mem manifest: {e}")))?;
+            // 3. Publish the disk manifest with the shared-lineage
+            //    conflict-retry (mirror flush_upload's rule).
+            let mut disk_ref_final = None;
+            if let Some((_, disk_manifest)) = inline_disks.remove(&mig.disk_manifest_ref) {
+                let mut attempt_ref = mig.disk_manifest_ref;
+                for _ in 0..5 {
+                    match chunk_store.put_manifest(attempt_ref, &disk_manifest).await {
+                        Ok(()) => {
+                            disk_ref_final = Some(attempt_ref);
+                            break;
+                        }
+                        Err(engram_chunk_store::error::ChunkStoreError::VersionConflict {
+                            latest,
+                            ..
+                        }) => {
+                            attempt_ref.version = latest + 1;
+                        }
+                        Err(e) => {
+                            return Err(SandboxError::Snapshot(format!(
+                                "publish disk manifest: {e}"
+                            )))
+                        }
+                    }
+                }
+                let Some(final_ref) = disk_ref_final else {
+                    return Err(SandboxError::Snapshot(
+                        "disk manifest publish: version conflict retries exhausted".into(),
+                    ));
+                };
+                #[cfg(target_os = "linux")]
+                if let Some(nbd) = &nbd {
+                    nbd.rebase_manifest_ref(final_ref).await;
+                    nbd.set_migration_fence(false);
+                }
+                row_template.disk_manifest = Some(final_ref);
+            } else {
+                #[cfg(target_os = "linux")]
+                if let Some(nbd) = &nbd {
+                    nbd.set_migration_fence(false);
+                }
+            }
+            row_template.memory_manifest = Some(mig.memory_manifest_ref);
+            tracing::info!(
+                sandbox_id = %id,
+                mem_ref = %mig.memory_manifest_ref,
+                "migration durability catch-up complete (ADR 0045 C1)",
+            );
+            Ok(row_template)
+        });
+        if let Some(prior) = self.snapshot_waits.insert(id, handle) {
+            prior.abort();
+        }
+        Ok(())
+    }
+
+    /// ADR 0045 C1: expired migration exports for the TTL sweep —
+    /// `(sandbox, bound session, export_id)` per export past
+    /// [`crate::migration::EXPORT_TTL`].
+    pub fn expired_migration_exports(&self) -> Vec<(SandboxId, Option<SessionId>, String)> {
+        self.migrations
+            .expired()
+            .into_iter()
+            .filter_map(|sandbox_id| {
+                let export_id = self.migrations.export_id_of(sandbox_id)?;
+                let session = self.session_bindings.get(&sandbox_id).map(|e| *e);
+                Some((sandbox_id, session, export_id))
+            })
+            .collect()
+    }
+
+    pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
+        self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
 
     /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
@@ -532,179 +1059,24 @@ impl PooledBackend {
     /// snapshot's own durability (chunks + blobs in GCS) is already
     /// settled; everything here is acceleration (chain) or
     /// reconciliation insurance (record).
-    async fn advance_checkpoint_state(
-        &self,
-        id: SandboxId,
-        metadata: &SnapshotMetadata,
-        paused_at: chrono::DateTime<chrono::Utc>,
-        next_manifest: Option<engram_chunk_store::Manifest>,
-    ) {
-        if self.checkpoint_dir.is_none() {
-            return;
-        }
-        let Some(memory_ref) = metadata.memory_manifest else {
-            // No chunked memory (no chunk store / non-FC backend):
-            // nothing to chain, and a record without a memory
-            // manifest adds nothing over the live disk manifest.
-            return;
-        };
-
-        match next_manifest {
-            // Diff capture: the rolling file was already overlaid in
-            // the post block; just advance the chain's manifest.
-            Some(next) => {
-                if let Some(mut chain) = self.checkpoint_chains.get_mut(&id) {
-                    chain.manifest_ref = memory_ref;
-                    chain.manifest = next;
-                }
-            }
-            // Full capture: seed the chain — copy the freshly-written
-            // memory.bin as the rolling diff-apply target and fetch
-            // the manifest we just published.
-            None => {
-                if let Err(e) = self.seed_checkpoint_chain(id, metadata, memory_ref).await {
-                    tracing::warn!(
-                        sandbox_id = %id,
-                        error = %e,
-                        "checkpoint chain seed failed; next capture will be Full again",
-                    );
-                }
-            }
-        }
-
-        // Durable record — only for session-bound sandboxes (anonymous
-        // base-snapshot captures have no session to reconcile).
-        let Some(session_id) = self.session_bindings.get(&id).map(|s| *s) else {
-            return;
-        };
-        let Some(records_dir) = self.checkpoint_records_dir() else {
-            return;
-        };
-        let record = crate::checkpoint::CheckpointRecord {
-            snapshot_id: metadata.id,
-            session_id,
-            sandbox_id: id,
-            image_version: metadata.image_version.clone(),
-            size_bytes: metadata.size_bytes,
-            disk_manifest: metadata.disk_manifest,
-            memory_manifest: metadata.memory_manifest,
-            aux_bundles: metadata.aux_bundles.clone(),
-            paused_at,
-            captured_at: metadata.created_at,
-        };
-        if let Err(e) = record.persist(&records_dir).await {
-            tracing::warn!(
-                sandbox_id = %id,
-                snapshot_id = %metadata.id,
-                error = %e,
-                "durable checkpoint record write failed; PG row (if the caller's \
-                 pipeline survives) is the only reference",
-            );
-        }
-    }
-
-    async fn seed_checkpoint_chain(
-        &self,
-        id: SandboxId,
-        metadata: &SnapshotMetadata,
-        memory_ref: engram_core::types::manifest::ManifestRef,
-    ) -> Result<(), SandboxError> {
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
-            return Ok(());
-        };
-        let Some(rolling) = self.checkpoint_rolling_path(id) else {
-            return Ok(());
-        };
-        let src = self.inner.snapshot_path_for(metadata.id).join("memory.bin");
-        if tokio::fs::metadata(&src).await.is_err() {
-            return Ok(());
-        }
-        if let Some(parent) = rolling.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("rolling dir: {e}")))?;
-        }
-        // GiB-scale copy off the hot path (the guest already resumed);
-        // copy to a temp + rename so a crash never leaves a torn
-        // rolling file masquerading as a baseline.
-        let tmp = rolling.with_extension("partial");
-        let (src_c, tmp_c) = (src.clone(), tmp.clone());
-        tokio::task::spawn_blocking(move || std::fs::copy(&src_c, &tmp_c))
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("seed copy join: {e}")))?
-            .map_err(|e| SandboxError::Snapshot(format!("seed copy: {e}")))?;
-        tokio::fs::rename(&tmp, &rolling)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("seed rename: {e}")))?;
-        let manifest = chunk_store
-            .get_manifest(memory_ref)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("fetch seeded manifest: {e}")))?;
-        self.checkpoint_chains.insert(
-            id,
-            crate::checkpoint::CheckpointChain {
-                manifest_ref: memory_ref,
-                manifest,
-                rolling_memfile: Some(rolling),
-            },
-        );
-        tracing::info!(
-            sandbox_id = %id,
-            manifest = %memory_ref,
-            "checkpoint chain seeded; subsequent captures ride the diff path",
-        );
-        Ok(())
-    }
-
-    /// ADR 0038 B2: seed the checkpoint chain on RESUME, manifest-only
-    /// (no local rolling image — "sparse mode"). The resume source's
-    /// memory manifest already describes the full image in the chunk
-    /// store, so the first post-resume periodic checkpoint can take the
-    /// diff path (`update_for_dirty_ranges_sparse`) instead of a Full
-    /// re-read of guest RAM — which under UFFD faults the entire working
-    /// set in from the store (the 60 s `PUT /snapshot/create` hang).
-    ///
-    /// Best-effort: a missing/unfetchable manifest just means the first
-    /// checkpoint falls back to Full (the prior behavior). Skips when
-    /// checkpointing is disabled, there's no chunk store, or a chain is
-    /// already tracked (a fresh `restore` always mints a new sandbox id,
-    /// so the latter is just defensive).
     async fn seed_checkpoint_chain_sparse(
         &self,
         id: SandboxId,
         memory_ref: engram_core::types::manifest::ManifestRef,
     ) {
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
-            return;
-        };
-        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
-            return;
-        }
-        match chunk_store.get_manifest(memory_ref).await {
-            Ok(manifest) => {
-                self.checkpoint_chains.insert(
-                    id,
-                    crate::checkpoint::CheckpointChain {
-                        manifest_ref: memory_ref,
-                        manifest,
-                        rolling_memfile: None,
-                    },
-                );
-                tracing::info!(
-                    sandbox_id = %id,
-                    manifest = %memory_ref,
-                    "ADR 0038: resume-seeded sparse checkpoint chain; first checkpoint will diff",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    manifest = %memory_ref,
-                    error = %e,
-                    "resume chain seed failed; first checkpoint falls back to Full",
-                );
-            }
-        }
+        self.finisher()
+            .seed_checkpoint_chain_sparse(id, memory_ref)
+            .await
+    }
+
+    async fn seed_checkpoint_chain_forked(
+        &self,
+        id: SandboxId,
+        src_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        self.finisher()
+            .seed_checkpoint_chain_forked(id, src_ref)
+            .await
     }
 
     /// Sandboxes due for a periodic checkpoint: session-bound, and no
@@ -1159,22 +1531,40 @@ impl PooledBackend {
     /// when the cache is already warm) and best-effort (errors
     /// degrade to the serial fault path inside materialize_to_file_cached).
     ///
-    /// Concurrency is bounded at 8 — well under the NIC's
-    /// saturation point on the prod n2-standard-8 hosts (single-
-    /// stream GCS hits ~80 MB/s; 8× parallel = ~640 MB/s, half the
-    /// 10 Gbps line rate) and well below GCS's per-object rate
-    /// limits.
+    /// Concurrency is bounded at [`MEMORY_PREFETCH_CONCURRENCY`] (32).
+    /// Single-stream GCS hits ~80 MB/s on the prod n2-standard-8 hosts;
+    /// the prior bound of 8 (~640 MB/s) left most of the 10 Gbps line
+    /// rate idle while the cold resume waited 66.5 s on this prefetch
+    /// (traced). 32 (~2.5 GB/s aggregate) saturates closer to line rate
+    /// without tripping GCS per-object rate limits, shrinking the
+    /// cold-cache refill that gates resume. (ADR 0039 item #19 also
+    /// flags moving this prefetch off the resume critical path entirely
+    /// — see the design note; that's the higher-risk follow-up.)
     async fn prefetch_memory_chunks(
         &self,
         metadata: &SnapshotMetadata,
     ) -> Result<usize, SandboxError> {
+        match (self.chunk_store.as_ref(), self.chunk_cache.as_ref()) {
+            (Some(cs), Some(cache)) => {
+                Self::prefetch_memory_chunks_inner(cs, cache, metadata).await
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Owner-agnostic body of [`Self::prefetch_memory_chunks`]. Takes the
+    /// already-resolved store + cache (by ref) so it can run either inline
+    /// (`await`, on the File base-create path where the serial
+    /// `materialize_memory_if_missing` reads the warmed cache) or inside a
+    /// spawned background task (ADR 0043 P1, the UFFD-resume path — the warmed
+    /// chunks are consumed only by the handler's later lazy faults, so warming
+    /// need not block resume).
+    async fn prefetch_memory_chunks_inner(
+        chunk_store: &ChunkStore,
+        cache: &ChunkCache,
+        metadata: &SnapshotMetadata,
+    ) -> Result<usize, SandboxError> {
         let Some(mref) = metadata.memory_manifest else {
-            return Ok(0);
-        };
-        let Some(chunk_store) = self.chunk_store.as_ref() else {
-            return Ok(0);
-        };
-        let Some(cache) = self.chunk_cache.as_ref() else {
             return Ok(0);
         };
         // ADR 0014 M1.14: if the snapshot has a published working-
@@ -1185,7 +1575,7 @@ impl PooledBackend {
         // prefetch (M1.13 behavior) when the trace isn't present,
         // unreachable, or empty.
         let hashes_to_prefetch: Vec<_> = match metadata.working_set_blob_key.as_deref() {
-            Some(ws_key) => match self.fetch_working_set_chunks(chunk_store, ws_key).await {
+            Some(ws_key) => match Self::fetch_working_set_chunks(chunk_store, ws_key).await {
                 Ok(chunks) if !chunks.is_empty() => {
                     tracing::debug!(
                         ws_key,
@@ -1226,10 +1616,14 @@ impl PooledBackend {
         let chunk_count = hashes_to_prefetch.len();
         let store_for_fetch = chunk_store.clone();
         cache
-            .prefetch_chunks_parallel(hashes_to_prefetch, 8, move |hash| {
-                let s = store_for_fetch.clone();
-                async move { s.get_chunk(hash).await }
-            })
+            .prefetch_chunks_parallel(
+                hashes_to_prefetch,
+                MEMORY_PREFETCH_CONCURRENCY,
+                move |hash| {
+                    let s = store_for_fetch.clone();
+                    async move { s.get_chunk(hash).await }
+                },
+            )
             .await
             .map_err(|e| SandboxError::Snapshot(format!("prefetch_chunks_parallel: {e}")))?;
         tracing::debug!(
@@ -1247,7 +1641,6 @@ impl PooledBackend {
     /// the blob is missing (older bakes that pre-date M1.14) so
     /// the caller falls back to full-manifest prefetch.
     async fn fetch_working_set_chunks(
-        &self,
         chunk_store: &ChunkStore,
         ws_key: &str,
     ) -> Result<Vec<engram_chunk_store::manifest::ChunkHash>, SandboxError> {
@@ -1789,13 +2182,489 @@ async fn materialize_chunked_rootfs(
 /// are omitted from the manifest (the chunk_file primitive already
 /// short-circuits them); on restore the resolver treats absent
 /// chunk entries as zero-fill (UFFDIO_ZEROPAGE) so zero pages cost
+/// ADR 0045 D5: what `capture_phase` hands the post phase.
+pub(crate) struct SnapshotCapture {
+    metadata: SnapshotMetadata,
+    dest: PathBuf,
+    chain_prev: Option<(
+        engram_core::types::manifest::ManifestRef,
+        engram_chunk_store::Manifest,
+    )>,
+    paused_at: chrono::DateTime<chrono::Utc>,
+    #[cfg(target_os = "linux")]
+    nbd_pending_flush: Option<crate::disk_daemon::PendingDiskFlush>,
+}
+
+/// ADR 0045 D5: see [`PooledBackend::finisher`]. Owns Arc-clones of the
+/// fields the snapshot post phase + chain bookkeeping touch, so the phase
+/// can run detached from the originating RPC.
+#[derive(Clone)]
+pub(crate) struct SnapshotFinisher {
+    #[cfg(target_os = "linux")]
+    nbd_sandboxes: Arc<DashMap<SandboxId, crate::disk_daemon::NbdSandboxState>>,
+    chunk_store: Option<ChunkStore>,
+    chunk_cache: Option<ChunkCache>,
+    bundle_dir: PathBuf,
+    inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
+    last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
+    checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
+    checkpoint_dir: Option<PathBuf>,
+    session_bindings: Arc<DashMap<SandboxId, SessionId>>,
+}
+
+impl SnapshotFinisher {
+    /// ADR 0045 D5 + issue #147: the post phase — disk upload, memory
+    /// re-chunk (parallel, `buffer_unordered(32)` inside the chunk
+    /// store), portable-blob upload, bundle publish, then chain
+    /// bookkeeping / cleanup. Instrumented end-to-end (the re-chunk used
+    /// to be invisible in traces).
+    pub(crate) async fn finish(
+        &self,
+        id: SandboxId,
+        cap: SnapshotCapture,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        let finish_start = std::time::Instant::now();
+        let flavor = if cap.chain_prev.is_some() {
+            "diff"
+        } else {
+            "full"
+        };
+        // Filled by the diff branch below; consumed by the chain
+        // advance after the post-processing block succeeds.
+        let mut next_manifest_for_chain: Option<engram_chunk_store::Manifest> = None;
+
+        // ADR 0014 cleanup hygiene: from here on, FC has materialised
+        // state.bin + memory.bin in `dest` (4+ GiB). Any failure in
+        // the post-inner steps below (chunking, sidecar patch, BlobStorage
+        // upload, NBD version conflict surfaced via the caller's
+        // earlier flush) MUST rm -rf `dest` before propagating, or
+        // we leak 4 GiB per failure — idle-evict retries every ~30s
+        // and fills the host disk inside an hour.
+        let metadata = cap.metadata;
+        let dest = cap.dest;
+        let chain_prev = cap.chain_prev;
+        let paused_at = cap.paused_at;
+        #[cfg(target_os = "linux")]
+        let nbd_pending_flush = cap.nbd_pending_flush;
+        let mut metadata = metadata;
+        let post = async {
+            // ADR 0038 B3: the guest has resumed (inner.snapshot above
+            // brought it back). Upload the drained disk chunks to GCS +
+            // publish the manifest now — OFF the frozen-guest path. The
+            // operation scope makes the chunk uploads attach `chunk.flush`
+            // spans to the snapshot op's trace. Awaited here (before the
+            // snapshot is recorded) so the recorded `disk_manifest`
+            // references durable chunks; `base` is rebased only after the
+            // upload, so the background scheduler never sees a
+            // not-yet-uploaded chunk.
+            #[cfg(target_os = "linux")]
+            if let Some(pending) = nbd_pending_flush {
+                if let Some(entry) = self.nbd_sandboxes.get(&id) {
+                    entry.backend.operation_scope().begin("snapshot");
+                    let res = entry.backend.flush_upload(pending).await;
+                    entry.backend.operation_scope().end();
+                    let outcome =
+                        res.map_err(|e| SandboxError::Snapshot(format!("nbd disk upload: {e}")))?;
+                    tracing::info!(
+                        sandbox_id = %id,
+                        manifest = %outcome.manifest_ref,
+                        chunks_flushed = outcome.chunks_flushed,
+                        bytes_uploaded = outcome.bytes_uploaded,
+                        "chunked NBD disk uploaded (post-resume)",
+                    );
+                    metadata.disk_manifest = Some(outcome.manifest_ref);
+                }
+            }
+            // ADR 0007 / Phase 5: when a chunk store is wired AND the
+            // underlying backend left a memory.bin in `dest` (FC does;
+            // VZ + Process don't), chunk it into the store + patch the
+            // FC snapshot manifest so the UFFD handler can resolve
+            // session-divergent pages on restore. Skipped silently when
+            // either condition isn't met — VZ + Process paths still
+            // produce valid snapshots without a memory_manifest, and
+            // FC without a chunk_store falls back to RestoreMode::File.
+            let Some(chunk_store) = self.chunk_store.as_ref() else {
+                return Ok(metadata);
+            };
+            let manifest_ref = if let Some((prev_ref, prev_manifest)) = chain_prev.as_ref() {
+                // ADR 0028 Fix A diff path: re-chunk ONLY the chunks the
+                // dirty extents touched — the previous manifest's hashes
+                // carry over for everything else, so CPU + upload stay
+                // O(dirty set). The manifest id is stable for the chain's
+                // lifetime; only `version` ticks.
+                //
+                // ADR 0039: sparse-only. Reconstruct each dirty chunk from
+                // its prev content (warm chunk cache) + the sparse diff —
+                // no full memfile to read, keep, or overlay.
+                let diff_path = dest.join("memory.diff");
+                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+                    .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
+                let next = chunk_store
+                    .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
+                let next_ref = prev_ref.next_version();
+                chunk_store
+                    .put_manifest(next_ref, &next)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
+                // The sparse diff did its job; drop it so the local
+                // snapshot dir stays state.bin + sidecar sized.
+                let _ = fs::remove_file(&diff_path).await;
+                next_manifest_for_chain = Some(next);
+                tracing::info!(
+                    session_sandbox = %id,
+                    manifest = %next_ref,
+                    dirty_ranges = ranges.len(),
+                    "diff checkpoint re-chunked",
+                );
+                next_ref
+            } else {
+                let mem_path = dest.join("memory.bin");
+                if fs::metadata(&mem_path).await.is_err() {
+                    return Ok(metadata);
+                }
+                let mref = chunk_memory_to_store(chunk_store, &mem_path, self.chunk_cache.as_ref())
+                    .await?;
+                // ADR 0039: the dump is now durable in the chunk store and
+                // the chain seeds from the manifest (not this file) — drop
+                // the GiB-scale memory.bin so committed snapshot dirs stay
+                // state.bin + sidecar sized. A cross-host restore
+                // re-materializes it from the chunks via the manifest
+                // (restore_materializes_missing_memory_bin_from_chunks).
+                let _ = fs::remove_file(&mem_path).await;
+                tracing::info!(
+                    session_sandbox = %id,
+                    manifest = %mref,
+                    "chunked FC memory.bin → chunk store (local dump removed)",
+                );
+                mref
+            };
+            // Patch the FC sidecar JSON (`manifest.json`) so its
+            // `memory_manifest` field carries the ref the UFFD handler
+            // needs at restore time. The FC backend deserializes via
+            // serde with `#[serde(default)]`, so a JSON patch over the
+            // wire-shape stays compatible without us depending on its
+            // private struct.
+            let manifest_json = dest.join("manifest.json");
+            patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
+            metadata.memory_manifest = Some(manifest_ref);
+
+            // ADR 0014: upload state.bin + sidecar to BlobStorage so a
+            // sibling host can restore from this snapshot. memory.bin
+            // is already chunk-stored above; state.bin and sidecar are
+            // small opaque blobs (state.bin is FC VMM+device state,
+            // sidecar is `manifest.json` carrying spec + memory_manifest
+            // + source sandbox_id). Skipped silently when state.bin is
+            // missing (defensive: should always exist after FC snapshot,
+            // but the chunked-memory path already gates on memory.bin
+            // existence for the same reason).
+            let blob = chunk_store.blob_storage();
+            let state_path = dest.join("state.bin");
+            let sidecar_path = dest.join("manifest.json");
+            if fs::metadata(&state_path).await.is_ok() && fs::metadata(&sidecar_path).await.is_ok()
+            {
+                let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
+                let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &state_key,
+                    &state_path,
+                )
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &sidecar_key,
+                    &sidecar_path,
+                )
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+                metadata.state_blob_key = Some(state_key);
+                metadata.sidecar_blob_key = Some(sidecar_key);
+                metadata.source_sandbox_id = Some(id);
+                tracing::info!(
+                    source_sandbox = %id,
+                    snapshot_id = %metadata.id,
+                    "portable snapshot artifacts uploaded to BlobStorage",
+                );
+            }
+            // ADR 0035 §2: idempotently publish the pinned bundle
+            // generations. Runs on every snapshot flavor — an eviction
+            // snapshot can pin a swapped-in generation no base capture
+            // ever published. Failure fails the snapshot (a pin nothing
+            // can satisfy is worse than a retried eviction).
+            if !metadata.aux_bundles.is_empty() {
+                crate::bundles::BundleStore::new(blob.clone(), self.bundle_dir.clone())
+                    .publish(&metadata.aux_bundles)
+                    .await?;
+            }
+            Ok::<_, SandboxError>(metadata)
+        }
+        .await;
+
+        let result = match post {
+            Ok(m) => {
+                // ADR 0014 issue #1/#2: record the snapshot_id so a
+                // future commit/abort RPC can clean up the per-snapshot
+                // artifacts even though the caller only knows the
+                // sandbox_id. Also lets a retry of this same sandbox's
+                // snapshot() find and tear down the prior attempt.
+                self.inflight_snapshots.insert(id, m.id);
+                // ADR 0016 Phase A: stamp the memory-tier RPO signal
+                // the `cow_state` RPC reports. Done AFTER post-
+                // processing succeeded — a snapshot whose state.bin /
+                // sidecar upload failed isn't durable and shouldn't
+                // advance the RPO indicator on the diagnostic
+                // surface. Pre-`commit_snapshot` is fine: the row
+                // hasn't been "claimed" by PG yet but the bytes are
+                // in BlobStorage, which is what the RPO measures.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.last_snapshot_unix_ms.insert(id, now_ms);
+                // ADR 0028 Fix A: seed/advance the rolling chain +
+                // persist the durable host-owned record. Best-effort
+                // beyond the capture: a seed failure means the next
+                // capture is Full again; a record failure means only
+                // PG (if the caller's pipeline survives) knows this
+                // checkpoint. Both safe, both logged inside.
+                self.advance_checkpoint_state(id, &m, paused_at, next_manifest_for_chain)
+                    .await;
+                Ok(m)
+            }
+            Err(e) => {
+                // ADR 0014 cleanup hygiene: rm -rf the FC-written
+                // snapshot dir before propagating. Idle-evict retry
+                // (every ~30s) without this leaks 4 GiB per try and
+                // fills the host disk inside an hour.
+                match tokio::fs::remove_dir_all(&dest).await {
+                    Ok(_) => tracing::warn!(
+                        sandbox_id = %id,
+                        dest = %dest.display(),
+                        error = %e,
+                        "PooledBackend::snapshot post-inner failed; orphan dir cleaned",
+                    ),
+                    Err(rm_err) => tracing::warn!(
+                        sandbox_id = %id,
+                        dest = %dest.display(),
+                        snapshot_error = %e,
+                        rm_error = %rm_err,
+                        "PooledBackend::snapshot post-inner failed; rm -rf of orphan dir also failed",
+                    ),
+                }
+                Err(e)
+            }
+        };
+        metrics::histogram!(
+            crate::metrics::SNAPSHOT_FINISH_SECONDS,
+            "type" => flavor,
+            "outcome" => if result.is_ok() { "success" } else { "error" },
+        )
+        .record(finish_start.elapsed().as_secs_f64());
+        result
+    }
+    fn checkpoint_records_dir(&self) -> Option<PathBuf> {
+        self.checkpoint_dir.as_ref().map(|d| d.join("records"))
+    }
+
+    async fn advance_checkpoint_state(
+        &self,
+        id: SandboxId,
+        metadata: &SnapshotMetadata,
+        paused_at: chrono::DateTime<chrono::Utc>,
+        next_manifest: Option<engram_chunk_store::Manifest>,
+    ) {
+        if self.checkpoint_dir.is_none() {
+            return;
+        }
+        let Some(memory_ref) = metadata.memory_manifest else {
+            // No chunked memory (no chunk store / non-FC backend):
+            // nothing to chain, and a record without a memory
+            // manifest adds nothing over the live disk manifest.
+            return;
+        };
+
+        match next_manifest {
+            // Diff capture: the sparse re-chunk already ran in the post
+            // block; just advance the chain's manifest pointer.
+            Some(next) => {
+                if let Some(mut chain) = self.checkpoint_chains.get_mut(&id) {
+                    chain.manifest_ref = memory_ref;
+                    chain.manifest = next;
+                }
+            }
+            // Full capture: seed the chain manifest-only from the manifest
+            // we just published (ADR 0039 — no local rolling image; the
+            // memory.bin was chunked + removed in the post block).
+            // Subsequent captures ride the sparse diff path.
+            None => {
+                self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+            }
+        }
+
+        // Durable record — only for session-bound sandboxes (anonymous
+        // base-snapshot captures have no session to reconcile).
+        let Some(session_id) = self.session_bindings.get(&id).map(|s| *s) else {
+            return;
+        };
+        let Some(records_dir) = self.checkpoint_records_dir() else {
+            return;
+        };
+        let record = crate::checkpoint::CheckpointRecord {
+            snapshot_id: metadata.id,
+            session_id,
+            sandbox_id: id,
+            image_version: metadata.image_version.clone(),
+            size_bytes: metadata.size_bytes,
+            disk_manifest: metadata.disk_manifest,
+            memory_manifest: metadata.memory_manifest,
+            aux_bundles: metadata.aux_bundles.clone(),
+            paused_at,
+            captured_at: metadata.created_at,
+        };
+        if let Err(e) = record.persist(&records_dir).await {
+            tracing::warn!(
+                sandbox_id = %id,
+                snapshot_id = %metadata.id,
+                error = %e,
+                "durable checkpoint record write failed; PG row (if the caller's \
+                 pipeline survives) is the only reference",
+            );
+        }
+    }
+
+    /// ADR 0045 seed-at-create: seed the chain by FORKING the source
+    /// lineage — publish the source manifest's content under a fresh
+    /// manifest id @v1, and chain on that. Required because fresh
+    /// creates seed from the SHARED per-image base manifest: chaining
+    /// directly on it makes every session's first diff race to publish
+    /// `base_id@v2` (the e2e-caught version conflict). The fork gives
+    /// each session a lineage it solely owns; the diff path then ticks
+    /// versions unchanged. One small manifest-JSON PUT (no chunk
+    /// uploads — the content is byte-identical to the source).
+    /// Best-effort like the sparse seed: failure → no chain → the next
+    /// capture is Full.
+    async fn seed_checkpoint_chain_forked(
+        &self,
+        id: SandboxId,
+        src_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return;
+        };
+        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
+            return;
+        }
+        let manifest = match chunk_store.get_manifest(src_ref).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    manifest = %src_ref,
+                    error = %e,
+                    "seed-at-create: source manifest fetch failed; first checkpoint falls back to Full",
+                );
+                return;
+            }
+        };
+        let fork_ref = engram_core::types::manifest::ManifestRef::new();
+        if let Err(e) = chunk_store.put_manifest(fork_ref, &manifest).await {
+            tracing::warn!(
+                sandbox_id = %id,
+                src = %src_ref,
+                fork = %fork_ref,
+                error = %e,
+                "seed-at-create: fork manifest publish failed; first checkpoint falls back to Full",
+            );
+            return;
+        }
+        self.checkpoint_chains.insert(
+            id,
+            crate::checkpoint::CheckpointChain {
+                manifest_ref: fork_ref,
+                manifest,
+            },
+        );
+        tracing::info!(
+            sandbox_id = %id,
+            src = %src_ref,
+            fork = %fork_ref,
+            "ADR 0045 seed-at-create: chain seeded on a forked lineage; first checkpoint will diff",
+        );
+    }
+
+    /// ADR 0038 B2 / ADR 0039: seed the checkpoint chain manifest-only
+    /// (no local rolling image — "sparse mode"). Two entry points: on
+    /// RESUME from the source's memory manifest, and after a fresh Full
+    /// capture from the just-published one. ADR 0039 retired the rolling
+    /// memfile, so this is the *only* seed. The manifest already describes
+    /// the full image in the chunk store, so the next periodic checkpoint
+    /// takes the diff path (`update_for_dirty_ranges_sparse`) instead of a
+    /// Full re-read of guest RAM — which under UFFD faults the entire
+    /// working set in from the store (the 60 s `PUT /snapshot/create`
+    /// hang).
+    ///
+    /// Best-effort: a missing/unfetchable manifest just means the next
+    /// checkpoint falls back to Full. Skips when checkpointing is
+    /// disabled, there's no chunk store, or a chain is already tracked
+    /// (a fresh `restore` mints a new sandbox id; the Full-capture caller
+    /// only reaches here when the chain was empty).
+    async fn seed_checkpoint_chain_sparse(
+        &self,
+        id: SandboxId,
+        memory_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        let Some(chunk_store) = self.chunk_store.as_ref() else {
+            return;
+        };
+        if self.checkpoint_dir.is_none() || self.checkpoint_chains.contains_key(&id) {
+            return;
+        }
+        match chunk_store.get_manifest(memory_ref).await {
+            Ok(manifest) => {
+                self.checkpoint_chains.insert(
+                    id,
+                    crate::checkpoint::CheckpointChain {
+                        manifest_ref: memory_ref,
+                        manifest,
+                    },
+                );
+                tracing::info!(
+                    sandbox_id = %id,
+                    manifest = %memory_ref,
+                    "ADR 0038/0039: seeded sparse checkpoint chain; next checkpoint will diff",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    manifest = %memory_ref,
+                    error = %e,
+                    "resume chain seed failed; first checkpoint falls back to Full",
+                );
+            }
+        }
+    }
+}
+
 /// zero chunks + zero bytes of object storage.
 async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
     memory_bin: &std::path::Path,
+    cache: Option<&ChunkCache>,
 ) -> Result<engram_core::types::manifest::ManifestRef, SandboxError> {
+    // ADR 0039 (sticky-everywhere): write-through the base memory chunks
+    // into the host's local cache as they're uploaded, so the capturing
+    // host keeps them local instead of re-fetching its own writes.
     let manifest = chunk_store
-        .chunk_file(memory_bin, engram_chunk_store::ManifestKind::Memory, None)
+        .chunk_file_into(
+            memory_bin,
+            engram_chunk_store::ManifestKind::Memory,
+            None,
+            cache,
+        )
         .await
         .map_err(|e| {
             SandboxError::Snapshot(format!("chunk memory.bin {}: {e}", memory_bin.display(),))
@@ -2020,396 +2889,352 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        // ADR 0028 Fix A: serialize captures per sandbox — a periodic
-        // checkpoint and an eviction/drain/SIGTERM snapshot must never
-        // interleave (the pause is idempotent, but concurrent NBD
-        // flushes + chain advances are not).
-        let capture_lock = self.capture_lock(id);
-        // ADR 0038 B0: time the lock wait — the gridlock signal. With
-        // B1 periodic checkpoints skip rather than queue, so a long tail
-        // here is an eviction/drain blocked on an in-flight capture.
-        let lock_wait = std::time::Instant::now();
-        let _capture_guard = capture_lock.lock().await;
-        metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
-            .record(lock_wait.elapsed().as_secs_f64());
-        // Diff-mode when a rolling chain exists: same coherent
-        // (memory, disk) capture contract, O(dirty set) cost. The
-        // chain seeds on the first (Full) capture below — so an
-        // eviction on a long-running session is just the final diff
-        // in its checkpoint chain, collapsing the multi-GiB-dump
-        // window the cf4d4afd incident sat in.
-        let chain_prev = self.checkpoint_chains.get(&id).map(|c| {
-            (
-                c.manifest_ref,
-                c.manifest.clone(),
-                c.rolling_memfile.clone(),
-            )
-        });
+        // ADR 0045 D5: composed form — capture, then run the post phase
+        // inline holding the capture lock (the periodic-checkpoint and
+        // drain flavor; eviction uses snapshot_begin/snapshot_wait).
+        let (_capture_guard, cap) = self.capture_phase(id).await?;
+        self.finisher().finish(id, cap).await
+    }
 
-        // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
-        // was produced but never committed (caller's downstream
-        // pipeline failed or the coord pod crashed between snapshot
-        // and commit), tear down its artifacts BEFORE we mint a fresh
-        // SnapshotId. This is the overwrite-in-place semantic that
-        // keeps the host-side disk bounded under coord-side retry
-        // storms — the prod incident on `engrams-fc-xngk` leaked
-        // ~25 dirs × 4 GiB in 13 min because each retry minted a fresh
-        // id and left the prior dir on disk.
-        if self.inflight_snapshots.contains_key(&id) {
-            if let Err(e) = self.abort_prior_inflight_snapshot(id).await {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    error = %e,
-                    "snapshot retry: best-effort abort of prior in-flight snapshot failed; \
-                     proceeding with fresh attempt anyway",
-                );
-            }
+    /// ADR 0045 D5: the eviction flavor. Runs the capture, re-pauses the
+    /// guest (it's being torn down — today's pipeline already discards
+    /// post-capture execution; this just stops it burning CPU during the
+    /// background upload), and spawns the post phase (chunk + upload +
+    /// chain bookkeeping) as a detached task that `snapshot_wait` awaits.
+    /// The coordinator may mark the session Idle as soon as this returns.
+    async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        let (capture_guard, cap) = self.capture_phase(id).await?;
+        // Idempotent re-pause; best-effort (a failure leaves the orphan
+        // running until destroy, which is today's behavior).
+        if let Err(e) = self.inner.pause(id).await {
+            tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
+        }
+        let snapshot_id = cap.metadata.id;
+        let finisher = self.finisher();
+        let handle = tokio::spawn(async move {
+            // The capture lock rides into the task: checkpoints stay
+            // locked out until the upload completes (chain bookkeeping
+            // is not concurrent-safe per sandbox).
+            let _capture_guard = capture_guard;
+            finisher.finish(id, cap).await
+        });
+        if let Some(prior) = self.snapshot_waits.insert(id, handle) {
+            // A prior begin whose wait never came (coordinator died).
+            // Don't await it (it may still be uploading) — just drop the
+            // handle; its artifacts are covered by the inflight tracking
+            // + abort-prior path on the next snapshot.
+            prior.abort();
+            tracing::warn!(sandbox_id = %id, "snapshot_begin superseded an unconsumed prior wait");
+        }
+        Ok(snapshot_id)
+    }
+
+    /// ADR 0045 D5: await the background post phase. Single-consumer.
+    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        let (_, handle) = self.snapshot_waits.remove(&id).ok_or_else(|| {
+            SandboxError::Snapshot(format!("no snapshot_begin in flight for sandbox {id}"))
+        })?;
+        handle
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("snapshot upload task: {e}")))?
+    }
+
+    /// ADR 0045 C1: freeze for a live move. See `crate::migration`'s
+    /// module docs for the lifecycle; the export holds the capture
+    /// lock (= the checkpoint fence) and the NBD backend's
+    /// migration_fence (= the flush/publish fence) until commit/abort.
+    async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        use engram_core::types::snapshot::MigrationCaptureOut;
+        let Some((chain_ref, chain_manifest)) = self
+            .checkpoint_chains
+            .get(&id)
+            .map(|c| (c.manifest_ref, c.manifest.clone()))
+        else {
+            // No chain (host restarted, seed failed) — the composed
+            // snapshot-rehome path handles it; signal fallback.
+            return Err(SandboxError::InvalidSpec(
+                "no checkpoint chain for this sandbox — use snapshot-rehome".into(),
+            ));
+        };
+        let Some(chunk_store) = self.chunk_store.clone() else {
+            return Err(SandboxError::InvalidSpec(
+                "no chunk store — use snapshot-rehome".into(),
+            ));
+        };
+        let Some(cache) = self.chunk_cache.clone() else {
+            return Err(SandboxError::InvalidSpec(
+                "no chunk cache — use snapshot-rehome".into(),
+            ));
+        };
+        if self.migrations.validate_open(id) {
+            return Err(SandboxError::AlreadyExists);
         }
 
-        // ADR 0021 P1.6 follow-up: gate snapshot on agentd readiness.
-        //
-        // The pre-flush pause below freezes vCPUs. If the guest is still
-        // in early boot (kernel → engram-init → agentd start) at that
-        // moment, the snapshot captures a half-initialised kernel — in
-        // particular, agentd may not have completed `bind(AF_VSOCK)` —
-        // and the resumed kernel comes up with a half-initialised vsock
-        // driver. `panic=1 reboot=k` then trips `KVM_EXIT_SHUTDOWN`
-        // ~1 s after `load_snapshot` returns; every subsequent
-        // host→guest dial fails ECONNREFUSED.
-        //
-        // Reachable in prod via:
-        //   1. SIGTERM-during-cold-boot. `shutdown.rs` checkpoints all
-        //      sandboxes from `backend.list()` after a 5 s drain — a
-        //      sandbox still booting at SIGTERM gets snapshotted mid-
-        //      bind without this gate.
-        //   2. coord-driven `snapshot(id)` fired quickly after create
-        //      (any fast-rebake / probe path).
-        //
-        // `wait_agent_ready` blocks until agentd has dialled the host's
-        // ready port (port 1027) — proving the guest's vsock stack is
-        // operational end-to-end. On warm-restored sandboxes the watch
-        // is pre-set true (FC's `restore_in_jail`), so this is a no-op
-        // for warm re-snapshot paths. The FC backend is the only one
-        // with the per-sandbox agent_ready watch; non-FC backends
-        // (Process, future) return `InvalidSpec` from the default trait
-        // impl, which we treat as "no readiness concept here, proceed."
+        // Checkpoint fence: held for the export's lifetime.
+        let capture_guard = self.capture_lock(id).lock_owned().await;
+
         match self.inner.wait_agent_ready(id).await {
             Ok(()) => {}
             Err(SandboxError::InvalidSpec(_)) => {}
             Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
         }
-
-        // ADR 0018 commit 12m + ADR 0038 B3: snapshot ordering is
-        //   pause → wait_idle → flush_local(drain) → inner.snapshot
-        //   → [resume] → flush_upload(GCS) (in the `post` block)
-        // where inner.snapshot's internal pause/capture/resume is a
-        // no-op pause (FC's PATCH /vm is idempotent) followed by the
-        // memory dump and a resume that brings the VM back running.
-        // This guarantees memory + disk are CAPTURED at the same point
-        // in time: the explicit pause stops vCPUs, wait_idle drains any
-        // in-flight virtio writes through the NBD daemon, flush_local
-        // drains the just-quiesced dirty set locally, and inner.snapshot
-        // then captures the page cache (which agrees with that disk
-        // state). The disk GCS upload is deferred to flush_upload AFTER
-        // resume — off the frozen-guest path — but the captured *content*
-        // is fixed at the drain, so coherence is unchanged.
-        //
-        // Pre-12m ordering was flush → inner.snapshot (FC's pause
-        // happened inside the inner call AFTER our flush). Writes
-        // queued between flush and pause landed in memory but not
-        // the drained disk set — the cross-host evac canary md5
-        // mismatch on dev-vm validation was exactly this race.
-        //
-        // ADR 0028 A.log: the pause instant is the coherence cut for
-        // the (memory, disk, event-log) triple — the coord resolves
-        // the session_events cursor as "last event at or before this"
-        // when it records the checkpoint.
         let paused_at = chrono::Utc::now();
         self.inner
             .pause(id)
             .await
-            .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
+            .map_err(|e| SandboxError::Snapshot(format!("migration pause: {e}")))?;
 
-        // ADR 0038 B3: under the pause, only DRAIN the dirty buffer
-        // (+ hash + stash in the backend's pending tier) — the
-        // multi-second GCS upload is deferred to `flush_upload` after
-        // the guest resumes (the `post` block below), so the
-        // guest-visible pause is O(local copy), not O(GCS). The drain
-        // still captures disk-at-the-pause-instant (ADR 0018 §12m); the
-        // memory capture below is paired with it.
+        // Disk: drain under the pause, land the pending tier in the
+        // LOCAL cache, fence further flush publishes.
         #[cfg(target_os = "linux")]
-        let nbd_pending_flush = if let Some(entry) = self.nbd_sandboxes.get(&id) {
-            // Drain in-flight NBD requests so the drain sees a quiescent
-            // dirty buffer. With FC paused above, no new virtio writes
-            // are issued, and wait_idle returns once already-in-flight
-            // requests have completed through backend.write().
-            entry.backend.wait_idle().await;
-            let pending = entry
-                .backend
-                .flush_local()
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
-            Some(pending)
-        } else {
-            None
-        };
-
-        // ADR 0007 Phase 6: backend owns its staging dir; we look
-        // it up via snapshot_path_for after the inner call so we
-        // can read/patch the on-disk artifacts the inner backend
-        // wrote (memory.bin / memory.diff, manifest.json). The inner
-        // call's pause-create-resume cycle is idempotent against our
-        // earlier pause and brings the VM back to running on exit —
-        // for the diff flavor that resume lands after O(dirty set),
-        // not O(guest RAM).
-        // ADR 0038 B0: time the FC memory capture (`PUT /snapshot/
-        // create`) — the previously-invisible step that hung 60 s on the
-        // cold Full seed. After B2, `type="full"` should vanish on the
-        // resume path (chain seeded → diff).
-        let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
-        let create_start = std::time::Instant::now();
-        let create_res = if chain_prev.is_some() {
-            self.inner.snapshot_diff(id).await
-        } else {
-            self.inner.snapshot(id).await
-        };
-        metrics::histogram!(
-            crate::metrics::SNAPSHOT_CREATE_SECONDS,
-            "type" => snap_type,
-            "outcome" => if create_res.is_ok() { "success" } else { "error" },
-        )
-        .record(create_start.elapsed().as_secs_f64());
-        let mut metadata = create_res?;
-        let dest = self.inner.snapshot_path_for(metadata.id);
-        // Filled by the diff branch below; consumed by the chain
-        // advance after the post-processing block succeeds.
-        let mut next_manifest_for_chain: Option<engram_chunk_store::Manifest> = None;
-
-        // ADR 0014 cleanup hygiene: from here on, FC has materialised
-        // state.bin + memory.bin in `dest` (4+ GiB). Any failure in
-        // the post-inner steps below (chunking, sidecar patch, BlobStorage
-        // upload, NBD version conflict surfaced via the caller's
-        // earlier flush) MUST rm -rf `dest` before propagating, or
-        // we leak 4 GiB per failure — idle-evict retries every ~30s
-        // and fills the host disk inside an hour.
-        let post = async {
-            // ADR 0038 B3: the guest has resumed (inner.snapshot above
-            // brought it back). Upload the drained disk chunks to GCS +
-            // publish the manifest now — OFF the frozen-guest path. The
-            // operation scope makes the chunk uploads attach `chunk.flush`
-            // spans to the snapshot op's trace. Awaited here (before the
-            // snapshot is recorded) so the recorded `disk_manifest`
-            // references durable chunks; `base` is rebased only after the
-            // upload, so the background scheduler never sees a
-            // not-yet-uploaded chunk.
-            #[cfg(target_os = "linux")]
-            if let Some(pending) = nbd_pending_flush {
-                if let Some(entry) = self.nbd_sandboxes.get(&id) {
-                    entry.backend.operation_scope().begin("snapshot");
-                    let res = entry.backend.flush_upload(pending).await;
-                    entry.backend.operation_scope().end();
-                    let outcome =
-                        res.map_err(|e| SandboxError::Snapshot(format!("nbd disk upload: {e}")))?;
-                    tracing::info!(
-                        sandbox_id = %id,
-                        manifest = %outcome.manifest_ref,
-                        chunks_flushed = outcome.chunks_flushed,
-                        bytes_uploaded = outcome.bytes_uploaded,
-                        "chunked NBD disk uploaded (post-resume)",
-                    );
-                    metadata.disk_manifest = Some(outcome.manifest_ref);
-                }
-            }
-            // ADR 0007 / Phase 5: when a chunk store is wired AND the
-            // underlying backend left a memory.bin in `dest` (FC does;
-            // VZ + Process don't), chunk it into the store + patch the
-            // FC snapshot manifest so the UFFD handler can resolve
-            // session-divergent pages on restore. Skipped silently when
-            // either condition isn't met — VZ + Process paths still
-            // produce valid snapshots without a memory_manifest, and
-            // FC without a chunk_store falls back to RestoreMode::File.
-            let Some(chunk_store) = self.chunk_store.as_ref() else {
-                return Ok(metadata);
-            };
-            let manifest_ref = if let Some((prev_ref, prev_manifest, rolling)) = chain_prev.as_ref()
-            {
-                // ADR 0028 Fix A diff path: re-chunk ONLY the chunks the
-                // dirty extents touched — the previous manifest's hashes
-                // carry over for everything else, so CPU + upload stay
-                // O(dirty set). The manifest id is stable for the chain's
-                // lifetime; only `version` ticks.
-                let diff_path = dest.join("memory.diff");
-                let ranges = crate::checkpoint::dirty_ranges(&diff_path)
-                    .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
-                let next = match rolling {
-                    // File-mode VM with a local rolling full image:
-                    // overlay the sparse diff, then re-chunk from it.
-                    Some(rolling_path) => {
-                        crate::checkpoint::overlay_sparse(&diff_path, rolling_path)
-                            .await
-                            .map_err(|e| SandboxError::Snapshot(format!("overlay diff: {e}")))?;
-                        chunk_store
-                            .update_for_dirty_ranges(prev_manifest, rolling_path, &ranges)
-                            .await
-                            .map_err(|e| {
-                                SandboxError::Snapshot(format!("incremental re-chunk: {e}"))
-                            })?
-                    }
-                    // ADR 0038 sparse mode (UFFD-resumed chain, no local
-                    // image): reconstruct each dirty chunk from its prev
-                    // content + the sparse diff — no full memfile to read.
-                    None => chunk_store
-                        .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
-                        .await
-                        .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?,
-                };
-                let next_ref = prev_ref.next_version();
-                chunk_store
-                    .put_manifest(next_ref, &next)
+        let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) =
+            if let Some(entry) = self.nbd_sandboxes.get(&id) {
+                entry.backend.set_migration_fence(true);
+                entry.backend.wait_idle().await;
+                let pending =
+                    entry.backend.flush_local().await.map_err(|e| {
+                        SandboxError::Snapshot(format!("migration disk drain: {e}"))
+                    })?;
+                let (m, hashes) = entry
+                    .backend
+                    .flush_to_local_cache(&pending)
                     .await
-                    .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
-                // The sparse diff did its job; drop it so the local
-                // snapshot dir stays state.bin + sidecar sized.
-                let _ = fs::remove_file(&diff_path).await;
-                next_manifest_for_chain = Some(next);
-                tracing::info!(
-                    session_sandbox = %id,
-                    manifest = %next_ref,
-                    dirty_ranges = ranges.len(),
-                    sparse = rolling.is_none(),
-                    "diff checkpoint re-chunked",
-                );
-                next_ref
+                    .map_err(|e| SandboxError::Snapshot(format!("migration disk cache: {e}")))?;
+                let dref = entry.backend.manifest_ref().await.next_version();
+                (
+                    serde_json::to_vec(&m)
+                        .map_err(|e| SandboxError::Snapshot(format!("disk manifest json: {e}")))?,
+                    dref,
+                    hashes,
+                    Some(pending),
+                )
             } else {
-                let mem_path = dest.join("memory.bin");
-                if fs::metadata(&mem_path).await.is_err() {
-                    return Ok(metadata);
-                }
-                let mref = chunk_memory_to_store(chunk_store, &mem_path).await?;
-                tracing::info!(
-                    session_sandbox = %id,
-                    manifest = %mref,
-                    "chunked FC memory.bin → chunk store",
-                );
-                mref
+                (
+                    Vec::new(),
+                    engram_core::types::manifest::ManifestRef::new(),
+                    Vec::new(),
+                    None,
+                )
             };
-            // Patch the FC sidecar JSON (`manifest.json`) so its
-            // `memory_manifest` field carries the ref the UFFD handler
-            // needs at restore time. The FC backend deserializes via
-            // serde with `#[serde(default)]`, so a JSON patch over the
-            // wire-shape stays compatible without us depending on its
-            // private struct.
-            let manifest_json = dest.join("manifest.json");
-            patch_fc_manifest_memory_ref(&manifest_json, manifest_ref).await?;
-            metadata.memory_manifest = Some(manifest_ref);
+        #[cfg(not(target_os = "linux"))]
+        let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) = (
+            Vec::new(),
+            engram_core::types::manifest::ManifestRef::new(),
+            Vec::<engram_chunk_store::manifest::ChunkHash>::new(),
+            None,
+        );
 
-            // ADR 0014: upload state.bin + sidecar to BlobStorage so a
-            // sibling host can restore from this snapshot. memory.bin
-            // is already chunk-stored above; state.bin and sidecar are
-            // small opaque blobs (state.bin is FC VMM+device state,
-            // sidecar is `manifest.json` carrying spec + memory_manifest
-            // + source sandbox_id). Skipped silently when state.bin is
-            // missing (defensive: should always exist after FC snapshot,
-            // but the chunked-memory path already gates on memory.bin
-            // existence for the same reason).
-            let blob = chunk_store.blob_storage();
-            let state_path = dest.join("state.bin");
-            let sidecar_path = dest.join("manifest.json");
-            if fs::metadata(&state_path).await.is_ok() && fs::metadata(&sidecar_path).await.is_ok()
-            {
-                let state_key = engram_chunk_store::snapshot_blob::state_blob_key(metadata.id);
-                let sidecar_key = engram_chunk_store::snapshot_blob::sidecar_blob_key(metadata.id);
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &state_key,
-                    &state_path,
-                )
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-                engram_chunk_store::snapshot_blob::upload_file(
-                    blob.as_ref(),
-                    &sidecar_key,
-                    &sidecar_path,
-                )
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
-                metadata.state_blob_key = Some(state_key);
-                metadata.sidecar_blob_key = Some(sidecar_key);
-                metadata.source_sandbox_id = Some(id);
-                tracing::info!(
-                    source_sandbox = %id,
-                    snapshot_id = %metadata.id,
-                    "portable snapshot artifacts uploaded to BlobStorage",
-                );
-            }
-            // ADR 0035 §2: idempotently publish the pinned bundle
-            // generations. Runs on every snapshot flavor — an eviction
-            // snapshot can pin a swapped-in generation no base capture
-            // ever published. Failure fails the snapshot (a pin nothing
-            // can satisfy is worse than a retried eviction).
-            if !metadata.aux_bundles.is_empty() {
-                crate::bundles::BundleStore::new(blob.clone(), self.bundle_dir.clone())
-                    .publish(&metadata.aux_bundles)
-                    .await?;
-            }
-            Ok::<_, SandboxError>(metadata)
+        // FC diff capture. `snapshot_diff` resumes the guest on
+        // success — re-pause immediately (the guest is mid-move; its
+        // post-capture execution would be discarded anyway, exactly
+        // the D5 argument).
+        let metadata = self
+            .inner
+            .snapshot_diff(id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration diff capture: {e}")))?;
+        if let Err(e) = self.inner.pause(id).await {
+            tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
         }
-        .await;
+        let dest = self.inner.snapshot_path_for(metadata.id);
 
-        match post {
-            Ok(m) => {
-                // ADR 0014 issue #1/#2: record the snapshot_id so a
-                // future commit/abort RPC can clean up the per-snapshot
-                // artifacts even though the caller only knows the
-                // sandbox_id. Also lets a retry of this same sandbox's
-                // snapshot() find and tear down the prior attempt.
-                self.inflight_snapshots.insert(id, m.id);
-                // ADR 0016 Phase A: stamp the memory-tier RPO signal
-                // the `cow_state` RPC reports. Done AFTER post-
-                // processing succeeded — a snapshot whose state.bin /
-                // sidecar upload failed isn't durable and shouldn't
-                // advance the RPO indicator on the diagnostic
-                // surface. Pre-`commit_snapshot` is fine: the row
-                // hasn't been "claimed" by PG yet but the bytes are
-                // in BlobStorage, which is what the RPO measures.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                self.last_snapshot_unix_ms.insert(id, now_ms);
-                // ADR 0028 Fix A: seed/advance the rolling chain +
-                // persist the durable host-owned record. Best-effort
-                // beyond the capture: a seed failure means the next
-                // capture is Full again; a record failure means only
-                // PG (if the caller's pipeline survives) knows this
-                // checkpoint. Both safe, both logged inside.
-                self.advance_checkpoint_state(id, &m, paused_at, next_manifest_for_chain)
-                    .await;
-                Ok(m)
-            }
-            Err(e) => {
-                // ADR 0014 cleanup hygiene: rm -rf the FC-written
-                // snapshot dir before propagating. Idle-evict retry
-                // (every ~30s) without this leaks 4 GiB per try and
-                // fills the host disk inside an hour.
-                match tokio::fs::remove_dir_all(&dest).await {
-                    Ok(_) => tracing::warn!(
-                        sandbox_id = %id,
-                        dest = %dest.display(),
-                        error = %e,
-                        "PooledBackend::snapshot post-inner failed; orphan dir cleaned",
-                    ),
-                    Err(rm_err) => tracing::warn!(
-                        sandbox_id = %id,
-                        dest = %dest.display(),
-                        snapshot_error = %e,
-                        rm_error = %rm_err,
-                        "PooledBackend::snapshot post-inner failed; rm -rf of orphan dir also failed",
-                    ),
+        // Local-sink re-chunk: dirty memory chunks into the NVMe cache.
+        let diff_path = dest.join("memory.diff");
+        let ranges = crate::checkpoint::dirty_ranges(&diff_path)
+            .map_err(|e| SandboxError::Snapshot(format!("migration dirty ranges: {e}")))?;
+        let (mem_manifest, mem_hashes) = chunk_store
+            .update_for_dirty_ranges_sparse_with_sink(
+                &chain_manifest,
+                &diff_path,
+                &ranges,
+                Some(&cache),
+            )
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration re-chunk: {e}")))?;
+        let mem_ref = chain_ref.next_version();
+        let _ = fs::remove_file(&diff_path).await;
+        patch_fc_manifest_memory_ref(&dest.join("manifest.json"), mem_ref).await?;
+
+        let export_id = crate::migration::MigrationRegistry::mint_export_id();
+        let mut allowed: std::collections::HashSet<engram_chunk_store::manifest::ChunkHash> =
+            mem_hashes.iter().copied().collect();
+        allowed.extend(disk_hashes.iter().copied());
+        let inserted = self.migrations.insert(crate::migration::MigrationExport {
+            export_id: export_id.clone(),
+            sandbox_id: id,
+            snapshot_dir: dest,
+            allowed_chunks: allowed,
+            disk_pending,
+            created_at: std::time::Instant::now(),
+            capture_guard,
+        });
+        if !inserted {
+            return Err(SandboxError::AlreadyExists);
+        }
+        tracing::info!(
+            sandbox_id = %id,
+            export_id = %export_id,
+            mem_ref = %mem_ref,
+            mem_chunks = mem_hashes.len(),
+            disk_chunks = disk_hashes.len(),
+            "migration capture complete; sandbox frozen, export open (ADR 0045 C1)",
+        );
+        Ok(MigrationCaptureOut {
+            export_id,
+            memory_manifest_json: serde_json::to_vec(&mem_manifest)
+                .map_err(|e| SandboxError::Snapshot(format!("mem manifest json: {e}")))?,
+            disk_manifest_json,
+            memory_manifest_ref: mem_ref,
+            disk_manifest_ref: disk_ref,
+            new_memory_chunk_hashes: mem_hashes.iter().map(|h| *h.as_bytes()).collect(),
+            new_disk_chunk_hashes: disk_hashes.iter().map(|h| *h.as_bytes()).collect(),
+            snapshot_id: metadata.id,
+            paused_at_unix_ms: paused_at.timestamp_millis(),
+        })
+    }
+
+    /// ADR 0045 C1: stream an export's artifacts. Allowlist-gated.
+    async fn migration_fetch(
+        &self,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<engram_core::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        use engram_core::types::snapshot::{MigrationFrame, MigrationItem};
+        // Resolve + validate under the registry ref, then drop it (the
+        // stream must not hold a dashmap guard).
+        let (snapshot_dir, allowed) = {
+            let Some(export) = self.migrations.find_by_export_id(export_id) else {
+                return Err(SandboxError::NotFound);
+            };
+            (export.snapshot_dir.clone(), export.allowed_chunks.clone())
+        };
+        for item in &items {
+            if let MigrationItem::Chunk(h) = item {
+                let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
+                if !allowed.contains(&hash) {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "chunk {hash} is not in this export's allowlist"
+                    )));
                 }
-                Err(e)
             }
         }
+        let cache = self.chunk_cache.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<MigrationFrame, SandboxError>>(16);
+        tokio::spawn(async move {
+            const FRAME: usize = 1024 * 1024;
+            for (idx, item) in items.into_iter().enumerate() {
+                let idx = idx as u32;
+                let bytes: Result<bytes::Bytes, SandboxError> = match item {
+                    MigrationItem::StateBin => fs::read(snapshot_dir.join("state.bin"))
+                        .await
+                        .map(bytes::Bytes::from)
+                        .map_err(|e| SandboxError::Snapshot(format!("read state.bin: {e}"))),
+                    MigrationItem::Sidecar => fs::read(snapshot_dir.join("manifest.json"))
+                        .await
+                        .map(bytes::Bytes::from)
+                        .map_err(|e| SandboxError::Snapshot(format!("read sidecar: {e}"))),
+                    MigrationItem::Chunk(h) => {
+                        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(h);
+                        match &cache {
+                            Some(cache) => cache
+                                .get(hash, || async {
+                                    Err(engram_chunk_store::error::ChunkStoreError::Internal(
+                                        "export chunk must be cache-resident".into(),
+                                    ))
+                                })
+                                .await
+                                .map_err(|e| {
+                                    SandboxError::Snapshot(format!("export chunk {hash}: {e}"))
+                                }),
+                            None => Err(SandboxError::Snapshot("no chunk cache".into())),
+                        }
+                    }
+                };
+                match bytes {
+                    Ok(bytes) => {
+                        let total = bytes.len();
+                        let mut off = 0usize;
+                        loop {
+                            let end = (off + FRAME).min(total);
+                            let frame = MigrationFrame {
+                                item_idx: idx,
+                                offset: off as u64,
+                                data: bytes.slice(off..end),
+                                last: end == total,
+                            };
+                            if tx.send(Ok(frame)).await.is_err() {
+                                return;
+                            }
+                            if end == total {
+                                break;
+                            }
+                            off = end;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        use futures::StreamExt;
+        Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
+    }
+
+    /// ADR 0045 C1: the move landed — drop the export (releasing both
+    /// fences) and destroy the frozen VM + its local snapshot dir.
+    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        if !self.migrations.validate(id, export_id) {
+            return Err(SandboxError::NotFound);
+        }
+        let export = self.migrations.remove(id).expect("validated above");
+        let snapshot_dir = export.snapshot_dir.clone();
+        drop(export); // releases the capture guard (checkpoint fence)
+        if let Err(e) = self.destroy(id).await {
+            tracing::warn!(sandbox_id = %id, error = %e,
+                "migration commit: destroy failed; orphan_reap will clean up");
+        }
+        let _ = fs::remove_dir_all(&snapshot_dir).await;
+        tracing::info!(sandbox_id = %id, "migration committed; source destroyed (ADR 0045 C1)");
+        Ok(())
+    }
+
+    /// ADR 0045 C1: the move failed — re-queue the drained disk tier,
+    /// unfence, un-pause in place. Zero loss.
+    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        if !self.migrations.validate(id, export_id) {
+            return Err(SandboxError::NotFound);
+        }
+        let export = self.migrations.remove(id).expect("validated above");
+        #[cfg(target_os = "linux")]
+        if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            if let Some(pending) = export.disk_pending {
+                entry.backend.requeue_pending(pending).await;
+            }
+            entry.backend.set_migration_fence(false);
+        }
+        let snapshot_dir = export.snapshot_dir.clone();
+        let _ = fs::remove_dir_all(&snapshot_dir).await;
+        drop(export.capture_guard);
+        self.inner
+            .resume(id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
+        tracing::info!(sandbox_id = %id, "migration aborted; guest resumed in place (ADR 0045 C1)");
+        Ok(())
     }
 
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -2470,18 +3295,52 @@ impl SandboxBackend for PooledBackend {
         // `metadata` is moved, then seed the chain sparse after the VM
         // is up — so the first post-resume periodic checkpoint is a
         // cheap diff, not a Full re-read of guest RAM (the UFFD fault
-        // storm). Idle-resume only; `restore_fresh` (base-create) keeps
-        // its Full seed.
+        // storm). Fresh creates seed the same way now (ADR 0045
+        // seed-at-create) — see `restore_fresh` / `restore_base_for_session`.
+        //
+        // ADR 0045 C1: a migration restore pulls the frozen source's
+        // export FIRST (state.bin + sidecar + chunks into the local
+        // cache, inline manifests staged), restores from those local
+        // artifacts, then seeds the chain from the inline v+1 content
+        // and spawns the durability catch-up (awaited by the
+        // coordinator via the existing `snapshot_wait`).
+        let mut metadata = metadata;
+        let migration = metadata.migration_source.take();
+        if let Some(mig) = &migration {
+            self.migration_prestage(&metadata, mig).await?;
+        }
         let memory_ref = metadata.memory_manifest;
+        let row_template = migration.as_ref().map(|_| metadata.clone());
         let id = self.restore_with(metadata, /*fresh=*/ false).await?;
-        if let Some(memory_ref) = memory_ref {
-            self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+        match migration {
+            Some(mig) => {
+                self.migration_finish_restore(id, mig, row_template.expect("set above"))
+                    .await?;
+            }
+            None => {
+                if let Some(memory_ref) = memory_ref {
+                    self.seed_checkpoint_chain_sparse(id, memory_ref).await;
+                }
+            }
         }
         Ok(id)
     }
 
     async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.restore_with(metadata, /*fresh=*/ true).await
+        // ADR 0045 seed-at-create: guest RAM right after a fresh restore
+        // is byte-identical to the base snapshot's memory manifest, and
+        // FC dirty-page tracking runs from the restore — exactly the
+        // resume-seeding argument. Seeding here makes the session's
+        // FIRST capture a diff (pages it actually dirtied) instead of a
+        // Full dump+re-chunk of all guest RAM. FORKED seed: the source
+        // manifest is shared across sessions, so the chain must own a
+        // fresh lineage (see seed_checkpoint_chain_forked).
+        let memory_ref = metadata.memory_manifest;
+        let id = self.restore_with(metadata, /*fresh=*/ true).await?;
+        if let Some(memory_ref) = memory_ref {
+            self.seed_checkpoint_chain_forked(id, memory_ref).await;
+        }
+        Ok(id)
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -2522,19 +3381,13 @@ impl SandboxBackend for PooledBackend {
         // snapshot timestamp) — same shape as a brand-new
         // sandbox.
         let _ = self.last_snapshot_unix_ms.remove(&id);
-        // ADR 0028 Fix A: tear down the checkpoint chain + its rolling
-        // memory image. Durable RECORDS deliberately survive destroy —
-        // an eviction's final checkpoint must stay re-advertisable
-        // until the coord acks it (that's the whole reconciliation
-        // point). GCS chunks are the durable truth; the rolling file
-        // is just the local diff-apply accelerator.
-        if let Some((_, chain)) = self.checkpoint_chains.remove(&id) {
-            // `None` for a sparse (UFFD-resumed) chain — nothing local
-            // to remove.
-            if let Some(rolling) = &chain.rolling_memfile {
-                let _ = tokio::fs::remove_file(rolling).await;
-            }
-        }
+        // ADR 0028 Fix A: tear down the checkpoint chain. Durable RECORDS
+        // deliberately survive destroy — an eviction's final checkpoint
+        // must stay re-advertisable until the coord acks it (that's the
+        // whole reconciliation point). GCS chunks are the durable truth;
+        // ADR 0039: the chain is manifest-only now (no local rolling
+        // image), so there's nothing on disk to remove here.
+        let _ = self.checkpoint_chains.remove(&id);
         let _ = self.capture_locks.remove(&id);
         result
     }
@@ -2622,7 +3475,18 @@ impl SandboxBackend for PooledBackend {
         //    harness baked into the rootfs at /opt/engram/harness/.
         //    Fresh flavor (ADR 0035 §3): aux bundles swap to the host's
         //    current generation so new sessions run the latest skills.
+        let memory_ref = metadata.memory_manifest;
         let id = self.restore_with(metadata, /*fresh=*/ true).await?;
+        // ADR 0045 seed-at-create: the session's RAM == the base
+        // manifest at this instant (see `restore_fresh`); seed the
+        // chain so the first eviction diffs instead of Full-dumping.
+        // FORKED: the base manifest is shared across every session of
+        // the image — each chain must own its own lineage. The env
+        // merge below dirties pages AFTER tracking started, so the
+        // diff stays correct.
+        if let Some(memory_ref) = memory_ref {
+            self.seed_checkpoint_chain_forked(id, memory_ref).await;
+        }
 
         // Inject the per-session env (manifest env + secrets + session
         // id). The base snapshot is shared, so per-session values can't
@@ -2970,7 +3834,24 @@ impl PooledBackend {
         //      rebased on `disk_ref` and starts the daemon. The
         //      returned NbdSandboxState carries scheduler=None;
         //      install_flush_scheduler runs post-restore.
+        //
+        // ADR 0045 C1: a migration restore staged its (not-yet-durable)
+        // disk manifest inline — attach from that content; the store
+        // would 404 on the provisional ref.
         let store_arc = Arc::new(chunk_store.clone());
+        if let Some(inline) = self.inline_disk_manifests.get(&disk_ref) {
+            let state = crate::disk_daemon::attach_manifest_content(
+                disk_ref,
+                inline.value(),
+                chunk_cache.clone(),
+                store_arc,
+                pool,
+                self.flush_config.dirty_threshold_bytes,
+            )
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("nbd attach (migration): {e}")))?;
+            return Ok(Some(state));
+        }
         let state = crate::disk_daemon::attach_manifest(
             disk_ref,
             chunk_cache.clone(),
@@ -3096,6 +3977,120 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
         }
+    }
+
+    /// ADR 0045 C1: migration_fetch is allowlist-gated and serves
+    /// state.bin/sidecar/chunks as offset-framed streams.
+    #[tokio::test]
+    async fn migration_fetch_rejects_unlisted_hash_and_bad_export_id() {
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let cache = engram_chunk_store::ChunkCache::new(
+            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
+        );
+        let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            tmp.path().join("sandboxes"),
+        ));
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("materialize"))
+            .with_chunk_cache(cache.clone());
+
+        // Hand-build an export: one allowed cache-resident chunk +
+        // state.bin/sidecar files.
+        let allowed_bytes = vec![0x5Au8; 8192];
+        let allowed = engram_chunk_store::manifest::ChunkHash::of(&allowed_bytes);
+        cache.put(allowed, &allowed_bytes).await.unwrap();
+        let unlisted = engram_chunk_store::manifest::ChunkHash::of(b"not-in-this-export");
+        let export_dir = tmp.path().join("export");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::write(export_dir.join("state.bin"), b"vmstate-bytes").unwrap();
+        std::fs::write(export_dir.join("manifest.json"), b"{}").unwrap();
+        let sandbox_id = SandboxId::new();
+        let export_id = crate::migration::MigrationRegistry::mint_export_id();
+        let guard_src = Arc::new(tokio::sync::Mutex::new(()));
+        assert!(pooled.migrations.insert(crate::migration::MigrationExport {
+            export_id: export_id.clone(),
+            sandbox_id,
+            snapshot_dir: export_dir,
+            allowed_chunks: [allowed].into_iter().collect(),
+            disk_pending: None,
+            created_at: std::time::Instant::now(),
+            capture_guard: guard_src.clone().try_lock_owned().unwrap(),
+        }));
+
+        // Bad export id => NotFound.
+        let Err(err) = pooled
+            .migration_fetch("0000", vec![MigrationItem::StateBin])
+            .await
+        else {
+            panic!("bad export must be refused");
+        };
+        assert!(matches!(err, SandboxError::NotFound));
+
+        // Unlisted chunk => InvalidSpec, even with a valid export id.
+        let Err(err) = pooled
+            .migration_fetch(&export_id, vec![MigrationItem::Chunk(*unlisted.as_bytes())])
+            .await
+        else {
+            panic!("unlisted hash must be refused");
+        };
+        assert!(matches!(err, SandboxError::InvalidSpec(_)));
+
+        // Valid pull: state.bin + the allowed chunk, framed in order.
+        let stream = pooled
+            .migration_fetch(
+                &export_id,
+                vec![
+                    MigrationItem::StateBin,
+                    MigrationItem::Chunk(*allowed.as_bytes()),
+                ],
+            )
+            .await
+            .expect("valid fetch");
+        let frames: Vec<_> = stream.map(|f| f.expect("frame")).collect().await;
+        let item0: Vec<u8> = frames
+            .iter()
+            .filter(|f| f.item_idx == 0)
+            .flat_map(|f| f.data.to_vec())
+            .collect();
+        assert_eq!(item0, b"vmstate-bytes");
+        let item1: Vec<u8> = frames
+            .iter()
+            .filter(|f| f.item_idx == 1)
+            .flat_map(|f| f.data.to_vec())
+            .collect();
+        assert_eq!(item1, allowed_bytes);
+        assert!(frames.iter().any(|f| f.item_idx == 1 && f.last));
+    }
+
+    /// ADR 0045 C1: capture without a checkpoint chain signals the
+    /// snapshot-rehome fallback (InvalidSpec), not a hard error.
+    #[tokio::test]
+    async fn migration_capture_without_chain_signals_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let cache = engram_chunk_store::ChunkCache::new(
+            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
+        );
+        let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            tmp.path().join("sandboxes"),
+        ));
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("materialize"))
+            .with_chunk_cache(cache)
+            .with_checkpoint_dir(tmp.path().join("checkpoints"));
+        let Err(err) = pooled.migration_capture(SandboxId::new()).await else {
+            panic!("no chain must signal fallback");
+        };
+        assert!(matches!(err, SandboxError::InvalidSpec(_)));
     }
 
     #[tokio::test]
@@ -3264,6 +4259,8 @@ mod tests {
                     image_version: "test:1".into(),
                     disk_manifest: None,
                     memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
                     sidecar_blob_key: None,
@@ -3401,6 +4398,8 @@ mod tests {
                     image_version: "test:1".into(),
                     disk_manifest: None,
                     memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
                     sidecar_blob_key: None,
@@ -3538,6 +4537,8 @@ mod tests {
                     image_version: "t".into(),
                     disk_manifest: None,
                     memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
                     sidecar_blob_key: None,
@@ -3591,15 +4592,18 @@ mod tests {
         let staging = inner.dir_for(metadata.id);
 
         // Simulate cross-host: delete the local staging files so
-        // restore has nothing to read from disk. Memory.bin is also
-        // deleted; it gets materialised from the chunked manifest.
+        // restore has nothing to read from disk. ADR 0039: the capture
+        // already removed memory.bin after chunking it — assert that
+        // (regression guard for the 61G leak fix), then restore
+        // re-materializes it from the chunked manifest.
+        assert!(
+            !staging.join("memory.bin").exists(),
+            "ADR 0039: Full capture must remove the local memory.bin after chunking",
+        );
         tokio::fs::remove_file(staging.join("state.bin"))
             .await
             .unwrap();
         tokio::fs::remove_file(staging.join("manifest.json"))
-            .await
-            .unwrap();
-        tokio::fs::remove_file(staging.join("memory.bin"))
             .await
             .unwrap();
 
@@ -3768,6 +4772,8 @@ mod tests {
             image_version: "test:1".into(),
             disk_manifest: None,
             memory_manifest: Some(manifest_ref),
+            base_memory_manifest: None,
+            migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -3895,6 +4901,8 @@ mod tests {
             image_version: "test:1".into(),
             disk_manifest: None,
             memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
+            base_memory_manifest: None,
+            migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -4381,6 +5389,8 @@ mod tests {
                     image_version: "test:1".into(),
                     disk_manifest: None,
                     memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
                     source_sandbox_id: None,
                     state_blob_key: None,
                     sidecar_blob_key: None,

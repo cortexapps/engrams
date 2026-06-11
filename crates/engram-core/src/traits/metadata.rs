@@ -96,6 +96,43 @@ pub trait MetadataStore: Send + Sync {
     /// session with an unroutable sandbox.
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError>;
 
+    /// ADR 0046: the fleet's schedulable free memory (MiB) — `Σ over ready /
+    /// draining hosts of max(0, allocatable_mib − Σ reserved session budgets)`.
+    /// This is the REAL demand-pressure signal the K4 autoscaler scales on
+    /// (`/admin/fleet/demand` + the `engram_fleet_free_mib` gauge), replacing the
+    /// phantom in-memory `total − used(=0)` that always read "fleet empty" (why
+    /// it never scaled during the OOM incident). Default impl (mock stores)
+    /// returns 0.
+    async fn fleet_free_mib(&self) -> Result<i64, MetaError> {
+        Ok(0)
+    }
+
+    /// ADR 0046: atomically pick a host from `candidates` (ranked — the
+    /// in-memory affinity/readiness order) and reserve `mem_budget_mib` on it,
+    /// returning the chosen host, or `None` when no candidate has room
+    /// (`total − reserved − residency_floor ≥ mem_budget_mib`). The Postgres
+    /// impl runs under `SELECT … FROM hosts … FOR UPDATE` so concurrent placers
+    /// (any coordinator replica) serialize and a burst can't overcommit; it
+    /// inserts a `pending`, sandbox-less session row as the reservation — later
+    /// finalized by `create_session_created` (an upsert) after boot, or released
+    /// by `delete_pending_session` on boot failure. Default impl (mock stores)
+    /// just returns the first candidate, no capacity check or row insert.
+    async fn reserve_placement(
+        &self,
+        _session_id: SessionId,
+        _spec: &SessionSpec,
+        _mem_budget_mib: i64,
+        candidates: &[HostId],
+    ) -> Result<Option<HostId>, MetaError> {
+        Ok(candidates.first().copied())
+    }
+
+    /// ADR 0046: release a reservation whose boot failed, by deleting its
+    /// `pending`, sandbox-less row. Default impl (mocks) is a no-op.
+    async fn delete_pending_session(&self, _session_id: SessionId) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     /// ADR 0009 reconcile pass: enumerate the `(session_id,
     /// sandbox_id)` pairs for every `status='active'` session
     /// assigned to `host_id` whose `sandbox_id` is populated. The
@@ -191,6 +228,33 @@ pub trait MetadataStore: Send + Sync {
         id: SessionId,
         target: SessionState,
     ) -> Result<SessionState, MetaError>;
+
+    /// Force a session to its FSM-legal terminal state — the shared
+    /// "delete / give up on this session" primitive (the delete handler
+    /// uses it; drain / dead-host paths can too). Reads the current state,
+    /// picks the terminal [`SessionState::terminal_target`] permits
+    /// (`Completed` for states that ran, `Failed` for ones that never
+    /// became usable), and drives [`Self::transition_session`] to it.
+    /// Returns `Some((prev, target))` on a transition, `None` if the
+    /// session is already terminal (idempotent no-op).
+    ///
+    /// The default impl composes `get_session` + `transition_session`, so
+    /// it reuses the latter's row-locked atomic write rather than
+    /// duplicating the UPDATE; only the target choice is read separately,
+    /// and a race there is self-correcting — the transition is still legal
+    /// for the new state, or returns `Conflict` for a now-terminal row.
+    async fn terminate_session(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<(SessionState, SessionState)>, MetaError> {
+        let session = self.get_session(id).await?;
+        let Some(target) = session.status.terminal_target() else {
+            return Ok(None);
+        };
+        let prev = self.transition_session(id, target).await?;
+        Ok(Some((prev, target)))
+    }
+
     async fn assign_session_host(
         &self,
         id: SessionId,
@@ -264,11 +328,14 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), MetaError>;
 
     /// List hosts whose `last_heartbeat_at` is older than `threshold_secs`
-    /// AND whose status is `Ready` or `Draining`. The dead-host detector
-    /// polls this every ~10s and races other coordinator replicas via
-    /// `pg_try_advisory_lock` for the right to evacuate each candidate.
-    /// `Dead` rows are filtered out so a still-running coordinator
-    /// replica's detector doesn't keep trying to re-kill them.
+    /// AND whose status is `Ready`. The dead-host detector polls this every
+    /// ~10s and races other coordinator replicas via `pg_try_advisory_lock`
+    /// for the right to evict each candidate. `Dead` rows are filtered out so
+    /// a still-running replica's detector doesn't re-kill them; `Draining`
+    /// rows are filtered out because they're operator-managed (mid image-roll
+    /// — where ADR 0044 K2 reattach keeps the VMs alive across the pod-swap
+    /// heartbeat gap — or mid node-removal), so the detector must not race the
+    /// operator and route a reattaching host's sessions to Idle.
     async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError>;
 
     /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id`
@@ -753,6 +820,22 @@ pub trait MetadataStore: Send + Sync {
     /// Idempotent. Drop-safe.
     async fn release_session_lease(&self, _session_id: SessionId) -> Result<(), MetaError> {
         Ok(())
+    }
+
+    /// ADR 0045 D5 / issue #147: refresh a held lease's `locked_at` so a
+    /// long-running owner (the eviction finalize task awaiting a slow
+    /// upload) is never reaped mid-work by `sweep_stale_session_leases`.
+    /// Scoped to the holder: refreshes only the row this `locked_by`
+    /// owns, so a touch can't resurrect a lease that was reaped and
+    /// re-acquired by someone else. Returns whether a row was touched —
+    /// `false` means the lease is gone (reaped or released) and the
+    /// caller should treat its ownership as lost.
+    async fn touch_session_lease(
+        &self,
+        _session_id: SessionId,
+        _locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        Ok(true)
     }
 
     /// Stale-lease reaper. Deletes rows where `locked_at < now() -

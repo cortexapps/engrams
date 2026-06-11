@@ -21,7 +21,10 @@
 //!   the receipt carries `EvacLoss::Memory{reason: "source-dead-..."}`.
 //! - `evacuate_dead_source_no_state_returns_no_recoverable` — both
 //!   manifests absent → typed error; PG row stays at HostLost so the
-//!   caller (dead_host.rs / NBD trigger) can drive to Dead.
+//!   caller (the `evac_resumer` scanner, fed by operator drain) can
+//!   surface it. (As of ADR 0045 Phase A the dead-host detector no
+//!   longer calls this — it routes recoverable sessions to Idle and
+//!   the rest to Dead directly; this primitive is drain-only now.)
 
 use std::sync::Arc;
 
@@ -120,6 +123,8 @@ impl HostClient for FakeBackend {
             image_version: "test".into(),
             disk_manifest: None,
             memory_manifest: None,
+            base_memory_manifest: None,
+            migration_source: None,
             source_sandbox_id: None,
             state_blob_key: None,
             sidecar_blob_key: None,
@@ -204,6 +209,38 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
         utilization: Default::default(),
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
+        host_addr: None,
+    })
+    .await
+    .expect("upsert_host");
+}
+
+/// Seed a host row with an explicit `status` + `last_heartbeat_at` so a test
+/// can stage stale / draining hosts for the dead-host detector's
+/// `list_stale_hosts` query.
+async fn seed_host_with(
+    meta: &Arc<dyn MetadataStore>,
+    host_id: HostId,
+    label: &str,
+    status: engram_core::types::HostStatus,
+    last_heartbeat_at: chrono::DateTime<Utc>,
+) {
+    use engram_core::types::host::HostRecord;
+    use engram_core::types::{HostCapacity, HostMetadata};
+    meta.upsert_host(HostRecord {
+        id: host_id,
+        hostname: format!("{label}-{host_id}"),
+        cloud_metadata: HostMetadata::default(),
+        capacity: HostCapacity {
+            total_gb: 100,
+            used_gb: 10,
+            total_mib: 65_536,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: Default::default(),
+        status,
+        last_heartbeat_at,
         host_addr: None,
     })
     .await
@@ -333,7 +370,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         .expect("latest_snapshot lookup")
         .expect("snapshot present");
 
-    let receipt = evacuate_dead_source(&registry, &meta, session, Some(snapshot), None)
+    let receipt = evacuate_dead_source(&registry, &meta, session, Some(snapshot), None, None)
         .await
         .expect("dead-source evac succeeds");
     assert_eq!(receipt.new_host_id, target_host);
@@ -378,10 +415,16 @@ async fn evacuate_dead_source_disk_only_records_memory_loss() {
     // ADR 0028 Fix B: disk-only recovery is a cold boot — the caller
     // supplies the boot spec (in prod, derived from the enabled image
     // via `resolve_cold_boot_spec`).
-    let receipt =
-        evacuate_dead_source(&registry, &meta, session, None, Some(test_cold_boot_spec()))
-            .await
-            .expect("disk-only evac succeeds");
+    let receipt = evacuate_dead_source(
+        &registry,
+        &meta,
+        session,
+        None,
+        Some(test_cold_boot_spec()),
+        None,
+    )
+    .await
+    .expect("disk-only evac succeeds");
     match &receipt.loss {
         EvacLoss::Memory { reason } => {
             assert_eq!(reason, "source-dead-no-snapshot");
@@ -410,7 +453,7 @@ async fn evacuate_dead_source_no_state_returns_no_recoverable() {
         .expect("Active → HostLost");
 
     let session = meta.get_session(session_id).await.expect("get session");
-    let result = evacuate_dead_source(&registry, &meta, session, None, None).await;
+    let result = evacuate_dead_source(&registry, &meta, session, None, None, None).await;
     assert!(matches!(result, Err(EvacError::NoRecoverableState)));
 
     // PG row sits at HostLost — the caller routes it to Dead next.
@@ -569,6 +612,7 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
         memory_mib: None,
         required_image_digest: None,
         exclude_host: None,
+        prefer_host: None,
     };
     let (first_pick, _) = registry.pick_for_session(&ctx).expect("pick succeeds");
     assert!(first_pick == cordoned || first_pick == healthy);
@@ -596,6 +640,7 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
         memory_mib: None,
         required_image_digest: None,
         exclude_host: Some(healthy),
+        prefer_host: None,
     };
     let (picked, _) = registry
         .pick_for_session(&exclude_healthy_ctx)
@@ -613,5 +658,54 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
     assert!(
         !registry.uncordon(HostId::new()),
         "unknown host returns false"
+    );
+}
+
+/// ADR 0044 K3 amendment: the dead-host detector must NOT strike out a
+/// `draining` host — it's operator-managed (mid image-roll, where K2 reattach
+/// keeps its VMs alive across the pod-swap heartbeat gap, or mid node-removal).
+/// So `list_stale_hosts` returns only stale `ready` hosts.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn list_stale_hosts_excludes_draining_hosts() {
+    use engram_core::types::HostStatus;
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+
+    let stale = Utc::now() - chrono::Duration::seconds(120);
+    let fresh = Utc::now();
+    let stale_ready = HostId::new();
+    let stale_draining = HostId::new();
+    let fresh_ready = HostId::new();
+    seed_host_with(&meta, stale_ready, "stale-ready", HostStatus::Ready, stale).await;
+    seed_host_with(
+        &meta,
+        stale_draining,
+        "stale-drain",
+        HostStatus::Draining,
+        stale,
+    )
+    .await;
+    seed_host_with(&meta, fresh_ready, "fresh-ready", HostStatus::Ready, fresh).await;
+
+    let stale_ids: Vec<HostId> = meta
+        .list_stale_hosts(60)
+        .await
+        .expect("list_stale_hosts")
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+
+    assert!(
+        stale_ids.contains(&stale_ready),
+        "a stale READY host is a strike-out candidate"
+    );
+    assert!(
+        !stale_ids.contains(&stale_draining),
+        "a stale DRAINING host is operator-managed — must be excluded"
+    );
+    assert!(
+        !stale_ids.contains(&fresh_ready),
+        "a fresh host is not stale"
     );
 }

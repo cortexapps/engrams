@@ -137,6 +137,14 @@ impl GrpcHostPool {
         Ok(())
     }
 
+    /// The address this pool is currently dialing for `host_id`, if any.
+    /// ADR 0044 K2 (GAP 1): the heartbeat handler compares this against
+    /// the host's advertised addr to detect a restarted pod whose IP
+    /// changed under a stable HostId, and re-`warm`s when they differ.
+    pub fn current_addr(&self, host_id: HostId) -> Option<String> {
+        self.entries.get(&host_id).map(|e| e.host_addr.clone())
+    }
+
     /// Drop the entry for a dead/migrated host. Any cloned
     /// `GrpcHostClient` held by an in-flight RPC keeps the
     /// `Channel` alive until that RPC completes; new lookups won't

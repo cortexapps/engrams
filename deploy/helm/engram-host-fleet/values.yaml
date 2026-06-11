@@ -1,0 +1,167 @@
+# Default (cloud-agnostic) values for the engram host fleet.
+# ADR 0044. Cloud-specific overlays (Workload Identity, secret
+# providers) live in values-*.yaml.example, mirroring the engram chart.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/cortexapps/engrams/host-agent
+  tag: ""            # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}    # e.g. GKE Workload Identity / EKS IRSA binding
+
+# Only schedule the host-agent + node-prep onto KVM / nested-virt
+# nodes. Label them: `kubectl label node <n> engram.io/kvm=true`.
+# (On managed K8s the node pool must have nested virt enabled — Intel
+# only today, see ADR 0044.)
+nodeSelector:
+  engram.io/kvm: "true"
+tolerations: []
+
+coordinator:
+  # ws:// or http:// endpoint the host-agent dials. Empty => the
+  # host-agent runs but does not register (useful for a bring-up
+  # smoke test). In-cluster: ws://<coord-release>-coordinator:8080
+  endpoint: ""
+  # Bearer token (ADR 0031). Sourced from an existing Secret to avoid
+  # baking it into values; key `coordinator-token`.
+  tokenSecretName: ""
+  tokenSecretKey: coordinator-token
+
+blob:
+  backend: gcs        # local | gcs | s3 (s3 lands in ADR 0044 K5)
+  gcsBucket: ""
+  s3Bucket: ""
+  s3EndpointUrl: ""   # MinIO / R2 / Spaces
+  s3Region: ""
+
+nodeAssets:
+  # ADR 0044 K2 / GAP 2: firecracker + the engram guest kernel, staged into
+  # each host-agent pod by an init container into a shared emptyDir (stock
+  # K8s nodes don't carry them; the GCE/Packer node image did). Built by
+  # docker/node-assets.Dockerfile — docker/node-assets-fetch.sh stages the
+  # build context (pinned FC release + the engram guest-kernel GH asset).
+  # Pin to a digest in prod and roll it via the K3 operator's node sequence.
+  image:
+    repository: ghcr.io/cortexapps/engrams/node-assets
+    tag: main
+    pullPolicy: IfNotPresent
+
+firecracker:
+  # firecracker + the guest kernel are staged into the pod emptyDir at
+  # /opt/engram by the node-assets init container (see nodeAssets); the
+  # host-agent reads them from there (ENGRAM_FIRECRACKER_BIN + the configmap
+  # ENGRAM_KERNEL_IMAGE_PATH). No node hostPath for them anymore.
+  restoreMode: ""     # "" (binary default) | file | uffd
+  # ADR 0045 D3 (the unified memory substrate, v2b): a tmpfs directory for
+  # per-template base shm files. When set: node-prep mounts a tmpfs there,
+  # Uffd restores back guest memory MAP_PRIVATE on the shared base
+  # (canonical pages CONTINUE-shared across same-template VMs), and
+  # fresh-creates flip from File mode to the substrate (parity-gated:
+  # density 35%==35%, restore median 61ms vs 56ms). "" = off (File-mode
+  # fresh-creates + anonymous-Uffd resumes, today's behavior). Requires
+  # the v2 forked firecracker (engrams#164+). Under workDirHostPath so it
+  # survives pod restarts (K2 reattach).
+  uffdBaseDir: ""     # e.g. /var/lib/engram/shm
+  # tmpfs size cap for uffdBaseDir (one base per enabled template; each
+  # file is guest-RAM-sized but populated lazily + hole-punchable).
+  uffdBaseTmpfsSize: 32g
+  # ADR 0044 K2 (VM-detach): a node-level cgroup-v2 dir the host-agent
+  # moves each VM's FC + uffd-handler into, so they survive THIS pod's
+  # cgroup teardown on a restart (hostPID keeps the PID namespace, but
+  # the pod-scope `cgroup.kill` would still reap them). Must be on the
+  # host cgroup tree (the chart mounts /sys/fs/cgroup rw). Set "" to
+  # disable (then a pod restart kills the node's VMs).
+  vmCgroupParent: /sys/fs/cgroup/engram-vms
+
+storage:
+  # Local NVMe for the chunk cache + per-sandbox work dir.
+  workDirHostPath: /var/lib/engram
+  chunkCacheBudgetBytes: ""   # "" => host-agent default (200 GiB)
+
+nbd:
+  # Comma-separated /dev/nbdN the host-agent serves. Empty => file-mode
+  # (no NBD). node-prep loads the module with nbdsMax slots.
+  devices: "/dev/nbd0,/dev/nbd1,/dev/nbd2,/dev/nbd3"
+  nbdsMax: 64
+
+nodePrep:
+  enabled: true
+  image:
+    repository: busybox
+    tag: "1.36"
+    pullPolicy: IfNotPresent
+  # sysctls node-prep sets (idempotent). The host-agent runs root so
+  # unprivileged_userfaultfd isn't strictly required, but we set it so
+  # a future non-root handler works, plus ip_forward for guest egress.
+  sysctls:
+    vm.unprivileged_userfaultfd: "1"
+    net.ipv4.ip_forward: "1"
+
+hostAgent:
+  grpcPort: 9101
+  metricsPort: 9100
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "16"
+      memory: 32Gi
+  extraEnv: []        # [{name, value}] escape hatch for any ENGRAM_* knob
+
+# Strategy note: forkd uses `Recreate`-equivalent because the daemon
+# holds VM state. We default the DaemonSet to OnDelete so the K3
+# operator (ADR 0044) drives drain-gated, node-by-node rollouts rather
+# than K8s rolling pods out from under live microVMs.
+updateStrategy: OnDelete
+
+operator:
+  # ADR 0044 K3: the drain-gated rollout operator. OFF by default until the
+  # operator image is published + a coordinatorUrl is set; with it off, the
+  # OnDelete DaemonSet must be rolled by hand (drain each host first).
+  enabled: false
+  image:
+    repository: ghcr.io/cortexapps/engrams/host-operator
+    tag: main
+    pullPolicy: IfNotPresent
+  logLevel: info
+  # ADR 0044 K4: node-pool scaler. `noop` logs the desired size only; `gke`
+  # resizes a GKE pool via the Container API + Workload Identity (the operator
+  # GSA needs container.clusters.update). New clouds add their own value.
+  scaler: noop          # noop | gke
+  # Render a HostFleet CR for this release's host-agent DaemonSet (the common
+  # case). Set false to manage the CR out-of-band.
+  createHostFleet: true
+  # Coordinator base URL the operator drives admin endpoints on (REQUIRED when
+  # enabled). In-cluster: http://<coord-release>-coordinator:8080
+  coordinatorUrl: ""
+  # Never drain a node if it would drop the fleet below this many Ready hosts.
+  capacityFloor: 1
+  # Abort a roll if a drained host still has running sandboxes after this long.
+  drainTimeoutSeconds: 600
+  resources:
+    requests: {cpu: "10m", memory: 64Mi}
+    limits: {cpu: "250m", memory: 128Mi}
+  # The operator only needs the K8s API + coordinator; keep it off the tainted
+  # kvm nodes (default: schedule anywhere untainted).
+  nodeSelector: {}
+
+  # ADR 0044 K4: node-pool autoscaling. The operator reads coordinator demand
+  # and sizes the host node pool to hold targetFreeMib of headroom (scale-up
+  # only in v1; drain-gated scale-down is a follow-up). The operator's default
+  # scaler is a noop that only LOGS the desired size — a GKE actuator is the
+  # follow-up, so enabling this today gives you the decision in logs, not a
+  # live resize.
+  autoscaling:
+    enabled: false
+    nodePool: ""           # the cloud node pool the scaler resizes
+    minHosts: 1            # set >= 1 (an empty fleet has no demand signal)
+    maxHosts: 10
+    targetFreeMib: 16384   # keep ~16 GiB of free guest-RAM headroom

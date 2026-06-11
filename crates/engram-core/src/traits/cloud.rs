@@ -29,3 +29,17 @@ pub trait CloudBackend: Send + Sync {
     /// Optional: tear down a previously-provisioned host.
     async fn deprovision_host(&self, id: HostId) -> Result<(), BackendError>;
 }
+
+/// ADR 0044 K4: node-pool autoscaling seam — declarative "make the host node
+/// pool N nodes". Distinct from [`CloudBackend`]'s per-host provision model:
+/// managed K8s node pools (GKE/EKS/AKS) resize by *count*, not by individual
+/// host. The rollout operator owns the *policy* (how many nodes from demand);
+/// an implementation owns the *actuation*. New clouds plug in by implementing
+/// this in their own crate (`engram-cloud-gcp` does GKE today) — no change to
+/// the operator beyond selecting the impl.
+#[async_trait]
+pub trait NodePoolScaler: Send + Sync {
+    /// Set the node pool's desired size. Idempotent — re-asserted every
+    /// reconcile. `node_pool` is an actuator-specific identifier.
+    async fn set_size(&self, node_pool: &str, desired: u32) -> Result<(), BackendError>;
+}

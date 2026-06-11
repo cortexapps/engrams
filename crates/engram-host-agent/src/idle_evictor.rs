@@ -21,9 +21,22 @@
 use std::time::Duration;
 
 /// Soft idle TTL — a session whose adapter emitted `Idle` and stayed
-/// quiet for this long is hot-suspended. Matches the coord-side
-/// constant.
-pub const DEFAULT_IDLE_TTL_SECS: u64 = 30;
+/// quiet for this long is hot-suspended.
+///
+/// ADR 0039 follow-up #20: bumped 30s → 300s (5 min). The 30s default
+/// was too aggressive for an interactive agent session: the harness
+/// emits `HarnessEvent::Idle` the moment it finishes a turn and has no
+/// queued prompt, so an ordinary think-pause while the user reads the
+/// output and composes the next message crosses 30s routinely (prod
+/// observed a just-resumed session re-nominated 32s later). Each such
+/// eviction pays a full snapshot+destroy and the next message a cold
+/// resume — churn with no density benefit on a session a human is
+/// actively driving. 5 min keeps the warm sandbox alive across normal
+/// conversational gaps while still reclaiming genuinely-abandoned
+/// sessions; the hard TTL ([`DEFAULT_IDLE_HARD_TTL_SECS`], 30 min)
+/// still backstops adapters that never emit `Idle`. Operators tune via
+/// `ENGRAM_IDLE_TTL_SECS` for denser-but-colder fleets.
+pub const DEFAULT_IDLE_TTL_SECS: u64 = 300;
 
 /// Hard idle TTL — backstop for adapters that go silent without ever
 /// emitting `Idle` (stuck in a tool call, infinite loop). Matches
@@ -106,6 +119,34 @@ pub fn disk_pressure_check(work_dir: &std::path::Path, floor_bytes: u64) -> (boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0039 follow-up #20: the soft idle TTL default is no longer
+    /// the aggressive 30s that evicted interactive sessions during
+    /// normal think-pauses. Guards against an accidental revert at
+    /// compile time. The floor of "at least a couple of minutes" is
+    /// what matters, not the exact value — and it must stay strictly
+    /// below the hard TTL (the never-emits-Idle backstop) so the soft
+    /// path still fires first for a genuinely abandoned session.
+    const _SOFT_TTL_NOT_AGGRESSIVE: () = {
+        assert!(DEFAULT_IDLE_TTL_SECS >= 120);
+        assert!(DEFAULT_IDLE_TTL_SECS < DEFAULT_IDLE_HARD_TTL_SECS);
+    };
+
+    /// With no env override, `idle_ttl_from_env` returns the (bumped)
+    /// default. Asserting the no-override branch keeps the test
+    /// race-free — it never mutates the process-global env.
+    #[test]
+    fn idle_ttl_from_env_falls_through_to_default_without_override() {
+        // The CI/dev environment does not set ENGRAM_IDLE_TTL_SECS; if a
+        // local shell does, skip rather than assert a wrong value.
+        if std::env::var("ENGRAM_IDLE_TTL_SECS").is_ok() {
+            return;
+        }
+        assert_eq!(
+            idle_ttl_from_env(),
+            Duration::from_secs(DEFAULT_IDLE_TTL_SECS),
+        );
+    }
 
     /// `free_disk_bytes` should return Some for any existing path
     /// on every supported host (Linux + macOS). The exact value is

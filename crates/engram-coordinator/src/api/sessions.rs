@@ -323,8 +323,13 @@ pub(crate) async fn resolve_session_env(
             match rt.users.get_user(engram_core::UserId(uuid)).await {
                 Ok(user) => {
                     let principal = user.to_principal();
-                    env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-                    env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+                    // Git [user] attribution is human-initiated sessions only —
+                    // the service principal's service_email isn't a valid commit
+                    // author (GitHub rejects the squash-merge).
+                    if !principal.is_service(&rt.config.service_email) {
+                        env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
+                        env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+                    }
                     let harness = bundle.as_ref().and_then(|b| b.manifest.harness.as_ref());
                     inject_user_claude_token(state, &principal, harness, session.mode, &mut env)
                         .await;
@@ -728,9 +733,17 @@ async fn create_session_inner(
     session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
 
     // ADR 0031: attribute git commits inside the session to the initiating
-    // user. `render_gitconfig` writes these into `/etc/gitconfig [user]`.
-    session_env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-    session_env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+    // user. `render_gitconfig` writes these into `/etc/gitconfig [user]`. Skip
+    // the service principal: its service_email isn't a valid commit author, so
+    // injecting it makes GitHub reject the squash-merge.
+    if !state
+        .auth
+        .as_ref()
+        .is_some_and(|rt| principal.is_service(&rt.config.service_email))
+    {
+        session_env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
+        session_env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+    }
 
     // ADR 0031: for built-in Claude sessions, auto-inject the user's saved
     // Claude Code OAuth token — we never prompt per-session. Best-effort: a
@@ -803,10 +816,12 @@ async fn create_session_inner(
 
     let (host_id, sandbox_id) = try_restore_base_snapshot(
         &state,
+        session_id,
         base_snapshot_id,
         &image_repo,
         &image_tag,
         memory_mib,
+        &spec,
         // Per-session sandbox env (manifest env + resolved secrets +
         // ENGRAM_SESSION_*). The shared base snapshot can't carry it, so
         // it's injected into the restored sandbox (cold-create baked it
@@ -1068,12 +1083,39 @@ async fn create_session_inner(
 /// host, and runs the combined restore + harness-swap op. Any error
 /// bubbles to the caller, which falls back to a cold create — so this
 /// never fails a session, it only declines to fast-path it.
+/// ADR 0039 (cache locality): the BlobStorage key for a base image's
+/// *canonical* working-set trace (`traces/<memory_manifest_id>/canonical.json`,
+/// published by the image-builder's profile pass), or `None` when the base
+/// snapshot has no memory image.
+///
+/// When set on the restore `SnapshotMetadata`, the host narrows its
+/// memory-chunk prefetch from "all base-memory chunks" to "just the chunks
+/// the kernel faults in the first ~5 s" — the REAP-style warm set
+/// (`prefetch_memory_chunks` in the pooled backend). Keyed off the *memory*
+/// manifest because the trace describes memory faults; disk-only / cold-boot
+/// base snapshots (VZ) have no memory image, so there is nothing to narrow.
+///
+/// Safe before any bake has published a canonical trace: a missing blob is
+/// treated as an empty working set and the host falls back to full-manifest
+/// prefetch (the prior, behaviour-preserving path).
+fn base_working_set_blob_key(
+    memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+) -> Option<String> {
+    memory_manifest
+        .map(|m| engram_chunk_store::working_set::TraceRef::canonical(m.manifest_id).storage_key())
+}
+
+// Cohesive base-restore + reserve-at-pick context; bundling into a struct would
+// just move the arg list. (ADR 0046 added session_id + spec for reservation.)
+#[allow(clippy::too_many_arguments)]
 async fn try_restore_base_snapshot(
     state: &SharedState,
+    session_id: engram_core::SessionId,
     snapshot_id: engram_core::types::SnapshotId,
     image_repo: &str,
     image_tag: &str,
     memory_mib: u32,
+    spec: &engram_core::types::SessionSpec,
     session_env: HashMap<String, String>,
 ) -> Result<(engram_core::HostId, engram_core::SandboxId), engram_core::SandboxError> {
     let record = state
@@ -1096,6 +1138,11 @@ async fn try_restore_base_snapshot(
     // manifests come off the snapshots row. Together this is the full
     // portable metadata the host's cross-host restore path consumes.
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
+        // ADR 0045 D4: fresh creates restore FROM the base snapshot, so
+        // canonical == session by construction; the host's fallback does
+        // exactly that.
+        base_memory_manifest: None,
+        migration_source: None,
         id: snapshot_id,
         size_bytes: record.size_bytes,
         created_at: record.created_at,
@@ -1110,9 +1157,10 @@ async fn try_restore_base_snapshot(
             snapshot_id,
         )),
         rootfs_blob_key: None,
-        // P1 leaves working-set prefetch off; P2 (ADR 0020) publishes the
-        // bake-time trace and points UFFD prefetch at it.
-        working_set_blob_key: None,
+        // ADR 0039 (cache locality): narrow the host's memory-chunk prefetch
+        // to the base image's canonical working-set trace. See
+        // [`base_working_set_blob_key`].
+        working_set_blob_key: base_working_set_blob_key(record.memory_manifest),
         // ADR 0035: the generations this base snapshot pins; the host
         // materializes any it's missing and (fresh flavor) swaps to
         // its current generation post-load.
@@ -1127,11 +1175,44 @@ async fn try_restore_base_snapshot(
         // the restore path; no host needs to have prefetched the image.
         required_image_digest: None,
         exclude_host: None,
+        prefer_host: None,
     };
-    state
-        .host_registry
-        .restore_base_for_session(&ctx, metadata, session_env)
+    // ADR 0046: reserve at pick. Rank candidates in-memory (affinity /
+    // readiness), then atomically pick + reserve in Postgres so a concurrent
+    // burst can't overcommit a host. The `pending` reservation row is finalized
+    // by `create_session_created` (an upsert) after boot, or released below on
+    // boot failure.
+    let candidates = state.host_registry.candidates_for(&ctx);
+    let host_id = match state
+        .services
+        .meta
+        .reserve_placement(session_id, spec, memory_mib as i64, &candidates)
         .await
+        .map_err(|e| engram_core::SandboxError::Snapshot(format!("reserve_placement: {e}")))?
+    {
+        Some(h) => h,
+        // No candidate has room — surfaces as the same 503 a pick miss does.
+        None => return Err(crate::host_registry::PickError::NoCapacity.into()),
+    };
+    match state
+        .host_registry
+        .restore_base_on_host(host_id, metadata, session_env)
+        .await
+    {
+        Ok(sandbox_id) => Ok((host_id, sandbox_id)),
+        Err(e) => {
+            // Boot failed — release the reservation (delete the pending row).
+            // Best-effort; the reconcile backstop reaps a stuck pending row.
+            if let Err(del) = state.services.meta.delete_pending_session(session_id).await {
+                tracing::warn!(
+                    %session_id,
+                    error = %del,
+                    "delete_pending_session after boot failure failed; reconcile will reap",
+                );
+            }
+            Err(e)
+        }
+    }
 }
 
 /// ADR 0031: inject the initiating user's saved Claude Code OAuth token into
@@ -1278,51 +1359,38 @@ pub async fn delete_session(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<StatusCode, ApiError> {
-    // Confirm the session exists *before* tearing anything down so
-    // unknown ids return 404 (matching the get/exec contract) instead
-    // of silently succeeding.
-    let session = state.services.meta.get_session(id).await?;
-
-    // Idempotent: a session already in a terminal state has nothing
-    // to tear down. Skip straight to 204 instead of trying to drive
-    // a `Completed`/`Failed`/`Dead` → `Completed` transition (which
-    // the state machine would reject as an illegal terminal-state
-    // move).
-    if session.status.is_terminal() {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    // ADR 0015 M2: transition to Completed *before* destroying the
-    // sandbox. The reconcile pass that runs on every heartbeat looks
-    // for `status='active'` sessions whose `sandbox_id` is missing
-    // from the host's running set; moving to Completed first removes
-    // this row from that view so reconcile can't race us into
-    // HostLost while we're waiting for the host RPC. The DB UPDATE
-    // is fast (single locked row); the destroy that follows is
-    // best-effort and can take seconds.
+    // Drive the session to its FSM-legal terminal BEFORE destroying the
+    // sandbox. `terminate_session` reads the current state and picks the
+    // terminal `SessionState::terminal_target` permits — `Completed` for
+    // states that ran, `Failed` for the early states (Pending / Created /
+    // GuestReady) that never became usable (this is what fixes the
+    // `5fadd364` phantom: deleting a `Created` session used to drive an
+    // illegal Created→Completed that surfaced as Conflict, destroying the
+    // sandbox but leaving the row non-terminal). Terminating first also
+    // removes this row from the heartbeat reconcile's "active session whose
+    // sandbox is missing" view, so reconcile can't race us into HostLost
+    // during the (best-effort, can-take-seconds) destroy RPC below.
     //
-    // If a sibling path (preemption drain, dead-host detector) flipped
-    // the row first, our transition fails with Conflict — treat that
-    // as idempotent success, the session is already on its way out.
+    // - `Ok(None)`: already terminal — idempotent 204, nothing to tear down.
+    // - `Ok(Some((prev, target)))`: transitioned; emit + drop the broker
+    //   token, then destroy.
+    // - `Conflict`: a sibling (drain, dead-host detector, eviction scanner)
+    //   raced us to terminal — best-effort tear down, then 204. (ADR 0034:
+    //   deleting mid-eviction works this way — the scanner's racing
+    //   transition_session(Idle) then fails against the terminal row, fires
+    //   abort_inflight_snapshot, and releases the lease.)
     //
-    // ADR 0034: deleting mid-eviction works the same way —
-    // Evicting → Completed is legal, and the eviction scanner's
-    // racing pipeline then fails its own transition_session(Idle)
-    // against the terminal row, fires abort_inflight_snapshot, and
-    // releases the session lease. No special-casing needed here.
-    match state
-        .services
-        .meta
-        .transition_session(id, SessionState::Completed)
-        .await
-    {
-        Ok(prev) => {
+    // An unknown id surfaces as 404 from `terminate_session`'s own
+    // `get_session` — matching the get/exec contract — before any teardown.
+    match state.services.meta.terminate_session(id).await {
+        Ok(None) => return Ok(StatusCode::NO_CONTENT),
+        Ok(Some((prev, target))) => {
             state
                 .emit(
                     id,
                     SessionEvent::StatusChanged {
                         from: prev,
-                        to: SessionState::Completed,
+                        to: target,
                         at: chrono::Utc::now(),
                     },
                 )
@@ -1347,7 +1415,7 @@ pub async fn delete_session(
         Err(e) => return Err(e.into()),
     }
 
-    // Status is Completed; reconcile won't touch this row anymore.
+    // Status is now terminal; reconcile won't touch this row anymore.
     // Now tear down the sandbox and clear the routing columns.
     if let Some(sandbox_id) = state.registry.unbind(id) {
         if let Err(e) = state.services.host.destroy(sandbox_id).await {
@@ -1616,6 +1684,31 @@ mod tests {
         assert_eq!(resolved_memory_mib(&mk(true, Some(8192))), 8192);
         // Browser + default (4 GiB): already above the floor.
         assert_eq!(resolved_memory_mib(&mk(true, None)), DEFAULT_MEMORY_MIB);
+    }
+
+    /// ADR 0039: the base-restore metadata points the host's memory-chunk
+    /// prefetch at the canonical working-set trace, keyed off the base
+    /// snapshot's *memory* manifest. Disk-only / cold-boot base snapshots
+    /// (no memory manifest) get `None` and fall back to full-manifest
+    /// prefetch.
+    #[test]
+    fn base_working_set_blob_key_points_at_canonical_trace() {
+        use engram_core::types::manifest::ManifestRef;
+        // FC base snapshot with a memory manifest → canonical trace key
+        // keyed on the *manifest_id* (not the version — the trace is per
+        // manifest lineage, stable across diff-chain version bumps).
+        let mref = ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 3,
+        };
+        let key = base_working_set_blob_key(Some(mref)).expect("memory manifest → Some key");
+        assert_eq!(
+            key,
+            format!("traces/{}/canonical.json", mref.manifest_id),
+            "key must be the canonical trace for the memory manifest lineage",
+        );
+        // Disk-only / cold-boot (VZ) base snapshot: no memory image → None.
+        assert_eq!(base_working_set_blob_key(None), None);
     }
 
     /// ADR 0016 §A.1.7 regression guard. The pure assembly path

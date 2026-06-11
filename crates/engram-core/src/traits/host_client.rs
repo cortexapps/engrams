@@ -69,6 +69,74 @@ pub trait HostClient: Send + Sync {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
+    /// ADR 0045 D5: the pause-side half of an eviction snapshot — pause +
+    /// drain + FC capture, then the guest is re-paused (it's being torn
+    /// down; today's pipeline already discards post-capture execution).
+    /// The chunk+upload work runs as a host-side background task; await it via
+    /// [`Self::snapshot_wait`]. Returns the new snapshot's id once the
+    /// capture itself has succeeded — the point where the coordinator
+    /// may mark the session Idle. Default errs so non-FC hosts and
+    /// pre-D5 host-agents fall back to the composed [`Self::snapshot`].
+    async fn snapshot_begin(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::SnapshotId, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `snapshot_begin`".into(),
+        ))
+    }
+    /// ADR 0045 D5: await the background upload spawned by
+    /// [`Self::snapshot_begin`] and return the durable
+    /// [`SnapshotMetadata`]. Idempotent w.r.t. reconnects — the upload
+    /// is host-autonomous once begun.
+    async fn snapshot_wait(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `snapshot_wait`".into(),
+        ))
+    }
+
+    /// ADR 0045 C1: see `SandboxBackend::migration_capture`. Default
+    /// errs so old hosts route the coordinator to snapshot-rehome.
+    async fn migration_capture(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::snapshot::MigrationCaptureOut, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_capture`".into(),
+        ))
+    }
+
+    /// ADR 0045 C1: see `SandboxBackend::migration_fetch`. Called by
+    /// the DESTINATION host-agent (the one host-to-host RPC).
+    async fn migration_fetch(
+        &self,
+        _export_id: &str,
+        _items: Vec<crate::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<crate::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_fetch`".into(),
+        ))
+    }
+
+    /// ADR 0045 C1: see `SandboxBackend::migration_commit`.
+    async fn migration_commit(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_commit`".into(),
+        ))
+    }
+
+    /// ADR 0045 C1: see `SandboxBackend::migration_abort`.
+    async fn migration_abort(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_abort`".into(),
+        ))
+    }
     /// ADR 0014 issue #1/#2: commit a snapshot whose post-snapshot
     /// pipeline has fully succeeded. See `SandboxBackend::commit_snapshot`
     /// for the contract. Default impl returns Ok so HostClients backed by
@@ -165,6 +233,23 @@ pub trait HostClient: Send + Sync {
     /// no-op for impls without a real harness (test fakes); the
     /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
     async fn interrupt(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// ADR 0045 Phase F: freeze the running microVM for `sandbox_id`
+    /// *in place* — pause its vCPUs without snapshotting, destroying, or
+    /// changing session state. An admin affordance to drive + observe
+    /// the pause/flush path (and the test surface for the live-migration
+    /// work). Default no-op for harness-less fakes; the `HostRegistry`,
+    /// gRPC client, and `LocalHostClient` override it to reach the
+    /// backend's [`crate::traits::SandboxBackend::pause`].
+    async fn pause(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// ADR 0045 Phase F: unfreeze a [`Self::pause`]d microVM — resume
+    /// its vCPUs in place. Symmetric with `pause`; same overrides.
+    async fn resume(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Ok(())
     }
 

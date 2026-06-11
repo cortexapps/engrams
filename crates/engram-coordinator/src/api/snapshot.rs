@@ -15,6 +15,8 @@
 //! callers that want both should snapshot then evict in two requests, or
 //! evict then resume across the lifecycle of a session.
 
+use std::time::Duration;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -28,7 +30,33 @@ use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::host_registry::ScheduleContext;
-use crate::state::{SessionEvent, SharedState};
+use crate::state::{RecoveryCause, SessionEvent, SharedState};
+
+/// ADR 0039 follow-up #20: how long `ensure_active` will HOLD a
+/// request that arrived mid-eviction (session `Evicting`) waiting for
+/// the eviction pipeline to land the session at `Idle` before falling
+/// back to the retryable 409. The eviction scanner sweeps on a 10s
+/// tick and a single pipeline is sub-second once it starts, so a few
+/// seconds covers the common "message races the snapshot" case
+/// without pinning a request for the full scanner cadence. Tunable via
+/// `ENGRAM_RESUME_EVICTING_HOLD_SECS` (0 disables the hold → immediate
+/// 409, the pre-follow-up behaviour).
+const DEFAULT_RESUME_EVICTING_HOLD_SECS: u64 = 8;
+
+/// Poll cadence while holding inside the `Evicting` arm. Short so a
+/// fast-settling eviction is observed promptly; the bound above caps
+/// the total wait.
+const RESUME_EVICTING_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Read `ENGRAM_RESUME_EVICTING_HOLD_SECS` — falls through to
+/// [`DEFAULT_RESUME_EVICTING_HOLD_SECS`]. `0` disables the hold.
+fn resume_evicting_hold_from_env() -> Duration {
+    std::env::var("ENGRAM_RESUME_EVICTING_HOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_RESUME_EVICTING_HOLD_SECS))
+}
 
 /// ADR 0016 §A.1.7 fallback: synthesize an unspecified-IP
 /// `SessionEgressPolicy`. Used only when
@@ -213,12 +241,19 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         // eviction scanner is snapshotting it), so this is explicitly
         // NOT the auto-resume arm above — kicking off a restore here
         // would race the pipeline (the session lease would 409 the
-        // loser anyway, but only after a wasted restore attempt). The
-        // eviction lands at Idle within a scanner tick or two, after
-        // which the next call auto-resumes.
-        SessionState::Evicting => Err(ApiError::Conflict(
-            "session is mid-eviction; retry shortly (it will land at idle and auto-resume)".into(),
-        )),
+        // loser anyway, but only after a wasted restore attempt).
+        //
+        // ADR 0039 follow-up #20: rather than bounce an immediate 409
+        // (prod observed a follow-up message stranded 4m32s waiting on
+        // the next client retry), HOLD briefly for the eviction to
+        // land the session at Idle, then auto-resume inline. The
+        // bounded poll caps the wait; if it doesn't settle we fall
+        // through to the same retryable 409 as before. We do NOT race
+        // the pipeline: the hold only *observes* the status flip and
+        // then takes the standard resume path, whose session lease +
+        // status gate serialize against the eviction (no double-
+        // resume, no orphaned sandbox).
+        SessionState::Evicting => ensure_active_after_evicting_hold(state, id).await,
         SessionState::Created | SessionState::GuestReady => Err(ApiError::Conflict(format!(
             "session is {} — agentd is not yet ready. \
              Wait for the session to reach Active (subscribe to /sessions/:id/events) \
@@ -241,6 +276,83 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
     }
 }
 
+/// ADR 0039 follow-up #20: the `Evicting` arm of [`ensure_active`].
+/// HOLD the request for up to `ENGRAM_RESUME_EVICTING_HOLD_SECS`
+/// (re-reading the session row on a short poll) for the eviction
+/// pipeline to land the session at a resumable state, then resume
+/// inline. The fallback when the hold expires is the same retryable
+/// 409 the pre-follow-up code returned — semantics preserved, just
+/// after a bounded wait instead of immediately.
+///
+/// Why this is race-safe and never double-resumes:
+/// - We only *observe* the status here; the actual resume goes through
+///   [`resume_session`], which acquires the per-session `session_lease`
+///   for the whole restore. The eviction pipeline holds that same lease
+///   end-to-end, so the resume can't begin until the pipeline has fully
+///   released — at which point the session is already `Idle`.
+/// - The status gate inside `resume_session` re-reads the row under the
+///   lease, so even if two callers escape the hold simultaneously, only
+///   the first finds a resumable state; the rest hit the lease 409 or
+///   the no-longer-Idle gate.
+/// - Terminal/raced transitions (a DELETE flips `Evicting → Completed`,
+///   or the scanner exhausts its budget to `HostLost`) drop out of the
+///   poll and re-dispatch through `ensure_active` for the honest typed
+///   error for that state.
+async fn ensure_active_after_evicting_hold(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<(), ApiError> {
+    ensure_active_after_evicting_hold_for(state, id, resume_evicting_hold_from_env()).await
+}
+
+/// Inner [`ensure_active_after_evicting_hold`] with the hold duration
+/// passed explicitly so tests can drive the bound deterministically
+/// (a `0` hold for the immediate-409 fallback, a short non-zero hold
+/// for the settle-then-resume path) without mutating the
+/// process-global `ENGRAM_RESUME_EVICTING_HOLD_SECS` env — which would
+/// race other parallel tests.
+async fn ensure_active_after_evicting_hold_for(
+    state: &SharedState,
+    id: SessionId,
+    hold: Duration,
+) -> Result<(), ApiError> {
+    let deadline = std::time::Instant::now() + hold;
+    loop {
+        // Sleep first: we were just told the session is Evicting, so an
+        // immediate re-read would almost always still be Evicting. The
+        // bound is the hold duration; a `0` env value means the very
+        // first check sees the deadline already passed → immediate 409
+        // (the pre-follow-up behaviour, preserved as an opt-out).
+        if std::time::Instant::now() >= deadline {
+            return Err(ApiError::Conflict(
+                "session is mid-eviction; retry shortly (it will land at idle and auto-resume)"
+                    .into(),
+            ));
+        }
+        tokio::time::sleep(RESUME_EVICTING_POLL_INTERVAL).await;
+
+        let session = state.services.meta.get_session(id).await?;
+        match session.status {
+            // Settled to a resumable state — take the standard resume
+            // path (lease-serialized; see the doc comment).
+            SessionState::Idle | SessionState::Evacuating => {
+                resume_session(state.clone(), id).await?;
+                return Ok(());
+            }
+            // Already back to Active (e.g. a concurrent resume won) —
+            // nothing to do.
+            SessionState::Active => return Ok(()),
+            // Still mid-eviction — keep holding until the deadline.
+            SessionState::Evicting => continue,
+            // The eviction raced to a terminal / unrecoverable state
+            // (DELETE → Completed, scanner budget → HostLost, …). Re-
+            // dispatch through ensure_active so the caller gets that
+            // state's honest typed error rather than a misleading 409.
+            _ => return Box::pin(ensure_active(state, id)).await,
+        }
+    }
+}
+
 async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
     // Serialize resume against concurrent resume + eviction for this session.
     // Reuses the per-session `session_lease` lease (keyed on session_id).
@@ -253,18 +365,34 @@ async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotRes
     // resume makes resume + eviction mutually exclusive per session. The
     // lease's `sandbox_id` is a diagnostic-only column; resume has no sandbox
     // at acquire time (it's about to create one), so we pass `None`.
-    let _lease = match crate::idle_evictor::SessionLeaseGuard::try_acquire(&state, id, None).await {
-        Ok(Some(guard)) => guard,
-        Ok(None) => {
-            return Err(ApiError::Conflict(format!(
-                "session {id} is already mid-resume or mid-eviction; retry shortly",
-            )))
+    // ADR 0045 D5: an eviction's finalize task holds the lease while its
+    // upload completes in the background (typically seconds for a
+    // diff-chain capture). A resume landing in that window WAITS briefly
+    // instead of 409ing — the common evict-then-immediately-resume shape
+    // — and only surfaces the Conflict if the lease stays held (a long
+    // full-seed upload, or a genuinely concurrent resume).
+    let mut lease = None;
+    for attempt in 0..8u32 {
+        match crate::idle_evictor::SessionLeaseGuard::try_acquire(&state, id, None).await {
+            Ok(Some(guard)) => {
+                lease = Some(guard);
+                break;
+            }
+            Ok(None) if attempt < 7 => {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "resume lease acquire failed: {e}"
+                )))
+            }
         }
-        Err(e) => {
-            return Err(ApiError::Internal(format!(
-                "resume lease acquire failed: {e}"
-            )))
-        }
+    }
+    let Some(_lease) = lease else {
+        return Err(ApiError::Conflict(format!(
+            "session {id} is already mid-resume or mid-eviction; retry shortly",
+        )));
     };
 
     let session = state.services.meta.get_session(id).await?;
@@ -438,6 +566,7 @@ async fn resume_disk_only_cold_boot(
         relocatable,
         None,
         Some(spec),
+        None,
     )
     .await
     .map_err(|e| match &e {
@@ -606,12 +735,18 @@ pub enum FinishResumeOutcome {
 /// already coherent; the worst case is a confusing-but-intact log.
 ///
 /// Shared by [`resume_from_fc_snapshot`] (manual `/resume`) and
-/// `evac_resumer::run_resume_pipeline` (dead-host warm recovery) — the
-/// two rung-1 entry points.
+/// `evac_resumer::run_resume_pipeline` (operator drain / teleport) — the
+/// two rung-1 entry points. The `cause` distinguishes them for the web
+/// copy (ADR 0045 F1): the manual-`/resume` path resumes a session that
+/// was idled after its host died, so it carries
+/// [`RecoveryCause::HostFailureRecovery`]; the evac-resumer path is an
+/// operator-initiated relocation, so it carries
+/// [`RecoveryCause::PlannedRelocation`].
 pub async fn apply_rung1_rewind(
     state: &SharedState,
     session_id: SessionId,
     events_cursor: Option<i64>,
+    cause: RecoveryCause,
 ) {
     // Only coherent checkpoints (memory present) rewind; a disk-only
     // record never reaches here (rung 2 cold-boots fresh, no rewind).
@@ -657,6 +792,7 @@ pub async fn apply_rung1_rewind(
                 through_idx: summary.through_idx,
                 rolled_back: summary.rolled_back,
                 surviving_side_effects: summary.surviving_side_effects,
+                cause,
                 at: Utc::now(),
             },
         )
@@ -671,11 +807,10 @@ pub async fn apply_rung1_rewind(
 /// - [`resume_from_fc_snapshot`] (user-initiated `/resume` from Idle).
 /// - [`crate::api::admin::evacuate_session`] (operator drain via the
 ///   admin endpoint).
-/// - [`crate::dead_host::evict_host`] (auto-evac on heartbeat loss).
-/// - [`crate::nbd_loss_trigger::process_unhealthy`] (auto-evac on
-///   NBD degradation).
-/// - [`resume_from_created`] dispatcher arm (manual recovery of an
-///   auto-evac'd session).
+/// - [`crate::evac_resumer`] scanner (drives `Evacuating → Created`
+///   for sessions an operator drain marked; ADR 0044 K3).
+/// - [`resume_from_created`] dispatcher arm (manual recovery of a
+///   drained session).
 ///
 /// Preconditions: the session row is at `Created` state, `host_id` +
 /// `sandbox_id` are bound to the target (caller's responsibility).
@@ -823,6 +958,33 @@ fn portable_blob_keys(
     }
 }
 
+/// ADR 0045 D4: the IMAGE's base-snapshot memory manifest for a session's
+/// image — the CANONICAL ref for substrate resumes (base-identical pages
+/// CONTINUE against the shared per-image base shm). Best-effort: any miss
+/// (image disabled, no base snapshot, no memory manifest) returns `None`
+/// and the restore falls back to canonical == session (pre-D4 behavior).
+pub(crate) async fn base_memory_manifest_for_image(
+    state: &SharedState,
+    image_uri: &str,
+) -> Option<engram_core::types::manifest::ManifestRef> {
+    let enabled = state
+        .services
+        .meta
+        .get_enabled_image_any(image_uri)
+        .await
+        .ok()
+        .flatten()?;
+    let base_id = enabled.base_snapshot_id?;
+    state
+        .services
+        .meta
+        .get_snapshot(base_id)
+        .await
+        .ok()
+        .flatten()?
+        .memory_manifest
+}
+
 async fn resume_from_fc_snapshot(
     state: SharedState,
     session: Session,
@@ -859,6 +1021,10 @@ async fn resume_from_fc_snapshot(
         // affinity already constrains to a host that has the bytes.
         required_image_digest: None,
         exclude_host: None,
+        // ADR 0045 D4 / ADR 0039: soft preference for the host whose
+        // chunk cache + per-image base shm are warm — the capturing
+        // host first, else wherever the session last ran.
+        prefer_host: record.host_id.or(session.host_id),
     };
     // ADR 0016 Phase B commit 6: pick the newer of
     // `session.live_disk_manifest` and `record.disk_manifest`.
@@ -916,11 +1082,16 @@ async fn resume_from_fc_snapshot(
     // Build the SnapshotMetadata the trait now takes. The record
     // carries every field we need; we just round-trip it back into
     // the engine type the backend expects.
+    // ADR 0045 D4: hand the host the image's base manifest so resumed
+    // sessions share the per-image base shm with fresh creates.
+    let base_memory_manifest = base_memory_manifest_for_image(&state, &session.image).await;
     let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
         id: record.id,
         size_bytes: record.size_bytes,
         created_at: record.created_at,
         image_version: record.image_version.clone(),
+        base_memory_manifest,
+        migration_source: None,
         disk_manifest: effective_disk_manifest,
         memory_manifest: record.memory_manifest,
         // ADR 0028 cross-host recovery: a memory-bearing FC snapshot
@@ -1001,7 +1172,15 @@ async fn resume_from_fc_snapshot(
     // before the harness comes back, so the resumed agent's first
     // events append after an honest recovery boundary, not after
     // messages it never made. No-op for a checkpoint that was the head.
-    apply_rung1_rewind(&state, id, record.events_cursor).await;
+    // ADR 0045 F1: the manual `/resume` path only rewinds when the
+    // checkpoint lags the lost live head — an unplanned host-death case.
+    apply_rung1_rewind(
+        &state,
+        id,
+        record.events_cursor,
+        RecoveryCause::HostFailureRecovery,
+    )
+    .await;
     // Refresh the session row so finish_resume_to_active sees the
     // freshly-bound host_id + sandbox_id (the caller might've raced
     // a concurrent writer between bind_resumed_session and now).
@@ -1086,8 +1265,8 @@ async fn bind_resumed_session(
 ///   publisher uses to attach session_id to the publish RPC.
 ///
 /// Shared with `bind_resumed_session` (the /resume path); exposed
-/// `pub(crate)` so the admin evac endpoint and the dead_host.rs /
-/// nbd_loss_trigger auto-trigger paths can fire the same shape.
+/// `pub(crate)` so the admin evac endpoint and the `evac_resumer`
+/// scanner (driving operator-drained sessions) can fire the same shape.
 pub(crate) async fn bind_session_routing(
     state: &SharedState,
     id: SessionId,
@@ -1651,22 +1830,116 @@ mod evicting_gate_tests {
         }
     }
 
-    /// ADR 0034: a prompt/exec arriving mid-eviction must get the
-    /// retryable 409 — NOT the Idle|Evacuating auto-resume arm (the
-    /// sandbox may still be live; a restore would race the pipeline).
+    /// ADR 0034 / ADR 0039 follow-up #20: a prompt/exec arriving
+    /// mid-eviction that does NOT settle within the hold window falls
+    /// back to the retryable 409 — NOT the Idle|Evacuating auto-resume
+    /// arm (the sandbox may still be live; a restore would race the
+    /// pipeline). A `ZERO` hold exercises the immediate-409 fallback
+    /// deterministically (the pre-follow-up behaviour, preserved).
     #[tokio::test]
-    async fn ensure_active_during_evicting_is_retryable_conflict() {
+    async fn ensure_active_during_evicting_falls_back_to_retryable_conflict() {
         let id = SessionId::new();
         let (state, _local) = build_state_for_session(evicting_session(id));
 
-        let err = ensure_active(&state, id)
+        let err = ensure_active_after_evicting_hold_for(&state, id, Duration::ZERO)
             .await
-            .expect_err("Evicting must not pass ensure_active");
+            .expect_err("Evicting that never settles must not pass ensure_active");
         assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+        assert!(
+            err.to_string().contains("mid-eviction"),
+            "fallback must be the honest retryable mid-eviction 409, got: {err}",
+        );
         // The session must be untouched — in particular NOT resumed
         // and NOT transitioned.
         let after = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(after.status, SessionState::Evicting);
+    }
+
+    /// ADR 0039 follow-up #20: a request arriving mid-eviction HOLDS
+    /// for the eviction to land the session at Idle, then auto-resumes
+    /// inline instead of bouncing a 409 the client has to retry later
+    /// (prod stranded a follow-up message 4m32s). We flip the session
+    /// `Evicting → Idle` from a concurrent task partway through the
+    /// hold; `ensure_active_after_evicting_hold_for` must observe the
+    /// flip and dispatch the standard resume path (NOT return the
+    /// Evicting "retry shortly" 409). With no snapshot seeded, that
+    /// resume legitimately fails `Gone` (snapshot_invalidated) and
+    /// marks the session Dead — which is the proof the hold released
+    /// into resume rather than 409-bouncing.
+    #[tokio::test]
+    async fn ensure_active_during_evicting_holds_then_resumes_when_settled() {
+        let id = SessionId::new();
+        let (state, _local) = build_state_for_session(evicting_session(id));
+
+        // Concurrently land the eviction at Idle shortly into the hold.
+        let flip_state = state.clone();
+        let flipper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            flip_state
+                .services
+                .meta
+                .transition_session(id, SessionState::Idle)
+                .await
+                .expect("Evicting → Idle is a legal transition");
+        });
+
+        // Generous hold so the flip is observed well before the bound.
+        let res = ensure_active_after_evicting_hold_for(&state, id, Duration::from_secs(5)).await;
+        flipper.await.unwrap();
+
+        // The hold must have dispatched to resume_session — proven by
+        // the resume's own error path, NOT the Evicting 409.
+        let err = res.expect_err("no snapshot seeded → resume fails Gone");
+        assert!(
+            !err.to_string().contains("mid-eviction"),
+            "must have left the Evicting hold and taken the resume path, got: {err}",
+        );
+        assert!(
+            err.to_string().contains("snapshot_invalidated"),
+            "expected the no-snapshot resume failure, got: {err}",
+        );
+        // resume_from_idle with no recoverable snapshot marks the
+        // session Dead — confirming the resume path actually ran.
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(after.status, SessionState::Dead);
+    }
+
+    /// ADR 0039 follow-up #20: if the eviction races to a TERMINAL
+    /// state during the hold (here `Evicting → Completed` via a
+    /// concurrent DELETE), the hold must re-dispatch through
+    /// `ensure_active` and surface that state's honest typed error —
+    /// the terminal "no work to dispatch" 409 — rather than the
+    /// misleading "mid-eviction; retry shortly" message.
+    #[tokio::test]
+    async fn ensure_active_during_evicting_surfaces_terminal_state_on_race() {
+        let id = SessionId::new();
+        let (state, _local) = build_state_for_session(evicting_session(id));
+
+        let flip_state = state.clone();
+        let flipper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            flip_state
+                .services
+                .meta
+                .transition_session(id, SessionState::Completed)
+                .await
+                .expect("Evicting → Completed is a legal transition");
+        });
+
+        let err = ensure_active_after_evicting_hold_for(&state, id, Duration::from_secs(5))
+            .await
+            .expect_err("Completed session has no work to dispatch");
+        flipper.await.unwrap();
+
+        assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+        assert!(
+            err.to_string().contains("terminal"),
+            "must surface the terminal-state error, not the mid-eviction 409, got: {err}",
+        );
+        assert!(
+            !err.to_string().contains("mid-eviction"),
+            "must not still report mid-eviction once the row went terminal, got: {err}",
+        );
     }
 
     /// A direct /resume mid-eviction gets the same honest 409.

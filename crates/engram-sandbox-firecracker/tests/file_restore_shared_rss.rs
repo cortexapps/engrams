@@ -258,8 +258,9 @@ async fn file_backend_base_create_shares_residency_memfile() {
     let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
     cfg.net_pool = None;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/spike-init.sh".into();
+    // ADR 0045 D3: fresh-create resolves to File whenever no substrate
+    // dir is configured — the bifurcation is derived, not configured.
     cfg.restore_mode = RestoreMode::Uffd;
-    cfg.base_restore_mode = Some(RestoreMode::File);
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -396,6 +397,252 @@ async fn file_backend_base_create_shares_residency_memfile() {
         pct < 80,
         "File-mode base-create off the residency memfile shows no page sharing \
          (Σpss/Σrss = {pct}%)",
+    );
+}
+
+/// ADR 0045 D3 parity gate: **substrate (v2b) cold boot vs File-mode cold
+/// boot, apples-to-apples** — same baked workload, same snapshot, same
+/// host, measured in one run:
+///
+///   - Arm A (today's prod default): `restore_fresh` through the File-mode
+///     base-create bifurcation off the captured memory.bin.
+///   - Arm B (the substrate): `restore_fresh` with `restore_mode = Uffd` +
+///     `uffd_base_dir` on the FORKED FC — guest memory `MAP_PRIVATE` of the
+///     per-template base shm, canonical faults CONTINUE-shared.
+///
+/// Gates (ADR 0045 D3): density — substrate Σpss/Σrss must be within 10
+/// points of File mode's (both share the canonical working set); the
+/// printed latencies are the ADR's measured numbers (the assertion bound
+/// is generous — the decision is made on the prints).
+///
+/// Skips cleanly without `ENGRAM_FC_FORK_BIN` (the substrate is fork-only)
+/// or a built `engram-uffd-handler`.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + ENGRAM_FC_FORK_BIN + Docker + mke2fs + built engram-uffd-handler"]
+async fn substrate_base_create_density_and_latency_parity() {
+    let env = match fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !require_bin("docker") || !require_bin("mke2fs") {
+        return;
+    }
+    let fork_bin = match std::env::var("ENGRAM_FC_FORK_BIN") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            eprintln!("SKIP: ENGRAM_FC_FORK_BIN not set (substrate is fork-only)");
+            return;
+        }
+    };
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let handler = Path::new(&manifest_dir).join("../../target/debug/engram-uffd-handler");
+    if !handler.exists() {
+        eprintln!("SKIP: engram-uffd-handler not built");
+        return;
+    }
+    std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
+
+    let baked = bake_spike_rootfs().await;
+
+    // ---- Source boot + snapshot (shared by both arms) ----
+    let work = tempfile::tempdir().expect("work dir");
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg.net_pool = None;
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/spike-init.sh".into();
+    // The fork is a verified drop-in; use it for BOTH arms so the binary
+    // isn't a variable in the comparison.
+    cfg.firecracker_bin = fork_bin.clone();
+    let backend = FirecrackerBackend::new(work.path(), cfg);
+
+    let spec = SandboxSpec {
+        image: "fc-substrate-parity-test".into(),
+        rootfs_source: Some(baked.rootfs.clone()),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 256 },
+        disk: DiskLimit { max_gib: 2 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let source = backend.create(spec).await.expect("create");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let metadata = match backend.snapshot(source).await {
+        Ok(m) => m,
+        Err(e) => {
+            dump_fc_logs(work.path());
+            let _ = backend.destroy(source).await;
+            panic!("snapshot failed — source guest did not survive: {e}");
+        }
+    };
+    backend.destroy(source).await.expect("destroy source");
+
+    // Chunk memory.bin where the spawned handler will find it (the
+    // ENGRAM_LOCAL_PATH/blobs layout — see snapshot_uffd.rs).
+    let local_path = work.path().join("local-state");
+    std::env::set_var("ENGRAM_BLOB_BACKEND", "local");
+    std::env::set_var("ENGRAM_LOCAL_PATH", &local_path);
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
+        std::sync::Arc::new(LocalBlobStorage::new(local_path.join("blobs")));
+    let chunk_store = ChunkStore::new(blob);
+    let mem_path = backend.snapshot_path_for(metadata.id).join("memory.bin");
+    let chunked = chunk_store
+        .chunk_file(&mem_path, ManifestKind::Memory, None)
+        .await
+        .expect("chunk memory.bin");
+    let manifest_ref = engram_core::types::manifest::ManifestRef::new();
+    chunk_store
+        .put_manifest(manifest_ref, &chunked)
+        .await
+        .expect("put memory manifest");
+    // The restore path trusts the on-disk sidecar manifest.json over the
+    // passed metadata — patch memory_manifest into it (see snapshot_uffd.rs).
+    let manifest_json = backend.snapshot_path_for(metadata.id).join("manifest.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_json).expect("read mj")).expect("parse mj");
+    value.as_object_mut().expect("mj root is an object").insert(
+        "memory_manifest".into(),
+        serde_json::to_value(manifest_ref).expect("serialize mref"),
+    );
+    std::fs::write(
+        &manifest_json,
+        serde_json::to_vec_pretty(&value).expect("re-serialize mj"),
+    )
+    .expect("write patched mj");
+
+    // One measurement arm: restore SIBLINGS via `restore_fresh` on the
+    // given backend, settle, measure (pct, median restore ms), destroy.
+    async fn measure_arm(
+        label: &str,
+        backend: &FirecrackerBackend,
+        metadata: &engram_core::types::snapshot::SnapshotMetadata,
+        work_path: &Path,
+    ) -> (u64, u128) {
+        let mut vms = Vec::new();
+        let mut latencies_ms = Vec::new();
+        for i in 0..SIBLINGS {
+            let t = Instant::now();
+            let id = match backend.restore_fresh(metadata.clone()).await {
+                Ok(id) => id,
+                Err(e) => {
+                    dump_fc_logs(work_path);
+                    for v in &vms {
+                        let _ = backend.destroy(*v).await;
+                    }
+                    panic!("{label} sibling {i} failed to restore: {e:?}");
+                }
+            };
+            let ms = t.elapsed().as_millis();
+            eprintln!("SPIKE: {label} restore sibling {i} = {ms} ms");
+            latencies_ms.push(ms);
+            vms.push(id);
+        }
+        // Settle until every sibling's working set is faulted in (RSS >
+        // blob) or RSS stops growing — prints distinguish "slow fault
+        // throughput" from "wedged fault" if the gate trips.
+        let mut last_rss: Vec<u64> = vec![0; vms.len()];
+        for round in 0..6 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let rss: Vec<u64> = vms
+                .iter()
+                .map(|id| smaps_rollup(fc_pid_for(work_path, &id.to_string())).rss_kb)
+                .collect();
+            eprintln!("SPIKE: {label} settle round {round}: rss KiB = {rss:?}");
+            if rss.iter().all(|r| *r > BLOB_MIB * 1024) {
+                break;
+            }
+            if rss == last_rss {
+                eprintln!("SPIKE: {label} rss plateaued below the blob — wedged?");
+                break;
+            }
+            last_rss = rss;
+        }
+        let (mut total_rss, mut total_pss) = (0u64, 0u64);
+        let mut failures = Vec::new();
+        for (i, id) in vms.iter().enumerate() {
+            let pid = fc_pid_for(work_path, &id.to_string());
+            let m = smaps_rollup(pid);
+            eprintln!(
+                "SPIKE: {label} sibling {i} pid {pid}: rss {} KiB, pss {} KiB, \
+                 shared_clean {} KiB, private_dirty {} KiB",
+                m.rss_kb, m.pss_kb, m.shared_clean_kb, m.private_dirty_kb,
+            );
+            if m.rss_kb <= BLOB_MIB * 1024 {
+                failures.push(format!(
+                    "{label} sibling {i} rss {} KiB < blob size — workload didn't run",
+                    m.rss_kb
+                ));
+            }
+            total_rss += m.rss_kb;
+            total_pss += m.pss_kb;
+        }
+        if !failures.is_empty() {
+            for v in vms.iter() {
+                let _ = backend.destroy(*v).await;
+            }
+            panic!("{}", failures.join("\n"));
+        }
+        for id in &vms {
+            backend.destroy(*id).await.expect("destroy sibling");
+        }
+        let pct = total_pss * 100 / total_rss.max(1);
+        latencies_ms.sort_unstable();
+        let median = latencies_ms[latencies_ms.len() / 2];
+        eprintln!("SPIKE: {label}: Σpss/Σrss = {pct}%, restore median {median} ms");
+        (pct, median)
+    }
+
+    // ---- Arm A: File-mode base-create (today's prod default) ----
+    let mut cfg_file = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg_file.net_pool = None;
+    cfg_file.default_boot_args =
+        "console=ttyS0 reboot=k panic=1 pci=off init=/spike-init.sh".into();
+    cfg_file.firecracker_bin = fork_bin.clone();
+    cfg_file.restore_mode = RestoreMode::Uffd;
+    let backend_file = FirecrackerBackend::new(work.path(), cfg_file);
+    let (pct_file, median_file) =
+        measure_arm("file-mode", &backend_file, &metadata, work.path()).await;
+
+    // ---- Arm B: the substrate (Uffd + base shm on the fork) ----
+    let base_dir = PathBuf::from(format!(
+        "/dev/shm/engram-parity-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&base_dir).expect("create base dir");
+    let mut cfg_sub = FirecrackerConfig::with_kernel(env.kernel.clone());
+    cfg_sub.net_pool = None;
+    cfg_sub.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/spike-init.sh".into();
+    cfg_sub.firecracker_bin = fork_bin;
+    cfg_sub.uffd_handler_bin = handler;
+    cfg_sub.restore_mode = RestoreMode::Uffd;
+    cfg_sub.uffd_base_dir = Some(base_dir.clone());
+    let backend_sub = FirecrackerBackend::new(work.path(), cfg_sub);
+    let mut metadata_sub = metadata.clone();
+    metadata_sub.memory_manifest = Some(manifest_ref);
+    let (pct_sub, median_sub) =
+        measure_arm("substrate", &backend_sub, &metadata_sub, work.path()).await;
+    let _ = std::fs::remove_dir_all(&base_dir);
+
+    eprintln!(
+        "SPIKE: D3 PARITY — density file={pct_file}% substrate={pct_sub}% \
+         | restore median file={median_file}ms substrate={median_sub}ms"
+    );
+
+    // The D3 density gate: the substrate must share what File mode shares.
+    // +10 points of slack for accounting drift between arms.
+    assert!(
+        pct_sub <= pct_file + 10,
+        "substrate density regressed vs File mode: Σpss/Σrss {pct_sub}% vs {pct_file}%",
+    );
+    // Generous latency bound — the printed medians are the ADR's measured
+    // numbers; this assertion only catches a pathological regression
+    // (e.g. the lazy path degenerating into a synchronous full read).
+    assert!(
+        median_sub <= median_file + 2000,
+        "substrate restore median {median_sub} ms wildly above File mode {median_file} ms",
     );
 }
 

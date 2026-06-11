@@ -389,6 +389,20 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         kernel_key: kernel_path,
         'ENGRAM_SANDBOX_WORK_DIR': work_dir,
         'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
+        # ADR 0039: the Tilt dev/e2e stack doesn't bake engram-uffd-handler
+        # (prod's FC-host image does), and the host-agent runs under sudo
+        # with a scrubbed PATH so it couldn't spawn a co-located one anyway.
+        # The host-agent code default is now `uffd`, so pin `file` here to
+        # keep idle-resume on the no-handler path. Override to `uffd` only
+        # where the handler is present. (Base-create stays code-default
+        # `file`, which needs no handler.)
+        'ENGRAM_FC_RESTORE_MODE': env_or('ENGRAM_FC_RESTORE_MODE', 'file'),
+        # ADR 0045 substrate (v2b): point at a tmpfs dir (e.g.
+        # /dev/shm/engram) to back Uffd restores with a shared
+        # per-template base shm. Empty = off (stock anonymous Uffd).
+        # Must be listed here: the host-agent runs under sudo
+        # --preserve-env=<these keys>, which scrubs unlisted vars.
+        'ENGRAM_FC_UFFD_BASE_DIR': env_or('ENGRAM_FC_UFFD_BASE_DIR', ''),
         # gRPC plumbing — coord dials advertise, host-agent listens on
         # bind. Same machine in dev, so loopback works for both.
         'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:' + grpc_port,
@@ -409,6 +423,12 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
         'RUST_LOG': 'info,engram=debug',
     }
+    # ADR 0045 substrate (v2b): dev uffd runs spawn the workspace-built
+    # handler (prod bakes it onto PATH). Conditional — an empty env var
+    # would clobber the host-agent's PATH-lookup default.
+    if env_or('ENGRAM_FC_UFFD_HANDLER_BIN', ''):
+        env['ENGRAM_FC_UFFD_HANDLER_BIN'] = env_or('ENGRAM_FC_UFFD_HANDLER_BIN', '')
+
     if nbd_csv:
         env['ENGRAM_NBD_DEVICES'] = nbd_csv
     if 'Darwin' in uname_str:

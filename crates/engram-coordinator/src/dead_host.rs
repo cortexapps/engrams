@@ -33,17 +33,15 @@
 //! forever (with a `host_id` pointing at a host that won't respond);
 //! operators can still `POST /sessions/:id/migrate` by hand.
 //!
-//! **ADR 0018 commit 12g (async auto-evac):** when
-//! `ENGRAM_DEAD_HOST_AUTO_EVAC=1` and the session has recoverable
-//! state (snapshot row OR `sessions.live_disk_manifest_*`), the
-//! second-stage routes `HostLost → Evacuating`; the `evac_resumer`
-//! background scanner then drives `Evacuating → Created → Active`
-//! on a peer. Without the flag, fall back to the legacy
-//! `HostLost → Idle` (user /resume) path. The no-state branch is
-//! always `HostLost → Dead`. This is the unified entry point for
-//! operator drain, dead-host recovery, and (future) NBD-loss
-//! triggers — all converge on `Evacuating` and the scanner handles
-//! the relocation.
+//! **ADR 0045 Phase A (retire reactive evac):** the second stage
+//! routes a recoverable session (snapshot row OR
+//! `sessions.live_disk_manifest_*`) to `HostLost → Idle` for lazy
+//! `/resume` on next access, and `HostLost → Dead` when there is no
+//! recoverable state. The detector no longer routes into
+//! `Evacuating` — the reactive auto-evac was the documented bug
+//! source (the resume-from-idle wedge, the deploy-storm cascade), so
+//! `Evacuating` is now reached *only* via operator drain (ADR 0044
+//! K3), and the `evac_resumer` scanner relocates only those.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,20 +54,6 @@ use sqlx::postgres::PgPool;
 
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus, SharedState};
 use engram_core::SessionId;
-
-/// Read the auto-evac flag. Defaults to **true** as of commit 10 —
-/// the resume-from-Created completion path now lands, so an auto-
-/// evac'd session reaches Active on a peer via the shared
-/// `finish_resume_to_active` primitive instead of stranding at
-/// Created. Operators can flip `ENGRAM_DEAD_HOST_AUTO_EVAC=0` to
-/// roll back to the legacy HostLost → Idle (user /resumes) path if
-/// a regression surfaces.
-fn auto_evac_enabled() -> bool {
-    std::env::var("ENGRAM_DEAD_HOST_AUTO_EVAC")
-        .ok()
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true)
-}
 
 /// Persist + publish a `StatusChanged{from, to}` event. Inline here
 /// (rather than via `SharedState::emit`) so the dead-host detector
@@ -134,11 +118,6 @@ impl Default for DeadHostConfig {
 /// Spawn the detector as a background task. Returns a JoinHandle the
 /// caller can drop on shutdown. Runs forever; logs and continues on
 /// per-tick errors so a transient Postgres blip doesn't stop the loop.
-///
-/// Takes the full `SharedState` so the auto-evac path can call into
-/// `api::snapshot::finish_resume_to_active` to drive the relocated
-/// session all the way through harness rebuild → Active (the same
-/// primitive `/resume` uses).
 pub fn spawn(cfg: DeadHostConfig, pool: PgPool, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(cfg.poll_interval);
@@ -177,6 +156,21 @@ async fn run_once(
         }
     }
     Ok(())
+}
+
+/// The dead-host detector's stage-2 routing decision (ADR 0045 Phase
+/// A). A session is recoverable — and routed to `Idle` for lazy
+/// `/resume` on next access — if it has a memory snapshot OR a live
+/// disk manifest (the latter still resumes via the cold-boot path).
+/// With nothing to recover from, it goes to `Dead`. The detector no
+/// longer routes into `Evacuating`; proactive relocation is operator
+/// drain only (ADR 0044 K3).
+fn recovery_target(has_snapshot: bool, has_live_manifest: bool) -> SessionState {
+    if has_snapshot || has_live_manifest {
+        SessionState::Idle
+    } else {
+        SessionState::Dead
+    }
 }
 
 async fn evict_host(
@@ -241,32 +235,24 @@ async fn evict_host(
 
     // Stage 2: per-session recoverability-aware second transition.
     //
-    // ADR 0018 commit 12g (async): the second stage no longer
-    // orchestrates the relocate inline. It picks the right next
-    // state and commits the transition; the `evac_resumer`
-    // background scanner picks Evacuating sessions up and drives
-    // them through to Active on a peer.
+    // ADR 0045 Phase A: route a recoverable session to `Idle` for
+    // lazy `/resume` on next access; `Dead` when there's nothing to
+    // recover. The detector no longer routes into `Evacuating` — the
+    // reactive auto-evac is retired (it was the source of the
+    // resume-from-idle wedge + deploy-storm cascade). Proactive
+    // relocation now happens only via operator drain (ADR 0044 K3).
     //
-    // Decision matrix (under default `auto_evac = true`):
+    // Decision matrix:
     //
-    // | snapshot | live_manifest | next state    | who finishes the resume     |
-    // |----------|---------------|---------------|-----------------------------|
-    // | Some     | _             | Evacuating    | evac_resumer scanner        |
-    // | None     | Some          | Evacuating    | evac_resumer scanner        |
-    // | None     | None          | Dead          | (no recoverable state)      |
-    //
-    // With `ENGRAM_DEAD_HOST_AUTO_EVAC=0` (operator escape hatch),
-    // the table degrades to:
-    //
-    // | snapshot | live_manifest | next state    | who finishes the resume     |
-    // |----------|---------------|---------------|-----------------------------|
-    // | Some     | _             | Idle          | user /resume                |
-    // | _        | _             | Dead          | (terminal)                  |
+    // | snapshot | live_manifest | next state | who recovers it          |
+    // |----------|---------------|------------|--------------------------|
+    // | Some     | _             | Idle       | user/exec /resume        |
+    // | None     | Some          | Idle       | /resume (disk-only cold) |
+    // | None     | None          | Dead       | (no recoverable state)   |
     //
     // Failures of any query/transition are logged and skipped; the
     // row stays at HostLost and a future reconcile pass (or
     // operator action) can move it on.
-    let auto_evac = auto_evac_enabled();
     for (session_id, _) in &affected {
         let snapshot = match meta.latest_snapshot_for_session(*session_id).await {
             Ok(opt) => opt,
@@ -280,44 +266,26 @@ async fn evict_host(
             }
         };
 
-        let target = if auto_evac {
-            // Look up the session row for live_disk_manifest. Failure
-            // leaves the row at HostLost — operator can drive
-            // resolution via /resume or /api/admin/sessions/:id/evacuate.
-            let has_live_manifest = match meta.get_session(*session_id).await {
-                Ok(s) => s.live_disk_manifest.is_some(),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        %session_id,
-                        "get_session failed during second-stage; leaving at HostLost",
-                    );
-                    continue;
-                }
-            };
-            if snapshot.is_some() || has_live_manifest {
-                SessionState::Evacuating
-            } else {
-                SessionState::Dead
-            }
-        } else {
-            // Legacy path: HostLost → Idle (if snapshot exists) or Dead.
-            match snapshot.is_some() {
-                true => SessionState::Idle,
-                false => SessionState::Dead,
+        // Look up the session row for live_disk_manifest so a disk-only
+        // session (no memory snapshot) stays recoverable via the
+        // cold-boot `/resume` path. Failure leaves the row at HostLost.
+        let has_live_manifest = match meta.get_session(*session_id).await {
+            Ok(s) => s.live_disk_manifest.is_some(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    %session_id,
+                    "get_session failed during second-stage; leaving at HostLost",
+                );
+                continue;
             }
         };
+
+        let target = recovery_target(snapshot.is_some(), has_live_manifest);
 
         match meta.transition_session(*session_id, target).await {
             Ok(prev) => {
                 emit_status_changed(meta, events, *session_id, prev, target).await;
-                if matches!(target, SessionState::Evacuating) {
-                    tracing::info!(
-                        %session_id,
-                        "dead-host recovery: session marked Evacuating; \
-                         evac_resumer scanner will resume on peer",
-                    );
-                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -347,6 +315,8 @@ async fn evict_host(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     // The detector's polling loop and advisory-lock dance are
     // Postgres-specific and require a live database to test
     // meaningfully. The trait-layer logic
@@ -354,4 +324,26 @@ mod tests {
     // by Mock-based tests in `tests/dead_host_mock.rs`. End-to-end
     // multi-replica behaviour is the live-Postgres test
     // (`#[ignore]`'d, gated behind dev-VM Docker compose).
+
+    // ADR 0045 Phase A: the stage-2 routing decision. A recoverable
+    // dead-host session goes to Idle (lazy /resume), never Evacuating
+    // (the reactive auto-evac is retired); only the no-state case is
+    // terminal.
+    #[test]
+    fn recovery_target_routes_recoverable_to_idle_never_evacuating() {
+        // snapshot present → Idle (memory + disk resume).
+        assert_eq!(recovery_target(true, false), SessionState::Idle);
+        // disk-only (live manifest, no snapshot) → Idle (cold-boot resume).
+        assert_eq!(recovery_target(false, true), SessionState::Idle);
+        // both present → Idle.
+        assert_eq!(recovery_target(true, true), SessionState::Idle);
+        // nothing recoverable → Dead.
+        assert_eq!(recovery_target(false, false), SessionState::Dead);
+
+        // The reactive auto-evac target is gone: no input combination
+        // routes a dead host's session into Evacuating.
+        for (snap, manifest) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_ne!(recovery_target(snap, manifest), SessionState::Evacuating);
+        }
+    }
 }

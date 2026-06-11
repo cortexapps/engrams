@@ -1,0 +1,73 @@
+{{- if .Values.operator.enabled -}}
+# ADR 0044 K3: the host-fleet rollout operator. Watches HostFleet CRs and
+# drives a drain-gated, node-by-node roll of the host-agent DaemonSet (which
+# is OnDelete precisely so nothing else rolls it under a live microVM). Runs
+# as a single replica Deployment on a normal node (no kvm toleration → it
+# stays off the tainted host nodes).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "hostfleet.operator.fullname" . }}
+  labels:
+    {{- include "hostfleet.operator.labels" . | nindent 4 }}
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hostfleet.operator.fullname" . }}
+  labels:
+    {{- include "hostfleet.operator.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # A second operator must never co-drive a roll. RollingUpdate could briefly
+  # run two; Recreate keeps it strictly single-writer.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "hostfleet.operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hostfleet.operator.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "hostfleet.operator.fullname" . }}
+      containers:
+        - name: operator
+          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.operator.logLevel | quote }}
+            # ADR 0044 K4: node-pool scaler — `noop` (logs only) or `gke`
+            # (resizes a GKE pool via the Container API + Workload Identity).
+            - name: ENGRAM_NODE_POOL_SCALER
+              value: {{ .Values.operator.scaler | quote }}
+            {{- if .Values.coordinator.tokenSecretName }}
+            # ADR 0031: the operator authenticates to the coordinator admin
+            # API with a service bearer token.
+            - name: ENGRAM_COORDINATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coordinator.tokenSecretName }}
+                  key: {{ .Values.coordinator.tokenSecretKey }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+      {{- with .Values.operator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

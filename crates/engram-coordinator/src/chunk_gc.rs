@@ -136,6 +136,15 @@ pub struct SweepReport {
     /// grace cutoff and were deleted from BlobStorage + the
     /// candidate table. Always 0 in `DryRun`.
     pub promoted_deletes: usize,
+    /// Promote-pass: expired candidates found RE-PINNED at delete time
+    /// and skipped (blob kept, stale candidate row cleared). `first_seen_at`
+    /// is sticky and classification never clears a re-pinned candidate, so
+    /// without this re-check a chunk marked while transiently unpinned but
+    /// since re-referenced (e.g. an image refresh re-pinning a shared
+    /// base-memory chunk) would be wrongly deleted — 404ing the pinning
+    /// manifest. `>0` means the durability guard fired. Mirrors the
+    /// snapshot-blob-gc promote pass (ADR 0028 addendum).
+    pub promote_repinned_skips: usize,
     /// Promote-pass: BlobStorage delete attempts that errored.
     /// The candidate row stays in the table so the next sweep
     /// retries; surfaced for visibility.
@@ -244,8 +253,10 @@ pub async fn run_one_sweep_inner(
 
     // -------- promote pass (Full only) --------
     if mode == SweepMode::Full {
-        let (deletes, errors) = promote_expired(meta.as_ref(), blob.as_ref(), cfg).await?;
+        let (deletes, repinned, errors) =
+            promote_expired(meta.as_ref(), blob.as_ref(), chunk_store, cfg).await?;
         report.promoted_deletes = deletes;
+        report.promote_repinned_skips = repinned;
         report.promote_delete_errors = errors;
     }
 
@@ -253,13 +264,16 @@ pub async fn run_one_sweep_inner(
 }
 
 /// Promote-pass: delete candidates older than `grace_period` from
-/// BlobStorage + the candidate table. Paged via
-/// `cfg.promote_batch_size` so a backlog can't lock the loop.
+/// BlobStorage + the candidate table — AFTER re-verifying the live pin
+/// set, so a candidate that was re-pinned since it was marked is skipped
+/// and cleared, never deleted. Paged via `cfg.promote_batch_size` so a
+/// backlog can't lock the loop. Returns `(deleted, repinned_skipped, errors)`.
 async fn promote_expired(
     meta: &dyn MetadataStore,
     blob: &dyn BlobStorage,
+    chunk_store: &ChunkStore,
     cfg: &ChunkGcConfig,
-) -> Result<(usize, usize), GcError> {
+) -> Result<(usize, usize, usize), GcError> {
     let cutoff = Utc::now()
         - chrono::Duration::from_std(cfg.grace_period)
             .unwrap_or_else(|_| chrono::Duration::seconds(86_400));
@@ -267,23 +281,45 @@ async fn promote_expired(
     let expired = meta
         .list_expired_gc_candidates(cutoff, cfg.promote_batch_size)
         .await?;
+    if expired.is_empty() {
+        return Ok((0, 0, 0));
+    }
 
-    let mut delete_ok: Vec<[u8; 32]> = Vec::with_capacity(expired.len());
+    // Re-verify the LIVE pin set at delete time — the load-bearing
+    // durability step, and parity with the snapshot-blob-gc promote pass
+    // (ADR 0028 addendum) that the chunk-gc promote never got.
+    // `first_seen_at` is sticky and the classification pass never clears a
+    // re-pinned candidate's row (it just skips pinned chunks), so a chunk
+    // marked while transiently unpinned but SINCE re-pinned — e.g. an image
+    // refresh re-referencing a shared base-memory chunk, or any content-
+    // addressed chunk that re-enters a fresh manifest — still carries an
+    // expired row. Deleting it on the stale row alone reaps a chunk that's
+    // currently referenced, so every reader of the pinning manifest 404s on
+    // first fault (the wedged-session class of bug). Skip + clear those;
+    // only genuinely-unpinned chunks get their blob deleted.
+    let pin_set = PinSet::collect(meta, chunk_store).await?;
+
+    let mut resolved: Vec<[u8; 32]> = Vec::with_capacity(expired.len());
+    let mut deleted = 0usize;
+    let mut repinned = 0usize;
     let mut errors = 0usize;
     for hash_bytes in expired {
-        // Reconstruct the storage key. We're using the raw bytes
-        // from PG, so build a ChunkHash and use its storage_key().
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&hash_bytes);
-        let hex: String = arr.iter().map(|b| format!("{b:02x}")).collect();
-        let key = format!("chunks/sha256/{}/{}", &hex[..2], &hex[2..]);
-        match blob.delete(&key).await {
+        let hash = ChunkHash::from_bytes(hash_bytes);
+        if pin_set.contains(&hash) {
+            // Re-pinned since it was marked — rescue: drop the stale
+            // candidate row, keep the blob.
+            repinned += 1;
+            resolved.push(hash_bytes);
+            continue;
+        }
+        match blob.delete(&hash.storage_key()).await {
             Ok(()) => {
-                delete_ok.push(hash_bytes);
+                resolved.push(hash_bytes);
+                deleted += 1;
             }
             Err(e) => {
                 tracing::warn!(
-                    chunk_hash = %hex,
+                    chunk_hash = %hash.to_hex(),
                     error = %e,
                     "chunk-gc promote: BlobStorage delete failed; candidate row stays for retry"
                 );
@@ -292,11 +328,19 @@ async fn promote_expired(
         }
     }
 
-    // Only drop candidate rows for the chunks we actually deleted —
-    // failed deletes keep their row so the next sweep retries.
-    meta.delete_gc_candidates(&delete_ok).await?;
+    // Clear rows for everything resolved this pass — deleted blobs AND
+    // rescued (re-pinned) candidates. Failed deletes keep their row so the
+    // next sweep retries.
+    meta.delete_gc_candidates(&resolved).await?;
+    if repinned > 0 {
+        tracing::info!(
+            repinned,
+            "chunk-gc promote: skipped + cleared re-pinned candidates \
+             (live chunks the stale rows would have wrongly deleted)"
+        );
+    }
 
-    Ok((delete_ok.len(), errors))
+    Ok((deleted, repinned, errors))
 }
 
 /// Background sweep loop. Spawned from coord startup; ticks every
@@ -328,6 +372,7 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
                     pinned = report.pin_set_size,
                     candidates = report.candidates_marked,
                     promoted = report.promoted_deletes,
+                    repinned_skips = report.promote_repinned_skips,
                     promote_errors = report.promote_delete_errors,
                     restart_count = report.restart_count,
                     restart_budget_exhausted = report.restart_budget_exhausted,

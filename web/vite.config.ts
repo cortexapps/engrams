@@ -1,8 +1,47 @@
 /// <reference types="vitest" />
 import http from 'node:http';
-import { defineConfig } from 'vite';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+
+// ghostty-web embeds the WASM as a data: URI in its JS bundle, but the
+// SPA's CSP (connect-src 'self') blocks fetch() of data: URIs, causing
+// the library's fallback candidates — ./ghostty-vt.wasm and
+// /ghostty-vt.wasm — to be tried instead. Without this plugin both
+// paths return the SPA's index.html (nginx try_files catch-all), which
+// passes C.ok === true but contains HTML, making WebAssembly.compile()
+// throw "expected magic word 00 61 73 6d, found 3c 21 64 6f".
+//
+// Fix: serve the real binary at /ghostty-vt.wasm in dev AND copy it to
+// the dist root for production so nginx serves the file before reaching
+// the try_files fallback.
+function ghosttyWasmPlugin(): Plugin {
+  const wasmSrc = 'node_modules/ghostty-web/ghostty-vt.wasm';
+  return {
+    name: 'ghostty-wasm',
+    configureServer(server) {
+      server.middlewares.use('/ghostty-vt.wasm', async (_req, res) => {
+        try {
+          const buf = await readFile(wasmSrc);
+          res.setHeader('Content-Type', 'application/wasm');
+          res.end(buf);
+        } catch {
+          res.statusCode = 404;
+          res.end('not found');
+        }
+      });
+    },
+    async generateBundle() {
+      this.emitFile({
+        type: 'asset',
+        fileName: 'ghostty-vt.wasm',
+        source: await readFile(wasmSrc),
+      });
+    },
+  };
+}
 
 // Coordinator binds to 127.0.0.1:8090 in `just dev` / `just dev-vz`.
 // The whole coord API lives under /api/v1, so proxy /api straight
@@ -20,7 +59,8 @@ const COORDINATOR = process.env.ENGRAM_COORDINATOR_URL ?? 'http://127.0.0.1:8090
 const proxyAgent = new http.Agent({ keepAlive: true });
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), ghosttyWasmPlugin()],
+  resolve: { alias: { '@': path.resolve(__dirname, './src') } },
   server: {
     port: 5173,
     proxy: {
@@ -40,6 +80,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: false,
+    setupFiles: ['./src/test-setup.ts'],
     include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
 });

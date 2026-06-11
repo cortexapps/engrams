@@ -293,6 +293,40 @@ impl CoordClient {
     }
 
     /// POST /api/v1/hosts/:id/idle-eviction-candidates
+    /// ADR 0045 C1: the export-TTL ownership check. `Ok(true)` = the
+    /// coordinator still binds this sandbox to the session (the move
+    /// never landed — abort the export, un-pause in place);
+    /// `Ok(false)` = ownership moved on (destroy the stale frozen
+    /// source); `Err` = coordinator unreachable (stay paused, retry).
+    pub async fn sandbox_ownership(
+        &self,
+        host_id: HostId,
+        session_id: engram_core::SessionId,
+        sandbox_id: engram_core::SandboxId,
+    ) -> Result<bool, CoordClientError> {
+        let url = self.endpoint(&format!(
+            "/hosts/{host_id}/sessions/{session_id}/sandboxes/{sandbox_id}/ownership"
+        ));
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            owned: bool,
+        }
+        let mut builder = self.http.get(&url);
+        if !self.auth_token.is_empty() {
+            builder = builder.bearer_auth(&self.auth_token);
+        }
+        let resp = builder.send().await.map_err(CoordClientError::Transport)?;
+        if !resp.status().is_success() {
+            return Err(CoordClientError::Http {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+                what: "sandbox_ownership",
+            });
+        }
+        let body: Resp = resp.json().await.map_err(CoordClientError::Transport)?;
+        Ok(body.owned)
+    }
+
     pub async fn push_idle_eviction_candidates(
         &self,
         host_id: HostId,
@@ -446,12 +480,6 @@ pub struct HeartbeatRequest {
     /// `ready_images.contains(digest)`.
     #[serde(default)]
     pub ready_images: Vec<engram_protocol::heartbeat::ManifestDigest>,
-    /// ADR 0018 Phase B: sandbox IDs whose backing `/dev/nbdN` is
-    /// degraded. Coord-side trigger (commit 5) relocates each.
-    /// `#[serde(default)]` so older coords ignore the field on rolling
-    /// upgrade.
-    #[serde(default)]
-    pub nbd_unhealthy: Vec<engram_core::SandboxId>,
     /// ADR 0035: the bake stamp's `drive_id` → sha256 set — which
     /// bundle generation this host image carries as *current*. Ops
     /// visibility (fleet skew mid-roll) + a defensive member of the
@@ -626,8 +654,8 @@ mod tests {
     }
 
     /// The request side IS `serde(default)`: coord rolls before the
-    /// host MIG, so a new coord must accept old hosts' heartbeats
-    /// (they simply report no current bundles).
+    /// host-agent pod restart, so a new coord must accept old hosts'
+    /// heartbeats (they simply report no current bundles).
     #[test]
     fn heartbeat_request_current_bundles_serializes() {
         let req = HeartbeatRequest {
@@ -637,7 +665,6 @@ mod tests {
             draining: false,
             host_addr: None,
             ready_images: vec![],
-            nbd_unhealthy: vec![],
             checkpoints: vec![],
             current_bundles: vec![engram_core::types::sandbox::AuxBundleRef {
                 drive_id: "skills".into(),

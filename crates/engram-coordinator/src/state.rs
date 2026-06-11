@@ -168,8 +168,35 @@ pub enum SessionEvent {
         /// Outside-world side-effects in the rolled-back span that
         /// survive (one human-readable line each).
         surviving_side_effects: Vec<String>,
+        /// ADR 0045 F1: why the rewind happened, so the web doesn't
+        /// label a planned operator move as a host failure. `#[serde(default)]`
+        /// → events persisted before this field default to the historical
+        /// meaning (`HostFailureRecovery`).
+        #[serde(default)]
+        cause: RecoveryCause,
         at: DateTime<Utc>,
     },
+}
+
+/// ADR 0045 F1: why a rung-1 recovery rewound the transcript. Drives the
+/// web copy on the recovery boundary — a planned operator relocation
+/// (drain / teleport) must not read as "recovered after a host failure",
+/// because no host failed. Defaults to [`RecoveryCause::HostFailureRecovery`]
+/// for events persisted before this field existed (the card's original
+/// meaning) and for the unplanned `/resume`-after-death path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryCause {
+    /// An operator deliberately relocated a live session (drain or
+    /// teleport, ADR 0045 Phase F). The snapshot-rehome resumes from the
+    /// last durable checkpoint, so the post-checkpoint tail is rolled
+    /// back — but nothing failed; it was a planned move.
+    PlannedRelocation,
+    /// A host died (or a session was resumed from `Idle` after one did),
+    /// so the restored checkpoint lags the lost live head — the original
+    /// meaning of the recovery boundary.
+    #[default]
+    HostFailureRecovery,
 }
 
 impl SessionEvent {
@@ -429,6 +456,15 @@ pub struct AppState {
     /// the session's `GitForge`. Cleared at terminal. In-memory (one
     /// `--mode=all` process); PG-backed is the multi-pod follow-on.
     pub git_broker_tokens: Arc<dashmap::DashMap<SessionId, String>>,
+    /// ADR 0045 Phase F (teleport): operator-pinned relocation targets
+    /// (session → destination host). Set by `POST .../sessions/:id/teleport`
+    /// before the session is marked `Evacuating`; the `evac_resumer`
+    /// scanner reads it to place on that exact host instead of the
+    /// capacity-ranked pick, and clears it once the session leaves
+    /// `Evacuating` (resolved or fell back to Idle). In-memory — the
+    /// coordinator is single-replica (ADR 0044); a coord restart loses
+    /// pending pins, which degrade to a standard any-peer move.
+    pub teleport_targets: Arc<dashmap::DashMap<SessionId, HostId>>,
     /// ADR 0023: the configured git forge authority (GitHub App, etc).
     /// Set on `main`'s run path via `run_with_registry_and_local`;
     /// `None` in tests and when `--git-forge` is unset (the forge
@@ -487,6 +523,7 @@ impl AppState {
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
             pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
+            teleport_targets: Arc::new(dashmap::DashMap::new()),
             forge: None,
             auth: None,
         }
@@ -706,6 +743,43 @@ pub(crate) mod tests {
         assert_eq!(ev.kind(), "run_interrupted");
     }
 
+    #[test]
+    fn recovery_cause_is_on_the_wire_and_defaults_for_legacy_rows() {
+        // ADR 0045 F1: the recovery boundary carries a machine-readable
+        // `cause` the web switches on. A planned operator relocation must
+        // serialize as `planned_relocation` so the card stops crying
+        // "host failure"; an event persisted before the field existed
+        // (no `cause` key) must read back as `HostFailureRecovery` — the
+        // card's historical meaning — so legacy transcripts are unchanged.
+        let planned = SessionEvent::RecoveredFromCheckpoint {
+            recovery_epoch: 1,
+            through_idx: 7,
+            rolled_back: 4,
+            surviving_side_effects: vec![],
+            cause: RecoveryCause::PlannedRelocation,
+            at: chrono::Utc::now(),
+        };
+        let v = serde_json::to_value(&planned).expect("serialize");
+        assert_eq!(v["type"], "recovered_from_checkpoint");
+        assert_eq!(v["cause"], "planned_relocation");
+
+        // A pre-F1 persisted payload omits `cause` entirely.
+        let legacy = serde_json::json!({
+            "type": "recovered_from_checkpoint",
+            "recovery_epoch": 1,
+            "through_idx": 7,
+            "rolled_back": 4,
+            "surviving_side_effects": [],
+            "at": chrono::Utc::now(),
+        });
+        match serde_json::from_value::<SessionEvent>(legacy).expect("deserialize legacy") {
+            SessionEvent::RecoveredFromCheckpoint { cause, .. } => {
+                assert_eq!(cause, RecoveryCause::HostFailureRecovery);
+            }
+            other => panic!("expected RecoveredFromCheckpoint, got {other:?}"),
+        }
+    }
+
     fn indexed(idx: i64, event: SessionEvent) -> IndexedEvent {
         IndexedEvent { idx, event }
     }
@@ -818,6 +892,9 @@ pub(crate) mod tests {
         pub(crate) events: PlMutex<Vec<PersistedEvent>>,
         next_idx: PlMutex<i64>,
         pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
+        /// ADR 0045 C1 tests: host rows for `list_active_hosts` (the
+        /// live-migration verb resolves the source's host_addr here).
+        pub(crate) hosts: PlMutex<Vec<HostRecord>>,
         /// ADR 0014 issue #1/#2 idle-evictor abort-on-failure tests:
         /// when true, the next `record_snapshot` call returns an error.
         /// Reset to false on use.
@@ -881,6 +958,7 @@ pub(crate) mod tests {
                 events: PlMutex::new(Vec::new()),
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
+                hosts: PlMutex::new(Vec::new()),
                 fail_next_record_snapshot: PlMutex::new(false),
                 session_leases: PlMutex::new(std::collections::HashMap::new()),
                 live_disk_manifests: PlMutex::new(std::collections::HashMap::new()),
@@ -982,7 +1060,7 @@ pub(crate) mod tests {
             Ok(())
         }
         async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
-            Ok(Vec::new())
+            Ok(self.hosts.lock().clone())
         }
         async fn set_host_status(&self, _: HostId, _: HostStatus) -> Result<(), MetaError> {
             Ok(())

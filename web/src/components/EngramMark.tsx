@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef } from "react";
 
 // The "engram trace" logomark as a React component, with a living
 // status mode. Renders a sparse memory trace on a 5×5 graph-paper
@@ -19,11 +19,14 @@ import { useEffect, useRef } from 'react';
 // and the pulse is a no-op (the static trace stays put).
 
 const COL = {
-  ink: '#1b1612',
-  amber: '#b85c0a',
-  verd: '#3a6b5c',
-  rule: '#d9cfb8',
-  paper: '#f4eedf',
+  // The trace + middle nodes + frame inherit the surrounding text colour, so
+  // the mark reads correctly on every ground it lands on: the dark-green
+  // sidebar (sage), the paper content (petrol ink), and either auth theme.
+  ink: "currentColor",
+  amber: "#b85c0a",
+  verd: "#3a6b5c",
+  rule: "#d9cfb8",
+  paper: "#f4eedf",
 } as const;
 
 type Cell = [number, number];
@@ -62,7 +65,7 @@ const TRACES: Cell[][] = [
   ],
 ];
 
-const NS = 'http://www.w3.org/2000/svg';
+const NS = "http://www.w3.org/2000/svg";
 
 function el(tag: string, attrs: Record<string, string | number>): SVGElement {
   const n = document.createElementNS(NS, tag);
@@ -72,9 +75,9 @@ function el(tag: string, attrs: Record<string, string | number>): SVGElement {
 
 function prefersReducedMotion(): boolean {
   return (
-    typeof window !== 'undefined' &&
+    typeof window !== "undefined" &&
     !!window.matchMedia &&
-    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
   );
 }
 
@@ -89,25 +92,24 @@ function driveLoop(layer: SVGGElement, period = 2600): { stop: () => void } {
   let i = 0;
 
   function paint(trace: Cell[]) {
-    layer.innerHTML = '';
+    layer.innerHTML = "";
     const pts = trace.map(([c, r]) => P(c, r));
-    const d = pts.map((p, k) => (k ? 'L' : 'M') + p[0] + ' ' + p[1]).join(' ');
-    const path = el('path', {
+    const d = pts.map((p, k) => (k ? "L" : "M") + p[0] + " " + p[1]).join(" ");
+    const path = el("path", {
       d,
-      fill: 'none',
+      fill: "none",
       stroke: COL.ink,
-      'stroke-width': 1.6,
-      'stroke-linecap': 'round',
-      'stroke-linejoin': 'round',
+      "stroke-width": 1.6,
+      "stroke-linecap": "round",
+      "stroke-linejoin": "round",
     }) as SVGPathElement;
     layer.appendChild(path);
     const nodes = pts.map((p, k) => {
-      const tone =
-        k === 0 ? COL.amber : k === pts.length - 1 ? COL.verd : COL.ink;
+      const tone = k === 0 ? COL.amber : k === pts.length - 1 ? COL.verd : COL.ink;
       const rad = k === 0 ? 4 : k === pts.length - 1 ? 3.6 : 3;
-      const n = el('circle', { cx: p[0], cy: p[1], r: rad, fill: tone });
-      (n as SVGElement).style.transformBox = 'fill-box';
-      (n as SVGElement).style.transformOrigin = 'center';
+      const n = el("circle", { cx: p[0], cy: p[1], r: rad, fill: tone });
+      (n as SVGElement).style.transformBox = "fill-box";
+      (n as SVGElement).style.transformOrigin = "center";
       layer.appendChild(n);
       return n as SVGCircleElement;
     });
@@ -117,10 +119,11 @@ function driveLoop(layer: SVGGElement, period = 2600): { stop: () => void } {
   function strike(trace: Cell[], onDone: () => void) {
     const { path, nodes } = paint(trace);
     if (reduce) {
-      const a = layer.animate(
-        [{ opacity: 0 }, { opacity: 1 }, { opacity: 1 }, { opacity: 0 }],
-        { duration: period * 0.9, easing: 'ease-in-out', fill: 'forwards' },
-      );
+      const a = layer.animate([{ opacity: 0 }, { opacity: 1 }, { opacity: 1 }, { opacity: 0 }], {
+        duration: period * 0.9,
+        easing: "ease-in-out",
+        fill: "forwards",
+      });
       a.onfinish = () => {
         if (!cancelled) onDone();
       };
@@ -129,12 +132,13 @@ function driveLoop(layer: SVGGElement, period = 2600): { stop: () => void } {
     const len = path.getTotalLength();
     path.style.strokeDasharray = String(len);
     path.style.strokeDashoffset = String(len);
-    const da = path.animate(
-      [{ strokeDashoffset: len }, { strokeDashoffset: 0 }],
-      { duration: grow, easing: 'linear', fill: 'forwards' },
-    );
-    const cx = nodes.map((n) => +n.getAttribute('cx')!);
-    const cy = nodes.map((n) => +n.getAttribute('cy')!);
+    const da = path.animate([{ strokeDashoffset: len }, { strokeDashoffset: 0 }], {
+      duration: grow,
+      easing: "linear",
+      fill: "forwards",
+    });
+    const cx = nodes.map((n) => +n.getAttribute("cx")!);
+    const cy = nodes.map((n) => +n.getAttribute("cy")!);
     const cum = [0];
     for (let k = 1; k < nodes.length; k++)
       cum[k] = cum[k - 1] + Math.hypot(cx[k] - cx[k - 1], cy[k] - cy[k - 1]);
@@ -143,15 +147,15 @@ function driveLoop(layer: SVGGElement, period = 2600): { stop: () => void } {
       const at = (cum[k] / tot) * grow;
       n.animate(
         [
-          { transform: 'scale(0)', opacity: 0 },
-          { transform: 'scale(1.3)', opacity: 1, offset: 0.6 },
-          { transform: 'scale(1)', opacity: 1 },
+          { transform: "scale(0)", opacity: 0 },
+          { transform: "scale(1.3)", opacity: 1, offset: 0.6 },
+          { transform: "scale(1)", opacity: 1 },
         ],
         {
           duration: 130,
           delay: at,
-          easing: 'cubic-bezier(0.3,0,0,1)',
-          fill: 'backwards',
+          easing: "cubic-bezier(0.3,0,0,1)",
+          fill: "backwards",
         },
       );
     });
@@ -163,7 +167,7 @@ function driveLoop(layer: SVGGElement, period = 2600): { stop: () => void } {
           { opacity: 1, offset: hold / (hold + fade) },
           { opacity: 0, offset: 1 },
         ],
-        { duration: hold + fade, easing: 'cubic-bezier(0.7,0,0.84,0)', fill: 'forwards' },
+        { duration: hold + fade, easing: "cubic-bezier(0.7,0,0.84,0)", fill: "forwards" },
       );
       fl.onfinish = () => {
         if (!cancelled) onDone();
@@ -192,7 +196,7 @@ export interface EngramMarkProps {
   size?: number;
   /** Draw a 1px square frame around the lattice (badge/favicon look). */
   frame?: boolean;
-  mode?: 'static' | 'loop';
+  mode?: "static" | "loop";
   /** Change this value to fire one pulse strike (ignored in loop mode). */
   pulseKey?: number;
   period?: number;
@@ -202,7 +206,7 @@ export interface EngramMarkProps {
 export function EngramMark({
   size = 30,
   frame = false,
-  mode = 'static',
+  mode = "static",
   pulseKey = 0,
   period = 2600,
   title,
@@ -214,28 +218,26 @@ export function EngramMark({
 
   const base = TRACES[0];
   const basePts = base.map(([c, r]) => P(c, r));
-  const baseD = basePts
-    .map((p, k) => (k ? 'L' : 'M') + p[0] + ' ' + p[1])
-    .join(' ');
+  const baseD = basePts.map((p, k) => (k ? "L" : "M") + p[0] + " " + p[1]).join(" ");
   const toneOf = (k: number) =>
     k === 0 ? COL.amber : k === basePts.length - 1 ? COL.verd : COL.ink;
   const radOf = (k: number) => (k === 0 ? 4 : k === basePts.length - 1 ? 3.6 : 3);
 
   // loop: hide the declarative base, cycle the four traces imperatively
   useEffect(() => {
-    if (mode !== 'loop' || !loopRef.current) return;
-    if (baseRef.current) baseRef.current.style.display = 'none';
+    if (mode !== "loop" || !loopRef.current) return;
+    if (baseRef.current) baseRef.current.style.display = "none";
     const d = driveLoop(loopRef.current, period);
     return () => {
       d.stop();
-      if (loopRef.current) loopRef.current.innerHTML = '';
-      if (baseRef.current) baseRef.current.style.display = '';
+      if (loopRef.current) loopRef.current.innerHTML = "";
+      if (baseRef.current) baseRef.current.style.display = "";
     };
   }, [mode, period]);
 
   // pulse: re-strike the declarative base trace whenever pulseKey changes
   useEffect(() => {
-    if (mode === 'loop' || !pulseKey || !pathRef.current) return;
+    if (mode === "loop" || !pulseKey || !pathRef.current) return;
     if (prefersReducedMotion()) return;
     const path = pathRef.current;
     const nodes = nodeRefs.current.filter(Boolean) as SVGCircleElement[];
@@ -243,10 +245,10 @@ export function EngramMark({
     const len = path.getTotalLength();
     path.animate([{ strokeDashoffset: len }, { strokeDashoffset: 0 }], {
       duration: grow,
-      easing: 'linear',
+      easing: "linear",
     });
-    const cx = nodes.map((n) => +n.getAttribute('cx')!);
-    const cy = nodes.map((n) => +n.getAttribute('cy')!);
+    const cx = nodes.map((n) => +n.getAttribute("cx")!);
+    const cy = nodes.map((n) => +n.getAttribute("cy")!);
     const cum = [0];
     for (let k = 1; k < nodes.length; k++)
       cum[k] = cum[k - 1] + Math.hypot(cx[k] - cx[k - 1], cy[k] - cy[k - 1]);
@@ -255,11 +257,11 @@ export function EngramMark({
       const at = (cum[k] / tot) * grow;
       n.animate(
         [
-          { transform: 'scale(0.2)', opacity: 0.2 },
-          { transform: 'scale(1.3)', opacity: 1, offset: 0.6 },
-          { transform: 'scale(1)', opacity: 1 },
+          { transform: "scale(0.2)", opacity: 0.2 },
+          { transform: "scale(1.3)", opacity: 1, offset: 0.6 },
+          { transform: "scale(1)", opacity: 1 },
         ],
-        { duration: 200, delay: at, easing: 'cubic-bezier(0.3,0,0,1)' },
+        { duration: 200, delay: at, easing: "cubic-bezier(0.3,0,0,1)" },
       );
     });
   }, [pulseKey, mode, period]);
@@ -270,18 +272,10 @@ export function EngramMark({
       height={size}
       viewBox="0 0 100 100"
       role="img"
-      aria-label={title || 'engrams'}
+      aria-label={title || "engrams"}
     >
       {frame && (
-        <rect
-          x="3"
-          y="3"
-          width="94"
-          height="94"
-          fill="none"
-          stroke={COL.ink}
-          strokeWidth="1.4"
-        />
+        <rect x="3" y="3" width="94" height="94" fill="none" stroke={COL.ink} strokeWidth="1.4" />
       )}
       <g ref={baseRef}>
         <path
@@ -303,7 +297,7 @@ export function EngramMark({
             cy={p[1]}
             r={radOf(k)}
             fill={toneOf(k)}
-            style={{ transformBox: 'fill-box', transformOrigin: 'center' }}
+            style={{ transformBox: "fill-box", transformOrigin: "center" }}
           />
         ))}
       </g>

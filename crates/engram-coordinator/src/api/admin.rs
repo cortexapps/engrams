@@ -454,7 +454,238 @@ pub async fn evacuate_session(
     ))
 }
 
+#[derive(serde::Deserialize)]
+pub struct TeleportSessionRequest {
+    /// The destination host to relocate the session onto.
+    pub target_host_id: engram_core::HostId,
+}
+
+/// `POST /api/admin/sessions/:id/teleport` — relocate an Active session
+/// to a **chosen** host. ADR 0045 Phase F: the operator/test surface for
+/// live migration. Today it rides the snapshot-rehome evac pipeline
+/// (pause → flush → snapshot → restore on the pinned host, ~seconds of
+/// downtime); ADR 0045 Phase C swaps the implementation to post-copy
+/// live teleport (~10ms) under this same verb, so the surface is stable.
+///
+/// Pre: Active session with a bound sandbox; `target_host_id` is a
+/// schedulable host that isn't the source. Post: 202; the session is
+/// marked `Evacuating` with the target pinned in `state.teleport_targets`,
+/// and the `evac_resumer` scanner resumes it on that exact host.
+pub async fn teleport_session(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+    Json(req): Json<TeleportSessionRequest>,
+) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
+    let session = state.services.meta.get_session(session_id).await?;
+    if !matches!(session.status, engram_core::types::SessionState::Active) {
+        return Err(ApiError::Conflict(format!(
+            "teleport only supported for Active sessions (got {})",
+            session.status.as_str(),
+        )));
+    }
+    let Some(sandbox_id) = session.sandbox_id else {
+        return Err(ApiError::Conflict(format!(
+            "session {session_id} has no bound sandbox",
+        )));
+    };
+
+    // Fail fast with a clear error if the chosen target can't take the
+    // session right now (unknown / draining / full / is the source) —
+    // better than marking the session Evacuating and letting the scanner
+    // retry-then-Idle against an impossible pin.
+    state
+        .host_registry
+        .pick_specific_host(req.target_host_id, session.host_id)
+        .map_err(|e| {
+            ApiError::Conflict(format!(
+                "target host {} can't take this session: {e:?}",
+                req.target_host_id,
+            ))
+        })?;
+
+    // ADR 0045 C1: behind ENGRAM_LIVE_TELEPORT=1, try the LIVE move
+    // first — the eager dirty-set push (no GCS on the pause path, no
+    // post-checkpoint state loss, no scanner tick). `Unsupported`
+    // (pre-C1 binaries, no chain, no host_addr) falls through to the
+    // snapshot-rehome path below; other failures surface — their
+    // recovery posture (aborted-to-source vs scanner parachute) is in
+    // the error.
+    if crate::live_migration::live_teleport_enabled() {
+        match crate::live_migration::migrate_session_live(&state, session_id, req.target_host_id)
+            .await
+        {
+            Ok(()) => {
+                return Ok((
+                    StatusCode::OK,
+                    Json(EvacuateSessionResponse {
+                        session_id,
+                        status: "migrated",
+                    }),
+                ));
+            }
+            Err(crate::live_migration::MigrateError::Unsupported(reason)) => {
+                metrics::counter!(crate::metrics::MIGRATION_TOTAL,
+                    "outcome" => "unsupported_fallback")
+                .increment(1);
+                tracing::info!(%session_id, %reason,
+                    "live teleport unsupported; falling back to snapshot-rehome");
+            }
+            Err(e) => {
+                let outcome = match &e {
+                    crate::live_migration::MigrateError::AbortedToSource(_) => "aborted_to_source",
+                    crate::live_migration::MigrateError::Parachute(_) => "parachute",
+                    _ => "fatal",
+                };
+                metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => outcome)
+                    .increment(1);
+                return Err(ApiError::Internal(format!("live teleport: {e}")));
+            }
+        }
+    }
+
+    // Pin the destination, then fire the same evac pipeline `evacuate`
+    // uses — the only difference is the scanner reads the pin and places
+    // on this exact host. Unwind the pin if the pipeline itself fails.
+    state
+        .teleport_targets
+        .insert(session_id, req.target_host_id);
+    if let Err(e) = crate::idle_evictor::evict_session_to_state(
+        &state,
+        session_id,
+        sandbox_id,
+        engram_core::types::SessionState::Evacuating,
+    )
+    .await
+    {
+        state.teleport_targets.remove(&session_id);
+        return Err(ApiError::Internal(format!("teleport pipeline: {e}")));
+    }
+
+    tracing::info!(
+        %session_id,
+        %sandbox_id,
+        target_host = %req.target_host_id,
+        "admin teleport: session marked Evacuating, pinned to target; scanner will resume there",
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(EvacuateSessionResponse {
+            session_id,
+            status: "evacuating",
+        }),
+    ))
+}
+
 // ---------------------------------------------------------------------
+// ADR 0045 Phase F — pause / resume a microVM in place (the freeze/flush
+// test surface). Thin admin passthroughs to the FC pause/resume
+// primitive: freeze or unfreeze the running guest WITHOUT snapshotting,
+// destroying, or changing session state. The session stays `Active`; a
+// paused guest simply stops executing until resumed. Distinct from
+// teleport/evac (which relocate) and from idle-eviction (which
+// snapshots + suspends to `Idle`).
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct PauseResumeResponse {
+    pub session_id: SessionId,
+    pub note: &'static str,
+}
+
+/// `POST /api/admin/sessions/:id/pause` — freeze the session's running
+/// microVM in place. 409 if the session has no live sandbox (idle / not
+/// yet started).
+pub async fn pause_session(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<PauseResumeResponse>, ApiError> {
+    let sandbox_id = state.registry.get(session_id).ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox to pause — it is idle or not yet started".into(),
+        )
+    })?;
+    state
+        .services
+        .host
+        .pause(sandbox_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("pause sandbox: {e}")))?;
+    tracing::info!(%session_id, %sandbox_id, "admin: froze microVM in place");
+    Ok(Json(PauseResumeResponse {
+        session_id,
+        note: "paused",
+    }))
+}
+
+/// `POST /api/admin/sessions/:id/resume` — unfreeze a `pause`d microVM in
+/// place. Note: this is the *in-place* unfreeze, NOT `/sessions/:id/resume`
+/// (which rehydrates an `Idle` session from a snapshot). 409 if the
+/// session has no live sandbox.
+pub async fn resume_session(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<PauseResumeResponse>, ApiError> {
+    let sandbox_id = state.registry.get(session_id).ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox to resume in place — it is idle or not yet started".into(),
+        )
+    })?;
+    state
+        .services
+        .host
+        .resume(sandbox_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("resume sandbox: {e}")))?;
+    tracing::info!(%session_id, %sandbox_id, "admin: unfroze microVM in place");
+    Ok(Json(PauseResumeResponse {
+        session_id,
+        note: "resumed",
+    }))
+}
+
+// ---------------------------------------------------------------------
+// ADR 0044 K4 — fleet-demand signal for the node-pool autoscaler
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct FleetDemandResponse {
+    /// Hosts with a live heartbeat.
+    pub ready_hosts: u32,
+    /// Non-draining hosts the scheduler can place on.
+    pub schedulable_hosts: u32,
+    /// ADR 0046: Σ max(0, allocatable_mib − reserved) over schedulable hosts —
+    /// the host-measured headroom (nets out the daemon/OS/chunk-cache/mlock
+    /// baseline), the autoscaler's true demand signal.
+    pub free_mib: u64,
+    /// Σ total_mib over schedulable hosts — lets the caller derive the
+    /// average per-host capacity (how much one node adds).
+    pub total_mib: u64,
+}
+
+/// `GET /api/admin/fleet/demand` — the K4 node-pool autoscaler's input. Host
+/// counts come from the in-memory registry; `free_mib` is the host-measured
+/// allocatable minus reserved session budgets (PG, ADR 0046) so the autoscaler
+/// scales on true demand rather than the phantom `total − used(=0)`.
+pub async fn fleet_demand(State(state): State<SharedState>) -> Json<FleetDemandResponse> {
+    let m = state.host_registry.fleet_metrics();
+    // On a transient query failure, fall back to total (treat as "no pressure";
+    // scale-down hysteresis rides out a single tick).
+    let free_mib = state
+        .services
+        .meta
+        .fleet_free_mib()
+        .await
+        .map(|f| f.max(0) as u64)
+        .unwrap_or(m.total_mib);
+    Json(FleetDemandResponse {
+        ready_hosts: m.ready_hosts,
+        schedulable_hosts: m.schedulable_hosts,
+        free_mib,
+        total_mib: m.total_mib,
+    })
+}
+
 // ADR 0018 commit 12e — host cordon / uncordon / drain
 // ---------------------------------------------------------------------
 

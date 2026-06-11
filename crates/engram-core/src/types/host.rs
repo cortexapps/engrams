@@ -89,6 +89,15 @@ pub struct HostUtilization {
     pub mem_total_mib: u64,
     #[serde(default)]
     pub mem_used_mib: u64,
+    /// ADR 0046: memory (MiB) actually available to place NEW sessions on this
+    /// host — `MemAvailable + Σ guest-resident (PSS)`. It nets out the host
+    /// daemon, OS, kube-system pods, the chunk cache, and the mlock'd
+    /// base-memfile residency (ADR 0022) automatically — everything in
+    /// `MemUsed` that isn't a running VM — so placement subtracts only session
+    /// budgets from it. `0` on non-Linux / pre-0058 hosts, where placement
+    /// falls back to the raw `mem_total_mib`.
+    #[serde(default)]
+    pub allocatable_mib: u64,
     /// Whole-host CPU utilization in percent (0–100), computed from
     /// the `/proc/stat` aggregate-cpu delta across the heartbeat
     /// interval. Zero on non-Linux or on the first tick (no prior

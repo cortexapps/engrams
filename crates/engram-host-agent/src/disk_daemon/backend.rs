@@ -40,6 +40,15 @@ use tokio::sync::{Mutex, Notify};
 /// `u64::MAX` to disable threshold-driven notification.
 pub const DEFAULT_DIRTY_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 
+/// ADR 0039 item #19: bounded concurrency for the per-chunk GCS puts in
+/// [`ChunkedDiskBackend::flush_upload`]. The 16 MiB-disk-chunk puts are
+/// content-addressed/idempotent and keyed by chunk index, so they're
+/// order-independent — we fan them out instead of awaiting one at a time
+/// (~16 ms/put serial → ~32 s for a ~1,936-chunk dirty set). 32 sits
+/// under a 10 Gbps host NIC's saturation and below GCS per-object rate
+/// limits (mirrors the memory prefetch + re-chunk bound).
+const DISK_FLUSH_UPLOAD_CONCURRENCY: usize = 32;
+
 /// Anything that can go wrong on the backend data plane.
 #[derive(Debug)]
 pub enum DiskBackendError {
@@ -108,13 +117,19 @@ pub struct DiskFlushOutcome {
 }
 
 /// ADR 0038 B3: handoff from `flush_local` (drain-under-pause) to
-/// `flush_upload` (upload-post-resume). The chunk bytes live in
-/// `pending_uploads` keyed by `chunk_idx`; this carries the
-/// `(chunk_idx, hash, size)` descriptor the upload + manifest rebuild
-/// needs. Empty `new_chunks` = nothing was dirty.
+/// `flush_upload` (upload-post-resume). Carries the drained
+/// `(chunk_idx, hash, bytes)` for each dirty chunk so `flush_upload`
+/// uploads **its own** bytes rather than re-reading the shared
+/// `pending_uploads` map. The bytes are ALSO mirrored into
+/// `pending_uploads` for read-survival during the flush window, but the
+/// upload no longer depends on that map — closing the drop where a
+/// concurrent flush cleared `pending_uploads[idx]` before this flush's
+/// upload read it, silently skipping the put while the manifest still
+/// referenced the (now never-uploaded) chunk. Empty `new_chunks` =
+/// nothing was dirty.
 #[derive(Clone, Debug)]
 pub struct PendingDiskFlush {
-    new_chunks: Vec<(usize, ChunkHash, u64)>,
+    new_chunks: Vec<(usize, ChunkHash, Bytes)>,
 }
 
 /// In-memory representation of the manifest, indexed for O(1) chunk
@@ -215,6 +230,13 @@ pub struct ChunkedDiskBackend {
     /// `u64::MAX` to disable threshold-driven wakeups (tests, or
     /// any caller that doesn't run a scheduler against this backend).
     threshold_notify: Arc<Notify>,
+    /// ADR 0045 C1: while a migration export is open on this sandbox,
+    /// `flush()` no-ops — the capture's drained manifest is the
+    /// coherence cut the destination restores from, and a concurrent
+    /// flush would publish a newer live_disk_manifest racing the
+    /// destination's rebind (split-brain). Cleared on abort; moot on
+    /// commit (sandbox destroyed).
+    migration_fence: std::sync::atomic::AtomicBool,
     threshold_bytes: u64,
     /// ADR 0018 commit 12m: in-flight request counter for the NBD
     /// daemon's serve loop. Incremented on entering a write/read
@@ -319,6 +341,42 @@ struct BackendState {
 /// bounding per-sandbox RAM.
 const DISK_CHUNK_MEM_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
+/// NBD durability: bound a single chunk fetch so a stuck origin GET can
+/// never hang the NBD request forever. Without this, a fetch that never
+/// returns (a black-holed GCS GET) leaves the guest's virtio-blk I/O in
+/// uninterruptible sleep (jbd2/writeback D-state) AND prevents FC from
+/// pausing the VM (`PATCH /vm` times out) — the wedged-session class.
+/// On exhaustion the fetch returns an error, which `serve_loop` turns
+/// into an NBD EIO: the guest's rootfs degrades to read-only but the VM
+/// stays responsive (pausable, evictable). Bounded retries cover a
+/// transient origin blip / GCS eventual-consistency without wedging
+/// (~5 × 3s ≈ 15s worst case before EIO). A missing chunk should never
+/// hang a VM; the chunk-GC pin-recheck fix prevents the missing chunk,
+/// this is the defense-in-depth that keeps a miss from wedging the host.
+const CHUNK_FETCH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Retry budget for a TRANSIENT fetch failure (origin 5xx / connection /
+/// per-attempt timeout): the blob exists, so it's worth riding out a GCS
+/// hiccup (~5 × backoff ≈ 15s) before failing the read with EIO.
+const CHUNK_FETCH_MAX_ATTEMPTS: u32 = 5;
+/// Retry budget for a definitive 404 (blob genuinely absent). Near-
+/// permanent, so retry only enough to ride out GCS read-after-write
+/// eventual consistency, then fail fast — no point spending the full
+/// transient budget on a blob that isn't coming back.
+const CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS: u32 = 2;
+const CHUNK_FETCH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Classify a chunk-fetch error: a definitive 404 (`BlobError::NotFound`,
+/// which the GCS backend maps a 404 to) gets the short
+/// [`CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS`] budget; everything else (5xx /
+/// connection / per-attempt [`ChunkStoreError::FetchTimeout`]) gets the
+/// fuller [`CHUNK_FETCH_MAX_ATTEMPTS`] since the blob is expected to exist.
+fn chunk_fetch_is_not_found(e: &engram_chunk_store::error::ChunkStoreError) -> bool {
+    matches!(
+        e,
+        engram_chunk_store::error::ChunkStoreError::Blob(engram_core::error::BlobError::NotFound)
+    )
+}
+
 /// In-memory LRU of recently-read **clean** chunks, keyed by content hash.
 ///
 /// Why this exists: a guest block read resolves to its containing chunk and
@@ -395,7 +453,21 @@ impl ChunkedDiskBackend {
         threshold_bytes: u64,
     ) -> Result<Self, DiskBackendError> {
         let manifest = store.get_manifest(manifest_ref).await?;
-        let base = PositionalDiskManifest::from_manifest(&manifest)?;
+        Self::from_manifest(manifest_ref, &manifest, cache, store, threshold_bytes)
+    }
+
+    /// ADR 0045 C1: construct from manifest CONTENT the caller already
+    /// holds — a migration destination attaches a not-yet-durable disk
+    /// manifest delivered inline (its chunks pre-pulled into the local
+    /// cache); the store is only the fallthrough for base chunks.
+    pub fn from_manifest(
+        manifest_ref: ManifestRef,
+        manifest: &engram_chunk_store::Manifest,
+        cache: ChunkCache,
+        store: Arc<ChunkStore>,
+        threshold_bytes: u64,
+    ) -> Result<Self, DiskBackendError> {
+        let base = PositionalDiskManifest::from_manifest(manifest)?;
         let chunk_size = base.chunk_size;
         let total_bytes = base.total_bytes;
         Ok(Self {
@@ -411,6 +483,7 @@ impl ChunkedDiskBackend {
             pending_uploads: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
+            migration_fence: std::sync::atomic::AtomicBool::new(false),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
@@ -442,6 +515,7 @@ impl ChunkedDiskBackend {
             pending_uploads: Arc::new(Mutex::new(HashMap::new())),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
+            migration_fence: std::sync::atomic::AtomicBool::new(false),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
@@ -715,8 +789,34 @@ impl ChunkedDiskBackend {
     /// where there's no FC resume to overlap with, so the historical
     /// drain→upload→rebase behavior is preserved.
     pub async fn flush(&self) -> Result<DiskFlushOutcome, DiskBackendError> {
+        if self
+            .migration_fence
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Migration capture in flight: report a no-op flush (the
+            // scheduler skips the publish on chunks_flushed == 0).
+            return Ok(DiskFlushOutcome {
+                manifest_ref: self.state.lock().await.manifest_ref,
+                chunks_flushed: 0,
+                bytes_uploaded: 0,
+            });
+        }
         let pending = self.flush_local().await?;
         self.flush_upload(pending).await
+    }
+
+    /// ADR 0045 C1 (destination): point the backend at the manifest
+    /// ref the durability catch-up actually published (the provisional
+    /// ref can lose the shared-lineage version race). Future flushes
+    /// chain from here.
+    pub async fn rebase_manifest_ref(&self, manifest_ref: ManifestRef) {
+        self.state.lock().await.manifest_ref = manifest_ref;
+    }
+
+    /// ADR 0045 C1: see `migration_fence`.
+    pub fn set_migration_fence(&self, fenced: bool) {
+        self.migration_fence
+            .store(fenced, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// ADR 0038 B3 — phase 1 (runs under the FC pause on the snapshot
@@ -734,16 +834,21 @@ impl ChunkedDiskBackend {
         }
         let drained: Vec<(usize, Vec<u8>)> = dirty_guard.drain().collect();
         drop(dirty_guard);
-        let mut new_chunks: Vec<(usize, ChunkHash, u64)> = Vec::with_capacity(drained.len());
+        let mut new_chunks: Vec<(usize, ChunkHash, Bytes)> = Vec::with_capacity(drained.len());
         let mut pending = self.pending_uploads.lock().await;
         for (chunk_idx, bytes) in drained {
-            let size = bytes.len() as u64;
+            let bytes = Bytes::from(bytes);
             // Local hash — identical to what `put_chunk` computes, so the
             // manifest `flush_upload` builds is consistent with the
             // bytes it uploads.
             let hash = ChunkHash::of(&bytes);
-            pending.insert(chunk_idx, (hash, Bytes::from(bytes)));
-            new_chunks.push((chunk_idx, hash, size));
+            // Mirror into the pending tier for read-survival during the
+            // flush window. `flush_upload` uploads from `new_chunks`'s own
+            // bytes (carried below), NOT from this shared map — so a
+            // concurrent flush clearing `pending[idx]` can't make us skip
+            // a put.
+            pending.insert(chunk_idx, (hash, bytes.clone()));
+            new_chunks.push((chunk_idx, hash, bytes));
         }
         Ok(PendingDiskFlush { new_chunks })
     }
@@ -757,6 +862,83 @@ impl ChunkedDiskBackend {
     /// from `pending_uploads` on success (reads fall through to the now-
     /// rebased `base`). A failed upload leaves them in `pending` — reads
     /// stay correct; they're reclaimed on `destroy`.
+    /// ADR 0045 C1: the migration flavor of `flush_upload` — land the
+    /// drained chunks in the host-local NVMe cache ONLY (no GCS PUT on
+    /// the teleport pause path) and return the post-drain manifest
+    /// WITHOUT publishing or rebasing. The manifest's chunks are
+    /// reachable through the cache for the destination's pull; the
+    /// destination's durability catch-up uploads + publishes later.
+    /// The source's own `state` is untouched: on commit the VM is
+    /// destroyed; on abort call [`Self::requeue_pending`] first.
+    ///
+    /// Returns `(manifest, new_hashes)` — `new_hashes` is the
+    /// pending-tier transfer set the destination must pull.
+    pub async fn flush_to_local_cache(
+        &self,
+        pending: &PendingDiskFlush,
+    ) -> Result<(Manifest, Vec<ChunkHash>), DiskBackendError> {
+        let chunk_size = self.chunk_size;
+        let mut new_hashes = Vec::with_capacity(pending.new_chunks.len());
+        for (_idx, hash, bytes) in &pending.new_chunks {
+            // No per-write sweep — batch-closing sweep below.
+            self.cache
+                .put_no_evict(*hash, bytes)
+                .await
+                .map_err(DiskBackendError::Chunk)?;
+            new_hashes.push(*hash);
+        }
+        self.cache.sweep().await.map_err(DiskBackendError::Chunk)?;
+        let state = self.state.lock().await;
+        let mut chunks: Vec<ChunkRef> = state
+            .base
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                h.map(|hash| ChunkRef {
+                    offset: (i as u64) * chunk_size,
+                    hash,
+                })
+            })
+            .collect();
+        for (idx, hash, _bytes) in &pending.new_chunks {
+            let offset = (*idx as u64) * chunk_size;
+            if let Some(existing) = chunks.iter_mut().find(|c| c.offset == offset) {
+                existing.hash = *hash;
+            } else {
+                chunks.push(ChunkRef {
+                    offset,
+                    hash: *hash,
+                });
+            }
+        }
+        chunks.sort_by_key(|c| c.offset);
+        Ok((
+            Manifest {
+                schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+                kind: ManifestKind::Disk,
+                chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(chunk_size),
+                total_bytes: self.total_bytes,
+                chunks,
+                parent: Some(state.manifest_ref),
+                working_set_trace: None,
+                annotations: serde_json::Value::Null,
+            },
+            new_hashes,
+        ))
+    }
+
+    /// ADR 0045 C1 abort path: put the drained-but-never-uploaded
+    /// chunks back into `dirty` so the resumed guest's next flush
+    /// retries them (a newer guest write wins — same rule as the
+    /// upload-failure re-queue). Idempotent.
+    pub async fn requeue_pending(&self, pending: PendingDiskFlush) {
+        let mut dirty = self.dirty.lock().await;
+        for (idx, _hash, bytes) in pending.new_chunks {
+            dirty.entry(idx).or_insert_with(|| bytes.to_vec());
+        }
+    }
+
     pub async fn flush_upload(
         &self,
         pending: PendingDiskFlush,
@@ -772,36 +954,100 @@ impl ChunkedDiskBackend {
             self.stamp_flush_completion();
             return Ok(out);
         }
-        // Upload each stashed chunk to GCS — OFF the frozen-guest path.
-        for (chunk_idx, _hash, size) in &new_chunks {
-            let Some(bytes) = self
-                .pending_uploads
-                .lock()
-                .await
-                .get(chunk_idx)
-                .map(|(_, b)| b.clone())
-            else {
-                continue;
-            };
-            // ADR 0019: span each dirty-chunk upload under an active
-            // operation so this (now post-resume) flush still shows in
-            // the op's trace.
-            let put = self.store.put_chunk(&bytes);
-            match self.operation_scope.current() {
-                Some(op) => {
-                    let span = op.span.in_scope(|| {
-                        tracing::info_span!(
-                            "chunk.flush",
-                            op = op.kind,
-                            chunk = *chunk_idx,
-                            bytes = *size,
-                        )
-                    });
-                    tracing::Instrument::instrument(put, span).await?;
+        // Upload the stashed chunks to GCS — OFF the frozen-guest path.
+        // ADR 0039 item #19: the per-chunk put dominates the flush
+        // (~16 ms each), so awaiting one at a time made a large dirty
+        // set (~1,936 chunks → ~32 s) the slow phase of an eviction.
+        // Puts are content-addressed/idempotent and keyed by chunk_idx,
+        // so they're order-independent — fan them out with bounded
+        // `buffer_unordered`.
+        //
+        // Each task uploads the bytes it carried out of `flush_local`,
+        // NOT a re-read of the shared `pending_uploads` map. The earlier
+        // shared-map lookup silently skipped (`Ok(())`) any chunk a
+        // *concurrent* flush had already cleared from `pending_uploads`,
+        // while the manifest rebuild below still referenced its hash —
+        // publishing a manifest pointing at a chunk nobody uploaded
+        // (prod incident: session 79b689e4, ~half its disk writes
+        // dropped → guest EIO). Uploading from `new_chunks`'s own bytes
+        // makes the put set exactly `new_chunks`, with no skips.
+        //
+        // ATOMICITY (durability invariant): `try_collect` aborts on the
+        // FIRST put error and the manifest rebuild runs ONLY after every
+        // put succeeds — a published manifest never references a
+        // not-yet-durable chunk. On failure we re-queue the drained bytes
+        // into `dirty` (a newer guest write wins) so the next checkpoint
+        // retries; nothing is lost and the previous snapshot stands. A
+        // failed flush is a no-op, never a half-written snapshot.
+        {
+            use futures::stream::{self, StreamExt, TryStreamExt};
+            let op = self.operation_scope.current();
+            let cache = &self.cache;
+            let upload = stream::iter(new_chunks.iter().cloned())
+                .map(|(chunk_idx, hash, bytes)| {
+                    let store = &self.store;
+                    let op = op.clone();
+                    async move {
+                        let size = bytes.len() as u64;
+                        // ADR 0019: span each dirty-chunk upload under an
+                        // active operation so this (now post-resume)
+                        // flush still shows in the op's trace.
+                        let put = store.put_chunk(&bytes);
+                        match op {
+                            Some(op) => {
+                                let span = op.span.in_scope(|| {
+                                    tracing::info_span!(
+                                        "chunk.flush",
+                                        op = op.kind,
+                                        chunk = chunk_idx,
+                                        bytes = size,
+                                    )
+                                });
+                                tracing::Instrument::instrument(put, span).await?;
+                            }
+                            None => {
+                                put.await?;
+                            }
+                        }
+                        // ADR 0039 (sticky-everywhere): write-through to the
+                        // local cache so the flushing host keeps its OWN
+                        // just-uploaded chunks and never re-fetches its writes
+                        // from GCS (`put_chunk` is upload-only). Best-effort:
+                        // the chunk is durable in GCS, so a local-cache write
+                        // failure (ENOSPC/perms) is logged, not fatal — reads
+                        // fall back to GCS.
+                        if let Err(e) = cache.put(hash, &bytes).await {
+                            tracing::warn!(
+                                chunk = chunk_idx,
+                                %hash,
+                                error = %e,
+                                "flush write-through to local cache failed (chunk durable in GCS; reads fall back)",
+                            );
+                        }
+                        Ok::<_, DiskBackendError>(())
+                    }
+                })
+                .buffer_unordered(DISK_FLUSH_UPLOAD_CONCURRENCY)
+                .try_collect::<()>()
+                .await;
+            if let Err(e) = upload {
+                // Atomic no-op. Re-queue the drained bytes into `dirty` so
+                // the next flush retries them — but only for an idx the
+                // guest hasn't rewritten since the drain (a newer dirty
+                // write supersedes our now-stale bytes). The bytes also
+                // remain in `pending_uploads`, so reads keep resolving
+                // locally (dirty → pending) rather than the un-rebased
+                // base. The manifest is NOT advanced.
+                let mut dirty = self.dirty.lock().await;
+                for (idx, _hash, bytes) in &new_chunks {
+                    dirty.entry(*idx).or_insert_with(|| bytes.to_vec());
                 }
-                None => {
-                    put.await?;
-                }
+                tracing::warn!(
+                    chunks = new_chunks.len(),
+                    error = %e,
+                    "nbd disk flush_upload failed; manifest NOT advanced, dirty re-queued (no partial snapshot)",
+                );
+                return Err(e);
             }
         }
 
@@ -826,7 +1072,7 @@ impl ChunkedDiskBackend {
             })
             .collect();
         let mut bytes_uploaded = 0u64;
-        for (idx, hash, size) in &new_chunks {
+        for (idx, hash, bytes) in &new_chunks {
             // Replace the existing entry if one was there; insert
             // otherwise. Linear scan because the chunks list is
             // small (<< 1024 entries for typical disks).
@@ -839,7 +1085,7 @@ impl ChunkedDiskBackend {
                     hash: *hash,
                 });
             }
-            bytes_uploaded += *size;
+            bytes_uploaded += bytes.len() as u64;
         }
         chunks.sort_by_key(|c| c.offset);
         let new_manifest = Manifest {
@@ -930,8 +1176,14 @@ impl ChunkedDiskBackend {
         // store — drop them from the pending tier.
         {
             let mut pending = self.pending_uploads.lock().await;
-            for (idx, _, _) in &new_chunks {
-                pending.remove(idx);
+            for (idx, hash, _) in &new_chunks {
+                // Only drop OUR entry — a concurrent flush may have
+                // re-inserted a newer (not-yet-uploaded) write for this
+                // idx; clobbering it would lose read-survival for those
+                // bytes until the next flush.
+                if matches!(pending.get(idx), Some((h, _)) if h == hash) {
+                    pending.remove(idx);
+                }
             }
         }
 
@@ -1037,30 +1289,119 @@ impl ChunkedDiskBackend {
                 } else {
                     "blobstorage"
                 };
-                let fut = self.cache.get(hash, || self.store.get_chunk(hash));
-                // ADR 0019: when a lifecycle operation is active (e.g. cold
-                // boot), span this base-chunk fetch under it so the page-in
-                // shows in the operation's trace, tagged with the serving tier.
-                let bytes = match self.operation_scope.current() {
-                    Some(op) => {
-                        let span = op.span.in_scope(|| {
-                            tracing::info_span!(
-                                "chunk.fetch",
-                                op = op.kind,
-                                chunk = chunk_idx,
-                                bytes = chunk_len,
-                                tier = tier,
-                            )
-                        });
-                        tracing::Instrument::instrument(fut, span).await?
-                    }
-                    None => fut.await?,
-                };
+                // NBD durability: bounded-retry + per-attempt timeout so a
+                // stuck or missing origin fetch fails fast (→ NBD EIO via
+                // serve_loop) instead of hanging the guest's virtio-blk I/O.
+                // The `chunk.fetch` span is emitted inside the helper,
+                // attached to the active op scope + serving tier.
+                let bytes = self
+                    .fetch_chunk_bounded(hash, chunk_idx, chunk_len, tier)
+                    .await?;
                 self.mem_cache.lock().unwrap().put(hash, bytes.clone());
                 Ok(bytes)
             }
             // Zero-filled hole — the manifest had no entry here.
             None => Ok(Bytes::from(vec![0u8; chunk_len as usize])),
+        }
+    }
+
+    /// Fetch a chunk via the cache (single-flight + populate), bounding
+    /// each attempt with [`CHUNK_FETCH_ATTEMPT_TIMEOUT`] and retrying up to
+    /// [`CHUNK_FETCH_MAX_ATTEMPTS`] so a stuck or transiently-missing origin
+    /// GET fails fast with an error (→ NBD EIO) rather than hanging the
+    /// guest's virtio-blk I/O indefinitely (which also blocks FC from
+    /// pausing the VM).
+    ///
+    /// The timeout lives INSIDE the single-flight closure on purpose:
+    /// [`ChunkCache::get`] drains its waiters whenever the fetch returns
+    /// (Ok or Err), so a timed-out fetch propagates the error to every
+    /// waiter and never poisons the inflight map — whereas timing out
+    /// *around* `cache.get` would cancel the in-flight fetcher and strand
+    /// the other waiters on the same hash.
+    async fn fetch_chunk_bounded(
+        &self,
+        hash: ChunkHash,
+        chunk_idx: usize,
+        chunk_len: u64,
+        tier: &'static str,
+    ) -> Result<Bytes, DiskBackendError> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let store = self.store.clone();
+            let fut = self.cache.get(hash, move || async move {
+                match tokio::time::timeout(CHUNK_FETCH_ATTEMPT_TIMEOUT, store.get_chunk(hash)).await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(engram_chunk_store::error::ChunkStoreError::FetchTimeout(
+                        format!("{hash} after {CHUNK_FETCH_ATTEMPT_TIMEOUT:?}"),
+                    )),
+                }
+            });
+            // ADR 0019: attach the page-in span to the active lifecycle
+            // operation (cold boot etc.), tagged with the serving tier.
+            let outcome = match self.operation_scope.current() {
+                Some(op) => {
+                    let span = op.span.in_scope(|| {
+                        tracing::info_span!(
+                            "chunk.fetch",
+                            op = op.kind,
+                            chunk = chunk_idx,
+                            bytes = chunk_len,
+                            tier = tier,
+                        )
+                    });
+                    tracing::Instrument::instrument(fut, span).await
+                }
+                None => fut.await,
+            };
+            match outcome {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => {
+                    // 404s are near-permanent (short budget — just ride out
+                    // GCS read-after-write EC); transient errors get the
+                    // fuller budget since the blob is expected to exist.
+                    let not_found = chunk_fetch_is_not_found(&e);
+                    let max = if not_found {
+                        CHUNK_FETCH_NOTFOUND_MAX_ATTEMPTS
+                    } else {
+                        CHUNK_FETCH_MAX_ATTEMPTS
+                    };
+                    if attempt >= max {
+                        // Exhausted the bounded budget — fail the read so the
+                        // NBD layer returns EIO. Loud + countable (with the
+                        // outcome class) so a missing/stuck chunk surfaces as
+                        // an alert, not a silent wedge.
+                        let outcome = if not_found { "notfound" } else { "transient" };
+                        metrics::counter!(
+                            "engram_nbd_chunk_fetch_failed_total",
+                            "tier" => tier,
+                            "outcome" => outcome,
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            chunk = chunk_idx,
+                            hash = %hash,
+                            attempts = attempt,
+                            outcome,
+                            error = %e,
+                            "chunk fetch exhausted bounded retries; failing the NBD request \
+                             (guest gets EIO — rootfs degrades read-only but the VM stays \
+                             pausable/evictable instead of wedging)",
+                        );
+                        return Err(e.into());
+                    }
+                    tracing::warn!(
+                        chunk = chunk_idx,
+                        hash = %hash,
+                        attempt,
+                        not_found,
+                        error = %e,
+                        "chunk fetch failed; retrying (bounded)",
+                    );
+                    tokio::time::sleep(CHUNK_FETCH_RETRY_BACKOFF).await;
+                }
+            }
         }
     }
 
@@ -1084,7 +1425,7 @@ mod tests {
     use super::*;
     use engram_chunk_store::cache::ChunkCacheConfig;
     use engram_chunk_store::manifest::{ChunkSize, MANIFEST_SCHEMA_VERSION};
-    use engram_core::traits::BlobStorage;
+    use engram_core::traits::{BlobStorage, ByteStream};
     use engram_storage_local::LocalBlobStorage;
     use std::sync::Arc;
 
@@ -1157,6 +1498,66 @@ mod tests {
 
         let bytes = backend.read(4096, 4096).await.unwrap();
         assert!(bytes.iter().all(|b| *b == 0xbb));
+    }
+
+    /// NBD durability: a read whose backing chunk blob is missing must
+    /// return an error in BOUNDED time (→ NBD EIO via serve_loop), never
+    /// hang. Regression for the wedged-session class where a stuck/missing
+    /// chunk fetch left the guest's virtio-blk I/O in uninterruptible sleep
+    /// (jbd2/writeback D-state) and blocked FC from pausing the VM. The
+    /// outer timeout is the assertion: the bounded-retry budget must elapse
+    /// to an `Err`, not block forever.
+    #[tokio::test]
+    async fn read_of_missing_chunk_fails_fast_within_bound_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        // Reference a chunk hash we NEVER store: the backing blob is absent,
+        // so every fetch attempt 404s — the prod "reaped chunk" shape.
+        let missing = ChunkHash::of(b"a-chunk-that-was-reaped-and-never-stored");
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, missing)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        // The read must resolve to an Err well within this generous bound
+        // (the bounded-retry budget), NOT hang. A timeout here = regression.
+        let outer = CHUNK_FETCH_RETRY_BACKOFF * (CHUNK_FETCH_MAX_ATTEMPTS + 4)
+            + CHUNK_FETCH_ATTEMPT_TIMEOUT;
+        let outcome = tokio::time::timeout(outer, backend.read(0, chunk_size))
+            .await
+            .expect("read must fail fast on a missing chunk, not hang");
+        assert!(
+            outcome.is_err(),
+            "a read of a missing chunk must surface an error (→ NBD EIO), got Ok",
+        );
+    }
+
+    /// The 404-vs-transient delineation that drives the retry budget: a
+    /// definitive `BlobError::NotFound` (GCS 404) is near-permanent and
+    /// gets the short budget; a fetch timeout / origin 5xx is transient and
+    /// gets the fuller budget.
+    #[test]
+    fn chunk_fetch_classifies_notfound_vs_transient() {
+        use engram_chunk_store::error::ChunkStoreError;
+        use engram_core::error::BlobError;
+        assert!(
+            chunk_fetch_is_not_found(&ChunkStoreError::Blob(BlobError::NotFound)),
+            "a 404 must classify as not-found (short retry budget)",
+        );
+        assert!(
+            !chunk_fetch_is_not_found(&ChunkStoreError::FetchTimeout("h after 3s".into())),
+            "a per-attempt timeout is transient (full retry budget)",
+        );
+        assert!(
+            !chunk_fetch_is_not_found(&ChunkStoreError::Origin("origin 5xx".into())),
+            "an origin/5xx error is transient (full retry budget)",
+        );
     }
 
     #[tokio::test]
@@ -1854,5 +2255,261 @@ mod tests {
         let r1 = tokio::time::timeout(std::time::Duration::from_millis(200), w1).await;
         let r2 = tokio::time::timeout(std::time::Duration::from_millis(200), w2).await;
         assert!(r1.is_ok() && r2.is_ok(), "both waiters must wake on drain");
+    }
+
+    /// ADR 0039 item #19: `flush_upload` fans its per-chunk puts out
+    /// with bounded `buffer_unordered`. Dirty MANY more chunks than
+    /// `DISK_FLUSH_UPLOAD_CONCURRENCY` so the parallel path runs across
+    /// several windows, then assert the published manifest is correct:
+    /// every dirty chunk's bytes are uploaded + retrievable, the
+    /// manifest is offset-sorted, and a post-flush read serves the
+    /// flushed bytes (proving the rebase saw every parallel put).
+    /// ADR 0045 C1: a fenced backend's flush is a no-op (no drain, no
+    /// publish — the scheduler skips on chunks_flushed == 0); clearing
+    /// the fence flushes the preserved dirty set; the abort re-queue
+    /// path round-trips drained chunks back into dirty.
+    #[tokio::test]
+    async fn migration_fence_noops_flush_and_requeue_restores_dirty() {
+        let chunk_size = 4096u64;
+        let base = synth_manifest(chunk_size * 4, chunk_size, vec![]);
+        let (backend, store, _dir) = build_backend(&base).await;
+        backend
+            .write(0, &vec![0x42; chunk_size as usize])
+            .await
+            .unwrap();
+
+        backend.set_migration_fence(true);
+        let fenced = backend.flush().await.unwrap();
+        assert_eq!(fenced.chunks_flushed, 0, "fenced flush must no-op");
+        assert_eq!(fenced.manifest_ref, base_ref_of(&backend).await);
+
+        // The migration path drains explicitly while fenced...
+        let pending = backend.flush_local().await.unwrap();
+        let (m, hashes) = backend.flush_to_local_cache(&pending).await.unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(m.chunks.len(), 1, "drained chunk in the local manifest");
+        assert!(
+            store.get_chunk(hashes[0]).await.is_err(),
+            "local-cache flush must not PUT to the store"
+        );
+
+        // ...and the abort path re-queues + unfences: the next flush
+        // publishes the chunk durably.
+        backend.requeue_pending(pending).await;
+        backend.set_migration_fence(false);
+        let after = backend.flush().await.unwrap();
+        assert_eq!(
+            after.chunks_flushed, 1,
+            "re-queued chunk flushes after abort"
+        );
+        assert!(store.get_chunk(hashes[0]).await.is_ok());
+    }
+
+    async fn base_ref_of(b: &ChunkedDiskBackend) -> ManifestRef {
+        b.manifest_ref().await
+    }
+
+    #[tokio::test]
+    async fn flush_upload_parallel_publishes_all_dirty_chunks_sorted() {
+        let chunk_size = 4096u64;
+        let n_chunks = DISK_FLUSH_UPLOAD_CONCURRENCY * 3 + 5; // 101 chunks
+        let total = n_chunks as u64 * chunk_size;
+        // Sparse base (no chunks): every write targets a fresh chunk.
+        let base = synth_manifest(total, chunk_size, vec![]);
+        let (backend, store, _dir) = build_backend(&base).await;
+
+        // Write a distinct non-zero byte into every chunk.
+        for c in 0..n_chunks {
+            let byte = ((c % 250) + 1) as u8;
+            backend
+                .write(c as u64 * chunk_size, &vec![byte; chunk_size as usize])
+                .await
+                .unwrap();
+        }
+
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, n_chunks);
+        assert_eq!(outcome.bytes_uploaded, total);
+
+        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        assert_eq!(published.chunks.len(), n_chunks);
+        let offsets: Vec<u64> = published.chunks.iter().map(|c| c.offset).collect();
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(offsets, sorted, "published manifest must be offset-sorted");
+
+        // Every published chunk's bytes are durable in the store, and a
+        // spot-check read serves the flushed (not stale-base) bytes.
+        for c in published.chunks.iter() {
+            store.get_chunk(c.hash).await.unwrap();
+        }
+        let mid = (n_chunks / 2) as u64;
+        let got = backend.read(mid * chunk_size, 16).await.unwrap();
+        assert_eq!(got, vec![((mid as usize % 250) + 1) as u8; 16]);
+    }
+
+    /// A `BlobStorage` that fails every PUT while `fail` is set and
+    /// delegates everything else to a real local backend. Used to drive
+    /// the flush-atomicity test.
+    struct FlakyPutBlob {
+        inner: LocalBlobStorage,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStorage for FlakyPutBlob {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(engram_core::error::BlobError::Protocol(
+                    "injected put failure (test)".into(),
+                ));
+            }
+            self.inner.put_streaming(key, body).await
+        }
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<ByteStream, engram_core::error::BlobError> {
+            self.inner.get_streaming(key).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    /// ADR 0038: a failed `flush_upload` must be an ATOMIC no-op — the
+    /// manifest is NOT advanced and the drained bytes are re-queued to
+    /// `dirty` so the next checkpoint retries them. Regression test for the
+    /// prod chunk-drop (session `79b689e4`): the old shared-`pending_uploads`
+    /// lookup silently skipped puts, publishing a manifest that referenced
+    /// never-uploaded chunks → guest EIO on read.
+    #[tokio::test]
+    async fn flush_upload_failure_is_atomic_no_op_and_retains_bytes() {
+        use std::sync::atomic::Ordering;
+        let chunk_size = 4096u64;
+        let total = 4 * chunk_size;
+        let base = synth_manifest(total, chunk_size, vec![]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blob: Arc<dyn BlobStorage> = Arc::new(FlakyPutBlob {
+            inner: LocalBlobStorage::new(dir.path().to_path_buf()),
+            fail: fail.clone(),
+        });
+        let store = Arc::new(ChunkStore::new(blob));
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &base).await.unwrap();
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &base, cache, store.clone(), u64::MAX).unwrap();
+
+        let ref0 = backend.manifest_ref().await;
+
+        // Dirty three chunks.
+        for c in 0..3u64 {
+            backend
+                .write(c * chunk_size, &vec![(c as u8) + 1; chunk_size as usize])
+                .await
+                .unwrap();
+        }
+
+        // Uploads fail → the flush must error, atomically.
+        fail.store(true, Ordering::SeqCst);
+        assert!(
+            backend.flush().await.is_err(),
+            "flush must fail when an upload fails"
+        );
+
+        // (1) manifest NOT advanced — no half-written snapshot.
+        assert_eq!(
+            backend.manifest_ref().await,
+            ref0,
+            "failed flush must not tick the manifest"
+        );
+        // (2) the drained bytes are re-queued for retry — not lost.
+        assert!(
+            backend.dirty_chunks_count().await >= 3,
+            "drained bytes must be re-queued to dirty on a failed upload"
+        );
+        // (3) reads still serve the written bytes locally — never EIO/stale.
+        assert_eq!(backend.read(chunk_size, 16).await.unwrap(), vec![2u8; 16]);
+
+        // Recover: uploads succeed → the retry flushes cleanly + durably.
+        fail.store(false, Ordering::SeqCst);
+        let outcome = backend.flush().await.unwrap();
+        assert_ne!(
+            outcome.manifest_ref, ref0,
+            "a successful retry must advance the manifest"
+        );
+        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        for c in published.chunks.iter() {
+            store
+                .get_chunk(c.hash)
+                .await
+                .expect("every published chunk must be durable after a successful flush");
+        }
+        assert_eq!(backend.read(chunk_size, 16).await.unwrap(), vec![2u8; 16]);
+    }
+
+    /// ADR 0039 (sticky-everywhere): a flush write-throughs each uploaded
+    /// chunk into the local cache, so the flushing host keeps its own
+    /// chunks resident on NVMe instead of re-fetching its writes from GCS.
+    #[tokio::test]
+    async fn flush_write_throughs_chunks_into_local_cache() {
+        let chunk_size = 4096u64;
+        let total = 3 * chunk_size;
+        let base = synth_manifest(total, chunk_size, vec![]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &base).await.unwrap();
+        // Hold a clone of the cache so we can assert the write-through.
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &base, cache.clone(), store.clone(), u64::MAX)
+                .unwrap();
+
+        backend
+            .write(chunk_size, &vec![0x5a; chunk_size as usize])
+            .await
+            .unwrap();
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 1);
+
+        // The flushed chunk is now resident in the LOCAL cache (write-through),
+        // not only in GCS — so a same-host read never round-trips to blob.
+        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        let h = published
+            .chunks
+            .iter()
+            .find(|c| c.offset == chunk_size)
+            .expect("flushed chunk in manifest")
+            .hash;
+        assert!(
+            cache.contains_on_disk(h),
+            "flush must write-through the uploaded chunk into the local cache",
+        );
     }
 }

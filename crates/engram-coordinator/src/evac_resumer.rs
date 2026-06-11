@@ -37,8 +37,10 @@
 //! handler to a known target and conflate retry domains; the
 //! state-machine+scanner shape decouples them. Source writes
 //! "session is ready to be continued"; scanner finds a healthy peer.
-//! Operator-initiated drain, dead-host detector, and (future)
-//! NBD-loss trigger all land in the same lane.
+//! Operator-initiated drain (ADR 0044 K3) is the sole producer of
+//! `Evacuating` — ADR 0045 Phase A retired the reactive dead-host /
+//! NBD-loss producers (the dead-host detector now routes recoverable
+//! sessions to `Idle` for lazy `/resume`).
 //!
 //! The scanner is single-coord-pod safe because each per-session
 //! advance starts with `bump_evac_attempts` (atomic +1) followed by
@@ -63,8 +65,9 @@ use crate::state::{SessionEvent, SharedState};
 #[derive(Clone, Debug)]
 pub struct EvacResumerConfig {
     /// How often to sweep for Evacuating sessions. The scanner picks
-    /// up new entries from operator drains, the dead-host detector,
-    /// and (future) NBD-loss triggers. Default 10s matches
+    /// up new entries from operator drains (ADR 0044 K3) — the sole
+    /// producer of `Evacuating` since ADR 0045 Phase A retired the
+    /// reactive triggers. Default 10s matches
     /// `DeadHostConfig::poll_interval` so the two scanners share the
     /// same operational cadence.
     pub poll_interval: Duration,
@@ -137,6 +140,18 @@ async fn advance_one(
     attempts: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_id = session.id;
+    // ADR 0045 C1 (the named follow-up in the module docs): take the
+    // session lease before driving a resume — a live migration's
+    // synchronous verb (or a peer pod's pipeline) may be mid-flight on
+    // this session; without the lease two actors can double-restore.
+    // Skip-if-held: the holder owns the session; we re-scan next tick.
+    let Some(_lease) = crate::idle_evictor::SessionLeaseGuard::try_acquire(state, session_id, None)
+        .await
+        .map_err(|e| format!("evac-resumer lease acquire: {e}"))?
+    else {
+        tracing::debug!(%session_id, "evac-resumer: session lease held; skipping this tick");
+        return Ok(());
+    };
     // Retry budget exhausted → fall back to Idle so the user can
     // `/resume` manually. Idle is a legal target from Evacuating per
     // the legality table; the row's snapshot lineage is already
@@ -176,6 +191,9 @@ async fn advance_one(
                 );
             }
         }
+        // Gave up relocating — drop any teleport pin so a later manual
+        // /resume isn't constrained to the (evidently unavailable) target.
+        state.teleport_targets.remove(&session_id);
         return Ok(());
     }
 
@@ -221,12 +239,18 @@ async fn run_resume_pipeline(
     // there fails structurally rather than burning the budget.
     let cold_boot_spec = resolve_cold_boot_spec(&state.services.meta, &session).await;
 
+    // ADR 0045 Phase F: an operator-pinned teleport destination, if any.
+    // Honored strictly (a bad pin retries then falls back to Idle, never
+    // silently lands elsewhere); cleared below once the session resolves.
+    let require_host = state.teleport_targets.get(&session_id).map(|e| *e.value());
+
     let receipt = match evacuate_dead_source(
         &state.host_registry,
         &state.services.meta,
         session.clone(),
         snapshot,
         cold_boot_spec,
+        require_host,
     )
     .await
     {
@@ -275,10 +299,15 @@ async fn run_resume_pipeline(
                     );
                 }
             }
+            // Session left Evacuating terminally — drop any teleport pin.
+            state.teleport_targets.remove(&session_id);
             return Ok(());
         }
         Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
     };
+
+    // Resolved onto a peer (Created) — the teleport pin is consumed.
+    state.teleport_targets.remove(&session_id);
 
     tracing::info!(
         %session_id,
@@ -309,8 +338,17 @@ async fn run_resume_pipeline(
     // EvacLoss::None (memory was actually restored); a rung-2 cold
     // boot carries no cursor and skips this. No-op if the checkpoint
     // was the head.
+    // ADR 0045 F1: this path is only reached via operator drain /
+    // teleport (Phase A retired the reactive dead-host producer), so the
+    // rewind is a planned relocation, not a host failure.
     if receipt.loss == engram_core::types::evacuation::EvacLoss::None {
-        crate::api::snapshot::apply_rung1_rewind(state, session_id, rewind_cursor).await;
+        crate::api::snapshot::apply_rung1_rewind(
+            state,
+            session_id,
+            rewind_cursor,
+            crate::state::RecoveryCause::PlannedRelocation,
+        )
+        .await;
     }
 
     // Refresh the session row so finish_resume_to_active sees the
@@ -422,6 +460,32 @@ mod tests {
             Arc::new(AppState::new_with_registry(cfg, services, host_registry)),
             meta,
         )
+    }
+
+    /// ADR 0045 C1: a held session lease (a live migration's
+    /// synchronous verb, a peer pod's pipeline) makes the scanner SKIP
+    /// the session this tick — no transition, no restore attempt, no
+    /// double-driving.
+    #[tokio::test]
+    async fn advance_one_skips_when_session_lease_held() {
+        let session = evacuating_session(None);
+        let session_id = session.id;
+        let (state, meta) = build_state(session.clone());
+        assert!(meta
+            .try_acquire_session_lease(session_id, None, "rival-pod")
+            .await
+            .unwrap());
+
+        advance_one(&EvacResumerConfig::default(), &state, session, 0)
+            .await
+            .expect("skip is not an error");
+
+        let after = meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Evacuating,
+            "lease-held session must be left untouched for the holder",
+        );
     }
 
     /// No snapshot + no live disk manifest → NoRecoverableState →

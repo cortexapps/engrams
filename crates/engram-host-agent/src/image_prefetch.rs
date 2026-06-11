@@ -40,11 +40,23 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use engram_chunk_store::manifest::ChunkHash;
 use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
 use engram_core::types::SnapshotId;
 use engram_protocol::heartbeat::{EnabledImageRef, ManifestDigest};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::{watch, Semaphore};
+
+/// ADR 0039 (cache locality): per-enabled-image record of the canonical
+/// base-manifest (disk + memory) chunk hashes this host has pinned in the
+/// `ChunkCache`, so the LRU can never evict the shared base out from under
+/// live File-backend siblings. Keyed by manifest digest; the `Vec` is the
+/// pin batch we hand back to `ChunkCache::unpin_all` when the image is
+/// disabled. Shared because pinning happens inside spawned per-image
+/// prefetch tasks while unpinning happens in the supervisor's reconcile
+/// loop. Pins are refcounted in the cache, so two enabled images sharing a
+/// base chunk both pin it and one disable leaves it pinned for the other.
+type PinnedManifests = Arc<Mutex<HashMap<ManifestDigest, Vec<ChunkHash>>>>;
 
 /// ADR 0022 Option A: resolves a base snapshot's id to its on-disk
 /// snapshot dir (`<work_dir>/snapshots/<id>`). Supplied by the
@@ -235,6 +247,11 @@ pub fn spawn_supervisor(
         // disable + the mlock pin once materialized). Lives across ticks.
         // Only populated when `base_memfile_dir` is `Some`.
         let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+        // ADR 0039: digest → the base-manifest chunk hashes pinned in the
+        // cache, so a later disable can unpin exactly that batch. Lives
+        // across ticks; shared into the per-image prefetch tasks (which
+        // pin) and read by reconcile's disable loop (which unpins).
+        let pinned_manifests: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
         loop {
             let enabled = rx.borrow_and_update().clone();
             reconcile(
@@ -245,6 +262,7 @@ pub fn spawn_supervisor(
                 semaphore.clone(),
                 base_memfile_dir.as_ref(),
                 &mut memfiles,
+                pinned_manifests.clone(),
             )
             .await;
 
@@ -269,6 +287,7 @@ pub fn spawn_supervisor(
 /// One reconciliation pass: compute the ready/enabled delta, drop
 /// disabled-but-still-ready digests, kick off prefetch for any
 /// enabled-but-not-yet-ready digest.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile(
     enabled: &[EnabledImageRef],
     readiness: Arc<ImageReadiness>,
@@ -277,6 +296,7 @@ async fn reconcile(
     semaphore: Arc<Semaphore>,
     base_memfile_dir: Option<&SnapshotDirResolver>,
     memfiles: &mut HashMap<ManifestDigest, MemfileState>,
+    pinned_manifests: PinnedManifests,
 ) {
     let current = readiness.snapshot();
     let current: HashSet<ManifestDigest> = current.into_iter().collect();
@@ -289,6 +309,21 @@ async fn reconcile(
     // disk pressure.
     for digest in current.difference(&enabled_set) {
         readiness.mark_unready(digest);
+        // ADR 0039: release this image's base-manifest pins so its
+        // canonical chunks become LRU-evictable again — but only those
+        // not still pinned by another enabled image (refcounted in the
+        // cache). The chunks themselves stay on NVMe; only the never-evict
+        // guard is dropped.
+        let unpin_batch = pinned_manifests.lock().remove(digest);
+        if let Some(hashes) = unpin_batch {
+            let n = hashes.len();
+            chunk_cache.unpin_all(hashes);
+            tracing::info!(
+                digest = digest.as_str(),
+                chunks = n,
+                "image disabled; unpinned base-manifest chunks",
+            );
+        }
         // ADR 0022: reclaim the per-template base memfile (a
         // guest-RAM-sized file) when its image is disabled. Best-effort
         // unlink; a live sharer keeps the inode alive via its MAP_PRIVATE
@@ -326,7 +361,34 @@ async fn reconcile(
     // chunk fetches across all images.
     for image in enabled {
         if current.contains(&image.manifest_digest) {
-            continue;
+            // ADR 0039 (honest readiness): a `ready` image must still have
+            // ALL its base chunks locally resolvable. Re-verify against the
+            // pinned set (the disk + memory hashes recorded at prefetch) —
+            // if the LRU evicted any, or a `write_local` silently failed so a
+            // pinned hash never actually landed on NVMe, flip to not-ready so
+            // this round re-prefetches. Without this the host keeps
+            // advertising `ready` while a restore cold-fetches (or EIOs) the
+            // base — the dev-engrams base-restore incident. (Cheap: a
+            // `try_exists` per pinned hash; the pin set is hundreds of
+            // entries.)
+            let still_warm = {
+                let guard = pinned_manifests.lock();
+                guard
+                    .get(&image.manifest_digest)
+                    .map(|hashes| hashes.iter().all(|h| chunk_cache.contains_on_disk(*h)))
+                    .unwrap_or(false)
+            };
+            if still_warm {
+                continue;
+            }
+            tracing::warn!(
+                image_uri = %image.image_uri,
+                digest = image.manifest_digest.as_str(),
+                "ready image's base chunks no longer resolvable locally; flipping to not-ready for re-prefetch",
+            );
+            readiness.mark_unready(&image.manifest_digest);
+            // fall through to re-prefetch (prefetch_one re-warms the chunks;
+            // the pin set is already recorded so it skips re-pinning).
         }
         // ADR 0022: where this image's contiguous per-template base
         // memfile must land — the SAME path a base session.create restore
@@ -350,15 +412,29 @@ async fn reconcile(
         let chunk_store = chunk_store.clone();
         let chunk_cache = chunk_cache.clone();
         let semaphore = semaphore.clone();
+        let pinned_manifests = pinned_manifests.clone();
         tokio::spawn(async move {
             match prefetch_one(&image, &chunk_store, &chunk_cache, &semaphore, base_memfile).await {
-                Ok(chunks) => {
+                Ok(warmed) => {
+                    // ADR 0039: pin the canonical base manifest (disk +
+                    // memory) so the LRU never evicts the shared base while
+                    // this image is enabled. Pins are refcounted; record the
+                    // batch so the disable path unpins exactly it. Skip if a
+                    // prior tick already pinned this digest (the prefetch is
+                    // idempotent but we must not double-pin and leave a
+                    // dangling refcount on disable).
+                    let mut guard = pinned_manifests.lock();
+                    if !guard.contains_key(&image.manifest_digest) {
+                        chunk_cache.pin_all(warmed.hashes.iter().copied());
+                        guard.insert(image.manifest_digest.clone(), warmed.hashes);
+                    }
+                    drop(guard);
                     readiness.mark_ready(image.manifest_digest.clone());
                     tracing::info!(
                         image_uri = %image.image_uri,
                         digest = image.manifest_digest.as_str(),
-                        chunks,
-                        "image base snapshot prefetched; marked ready",
+                        chunks = warmed.chunk_count,
+                        "image base snapshot prefetched + pinned; marked ready",
                     );
                 }
                 Err(e) => {
@@ -404,6 +480,17 @@ async fn reconcile(
     }
 }
 
+/// The outcome of [`prefetch_one`]: the total chunk count warmed (for
+/// logging) plus the full set of base-manifest chunk hashes (disk +
+/// memory) the supervisor pins against eviction (ADR 0039). The hashes
+/// are deduped — a chunk shared between the disk and memory manifests is
+/// pinned once — so the recorded batch matches what `pin_all` actually
+/// pinned and `unpin_all` will release.
+struct WarmedManifest {
+    chunk_count: usize,
+    hashes: Vec<ChunkHash>,
+}
+
 /// Warm an enabled image's base-snapshot working set on local NVMe so the
 /// first session restoring it pages in from tier-1, not GCS. We prefetch the
 /// base snapshot's disk + memory manifests ONLY — never the source OCI image.
@@ -413,7 +500,7 @@ async fn reconcile(
 /// template-boot writes the image manifest lacks), so the OCI image is never
 /// read at session time. Both manifests are always present (the
 /// `enabled_images` columns are NOT NULL, migrations 0042/0043). Returns the
-/// total chunk count on success.
+/// chunk count + the deduped base-manifest hash set for pinning.
 async fn prefetch_one(
     image: &EnabledImageRef,
     chunk_store: &ChunkStore,
@@ -427,7 +514,20 @@ async fn prefetch_one(
     // readiness on this means an image isn't "ready" until the shared
     // memfile exists, so the first session restores against a warm file.
     base_memfile: Option<PathBuf>,
-) -> Result<usize, PrefetchError> {
+) -> Result<WarmedManifest, PrefetchError> {
+    // Accumulate the deduped pin set across the disk + memory manifests.
+    // `seen` keeps the pin batch unique so a chunk shared by both manifests
+    // is pinned once and unpinned once.
+    let mut pin_hashes: Vec<ChunkHash> = Vec::new();
+    let mut seen: HashSet<ChunkHash> = HashSet::new();
+    let mut record_hashes = |manifest: &Manifest| {
+        for chunk in &manifest.chunks {
+            if seen.insert(chunk.hash) {
+                pin_hashes.push(chunk.hash);
+            }
+        }
+    };
+
     // (1) ADR 0021 P2 — the base snapshot's rootfs. The session restores from
     // the per-image base snapshot, whose disk manifest carries the runtime
     // files written at template-boot (Bun / node_modules / claude). Warming
@@ -438,6 +538,7 @@ async fn prefetch_one(
         .get_manifest(image.base_snapshot_disk_manifest)
         .await
         .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot disk: {e}")))?;
+    record_hashes(&disk_manifest);
     let mut total =
         prefetch_manifest_chunks(disk_manifest, chunk_store, chunk_cache, semaphore).await?;
 
@@ -456,9 +557,50 @@ async fn prefetch_one(
             .get_manifest(memory_ref)
             .await
             .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
+        record_hashes(&memory_manifest);
         total +=
             prefetch_manifest_chunks(memory_manifest.clone(), chunk_store, chunk_cache, semaphore)
                 .await?;
+
+        // ADR 0045 C1 (the handshake-breakdown follow-up): pre-warm the
+        // SUBSTRATE's per-image base shm file from the just-prefetched
+        // NVMe-warm chunks. Without this, the FIRST session on a
+        // freshly-rolled host pays fetch+pwrite+CONTINUE for every
+        // base page it touches (~17s of in-guest first-touch on the
+        // prod canary); with it, first sessions CONTINUE against an
+        // already-populated page cache like every later sibling.
+        // Skip-if-exists: a handler may already own (and be lazily
+        // populating) the file — both writers produce byte-identical
+        // content at the same offsets, but ceding to the lazy path
+        // keeps this arm trivially safe. Manifest-elided ranges stay
+        // HOLES (the handler's ZEROPAGE arm owns zero pages — v2b
+        // semantics). Best-effort: a tmpfs hiccup must not block image
+        // readiness; the lazy path is the backstop.
+        if let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env() {
+            let base_path = engram_sandbox_firecracker::uffd_base_path_in(&base_dir, &memory_ref);
+            if tokio::fs::metadata(&base_path).await.is_err() {
+                match prewarm_base_shm(&base_path, &memory_manifest, chunk_store, chunk_cache).await
+                {
+                    Ok(written) => {
+                        tracing::info!(
+                            image_uri = %image.image_uri,
+                            path = %base_path.display(),
+                            chunks = written,
+                            "per-image base shm pre-warmed at prefetch (ADR 0045 C1)",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            image_uri = %image.image_uri,
+                            path = %base_path.display(),
+                            error = %e,
+                            "base shm pre-warm failed; the handler's lazy path backstops",
+                        );
+                        let _ = tokio::fs::remove_file(&base_path).await;
+                    }
+                }
+            }
+        }
 
         // ADR 0022 Option A: materialize the contiguous per-template base
         // memfile (density + faster boot). The chunks are now NVMe-warm
@@ -487,7 +629,55 @@ async fn prefetch_one(
     // memory image — density is FC-only — so no memfile is built and
     // readiness folds in only the disk working set, exactly as before.
 
-    Ok(total)
+    Ok(WarmedManifest {
+        chunk_count: total,
+        hashes: pin_hashes,
+    })
+}
+
+/// ADR 0045 C1: populate a per-image base shm file from a memory
+/// manifest's chunks (NVMe-warm after the preceding prefetch). Grow-only
+/// size like the handler's `BaseShm::open`; chunk bytes land at their
+/// manifest offsets; elided ranges stay holes. Returns chunks written.
+async fn prewarm_base_shm(
+    path: &std::path::Path,
+    manifest: &Manifest,
+    chunk_store: &ChunkStore,
+    chunk_cache: &engram_chunk_store::ChunkCache,
+) -> Result<usize, String> {
+    use std::os::unix::fs::FileExt;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create base dir: {e}"))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("open base file: {e}"))?;
+    if file.metadata().map_err(|e| e.to_string())?.len() < manifest.total_bytes {
+        file.set_len(manifest.total_bytes)
+            .map_err(|e| format!("size base file: {e}"))?;
+    }
+    let file = std::sync::Arc::new(file);
+    let mut written = 0usize;
+    for chunk in &manifest.chunks {
+        let bytes = chunk_cache
+            .get(chunk.hash, || chunk_store.get_chunk(chunk.hash))
+            .await
+            .map_err(|e| format!("chunk {}: {e}", chunk.hash))?;
+        let file = file.clone();
+        let offset = chunk.offset;
+        tokio::task::spawn_blocking(move || file.write_all_at(&bytes, offset))
+            .await
+            .map_err(|e| format!("join: {e}"))?
+            .map_err(|e| format!("pwrite at {offset}: {e}"))?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 /// Pull every chunk of one chunked manifest through the tiered
@@ -736,6 +926,229 @@ mod tests {
         assert!(
             tokio::fs::metadata(&dest).await.is_err(),
             "disk-only image must not materialize a memfile",
+        );
+    }
+
+    // ---- ADR 0039: base-manifest pin bookkeeping ----
+
+    #[tokio::test]
+    async fn prefetch_one_returns_deduped_disk_plus_memory_hash_set() {
+        // The pin batch is the union of the disk + memory manifests'
+        // chunk hashes, deduped. We pin exactly this set; the disable
+        // path unpins exactly it. Verify the set matches the manifests'
+        // union (a mix-up between disk/memory chunks would surface here).
+        let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let base_id = SnapshotId::new();
+        let _ = dir; // tempdir kept alive
+
+        let disk_m = store.get_manifest(disk_ref).await.unwrap();
+        let mem_m = store.get_manifest(mem_ref).await.unwrap();
+        let expected: HashSet<ChunkHash> = disk_m
+            .chunks
+            .iter()
+            .chain(mem_m.chunks.iter())
+            .map(|c| c.hash)
+            .collect();
+
+        let img = image_ref(base_id, disk_ref, Some(mem_ref));
+        let warmed = prefetch_one(&img, &store, &cache, &sem, None)
+            .await
+            .unwrap();
+
+        // No duplicates in the returned batch.
+        let got: HashSet<ChunkHash> = warmed.hashes.iter().copied().collect();
+        assert_eq!(got.len(), warmed.hashes.len(), "pin batch must be deduped");
+        assert_eq!(got, expected, "pin batch = union of disk + memory hashes");
+    }
+
+    #[tokio::test]
+    async fn reconcile_pins_enabled_then_unpins_on_disable() {
+        // End-to-end of the supervisor's pin bookkeeping: an enabled image
+        // pins its base manifest; disabling it unpins exactly that set; a
+        // chunk shared with a still-enabled image stays pinned (refcount).
+        let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let _ = dir;
+        let sem = Arc::new(Semaphore::new(8));
+        let readiness = ImageReadiness::new();
+        let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+
+        let base_id = SnapshotId::new();
+        let img = image_ref(base_id, disk_ref, Some(mem_ref));
+        let total_chunks = {
+            let disk_m = store.get_manifest(disk_ref).await.unwrap();
+            let mem_m = store.get_manifest(mem_ref).await.unwrap();
+            disk_m
+                .chunks
+                .iter()
+                .chain(mem_m.chunks.iter())
+                .map(|c| c.hash)
+                .collect::<HashSet<_>>()
+                .len()
+        };
+
+        // Enable: reconcile spawns the prefetch task. It marks ready +
+        // pins asynchronously; poll until readiness flips (bounded).
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if readiness.contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            readiness.contains(&img.manifest_digest),
+            "image should become ready after prefetch",
+        );
+        // The pin batch is recorded + the cache reflects it.
+        assert_eq!(
+            pinned.lock().get(&img.manifest_digest).map(Vec::len),
+            Some(total_chunks),
+        );
+        assert_eq!(cache.pinned_count(), total_chunks, "base manifest pinned");
+
+        // Disable: reconcile with an empty enabled set unpins the batch.
+        reconcile(
+            &[],
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+        )
+        .await;
+        assert!(!readiness.contains(&img.manifest_digest), "now unready");
+        assert!(pinned.lock().get(&img.manifest_digest).is_none());
+        assert_eq!(cache.pinned_count(), 0, "all base pins released on disable");
+    }
+
+    #[tokio::test]
+    async fn reconcile_flips_ready_to_unready_when_base_chunk_is_gone() {
+        // ADR 0039 (honest readiness): if a `ready` image's base chunks are
+        // no longer resolvable on local NVMe (LRU eviction / a silently-
+        // failed write_local), the next reconcile must flip it back to
+        // not-ready so a restore never lands on a ready-but-cold host.
+        let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let readiness = ImageReadiness::new();
+        let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+        let base_id = SnapshotId::new();
+        let img = image_ref(base_id, disk_ref, Some(mem_ref));
+
+        // Enable + wait for ready.
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if readiness.contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            readiness.contains(&img.manifest_digest),
+            "ready after prefetch"
+        );
+
+        // Simulate the chunk going cold: delete one pinned chunk's on-disk
+        // cache file out from under the cache (what an LRU sweep or a failed
+        // write_local would leave behind — pinned-but-not-resident).
+        let victim = *pinned
+            .lock()
+            .get(&img.manifest_digest)
+            .unwrap()
+            .first()
+            .unwrap();
+        cache.evict_on_disk_for_test(victim);
+        assert!(!cache.contains_on_disk(victim), "victim chunk now gone");
+
+        // Re-verify on the next reconcile: the image is no longer warm, so it
+        // flips to not-ready (then re-prefetches — but it's gone unready,
+        // which is the contract the scheduler relies on).
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+        )
+        .await;
+        assert!(
+            !readiness.contains(&img.manifest_digest),
+            "a ready image with an evicted base chunk must flip to not-ready",
+        );
+    }
+}
+
+#[cfg(test)]
+mod prewarm_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// ADR 0045 C1: the pre-warm writes each manifest chunk at its
+    /// offset, sizes the file to total_bytes, and leaves elided ranges
+    /// as holes (the handler's ZEROPAGE arm owns zeros).
+    #[tokio::test]
+    async fn prewarm_base_shm_writes_chunks_and_preserves_holes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let store = ChunkStore::new(blob);
+        let cache = engram_chunk_store::ChunkCache::new(
+            engram_chunk_store::cache::ChunkCacheConfig::new(tmp.path().join("cache")),
+        );
+
+        // A sparse image: chunk at 0 (0xAA), HOLE at 4096, chunk at 8192 (0xBB).
+        let img = tmp.path().join("img.bin");
+        let mut bytes = vec![0u8; 3 * 4096];
+        bytes[..4096].fill(0xAA);
+        bytes[2 * 4096..].fill(0xBB);
+        std::fs::write(&img, &bytes).unwrap();
+        let manifest = store
+            .chunk_file(&img, engram_chunk_store::ManifestKind::Memory, Some(4096))
+            .await
+            .unwrap();
+        assert_eq!(manifest.chunks.len(), 2, "the zero chunk is elided");
+
+        let base = tmp.path().join("shm").join("base.base");
+        let written = prewarm_base_shm(&base, &manifest, &store, &cache)
+            .await
+            .expect("prewarm");
+        assert_eq!(written, 2);
+
+        let got = std::fs::read(&base).unwrap();
+        assert_eq!(got.len() as u64, manifest.total_bytes);
+        assert_eq!(&got[..4096], &bytes[..4096]);
+        assert_eq!(&got[2 * 4096..], &bytes[2 * 4096..]);
+        assert!(
+            got[4096..2 * 4096].iter().all(|b| *b == 0),
+            "hole reads as zeros"
         );
     }
 }

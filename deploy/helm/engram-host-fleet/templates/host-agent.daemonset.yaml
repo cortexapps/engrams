@@ -1,0 +1,163 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "hostfleet.hostAgent.fullname" . }}
+  labels:
+    {{- include "hostfleet.hostAgent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hostfleet.hostAgent.selectorLabels" . | nindent 6 }}
+  # OnDelete: the host-agent holds live microVM state, so K8s must not
+  # roll pods out from under it. The ADR 0044 K3 operator drives
+  # drain-gated, node-by-node replacement instead.
+  updateStrategy:
+    type: {{ .Values.updateStrategy }}
+  template:
+    metadata:
+      labels:
+        {{- include "hostfleet.hostAgent.selectorLabels" . | nindent 8 }}
+    spec:
+      # ADR 0044 K2 (VM-detach): the FC microVMs (and any uffd-handler)
+      # must SURVIVE a host-agent pod restart so the successor pod can
+      # pidfd-reattach them — a routine DaemonSet upgrade then drops zero
+      # sessions. hostPID puts those processes in the NODE's PID
+      # namespace, so deleting this pod doesn't tear down their PID
+      # namespace and kill them. The host-agent spawns FC without
+      # kill_on_drop and never checkpoints on SIGTERM; it just detaches.
+      hostPID: true
+      # ADR 0044 K2: hostPID alone keeps the FC *process* alive across a pod
+      # restart, but the VM's network plumbing — the veth host-side and the
+      # MASQUERADE/SNAT iptables — lives in the host-agent's network namespace.
+      # In a pod-scoped netns that's torn down on delete, so the successor pod
+      # can't reattach ("net slot reserve failed: netns gone"). hostNetwork
+      # puts the host-agent (and everything it plumbs) in the NODE root netns,
+      # so the veth + iptables + the host->VM dial all persist across the roll.
+      # The kvm nodes are dedicated (no port contention) and the node IP is a
+      # stabler advertise addr than an ephemeral pod IP. ClusterFirstWithHostNet
+      # keeps the in-cluster coordinator Service resolvable under hostNetwork.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: {{ include "hostfleet.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # terminationGracePeriod is generous: the K3 operator drains via
+      # the coordinator before deleting a pod, but a bare `kubectl
+      # delete` should still let in-flight captures finish.
+      terminationGracePeriodSeconds: 120
+      initContainers:
+        # ADR 0044 K2 / GAP 2: stage firecracker + the guest kernel out of
+        # the node-assets image into a shared emptyDir. Stock K8s nodes have
+        # neither (the GCE/Packer node image baked them in); this is the K8s
+        # equivalent, and being per-pod means a reattached FC keeps its own
+        # running binary — no swap under a live VM. Runs before the
+        # host-agent and before the emptyDir is read, so there's no
+        # fail-before-init race a `type: File` hostPath mount would have.
+        - name: stage-node-assets
+          image: "{{ .Values.nodeAssets.image.repository }}:{{ .Values.nodeAssets.image.tag }}"
+          imagePullPolicy: {{ .Values.nodeAssets.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              cp /assets/firecracker /opt/engram/firecracker
+              cp /assets/vmlinux     /opt/engram/vmlinux
+              chmod 0755 /opt/engram/firecracker
+              echo "[stage-node-assets] firecracker + vmlinux -> /opt/engram"
+              # ADR 0027: stage the RO session bundles + stamp to the
+              # fleet-canonical /var/lib/engram/shared (inside the `work`
+              # hostPath the host-agent reads). The host-agent resolves aux RO
+              # drives ([git] -> skills, [browser] -> playwright) against
+              # current.json there. Graceful if a node-assets image predates
+              # bundles: the host still serves non-bundle sessions (bundle
+              # images fail loudly at capture, the same signal as before).
+              if ls /assets/bundles/*.squashfs >/dev/null 2>&1; then
+                mkdir -p /var/lib/engram/shared
+                cp /assets/bundles/*.squashfs   /var/lib/engram/shared/
+                cp /assets/bundles/current.json /var/lib/engram/shared/current.json
+                echo "[stage-node-assets] bundles + stamp -> /var/lib/engram/shared"
+              else
+                echo "[stage-node-assets] WARNING: node-assets image carries no bundles; aux-RO-drive images will fail to capture" >&2
+              fi
+          volumeMounts:
+            - {name: engram-assets, mountPath: /opt/engram}
+            # ADR 0027: bundles land in /var/lib/engram/shared, inside the
+            # `work` hostPath the host-agent reads.
+            - {name: work, mountPath: /var/lib/engram}
+      containers:
+        - name: host-agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            # Spike (ADR 0044) ran fully privileged; production should
+            # tighten to a KVM device plugin + scoped caps (K-hardening).
+            privileged: true
+            runAsUser: 0
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "IPC_LOCK"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "hostfleet.hostAgent.fullname" . }}
+          env:
+            # The coord dials this back for gRPC (ADR 0013). Under hostNetwork
+            # (above), status.podIP resolves to the NODE's primary IP — a
+            # stable, in-cluster-routable advertise addr that outlives any pod.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # ADR 0044 K2 (GAP 1): the host-agent seeds a STABLE HostId
+            # from the node name (persisted to the work_dir hostPath), so a
+            # DaemonSet pod restart keeps its identity and the coordinator's
+            # session->host binding survives while detach+reattach re-adopts
+            # the node's still-live microVMs.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ENGRAM_GRPC_ADVERTISE_ADDR
+              value: "http://$(POD_IP):{{ .Values.hostAgent.grpcPort }}"
+            # ADR 0044 K2 / GAP 2: firecracker lives in the staged emptyDir,
+            # not on PATH (ENGRAM_KERNEL_IMAGE_PATH=/opt/engram/vmlinux is set
+            # in the configmap, and matches the emptyDir layout).
+            - name: ENGRAM_FIRECRACKER_BIN
+              value: /opt/engram/firecracker
+            {{- if .Values.coordinator.tokenSecretName }}
+            - name: ENGRAM_COORDINATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coordinator.tokenSecretName }}
+                  key: {{ .Values.coordinator.tokenSecretKey }}
+            {{- end }}
+            {{- with .Values.hostAgent.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - {name: grpc, containerPort: {{ .Values.hostAgent.grpcPort }}, protocol: TCP}
+            - {name: metrics, containerPort: {{ .Values.hostAgent.metricsPort }}, protocol: TCP}
+          resources:
+            {{- toYaml .Values.hostAgent.resources | nindent 12 }}
+          volumeMounts:
+            - {name: dev, mountPath: /dev}
+            # firecracker + vmlinux, staged by the init container (GAP 2)
+            - {name: engram-assets, mountPath: /opt/engram}
+            - {name: work, mountPath: /var/lib/engram}
+            - {name: cgroup, mountPath: /sys/fs/cgroup}
+      volumes:
+        - {name: dev, hostPath: {path: /dev, type: Directory}}
+        # ADR 0044 K2 / GAP 2: firecracker + the guest kernel land here from
+        # the node-assets init container — replaces the hostPath `type: File`
+        # mounts, which fail-before-init when the node lacks the files.
+        - {name: engram-assets, emptyDir: {}}
+        - {name: work, hostPath: {path: {{ .Values.storage.workDirHostPath | quote }}, type: DirectoryOrCreate}}
+        - {name: cgroup, hostPath: {path: /sys/fs/cgroup, type: Directory}}

@@ -525,6 +525,32 @@ async fn main() -> Result<(), CoordinatorError> {
     // starts empty and hosts dial in via /api/hosts/connect.
     let host_registry = Arc::new(HostRegistry::new(meta_arc.clone()));
 
+    // ADR 0044 K4: emit the fleet-demand gauges on a tick (the node-pool
+    // autoscaler scales on these). Also wires HOSTS_READY, defined in
+    // metrics.rs but previously never emitted.
+    {
+        let reg = host_registry.clone();
+        let meta = meta_arc.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                let m = reg.fleet_metrics();
+                ::metrics::gauge!(engram_coordinator::metrics::HOSTS_READY)
+                    .set(m.ready_hosts as f64);
+                ::metrics::gauge!(engram_coordinator::metrics::FLEET_SCHEDULABLE_HOSTS)
+                    .set(m.schedulable_hosts as f64);
+                // ADR 0046: real free_mib = Σ(allocatable − reserved) from PG,
+                // not the in-memory `total − used(=0)` phantom. Leave the gauge
+                // at its last value on a transient query error.
+                if let Ok(free) = meta.fleet_free_mib().await {
+                    ::metrics::gauge!(engram_coordinator::metrics::FLEET_FREE_MIB)
+                        .set(free.max(0) as f64);
+                }
+            }
+        });
+    }
+
     // ADR 0007 Phase 5: stable HostId for `--mode=all`. Hoisted
     // up here (was computed below alongside the host_registry
     // register) so the FC backend can stamp it on its config
@@ -568,16 +594,11 @@ async fn main() -> Result<(), CoordinatorError> {
                 // (`""` / `"none"` disables, anything else passes
                 // through verbatim).
                 fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
-                // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips
-                // restore to the chunk-native UFFD handler (lazy memory,
-                // no memory.bin materialize). Defaults to File.
+                // ADR 0020 Route B / ADR 0039: idle-resume uses the
+                // chunk-native UFFD handler (lazy memory). Now the DEFAULT
+                // (ENGRAM_FC_RESTORE_MODE unset ⇒ uffd), so the Helm chart
+                // no longer needs to set it; `file` is the explicit opt-out.
                 fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
-                // ADR 0022 Option A: ENGRAM_FC_BASE_RESTORE_MODE=file flips
-                // *base session.create* restores to the File backend
-                // against the per-template resident memfile (density +
-                // faster boot); idle-resume stays on `restore_mode`. Unset
-                // ⇒ inherit `restore_mode` (behaviour-preserving).
-                fc_cfg.base_restore_mode = engram_sandbox_firecracker::base_restore_mode_from_env();
                 // Point the UFFD handler at the SAME chunk cache the
                 // PooledBackend restore-prefetch warms (`local_path/
                 // chunk-cache`, wired below) so on-fault `cache.get`

@@ -31,11 +31,36 @@ pub struct PostgresStore {
 
 impl PostgresStore {
     pub async fn connect(url: &str) -> Result<Self, MetaError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .connect(url)
-            .await
-            .map_err(|e| MetaError::Db(Box::new(e)))?;
+        // Retry the initial connect with backoff. In prod PG (Cloud SQL)
+        // is always up, so the first attempt succeeds with no delay. But
+        // a freshly-started PG — the docker-compose container in CI's
+        // `test-e2e-stack` lane, or a just-provisioned instance — can
+        // reset the first connections while it finishes booting. Without
+        // a retry the coord exits at startup ("postgres connect:
+        // Connection reset by peer") and the e2e-stack bring-up flakes
+        // ("coord never came up"). ~10 attempts over ~20s covers the
+        // container-startup race without masking a genuinely-bad URL.
+        const MAX_ATTEMPTS: u32 = 10;
+        let mut attempt = 0;
+        let pool = loop {
+            attempt += 1;
+            match PgPoolOptions::new().max_connections(8).connect(url).await {
+                Ok(pool) => break pool,
+                Err(e) if attempt < MAX_ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %e,
+                        "postgres connect failed; retrying after backoff",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * u64::from(attempt.min(6)),
+                    ))
+                    .await;
+                }
+                Err(e) => return Err(MetaError::Db(Box::new(e))),
+            }
+        };
         Ok(Self { pool })
     }
 
@@ -58,6 +83,129 @@ impl PostgresStore {
 
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
+}
+
+/// ADR 0046: least-loaded-that-fits among `candidates` (ranked). `free = total
+/// − reserved − residency_floor`; ties break toward the earlier (affinity-
+/// preferred) candidate. `None` → no candidate has room → caller rejects (503).
+/// Pure (no I/O) so it's unit-tested without a database — it is the placement
+/// decision the OOM incident needed.
+fn choose_placement_host(
+    candidates: &[uuid::Uuid],
+    allocatable_mib: &std::collections::HashMap<uuid::Uuid, i64>,
+    reserved_mib: &std::collections::HashMap<uuid::Uuid, i64>,
+    budget_mib: i64,
+) -> Option<uuid::Uuid> {
+    let mut best_known: Option<(i64, uuid::Uuid)> = None;
+    let mut fallback_unknown: Option<uuid::Uuid> = None;
+    for h in candidates {
+        let Some(&alloc) = allocatable_mib.get(h) else {
+            continue; // not ready/draining at lock time → skip
+        };
+        if alloc <= 0 {
+            // No allocatable measurement yet (non-Linux dev backend, pre-0058,
+            // or a brand-new host) — don't gate on a bogus 0; keep as a
+            // last-resort fallback so dev/new hosts still take work.
+            fallback_unknown.get_or_insert(*h);
+            continue;
+        }
+        let free = alloc - reserved_mib.get(h).copied().unwrap_or(0);
+        if free < budget_mib {
+            continue;
+        }
+        match best_known {
+            Some((bf, _)) if bf >= free => {}
+            _ => best_known = Some((free, *h)),
+        }
+    }
+    best_known.map(|(_, h)| h).or(fallback_unknown)
+}
+
+// Kept beside `choose_placement_host` (the fn it exercises) rather than at the
+// file end — the `MetadataStore` impl follows.
+#[allow(clippy::items_after_test_module)]
+#[cfg(test)]
+mod placement_tests {
+    use super::choose_placement_host;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn ids(n: usize) -> Vec<Uuid> {
+        (1..=n as u128).map(Uuid::from_u128).collect()
+    }
+
+    #[test]
+    fn picks_least_loaded_that_fits() {
+        let h = ids(2);
+        let total: HashMap<_, _> = [(h[0], 32768i64), (h[1], 32768)].into();
+        let reserved: HashMap<_, _> = [(h[0], 28000i64)].into(); // h0 nearly full
+        assert_eq!(
+            choose_placement_host(&h, &total, &reserved, 4096),
+            Some(h[1])
+        );
+    }
+
+    #[test]
+    fn rejects_when_none_fit() {
+        let h = ids(2);
+        let total: HashMap<_, _> = [(h[0], 8192i64), (h[1], 8192)].into();
+        let reserved: HashMap<_, _> = [(h[0], 6000i64), (h[1], 6000)].into();
+        assert_eq!(choose_placement_host(&h, &total, &reserved, 4096), None);
+    }
+
+    #[test]
+    fn unknown_allocatable_is_a_fallback_not_a_gate() {
+        let h = ids(2);
+        // h0 unmeasured (0), h1 measured + fits → prefer the measured host.
+        let alloc: HashMap<_, _> = [(h[0], 0i64), (h[1], 32768)].into();
+        assert_eq!(
+            choose_placement_host(&h, &alloc, &HashMap::new(), 4096),
+            Some(h[1])
+        );
+        // only the unmeasured host (dev backend / brand-new) → fall back to it.
+        let only0: HashMap<_, _> = [(h[0], 0i64)].into();
+        assert_eq!(
+            choose_placement_host(&h[..1], &only0, &HashMap::new(), 4096),
+            Some(h[0])
+        );
+    }
+
+    #[test]
+    fn tie_breaks_toward_earlier_candidate() {
+        let h = ids(2);
+        let total: HashMap<_, _> = [(h[0], 32768i64), (h[1], 32768)].into();
+        assert_eq!(
+            choose_placement_host(&h, &total, &HashMap::new(), 4096),
+            Some(h[0])
+        );
+    }
+
+    /// The incident in miniature: a burst of 4 GiB sessions onto two ~16 GiB
+    /// hosts. With each reservation feeding the next pick (as the FOR UPDATE
+    /// txn makes real), placement spreads evenly and rejects the overflow
+    /// instead of stacking onto one host and OOM-ing it.
+    #[test]
+    fn burst_spreads_then_rejects_overflow() {
+        let h = ids(2);
+        let total: HashMap<_, _> = [(h[0], 16384i64), (h[1], 16384)].into();
+        let mut reserved: HashMap<Uuid, i64> = HashMap::new();
+        let budget = 4096;
+        let mut picks = Vec::new();
+        for _ in 0..10 {
+            match choose_placement_host(&h, &total, &reserved, budget) {
+                Some(p) => {
+                    *reserved.entry(p).or_default() += budget;
+                    picks.push(Some(p));
+                }
+                None => picks.push(None),
+            }
+        }
+        let placed = picks.iter().filter(|p| p.is_some()).count();
+        assert_eq!(placed, 8, "16384/4096 = 4 per host = 8 total fit");
+        let on0 = picks.iter().flatten().filter(|&&p| p == h[0]).count();
+        let on1 = picks.iter().flatten().filter(|&&p| p == h[1]).count();
+        assert_eq!((on0, on1), (4, 4), "spread evenly, not stacked");
+    }
 }
 
 #[async_trait]
@@ -115,6 +263,11 @@ impl MetadataStore for PostgresStore {
                  image_uri, mode,
                  created_at, last_active_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+            ON CONFLICT (id) DO UPDATE SET
+                status         = EXCLUDED.status,
+                sandbox_id     = EXCLUDED.sandbox_id,
+                host_id        = EXCLUDED.host_id,
+                last_active_at = EXCLUDED.last_active_at
             "#,
         )
         .bind(session_id.as_uuid())
@@ -125,6 +278,113 @@ impl MetadataStore for PostgresStore {
         .bind(&spec.image)
         .bind(mode_text)
         .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn reserve_placement(
+        &self,
+        session_id: SessionId,
+        spec: &SessionSpec,
+        mem_budget_mib: i64,
+        candidates: &[HostId],
+    ) -> Result<Option<HostId>, MetaError> {
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Lock the candidate host rows so concurrent placers (any coord replica)
+        // serialize on the overlap — a burst can't read the same pre-insert
+        // reserved figure and stack onto one host. Held only for the pick +
+        // insert below (sub-ms).
+        let host_rows = sqlx::query(
+            r#"
+            SELECT id, allocatable_mib
+            FROM hosts
+            WHERE id = ANY($1) AND status IN ('ready','draining')
+            FOR UPDATE
+            "#,
+        )
+        .bind(&cand)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        // ADR 0046: allocatable_mib is the host-measured headroom for new
+        // sessions (MemAvailable + Σ guest-resident) — it already nets out the
+        // daemon / OS / chunk-cache / mlock'd residency baseline, so we subtract
+        // only session budgets from it. 0 = no measurement yet (dev/pre-0058).
+        let mut alloc: std::collections::HashMap<uuid::Uuid, i64> =
+            std::collections::HashMap::with_capacity(host_rows.len());
+        for r in &host_rows {
+            let id: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
+            let a: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
+            alloc.insert(id, a);
+        }
+        // Reserved within the txn — sees the committed `pending` rows of placers
+        // that locked these hosts before us. Status list is the SQL twin of
+        // `SessionState::host_memory_reserving_states()`.
+        let res_rows = sqlx::query(
+            r#"
+            SELECT host_id, COALESCE(SUM(mem_budget_mib), 0)::BIGINT AS reserved_mib
+            FROM sessions
+            WHERE host_id = ANY($1)
+              AND status IN ('pending','created','guest_ready','active',
+                             'evacuating','evicting')
+              -- A `pending` row older than 10 min is a crash-orphaned
+              -- reservation (a boot never takes that long); don't let it leak
+              -- into the reserved figure and false-reject the host.
+              AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
+            GROUP BY host_id
+            "#,
+        )
+        .bind(&cand)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let mut reserved: std::collections::HashMap<uuid::Uuid, i64> =
+            std::collections::HashMap::with_capacity(res_rows.len());
+        for r in &res_rows {
+            let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
+            let v: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
+            reserved.insert(h, v);
+        }
+        // Least-loaded-that-fits among the (ranked) candidates — see
+        // `choose_placement_host` (unit-tested).
+        let Some(picked) = choose_placement_host(&cand, &alloc, &reserved, mem_budget_mib) else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None);
+        };
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO sessions
+                (id, user_id, status, host_id, sandbox_id,
+                 image_uri, mode, mem_budget_mib, created_at, last_active_at)
+            VALUES ($1, $2, 'pending', $3, NULL, $4, $5, $6, $7, $7)
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(spec.user_id.as_deref())
+        .bind(picked)
+        .bind(&spec.image)
+        .bind(spec.mode.as_str())
+        .bind(mem_budget_mib)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(HostId(picked)))
+    }
+
+    async fn delete_pending_session(&self, session_id: SessionId) -> Result<(), MetaError> {
+        sqlx::query(
+            "DELETE FROM sessions WHERE id = $1 AND status = 'pending' AND sandbox_id IS NULL",
+        )
+        .bind(session_id.as_uuid())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -147,6 +407,33 @@ impl MetadataStore for PostgresStore {
         .map_err(db_err)?
         .ok_or(MetaError::NotFound)?;
         row::session_from_row(&row)
+    }
+
+    /// ADR 0046: Σ over schedulable hosts of `max(0, allocatable − reserved)` —
+    /// the real fleet free-memory signal (replaces the phantom `total − used`).
+    /// `pending` reservations older than 10 min are excluded as crash-orphaned
+    /// (a boot never takes that long), matching `reserve_placement`.
+    async fn fleet_free_mib(&self) -> Result<i64, MetaError> {
+        let free: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(SUM(GREATEST(0, h.allocatable_mib - COALESCE(r.reserved, 0))), 0)::BIGINT
+            FROM hosts h
+            LEFT JOIN (
+                SELECT host_id, SUM(mem_budget_mib) AS reserved
+                FROM sessions
+                WHERE host_id IS NOT NULL
+                  AND status IN ('pending','created','guest_ready','active',
+                                 'evacuating','evicting')
+                  AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
+                GROUP BY host_id
+            ) r ON r.host_id = h.id
+            WHERE h.status IN ('ready','draining')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(free)
     }
 
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
@@ -670,7 +957,8 @@ impl MetadataStore for PostgresStore {
                                running_sandboxes_count,
                                last_heartbeat_at, status, host_addr, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-            ON CONFLICT (hostname) DO UPDATE SET
+            ON CONFLICT (id) DO UPDATE SET
+                hostname                = EXCLUDED.hostname,
                 cloud_metadata          = EXCLUDED.cloud_metadata,
                 capacity_total_gb       = EXCLUDED.capacity_total_gb,
                 capacity_used_gb        = EXCLUDED.capacity_used_gb,
@@ -714,6 +1002,7 @@ impl MetadataStore for PostgresStore {
                    running_sandboxes_count,
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
+                   allocatable_mib,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -757,6 +1046,7 @@ impl MetadataStore for PostgresStore {
                       util_mem_total_mib = $8,
                       util_mem_used_mib = $9,
                       util_cpu_pct = $10,
+                      allocatable_mib = $11,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -771,6 +1061,7 @@ impl MetadataStore for PostgresStore {
         .bind(utilization.mem_total_mib as i64)
         .bind(utilization.mem_used_mib as i64)
         .bind(utilization.cpu_pct)
+        .bind(utilization.allocatable_mib as i64)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -793,9 +1084,18 @@ impl MetadataStore for PostgresStore {
                    running_sandboxes_count,
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
+                   allocatable_mib,
                    last_heartbeat_at, status, host_addr
               FROM hosts
-             WHERE status IN ('ready','draining')
+             -- Only `ready` hosts are strike-out candidates. A `draining`
+             -- host is operator-managed: mid image-roll (where ADR 0044 K2
+             -- reattach keeps its VMs alive across the brief pod-swap
+             -- heartbeat gap) or mid node-removal (where its sessions are
+             -- already being evacuated). The operator owns its lifecycle, so
+             -- the dead-host detector must not race a roll and route the
+             -- reattaching sessions to Idle out from under the successor.
+             -- (ADR 0044 K3: image rolls reattach, not evacuate.)
+             WHERE status = 'ready'
                AND last_heartbeat_at < NOW() - make_interval(secs => $1::bigint)
             "#,
         )
@@ -2058,6 +2358,23 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
         // Idempotent: missing row = already released / never held.
         Ok(())
+    }
+
+    async fn touch_session_lease(
+        &self,
+        session_id: SessionId,
+        locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE session_lease SET locked_at = now() \
+             WHERE session_id = $1 AND locked_by = $2",
+        )
+        .bind(session_id.as_uuid())
+        .bind(locked_by)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() == 1)
     }
 
     async fn sweep_stale_session_leases(

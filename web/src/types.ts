@@ -35,17 +35,17 @@
  *   dead        — terminal (chunked manifests gone or never were)
  */
 export type SessionState =
-  | 'pending'
-  | 'created'
-  | 'guest_ready'
-  | 'active'
-  | 'idle'
-  | 'host_lost'
-  | 'evacuating'
-  | 'evicting'
-  | 'completed'
-  | 'failed'
-  | 'dead';
+  | "pending"
+  | "created"
+  | "guest_ready"
+  | "active"
+  | "idle"
+  | "host_lost"
+  | "evacuating"
+  | "evicting"
+  | "completed"
+  | "failed"
+  | "dead";
 
 // Stage B1 wire shape: a session's image is now a flat OCI URI
 // (`<host>[:port]/<repo>:<tag>`). The earlier discriminated
@@ -65,7 +65,7 @@ export type ImageRef = string;
  * For a harness-less image, both modes look the same (there's no
  * harness to drive); we still send `mode` for wire uniformity.
  */
-export type SessionMode = 'agent' | 'dev_vm';
+export type SessionMode = "agent" | "dev_vm";
 
 export interface Session {
   id: string;
@@ -86,7 +86,7 @@ export interface SessionListItem extends Session {
   owner_name: string | null;
   /** `'system'` for warm-pool / automated sessions; `'user'` or absent for
    * human-launched sessions. Drives the OwnerCell badge choice. */
-  owner_kind?: 'user' | 'system' | null;
+  owner_kind?: "user" | "system" | null;
 }
 
 export interface ListSessionsResponse {
@@ -95,7 +95,7 @@ export interface ListSessionsResponse {
 
 // ---- ADR 0031: identity ------------------------------------------------
 
-export type Role = 'admin' | 'member';
+export type Role = "admin" | "member";
 
 /** The current principal, from `GET /me`. */
 export interface Principal {
@@ -112,7 +112,7 @@ export interface Principal {
   can_sign_out: boolean;
   /** ADR 0031: how the role was assigned. `claim` = IdP claim on sign-in;
    * `scim` = SCIM push; `manual` = admin promoted/revoked in the Members UI. */
-  role_source?: 'manual' | 'scim' | 'claim';
+  role_source?: "manual" | "scim" | "claim";
 }
 
 /** A row from `GET /admin/users`. */
@@ -121,11 +121,11 @@ export interface AdminUser {
   email: string;
   display_name: string | null;
   role: Role;
-  role_source: 'manual' | 'scim' | 'claim';
+  role_source: "manual" | "scim" | "claim";
   active: boolean;
 }
 
-export type HostStatus = 'ready' | 'draining' | 'dead';
+export type HostStatus = "ready" | "draining" | "dead";
 
 export interface HostView {
   id: string;
@@ -237,7 +237,7 @@ export interface CreateSessionResponse {
 
 // ---- Session events (SSE) ----------------------------------------------
 
-export type AgentRole = 'assistant' | 'user' | 'system';
+export type AgentRole = "assistant" | "user" | "system";
 
 export interface ExecRusage {
   duration_ms: number;
@@ -249,42 +249,42 @@ export interface ExecRusage {
 // union with `type` as the discriminant.
 export type SessionEvent =
   | {
-      type: 'status_changed';
+      type: "status_changed";
       from: SessionState;
       to: SessionState;
       at: string;
     }
   | {
-      type: 'exec_started';
+      type: "exec_started";
       exec_id: string;
       command: string[];
       at: string;
     }
   | {
-      type: 'exec_completed';
+      type: "exec_completed";
       exec_id: string;
       exit_status: number | null;
       rusage: ExecRusage;
       at: string;
     }
-  | { type: 'stdout'; exec_id: string; chunk: string }
-  | { type: 'stderr'; exec_id: string; chunk: string }
+  | { type: "stdout"; exec_id: string; chunk: string }
+  | { type: "stderr"; exec_id: string; chunk: string }
   | {
-      type: 'snapshot_taken';
+      type: "snapshot_taken";
       snapshot_id: string;
       size_bytes: number;
       at: string;
     }
-  | { type: 'evicted'; at: string }
-  | { type: 'resumed'; snapshot_id: string; at: string }
+  | { type: "evicted"; at: string }
+  | { type: "resumed"; snapshot_id: string; at: string }
   | {
-      type: 'run_started';
+      type: "run_started";
       run_id: string;
       prompt_summary: string | null;
       at: string;
     }
   | {
-      type: 'agent_message';
+      type: "agent_message";
       run_id: string;
       message_id: string;
       role: AgentRole;
@@ -292,7 +292,7 @@ export type SessionEvent =
       at: string;
     }
   | {
-      type: 'tool_call_started';
+      type: "tool_call_started";
       run_id: string;
       tool_call_id: string;
       tool_name: string;
@@ -300,7 +300,7 @@ export type SessionEvent =
       at: string;
     }
   | {
-      type: 'tool_call_completed';
+      type: "tool_call_completed";
       run_id: string;
       tool_call_id: string;
       tool_name: string;
@@ -309,14 +309,14 @@ export type SessionEvent =
       result_summary: string | null;
       at: string;
     }
-  | { type: 'run_completed'; run_id: string; ok: boolean; at: string }
+  | { type: "run_completed"; run_id: string; ok: boolean; at: string }
   // ADR 0030: the in-flight run was stopped by an operator interrupt
   // (`POST /sessions/:id/interrupt`). The session stays alive; the
   // transcript renders an "interrupted" receipt and the run closes.
-  | { type: 'run_interrupted'; run_id: string; at: string }
-  | { type: 'harness_idle'; at: string }
+  | { type: "run_interrupted"; run_id: string; at: string }
+  | { type: "harness_idle"; at: string }
   | {
-      type: 'pull_request_opened';
+      type: "pull_request_opened";
       url: string;
       repo: string;
       title: string;
@@ -330,7 +330,7 @@ export type SessionEvent =
   // coord-detected type; the transcript renders image/video inline and
   // anything else as a download chip.
   | {
-      type: 'file_shared';
+      type: "file_shared";
       artifact_id: string;
       media_type: string;
       size_bytes: number;
@@ -344,15 +344,21 @@ export type SessionEvent =
   // are outside-world actions in the rolled-back span the platform
   // can't undo (opened PRs, shared files) — surfaced, not hidden.
   | {
-      type: 'recovered_from_checkpoint';
+      type: "recovered_from_checkpoint";
       recovery_epoch: number;
       through_idx: number;
       rolled_back: number;
       surviving_side_effects: string[];
+      // ADR 0045 F1: why the rewind happened — `planned_relocation`
+      // (operator drain / teleport, no host failed) vs the original
+      // `host_failure_recovery`. Optional: events persisted before this
+      // field omit it, and the renderer treats a missing value as a
+      // host failure (the card's historical meaning).
+      cause?: "planned_relocation" | "host_failure_recovery";
       at: string;
     };
 
-export type SessionEventKind = SessionEvent['type'];
+export type SessionEventKind = SessionEvent["type"];
 
 // ADR 0028 A.log: one checkpoint in a session's chain.
 export interface CheckpointSummary {
@@ -396,17 +402,14 @@ export interface IndexedEvent {
 // IAM identity is the credential. Future siblings (AwsInstanceRole,
 // GcpImpersonateSa, ...) slot in here as new variants without
 // reshaping anything.
-export type RegistryAuthKind =
-  | 'static'
-  | 'gcp_workload_identity'
-  | 'anonymous';
+export type RegistryAuthKind = "static" | "gcp_workload_identity" | "anonymous";
 
 /** Variant-discriminated request body for `POST /api/registries`. The
  * server `serde(tag = "kind")` decoder matches on these. */
 export type AddRegistryAuth =
-  | { kind: 'static'; username: string; password: string }
-  | { kind: 'gcp_workload_identity'; impersonate_sa?: string | null }
-  | { kind: 'anonymous' };
+  | { kind: "static"; username: string; password: string }
+  | { kind: "gcp_workload_identity"; impersonate_sa?: string | null }
+  | { kind: "anonymous" };
 
 export interface AddRegistryRequest {
   host: string;
@@ -470,12 +473,7 @@ export interface EnabledImageSummary {
 }
 
 /** ADR 0036: state of an async image-enable job. */
-export type EnableJobState =
-  | 'pending'
-  | 'materializing'
-  | 'capturing'
-  | 'ready'
-  | 'failed';
+export type EnableJobState = "pending" | "materializing" | "capturing" | "ready" | "failed";
 
 /** ADR 0036: one row of `GET /api/enable-jobs` — an asynchronous
  * image enable in flight (or terminal). `chunks_done/chunks_total`

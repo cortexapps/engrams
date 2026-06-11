@@ -222,12 +222,42 @@ impl HarnessSupervisor {
 
         let mut guard = self.inner.lock().await;
         if let Some(mut prev) = guard.current_child.take() {
-            tracing::info!(
-                pid = ?prev.id(),
-                "respawn requested; killing previous harness child",
-            );
-            let _ = prev.kill().await;
-            let _ = prev.wait().await;
+            // ADR 0045 C1: REATTACH, don't respawn, when the previous
+            // harness is still ALIVE. A live-teleported (or mid-run
+            // resumed) guest arrives with its harness running inside
+            // the moved memory image — the post-move SpawnHarness from
+            // `finish_resume_to_active` used to KILL it here, silently
+            // destroying the in-flight run the teleport had just
+            // preserved losslessly. The harness's event pipe into
+            // agentd is intact (both ends moved together), and the
+            // host re-dials agentd's stream regardless, so the only
+            // correct action for a live child is: return its pid and
+            // leave it alone. An EXITED child (the idle-resume shape:
+            // the run completed before capture) is reaped and a fresh
+            // harness spawns — the pre-existing resume semantics.
+            match prev.try_wait() {
+                Ok(None) => {
+                    let pid = prev.id();
+                    tracing::info!(
+                        pid = ?pid,
+                        "harness still running (live move / mid-run resume); reattaching, not respawning",
+                    );
+                    guard.current_child = Some(prev);
+                    return Ok(pid);
+                }
+                Ok(Some(status)) => {
+                    tracing::info!(
+                        pid = ?prev.id(),
+                        ?status,
+                        "previous harness exited; reaping and spawning fresh",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "harness liveness probe failed; respawning");
+                    let _ = prev.kill().await;
+                    let _ = prev.wait().await;
+                }
+            }
         }
 
         // Detach the child from agentd's stdio (= /dev/console, which
@@ -282,6 +312,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pid, None);
+    }
+
+    /// ADR 0045 C1: SpawnHarness against a LIVE child reattaches
+    /// (same pid, child untouched); against an EXITED child it reaps
+    /// and respawns. The live-teleport handshake depends on the first
+    /// arm — the old kill-and-respawn destroyed mid-run harnesses the
+    /// move had just preserved.
+    #[tokio::test]
+    async fn spawn_reattaches_live_child_and_respawns_exited() {
+        let sup = HarnessSupervisor::new();
+        let long = SpawnHarnessRequest {
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+            env: HashMap::new(),
+            session_env: HashMap::new(),
+        };
+        let pid1 = sup.spawn(long.clone()).await.unwrap().expect("pid");
+        // The teleport-handshake shape: SpawnHarness while running.
+        let pid2 = sup.spawn(long.clone()).await.unwrap().expect("pid");
+        assert_eq!(pid1, pid2, "live child must be reattached, not respawned");
+        // The child is genuinely still alive.
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-0", &pid1.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false),
+            "reattach must not have killed the child"
+        );
+
+        // Exited child: reap + fresh spawn (the idle-resume shape).
+        let short = SpawnHarnessRequest {
+            argv: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+            env: HashMap::new(),
+            session_env: HashMap::new(),
+        };
+        let sup2 = HarnessSupervisor::new();
+        let pid3 = sup2.spawn(short.clone()).await.unwrap().expect("pid");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let pid4 = sup2.spawn(short).await.unwrap().expect("pid");
+        assert_ne!(pid3, pid4, "exited child must be reaped and respawned");
     }
 
     #[tokio::test]

@@ -4,6 +4,8 @@
 //! preemption notices on `instance/preempted` and `instance/maintenance-event`.
 //! Phase 4 lights this up; Phase 5 wires the drain handler.
 
+pub mod gke;
+
 use std::time::Duration;
 
 use async_trait::async_trait;

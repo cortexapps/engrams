@@ -1,4 +1,4 @@
-import { fmtDur } from './transcriptFmt';
+import { fmtDur } from "./transcriptFmt";
 
 // A run's "receipt" — a faint one-line tally of what the agent did this
 // run (read N · edited N · ran N · duration), rendered at the run's
@@ -29,8 +29,7 @@ export function RunSummary({
   if (summary.reads) parts.push(`read ${summary.reads}`);
   if (summary.edits) parts.push(`edited ${summary.edits}`);
   if (summary.ran) parts.push(`ran ${summary.ran}`);
-  if (summary.other)
-    parts.push(`${summary.other} ${summary.other === 1 ? 'tool' : 'tools'}`);
+  if (summary.other) parts.push(`${summary.other} ${summary.other === 1 ? "tool" : "tools"}`);
   if (summary.at && endAt) {
     const ms = new Date(endAt).getTime() - new Date(summary.at).getTime();
     if (ms > 0) parts.push(fmtDur(ms));
@@ -47,10 +46,10 @@ export function RunSummary({
       </span>
       <span className="run-summary-text font-mono">
         {interrupted
-          ? `interrupted${parts.length ? ` · ${parts.join(' · ')}` : ''}`
+          ? `interrupted${parts.length ? ` · ${parts.join(" · ")}` : ""}`
           : ok
-            ? parts.join(' · ')
-            : `failed${parts.length ? ` · ${parts.join(' · ')}` : ''}`}
+            ? parts.join(" · ")
+            : `failed${parts.length ? ` · ${parts.join(" · ")}` : ""}`}
       </span>
     </div>
   );

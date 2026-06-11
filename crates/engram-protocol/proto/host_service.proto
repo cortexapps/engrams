@@ -34,8 +34,39 @@ service HostService {
   // sidecar.json, working_set.json) so they don't accumulate as
   // 4 GiB-per-attempt leaks during retry storms. Idempotent.
   rpc AbortSnapshot(SandboxIdMessage) returns (Empty);
+  // ADR 0045 D5: the teardown reorder. SnapshotBegin runs only the
+  // pause-side capture (pause -> NBD drain -> FC create; for eviction
+  // the VM stays paused) and spawns the chunk+upload work as a host-side
+  // background task; SnapshotWait awaits that task and returns the
+  // durable SnapshotMetadata. The coordinator marks the session Idle
+  // between the two — user-visible teardown ends at Begin. The legacy
+  // Snapshot RPC stays as the composed begin+wait (periodic checkpoints,
+  // drain paths, old coordinators).
+  rpc SnapshotBegin(SandboxIdMessage) returns (SnapshotBeginResponse);
+  rpc SnapshotWait(SandboxIdMessage) returns (SnapshotResponse);
+  // ADR 0045 Phase C1: live-teleport source-side surface.
+  // MigrationCapture freezes the sandbox for a move: pause + NBD drain +
+  // FC diff capture + LOCAL-sink re-chunk (no GCS on the pause path);
+  // the guest STAYS PAUSED and the sandbox is fenced (no flush publish,
+  // no checkpoints) until Commit or Abort. Returns the not-yet-durable
+  // next manifests inline plus the transfer set the destination must
+  // pull. MigrationFetch is the one host-to-host RPC: the DESTINATION
+  // host-agent streams the export's artifacts (state.bin, sidecar,
+  // chunk bytes), gated by the export_id nonce + a server-side
+  // allowlist. Commit destroys the source VM + drops the export; Abort
+  // un-pauses the guest in place and unfences (zero loss).
+  rpc MigrationCapture(SandboxIdMessage) returns (MigrationCaptureResponse);
+  rpc MigrationFetch(MigrationFetchRequest) returns (stream MigrationFrame);
+  rpc MigrationCommit(MigrationExportRef) returns (Empty);
+  rpc MigrationAbort(MigrationExportRef) returns (Empty);
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
+  // ADR 0045 Phase F: freeze / unfreeze a running microVM *in place* —
+  // pause vCPUs without snapshotting, destroying, or changing session
+  // state. An admin affordance to exercise + observe the pause/flush
+  // path; maps to SandboxBackend::pause / ::resume.
+  rpc PauseSandbox(SandboxIdMessage) returns (Empty);
+  rpc ResumeSandbox(SandboxIdMessage) returns (Empty);
 
   // ADR 0020 P1: boot the image to agentd-ready with a stub harness,
   // take a portable FC snapshot (chunked memory + uploaded
@@ -160,6 +191,71 @@ message ListSandboxesResponse {
 }
 
 // --- Snapshot ---
+
+message MigrationCaptureResponse {
+  // Single-use unguessable nonce naming this export on the source;
+  // the destination presents it to MigrationFetch.
+  string export_id = 1;
+  // The next memory manifest (fork lineage @v+1), serialized Manifest
+  // JSON — NOT yet in the blob store; durable only after the
+  // destination's catch-up upload.
+  bytes memory_manifest_json = 2;
+  // The drained, coherent disk manifest JSON (coherence cut = the
+  // pause-window drain).
+  bytes disk_manifest_json = 3;
+  // Chunk hashes the destination must pull from this export (rebuilt
+  // memory chunks + pending-tier disk chunks). 32-byte raw hashes.
+  repeated bytes new_memory_chunk_hashes = 4;
+  repeated bytes new_disk_chunk_hashes = 5;
+  bytes snapshot_id = 6;
+  int64 paused_at_unix_ms = 7;
+  // bincode ManifestRef for each inline manifest. The memory ref is
+  // the fork lineage's next version (owned by this session); the disk
+  // ref is PROVISIONAL — the destination's catch-up publish does the
+  // version-conflict retry dance (shared-template disk lineages).
+  bytes memory_manifest_ref = 8;
+  bytes disk_manifest_ref = 9;
+}
+
+message MigrationExportRef {
+  bytes sandbox_id = 1;
+  string export_id = 2;
+}
+
+message MigrationFetchRequest {
+  string export_id = 1;
+  // Named artifacts + chunk hashes, in the order frames should refer
+  // to them by index.
+  repeated MigrationItem items = 2;
+}
+
+message MigrationItem {
+  // Exactly one of:
+  //   kind = STATE_BIN | SIDECAR  (hash empty)
+  //   kind = CHUNK                (hash = 32-byte chunk hash)
+  enum Kind {
+    CHUNK = 0;
+    STATE_BIN = 1;
+    SIDECAR = 2;
+  }
+  Kind kind = 1;
+  bytes hash = 2;
+}
+
+message MigrationFrame {
+  uint32 item_idx = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  // Last frame for this item.
+  bool last = 4;
+}
+
+message SnapshotBeginResponse {
+  // Correlates Begin with the eventual Wait result; also proves the
+  // capture itself (pause + FC create) succeeded before the coordinator
+  // marks the session Idle.
+  bytes snapshot_id = 1;
+}
 
 message SnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.

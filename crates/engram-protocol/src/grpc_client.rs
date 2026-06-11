@@ -22,6 +22,7 @@ use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use futures::Stream;
 use std::pin::Pin;
+use std::time::Duration;
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::transport::Channel;
@@ -31,10 +32,10 @@ use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
     CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    MigrationExportRef, MigrationFetchRequest, MigrationItem, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
+    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -56,6 +57,28 @@ impl Interceptor for TraceparentInjector {
         }
         Ok(req)
     }
+}
+
+/// Deadline applied (via the gRPC `grpc-timeout` header) to the
+/// snapshot-restore RPCs — `restore` (resume) and
+/// `restore_base_for_session` (cold-create-via-restore). Without it a
+/// host that wedges mid-restore leaves the coord caller hung
+/// indefinitely (observed as a ~6-minute dead-host stall); the
+/// keepalive pings only catch a *silent* connection, not a peer that
+/// ACKs but never completes the call. Set generously above the
+/// slowest legitimate restore (cold boot ~15-30s, rechunk-heavy
+/// resumes up to a couple of minutes) so it never aborts a real
+/// restore, while still bounding the pathological hang. Because it
+/// rides the gRPC deadline header, the *host* side observes it too and
+/// can abort its own work. Override via
+/// `ENGRAM_RESTORE_RPC_TIMEOUT_SECS`.
+fn restore_rpc_timeout() -> Duration {
+    let secs = std::env::var("ENGRAM_RESTORE_RPC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(240);
+    Duration::from_secs(secs)
 }
 
 /// Coord-side client wrapping a `tonic::transport::Channel` to one
@@ -158,6 +181,176 @@ impl GrpcHostClient {
         decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
     }
 
+    /// ADR 0045 D5. An `Unimplemented` status from a pre-D5 host-agent
+    /// maps to `InvalidSpec` (same shape as the trait default), which the
+    /// coordinator treats as "fall back to the composed snapshot()".
+    pub async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .snapshot_begin(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let uuid = uuid::Uuid::from_slice(&resp.snapshot_id)
+            .map_err(|e| SandboxError::Snapshot(format!("snapshot_begin id decode: {e}")))?;
+        Ok(engram_core::types::SnapshotId::from(uuid))
+    }
+
+    /// ADR 0045 D5: await the host-side background upload.
+    pub async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .snapshot_wait(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
+    }
+
+    /// ADR 0045 C1: freeze a sandbox for a live move (coordinator → source).
+    pub async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .migration_capture(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let to32 = |v: Vec<u8>| -> Result<[u8; 32], SandboxError> {
+            v.as_slice()
+                .try_into()
+                .map_err(|_| SandboxError::Snapshot("chunk hash must be 32 bytes".into()))
+        };
+        Ok(engram_core::types::snapshot::MigrationCaptureOut {
+            export_id: resp.export_id,
+            memory_manifest_json: resp.memory_manifest_json,
+            disk_manifest_json: resp.disk_manifest_json,
+            memory_manifest_ref: decode_bincode(&resp.memory_manifest_ref, "ManifestRef")?,
+            disk_manifest_ref: decode_bincode(&resp.disk_manifest_ref, "ManifestRef")?,
+            new_memory_chunk_hashes: resp
+                .new_memory_chunk_hashes
+                .into_iter()
+                .map(to32)
+                .collect::<Result<_, _>>()?,
+            new_disk_chunk_hashes: resp
+                .new_disk_chunk_hashes
+                .into_iter()
+                .map(to32)
+                .collect::<Result<_, _>>()?,
+            snapshot_id: engram_core::types::SnapshotId::from(
+                uuid::Uuid::from_slice(&resp.snapshot_id)
+                    .map_err(|e| SandboxError::Snapshot(format!("snapshot id decode: {e}")))?,
+            ),
+            paused_at_unix_ms: resp.paused_at_unix_ms,
+        })
+    }
+
+    /// ADR 0045 C1: pull an export's artifacts (destination host → source host).
+    pub async fn migration_fetch(
+        &self,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<engram_core::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        use crate::grpc::migration_item::Kind;
+        let wire_items = items
+            .into_iter()
+            .map(|item| match item {
+                engram_core::types::snapshot::MigrationItem::StateBin => MigrationItem {
+                    kind: Kind::StateBin as i32,
+                    hash: Vec::new(),
+                },
+                engram_core::types::snapshot::MigrationItem::Sidecar => MigrationItem {
+                    kind: Kind::Sidecar as i32,
+                    hash: Vec::new(),
+                },
+                engram_core::types::snapshot::MigrationItem::Chunk(h) => MigrationItem {
+                    kind: Kind::Chunk as i32,
+                    hash: h.to_vec(),
+                },
+            })
+            .collect();
+        let resp = self
+            .inner
+            .clone()
+            .migration_fetch(MigrationFetchRequest {
+                export_id: export_id.to_string(),
+                items: wire_items,
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        use futures::StreamExt;
+        Ok(resp
+            .map(|frame| {
+                frame
+                    .map(|f| engram_core::types::snapshot::MigrationFrame {
+                        item_idx: f.item_idx,
+                        offset: f.offset,
+                        data: bytes::Bytes::from(f.data),
+                        last: f.last,
+                    })
+                    .map_err(grpc_to_sandbox_err)
+            })
+            .boxed())
+    }
+
+    /// ADR 0045 C1.
+    pub async fn migration_commit(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<(), SandboxError> {
+        self.inner
+            .clone()
+            .migration_commit(MigrationExportRef {
+                sandbox_id: id.as_uuid().as_bytes().to_vec(),
+                export_id: export_id.to_string(),
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    /// ADR 0045 C1.
+    pub async fn migration_abort(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<(), SandboxError> {
+        self.inner
+            .clone()
+            .migration_abort(MigrationExportRef {
+                sandbox_id: id.as_uuid().as_bytes().to_vec(),
+                export_id: export_id.to_string(),
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
     pub async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         let req = SandboxIdMessage {
             uuid: id.as_uuid().as_bytes().to_vec(),
@@ -183,9 +376,10 @@ impl GrpcHostClient {
     }
 
     pub async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        let req = RestoreRequest {
+        let mut req = tonic::Request::new(RestoreRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
-        };
+        });
+        req.set_timeout(restore_rpc_timeout());
         let resp = self
             .inner
             .clone()
@@ -218,10 +412,11 @@ impl GrpcHostClient {
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
     ) -> Result<SandboxId, SandboxError> {
-        let req = RestoreBaseForSessionRequest {
+        let mut req = tonic::Request::new(RestoreBaseForSessionRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
             session_env,
-        };
+        });
+        req.set_timeout(restore_rpc_timeout());
         let resp = self
             .inner
             .clone()
@@ -293,6 +488,32 @@ impl GrpcHostClient {
         self.inner
             .clone()
             .interrupt_harness(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    /// ADR 0045 Phase F: freeze the microVM in place.
+    pub async fn pause_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .pause_sandbox(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    /// ADR 0045 Phase F: unfreeze a paused microVM.
+    pub async fn resume_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .resume_sandbox(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -730,6 +951,46 @@ impl HostClient for GrpcHostClient {
         Self::snapshot(self, id).await
     }
 
+    async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        Self::snapshot_begin(self, id).await
+    }
+
+    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        Self::snapshot_wait(self, id).await
+    }
+
+    async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        Self::migration_capture(self, id).await
+    }
+
+    async fn migration_fetch(
+        &self,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<engram_core::types::snapshot::MigrationFrame, SandboxError>,
+        >,
+        SandboxError,
+    > {
+        Self::migration_fetch(self, export_id, items).await
+    }
+
+    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        Self::migration_commit(self, id, export_id).await
+    }
+
+    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        Self::migration_abort(self, id, export_id).await
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         Self::commit_snapshot(self, id).await
     }
@@ -794,6 +1055,14 @@ impl HostClient for GrpcHostClient {
         self.interrupt_harness(sandbox_id).await
     }
 
+    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.pause_sandbox(sandbox_id).await
+    }
+
+    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.resume_sandbox(sandbox_id).await
+    }
+
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Self::acquire_shell(self, sandbox_id).await
     }
@@ -840,6 +1109,12 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
         Code::DeadlineExceeded | Code::Aborted => SandboxError::Timeout,
         Code::ResourceExhausted => SandboxError::LimitExceeded(status.message().to_string()),
         Code::InvalidArgument => SandboxError::InvalidSpec(status.message().to_string()),
+        // ADR 0045 D5: a pre-D5 host-agent answers the new
+        // SnapshotBegin/SnapshotWait RPCs with Unimplemented; map to the
+        // same InvalidSpec shape the trait defaults use so the
+        // coordinator's "unsupported -> composed snapshot()" fallback
+        // fires uniformly for old binaries and non-FC backends alike.
+        Code::Unimplemented => SandboxError::InvalidSpec(status.message().to_string()),
         // Unavailable = host disconnected mid-call / channel evicted.
         // Surfacing as `Vm` rather than a dedicated variant matches
         // the WS path's `ConnectionError::Closed` mapping.

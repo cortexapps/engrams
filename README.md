@@ -12,6 +12,7 @@ It brings the Modal/E2B/Ramp-Inspect "ephemeral sandbox per task" pattern to ope
 - What shipped, in order: [`docs/history.md`](./docs/history.md).
 - What's pending / deferred: [`docs/chunked-storage-rollout.md`](./docs/chunked-storage-rollout.md).
 - Operational guide for GCP: [`docs/deploy.md`](./docs/deploy.md).
+- Firecracker fork health (ADR 0045 Phase B): [![rebase-fc-fork](https://github.com/cortexapps/engrams/actions/workflows/rebase-fc-fork.yml/badge.svg)](https://github.com/cortexapps/engrams/actions/workflows/rebase-fc-fork.yml) — the vendored FC fork's daily rebase onto upstream. Red = a rebase conflict needs a hand (see the tracked issue + [`docs/runbooks/firecracker-fork.md`](./docs/runbooks/firecracker-fork.md)).
 
 ## Architecture
 
@@ -510,8 +511,7 @@ For multi-host production (coordinator on GKE behind a load balancer, a pool of 
 
 Deployment artifacts ship in-tree:
 - [`deploy/helm/engram/`](./deploy/helm/engram/) — Helm chart, cloud-agnostic templates. Deploys the coordinator + optional nginx web frontend.
-- [`deploy/packer/`](./deploy/packer/) — Packer manifest for the GCE FC host image.
-- [`deploy/terraform/gcp/`](./deploy/terraform/gcp/) — GCP reference modules (network, storage, fc-host-mig) + `examples/minimal/`.
+- [`deploy/terraform/gcp/`](./deploy/terraform/gcp/) — GCP reference modules (network, storage, fc-host-gsa) + `examples/minimal/`.
 
 See [`docs/deploy.md`](./docs/deploy.md) for the full env-var inventory, the KEK + egress-proxy CA sourcing path, IAM/Workload-Identity wiring, and the operational gaps (observability, AWS Terraform, multi-region) still slated for v2 with their workarounds.
 

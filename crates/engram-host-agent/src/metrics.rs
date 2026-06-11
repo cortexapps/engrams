@@ -1,13 +1,8 @@
 //! Prometheus metrics exporter for the host-agent.
 //!
-//! Listens on `ENGRAM_HOST_METRICS_ADDR` (default `0.0.0.0:9100`)
-//! so it doubles as the TCP target for the GCE MIG's autohealing
-//! health check (see `deploy/terraform/gcp/modules/fc-host-mig/main.tf`
-//! — `google_compute_health_check.host_agent` targets this port).
-//! Before this listener existed, the MIG marked every instance
-//! unhealthy after `initial_delay_sec` and rolled them in a tight
-//! loop. Just binding the port satisfies the TCP probe; the
-//! metrics themselves are a bonus.
+//! Listens on `ENGRAM_HOST_METRICS_ADDR` (default `0.0.0.0:9100`),
+//! the Prometheus scrape target (a k8s ServiceMonitor scrapes this
+//! port).
 //!
 //! Same naming convention as the coord's metrics module:
 //! `engram_<subsystem>_<thing>_<unit>`, low-cardinality labels.
@@ -126,6 +121,10 @@ pub const SANDBOX_GUEST_RSS_BYTES: &str = "engram_sandbox_guest_rss_bytes";
 ///
 /// This is the authoritative signal that the 60 s hang is gone.
 pub const SNAPSHOT_CREATE_SECONDS: &str = "engram_snapshot_create_seconds";
+/// ADR 0045 D5 + issue #147: wall-clock of the snapshot POST phase (disk
+/// upload + memory re-chunk + portable blobs) — the previously-invisible
+/// half of "the snapshot is just slow". Labels: type=full|diff, outcome.
+pub const SNAPSHOT_FINISH_SECONDS: &str = "engram_snapshot_finish_seconds";
 
 /// ADR 0038 B0: histogram of how long a capture waited to acquire the
 /// per-sandbox capture lock. The gridlock signal — the 5fadd364

@@ -1,0 +1,70 @@
+{{- if .Values.nodePrep.enabled -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "hostfleet.nodePrep.fullname" . }}
+  labels:
+    {{- include "hostfleet.nodePrep.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hostfleet.nodePrep.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hostfleet.nodePrep.selectorLabels" . | nindent 8 }}
+    spec:
+      # Node-OS prep the Packer image used to bake: load the nbd module
+      # and set the (non-namespaced) sysctls. Idempotent + best-effort
+      # per step so a node that already has them doesn't crash-loop.
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      hostPID: true
+      containers:
+        - name: node-prep
+          image: "{{ .Values.nodePrep.image.repository }}:{{ .Values.nodePrep.image.tag }}"
+          imagePullPolicy: {{ .Values.nodePrep.image.pullPolicy }}
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              echo "[node-prep] modprobe nbd nbds_max={{ .Values.nbd.nbdsMax }}"
+              modprobe nbd nbds_max={{ .Values.nbd.nbdsMax }} 2>&1 || echo "[node-prep] nbd modprobe skipped (already loaded or unavailable)"
+              {{- range $k, $v := .Values.nodePrep.sysctls }}
+              # {{ $k }} — non-namespaced sysctls (vm.*) take effect node-wide;
+              # namespaced ones (net.*) only bind this pod's netns and are
+              # re-applied by the host-agent in its own netns.
+              echo "[node-prep] sysctl {{ $k }}={{ $v }}"
+              ( echo {{ $v | quote }} > /proc/sys/{{ $k | replace "." "/" }} ) 2>&1 || echo "[node-prep] {{ $k }} skipped"
+              {{- end }}
+              {{- with .Values.firecracker.uffdBaseDir }}
+              # ADR 0045 D3: tmpfs for the per-template base shm files
+              # (UFFD MINOR faults are shmem-only). Mounted in the HOST
+              # mount namespace via nsenter (hostPID:true gives us pid 1;
+              # busybox ships nsenter) so the host-agent's hostPath volume
+              # sees it. Idempotent across pod restarts; never unmounted —
+              # live VMs map files inside it.
+              echo "[node-prep] tmpfs {{ . }} (size={{ $.Values.firecracker.uffdBaseTmpfsSize }})"
+              nsenter -t 1 -m -- sh -c \
+                'mkdir -p {{ . }} && { mountpoint -q {{ . }} || mount -t tmpfs -o size={{ $.Values.firecracker.uffdBaseTmpfsSize }} engram-base-shm {{ . }}; }' \
+                2>&1 || echo "[node-prep] base-shm tmpfs mount FAILED (substrate restores will fail loudly)"
+              {{- end }}
+              echo "[node-prep] done; holding"
+              exec sleep infinity
+          volumeMounts:
+            - {name: lib-modules, mountPath: /lib/modules, readOnly: true}
+          resources:
+            requests: {cpu: "10m", memory: 32Mi}
+            limits: {cpu: "100m", memory: 64Mi}
+      volumes:
+        - {name: lib-modules, hostPath: {path: /lib/modules, type: Directory}}
+{{- end }}

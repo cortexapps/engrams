@@ -179,3 +179,36 @@ Commit chain (this branch):
   the verifiable "is the 60 s Full-seed gone" signal and avoids a
   redundant span; the existing `snapshot` operation-scope already
   brackets the capture in Cloud Trace.
+
+## Post-merge correctness fix: atomic flush (chunk-drop incident)
+
+The **B3 durability-before-record invariant above was violated** by a
+chunk-drop bug found in prod (session `79b689e4`, 2026-06-06): a fresh
+dev session lost ~half its disk writes (6 of 13 chunks), every periodic
+checkpoint carried the dangling references forward, and guest reads of
+the dropped regions returned EIO (#103's fail-fast kept the VM alive
+instead of wedging).
+
+**Root cause.** `flush_upload`'s parallel upload re-read each chunk's
+bytes from the **shared** `pending_uploads` map by `chunk_idx`, with an
+`else return Ok(())` when the entry was absent. With the periodic-
+checkpoint flush and the threshold `flush_scheduler` flush both racing
+the shared buffer, one flush could clear `pending_uploads[idx]` before
+the other's upload read it → the put was **silently skipped as success**
+while the manifest rebuild still referenced that chunk's hash.
+`try_collect()?` caught hard put errors but not skips, so a manifest got
+published pointing at a chunk nobody uploaded — the invariant broke
+despite the rebase-after-upload ordering.
+
+**Fix — all-or-nothing flush.** `PendingDiskFlush` now carries the
+drained bytes, so `flush_upload` uploads from **its own** `new_chunks`
+(no shared-map lookup, no silent skip); the put set is exactly the
+manifest's new chunks. `try_collect` aborts on the first put error and
+the rebuild runs only on full success. On **any** failure the flush is an
+atomic no-op: the manifest is not advanced, the drained bytes are
+re-queued into `dirty` (a newer guest write wins) so the next checkpoint
+retries, and reads keep resolving from `dirty`/`pending` — nothing is
+lost and the previous snapshot stands. Pending entries are cleared on
+success only when the hash still matches (never clobber a concurrent
+flush's newer entry). Parallel upload is retained (the #19 latency win).
+Regression test: `flush_upload_failure_is_atomic_no_op_and_retains_bytes`.

@@ -26,6 +26,23 @@ pub struct SnapshotMetadata {
     /// stays FC-only.
     #[serde(default)]
     pub memory_manifest: Option<super::manifest::ManifestRef>,
+    /// ADR 0045 D4: the IMAGE's base-snapshot memory manifest — the
+    /// CANONICAL ref for substrate restores. When set, the UFFD handler
+    /// resolves pages still identical to the image base via
+    /// `UFFDIO_CONTINUE` against the SHARED per-image base shm file
+    /// (one page-cache copy per host across fresh + resumed sessions),
+    /// and only session-divergent pages install privately. `None` ⇒
+    /// canonical == `memory_manifest` (the pre-D4 behavior; also the
+    /// mixed-version fallback — old coordinators simply don't send it).
+    #[serde(default)]
+    pub base_memory_manifest: Option<super::manifest::ManifestRef>,
+    /// ADR 0045 C1: present when this restore is the DESTINATION leg of
+    /// a live teleport — everything the dest needs to pull the frozen
+    /// source's export and restore from not-yet-durable manifests.
+    /// serde-default ⇒ mixed-roll-safe; old hosts ignore it and the
+    /// coordinator falls back to snapshot-rehome on `InvalidSpec`.
+    #[serde(default)]
+    pub migration_source: Option<MigrationSourceInfo>,
     /// ADR 0014: source sandbox_id at snapshot time. Required for
     /// receivers to re-create canonical rootfs/harness symlinks at
     /// `<work_dir>/{rootfs,harness}/<source_sandbox_id>.{dev,ext4}`
@@ -153,4 +170,56 @@ pub struct SnapshotRecord {
     /// tombstoning".
     #[serde(default)]
     pub events_cursor: Option<i64>,
+}
+
+/// ADR 0045 C1: the destination-side rider on a migration restore's
+/// metadata. The coordinator assembles it from `MigrationCaptureOut` +
+/// the source's `host_addr`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MigrationSourceInfo {
+    pub export_id: String,
+    /// h2c URL of the source host-agent, e.g. `http://10.10.0.42:9101`.
+    pub source_addr: String,
+    pub memory_manifest_json: Vec<u8>,
+    pub disk_manifest_json: Vec<u8>,
+    pub memory_manifest_ref: super::manifest::ManifestRef,
+    pub disk_manifest_ref: super::manifest::ManifestRef,
+    pub new_memory_chunk_hashes: Vec<[u8; 32]>,
+    pub new_disk_chunk_hashes: Vec<[u8; 32]>,
+}
+
+/// ADR 0045 C1: what `migration_capture` hands the coordinator — the
+/// frozen sandbox's not-yet-durable next manifests (inline JSON; durable
+/// only after the destination's catch-up) plus the transfer set the
+/// destination must pull from the source's export.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MigrationCaptureOut {
+    pub export_id: String,
+    pub memory_manifest_json: Vec<u8>,
+    pub disk_manifest_json: Vec<u8>,
+    pub memory_manifest_ref: super::manifest::ManifestRef,
+    /// PROVISIONAL — shared-template disk lineages version-race; the
+    /// destination's catch-up publish does the conflict-retry dance.
+    pub disk_manifest_ref: super::manifest::ManifestRef,
+    pub new_memory_chunk_hashes: Vec<[u8; 32]>,
+    pub new_disk_chunk_hashes: Vec<[u8; 32]>,
+    pub snapshot_id: super::ids::SnapshotId,
+    pub paused_at_unix_ms: i64,
+}
+
+/// One artifact the destination pulls from a migration export.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MigrationItem {
+    StateBin,
+    Sidecar,
+    Chunk([u8; 32]),
+}
+
+/// A frame of `migration_fetch`'s stream.
+#[derive(Debug, Clone)]
+pub struct MigrationFrame {
+    pub item_idx: u32,
+    pub offset: u64,
+    pub data: bytes::Bytes,
+    pub last: bool,
 }

@@ -45,10 +45,8 @@ struct Cli {
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
 
-    /// Address the Prometheus `/metrics` exporter listens on.
-    /// Doubles as the TCP target for the GCE MIG's autohealing
-    /// health check (see fc-host-mig TF — `google_compute_health_check.host_agent`
-    /// targets port 9100).
+    /// Address the Prometheus `/metrics` exporter listens on. This is
+    /// the Prometheus scrape target (k8s ServiceMonitor scrapes port 9100).
     #[arg(long, env = "ENGRAM_HOST_METRICS_ADDR", default_value = "0.0.0.0:9100")]
     metrics_addr: std::net::SocketAddr,
 
@@ -68,9 +66,10 @@ struct Cli {
 
     /// ADR 0013: externally-routable URL the coord uses to dial the
     /// gRPC server (sent to coord in `POST /api/hosts/register`).
-    /// When unset, host-agent auto-derives it: GCE metadata server
-    /// → `http://<internal-ip>:<grpc-port>`; falls back to
-    /// `http://127.0.0.1:<grpc-port>` for non-GCE dev runs.
+    /// On K8s the chart injects this (the pod's routable address);
+    /// when unset, host-agent falls back to
+    /// `http://127.0.0.1:<grpc-port>` for dev runs (coord and
+    /// host-agent on the same box).
     /// Set to an empty string to opt out of registration entirely.
     #[arg(long, env = "ENGRAM_GRPC_ADVERTISE_ADDR")]
     grpc_advertise_addr: Option<String>,
@@ -192,10 +191,9 @@ async fn main() -> Result<(), HostAgentError> {
 
     let cli = Cli::parse();
 
-    // Bind the metrics port first. It doubles as the GCE MIG
-    // autohealing health check's TCP target — without this listener
-    // the autohealer fails every instance after the 180s grace
-    // period and the MIG rolls in a tight loop.
+    // Bind the metrics port first. It's the Prometheus scrape target
+    // (k8s ServiceMonitor scrapes it); binding early means metrics are
+    // available as soon as the process is up.
     engram_host_agent::metrics::init(cli.metrics_addr);
 
     // ADR 0013: resolve the gRPC listen + advertise addrs.
@@ -205,14 +203,12 @@ async fn main() -> Result<(), HostAgentError> {
     // standalone dev where the host-agent serves only its in-proc
     // backend). Default 0.0.0.0:9101 is "always on" in production.
     //
-    // advertise_addr: prefer ENGRAM_GRPC_ADVERTISE_ADDR; if unset,
-    // try the GCE metadata server for the host's internal IP; if
-    // neither yields a value, fall back to 127.0.0.1 with the
-    // resolved listen port (covers dev-vm split-mode where the
-    // coord and host-agent run on the same box).
+    // advertise_addr: prefer ENGRAM_GRPC_ADVERTISE_ADDR (the chart
+    // injects the pod's routable address on K8s); if unset, fall back
+    // to 127.0.0.1 with the resolved listen port (covers dev-vm
+    // split-mode where the coord and host-agent run on the same box).
     let (grpc_listen_addr, grpc_port) = parse_grpc_listen(&cli.grpc_listen_addr);
-    let grpc_advertise_addr =
-        resolve_advertise_addr(cli.grpc_advertise_addr.clone(), grpc_port).await;
+    let grpc_advertise_addr = resolve_advertise_addr(cli.grpc_advertise_addr.clone(), grpc_port);
 
     let cfg = HostAgentConfig {
         work_dir: cli.work_dir.clone(),
@@ -223,13 +219,16 @@ async fn main() -> Result<(), HostAgentError> {
         ..HostAgentConfig::default()
     };
 
-    // ADR 0007 Phase 5: generate a per-startup HostId early so the
-    // FC config can stamp it on snapshots' `trace_host_hint` and
-    // pass it as `--publish-trace-host` to the UFFD handler.
-    // Cross-host trace replay keys off this id — a snapshot taken
-    // by host A becomes restoreable on host B with B reusing A's
-    // recorded trace.
-    let host_id = engram_core::HostId::new();
+    // ADR 0007 Phase 5: resolve the HostId early so the FC config can
+    // stamp it on snapshots' `trace_host_hint` and pass it as
+    // `--publish-trace-host` to the UFFD handler. Cross-host trace replay
+    // keys off this id — a snapshot taken by host A becomes restoreable on
+    // host B with B reusing A's recorded trace.
+    // ADR 0044 K2 (GAP 1): STABLE across restarts (persisted in work_dir,
+    // node-name-seeded on K8s) so a DaemonSet pod restart keeps its host
+    // identity and the coordinator's session→host binding survives.
+    let node_name = std::env::var("NODE_NAME").ok().filter(|s| !s.is_empty());
+    let host_id = resolve_host_id(&cli.work_dir, node_name.as_deref());
 
     // ADR 0007: blob backend + chunk store. Created before the backend
     // match so the inner VZ backend can be wired with its own chunk
@@ -259,6 +258,13 @@ async fn main() -> Result<(), HostAgentError> {
             })?;
             let mut fc_cfg = engram_sandbox_firecracker::FirecrackerConfig::with_kernel(kernel);
             fc_cfg.host_id = Some(host_id);
+            // ADR 0044 K2 / GAP 2: on K8s the firecracker binary is staged
+            // into a pod emptyDir (e.g. /opt/engram/firecracker), not on
+            // PATH. Point the backend at it. Defaults to a PATH lookup of
+            // `firecracker` (the GCE/Packer hosts + dev).
+            if let Some(p) = std::env::var_os("ENGRAM_FIRECRACKER_BIN") {
+                fc_cfg.firecracker_bin = PathBuf::from(p);
+            }
             // ADR 0028 Fix A: arm KVM dirty tracking fleet-wide so every
             // capture after the chain's first can be a Diff (O(dirty)
             // pause). Tied to the same env knob as the checkpoint driver —
@@ -294,16 +300,18 @@ async fn main() -> Result<(), HostAgentError> {
             // env var overrides (`""` / `"none"` for passthrough, any
             // other value for a custom template name).
             fc_cfg.cpu_template = engram_sandbox_firecracker::cpu_template_from_env();
+            // ADR 0044 K2: on K8s the chart sets this to a node-level cgroup
+            // dir (e.g. /sys/fs/cgroup/engram-vms); the FC backend moves each
+            // VM's processes there so a host-agent pod restart's cgroup teardown
+            // doesn't kill them. Unset on dev / tests (no pod scope to escape).
+            fc_cfg.vm_cgroup_parent = std::env::var("ENGRAM_FC_VM_CGROUP_PARENT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
             // ADR 0020 Route B: ENGRAM_FC_RESTORE_MODE=uffd flips restore
             // to the chunk-native UFFD handler (lazy memory, no memory.bin
             // materialize). Defaults to File.
             fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
-            // ADR 0022 Option A: ENGRAM_FC_BASE_RESTORE_MODE=file flips
-            // *base session.create* restores to the File backend against
-            // the per-template resident memfile (density + faster boot),
-            // leaving idle-resume on `restore_mode`. Unset ⇒ base-create
-            // inherits `restore_mode` (behaviour-preserving).
-            fc_cfg.base_restore_mode = engram_sandbox_firecracker::base_restore_mode_from_env();
             // Point the UFFD handler at the SAME chunk cache the
             // PooledBackend's restore-prefetch warms (`chunk-cache`,
             // see below) — not the FC backend's separate default — so
@@ -317,6 +325,17 @@ async fn main() -> Result<(), HostAgentError> {
             if let Ok(p) = std::env::var("ENGRAM_FC_UFFD_HANDLER_BIN") {
                 fc_cfg.uffd_handler_bin = p.into();
             }
+            // ADR 0045 unified memory substrate (v2b): when
+            // ENGRAM_FC_UFFD_BASE_DIR points at a tmpfs dir, Uffd-mode
+            // restores back guest memory MAP_PRIVATE on a per-template
+            // base shm file there — canonical pages become one shared
+            // page-cache copy per host (the D2 rollout gate; D3/D4
+            // parity flips retire the knob).
+            fc_cfg.uffd_base_dir = engram_sandbox_firecracker::uffd_base_dir_from_env();
+            // ADR 0045 D4: GC unreferenced base shm files (disabled
+            // images, pre-D4 session-keyed leftovers). Live files are
+            // protected by the handlers' open fds; see base_shm_gc.
+            let _base_shm_gc = engram_host_agent::base_shm_gc::spawn(fc_cfg.uffd_base_dir.clone());
             // ADR 0014 M1.12: each FC host maintains a 16 MiB empty
             // ext4 stub harness that warm-pool restore points the
             // harness symlink at. Content-identical to the one the
@@ -577,16 +596,15 @@ fn parse_grpc_listen(raw: &str) -> (Option<std::net::SocketAddr>, u16) {
 /// Resolve the externally-routable URL the coord uses to dial us.
 /// ADR 0013. Precedence:
 ///   1. The CLI/env `ENGRAM_GRPC_ADVERTISE_ADDR` value, if non-empty.
-///      An explicit empty string opts out of registration.
-///   2. The GCE metadata server's primary internal IP, with the
-///      resolved gRPC port. Times out fast (500 ms) so a non-GCE dev
-///      run doesn't pay the wait.
-///   3. `http://127.0.0.1:<grpc_port>` — appropriate for the dev-vm
-///      split-mode test where the coord runs on the same VM.
+///      An explicit empty string opts out of registration. On K8s the
+///      chart always injects this (`http://$(POD_IP):<port>` — the node
+///      IP under hostNetwork, ADR 0044 K2).
+///   2. `http://127.0.0.1:<grpc_port>` — the dev-vm split-mode fallback
+///      where the coord runs on the same VM.
 ///
 /// `grpc_port=0` (gRPC server disabled) returns `None` regardless of
 /// the env var, since there's nothing to advertise.
-async fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Option<String> {
+fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Option<String> {
     if grpc_port == 0 {
         if cli_value.as_deref().is_some_and(|s| !s.is_empty()) {
             tracing::warn!("ENGRAM_GRPC_ADVERTISE_ADDR set but gRPC listener disabled; ignoring",);
@@ -602,47 +620,15 @@ async fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Op
         }
         return Some(v);
     }
-    // Try GCE metadata server with a short timeout.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(500))
-        .build()
-        .ok()?;
-    let metadata_url =
-        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip";
-    match client
-        .get(metadata_url)
-        .header("Metadata-Flavor", "Google")
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => match resp.text().await {
-            Ok(ip) => {
-                let ip = ip.trim();
-                if ip.is_empty() {
-                    tracing::warn!("GCE metadata returned empty IP; falling back to 127.0.0.1");
-                    Some(format!("http://127.0.0.1:{grpc_port}"))
-                } else {
-                    let addr = format!("http://{ip}:{grpc_port}");
-                    tracing::info!(
-                        advertise_addr = %addr,
-                        "resolved gRPC advertise addr from GCE metadata",
-                    );
-                    Some(addr)
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "GCE metadata body read failed; falling back");
-                Some(format!("http://127.0.0.1:{grpc_port}"))
-            }
-        },
-        _ => {
-            tracing::info!(
-                "GCE metadata server unreachable; advertising http://127.0.0.1:{grpc_port} \
-                 (set ENGRAM_GRPC_ADVERTISE_ADDR explicitly for non-GCE multi-host runs)",
-            );
-            Some(format!("http://127.0.0.1:{grpc_port}"))
-        }
-    }
+    // No explicit advertise addr: the dev-vm split-mode fallback (coord on
+    // the same VM). On K8s the chart always injects
+    // ENGRAM_GRPC_ADVERTISE_ADDR, so this is dev-only — the GCE-metadata-server
+    // probe this used to fall back to retired with the MIG (ADR 0044 K5).
+    tracing::info!(
+        "ENGRAM_GRPC_ADVERTISE_ADDR unset; advertising http://127.0.0.1:{grpc_port} \
+         (set it explicitly for a multi-host run)",
+    );
+    Some(format!("http://127.0.0.1:{grpc_port}"))
 }
 
 /// Initialise the global tracing subscriber (+ optional OpenTelemetry
@@ -656,6 +642,48 @@ async fn resolve_advertise_addr(cli_value: Option<String>, grpc_port: u16) -> Op
 ///
 /// The returned guard must be held for the lifetime of `main` so spans
 /// flush on shutdown (`TelemetryGuard` is itself `#[must_use]`).
+/// ADR 0044 K2 (GAP 1): resolve a STABLE `HostId` so a DaemonSet pod
+/// restart keeps the same host identity. K2's detach+reattach leaves the
+/// node's VMs running and the successor pod re-adopts them — but only if
+/// it re-registers under the SAME id, or the coordinator's session→host
+/// binding goes stale (reconcile would migrate a live VM out from under
+/// itself). Resolution order:
+///   1. `<work_dir>/host_id` if present + parseable — the work_dir is a
+///      node hostPath on K8s, so it survives a pod restart on the node.
+///   2. else seed deterministically from the K8s node name (so a
+///      same-node restart with a wiped work_dir still recovers the id),
+///      and persist it.
+///   3. else (no node name — non-K8s dev) a fresh random id, persisted.
+fn resolve_host_id(work_dir: &std::path::Path, node_name: Option<&str>) -> engram_core::HostId {
+    let id_path = work_dir.join("host_id");
+    if let Ok(contents) = std::fs::read_to_string(&id_path) {
+        if let Ok(id) = contents.trim().parse::<engram_core::HostId>() {
+            tracing::info!(%id, path = %id_path.display(), "host_id: reusing persisted id");
+            return id;
+        }
+        tracing::warn!(
+            path = %id_path.display(),
+            "host_id: file present but unparseable; regenerating"
+        );
+    }
+    let id = match node_name {
+        Some(name) if !name.is_empty() => engram_core::HostId::from_node_name(name),
+        _ => engram_core::HostId::new(),
+    };
+    if let Some(parent) = id_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&id_path, id.to_string()) {
+        tracing::warn!(
+            error = %e,
+            path = %id_path.display(),
+            "host_id: failed to persist; a work_dir wipe on the same node would change identity"
+        );
+    }
+    tracing::info!(%id, node_name = ?node_name, "host_id: generated + persisted");
+    id
+}
+
 /// ADR 0022: raise `RLIMIT_MEMLOCK` to unlimited so the image prefetcher can
 /// pin (`mlock`) per-template base memfiles resident. Root can raise its own
 /// hard limit; best-effort — a failure is logged and the mlock attempts in
@@ -700,5 +728,49 @@ fn default_vz_kernel_path() -> Option<PathBuf> {
         Some(candidate)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_id_persists_and_is_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = resolve_host_id(tmp.path(), Some("node-a"));
+        // A persisted id wins over the node-name seed on the next start.
+        let second = resolve_host_id(tmp.path(), Some("a-totally-different-node"));
+        assert_eq!(first, second, "persisted host_id must be reused verbatim");
+        let on_disk = std::fs::read_to_string(tmp.path().join("host_id")).unwrap();
+        assert_eq!(
+            on_disk.trim().parse::<engram_core::HostId>().unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn node_name_seed_is_deterministic_across_wiped_work_dirs() {
+        // Same node name → same id even with a fresh work_dir (the
+        // disk-wipe-same-node recovery path).
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_host_id(a.path(), Some("node-x")),
+            resolve_host_id(b.path(), Some("node-x")),
+        );
+        assert_ne!(
+            engram_core::HostId::from_node_name("node-x"),
+            engram_core::HostId::from_node_name("node-y"),
+        );
+    }
+
+    #[test]
+    fn no_node_name_generates_random_then_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = resolve_host_id(tmp.path(), None);
+        // Persisted, so the next start on the same work_dir reuses it.
+        let second = resolve_host_id(tmp.path(), None);
+        assert_eq!(first, second);
     }
 }

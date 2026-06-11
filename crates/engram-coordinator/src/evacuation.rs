@@ -2,9 +2,11 @@
 //!
 //! `evacuate_dead_source` restores a session onto a peer host from
 //! already-recorded artifacts (a snapshot row and/or the live disk
-//! manifest) when the source host is gone. The two callers — the
-//! `evac_resumer` background scanner (driving `Evacuating → Created`)
-//! and the FC NBD-loss trigger — share this one implementation.
+//! manifest) when the source host is gone. Its sole caller is the
+//! `evac_resumer` background scanner (driving `Evacuating → Created`),
+//! fed by operator drain (ADR 0044 K3). ADR 0045 Phase A retired the
+//! reactive NBD-loss / dead-host producers, so this is a drain-only
+//! primitive now.
 //!
 //! The primitive leaves the session at `Created` on the new host: the
 //! restored VM has snapshotted memory but a stale harness (its vsock
@@ -176,11 +178,12 @@ fn pick_evac_disk_manifest(
     }
 }
 
-/// Mechanics for **dead-source** evacuation. Used by `dead_host.rs`'s
-/// second-stage transition (Phase B) when a host is already marked
-/// Dead and the session has been flipped to `HostLost` — the source
-/// backend is unreachable, so a fresh source-side snapshot isn't
-/// possible.
+/// Mechanics for **dead-source** evacuation. Driven by the
+/// `evac_resumer` scanner for `Evacuating` sessions (produced by
+/// operator drain, ADR 0044 K3) — restores from existing artifacts
+/// because the source backend is unreachable, so a fresh source-side
+/// snapshot isn't possible. (ADR 0045 Phase A retired the reactive
+/// dead-host / NBD-loss producers that used to feed this.)
 ///
 /// Restores from existing artifacts, rung-aware (ADR 0028 recovery
 /// ladder):
@@ -222,6 +225,10 @@ pub async fn evacuate_dead_source(
     // is disk-only recoverable and this is `None`, the call fails
     // structurally with `ColdBootUnavailable`.
     cold_boot_spec: Option<engram_core::types::sandbox::SandboxSpec>,
+    // ADR 0045 Phase F (teleport): when `Some`, place onto this exact
+    // host instead of the capacity-ranked pick (operator-pinned
+    // destination). `None` keeps the standard any-peer policy.
+    require_host: Option<engram_core::HostId>,
 ) -> Result<EvacReceipt, EvacError> {
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
@@ -285,26 +292,34 @@ pub async fn evacuate_dead_source(
         image_version: image_tag,
         prefer_snapshot_id: snapshot.as_ref().map(|s| s.id),
         memory_mib: None,
-        // Phase C target-selection: image-cache-warm preference is a
-        // future refinement (defer when we add zone tagging to
-        // HostState). Today we accept any host that can take the
-        // work, but never the source host (exclude_host) — set to
-        // the prior owner via `session.host_id` so the NBD-loss
-        // trigger doesn't relocate back onto the degraded host. For
-        // the dead-source path the source is already unregistered;
-        // exclude_host is defensive.
+        // Target-selection: image-cache-warm preference is a future
+        // refinement (defer when we add zone tagging to HostState).
+        // Today we accept any host that can take the work, but never
+        // the source host (exclude_host) — set to the prior owner via
+        // `session.host_id` so a drain doesn't relocate back onto the
+        // host being drained. For the dead-source path the source is
+        // already unregistered; exclude_host is defensive.
         required_image_digest: None,
         exclude_host: session.host_id,
+        prefer_host: None,
     };
 
     // Split pick + restore so picker errors and backend errors keep
     // distinct typing — picker failures are `NoTargetAvailable`
     // (operator action: free capacity or wait for image prefetch);
     // backend failures are `RestoreFailed` (retry against another
-    // host or surface to user).
-    let (target_host, target_backend) = registry
-        .pick_for_session(&ctx)
-        .map_err(EvacError::NoTargetAvailable)?;
+    // host or surface to user). ADR 0045 Phase F: an operator-pinned
+    // teleport target bypasses capacity ranking and places on that
+    // exact host (still excluding the source); a bad pin retries then
+    // falls back to Idle rather than silently landing elsewhere.
+    let (target_host, target_backend) = match require_host {
+        Some(host) => registry
+            .pick_specific_host(host, session.host_id)
+            .map_err(EvacError::NoTargetAvailable)?,
+        None => registry
+            .pick_for_session(&ctx)
+            .map_err(EvacError::NoTargetAvailable)?,
+    };
 
     let new_sandbox_id = match cold_boot {
         // ADR 0028 Fix B — rung 2: no coherent memory snapshot, but
@@ -345,13 +360,30 @@ pub async fn evacuate_dead_source(
             let s = snapshot
                 .as_ref()
                 .expect("memory_manifest implies a snapshot row");
+            // ADR 0045 D4: best-effort image-base canonical ref (shared
+            // per-image base shm on the target); None falls back to
+            // canonical == session.
+            let base_memory_manifest = match meta.get_enabled_image(&session.image).await {
+                Ok(Some(img)) => match img.base_snapshot_id {
+                    Some(bid) => meta
+                        .get_snapshot(bid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|b| b.memory_manifest),
+                    None => None,
+                },
+                _ => None,
+            };
             let metadata = SnapshotMetadata {
+                migration_source: None,
                 id: s.id,
                 size_bytes: s.size_bytes,
                 created_at: s.created_at,
                 image_version: s.image_version.clone(),
                 disk_manifest,
                 memory_manifest,
+                base_memory_manifest,
                 source_sandbox_id: None,
                 state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(s.id)),
                 sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(s.id)),
@@ -376,9 +408,11 @@ pub async fn evacuate_dead_source(
     }
     registry.record_sandbox_owner(new_sandbox_id, target_host);
 
-    // PG rebind. dead_host.rs has already flipped Active → HostLost
-    // (via `mark_host_dead_and_orphan_sessions`), so we drive
-    // HostLost → Created here.
+    // PG rebind. The `evac_resumer` scanner has the session at
+    // `Evacuating` (operator drain flipped Active → Evacuating), so we
+    // drive Evacuating → Created here. (`transition_session` enforces
+    // the legality table; both Evacuating → Created and the legacy
+    // HostLost → Created are legal edges.)
     meta.assign_session_host(session_id, Some(target_host))
         .await
         .map_err(EvacError::Rebind)?;
@@ -477,6 +511,8 @@ mod tests {
                 size_bytes: 1024,
                 created_at: chrono::Utc::now(),
                 image_version: "test".into(),
+                base_memory_manifest: None,
+                migration_source: None,
                 disk_manifest: None,
                 memory_manifest: None,
                 source_sandbox_id: None,
@@ -907,6 +943,7 @@ mod tests {
             session.clone(),
             Some(snapshot),
             None,
+            None,
         )
         .await
         .expect("rung-1 happy path");
@@ -962,6 +999,7 @@ mod tests {
             session.clone(),
             Some(snapshot),
             None,
+            None,
         )
         .await
         .expect("snapshot-only happy path");
@@ -1010,6 +1048,7 @@ mod tests {
             session.clone(),
             None,
             Some(test_cold_boot_spec()),
+            None,
         )
         .await
         .expect("disk-only cold-boot happy path");
@@ -1053,6 +1092,7 @@ mod tests {
             session.clone(),
             None,
             None,
+            None,
         )
         .await;
         match &result {
@@ -1078,6 +1118,7 @@ mod tests {
             &registry,
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
+            None,
             None,
             None,
         )
@@ -1107,6 +1148,7 @@ mod tests {
             session.clone(),
             None,
             Some(test_cold_boot_spec()),
+            None,
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoTargetAvailable(_))));

@@ -52,9 +52,11 @@ jobs:
       host_binaries: ${{ steps.lanes.outputs.host_binaries }}
       host_base: ${{ steps.lanes.outputs.host_base }}
       host_image: ${{ steps.lanes.outputs.host_image }}
+      cli_tools: ${{ steps.lanes.outputs.cli_tools }}
       tf_or_helm: ${{ steps.lanes.outputs.tf_or_helm }}
       bundles: ${{ steps.lanes.outputs.bundles }}
       dev_image: ${{ steps.lanes.outputs.dev_image }}
+      fc_fork: ${{ steps.lanes.outputs.fc_fork }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -102,7 +104,7 @@ jobs:
       # Surface every image's failure independently — easier to debug.
       fail-fast: false
       matrix:
-        image: [coordinator, host-agent, web]
+        image: [coordinator, host-agent, host-operator, web]
 
     steps:
       - uses: actions/checkout@v6
@@ -252,6 +254,351 @@ jobs:
             oras tag "$REPO:$SHA" "main"
           fi
           echo "Published host-binaries -> $REPO:{$SHA,$SHORT}"
+
+  # ADR 0045 Phase B: build the FORKED Firecracker (the third_party/firecracker
+  # submodule — our MAP_SHARED + Msync/MsyncAndState surface on a pinned upstream
+  # tag) as a static-musl binary and publish it to GHCR as an OCI artifact keyed
+  # by the FORK's commit SHA. publish-node-assets pulls it (by that SHA) and
+  # stages it as /opt/engram/firecracker via ENGRAM_FC_SRC — replacing the
+  # upstream-release download, with the node-assets image contract unchanged.
+  #
+  # Gated on the fc_fork lane (the submodule pointer moved), so the heavy FC
+  # compile runs ONLY when the fork actually changes; because the artifact is
+  # content-keyed by the fork SHA, every other node-assets bake reuses it. The
+  # daily rebase cron (ADR 0045 Phase B M4) bumps the submodule, which trips this
+  # lane and rolls the new binary through the existing node-assets → host fleet.
+  build-firecracker:
+    needs: detect
+    if: needs.detect.outputs.fc_fork == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    concurrency:
+      group: bake-firecracker-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          # The forked FC source lives in the submodule; fetch it. (Only THIS job
+          # checks out submodules — every other job stays on a bare checkout so it
+          # never pays the FC clone.) The default GITHUB_TOKEN is scoped to THIS
+          # repo, so it can't read the INTERNAL cortexapps/firecracker submodule —
+          # use the cross-org GH_TOKEN (same PAT the notify job uses) so the
+          # submodule fetch authenticates.
+          submodules: recursive
+          token: ${{ secrets.GH_TOKEN }}
+          # Full history (main repo AND the submodule) so the R2 guard's
+          # `git describe` can walk the fork HEAD back to its upstream base tag.
+          # A shallow (depth-1) submodule has no ancestry, so describe finds no
+          # tag. build-firecracker runs rarely (fork bumps only), so the cost is
+          # fine.
+          fetch-depth: 0
+
+      - name: Resolve fork SHA + R2 snapshot-compat guard
+        id: fork
+        working-directory: third_party/firecracker
+        run: |
+          set -euo pipefail
+          FC_SHA="$(git rev-parse HEAD)"
+          echo "fc_sha=$FC_SHA" >> "$GITHUB_OUTPUT"
+          # R2 (ADR 0045 Phase B): the fork MUST stay snapshot-wire-compatible
+          # with stock FC — it must not touch the snapshot (de)serialization or
+          # bump SNAPSHOT_VERSION, so stock<->fork Full/Diff snapshots restore
+          # both directions (mixed fleets during a roll are then safe by
+          # construction). Compare against the upstream base tag the fork sits on
+          # (robust across the M4 auto-rebases, which move the base forward).
+          # `git describe` needs full history + the release tags. Deepen the
+          # submodule if checkout left it shallow, fetch tags from the
+          # (authenticated) fork origin, then fall back to upstream
+          # firecracker-microvm (public, no auth) if the tags still aren't found.
+          git fetch --tags --unshallow --quiet origin 2>/dev/null \
+            || git fetch --tags --quiet origin 2>/dev/null || true
+          # `--match 'v[0-9]*'` finds the UPSTREAM base tag (e.g. v1.16.0) and
+          # ignores our own `engram-v*` lockstep tags, which sit on the fork HEAD.
+          BASE="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+          if [ -z "$BASE" ]; then
+            git fetch --tags --quiet https://github.com/firecracker-microvm/firecracker.git || true
+            BASE="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+          fi
+          [ -n "$BASE" ] || { echo "::error::R2 guard: could not determine the fork's upstream base tag"; exit 1; }
+          echo "Fork base tag: $BASE"
+          if ! git diff --quiet "$BASE"..HEAD -- src/vmm/src/snapshot/; then
+            echo "::error::R2 guard: the fork modifies src/vmm/src/snapshot/ — the snapshot wire format may diverge from stock FC. See ADR 0045 Phase B."
+            exit 1
+          fi
+          # Version-agnostic: the fork's diff vs the base tag must not touch the
+          # SNAPSHOT_VERSION line (it's 10.0.0 on v1.16.0, was 4.0.0 on v1.10.1 —
+          # the point is the fork doesn't CHANGE upstream's value).
+          if git diff "$BASE"..HEAD -- src/vmm/src/persist.rs | grep -qE '^[-+].*SNAPSHOT_VERSION'; then
+            echo "::error::R2 guard: the fork changes SNAPSHOT_VERSION — stock<->fork restore would break."
+            exit 1
+          fi
+          echo "R2 guard OK: snapshot/ untouched, SNAPSHOT_VERSION unchanged."
+
+      - name: Install FC build deps (cmake, clang, musl, kernel uapi headers)
+        # FC's firecracker binary pulls aws-lc-sys (needs cmake) and
+        # userfaultfd-sys (needs <linux/*.h> + bindgen/clang). Unlike
+        # publish-host-binaries we must NOT inject `-I/usr/include` globally: it
+        # leaks glibc headers into aws-lc-sys's musl build (redundant-decl
+        # -Werror). Instead expose ONLY the libc-agnostic kernel uapi dirs into
+        # musl's own sysroot, so userfaultfd-sys finds the headers and aws-lc-sys
+        # stays clean.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # libseccomp-dev: FC v1.16.x statically links libseccomp (new vs v1.10).
+          sudo apt-get install -y -qq cmake clang musl-tools linux-libc-dev libseccomp-dev
+          MUSL_INC=/usr/include/x86_64-linux-musl
+          sudo ln -sfn /usr/include/linux               "$MUSL_INC/linux"
+          sudo ln -sfn /usr/include/asm-generic         "$MUSL_INC/asm-generic"
+          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm "$MUSL_INC/asm"
+
+      - name: Ensure rustup (FC's rust-toolchain.toml drives the toolchain)
+        # We deliberately don't use a rust-toolchain action (it would set a
+        # default that competes with FC's pinned toolchain). Just guarantee
+        # rustup exists with NO default toolchain, so cargo-in-the-submodule
+        # auto-installs the exact rustc + musl target FC's rust-toolchain.toml
+        # pins. (Matches the dev-vm setup that built this fork.)
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          "$HOME/.cargo/bin/rustup" --version 2>/dev/null || rustup --version
+
+      - name: Build forked firecracker (static musl, FC's pinned toolchain)
+        working-directory: third_party/firecracker
+        # No rust-toolchain action: cargo in this dir honors FC's own
+        # rust-toolchain.toml (it pins the exact rustc and lists the musl
+        # targets, which rustup auto-installs), so the fork builds with its
+        # blessed toolchain regardless of what engrams pins. Don't override it.
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          # bindgen (userfaultfd-sys) parses headers with libclang — point it at
+          # the system uapi headers. This is a separate step from the cc/musl
+          # compile, so it does not affect aws-lc-sys.
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+        run: |
+          set -euo pipefail
+          cargo build -p firecracker --release --target x86_64-unknown-linux-musl
+          BIN=build/cargo_target/x86_64-unknown-linux-musl/release/firecracker
+          file "$BIN" | grep -q "statically linked"
+          "$BIN" --version
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          install -m0755 "$BIN" "$GITHUB_WORKSPACE/dist/firecracker"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Publish forked firecracker to GHCR (oras), keyed by fork SHA
+        working-directory: dist
+        env:
+          FC_SHA: ${{ steps.fork.outputs.fc_sha }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${{ github.repository }}/firecracker"
+          # Tag by the FORK commit SHA (not the engrams SHA) so the artifact is
+          # reused across every engrams commit that doesn't move the submodule.
+          # `oras pull <repo>/firecracker:<fc-sha>` drops the binary into cwd.
+          oras push "$REPO:$FC_SHA" \
+            --artifact-type application/vnd.engrams.firecracker.v1 \
+            firecracker:application/octet-stream
+          echo "Published forked firecracker -> $REPO:$FC_SHA"
+
+  # Compile the ops CLI + the in-guest agentd ONCE — the exact, CI-tested
+  # binaries — and publish them to GHCR as an OCI artifact keyed by SHA. The
+  # reusable bake-dev-image.yml workflow (and any consuming repo's dev-image
+  # bake) pulls these instead of compiling from a private source checkout —
+  # exactly how the FC-host bakes consume publish-host-binaries, and for the
+  # same reason: the bake that ships is the bake CI tested, and the consuming
+  # workflow needs no Rust toolchain. agentd matches the deployed coordinator at
+  # the moving `main` tag (the same contract host-binaries:main relies on).
+  # engram-agentd is static-musl (injected into the guest rootfs at bake);
+  # engram-cli is the runner-native gnu build — it only ever runs on the ubuntu
+  # bake runner, so gnu is correct and dodges a musl reqwest/TLS rebuild.
+  publish-cli-tools:
+    needs: detect
+    if: needs.detect.outputs.cli_tools == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    concurrency:
+      group: bake-cli-tools-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Rust (stable + musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # engram-protocol/build.rs (transitively, via engram-agentd) invokes
+      # protoc. Pin an exact tag — the action's default semver range hits the
+      # GitHub releases API, which flakes on the shared Blacksmith IP pool.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.9"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo build state
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install musl-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
+      - name: Build engram-cli (gnu) + engram-agentd (musl-static)
+        run: |
+          # agentd is injected into the guest rootfs, so it must be static-musl
+          # (no glibc loader inside the minimal guest).
+          cargo build --release --target x86_64-unknown-linux-musl -p engram-agentd
+          # engram-cli drives the bake on the host runner; the runner-native gnu
+          # build is correct and avoids the musl reqwest/TLS rebuild.
+          cargo build --release -p engram-cli
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/engram-agentd dist/
+          cp target/release/engram-cli dist/
+          file dist/engram-cli dist/engram-agentd
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Publish cli-tools to GHCR (oras)
+        working-directory: dist
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${{ github.repository }}/cli-tools"
+          SHORT="${SHA:0:7}"
+          # Both binaries as one artifact tagged by full SHA. `oras pull
+          # <repo>/cli-tools:<ref>` drops engram-cli + engram-agentd into cwd.
+          oras push "$REPO:$SHA" \
+            --artifact-type application/vnd.engrams.cli-tools.v1 \
+            engram-cli:application/octet-stream \
+            engram-agentd:application/octet-stream
+          oras tag "$REPO:$SHA" "$SHORT"
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            oras tag "$REPO:$SHA" "main"
+          fi
+          echo "Published cli-tools -> $REPO:{$SHA,$SHORT}"
+
+  # ADR 0044 K2 / GAP 2 + ADR 0027: bake the node-assets image (firecracker +
+  # the engram guest kernel + the RO session bundles) the engram-host-fleet
+  # chart stages onto each K8s node via a host-agent pod init container. Stock
+  # K8s nodes carry none of these. Gated on the images lane (docker/ changes,
+  # incl. node-assets.Dockerfile / node-assets-fetch.sh) OR the bundles lane (a
+  # skills/playwright change must reach the hosts) — and ordered AFTER
+  # publish-bundles so the bundle-*:main tags node-assets-fetch.sh pulls are
+  # this run's.
+  publish-node-assets:
+    needs: [detect, publish-bundles, build-firecracker]
+    if: |
+      always() &&
+      (needs.detect.outputs.images == 'true'
+        || needs.detect.outputs.bundles == 'true'
+        || github.event_name == 'workflow_dispatch') &&
+      needs.publish-bundles.result != 'failure' &&
+      needs.publish-bundles.result != 'cancelled' &&
+      needs.build-firecracker.result != 'failure' &&
+      needs.build-firecracker.result != 'cancelled'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    concurrency:
+      group: bake-node-assets-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read   # read this repo's own (private) guest-kernel release asset
+      packages: write  # push to GHCR
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      # GHCR login first: node-assets-fetch.sh oras-pulls the bundle-*:main
+      # artifacts below, and the buildx push needs it too.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oras-project/setup-oras@v1
+
+      # ADR 0045 Phase B: pull the FORKED firecracker binary that build-firecracker
+      # published, keyed by the submodule's gitlink SHA. We read that SHA straight
+      # from the tree (git ls-tree) — no submodule fetch/clone needed here. The
+      # artifact is guaranteed to exist: any commit that moves the submodule trips
+      # the fc_fork lane, which runs build-firecracker before this job; commits
+      # that DON'T move it reuse the artifact already published for that SHA.
+      - name: Stage the forked firecracker binary
+        id: fcfork
+        run: |
+          set -euo pipefail
+          FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
+          if [ -z "$FC_SHA" ]; then
+            echo "::error::no third_party/firecracker submodule gitlink found"; exit 1
+          fi
+          echo "Forked firecracker @ $FC_SHA"
+          mkdir -p fc-fork
+          oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output fc-fork
+          chmod +x fc-fork/firecracker
+          echo "src=$PWD/fc-fork/firecracker" >> "$GITHUB_OUTPUT"
+
+      # Stage the forked firecracker (ENGRAM_FC_SRC wins over the upstream-release
+      # download) + the engram guest kernel (this repo's own private release asset
+      # — GITHUB_TOKEN/contents:read reads it) + the RO session bundles (oras-pulled
+      # from bundle-*:main) into the build context.
+      - name: Stage firecracker + guest kernel + bundles
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENGRAM_FC_SRC: ${{ steps.fcfork.outputs.src }}
+        run: bash docker/node-assets-fetch.sh node-assets-ctx
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Derive tags
+        id: tags
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          BASE="ghcr.io/${{ github.repository }}/node-assets"
+          SHORT="${SHA:0:7}"
+          TAGS=("$BASE:$SHA" "$BASE:$SHORT")
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAGS+=("$BASE:main" "$BASE:latest")
+          fi
+          printf '%s\n' "${TAGS[@]}" > /tmp/na-tags.txt
+          echo "Will tag:"
+          cat /tmp/na-tags.txt
+          { echo 'list<<EOF'; cat /tmp/na-tags.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+
+      - name: Build + push node-assets
+        uses: docker/build-push-action@v6
+        with:
+          context: node-assets-ctx
+          file: docker/node-assets.Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
 
   # ADR 0027: build the RO session bundles (skills, playwright) and publish
   # each as an OCI artifact to GHCR, mirroring publish-host-binaries. The

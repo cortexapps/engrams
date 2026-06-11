@@ -1,0 +1,161 @@
+//! Live-Postgres tests for ADR 0046 PG-backed placement reservation:
+//! `reserve_placement`'s `FOR UPDATE` transaction (burst-safe spread + reject),
+//! the `mem_budget_mib` ledger column, and `fleet_free_mib`
+//! (Σ allocatable − reserved) — all against REAL Postgres. The api.rs create
+//! tests use a mock store whose `reserve_placement` is the trivial default, so
+//! this is the only coverage of the actual SQL: the transaction, the
+//! reserved-set aggregate, the pending-row insert, the `LEFT JOIN`/`GREATEST`
+//! free computation, and that migrations 0057/0058 apply. Pins the incident
+//! fix: a create burst SPREADS across hosts and REJECTS the overflow instead of
+//! stacking onto one host (the OOM).
+//!
+//! `#[ignore]`'d by default; requires Postgres at `ENGRAM_TEST_DATABASE_URL`.
+//! Run:
+//! ```bash
+//! just db-up
+//! ENGRAM_TEST_DATABASE_URL=postgres://engram:engram@localhost:5435/engram \
+//!     cargo test -p engram-coordinator --test placement_reservation_live_pg -- --ignored
+//! ```
+
+use std::sync::Arc;
+
+use chrono::Utc;
+use engram_core::traits::MetadataStore;
+use engram_core::types::host::{
+    HostCapacity, HostMetadata, HostRecord, HostStatus, HostUtilization,
+};
+use engram_core::types::session::{SessionMode, SessionSpec};
+use engram_core::types::{HostId, SessionId};
+
+async fn connect() -> Option<Arc<dyn MetadataStore>> {
+    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("skipping: ENGRAM_TEST_DATABASE_URL not set (run `just db-up`)");
+            return None;
+        }
+    };
+    let store = engram_postgres::PostgresStore::connect(&database_url)
+        .await
+        .expect("connect postgres");
+    store.migrate().await.expect("migrate");
+    Some(Arc::new(store))
+}
+
+fn zero_capacity() -> HostCapacity {
+    HostCapacity {
+        total_gb: 0,
+        used_gb: 0,
+        total_mib: 0,
+        used_mib: 0,
+        running_sandboxes: 0,
+    }
+}
+
+/// Seed a `ready` host with `allocatable_mib` headroom. `upsert_host` inserts
+/// the row (capacity only); `touch_host_heartbeat` writes the utilization that
+/// carries `allocatable_mib` (the figure `reserve_placement` reads).
+async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mib: u64) -> HostId {
+    let id = HostId::new();
+    meta.upsert_host(HostRecord {
+        id,
+        hostname: hostname.into(),
+        cloud_metadata: HostMetadata::default(),
+        capacity: zero_capacity(),
+        utilization: HostUtilization::default(),
+        status: HostStatus::Ready,
+        last_heartbeat_at: Utc::now(),
+        host_addr: Some(format!("http://{hostname}:9101")),
+    })
+    .await
+    .expect("upsert host");
+    meta.touch_host_heartbeat(
+        id,
+        HostStatus::Ready,
+        zero_capacity(),
+        HostUtilization {
+            allocatable_mib,
+            ..HostUtilization::default()
+        },
+    )
+    .await
+    .expect("heartbeat host");
+    id
+}
+
+fn spec() -> SessionSpec {
+    SessionSpec {
+        image: "localhost:5001/placement-reservation:test".into(),
+        mode: SessionMode::Agent,
+        user_id: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn burst_spreads_across_hosts_then_rejects_overflow() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+    // Unique hostnames per run so repeats don't collide on upsert_host's
+    // ON CONFLICT (hostname); reserve_placement is candidate-scoped
+    // (`host_id = ANY($candidates)`), so this is robust under parallel tests
+    // sharing the DB. Two 16 GiB hosts, 4 GiB budgets: exactly 4 fit per host
+    // (the OOM incident shape, scaled down).
+    let tag = SessionId::new();
+    let host_a = seed_host(&meta, &format!("plc-a-{tag}"), 16384).await;
+    let host_b = seed_host(&meta, &format!("plc-b-{tag}"), 16384).await;
+    let candidates = vec![host_a, host_b];
+    let budget = 4096i64;
+
+    let mut placed = Vec::new();
+    for _ in 0..8 {
+        let picked = meta
+            .reserve_placement(SessionId::new(), &spec(), budget, &candidates)
+            .await
+            .expect("reserve_placement ok");
+        placed.push(picked);
+    }
+    assert!(
+        placed.iter().all(Option::is_some),
+        "first 8 (4 per 16 GiB host) must all place; got {placed:?}"
+    );
+    let on_a = placed.iter().filter(|h| **h == Some(host_a)).count();
+    let on_b = placed.iter().filter(|h| **h == Some(host_b)).count();
+    assert_eq!(
+        (on_a, on_b),
+        (4, 4),
+        "a burst must SPREAD evenly across hosts, not stack onto one (the OOM)"
+    );
+
+    // 9th: both hosts at allocatable (4×4096 = 16384) → free 0 → reject.
+    let ninth = meta
+        .reserve_placement(SessionId::new(), &spec(), budget, &candidates)
+        .await
+        .expect("reserve_placement ok");
+    assert_eq!(
+        ninth, None,
+        "the 9th create must be REJECTED — both hosts are fully reserved (the \
+         admission control that stops the OOM)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn fleet_free_mib_sql_runs_against_real_pg() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+    // The exact value is global (all ready hosts) and unit-tested via the pure
+    // decision fn; here we only assert the SQL — the LEFT JOIN over the
+    // reserved aggregate, GREATEST(0, …), the pending age-guard, the ::BIGINT
+    // cast — parses and runs against real Postgres and yields a sane figure.
+    let free = meta
+        .fleet_free_mib()
+        .await
+        .expect("fleet_free_mib SQL runs");
+    assert!(
+        free >= 0,
+        "free_mib is a non-negative MiB count; got {free}"
+    );
+}

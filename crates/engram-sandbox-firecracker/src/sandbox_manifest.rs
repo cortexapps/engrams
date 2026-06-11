@@ -9,10 +9,11 @@
 //! mid-destroy can leave one; the Phase 6 startup reattach pass
 //! tolerates these.
 //!
-//! Schema v1 — see `SandboxManifest` below. Phase 6 reads this to
-//! decide whether to reattach via pidfd (path 1). Phase 8 fills
-//! `last_local_snapshot` after a SIGTERM checkpoint so path 2 can
-//! cold-restore from local NVMe when path 1 fails.
+//! See `SandboxManifest` below. The startup reattach pass reads this
+//! to re-adopt the still-live FC (and uffd-handler) process(es) via
+//! pidfd. ADR 0044 K2: a host-agent restart *detaches* its VMs
+//! (leaves them running) rather than killing or checkpointing them;
+//! the successor host-agent reattaches off this manifest.
 //!
 //! Atomic write: `write_temp_then_rename`. Same primitive the
 //! chunk-store uses; provides crash-safety against a partial write
@@ -28,19 +29,21 @@ use engram_core::SandboxId;
 use serde::{Deserialize, Serialize};
 
 /// Current schema version. Bumped on incompatible changes to the
-/// on-disk JSON shape. The Phase 6 reattach pass refuses to read
-/// older or newer versions — operator must manually evict stale
-/// sandboxes before deploying a host-agent that bumped the version.
-pub const SCHEMA_VERSION: u32 = 2;
+/// on-disk JSON shape. The startup reattach pass refuses to read
+/// older or newer versions — a stale manifest is treated as
+/// unreattachable and orphan-reaped, after which the owning session
+/// reconciles. Bumped to 3 in ADR 0044 K2: dropped the
+/// `last_local_snapshot` field along with the SIGTERM-checkpoint path.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Marker for the `backend` discriminator. VZ may eventually share
 /// this format with a `"vz"` value and a different `firecracker`
 /// vs `vz` payload struct.
 pub const BACKEND_FIRECRACKER: &str = "firecracker";
 
-/// Top-level on-disk manifest. The Phase 6 reattach pass deserializes
-/// this; the Phase 8 SIGTERM-checkpoint pipeline updates
-/// `last_local_snapshot` in place.
+/// Top-level on-disk manifest. The startup reattach pass deserializes
+/// this to re-adopt the still-live FC (and uffd-handler) process(es)
+/// of a sandbox whose host-agent generation exited.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxManifest {
     pub schema_version: u32,
@@ -48,18 +51,24 @@ pub struct SandboxManifest {
     pub backend: String,
     pub spec: SandboxSpec,
     pub firecracker: FirecrackerProcessRecord,
-    /// `None` when the sandbox was created with `net_pool=None`
-    /// (test-mode FC). Phase 6 reattach skips network rehydration
-    /// in that case.
+    /// Host-root networking (cold-created VMs): a unique per-VM `/30` +
+    /// TAP in the node's root netns. `None` when the sandbox used a
+    /// per-VM netns instead (see `netns`) or was created with
+    /// `net_pool=None` (test-mode FC). Mutually exclusive with `netns`.
     pub network: Option<NetworkRecord>,
+    /// Per-VM netns networking (warm-restored VMs, ADR 0014 M1.16): the
+    /// snapshot bakes a fixed TAP name + guest IP that FC won't let us
+    /// re-point, so each restore runs in its own netns. Recorded so the
+    /// reattach pass can re-reserve the SNAT slot + rebuild the
+    /// `NetnsSetup` for a still-live restored VM (ADR 0044 K2). Mutually
+    /// exclusive with `network`.
+    #[serde(default)]
+    pub netns: Option<NetnsRecord>,
     /// Present iff `RestoreMode::Uffd` was used and the handler is
     /// still alive. Same three-axis verification (pid + start_time +
-    /// comm) on reattach.
+    /// comm) on reattach. Like FC, the handler is detached (not
+    /// killed) on host-agent shutdown and re-adopted by the successor.
     pub uffd_handler: Option<ProcessRecord>,
-    /// Filled by Phase 8's SIGTERM checkpoint. `None` until then.
-    /// Phase 6 path 2 (NVMe restore) reads this to know which local
-    /// chunked manifests to restore from when path 1 fails.
-    pub last_local_snapshot: Option<LocalSnapshotRef>,
 }
 
 /// Three-axis pid identity. Phase 6 reattach verifies all three
@@ -121,32 +130,28 @@ pub struct NetworkRecord {
     pub guest_ip: std::net::Ipv4Addr,
 }
 
-/// Phase 8: reference to a SIGTERM-time local-NVMe snapshot for
-/// this sandbox. Path 2 of the reattach uses `snapshot_id` to
-/// locate `<work_dir>/snapshots/<snapshot_id>/` on disk (the FC
-/// state + memory + manifest.json the snapshot pipeline wrote)
-/// and calls `FirecrackerBackend::restore_as_sandbox_id` to
-/// re-spawn FC under the ORIGINAL sandbox_id (preserving coord
-/// routing). The chunk-manifest refs are diagnostic + future
-/// has-all-chunks check.
+/// Per-VM netns bookkeeping for a warm-restored VM. Enough to rebuild
+/// `net::NetnsSetup` and re-reserve the SNAT `/30` from the host pool on
+/// reattach, so a still-live restored VM is re-adopted rather than
+/// orphaned (ADR 0044 K2). The netns, veth pair, TAP, and SNAT rule all
+/// survive in the kernel across a host-agent restart — this just records
+/// the names + CIDRs needed to reconstruct the in-memory handle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LocalSnapshotRef {
-    /// SnapshotId of the just-taken local checkpoint. Path 2 uses
-    /// this to find `<work_dir>/snapshots/<snapshot_id>/`.
-    #[serde(default)]
-    pub snapshot_id: Option<engram_core::SnapshotId>,
-    pub disk_manifest_id: uuid::Uuid,
-    pub disk_manifest_version: u64,
-    pub memory_manifest_id: Option<uuid::Uuid>,
-    pub memory_manifest_version: Option<u64>,
-    /// Wall-clock time the SIGTERM checkpoint completed. Diagnostic
-    /// only — the reattach pass doesn't gate on age (a manifest is
-    /// either restorable or it isn't; staleness shows up as a
-    /// `has_all_chunks` miss).
-    pub taken_at: chrono::DateTime<chrono::Utc>,
-    /// Why the checkpoint was taken. Currently always `"sigterm"`;
-    /// reserved for future "periodic", "operator", etc. triggers.
-    pub trigger: String,
+pub struct NetnsRecord {
+    /// `engr-vm-<id>` — resolves to `/var/run/netns/<netns_name>`.
+    pub netns_name: String,
+    /// Host-root-side veth.
+    pub veth_host: String,
+    /// Netns-side veth.
+    pub veth_ns: String,
+    /// TAP name FC opens (created inside the netns so the bake's name
+    /// doesn't collide globally).
+    pub tap_name: String,
+    /// `.0` of the bake's /30 (the guest's baked IP lives here).
+    pub vm_cidr_network: std::net::Ipv4Addr,
+    /// `.0` of the per-VM SNAT /30 drawn from the host pool. Re-reserved
+    /// on reattach so new restores don't hand the same slot out again.
+    pub snat_cidr_network: std::net::Ipv4Addr,
 }
 
 /// Canonical on-disk path. `<work_dir>/<sandbox_id>/sandbox.json` —
@@ -319,8 +324,8 @@ mod tests {
                 vsock_cid: 3,
             },
             network: None,
+            netns: None,
             uffd_handler: None,
-            last_local_snapshot: None,
         }
     }
 
@@ -338,7 +343,6 @@ mod tests {
         assert_eq!(back.firecracker.vsock_cid, 3);
         assert!(back.network.is_none());
         assert!(back.uffd_handler.is_none());
-        assert!(back.last_local_snapshot.is_none());
     }
 
     #[test]

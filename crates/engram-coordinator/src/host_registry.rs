@@ -109,6 +109,15 @@ pub struct ScheduleContext<'a> {
     /// drain, where the source is still registered but should not be
     /// reselected.
     pub exclude_host: Option<HostId>,
+    /// ADR 0039 / ADR 0045 D4: SOFT host preference — the host the
+    /// session last ran on, where the chunk cache and the per-image
+    /// base shm are warm (warm resume ≈ CONTINUE-speed vs the cold
+    /// cross-host tail). Strictly soft: falls through to capacity-fit
+    /// on any miss, and never overrides `exclude_host` or the
+    /// readiness/digest filters. Ranked below snapshot-affinity (a
+    /// host actually holding the snapshot beats one that merely ran
+    /// the session before).
+    pub prefer_host: Option<HostId>,
 }
 
 /// Why `pick_for_session` couldn't place a session. Distinguishes
@@ -126,6 +135,22 @@ pub enum PickError {
     /// was required) but none has free capacity matching the
     /// memory hint or is non-draining.
     NoCapacity,
+}
+
+/// Fleet-wide autoscaling signals (ADR 0044 K4). Read off the in-memory
+/// registry on a tick; emitted as the `engram_fleet_*` gauges the node-pool
+/// autoscaler scales on.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FleetMetrics {
+    /// Hosts with a live heartbeat in the registry.
+    pub ready_hosts: u32,
+    /// Non-draining hosts the scheduler can place on.
+    pub schedulable_hosts: u32,
+    /// Σ (total_mib − used_mib) over schedulable hosts.
+    pub free_mib: u64,
+    /// Σ total_mib over schedulable hosts — lets a consumer derive the
+    /// average per-host capacity (how much one node adds).
+    pub total_mib: u64,
 }
 
 impl From<PickError> for SandboxError {
@@ -413,6 +438,76 @@ impl HostRegistry {
         self.pick_any()
     }
 
+    /// ADR 0045 Phase F (teleport): place onto a **specific** host
+    /// instead of the capacity-ranked pick. Used by operator-pinned
+    /// teleport — the operator chose the destination, so we validate
+    /// it's a legal target (registered, not draining, not the source,
+    /// has free capacity) and return its backend, or a `PickError`
+    /// describing why it can't take the session. Not image-readiness
+    /// gated (like `pick_capture_host`): a target missing the image
+    /// lazy-materializes the rootfs from BlobStorage during restore.
+    pub fn pick_specific_host(
+        &self,
+        host_id: HostId,
+        exclude_host: Option<HostId>,
+    ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
+        if Some(host_id) == exclude_host {
+            // The chosen target is the source host — nowhere to go.
+            return Err(PickError::NoCapacity);
+        }
+        let entry = self.hosts.get(&host_id).ok_or(PickError::NoCapacity)?;
+        let st = entry.value().state.read();
+        if st.draining {
+            return Err(PickError::NoCapacity);
+        }
+        let free = st.capacity.total_mib.saturating_sub(st.capacity.used_mib);
+        if free == 0 {
+            return Err(PickError::NoCapacity);
+        }
+        Ok((host_id, entry.value().backend.clone()))
+    }
+
+    /// ADR 0046: the ranked candidate hosts for `ctx`, by the same soft
+    /// criteria `pick_for_session` uses — snapshot-affinity first, then any
+    /// ready non-draining host; excludes `exclude_host` and digest-unready
+    /// hosts — but WITHOUT the capacity gate, which moves to the PG
+    /// `reserve_placement` transaction (the only place that can atomically read
+    /// the reserved figure and reserve against it). Empty when nothing is ready.
+    pub fn candidates_for(&self, ctx: &ScheduleContext<'_>) -> Vec<HostId> {
+        let host_is_ready = |host_id: HostId, st: &HostState| {
+            if Some(host_id) == ctx.exclude_host {
+                return false;
+            }
+            if st.draining {
+                return false;
+            }
+            match ctx.required_image_digest.as_ref() {
+                Some(d) => st.ready_images.contains(d),
+                None => true,
+            }
+        };
+        let mut ranked: Vec<HostId> = Vec::new();
+        // 1. snapshot-affinity hosts first (zero-cost hot-tier hit).
+        if let Some(target) = ctx.prefer_snapshot_id {
+            for entry in self.hosts.iter() {
+                let st = entry.value().state.read();
+                if host_is_ready(*entry.key(), &st)
+                    && st.local_snapshots.iter().any(|s| s.snapshot_id == target)
+                {
+                    ranked.push(*entry.key());
+                }
+            }
+        }
+        // 2. then every other ready host.
+        for entry in self.hosts.iter() {
+            let st = entry.value().state.read();
+            if host_is_ready(*entry.key(), &st) && !ranked.contains(entry.key()) {
+                ranked.push(*entry.key());
+            }
+        }
+        ranked
+    }
+
     /// Session scheduler. Inputs the per-host heartbeat state (capacity,
     /// local snapshots, draining, ready_images) and ranks:
     ///
@@ -427,6 +522,23 @@ impl HostRegistry {
     /// 3. Else any non-draining host.
     /// 4. Else `Err(NoCapacity)` — coordinator surfaces a 503.
     pub fn pick_for_session(
+        &self,
+        ctx: &ScheduleContext<'_>,
+    ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
+        // ADR 0044 K4: emit the demand-pressure signal at the one place every
+        // scheduling decision funnels through.
+        let result = self.pick_for_session_inner(ctx);
+        let outcome = match &result {
+            Ok(_) => "placed",
+            Err(PickError::NoCapacity) => "no_capacity",
+            Err(PickError::ImageNotReady(_)) => "image_not_ready",
+        };
+        ::metrics::counter!(crate::metrics::SESSION_PLACEMENT_TOTAL, "outcome" => outcome)
+            .increment(1);
+        result
+    }
+
+    fn pick_for_session_inner(
         &self,
         ctx: &ScheduleContext<'_>,
     ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
@@ -469,6 +581,18 @@ impl HostRegistry {
             }
         }
 
+        // Host-affinity (soft): the session's previous host, if ready
+        // and it fits. Warm chunk cache + warm base shm (ADR 0045 D4).
+        if let Some(want) = ctx.prefer_host {
+            if let Some(entry) = self.hosts.get(&want) {
+                let st = entry.value().state.read();
+                let free = st.capacity.total_mib.saturating_sub(st.capacity.used_mib);
+                if host_is_ready(want, &st) && free >= ctx.memory_mib.unwrap_or(0) as u64 {
+                    return Ok((want, entry.value().backend.clone()));
+                }
+            }
+        }
+
         // Capacity-fit: largest free RAM among ready hosts that
         // meets `memory_mib`.
         let need = ctx.memory_mib.unwrap_or(0) as u64;
@@ -502,6 +626,23 @@ impl HostRegistry {
             .ok_or(PickError::NoCapacity)
     }
 
+    /// Fleet-wide autoscaling signals (ADR 0044 K4), sampled on a tick and
+    /// emitted as gauges. `schedulable_hosts` excludes draining hosts;
+    /// `free_mib` is the spare guest-RAM reservation across them.
+    pub fn fleet_metrics(&self) -> FleetMetrics {
+        let mut m = FleetMetrics::default();
+        for entry in self.hosts.iter() {
+            m.ready_hosts += 1;
+            let st = entry.value().state.read();
+            if !st.draining {
+                m.schedulable_hosts += 1;
+                m.free_mib += st.capacity.total_mib.saturating_sub(st.capacity.used_mib);
+                m.total_mib += st.capacity.total_mib;
+            }
+        }
+        m
+    }
+
     /// Pick a host for `ctx`, then `restore` from `metadata` on that
     /// host's backend. Routes to the host carrying the snapshot if any;
     /// else falls through to capacity-based pick. ADR 0007 Phase 6: takes
@@ -520,24 +661,30 @@ impl HostRegistry {
         Ok((host_id, sandbox_id))
     }
 
-    /// ADR 0020 P1: restore a per-image base snapshot for a fresh
-    /// session, late-binding the session harness (option-D swap). Like
-    /// `restore_for_session` but the picked host runs the combined
-    /// restore + harness-swap op so `create_session` can route a cold
-    /// create through restore instead of a fresh kernel boot.
-    #[tracing::instrument(name = "coord.restore_base_for_session", skip_all)]
-    pub async fn restore_base_for_session(
+    /// ADR 0046: restore the base snapshot onto an ALREADY-CHOSEN host (picked
+    /// and reserved by the PG `reserve_placement` transaction) rather than
+    /// picking here. Mirrors `restore_base_for_session` minus the pick — the
+    /// capacity decision already happened durably in Postgres.
+    pub async fn restore_base_on_host(
         &self,
-        ctx: &ScheduleContext<'_>,
+        host_id: HostId,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
-    ) -> Result<(HostId, SandboxId), SandboxError> {
-        let (host_id, backend) = self.pick_for_session(ctx)?;
+    ) -> Result<SandboxId, SandboxError> {
+        // The capacity decision already happened in `reserve_placement`; just
+        // resolve the chosen host's backend. NO free-capacity re-gate — that
+        // would wrongly reject a host with no allocatable measurement yet (the
+        // reserve-time fallback host, plus every test fixture / brand-new host).
+        let backend = self
+            .hosts
+            .get(&host_id)
+            .map(|e| e.value().backend.clone())
+            .ok_or_else(|| SandboxError::from(PickError::NoCapacity))?;
         let sandbox_id = backend
             .restore_base_for_session(metadata, session_env)
             .await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
-        Ok((host_id, sandbox_id))
+        Ok(sandbox_id)
     }
 
     /// Look up the host that owns `sandbox_id`. Used by 3d migration
@@ -714,6 +861,37 @@ impl HostClient for HostRegistry {
         backend.snapshot(id).await
     }
 
+    async fn snapshot_begin(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.snapshot_begin(id).await
+    }
+
+    async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.snapshot_wait(id).await
+    }
+
+    async fn migration_capture(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.migration_capture(id).await
+    }
+
+    async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.migration_commit(id, export_id).await
+    }
+
+    async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.migration_abort(id, export_id).await
+    }
+
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
         backend.commit_snapshot(id).await
@@ -800,6 +978,16 @@ impl HostClient for HostRegistry {
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.interrupt(sandbox_id).await
+    }
+
+    async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.pause(sandbox_id).await
+    }
+
+    async fn resume(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.resume(sandbox_id).await
     }
 
     async fn acquire_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
@@ -1246,12 +1434,95 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(
             picked, h_with_snap,
             "snapshot affinity must override raw capacity"
         );
+    }
+
+    /// ADR 0045 D4 / ADR 0039: the soft host-affinity tier.
+    #[test]
+    fn prefer_host_wins_over_larger_capacity_but_loses_to_snapshot_affinity() {
+        let reg = stub_registry();
+        let (b1, _d1) = dummy_backend();
+        let (b2, _d2) = dummy_backend();
+        let h_prev = HostId::new(); // the session's previous host (small)
+        let h_big = HostId::new();
+        reg.register(h_prev, b1);
+        reg.register(h_big, b2);
+        let small = HostState {
+            capacity: HostCapacityReport {
+                total_mib: 4096,
+                used_mib: 2048,
+                running_sandboxes: 1,
+            },
+            local_snapshots: Vec::new(),
+            draining: false,
+            ready_images: Default::default(),
+            current_bundles: Vec::new(),
+            utilization: Default::default(),
+        };
+        let mut big = small.clone();
+        big.capacity = HostCapacityReport {
+            total_mib: 16_384,
+            used_mib: 0,
+            running_sandboxes: 0,
+        };
+        reg.update_state(h_prev, small.clone());
+        reg.update_state(h_big, big.clone());
+
+        // Soft preference beats raw capacity (warm cache + base shm).
+        let mut ctx = ScheduleContext {
+            repo: "r",
+            image_version: "v",
+            prefer_snapshot_id: None,
+            memory_mib: Some(1024),
+            required_image_digest: None,
+            exclude_host: None,
+            prefer_host: Some(h_prev),
+        };
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_prev, "prefer_host beats larger free capacity");
+
+        // ...but loses to snapshot affinity (a host actually holding the
+        // snapshot beats one that merely ran the session before).
+        let snap = SnapshotId::new();
+        let mut big_with_snap = big.clone();
+        big_with_snap.local_snapshots = vec![engram_protocol::heartbeat::LocalSnapshotReport {
+            snapshot_id: snap,
+            session_id: SessionId::new(),
+            size_bytes: 1,
+            replicated: false,
+            last_accessed_at: chrono::Utc::now(),
+        }];
+        reg.update_state(h_big, big_with_snap);
+        ctx.prefer_snapshot_id = Some(snap);
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_big, "snapshot affinity outranks prefer_host");
+
+        // Draining preferred host falls through to capacity.
+        ctx.prefer_snapshot_id = None;
+        let mut draining = small.clone();
+        draining.draining = true;
+        reg.update_state(h_prev, draining);
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_big, "draining prefer_host falls through");
+
+        // prefer == exclude: exclusion wins (evac must never re-pick the
+        // source even if something also prefers it).
+        reg.update_state(h_prev, small);
+        ctx.exclude_host = Some(h_prev);
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_big, "exclude_host overrides prefer_host");
+
+        // Preferred host too small for the memory hint: falls through.
+        ctx.exclude_host = None;
+        ctx.memory_mib = Some(8192);
+        let (picked, _) = reg.pick_for_session(&ctx).unwrap();
+        assert_eq!(picked, h_big, "undersized prefer_host falls through");
     }
 
     #[test]
@@ -1302,6 +1573,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_big, "larger free capacity wins");
@@ -1356,6 +1628,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h_ready);
@@ -1415,6 +1688,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: Some(source),
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(
@@ -1423,10 +1697,10 @@ mod tests {
         );
     }
 
-    /// `exclude_host` with no other candidates → NoCapacity. The
-    /// evac caller (NBD-loss trigger) interprets this as
-    /// `NoTargetAvailable` and leaves the session at HostLost for a
-    /// later retry.
+    /// `exclude_host` with no other candidates → NoCapacity. The evac
+    /// caller (the `evac_resumer` scanner, draining off the excluded
+    /// host) interprets this as `NoTargetAvailable` and leaves the
+    /// session at `Evacuating` for a later retry.
     #[test]
     fn pick_for_session_with_only_excluded_host_errors() {
         let reg = stub_registry();
@@ -1456,6 +1730,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: Some(lone),
+            prefer_host: None,
         };
         let res = reg.pick_for_session(&ctx);
         match res {
@@ -1463,6 +1738,66 @@ mod tests {
             Err(other) => panic!("expected NoCapacity, got {other:?}"),
             Ok(_) => panic!("expected an error when the only host is excluded"),
         }
+    }
+
+    /// ADR 0045 Phase F: `pick_specific_host` honors an operator-pinned
+    /// teleport target and rejects every illegal destination (the source
+    /// itself, unknown, draining, full).
+    #[test]
+    fn pick_specific_host_validates_the_pinned_target() {
+        fn ready_state(total: u64, used: u64, draining: bool) -> HostState {
+            HostState {
+                capacity: HostCapacityReport {
+                    total_mib: total,
+                    used_mib: used,
+                    running_sandboxes: 0,
+                },
+                local_snapshots: Vec::new(),
+                draining,
+                ready_images: Default::default(),
+                current_bundles: Vec::new(),
+                utilization: Default::default(),
+            }
+        }
+
+        let reg = stub_registry();
+        let (b_src, _d0) = dummy_backend();
+        let (b_tgt, _d1) = dummy_backend();
+        let source = HostId::new();
+        let target = HostId::new();
+        reg.register(source, b_src);
+        reg.register(target, b_tgt);
+        reg.update_state(source, ready_state(64_000, 0, false));
+        reg.update_state(target, ready_state(64_000, 0, false));
+
+        // Happy path: a healthy target that isn't the source.
+        let (picked, _) = reg
+            .pick_specific_host(target, Some(source))
+            .expect("healthy pinned target should be accepted");
+        assert_eq!(picked, target);
+
+        // The pin is the source host → nowhere to go.
+        assert!(matches!(
+            reg.pick_specific_host(source, Some(source)),
+            Err(PickError::NoCapacity)
+        ));
+        // Unknown host id.
+        assert!(matches!(
+            reg.pick_specific_host(HostId::new(), Some(source)),
+            Err(PickError::NoCapacity)
+        ));
+        // Draining target.
+        reg.update_state(target, ready_state(64_000, 0, true));
+        assert!(matches!(
+            reg.pick_specific_host(target, Some(source)),
+            Err(PickError::NoCapacity)
+        ));
+        // Full target (no free capacity).
+        reg.update_state(target, ready_state(64_000, 64_000, false));
+        assert!(matches!(
+            reg.pick_specific_host(target, Some(source)),
+            Err(PickError::NoCapacity)
+        ));
     }
 
     #[tokio::test]
@@ -1536,6 +1871,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = reg.pick_for_session(&ctx).unwrap();
         assert_eq!(picked, h);
@@ -1599,6 +1935,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: Some(digest),
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = match reg.pick_for_session(&ctx) {
             Ok(v) => v,
@@ -1632,6 +1969,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: Some(digest.clone()),
             exclude_host: None,
+            prefer_host: None,
         };
         match reg.pick_for_session(&ctx) {
             Err(PickError::ImageNotReady(d)) => assert_eq!(d, digest),
@@ -1656,6 +1994,7 @@ mod tests {
             memory_mib: None,
             required_image_digest: None,
             exclude_host: None,
+            prefer_host: None,
         };
         let (picked, _) = match reg.pick_for_session(&ctx) {
             Ok(v) => v,

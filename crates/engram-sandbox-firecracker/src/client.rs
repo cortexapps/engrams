@@ -283,6 +283,8 @@ impl FirecrackerClient {
             },
             enable_diff_snapshots,
             resume_vm,
+            // Substrate base backing is a Uffd-mode concept (ADR 0045 v2b).
+            uffd_base_file: None,
         };
         self.put("/snapshot/load", &body).await
     }
@@ -300,8 +302,14 @@ impl FirecrackerClient {
         state_path: &Path,
         uffd_uds_path: &Path,
     ) -> Result<(), SandboxError> {
-        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, /*resume_vm=*/ true, false)
-            .await
+        self.load_snapshot_uffd_inner(
+            state_path,
+            uffd_uds_path,
+            /*resume_vm=*/ true,
+            false,
+            None,
+        )
+        .await
     }
 
     /// UFFD-backed load that leaves the VM paused. Caller must
@@ -316,8 +324,14 @@ impl FirecrackerClient {
         state_path: &Path,
         uffd_uds_path: &Path,
     ) -> Result<(), SandboxError> {
-        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, /*resume_vm=*/ false, false)
-            .await
+        self.load_snapshot_uffd_inner(
+            state_path,
+            uffd_uds_path,
+            /*resume_vm=*/ false,
+            false,
+            None,
+        )
+        .await
     }
 
     /// UFFD-backed load with explicit `resume_vm` /
@@ -329,9 +343,16 @@ impl FirecrackerClient {
         uffd_uds_path: &Path,
         resume_vm: bool,
         enable_diff_snapshots: bool,
+        uffd_base_file: Option<&Path>,
     ) -> Result<(), SandboxError> {
-        self.load_snapshot_uffd_inner(state_path, uffd_uds_path, resume_vm, enable_diff_snapshots)
-            .await
+        self.load_snapshot_uffd_inner(
+            state_path,
+            uffd_uds_path,
+            resume_vm,
+            enable_diff_snapshots,
+            uffd_base_file,
+        )
+        .await
     }
 
     async fn load_snapshot_uffd_inner(
@@ -340,6 +361,7 @@ impl FirecrackerClient {
         uffd_uds_path: &Path,
         resume_vm: bool,
         enable_diff_snapshots: bool,
+        uffd_base_file: Option<&Path>,
     ) -> Result<(), SandboxError> {
         let body = SnapshotLoadBody {
             snapshot_path: state_path.to_string_lossy().into_owned(),
@@ -349,6 +371,7 @@ impl FirecrackerClient {
             },
             enable_diff_snapshots,
             resume_vm,
+            uffd_base_file: uffd_base_file.map(|p| p.to_string_lossy().into_owned()),
         };
         self.put("/snapshot/load", &body).await
     }
@@ -703,6 +726,15 @@ struct SnapshotLoadBody {
     /// `true` makes Firecracker resume the guest immediately after
     /// load (no separate `PATCH /vm Resumed` needed).
     resume_vm: bool,
+    /// ADR 0045 substrate (v2b): when set with the Uffd backend, the
+    /// forked FC creates guest memory as `MAP_PRIVATE` of this shmem
+    /// base file and registers UFFD `MISSING|MINOR`, letting the
+    /// handler share base-identical pages across same-template VMs via
+    /// `UFFDIO_CONTINUE`. `skip_serializing_if` keeps the body
+    /// byte-identical to stock when unset (stock FC and pre-v2 forks
+    /// `deny_unknown_fields` this struct).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uffd_base_file: Option<String>,
 }
 
 /// How memory is supplied during snapshot load.
@@ -1120,6 +1152,7 @@ mod tests {
             },
             enable_diff_snapshots: false,
             resume_vm: true,
+            uffd_base_file: None,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["snapshot_path"], "/snap/state.bin");

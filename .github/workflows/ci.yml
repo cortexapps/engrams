@@ -28,7 +28,8 @@ name: CI
 #                       Root set under sudo for iptables + TAP + loop
 #                       mounts: host_startup, proxy_e2e, snapshot_net,
 #                       patch_drive_swap, option_d_warm_lease.
-#   - web:              pnpm install + tsc + vite build + vitest
+#   - web:              pnpm install + oxlint + tsc + vite build +
+#                       vitest
 #   - bake-demo-image:  push-to-main only. Bakes the canonical
 #                       deploy/demo rootfs as a chunked-OCI artifact
 #                       and pushes to
@@ -65,8 +66,12 @@ name: CI
 on:
   push:
     branches: [main]
+  # No base-branch filter: STACKED PRs (base = another feature branch)
+  # must run the same checks — with the old `branches: [main]` filter
+  # they triggered no run at all, leaving the ruleset's required
+  # contexts "waiting for status to be reported" until a base retarget
+  # (whose late-fired run then built a racy stale merge ref).
   pull_request:
-    branches: [main]
   # GitHub Merge Queue fires `merge_group` events for the temporary
   # ref it builds out of (current main + queued PRs combined). Branch
   # protection blocks the queue from completing until every required
@@ -297,6 +302,8 @@ jobs:
             --test checkpoint_reconcile_live_pg \
             --test enable_jobs_live_pg \
             --test enable_reuse_live_pg \
+            --test placement_reservation_live_pg \
+            --test host_register_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -394,6 +401,11 @@ jobs:
       - name: pnpm install
         run: pnpm install --frozen-lockfile
 
+      # oxlint over src/. Fast (Rust-based) static gate; runs before the
+      # build so lint failures surface without waiting on tsc + vite.
+      - name: pnpm lint (oxlint)
+        run: pnpm lint
+
       # `pnpm build` runs `tsc -b && vite build` — gives us typecheck
       # AND production bundle validation in one step.
       - name: pnpm build (tsc -b + vite build)
@@ -454,19 +466,48 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools e2fsprogs
 
-      # Pin to v1.10 to match the `firecracker-ci/v1.10` artifact
-      # bucket that fetch-fc-test-artifacts.sh pulls from. Bumping
-      # both pins should be a coordinated change — kernel ABI between
-      # the host firecracker binary and the kernel image needs to
-      # match.
-      - name: Install firecracker (v1.10.1)
+      # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
+      # so the existing FC suite + the stock<->fork compat test exercise the
+      # version we actually ship. The cached test artifacts (our engram 6.1.102
+      # guest kernel + the ubuntu-22.04 rootfs) are validated compatible with
+      # v1.16.0 (dev-vm: the compat test boots+snapshots+restores green).
+      - name: Install firecracker (v1.16.0)
         env:
-          FC_VER: v1.10.1
+          FC_VER: v1.16.0
         run: |
           curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" -o /tmp/fc.tgz
           tar -xzf /tmp/fc.tgz -C /tmp
           sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
           firecracker --version
+
+      - uses: oras-project/setup-oras@v1
+
+      # ADR 0045 Phase B: stage both binaries for the stock<->fork
+      # snapshot-compat test (`stock_fork_snapshot_compat`). Stock = the
+      # v1.10.1 just installed; fork = the artifact build-firecracker published,
+      # keyed by the submodule's gitlink SHA (read from the tree — no submodule
+      # fetch). Graceful: if the fork artifact isn't published yet (e.g. a
+      # submodule-bump PR before its merge builds it), leave ENGRAM_FC_FORK_BIN
+      # unset and the compat test skips cleanly via compat_preflight().
+      - name: Stage stock + forked firecracker (compat test)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "ENGRAM_FC_STOCK_BIN=/usr/local/bin/firecracker" >> "$GITHUB_ENV"
+          FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
+          if [ -z "$FC_SHA" ]; then echo "no third_party/firecracker gitlink; compat test will skip"; exit 0; fi
+          if ! echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin; then
+            echo "oras login failed; compat test will skip"; exit 0
+          fi
+          mkdir -p "$HOME/fc-fork"
+          if oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output "$HOME/fc-fork"; then
+            chmod +x "$HOME/fc-fork/firecracker"
+            echo "ENGRAM_FC_FORK_BIN=$HOME/fc-fork/firecracker" >> "$GITHUB_ENV"
+            echo "staged forked firecracker @ $FC_SHA"
+          else
+            echo "fork artifact firecracker:$FC_SHA not published yet; compat test will skip"
+          fi
 
       # Cache the kernel + ubuntu rootfs in GH Actions cache. Both
       # artifacts are version-pinned via fetch-fc-test-artifacts.sh
@@ -575,6 +616,7 @@ jobs:
             -p engram-sandbox-firecracker \
             --test boot \
             --test lifecycle \
+            --test reattach_detach \
             --test snapshot \
             --test snapshot_uffd \
             --test exec_real_vm \
@@ -587,6 +629,9 @@ jobs:
             --test aux_ro_drive \
             --test diff_snapshot \
             --test file_restore_shared_rss \
+            --test stock_fork_snapshot_compat \
+            --test substrate_kernel_capabilities \
+            --test substrate_uffd_base \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -596,6 +641,8 @@ jobs:
           cargo nextest run \
             -p engram-host-agent \
             --test checkpoint_chain \
+            --test migration_source \
+            --test two_host_live_teleport \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -1255,9 +1302,9 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
               musl-tools e2fsprogs jq bc python3
 
-      - name: Install firecracker (v1.10.1)
+      - name: Install firecracker (v1.16.0)
         run: |
-          FC_VER=v1.10.1
+          FC_VER=v1.16.0
           curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" \
             -o /tmp/fc.tgz
           tar -xzf /tmp/fc.tgz -C /tmp

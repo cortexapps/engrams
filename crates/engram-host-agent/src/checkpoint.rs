@@ -5,9 +5,8 @@
 //! the pieces around `PooledBackend::checkpoint_sandbox` (which owns
 //! the capture pipeline itself):
 //!
-//! - the sparse-file utilities the diff path rides (`dirty_ranges`,
-//!   `overlay_sparse`),
-//! - the per-sandbox rolling chain state ([`CheckpointChain`]),
+//! - the sparse-file utility the diff path rides (`dirty_ranges`),
+//! - the per-sandbox checkpoint chain state ([`CheckpointChain`]),
 //! - the durable, self-describing per-checkpoint record
 //!   ([`CheckpointRecord`] — written the moment the upload finishes,
 //!   surviving a lost RPC reply / dead coord; re-advertised in every
@@ -34,28 +33,22 @@ use engram_core::types::ids::{SandboxId, SessionId, SnapshotId};
 use engram_core::types::manifest::ManifestRef;
 use serde::{Deserialize, Serialize};
 
-/// Per-sandbox rolling chain state. Lives in
-/// `PooledBackend::checkpoint_chains`; seeded either by the first
-/// (Full) checkpoint (File-mode, with a rolling memfile) or
-/// manifest-only on resume (ADR 0038, UFFD "sparse mode"), and
-/// advanced by every diff.
+/// Per-sandbox checkpoint chain state. Lives in
+/// `PooledBackend::checkpoint_chains`; seeded manifest-only (no local
+/// image) — on resume from the source's memory manifest, or after a
+/// fresh Full capture from the just-published one — and advanced by
+/// every diff. ADR 0039: always "sparse mode"; the rolling memfile is
+/// retired.
 pub struct CheckpointChain {
     /// The last published memory manifest — same `manifest_id` for the
     /// chain's lifetime, `version` ticking on every checkpoint.
     pub manifest_ref: ManifestRef,
     /// Its full chunk list — the `prev` for the next incremental
-    /// re-chunk.
+    /// re-chunk. Diffs re-chunk via `update_for_dirty_ranges_sparse`
+    /// (fetch the dirty set's prev chunks from the warm cache + apply
+    /// the sparse diff), so we never materialize guest RAM — or keep a
+    /// full local image — just to checkpoint.
     pub manifest: engram_chunk_store::Manifest,
-    /// The rolling full memory image on local NVMe — the diff-apply
-    /// target for `update_for_dirty_ranges`, and (fork-ready, ADR 0022)
-    /// the same-host File-restore / fork source. Disposable: GCS chunks
-    /// are truth.
-    ///
-    /// `None` = ADR 0038 "sparse mode": a UFFD-resumed chain seeded
-    /// manifest-only, with no local full image. Diffs re-chunk via
-    /// `update_for_dirty_ranges_sparse` (fetch prev chunks + apply the
-    /// sparse diff) so we never materialize guest RAM just to checkpoint.
-    pub rolling_memfile: Option<PathBuf>,
 }
 
 /// Durable, self-describing record of one completed checkpoint.
@@ -178,58 +171,35 @@ pub fn dirty_ranges(diff: &Path) -> std::io::Result<Vec<(u64, u64)>> {
     Ok(ranges)
 }
 
-/// Copy `diff`'s data extents onto `base` at the same offsets — the
-/// userspace half of FC's documented diff-snapshot rebase. `base`
-/// MUST NOT be mapped by any live VM (mutating a `MAP_PRIVATE`
-/// mapping's backing file corrupts unfaulted pages); the rolling
-/// memfile is only ever touched by this pipeline. Returns bytes
-/// copied.
-pub async fn overlay_sparse(diff: &Path, base: &Path) -> std::io::Result<u64> {
-    let diff = diff.to_path_buf();
-    let base = base.to_path_buf();
-    // Blocking loop in spawn_blocking: this moves up to gigabytes on
-    // a pathological diff and must not stall the runtime.
-    tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Seek, SeekFrom, Write};
-
-        let ranges = dirty_ranges(&diff)?;
-        let mut src = std::fs::File::open(&diff)?;
-        let mut dst = std::fs::OpenOptions::new().write(true).open(&base)?;
-        let mut buf = vec![0u8; 1 << 20];
-        let mut copied = 0u64;
-        for (off, len) in ranges {
-            src.seek(SeekFrom::Start(off))?;
-            dst.seek(SeekFrom::Start(off))?;
-            let mut remaining = len;
-            while remaining > 0 {
-                let n = remaining.min(buf.len() as u64) as usize;
-                src.read_exact(&mut buf[..n])?;
-                dst.write_all(&buf[..n])?;
-                remaining -= n as u64;
-                copied += n as u64;
-            }
-        }
-        dst.sync_all()?;
-        Ok::<_, std::io::Error>(copied)
-    })
-    .await
-    .map_err(|e| std::io::Error::other(format!("overlay join: {e}")))?
-}
-
 /// Config for the periodic driver.
 #[derive(Clone, Debug)]
 pub struct CheckpointConfig {
-    /// Capture cadence per sandbox. `None` disables the driver
-    /// (`ENGRAM_CHECKPOINT_INTERVAL_SECS=0`).
+    /// Capture cadence per sandbox — the relaxed *in-RAM* backstop (ADR 0043
+    /// P2a). `None` disables the periodic driver entirely
+    /// (`ENGRAM_CHECKPOINT_INTERVAL_SECS=0`); disk durability and the
+    /// event-driven memory checkpoints (drain / idle-evict / operator) are
+    /// unaffected either way.
     pub interval: Option<Duration>,
 }
 
 impl CheckpointConfig {
+    /// ADR 0043 P2a relaxed the default cadence from the old aggressive 60 s
+    /// to 10 minutes. The periodic checkpoint is only the *in-RAM* backstop
+    /// for an unplanned crash of an ACTIVE session: the guest DISK is already
+    /// durable on a continuous ~30 s flush
+    /// ([`crate::disk_daemon::flush_scheduler`], no guest pause), and the FC
+    /// memory state is captured on every meaningful event — drain (SIGTERM),
+    /// idle-eviction, and the operator `POST /sessions/:id/snapshot`. So the
+    /// timer only bounds how much in-RAM progress an active session can lose to
+    /// an unplanned host crash (its disk + harness transcript survive). 10 min
+    /// is "infrequent but sane", with far less per-session pause / capture-lock
+    /// contention / GCS churn than every 60 s. Override (or disable, `=0`) via
+    /// `ENGRAM_CHECKPOINT_INTERVAL_SECS`.
     pub fn from_env() -> Self {
         let secs = std::env::var("ENGRAM_CHECKPOINT_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60);
+            .unwrap_or(600);
         Self {
             interval: (secs > 0).then(|| Duration::from_secs(secs)),
         }

@@ -104,6 +104,12 @@ impl ChunkHash {
         &self.0
     }
 
+    /// Wrap a raw 32-byte digest (e.g. candidate-table bytes read back
+    /// from PG) without recomputing or hex round-tripping.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Lowercase hex (64 chars).
     pub fn to_hex(&self) -> String {
         let mut s = String::with_capacity(64);

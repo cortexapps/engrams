@@ -45,11 +45,13 @@ pub enum SessionState {
     /// via `Idle → Created → Active` (the resume path re-runs the
     /// create-shape transitions on the new sandbox).
     Idle,
-    /// Heartbeat-loss against the bound host. Non-terminal: M3 wires
-    /// the heartbeat-loss cache invalidation into this transition; M4
-    /// adds re-pick on a peer host (`HostLost → Created → Active`).
-    /// Until then the reconciler moves `HostLost → Idle` (if a
-    /// snapshot exists) or `HostLost → Dead` (otherwise).
+    /// Heartbeat-loss against the bound host. Non-terminal: the
+    /// dead-host detector's second stage moves it onward —
+    /// `HostLost → Idle` when the session is recoverable (a snapshot
+    /// OR a live disk manifest exists; the user/exec `/resume`s on
+    /// next access, ADR 0045 Phase A), or `HostLost → Dead` when
+    /// there is nothing to recover. The detector no longer routes
+    /// into `Evacuating` (the reactive auto-evac is retired).
     HostLost,
     /// ADR 0018 commit 12: session is mid-relocation. The source host
     /// has paused FC, flushed dirty pages, captured a memory snapshot,
@@ -60,13 +62,14 @@ pub enum SessionState {
     /// host via the same `resume_session` machinery `/resume from
     /// Idle` uses. After 20 failed peer-pick / restore attempts
     /// (~3 min), falls back to `Idle` so a user `/resume` can drive
-    /// it forward by hand. Reached from `Active` (operator drain via
-    /// `POST /api/admin/sessions/:id/evacuate` or
-    /// `POST /api/admin/hosts/:id/drain`) or from `HostLost` (the
-    /// `dead_host.rs` second-stage routes through here instead of
-    /// the legacy `Idle` fall-through). Sandbox + host bindings are
-    /// nulled out same as `Idle` — the session is recoverable but
-    /// not running.
+    /// it forward by hand. Reached **only** from `Active` via operator
+    /// drain (`POST /api/admin/sessions/:id/evacuate` or
+    /// `POST /api/admin/hosts/:id/drain`) — ADR 0044 K3. As of ADR
+    /// 0045 Phase A the dead-host detector no longer routes here (the
+    /// reactive auto-evac is retired); the `HostLost → Evacuating`
+    /// edge is kept legal but unused (a future post-copy phase may
+    /// reuse it). Sandbox + host bindings are nulled out same as
+    /// `Idle` — the session is recoverable but not running.
     Evacuating,
     /// ADR 0034: durable idle-eviction intent marker. The candidates
     /// handler (or the PG detection backstop) transitions
@@ -101,6 +104,39 @@ pub enum SessionState {
 }
 
 impl SessionState {
+    /// ADR 0046: states in which the session has a live VM resident on its host
+    /// and therefore holds a memory reservation. Excludes `Idle` (sandbox torn
+    /// down to a snapshot), `HostLost` (host gone), and the terminal states. The
+    /// reservation is held across the *entire* eviction — the snapshot can take
+    /// minutes (#147) and the VM is resident the whole time — and released only
+    /// at teardown to `Idle`/terminal. A paused VM keeps status `Active`, so it
+    /// stays reserved.
+    pub fn reserves_host_memory(&self) -> bool {
+        matches!(
+            self,
+            Self::Pending
+                | Self::Created
+                | Self::GuestReady
+                | Self::Active
+                | Self::Evacuating
+                | Self::Evicting
+        )
+    }
+
+    /// SQL-literal twin of [`Self::reserves_host_memory`], for the
+    /// `status IN (…)` reservation aggregate. Kept in lockstep with the matcher
+    /// by `reserving_states_match` (test).
+    pub const fn host_memory_reserving_states() -> &'static [&'static str] {
+        &[
+            "pending",
+            "created",
+            "guest_ready",
+            "active",
+            "evacuating",
+            "evicting",
+        ]
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -185,6 +221,27 @@ impl SessionState {
             Evicting => matches!(target, Idle | HostLost | Dead | Completed),
             Failed | Completed | Dead => false,
         }
+    }
+
+    /// The FSM-legal terminal a forced termination (operator delete, drain,
+    /// give-up) should drive this state to: `Completed` for states that
+    /// actually ran, `Failed` for the early states that never became
+    /// usable, `None` if already terminal (nothing to do). Single source of
+    /// truth for "what terminal does terminating this session mean" — kept
+    /// beside [`Self::can_transition_to`] so it can't drift from the table
+    /// above (and debug-asserted to be a legal edge).
+    pub fn terminal_target(&self) -> Option<Self> {
+        use SessionState::*;
+        let target = match self {
+            Active | Idle | HostLost | Evacuating | Evicting => Completed,
+            Pending | Created | GuestReady => Failed,
+            Failed | Completed | Dead => return None,
+        };
+        debug_assert!(
+            self.can_transition_to(target),
+            "terminal_target({self:?}) = {target:?} must be a legal transition",
+        );
+        Some(target)
     }
 
     /// Consume `self` and produce the next state if the transition is
@@ -494,6 +551,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn terminal_target_is_legal_and_total() {
+        use SessionState::*;
+        // Every non-terminal state maps to a terminal via a LEGAL edge.
+        for &s in &[
+            Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
+        ] {
+            let target = s
+                .terminal_target()
+                .expect("a non-terminal state must have a terminal_target");
+            assert!(target.is_terminal(), "{s:?} -> {target:?} must be terminal");
+            assert!(
+                s.can_transition_to(target),
+                "{s:?} -> {target:?} must be a legal FSM edge",
+            );
+        }
+        // Terminal states have nothing to terminate.
+        for &t in &[Failed, Completed, Dead] {
+            assert_eq!(t.terminal_target(), None, "{t:?} is already terminal");
+        }
+        // The semantic split: states that ran complete; never-ran ones fail.
+        assert_eq!(Active.terminal_target(), Some(Completed));
+        assert_eq!(Idle.terminal_target(), Some(Completed));
+        assert_eq!(Created.terminal_target(), Some(Failed));
+        assert_eq!(Pending.terminal_target(), Some(Failed));
     }
 
     #[test]

@@ -258,12 +258,6 @@ pub struct HeartbeatRequest {
     /// placement on `ready_images.contains(&digest)`.
     #[serde(default)]
     pub ready_images: Vec<ManifestDigest>,
-    /// ADR 0018 Phase B: sandbox IDs whose backing `/dev/nbdN` has
-    /// failed health probes. Coord's heartbeat handler (commit 5)
-    /// fires the evacuation primitive against each entry.
-    /// `#[serde(default)]` for back-compat with pre-Phase-B hosts.
-    #[serde(default)]
-    pub nbd_unhealthy: Vec<SandboxId>,
     /// ADR 0035: the host's bake-stamp bundle set (`drive_id` →
     /// sha256 as refs). `#[serde(default)]` — coord rolls before the
     /// host MIG, so old hosts mid-roll simply report none.
@@ -325,11 +319,26 @@ pub async fn heartbeat(
     // don't need a PG lookup; the warm + register are idempotent
     // on the steady-state path.
     if let Some(host_addr) = hb.host_addr.as_deref() {
-        if !state.host_registry.contains(host_id) {
+        // (Re)warm + register when EITHER the host is unknown to this
+        // coord pod (it was rolled by helm-deploy — the original ADR 0013
+        // self-heal), OR its advertised addr changed since we last dialed
+        // it. The latter is ADR 0044 K2 (GAP 1): a DaemonSet pod restart
+        // keeps a STABLE HostId but gets a fresh POD_IP, so `contains` is
+        // still true — without the addr-change arm we'd keep dialing the
+        // dead old IP forever. `warm` is idempotent (a no-op when the addr
+        // is unchanged), and the `register` below re-points the dispatch
+        // backend; `update_state` later in this handler repopulates the
+        // reset HostState from this same heartbeat.
+        let known = state.host_registry.contains(host_id);
+        let addr_changed =
+            state.services.host_pool.current_addr(host_id).as_deref() != Some(host_addr);
+        if !known || addr_changed {
             tracing::info!(
                 host_id = %host_id,
                 host_addr = %host_addr,
-                "heartbeat for unregistered host; warming pool + registering",
+                known,
+                addr_changed,
+                "heartbeat: (re)warming pool + registering (new host or changed dial addr)",
             );
             state
                 .services
@@ -356,22 +365,6 @@ pub async fn heartbeat(
             count = flipped.len(),
             "heartbeat reconcile flipped missing-sandbox sessions",
         );
-    }
-
-    // ADR 0018 Phase B: NBD-loss-triggered evacuation. Gated on
-    // ENGRAM_NBD_AUTO_EVAC=1 — default off until the
-    // resume-from-Created path lands. The trigger module handles
-    // session resolution + state-machine drive + dead-source primitive
-    // dispatch. Best-effort per-sandbox; failures log and the affected
-    // session sits at HostLost or wherever the partial transition left
-    // it.
-    if !hb.nbd_unhealthy.is_empty() {
-        tracing::info!(
-            host_id = %host_id,
-            count = hb.nbd_unhealthy.len(),
-            "heartbeat reports nbd-unhealthy sandboxes; dispatching trigger",
-        );
-        crate::nbd_loss_trigger::process_unhealthy(&state, host_id, &hb.nbd_unhealthy).await;
     }
 
     // Refresh in-memory scheduler view so the next session-create
@@ -731,6 +724,31 @@ pub async fn live_manifest_publish(
 /// re-nominates a still-Evicting sandbox on every 10s tick until the
 /// pipeline destroys it; counting those re-nominations as accepted
 /// no-ops is what keeps that loop silent and cheap.
+/// ADR 0045 C1: the migration export TTL's dumb-host ownership check.
+/// A source host-agent holding a frozen export past its TTL (no
+/// commit/abort arrived — a coordinator death mid-move) asks: "does
+/// session X still bind my sandbox Y?" `true` ⇒ the move never landed,
+/// un-pause in place (abort). `false` ⇒ the session moved on (the
+/// scanner rehomed it, or the rebind landed without the commit) —
+/// destroying the stale frozen source is safe and REQUIRED (resuming
+/// it would split state).
+pub async fn sandbox_ownership(
+    State(state): State<SharedState>,
+    Path((_host_id, session_id, sandbox_id)): Path<(HostId, SessionId, SandboxId)>,
+) -> Result<Json<SandboxOwnershipResponse>, ApiError> {
+    let owned = match state.services.meta.get_session(session_id).await {
+        Ok(s) => s.sandbox_id == Some(sandbox_id),
+        Err(engram_core::MetaError::NotFound) => false,
+        Err(e) => return Err(ApiError::Internal(format!("get_session: {e}"))),
+    };
+    Ok(Json(SandboxOwnershipResponse { owned }))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SandboxOwnershipResponse {
+    pub owned: bool,
+}
+
 pub async fn idle_eviction_candidates(
     State(state): State<SharedState>,
     Path(host_id): Path<HostId>,
