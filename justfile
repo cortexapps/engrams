@@ -386,6 +386,21 @@ dev-shell:
               "harness": {"kind":"none"} \
             }' | jq -r '.session_id'
 
+# Live smoke of the app-gRPC surface (ADR 0039 Task 10 stage gate).
+# Requires `just dev` running. The dev bearer matches the Tiltfile's
+# ENGRAM_APP_GRPC_TOKENS default. The test finds a no-harness enabled
+# image from the REST surface, then drives create → list → get → delete
+# over gRPC. Prints SKIP with instructions when the stack is not up.
+smoke-control-plane:
+    ENGRAM_SMOKE_GRPC=127.0.0.1:50061 ENGRAM_SMOKE_GRPC_TOKEN=dev-app-grpc-token \
+        cargo test -p engram-coordinator --test grpc_smoke -- --ignored --nocapture
+
+# Umbrella stage gate: run all smoke-* recipes in sequence. Each task
+# that adds a new smoke-* recipe appends its name to this recipe's
+# dependencies. (A just recipe cannot reference recipes that don't
+# exist yet, so each task is responsible for appending here.)
+smoke: smoke-control-plane
+
 # Drop everything in ./var/* (sandbox cwds + snapshots).
 clean-var:
     rm -rf ./var
