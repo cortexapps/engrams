@@ -2996,6 +2996,28 @@ impl SandboxBackend for PooledBackend {
         let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) =
             if let Some(entry) = self.nbd_sandboxes.get(&id) {
                 entry.backend.set_migration_fence(true);
+                // Push the HOST's block-device page cache down to the
+                // daemon before draining. FC's virtio-blk writes to
+                // /dev/nbdN through the kernel page cache (drive
+                // cache_type default = Unsafe: guest FLUSH does not
+                // propagate), so without this fsync the drain captures
+                // only what background writeback happened to push —
+                // an ACTIVE guest's recent writes were still in the
+                // host cache and the export shipped a chunk with
+                // zeros/stale bytes where they belonged (the two-host
+                // NBD e2e probe; idle evictions dodge it because a
+                // quiescent session ages past the writeback interval).
+                let dev = entry.device_path().to_path_buf();
+                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&dev)?;
+                    f.sync_all()
+                })
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
+                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
                 entry.backend.wait_idle().await;
                 let pending =
                     entry.backend.flush_local().await.map_err(|e| {
@@ -3850,6 +3872,24 @@ impl PooledBackend {
             )
             .await
             .map_err(|e| SandboxError::Snapshot(format!("nbd attach (migration): {e}")))?;
+            // The sidecar patch is NOT optional here. Without it the
+            // sidecar's `rootfs_source` still names the SOURCE host's
+            // /dev/nbdN; `restore_canonical_symlinks` then aims both
+            // canonical symlinks at that literal device and FC reopens
+            // it — on a host whose slot allocator handed this restore
+            // a different index, that's a DIFFERENT SESSION'S live
+            // disk (prod canaries 5fa742b7/4391e591: zeros + "Exec
+            // format error" on every uncached read, with a cross-
+            // session write hazard). Single-session hosts masked it
+            // because nbd0 lined up on both sides by coincidence.
+            let device_path = state.device_path().to_path_buf();
+            patch_sidecar_rootfs_source(src, &device_path).await?;
+            tracing::info!(
+                src = %src.display(),
+                manifest = %disk_ref,
+                device = %device_path.display(),
+                "migration NBD attach: inline manifest served, sidecar patched to /dev/nbdN",
+            );
             return Ok(Some(state));
         }
         let state = crate::disk_daemon::attach_manifest(

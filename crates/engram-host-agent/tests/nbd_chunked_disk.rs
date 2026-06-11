@@ -450,3 +450,125 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
         .expect("destroy recovered sandbox");
     eprintln!("TEARDOWN: recovered VM destroyed + NBD daemon disconnected");
 }
+
+/// VM-free minimal repro for the teleport-canary disk corruption
+/// (prod sessions 5fa742b7/4391e591): a write to a HIGH-offset chunk
+/// through the kernel NBD device cannot be read back, while low
+/// offsets work. No KVM, no Docker — synthetic 13-slot manifest
+/// (9 populated, tail sparse), attach, pwrite at ~142 MiB, fsync,
+/// pread back. Run as root (NBD ioctls).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + modprobe nbd + root"]
+async fn high_offset_write_reads_back_through_the_device() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let nbd_path = PathBuf::from(
+        std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
+    );
+    if !nbd_path.exists() {
+        eprintln!("SKIP: {} not present", nbd_path.display());
+        return;
+    }
+    let work = tempfile::tempdir().expect("work");
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
+    let store = ChunkStore::new(blob);
+    let mut cache_cfg = ChunkCacheConfig::new(work.path().join("cache"));
+    cache_cfg.budget_bytes = 1024 * 1024 * 1024;
+    let cache = ChunkCache::new(cache_cfg);
+
+    // 13-slot device (217104384 bytes), 9 populated chunks — the same
+    // shape the baked ext4 produced in the failing e2e.
+    const CHUNK: u64 = 16 * 1024 * 1024;
+    const TOTAL: u64 = 217_104_384;
+    let mut chunks = Vec::new();
+    for i in 0..9u64 {
+        let body = vec![(i as u8).wrapping_add(1); CHUNK as usize];
+        let hash = store.put_chunk(&body).await.expect("put chunk");
+        chunks.push(engram_chunk_store::manifest::ChunkRef {
+            offset: i * CHUNK,
+            hash,
+        });
+    }
+    let manifest = engram_chunk_store::Manifest {
+        schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+        kind: ManifestKind::Disk,
+        chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(CHUNK),
+        total_bytes: TOTAL,
+        chunks,
+        parent: None,
+        working_set_trace: None,
+        annotations: serde_json::Value::Null,
+    };
+    let mref = ManifestRef::new();
+    store
+        .put_manifest(mref, &manifest)
+        .await
+        .expect("put manifest");
+
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    let state = attach_manifest(mref, cache, Arc::new(store), &pool, u64::MAX)
+        .await
+        .expect("attach");
+    let dev = state.device_path().to_path_buf();
+    eprintln!("attached at {}", dev.display());
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&dev)
+        .expect("open device");
+    // The kernel applies NBD_SET_SIZE asynchronously w.r.t. open();
+    // wait for the device to report its full size.
+    for i in 0..40 {
+        let size = f.seek(SeekFrom::End(0)).expect("size probe");
+        if size == TOTAL {
+            break;
+        }
+        eprintln!("device size {size} != {TOTAL} (attempt {i}); waiting");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dev)
+            .expect("re-open device");
+    }
+    let final_size = f.seek(SeekFrom::End(0)).expect("size probe");
+    eprintln!("device size: {final_size} (want {TOTAL})");
+
+    // Control: low offset read.
+    let mut low = vec![0u8; 4096];
+    f.seek(SeekFrom::Start(0)).unwrap();
+    f.read_exact(&mut low).expect("low-offset read");
+    assert!(low.iter().all(|b| *b == 1), "chunk 0 content");
+
+    // The probe: 8 MiB at 142,606,336 (inside populated chunk 8).
+    let probe_off = 142_606_336u64;
+    let payload: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    f.seek(SeekFrom::Start(probe_off)).unwrap();
+    f.write_all(&payload).expect("probe write");
+    f.sync_data().expect("fsync");
+
+    let mut back = vec![0u8; payload.len()];
+    f.seek(SeekFrom::Start(probe_off)).unwrap();
+    f.read_exact(&mut back).expect("probe read-back");
+    assert_eq!(
+        back, payload,
+        "a high-offset write must read back byte-identical through the NBD device"
+    );
+
+    // Also exercise a SPARSE tail slot (chunk 10 — a manifest hole).
+    let hole_off = 10 * CHUNK + 1024;
+    f.seek(SeekFrom::Start(hole_off)).unwrap();
+    f.write_all(&payload[..4096]).expect("hole write");
+    f.sync_data().expect("fsync 2");
+    let mut hole_back = vec![0u8; 4096];
+    f.seek(SeekFrom::Start(hole_off)).unwrap();
+    f.read_exact(&mut hole_back).expect("hole read-back");
+    assert_eq!(
+        hole_back,
+        payload[..4096],
+        "hole-backed chunk write survives"
+    );
+    drop(f);
+    drop(state);
+}

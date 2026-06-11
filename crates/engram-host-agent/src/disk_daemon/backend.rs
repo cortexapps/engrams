@@ -712,24 +712,44 @@ impl ChunkedDiskBackend {
         let prefetched_base: Option<Vec<u8>> = if already_present {
             None
         } else {
-            // Fetch base bytes OUTSIDE the dirty lock. Another writer
-            // may insert the same chunk while we're awaiting the
-            // chunk-store fetch; we handle that under the lock below
-            // (the racing-writer branch).
-            let hash = self
-                .state
+            // The RMW base MUST honor the same tier order as
+            // `read_chunk`: pending BEFORE base. A flush drains
+            // dirty→pending and only rebases `base` after the upload
+            // lands (multi-second in prod), so a write arriving in
+            // that window would otherwise rebuild the chunk from the
+            // PRE-FLUSH base and silently drop everything the drain
+            // just captured — the teleport-canary "zeros where the
+            // session's data should be" corruption, reproduced by
+            // the two-host NBD e2e (an 8 MiB write crossing the
+            // flush threshold mid-stream loses its first wave).
+            let pending_bytes = self
+                .pending_uploads
                 .lock()
                 .await
-                .base
-                .chunks
-                .get(chunk_idx)
-                .copied()
-                .flatten();
-            let base_bytes = match hash {
-                Some(hash) => self.cache.get(hash, || self.store.get_chunk(hash)).await?,
-                None => Bytes::from(vec![0u8; chunk_len]),
-            };
-            Some(base_bytes.to_vec())
+                .get(&chunk_idx)
+                .map(|(_hash, bytes)| bytes.to_vec());
+            if let Some(b) = pending_bytes {
+                Some(b)
+            } else {
+                // Fetch base bytes OUTSIDE the dirty lock. Another writer
+                // may insert the same chunk while we're awaiting the
+                // chunk-store fetch; we handle that under the lock below
+                // (the racing-writer branch).
+                let hash = self
+                    .state
+                    .lock()
+                    .await
+                    .base
+                    .chunks
+                    .get(chunk_idx)
+                    .copied()
+                    .flatten();
+                let base_bytes = match hash {
+                    Some(hash) => self.cache.get(hash, || self.store.get_chunk(hash)).await?,
+                    None => Bytes::from(vec![0u8; chunk_len]),
+                };
+                Some(base_bytes.to_vec())
+            }
         };
 
         // Single critical section: ensure entry exists, patch in
@@ -1498,6 +1518,46 @@ mod tests {
 
         let bytes = backend.read(4096, 4096).await.unwrap();
         assert!(bytes.iter().all(|b| *b == 0xbb));
+    }
+
+    /// The flush-window write race (the teleport-canary zeros): a write
+    /// landing AFTER `flush_local` drained its chunk to the pending tier
+    /// but BEFORE the upload rebases `base` must RMW from PENDING, not
+    /// the stale base — otherwise everything the drain just captured is
+    /// silently dropped from the chunk and reads (and the next publish)
+    /// serve zeros/stale bytes where the first write wave should be.
+    #[tokio::test]
+    async fn write_during_flush_window_rmws_from_pending_not_stale_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 4096u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        // Wave 1: first half of the chunk.
+        backend.write(0, &[0x11u8; 2048]).await.unwrap();
+        // The scheduler's drain races in: dirty -> pending (upload not
+        // yet landed, base NOT rebased).
+        let _pending = backend.flush_local().await.unwrap();
+        // Wave 2: second half, arriving inside the flush window.
+        backend.write(2048, &[0x22u8; 2048]).await.unwrap();
+
+        let bytes = backend.read(0, 4096).await.unwrap();
+        assert!(
+            bytes[..2048].iter().all(|b| *b == 0x11),
+            "wave-1 bytes must survive a wave-2 RMW inside the flush window \
+             (stale-base RMW would resurrect the pre-flush base here)",
+        );
+        assert!(bytes[2048..].iter().all(|b| *b == 0x22), "wave-2 bytes");
     }
 
     /// NBD durability: a read whose backing chunk blob is missing must

@@ -673,7 +673,7 @@ jobs:
         id: nbd_setup
         run: |
           if sudo modprobe nbd nbds_max=4 2>/dev/null \
-             && sudo chmod 666 /dev/nbd0 2>/dev/null; then
+             && sudo chmod 666 /dev/nbd0 /dev/nbd1 2>/dev/null; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             ls -la /dev/nbd0
           else
