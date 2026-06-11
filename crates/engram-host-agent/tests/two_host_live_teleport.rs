@@ -228,7 +228,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
-                    "echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
+                    "trap '' USR1; echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
                      echo $i > /dev/shm/harness-heartbeat; sleep 0.2; done"
                         .into(),
                 ],
@@ -308,7 +308,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
-                    "echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
+                    "trap '' USR1; echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
                      echo $i > /dev/shm/harness-heartbeat; sleep 0.2; done"
                         .into(),
                 ],

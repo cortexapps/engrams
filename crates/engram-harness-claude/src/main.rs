@@ -212,6 +212,16 @@ mod adapter {
         // Connection loop: dial → handshake → splice (forward host
         // commands / pump engine events) until the link drops, then
         // re-dial. The engine drives termination.
+        //
+        // ADR 0045 C1: SIGUSR1 = "drop the connection and re-dial NOW",
+        // sent by agentd's SpawnHarness-reattach arm right after a live
+        // move / snapshot restore. The restore rebuilds the vsock
+        // device, but this side's established connection never EOFs —
+        // the splice would block forever on a read the peer can no
+        // longer answer, and the new host would never see an attach.
+        let mut reconnect_nudge =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .expect("install SIGUSR1 handler");
         let mut consecutive_failures: u32 = 0;
         const MAX_BACKOFF_SECS: u64 = 10;
         // `None` → the engine finished on its own; await it below for the
@@ -254,7 +264,17 @@ mod adapter {
                     continue;
                 }
             };
-            match run_one_connection(stream, &cli, &cmd_tx, &mut evt_rx, &held, &reattach).await {
+            let outcome = tokio::select! {
+                outcome = run_one_connection(stream, &cli, &cmd_tx, &mut evt_rx, &held, &reattach) => outcome,
+                _ = reconnect_nudge.recv() => {
+                    tracing::info!(
+                        "SIGUSR1 reconnect nudge (live move / restore); \
+                         dropping the connection and re-dialing"
+                    );
+                    ConnOutcome::Dropped { reason: "SIGUSR1 reconnect nudge" }
+                }
+            };
+            match outcome {
                 ConnOutcome::EngineDone => break None,
                 ConnOutcome::Rejected => break Some(ExitCode::from(1)),
                 ConnOutcome::HandshakeFailed { reason } => {

@@ -392,6 +392,58 @@ impl Runtime {
         Ok(())
     }
 
+    /// ADR 0045 C1 tail latency: eagerly install EVERY chunk of the
+    /// session — canonical via the shared base (CONTINUE), divergent
+    /// via fetch + COPY — as a background producer racing the fault
+    /// loop, exactly like `prefault_from_trace` but with total
+    /// coverage instead of a recorded working set. A migration restore
+    /// has no host trace, so before this sweep its divergent chunks
+    /// (the checkpoint chain's accumulated diff — hundreds of 512 KiB
+    /// chunks, all prestaged on local NVMe) faulted in one at a time
+    /// through the single-threaded fault loop: the residual ~27 s
+    /// post-teleport guest crawl (prod canary 51d51740). Idempotent
+    /// against the fault loop via the `installed` bitmap; `wake=false`
+    /// (no vCPU waits on a page it hasn't faulted).
+    pub fn sweep_all(&self) -> Result<(), HandlerError> {
+        let chunk_size = self.backend.chunk_size();
+        let total = self.backend.total_bytes();
+        let mut installed = 0usize;
+        let mut offset: u64 = 0;
+        while offset < total {
+            let did = match self.backend.resolve(offset) {
+                Some(ResolvedPage::Canonical { canonical_offset }) => {
+                    match self.backend.canonical_chunk_hash(canonical_offset) {
+                        Some(hash) => match self.base_shm.as_ref() {
+                            Some(base) => {
+                                self.install_canonical_shared(base, offset, hash, false)?
+                            }
+                            None => {
+                                let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                                self.install_chunk_at(offset, bytes, false)?
+                            }
+                        },
+                        None => self.install_zero_substrate(offset, false)?,
+                    }
+                }
+                Some(ResolvedPage::Chunk { hash }) => {
+                    let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+                    self.install_chunk_at(offset, bytes, false)?
+                }
+                None => false,
+            };
+            if did {
+                installed += 1;
+            }
+            offset += chunk_size;
+        }
+        tracing::info!(
+            installed,
+            total_chunks = total.div_ceil(chunk_size),
+            "eager full sweep complete (ADR 0045 C1)"
+        );
+        Ok(())
+    }
+
     /// Install `bytes` (a full chunk) at the given session byte
     /// offset, copying into the guest's UFFD-registered region via
     /// one `UFFDIO_COPY`. `wake` controls whether vCPUs blocked on
@@ -819,19 +871,34 @@ pub fn run_listener(
     // sound. Previously prefault ran to completion before `run()`, which put
     // the entire working-set fetch on the resume critical path.
     let rt = Arc::new(rt);
-    let prefault_thread = prefault_trace.map(|trace| {
+    let prefault_thread = {
         let rt = Arc::clone(&rt);
         std::thread::Builder::new()
             .name("engram-uffd-prefault".to_string())
             .spawn(move || {
-                if let Err(e) = rt.prefault_from_trace(&trace) {
+                // Hot set first (when a trace exists), then the eager
+                // full sweep covers everything else — so by the time
+                // the guest touches ANY page, the odds it must round-
+                // trip the fault loop shrink to the race window. The
+                // sweep is what kills the migration-restore crawl: no
+                // host trace exists on a fresh dest, and the divergent
+                // chunk set otherwise faults in serially (ADR 0045 C1).
+                if let Some(trace) = prefault_trace {
+                    if let Err(e) = rt.prefault_from_trace(&trace) {
+                        tracing::warn!(
+                            error = %e,
+                            "background prefault failed; remaining pages serve on-demand",
+                        );
+                    }
+                }
+                if let Err(e) = rt.sweep_all() {
                     tracing::warn!(
                         error = %e,
-                        "background prefault failed; remaining pages serve on-demand",
+                        "eager full sweep failed; remaining pages serve on-demand",
                     );
                 }
             })
-    });
+    };
     let _stream_alive = stream;
     tracing::info!(pid, "starting fault loop");
     let result = rt.run();
@@ -839,7 +906,7 @@ pub fn run_listener(
     // Join the prefault producer before freezing the recorder so it's
     // quiesced. Once the uffd closes (FC exited) the prefault's next install
     // errors out, so this returns promptly rather than blocking teardown.
-    if let Some(Ok(handle)) = prefault_thread {
+    if let Ok(handle) = prefault_thread {
         let _ = handle.join();
     }
     result?;
