@@ -104,18 +104,40 @@ pub async fn migrate_session_live(
         })?;
 
     // The last durable checkpoint row: the metadata template AND the
-    // parachute's landing spot.
+    // parachute's landing spot. OPTIONAL by operator decision
+    // (2026-06-11): a session with no durable row yet (younger than
+    // its first periodic checkpoint) teleports anyway — if the move
+    // fails mid-flight there is nothing to rehome from and the
+    // session is lost. Metadata falls back to the image's base
+    // snapshot row (aux_bundles must still pin, or a [git] image
+    // restores without its skills mounts).
     let durable_row = state
         .services
         .meta
         .latest_snapshot_for_session(session_id)
         .await
-        .map_err(|e| MigrateError::Fatal(format!("latest snapshot: {e}")))?
-        .ok_or_else(|| {
-            MigrateError::Unsupported(
-                "no durable checkpoint yet — snapshot-rehome handles the first move".into(),
-            )
-        })?;
+        .map_err(|e| MigrateError::Fatal(format!("latest snapshot: {e}")))?;
+    let base_row = match &durable_row {
+        Some(_) => None,
+        None => match state
+            .services
+            .meta
+            .get_enabled_image_any(&session.image)
+            .await
+        {
+            Ok(Some(img)) => match img.base_snapshot_id {
+                Some(id) => state.services.meta.get_snapshot(id).await.ok().flatten(),
+                None => None,
+            },
+            _ => None,
+        },
+    };
+    if durable_row.is_none() {
+        tracing::warn!(
+            %session_id,
+            "live migration without a durable checkpoint row — a mid-move              failure past the freeze CANNOT be rehomed (operator-accepted)",
+        );
+    }
 
     // Resolve the source's backend handle ONCE, pre-freeze, and use it
     // for capture, the failure-arm aborts, AND the post-rebind commit.
@@ -168,9 +190,20 @@ pub async fn migrate_session_live(
     let has_disk = !capture.disk_manifest_json.is_empty();
     let metadata = engram_core::types::snapshot::SnapshotMetadata {
         id: capture.snapshot_id,
-        size_bytes: durable_row.size_bytes,
+        size_bytes: durable_row.as_ref().map(|r| r.size_bytes).unwrap_or(0),
         created_at: chrono::Utc::now(),
-        image_version: durable_row.image_version.clone(),
+        image_version: durable_row
+            .as_ref()
+            .map(|r| r.image_version.clone())
+            .or_else(|| base_row.as_ref().map(|r| r.image_version.clone()))
+            .unwrap_or_else(|| {
+                session
+                    .image
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
+            }),
         base_memory_manifest,
         migration_source: Some(MigrationSourceInfo {
             export_id: capture.export_id.clone(),
@@ -189,7 +222,11 @@ pub async fn migrate_session_live(
         sidecar_blob_key: None,
         rootfs_blob_key: None,
         working_set_blob_key: None,
-        aux_bundles: durable_row.aux_bundles.clone(),
+        aux_bundles: durable_row
+            .as_ref()
+            .map(|r| r.aux_bundles.clone())
+            .or_else(|| base_row.as_ref().map(|r| r.aux_bundles.clone()))
+            .unwrap_or_default(),
     };
     let new_sandbox_id = match dest_backend.restore(metadata).await {
         Ok(id) => id,
