@@ -1,0 +1,217 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// Image curation + registry credentials (ADR 0039 §2.3, rev
+// 2026-06-10). The caller is a single trusted service (bearer-authed);
+// authz lives in the orchestrator.
+service ImageService {
+  rpc ListEnabledImages(ListEnabledImagesRequest) returns (ListEnabledImagesResponse);
+  // ADR 0036: enabling is asynchronous — the call validates the URI
+  // with a cheap metadata pull and records an enable job; the scanner
+  // drives the heavy pipeline. Re-calling while a job is in flight
+  // returns the existing job (idempotent).
+  rpc EnableImage(EnableImageRequest) returns (EnableImageResponse);
+  rpc DisableImage(DisableImageRequest) returns (DisableImageResponse);
+  rpc RefreshImage(RefreshImageRequest) returns (RefreshImageResponse);
+  rpc ListEnableJobs(ListEnableJobsRequest) returns (ListEnableJobsResponse);
+  rpc GetEnableJob(GetEnableJobRequest) returns (GetEnableJobResponse);
+  rpc RetryEnableJob(RetryEnableJobRequest) returns (RetryEnableJobResponse);
+  rpc ListRegistries(ListRegistriesRequest) returns (ListRegistriesResponse);
+  rpc AddRegistry(AddRegistryRequest) returns (AddRegistryResponse);
+  rpc DeleteRegistry(DeleteRegistryRequest) returns (DeleteRegistryResponse);
+}
+
+message ListEnabledImagesRequest {}
+
+message ListEnabledImagesResponse {
+  repeated EnabledImageSummary images = 1;
+}
+
+// Mirrors engram_core::types::EnabledImageSummary — one live row of the
+// operator-curated image allow-list. The raw manifest.toml is
+// intentionally omitted; clients render via the lifted manifest_*
+// fields.
+message EnabledImageSummary {
+  string id = 1;
+  // Full OCI URI: <host>[/path]/<repo>:<tag>.
+  string image_uri = 2;
+  string manifest_digest = 3;
+  // Lifted from the parsed manifest.toml; unset when the stored toml
+  // fails to parse (the row stays listed so an operator can disable it).
+  optional string manifest_name = 4;
+  optional string manifest_description = 5;
+  // ADR 0021: name of the harness baked into this image, or unset for a
+  // harness-less image. Drives the session-create form (e.g. show the
+  // Claude OAuth/API-key picker iff "claude").
+  optional string harness_name = 6;
+  // ISO-8601.
+  string last_refreshed_at = 7;
+  // ISO-8601.
+  string created_at = 8;
+}
+
+message EnableImageRequest {
+  // Full OCI URI. The host portion must match a registry credential row
+  // for non-anonymous pulls; missing rows fall through to anonymous.
+  string image_uri = 1;
+}
+
+// Today's HTTP route returns 202 + the bare EnableJob; wrapped here per
+// the entity-wrapping convention.
+message EnableImageResponse {
+  EnableJob job = 1;
+}
+
+// Mirrors engram_core::types::EnableJob (ADR 0036) — an asynchronous
+// image enable in flight (or terminal). chunks_done/chunks_total drive
+// the progress bar.
+message EnableJob {
+  string id = 1;
+  string image_uri = 2;
+  // OCI manifest digest observed at submit time (informational — the
+  // scanner re-pulls at materialize time). Unset until observed.
+  optional string manifest_digest = 3;
+  // EnableJobState, snake_case: "pending" | "materializing" |
+  // "capturing" | "ready" | "failed".
+  string state = 4;
+  // Total chunks in the image's bootstrap; unset until the scanner has
+  // pulled + parsed the artifact metadata.
+  optional uint32 chunks_total = 5;
+  uint32 chunks_done = 6;
+  // Pipeline failures so far; the scanner flips to "failed" once this
+  // exceeds its budget.
+  uint32 attempts = 7;
+  // Human-readable failure diagnostic; not machine-parsed, not stable.
+  optional string error = 8;
+  // ISO-8601.
+  string created_at = 9;
+  // ISO-8601.
+  string updated_at = 10;
+}
+
+message DisableImageRequest {
+  string image_uri = 1;
+}
+
+// Today's HTTP handler returns 204 No Content on success (idempotently
+// — already-disabled gets the same 204). The refused case — one or more
+// sessions in {pending, created, active, evacuating} still reference
+// the image — is a 409 with an `image_in_use` body listing the blocking
+// sessions; on this surface it maps to a gRPC error (the web surfaces
+// the message text only, so the structured blocking_sessions list is an
+// error-detail concern for the convert layer, not a response field).
+message DisableImageResponse {}
+
+message RefreshImageRequest {
+  // Must already be enabled — refresh refuses to enable a new URI so
+  // the auditable enable path can't be bypassed.
+  string image_uri = 1;
+}
+
+// Refresh runs the identical async pipeline as enable (the upsert
+// preserves id/created_at); 202 + the bare EnableJob today, wrapped
+// here. Distinct from EnableImageResponse per
+// RPC_REQUEST_RESPONSE_UNIQUE.
+message RefreshImageResponse {
+  EnableJob job = 1;
+}
+
+message ListEnableJobsRequest {}
+
+// Recent jobs, newest first (server-bounded — 50 today).
+message ListEnableJobsResponse {
+  repeated EnableJob jobs = 1;
+}
+
+message GetEnableJobRequest {
+  string job_id = 1;
+}
+
+message GetEnableJobResponse {
+  EnableJob job = 1;
+}
+
+// Re-queue a "failed" job to "pending" — the explicit admin trigger
+// pairing for the scanner's implicit retry budget.
+message RetryEnableJobRequest {
+  string job_id = 1;
+}
+
+message RetryEnableJobResponse {
+  EnableJob job = 1;
+}
+
+message ListRegistriesRequest {}
+
+message ListRegistriesResponse {
+  repeated RegistryCredentialSummary registries = 1;
+}
+
+// Mirrors engram_core::types::registry::RegistryCredentialSummary.
+// Never carries secret material — the coordinator redacts the cipher
+// payload before it reaches any wire.
+message RegistryCredentialSummary {
+  string id = 1;
+  string registry_host = 2;
+  // RegistryAuthSpec kind: "static" | "gcp_workload_identity" |
+  // "anonymous". Future cloud-IAM kinds extend this set.
+  string auth_kind = 3;
+  // For "static": the username. For "gcp_workload_identity": the
+  // impersonated SA email if any, else unset. Always non-secret.
+  optional string auth_principal = 4;
+  // ISO-8601.
+  string created_at = 5;
+  // ISO-8601; unset if never updated.
+  optional string updated_at = 6;
+}
+
+// api/registries.rs AddRegistryAuth is an internally-tagged serde union
+// (`serde(tag = "kind")`) → oneof, variant names from the Rust enum.
+// The convert layer maps oneof case → tag explicitly.
+message AddRegistryRequest {
+  string host = 1;
+  oneof auth {
+    StaticRegistryAuth static = 2;
+    GcpWorkloadIdentityRegistryAuth gcp_workload_identity = 3;
+    AnonymousRegistryAuth anonymous = 4;
+  }
+}
+
+message StaticRegistryAuth {
+  string username = 1;
+  // Plaintext in transit (TLS/private net) — sealed under the
+  // deployment KEK before it lands in Postgres; never echoed back.
+  string password = 2;
+}
+
+message GcpWorkloadIdentityRegistryAuth {
+  // Optional service account to impersonate via the IAM Credentials
+  // API. Unset = use the runtime's ambient identity directly. No secret
+  // material either way.
+  optional string impersonate_sa = 1;
+}
+
+// Public registry — no auth material. Stored as a row so the catalog
+// browser can list the host and enable-image can validate against a
+// known set.
+message AnonymousRegistryAuth {}
+
+message AddRegistryResponse {
+  string id = 1;
+  string host = 2;
+  // Echo of the accepted kind: "static" | "gcp_workload_identity" |
+  // "anonymous".
+  string auth_kind = 3;
+  // See RegistryCredentialSummary.auth_principal.
+  optional string auth_principal = 4;
+}
+
+message DeleteRegistryRequest {
+  // Keyed by registry host (today's DELETE /api/registries/:host), not
+  // by row id.
+  string host = 1;
+}
+
+// Today's HTTP handler returns 204 No Content — no body to mirror.
+message DeleteRegistryResponse {}

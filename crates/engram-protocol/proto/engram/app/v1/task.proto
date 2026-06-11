@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+import "engram/app/v1/session.proto";
+
+// The application aggregate root (ADR §3). ORCHESTRATOR-NATIVE: the
+// control plane neither implements nor knows about tasks — this file
+// lives in the same package so web gets one uniform generated API, and
+// it is excluded from the Rust build.
+service TaskService {
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+  // No filter fields: the server scopes the list by the CALLER's
+  // ability, never by a client-supplied filter.
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+}
+
+message CreateTaskRequest {
+  // "chat" is the only accepted value for now;
+  // linear_issue/dependabot/incident later.
+  string type = 1;
+  string image_uri = 2;
+  optional string prompt = 3;
+  optional string title = 4;
+}
+
+message CreateTaskResponse {
+  Task task = 1;
+}
+
+message Task {
+  string id = 1;
+  // "chat" now; linear_issue/dependabot/incident later.
+  string type = 2;
+  optional string title = 3;
+  // "open" | "working" | "awaiting_review" | "done" | "failed".
+  string status = 4;
+  // better-auth user id of the creator; unset for system-triggered
+  // tasks. Attribution lives HERE, not on the control-plane Session.
+  optional string created_by_user_id = 5;
+  // Type-specific trigger ref (jsonb passthrough).
+  string source_json = 6;
+  repeated TaskSessionRef sessions = 7;
+  // RFC3339.
+  string created_at = 8;
+}
+
+message TaskSessionRef {
+  string session_id = 1;
+  optional string role = 2;
+  // Denormalized from the control plane at read time (state, image, …);
+  // unset when the control-plane lookup fails or lags. proto3
+  // `optional` on a message-typed field is redundant but kept to make
+  // the unset case explicit.
+  optional Session session = 3;
+}
+
+message ListTasksRequest {}
+
+message ListTasksResponse {
+  repeated Task tasks = 1;
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message GetTaskResponse {
+  Task task = 1;
+}
+
+message DeleteTaskRequest {
+  string task_id = 1;
+}
+
+message DeleteTaskResponse {}
