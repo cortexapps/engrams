@@ -229,6 +229,14 @@ pub async fn evacuate_dead_source(
     // host instead of the capacity-ranked pick (operator-pinned
     // destination). `None` keeps the standard any-peer policy.
     require_host: Option<engram_core::HostId>,
+    // ADR 0045 C2 (E2B fold, origin affinity): soft preference for this
+    // host in the capacity-ranked pick — tier-2, below snapshot
+    // affinity, loses to exclude/draining/capacity (host_registry's
+    // standard precedence). The disk-only RESUME path passes the
+    // session's ORIGIN host (its chunk cache + base shm are warm
+    // there); movers (drain, dead-host) pass `None` — they are moving
+    // AWAY by definition.
+    prefer_host: Option<engram_core::HostId>,
 ) -> Result<EvacReceipt, EvacError> {
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
@@ -301,7 +309,7 @@ pub async fn evacuate_dead_source(
         // already unregistered; exclude_host is defensive.
         required_image_digest: None,
         exclude_host: session.host_id,
-        prefer_host: None,
+        prefer_host,
     };
 
     // Split pick + restore so picker errors and backend errors keep
@@ -944,6 +952,7 @@ mod tests {
             Some(snapshot),
             None,
             None,
+            None,
         )
         .await
         .expect("rung-1 happy path");
@@ -1000,10 +1009,60 @@ mod tests {
             Some(snapshot),
             None,
             None,
+            None,
         )
         .await
         .expect("snapshot-only happy path");
         assert_eq!(receipt.loss, EvacLoss::None);
+    }
+
+    /// ADR 0045 C2 (E2B fold, origin affinity): the disk-only RESUME
+    /// path threads the session's origin host as a soft preference —
+    /// its NBD chunk cache + base shm are warm there. Two otherwise
+    /// equal hosts: the pick lands on the preferred one. (Precedence —
+    /// snapshot affinity above, exclude/draining/capacity vetoes — is
+    /// pinned by host_registry's own prefer_host tests.)
+    #[tokio::test]
+    async fn evac_prefers_the_origin_host_when_passed() {
+        let meta = Arc::new(FakeMeta::default());
+        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
+        session.live_disk_manifest = None;
+        // Mirrors resume_disk_only_cold_boot: host_id cleared (so the
+        // origin is NOT excluded), origin threaded as prefer_host.
+        session.host_id = None;
+        let session_id = session.id;
+        meta.install_session(session.clone());
+        let snapshot = make_snapshot_for(
+            session_id,
+            Some(fake_manifest(0x1111, 1)),
+            Some(fake_manifest(0x2222, 1)),
+        );
+
+        let registry = Arc::new(HostRegistry::new(meta.clone()));
+        let origin = HostId::new();
+        let other = HostId::new();
+        let origin_be = Arc::new(FakeBackend::default());
+        let other_be = Arc::new(FakeBackend::default());
+        registry.register(other, other_be.clone());
+        registry.register(origin, origin_be.clone());
+        origin_be.set_restore_id(SandboxId::new());
+        other_be.set_restore_id(SandboxId::new());
+
+        let receipt = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            Some(snapshot),
+            None,
+            None,
+            Some(origin),
+        )
+        .await
+        .expect("origin-affinity happy path");
+        assert_eq!(
+            receipt.new_host_id, origin,
+            "with equal capacity the origin preference must win the pick"
+        );
     }
 
     /// A plausible cold-boot spec, the shape `resolve_cold_boot_spec`
@@ -1049,6 +1108,7 @@ mod tests {
             None,
             Some(test_cold_boot_spec()),
             None,
+            None,
         )
         .await
         .expect("disk-only cold-boot happy path");
@@ -1093,6 +1153,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         match &result {
@@ -1118,6 +1179,7 @@ mod tests {
             &registry,
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
+            None,
             None,
             None,
             None,
@@ -1148,6 +1210,7 @@ mod tests {
             session.clone(),
             None,
             Some(test_cold_boot_spec()),
+            None,
             None,
         )
         .await;

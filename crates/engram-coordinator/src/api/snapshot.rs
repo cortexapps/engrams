@@ -558,7 +558,7 @@ async fn resume_disk_only_cold_boot(
     // destroyed); clearing host_id disables `exclude_host` so a
     // single-host deployment can recover onto itself.
     let mut relocatable = session.clone();
-    relocatable.host_id = None;
+    let origin = relocatable.host_id.take();
 
     let receipt = evacuate_dead_source(
         &state.host_registry,
@@ -567,6 +567,11 @@ async fn resume_disk_only_cold_boot(
         None,
         Some(spec),
         None,
+        // ADR 0045 C2 (E2B fold, origin affinity): prefer the host the
+        // session last ran on — its NBD chunk cache (and base shm) are
+        // warm there. Soft tier-2: loses to capacity/draining, so this
+        // never strands the resume.
+        origin,
     )
     .await
     .map_err(|e| match &e {

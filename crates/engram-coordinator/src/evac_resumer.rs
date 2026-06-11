@@ -251,6 +251,9 @@ async fn run_resume_pipeline(
         snapshot,
         cold_boot_spec,
         require_host,
+        // No origin preference: every scanner producer (drain, dead
+        // host, migration parachute) is moving AWAY from the source.
+        None,
     )
     .await
     {
