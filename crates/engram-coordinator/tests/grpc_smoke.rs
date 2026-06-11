@@ -181,10 +181,12 @@ async fn stream_events_smoke() {
         .expect("StreamEvents must succeed")
         .into_inner();
 
-    // Collect up to 5 events (or until 10s timeout), noting their idx values.
+    // Collect up to 2 events (or until 10s timeout), noting their idx values.
+    // We stop as soon as we have 2, or on a non-status_changed event — the
+    // loop bound and break condition agree on 2.
     let mut grpc_idxs: Vec<i64> = Vec::new();
     let stream_read_timeout = std::time::Duration::from_secs(10);
-    while grpc_idxs.len() < 5 {
+    while grpc_idxs.len() < 2 {
         match tokio::time::timeout(stream_read_timeout, stream.message()).await {
             Ok(Ok(Some(ev))) => {
                 println!(
@@ -280,10 +282,11 @@ async fn stream_events_smoke() {
                         match byte_stream.next().await {
                             None => break, // stream ended (session terminal)
                             Some(Err(e)) => {
-                                // Transport error mid-stream — propagate so
-                                // the outer timeout arm handles it.
-                                eprintln!("smoke(stream_events): SSE read error: {e}");
-                                break;
+                                // Transport error mid-stream — hard fail so we
+                                // don't silently weaken the comparison. If this
+                                // fires, the SSE path has a real transport bug.
+                                // (Comparison NOT weakened: panic immediately.)
+                                panic!("smoke(stream_events): SSE read error mid-stream: {e}");
                             }
                             Some(Ok(chunk)) => {
                                 partial.push_str(&String::from_utf8_lossy(&chunk));
@@ -378,8 +381,9 @@ async fn stream_events_smoke() {
         Ok(Ok(None)) | Err(_) => {
             // Session may have no more events within the window — that's fine.
             println!(
-                "smoke(stream_events): reopen with since={last_idx}: no additional events \
-                 within timeout — replay dedup verified (no events before last_idx replayed)"
+                "smoke(stream_events): reopen with since={last_idx}: no events received \
+                 within 5s — no dupes or gaps observed (stream opened cleanly, no events \
+                 before or at last_idx were delivered)"
             );
         }
         Ok(Err(e)) => {
