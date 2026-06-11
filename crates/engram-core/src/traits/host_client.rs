@@ -124,6 +124,37 @@ pub trait HostClient: Send + Sync {
         ))
     }
 
+    /// ADR 0045 C2: see `SandboxBackend::migration_presetup`.
+    async fn migration_presetup(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::snapshot::MigrationPresetupOut, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_presetup`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: see `SandboxBackend::migration_capture_postcopy`.
+    async fn migration_capture_postcopy(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+    ) -> Result<crate::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_capture_postcopy`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: see `SandboxBackend::migration_drain_wait`.
+    async fn migration_drain_wait(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::snapshot::DrainOutcome, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this host doesn't support `migration_drain_wait`".into(),
+        ))
+    }
+
     /// ADR 0045 C1: see `SandboxBackend::migration_commit`.
     async fn migration_commit(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(

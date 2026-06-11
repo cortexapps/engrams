@@ -274,6 +274,10 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
         new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
         hot_chunks: vec![],
+        post_copy: false,
+        peer_addr: None,
+        peer_token: None,
+        sidecar_json: Vec::new(),
     });
 
     let t_restore = std::time::Instant::now();
@@ -566,6 +570,10 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
         new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
         hot_chunks: vec![],
+        post_copy: false,
+        peer_addr: None,
+        peer_token: None,
+        sidecar_json: Vec::new(),
     });
     let moved = client_b.restore(metadata).await.expect("restore on B");
     let row = host_b.pooled.snapshot_wait(moved).await.expect("catch-up");
@@ -717,6 +725,10 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
         new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
         hot_chunks: vec![],
+        post_copy: false,
+        peer_addr: None,
+        peer_token: None,
+        sidecar_json: Vec::new(),
     });
 
     let err = client_b.restore(metadata).await;

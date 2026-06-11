@@ -1035,6 +1035,13 @@ impl PooledBackend {
                             .await
                             .map_err(|e| SandboxError::Snapshot(format!("write sidecar: {e}")))?;
                     }
+                    MigrationItem::DiskManifest => {
+                        fs::write(dest.join("disk-manifest.json"), &current)
+                            .await
+                            .map_err(|e| {
+                                SandboxError::Snapshot(format!("write disk manifest: {e}"))
+                            })?;
+                    }
                     MigrationItem::Chunk(h) => {
                         let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
                         // No per-write sweep (the prod canary's 70s
@@ -3395,6 +3402,12 @@ impl SandboxBackend for PooledBackend {
                         .await
                         .map(bytes::Bytes::from)
                         .map_err(|e| SandboxError::Snapshot(format!("read sidecar: {e}"))),
+                    MigrationItem::DiskManifest => {
+                        fs::read(snapshot_dir.join("disk-manifest.json"))
+                            .await
+                            .map(bytes::Bytes::from)
+                            .map_err(|e| SandboxError::Snapshot(format!("read disk manifest: {e}")))
+                    }
                     MigrationItem::Chunk(h) => {
                         let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(h);
                         match &cache {

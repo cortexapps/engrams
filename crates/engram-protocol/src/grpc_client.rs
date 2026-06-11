@@ -267,6 +267,111 @@ impl GrpcHostClient {
         })
     }
 
+    /// ADR 0045 C2: the pre-pause presetup half of a post-copy move.
+    pub async fn migration_presetup(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .migration_presetup(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let to32 = |v: Vec<u8>| -> Result<[u8; 32], SandboxError> {
+            v.as_slice()
+                .try_into()
+                .map_err(|_| SandboxError::Snapshot("chunk hash must be 32 bytes".into()))
+        };
+        Ok(engram_core::types::snapshot::MigrationPresetupOut {
+            export_id: resp.export_id,
+            peer_token: resp.peer_token,
+            peer_port: resp.peer_port as u16,
+            sidecar_json: resp.sidecar_json,
+            memory_manifest_json: resp.memory_manifest_json,
+            memory_manifest_ref: decode_bincode(&resp.memory_manifest_ref, "ManifestRef")?,
+            disk_manifest_ref: decode_bincode(&resp.disk_manifest_ref, "Option<ManifestRef>")?,
+            hot_chunks: resp
+                .hot_chunks
+                .into_iter()
+                .map(to32)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// ADR 0045 C2: the blackout capture half (pause → vmstate-only →
+    /// pagemap seal).
+    pub async fn migration_capture_postcopy(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        let req = MigrationExportRef {
+            sandbox_id: id.as_uuid().as_bytes().to_vec(),
+            export_id: export_id.to_string(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .migration_capture_post_copy(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let to32 = |v: Vec<u8>| -> Result<[u8; 32], SandboxError> {
+            v.as_slice()
+                .try_into()
+                .map_err(|_| SandboxError::Snapshot("chunk hash must be 32 bytes".into()))
+        };
+        Ok(engram_core::types::snapshot::PostCopyCaptureOut {
+            sealed_chunks: resp.sealed_chunks,
+            total_chunks: resp.total_chunks,
+            scan_ms: resp.scan_ms,
+            disk_manifest_json: resp.disk_manifest_json,
+            disk_manifest_ref: decode_bincode(&resp.disk_manifest_ref, "Option<ManifestRef>")?,
+            new_disk_chunk_hashes: resp
+                .new_disk_chunk_hashes
+                .into_iter()
+                .map(to32)
+                .collect::<Result<_, _>>()?,
+            paused_at_unix_ms: resp.paused_at_unix_ms,
+        })
+    }
+
+    /// ADR 0045 C2: await the destination's drain outcome.
+    pub async fn migration_drain_wait(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: id.as_uuid().as_bytes().to_vec(),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .migration_drain_wait(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        use engram_core::types::snapshot::DrainOutcome;
+        Ok(if resp.done {
+            DrainOutcome::Done {
+                pulled: resp.pulled,
+                alt_sourced: resp.alt_sourced,
+                zero_chunks: resp.zero_chunks,
+                ms: resp.ms,
+            }
+        } else {
+            DrainOutcome::PeerLost {
+                remaining: resp.remaining,
+                detail: resp.detail,
+            }
+        })
+    }
+
     /// ADR 0045 C1: pull an export's artifacts (destination host → source host).
     pub async fn migration_fetch(
         &self,
@@ -294,6 +399,10 @@ impl GrpcHostClient {
                 engram_core::types::snapshot::MigrationItem::Chunk(h) => MigrationItem {
                     kind: Kind::Chunk as i32,
                     hash: h.to_vec(),
+                },
+                engram_core::types::snapshot::MigrationItem::DiskManifest => MigrationItem {
+                    kind: Kind::DiskManifest as i32,
+                    hash: Vec::new(),
                 },
             })
             .collect();
@@ -972,6 +1081,28 @@ impl HostClient for GrpcHostClient {
         id: SandboxId,
     ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
         Self::migration_capture(self, id).await
+    }
+
+    async fn migration_presetup(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        Self::migration_presetup(self, id).await
+    }
+
+    async fn migration_capture_postcopy(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        Self::migration_capture_postcopy(self, id, export_id).await
+    }
+
+    async fn migration_drain_wait(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
+        Self::migration_drain_wait(self, id).await
     }
 
     async fn migration_fetch(

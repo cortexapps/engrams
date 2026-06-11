@@ -81,6 +81,15 @@ pub struct GuestMemoryStats {
     pub sampled: u32,
 }
 
+/// ADR 0045 C2: see [`SandboxBackend::post_copy_source_view`].
+#[derive(Clone, Debug)]
+pub struct PostCopySourceView {
+    pub fc_pid: u32,
+    /// The substrate base dir (tmpfs) — the page server resolves the
+    /// exact base file by scanning the FC process's maps for it.
+    pub uffd_base_dir: PathBuf,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
@@ -241,6 +250,49 @@ pub trait SandboxBackend: Send + Sync {
     ) -> Result<crate::types::snapshot::MigrationCaptureOut, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `migration_capture`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: the pre-pause half of a post-copy move. Mints the
+    /// export identity (the page server parks the dest handler's Hello
+    /// until the capture registers it) and packages everything the
+    /// destination can use BEFORE the source pauses: the sidecar, the
+    /// inline v+1 session manifest (post-copy never re-chunks at
+    /// capture), the live disk ref, the hot set. NO pause, no fence —
+    /// the guest keeps running until `migration_capture_postcopy`.
+    async fn migration_presetup(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::snapshot::MigrationPresetupOut, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `migration_presetup`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: the blackout half. Pause → NBD fsync + dirty-tail
+    /// drain → vmstate-only snapshot (fork v3) → pagemap scan → seal
+    /// the page server's export (the parked dest handler unblocks).
+    /// The guest stays paused serving pages until commit (post-drain)
+    /// or abort; `state.bin` becomes fetchable via `migration_fetch`.
+    async fn migration_capture_postcopy(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+    ) -> Result<crate::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `migration_capture_postcopy`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2 (destination): await the background drain's
+    /// terminal outcome — `Done` (source releasable) or `PeerLost`
+    /// (dest poisoned + paused; the caller rewinds the session).
+    async fn migration_drain_wait(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::snapshot::DrainOutcome, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `migration_drain_wait`".into(),
         ))
     }
 
@@ -494,6 +546,23 @@ pub trait SandboxBackend: Send + Sync {
     /// `hot_chunks` rider so the destination warms the guest's hot set
     /// first. `None` = backend has no per-sandbox trace (VZ, process).
     fn working_set_trace_path(&self, _id: SandboxId) -> Option<PathBuf> {
+        None
+    }
+
+    /// ADR 0045 C2: what the source page server needs to read this
+    /// sandbox's guest memory from outside: FC's pid (this process is
+    /// its parent, so `process_vm_readv` is YAMA-legal) and the tmpfs
+    /// dir holding the substrate base file its guest RAM is
+    /// MAP_PRIVATE of (the `/proc/<pid>/maps` filter key). `None` ⇒
+    /// not a substrate-restored FC sandbox (cannot post-copy).
+    fn post_copy_source_view(&self, _id: SandboxId) -> Option<PostCopySourceView> {
+        None
+    }
+
+    /// ADR 0045 C2 (destination): the uffd-handler's control socket
+    /// for this sandbox, when it was spawned in peer mode (drain
+    /// progress / PeerLost reports). `None` otherwise.
+    fn post_copy_control_sock(&self, _id: SandboxId) -> Option<PathBuf> {
         None
     }
 

@@ -4357,6 +4357,96 @@ impl SandboxBackend for FirecrackerBackend {
     }
 }
 
+/// ADR 0045 C2: the post-copy capture surface — a vmstate-only
+/// snapshot package (state.bin + sidecar, NO memory artifact: the
+/// destination demand-faults memory from this paused VM's address
+/// space) and the pre-pause sidecar composition the presetup ships so
+/// the destination can BEGIN restoring before the source pauses.
+/// (Nothing in the sidecar changes across the freeze, so the two are
+/// byte-identical by construction.)
+impl FirecrackerBackend {
+    /// Compose the restore sidecar (`manifest.json` content) from the
+    /// LIVE sandbox state — the same composition `snapshot_with_type`
+    /// writes at capture (spec env redacted, net echo, canonical-path
+    /// anchors), minus any snapshot artifacts.
+    pub fn compose_live_sidecar(
+        &self,
+        id: SandboxId,
+        memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    ) -> Result<Vec<u8>, SandboxError> {
+        let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+        let net_snapshot = live
+            .net
+            .as_ref()
+            .map(|setup| FcNetSnapshot {
+                tap_name: setup.tap_name.clone(),
+                cidr_network: setup.vm_cidr.network(),
+            })
+            .or_else(|| {
+                live.netns.as_ref().map(|ns| FcNetSnapshot {
+                    tap_name: ns.tap_name.clone(),
+                    cidr_network: ns.vm_cidr.network(),
+                })
+            });
+        let mut redacted_spec = live.state.spec.clone();
+        for (_k, v) in redacted_spec.env.iter_mut() {
+            *v = "<redacted>".into();
+        }
+        let source_rootfs_canonical = live
+            .state
+            .spec
+            .rootfs_source
+            .is_some()
+            .then(|| live.state.rootfs_canonical.clone());
+        let manifest = FcSnapshotManifest {
+            sandbox_id: id,
+            created_at: Utc::now(),
+            spec: redacted_spec,
+            net: net_snapshot,
+            format: MANIFEST_FORMAT_FC.into(),
+            memory_manifest,
+            trace_host_hint: self.config.host_id,
+            source_rootfs_canonical,
+            source_harness_canonical: None,
+            source_vsock_canonical: Some(live.state.vsock_uds_path.clone()),
+        };
+        serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| SandboxError::Snapshot(format!("sidecar serialize: {e}")))
+    }
+
+    /// ADR 0045 C2: write a vmstate-only snapshot package into a fresh
+    /// snapshot dir: the given sidecar bytes as `manifest.json` + a
+    /// fork-v3 `state.bin`. The CALLER holds the VM paused and owns
+    /// resume — no auto-resume anywhere on this path (split-brain
+    /// guard). Requires the fork-v3 binary (stock FC rejects the
+    /// create field — the capability gate).
+    pub async fn snapshot_vmstate_only_package(
+        &self,
+        id: SandboxId,
+        sidecar_json: &[u8],
+    ) -> Result<(SnapshotId, PathBuf), SandboxError> {
+        let socket = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.firecracker_socket.clone()
+        };
+        paths::assert_rootfs_canonical(&self.work_dir, id)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("non-canonical jail layout: {e}")))?;
+        let snapshot_id = SnapshotId::new();
+        let dest = self.snapshot_dir_for(snapshot_id);
+        tokio::fs::create_dir_all(&dest).await.map_err(|e| {
+            SandboxError::Snapshot(format!("create snapshot dir {}: {e}", dest.display()))
+        })?;
+        tokio::fs::write(dest.join("manifest.json"), sidecar_json)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("write sidecar: {e}")))?;
+        let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
+        api.create_snapshot_vmstate_only(&dest.join("state.bin"))
+            .await?;
+        Ok((snapshot_id, dest))
+    }
+}
+
 /// ADR 0028 Fix A: shared body of `SandboxBackend::snapshot` (Full →
 /// `memory.bin`) and `snapshot_diff` (Diff → sparse `memory.diff`).
 /// Identical sidecar/vmstate/dir contract either way; only the memory

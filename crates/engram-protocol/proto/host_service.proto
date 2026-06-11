@@ -59,6 +59,12 @@ service HostService {
   rpc MigrationFetch(MigrationFetchRequest) returns (stream MigrationFrame);
   rpc MigrationCommit(MigrationExportRef) returns (Empty);
   rpc MigrationAbort(MigrationExportRef) returns (Empty);
+  // ADR 0045 C2 post-copy: the pre-pause presetup (export identity +
+  // the restore package sans state.bin), the blackout capture
+  // (vmstate-only + pagemap seal), and the destination's drain await.
+  rpc MigrationPresetup(SandboxIdMessage) returns (MigrationPresetupResponse);
+  rpc MigrationCapturePostCopy(MigrationExportRef) returns (PostCopyCaptureResponse);
+  rpc MigrationDrainWait(SandboxIdMessage) returns (DrainOutcomeResponse);
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
   // ADR 0045 Phase F: freeze / unfreeze a running microVM *in place* —
@@ -228,6 +234,41 @@ message MigrationExportRef {
   string export_id = 2;
 }
 
+// ADR 0045 C2: see MigrationPresetupOut in engram-core for field
+// semantics (this is a 1:1 wire mapping).
+message MigrationPresetupResponse {
+  string export_id = 1;
+  string peer_token = 2;
+  uint32 peer_port = 3;
+  bytes sidecar_json = 4;
+  bytes memory_manifest_json = 5;
+  bytes memory_manifest_ref = 6;   // bincode ManifestRef
+  bytes disk_manifest_ref = 7;     // bincode Option<ManifestRef> (empty = none)
+  repeated bytes hot_chunks = 8;
+}
+
+message PostCopyCaptureResponse {
+  uint64 sealed_chunks = 1;
+  uint64 total_chunks = 2;
+  uint64 scan_ms = 3;
+  bytes disk_manifest_json = 4;
+  bytes disk_manifest_ref = 5;     // bincode Option<ManifestRef> (empty = none)
+  repeated bytes new_disk_chunk_hashes = 6;
+  int64 paused_at_unix_ms = 7;
+}
+
+message DrainOutcomeResponse {
+  bool done = 1;
+  // done=true:
+  uint64 pulled = 2;
+  uint64 alt_sourced = 3;
+  uint64 zero_chunks = 4;
+  uint64 ms = 5;
+  // done=false (PeerLost):
+  uint64 remaining = 6;
+  string detail = 7;
+}
+
 message MigrationFetchRequest {
   string export_id = 1;
   // Named artifacts + chunk hashes, in the order frames should refer
@@ -243,6 +284,8 @@ message MigrationItem {
     CHUNK = 0;
     STATE_BIN = 1;
     SIDECAR = 2;
+    // ADR 0045 C2: the drained coherent disk manifest JSON.
+    DISK_MANIFEST = 3;
   }
   Kind kind = 1;
   bytes hash = 2;
