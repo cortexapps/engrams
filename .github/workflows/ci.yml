@@ -91,9 +91,14 @@ concurrency:
 
 # Default to read-only repo access. No job here writes to the repo
 # (no GH releases, no commit-back, no PR comments), so least
-# privilege.
+# privilege. `packages: read` is load-bearing: the test-firecracker
+# job oras-pulls the forked firecracker artifact from GHCR — without
+# it the pull is DENIED and every fork-gated FC test (the ADR 0045 R2
+# stock<->fork compat gate, the substrate suites, vmstate_only)
+# silently green-by-skips.
 permissions:
   contents: read
+  packages: read
 
 env:
   CARGO_TERM_COLOR: always
