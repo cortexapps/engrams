@@ -41,15 +41,43 @@ LOCAL_REGISTRY="localhost:5001"
 IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
 # Already enabled?
-already_enabled=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/enabled-images" \
+already_enabled=$(curl -fsS ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$COORD/api/v1/enabled-images" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('image_uri')=='$IMAGE_URI' for i in d.get('images',[])))" 2>/dev/null || echo False)
 
 if [ "$already_enabled" = "True" ]; then
     echo "==> image $IMAGE_URI already enabled; skipping bake"
 else
-    echo "==> baking demo image @ $SHORT"
+    # Backend + arch detection (ported from bake-demo.sh): dev bakes
+    # cross-compile agentd for the host's own arch (guest arch == host
+    # arch), and the in-VM transport depends on the backend (VZ uses
+    # virtio-console; Firecracker/process use vsock). The old hardcoded
+    # x86_64 musl target baked an image that can't boot on VZ/arm64.
+    backend="$(bash deploy/dev/detect-backend.sh)"
+    case "$(uname -m)" in
+        arm64 | aarch64) TARGET=aarch64-unknown-linux-musl ;;
+        x86_64 | amd64) TARGET=x86_64-unknown-linux-musl ;;
+        *)
+            echo "integration-session: unsupported arch $(uname -m)" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$backend" = "vz" ]; then TRANSPORT=console; else TRANSPORT=vsock; fi
+
+    # On macOS/VZ, ext4 image builds need mke2fs (e2fsprogs).
+    if [ "$backend" = "vz" ]; then
+        PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"
+        if ! command -v mke2fs >/dev/null 2>&1; then
+            echo "ERROR: mke2fs not found. VZ image builds require e2fsprogs:" >&2
+            echo "       brew install e2fsprogs" >&2
+            exit 1
+        fi
+    fi
+
+    rustup target add "$TARGET" >/dev/null 2>&1 || true
+
+    echo "==> baking demo image @ $SHORT ($TARGET, transport=$TRANSPORT)"
     cargo build --release -p engram-cli >/dev/null 2>&1
-    cargo build --release --target x86_64-unknown-linux-musl \
+    cargo build --release --target "$TARGET" \
         -p engram-agentd >/dev/null 2>&1
     ./target/release/engram-cli image build \
         --repo integration-test/demo \
@@ -57,7 +85,8 @@ else
         --source deploy/demo \
         --format ext4 \
         --images-dir ./var/integration/images \
-        --inject-agent target/x86_64-unknown-linux-musl/release/engram-agentd \
+        --transport "$TRANSPORT" \
+        --inject-agent "target/$TARGET/release/engram-agentd" \
         --push "$IMAGE_URI" \
         2>&1 | tail -3
     # Base snapshot is captured at enable time (ADR 0020), not at bake — the
@@ -65,19 +94,19 @@ else
 
     echo "==> POST /api/enabled-images (ADR 0036: async — poll the job)"
     ENABLE_BODY=$(printf '{"image_uri": "%s"}' "$IMAGE_URI")
-    JOB_ID=$(curl -fsS -X POST "${AUTH_HEADER[@]}" \
+    JOB_ID=$(curl -fsS -X POST ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} \
         -H "Content-Type: application/json" \
         -d "$ENABLE_BODY" \
         "$COORD/api/v1/enabled-images" \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
     while :; do
-        JOB_STATE=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/enable-jobs/$JOB_ID" \
+        JOB_STATE=$(curl -fsS ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$COORD/api/v1/enable-jobs/$JOB_ID" \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
         case "$JOB_STATE" in
             ready) echo "    enable job ready"; break ;;
             failed)
                 echo "ERROR: enable job $JOB_ID failed" >&2
-                curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/enable-jobs/$JOB_ID" >&2 || true
+                curl -fsS ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$COORD/api/v1/enable-jobs/$JOB_ID" >&2 || true
                 exit 1
                 ;;
             *) sleep 2 ;;
@@ -90,7 +119,7 @@ fi
 # row doesn't carry a label field, so we filter by image+status and
 # pick the most recent. Best-effort: stale rows from prior runs are
 # possible if `just dev-down` didn't reap.
-existing_sid=$(curl -fsS "${AUTH_HEADER[@]}" "$COORD/api/v1/sessions" 2>/dev/null \
+existing_sid=$(curl -fsS ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$COORD/api/v1/sessions" 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -126,7 +155,7 @@ print(json.dumps({
 }))
 ")
     fi
-    SESS_RESP=$(curl -fsS -X POST "${AUTH_HEADER[@]}" \
+    SESS_RESP=$(curl -fsS -X POST ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} \
         -H "Content-Type: application/json" \
         -d "$SESS_BODY" \
         "$COORD/api/v1/sessions")
