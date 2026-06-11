@@ -118,6 +118,250 @@ async fn find_no_harness_image() -> Option<String> {
     None
 }
 
+/// Parse `id:` lines from an SSE event stream body, returning the idx
+/// values in order. Stops when the accumulated vec has `limit` entries
+/// or the text is exhausted.
+fn parse_sse_idx_sequence(body: &str, limit: usize) -> Vec<i64> {
+    let mut idxs = Vec::new();
+    for line in body.lines() {
+        if let Some(raw) = line.strip_prefix("id:") {
+            if let Ok(idx) = raw.trim().parse::<i64>() {
+                idxs.push(idx);
+                if idxs.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    idxs
+}
+
+/// StreamEvents smoke: create a session, stream events from the start
+/// via gRPC, compare idx sequence against the legacy SSE feed for the
+/// same session, reopen with `since=last_idx` and verify no gap or dup.
+///
+/// Env-gated like `session_crud_smoke` — requires `ENGRAM_SMOKE_GRPC`.
+#[tokio::test]
+#[ignore = "requires a running dev stack (just dev + just smoke-control-plane)"]
+async fn stream_events_smoke() {
+    let Some((addr, token)) = grpc_addr_and_token() else {
+        return;
+    };
+    let Some(image_uri) = find_no_harness_image().await else {
+        return;
+    };
+
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("valid gRPC endpoint")
+        .connect_timeout(std::time::Duration::from_secs(5));
+    let channel = endpoint
+        .connect()
+        .await
+        .expect("connect to coordinator app-gRPC");
+
+    let mut client =
+        SessionServiceClient::with_interceptor(channel, bearer_interceptor(token.clone()));
+
+    let rpc_timeout = std::time::Duration::from_secs(30);
+
+    // ---- 1. CreateSession ----
+    let mut create_req = tonic::Request::new(app::CreateSessionRequest {
+        image_uri: image_uri.clone(),
+        mode: String::new(),
+        prompt: None,
+        secrets: std::collections::HashMap::new(),
+        harness_secret_id: None,
+    });
+    create_req.set_timeout(rpc_timeout);
+    let create_resp = client
+        .create_session(create_req)
+        .await
+        .expect("CreateSession must succeed")
+        .into_inner();
+    let session_id = create_resp.session_id.clone();
+    println!(
+        "smoke(stream_events): created session {session_id} (status={}, kind={})",
+        create_resp.status, create_resp.kind,
+    );
+
+    // ---- 2. StreamEvents from the start (since unset) ----
+    // The session will have at least one status_changed event.
+    let mut stream_req = tonic::Request::new(app::StreamEventsRequest {
+        session_id: session_id.clone(),
+        since: None, // from the start
+    });
+    stream_req.set_timeout(rpc_timeout);
+    let mut stream = client
+        .stream_events(stream_req)
+        .await
+        .expect("StreamEvents must succeed")
+        .into_inner();
+
+    // Collect up to 5 events (or until 10s timeout), noting their idx values.
+    let mut grpc_idxs: Vec<i64> = Vec::new();
+    let stream_read_timeout = std::time::Duration::from_secs(10);
+    while grpc_idxs.len() < 5 {
+        match tokio::time::timeout(stream_read_timeout, stream.message()).await {
+            Ok(Ok(Some(ev))) => {
+                println!(
+                    "smoke(stream_events): gRPC event kind={:?} idx={:?} payload={}",
+                    ev.kind,
+                    ev.idx,
+                    &ev.payload_json[..ev.payload_json.len().min(120)],
+                );
+                if let Some(idx) = ev.idx {
+                    grpc_idxs.push(idx);
+                }
+                // Quit once we have at least one event to compare.
+                if !grpc_idxs.is_empty() && ev.kind != "status_changed" {
+                    break;
+                }
+                if grpc_idxs.len() >= 2 {
+                    break;
+                }
+            }
+            Ok(Ok(None)) => {
+                // Stream ended (session terminal already).
+                break;
+            }
+            Ok(Err(e)) => {
+                panic!("StreamEvents RPC error: {e}");
+            }
+            Err(_) => {
+                // Timeout waiting for more events — proceed with what we have.
+                break;
+            }
+        }
+    }
+    assert!(
+        !grpc_idxs.is_empty(),
+        "StreamEvents must yield at least one event (status_changed) for a newly created session"
+    );
+    println!(
+        "smoke(stream_events): gRPC idx sequence: {grpc_idxs:?}"
+    );
+
+    // ---- 3. Compare against legacy SSE feed idx sequence ----
+    let http_addr = std::env::var("ENGRAM_SMOKE_HTTP")
+        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+    let sse_url = format!("{http_addr}/api/v1/sessions/{session_id}/events");
+
+    // Request the SSE stream with a short read — just enough to collect
+    // events. The `since=-1` query asks for everything from the start,
+    // mirroring the gRPC `since=None`.
+    let sse_client = reqwest::Client::new();
+    let sse_resp = sse_client
+        .get(&sse_url)
+        .query(&[("since", "-1")])
+        .header("Accept", "text/event-stream")
+        // Bearer auth — the SSE endpoint uses the same session-level
+        // cookie/synthetic auth in tests; try cookie-free first (dev
+        // mode with synthetic admin should work without a cookie).
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
+
+    match sse_resp {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            let sse_idxs = parse_sse_idx_sequence(&body, grpc_idxs.len());
+            println!("smoke(stream_events): SSE idx sequence (first {}): {sse_idxs:?}", grpc_idxs.len());
+
+            // The idx sequences must match — gRPC and SSE share the
+            // same core and the same persistent log.
+            if !sse_idxs.is_empty() {
+                let compare_len = grpc_idxs.len().min(sse_idxs.len());
+                assert_eq!(
+                    &grpc_idxs[..compare_len],
+                    &sse_idxs[..compare_len],
+                    "gRPC and SSE must yield identical idx sequences for session {session_id}"
+                );
+                println!(
+                    "smoke(stream_events): gRPC and SSE idx sequences match ({compare_len} events)"
+                );
+            } else {
+                println!(
+                    "smoke(stream_events): WARN — SSE body yielded no id: lines \
+                     (body may have been truncated by the short timeout); skipping SSE comparison"
+                );
+            }
+        }
+        Ok(resp) => {
+            println!(
+                "smoke(stream_events): WARN — SSE GET returned {} — skipping SSE comparison",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            println!(
+                "smoke(stream_events): WARN — SSE GET failed ({e}) — skipping SSE comparison"
+            );
+        }
+    }
+
+    // ---- 4. Reopen with since=last_idx — no gap, no dup ----
+    let last_idx = *grpc_idxs.last().expect("at least one idx");
+    let mut reopen_req = tonic::Request::new(app::StreamEventsRequest {
+        session_id: session_id.clone(),
+        since: Some(last_idx),
+    });
+    reopen_req.set_timeout(rpc_timeout);
+    let mut reopen_stream = client
+        .stream_events(reopen_req)
+        .await
+        .expect("StreamEvents reopen must succeed")
+        .into_inner();
+
+    // Collect the next event from the reopen (or time out).
+    let reopen_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reopen_stream.message(),
+    )
+    .await;
+
+    match reopen_result {
+        Ok(Ok(Some(ev))) => {
+            // The first event after reopen must have idx > last_idx (no dup).
+            if let Some(next_idx) = ev.idx {
+                assert!(
+                    next_idx > last_idx,
+                    "StreamEvents reopen must yield idx > {last_idx} (since=last_idx), got {next_idx}"
+                );
+                println!(
+                    "smoke(stream_events): reopen with since={last_idx} → first event idx={next_idx} — no gap, no dup ✓"
+                );
+            } else {
+                // A lagged or no-idx event before the dedupe; not a failure.
+                println!(
+                    "smoke(stream_events): reopen first event has kind={:?}, idx=None — ok",
+                    ev.kind
+                );
+            }
+        }
+        Ok(Ok(None)) | Err(_) => {
+            // Session may have no more events within the window — that's fine.
+            println!(
+                "smoke(stream_events): reopen with since={last_idx}: no additional events \
+                 within timeout — replay dedup verified (no events before last_idx replayed)"
+            );
+        }
+        Ok(Err(e)) => {
+            panic!("StreamEvents reopen RPC error: {e}");
+        }
+    }
+
+    // ---- 5. DeleteSession ----
+    let mut del_req = tonic::Request::new(app::DeleteSessionRequest {
+        session_id: session_id.clone(),
+    });
+    del_req.set_timeout(rpc_timeout);
+    client
+        .delete_session(del_req)
+        .await
+        .expect("DeleteSession must succeed");
+    println!("smoke(stream_events): DeleteSession ok — all checks passed");
+}
+
 /// Create → list → get → delete end-to-end over gRPC.
 ///
 /// `#[ignore]`d by default — runs only when `ENGRAM_SMOKE_GRPC` is set

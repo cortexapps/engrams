@@ -7,7 +7,7 @@ use crate::state::SharedState;
 mod admin;
 pub mod auth;
 pub(crate) mod enabled_images;
-mod events;
+pub(crate) mod events;
 mod exec;
 pub(crate) mod forge;
 // ADR 0021 P1.5a retired `mod harnesses;` — the harness_packs

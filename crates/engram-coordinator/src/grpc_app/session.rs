@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use engram_protocol::app;
+use futures::StreamExt as _;
 use tonic::{Request, Response, Status};
 
 use super::{auth, into_status, BoxStream, UNIMPLEMENTED};
@@ -135,7 +136,108 @@ impl app::session_service_server::SessionService for AppSessionService {
         req: Request<app::StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
         self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
+        let r = req.into_inner();
+        let id = super::parse_session_id(&r.session_id)?;
+
+        // proto3: `since` unset = from the start. We pass None so
+        // events_core uses -1 (the "all" sentinel). The HTTP -1
+        // translation is the orchestrator's job; we do not touch it here.
+        let since: Option<i64> = r.since;
+
+        let (replayed, live_rx) =
+            crate::api::events::events_core(&self.state, id, since)
+                .await
+                .map_err(super::into_status)?;
+
+        let replay_high_water = replayed
+            .last()
+            .map(|e| e.idx)
+            .unwrap_or(since.unwrap_or(-1));
+
+        // Map the replayed (persisted) events to proto SessionEvent.
+        // with_rewind_meta applies to BOTH arms (replay + live) as per
+        // the SSE handler — the ADR 0028 A.log metadata folds into
+        // payload_json on every message.
+        //
+        // Collect into plain events first (no Result wrapper) to avoid
+        // the `result_large_err` lint on `tonic::Status`.
+        let replay_proto: Vec<app::SessionEvent> = replayed
+            .into_iter()
+            .map(|ev| {
+                let rewound = ev.rewound_at.is_some();
+                let payload_json =
+                    crate::api::events::with_rewind_meta(ev.payload, ev.recovery_epoch, rewound);
+                app::SessionEvent {
+                    idx: Some(ev.idx),
+                    kind: ev.kind,
+                    payload_json,
+                }
+            })
+            .collect();
+        let replay_events = futures::stream::iter(replay_proto.into_iter().map(Ok::<_, Status>));
+
+        // Map the live broadcast stream. Drop events already replayed
+        // (idx <= replay_high_water) — exact dedup rule from events.rs:98-101.
+        // Lagged → special SessionEvent with kind="lagged", idx unset,
+        // payload_json={"missed":n} — exact rule from events.rs:102-106.
+        use tokio_stream::wrappers::BroadcastStream;
+        let live_stream = BroadcastStream::new(live_rx).filter_map(
+            move |recv| async move {
+                match recv {
+                    Ok(indexed) if indexed.idx > replay_high_water => {
+                        let payload =
+                            serde_json::to_value(&indexed.event).unwrap_or(serde_json::Value::Null);
+                        let payload_json =
+                            crate::api::events::with_rewind_meta(payload, 0, false);
+                        Some(Ok(app::SessionEvent {
+                            idx: Some(indexed.idx),
+                            kind: indexed.event.kind().to_string(),
+                            payload_json,
+                        }))
+                    }
+                    Ok(_) => None,
+                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                        Some(Ok(app::SessionEvent {
+                            idx: None,
+                            kind: "lagged".to_string(),
+                            payload_json: format!(r#"{{"missed":{n}}}"#),
+                        }))
+                    }
+                }
+            },
+        );
+
+        // RAII teardown guard: when the stream future is dropped
+        // (client disconnects), log at debug level. The broadcast
+        // Receiver itself drops at the same time, releasing the slot.
+        struct DisconnectGuard {
+            session_id: engram_core::SessionId,
+        }
+        impl Drop for DisconnectGuard {
+            fn drop(&mut self) {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "StreamEvents: client disconnected, receiver dropped (RAII teardown)"
+                );
+            }
+        }
+        let guard = DisconnectGuard { session_id: id };
+
+        let full_stream = replay_events
+            .chain(live_stream)
+            // Attach the guard to the stream so it lives exactly as long as
+            // the stream is being polled. When the stream is dropped, the
+            // guard drops too.
+            .chain(futures::stream::poll_fn(move |_| {
+                // Keep guard alive until the upstream stream exhausts.
+                // This arm is never reached (the live tail is infinite),
+                // but Rust's drop-ordering requires the value to be moved
+                // into the closure body.
+                let _ = &guard;
+                std::task::Poll::Ready(None)
+            }));
+
+        Ok(Response::new(Box::pin(full_stream)))
     }
 
     type ExecStream = BoxStream<app::ExecOutput>;
