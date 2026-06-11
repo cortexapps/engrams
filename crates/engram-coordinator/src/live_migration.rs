@@ -182,6 +182,21 @@ pub async fn migrate_session_live(
         return Err(MigrateError::AbortedToSource(format!("transition: {e}")));
     }
     state.teleport_targets.insert(session_id, target_host_id);
+    // Observer-facing truth: the session leaves `active` NOW (the
+    // guest is frozen). The matching `evacuating -> active` is emitted
+    // only after the harness rebuild on the dest — `active` again
+    // means "messages actually flow" (the intermediate Created hop is
+    // suppressed in finish_resume_to_active for this path).
+    let _ = state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Active,
+                to: SessionState::Evacuating,
+                at: chrono::Utc::now(),
+            },
+        )
+        .await;
 
     // ---- 3. Restore on the destination (pull + UFFD bring-up) ----
     let t_restore = std::time::Instant::now();
@@ -297,9 +312,13 @@ pub async fn migrate_session_live(
         .get_session(session_id)
         .await
         .map_err(|e| MigrateError::Parachute(format!("refresh session: {e}")))?;
-    if let Err(e) =
-        crate::api::snapshot::finish_resume_to_active(state, &session_refreshed, new_sandbox_id)
-            .await
+    if let Err(e) = crate::api::snapshot::finish_resume_to_active(
+        state,
+        &session_refreshed,
+        new_sandbox_id,
+        false,
+    )
+    .await
     {
         // Harness rebuild failed; session sits at Created — the same
         // posture the evac resumer leaves on this failure. The move
