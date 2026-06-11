@@ -1,0 +1,29 @@
+# buf owns this proto tree (ADR 0039 §7): `buf lint` gates style,
+# `buf breaking` gates wire compatibility against main (enforced in
+# CI via bufbuild/buf-action's PR-base behavior), and the repo-root
+# buf.gen.yaml drives TS codegen (`just gen-proto`).
+#
+# host_service.proto predates buf — it was authored for tonic-build
+# (ADR 0013) and fails four STANDARD rules. Those exceptions are
+# scoped to the legacy file ONLY: everything new (engram/app/...)
+# must be clean under full STANDARD.
+version: v2
+lint:
+  use:
+    - STANDARD
+  ignore_only:
+    ENUM_VALUE_PREFIX:
+      - host_service.proto
+    ENUM_ZERO_VALUE_SUFFIX:
+      - host_service.proto
+    PACKAGE_DIRECTORY_MATCH:
+      - host_service.proto
+    RPC_REQUEST_RESPONSE_UNIQUE:
+      - host_service.proto
+    RPC_REQUEST_STANDARD_NAME:
+      - host_service.proto
+    RPC_RESPONSE_STANDARD_NAME:
+      - host_service.proto
+breaking:
+  use:
+    - FILE

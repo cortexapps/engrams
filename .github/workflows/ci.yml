@@ -417,6 +417,47 @@ jobs:
       - name: pnpm test (vitest)
         run: pnpm test
 
+  # ADR 0039 §7: buf owns crates/engram-protocol/proto. Lint gates
+  # style (legacy host_service.proto carries scoped exceptions in
+  # buf.yaml; everything new must be clean under full STANDARD);
+  # breaking-change detection runs on PRs against the PR base via
+  # buf-action's default behavior (`.git#branch=main` doesn't resolve
+  # on PR runners); the drift step asserts committed TS bindings match
+  # `buf generate` output (`just gen-proto` locally to fix).
+  buf:
+    name: buf (proto lint + breaking + codegen drift)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: bufbuild/buf-action@v1
+        with:
+          input: crates/engram-protocol/proto
+          # host_service.proto predates `buf format`; don't gate on
+          # formatting (the action runs it by default on PRs).
+          format: false
+          # lint defaults to PR-events only — force it on so
+          # push-to-main + merge_group keep the gate. (breaking stays
+          # on its default: PR-only, against the PR base.)
+          lint: true
+          # The action's push step publishes to the Buf Schema
+          # Registry by default on push events — we don't use the BSR.
+          push: false
+          archive: false
+          # This workflow runs with `contents: read` only; the
+          # action's PR-comment step needs `pull-requests: write`.
+          pr_comment: false
+      # TS codegen drift check. Guarded: the engram/app contract dir
+      # lands with ADR 0039 Tasks 4-5; `buf generate` hard-fails on a
+      # missing/empty input path until then.
+      - name: Codegen drift check (buf generate)
+        run: |
+          if [ -d crates/engram-protocol/proto/engram/app ]; then
+            buf generate
+            git diff --exit-code -- web/src/gen orchestrator/src/gen
+          else
+            echo "engram/app contract not present yet (ADR 0039 Tasks 4-5) — skipping codegen drift check"
+          fi
+
   test-firecracker:
     name: tests (firecracker, Linux + KVM)
     # Blacksmith exposes `/dev/kvm` via nested virtualization (see

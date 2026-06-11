@@ -36,6 +36,19 @@ check:
 fmt:
     cargo fmt --all
 
+# Regenerate the TS bindings for the engram.app contract (ADR 0039 §7)
+# from crates/engram-protocol/proto via the repo-root buf.gen.yaml.
+# Outputs: web/src/gen + orchestrator/src/gen — commit them; CI's `buf`
+# job re-generates and fails on drift. Guarded: until the app contract
+# lands (Tasks 4-5) there is nothing to generate. Install buf:
+# `brew install bufbuild/buf/buf`.
+gen-proto:
+    @if [ -d crates/engram-protocol/proto/engram/app ]; then \
+        buf generate; \
+    else \
+        echo "engram/app contract not present yet (ADR 0039 Tasks 4-5) — nothing to generate"; \
+    fi
+
 # Regenerate `workspace-hack/Cargo.toml` from the current dep
 # graph. Run after adding or removing a workspace dep so
 # `cargo hakari verify` (in `just check` and CI) stays green. The
