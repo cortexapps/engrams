@@ -786,38 +786,60 @@ impl PooledBackend {
             .await
             .map_err(|e| SandboxError::Snapshot(format!("dial source: {e}")))?;
         let source = engram_protocol::grpc_client::GrpcHostClient::new(channel);
-        let items: Vec<MigrationItem> = hashes
-            .iter()
-            .map(|h| MigrationItem::Chunk(*h.as_bytes()))
-            .collect();
-        let mut stream = source
-            .migration_fetch(export_id, items)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("divergence fetch: {e}")))?;
+        // N concurrent streams: one ordered gRPC stream moves ~20 MB/s
+        // (frame channel depth x 1 MiB frames); the divergent set is
+        // hundreds of MB and sits on the RESTORE critical path now, so
+        // fan out over batches to reach LAN line rate.
+        const STREAMS: usize = 8;
         use futures::StreamExt;
-        let mut current: Vec<u8> = Vec::new();
-        let mut current_idx: Option<u32> = None;
-        let mut landed = 0usize;
-        while let Some(frame) = stream.next().await {
-            let frame = frame.map_err(|e| SandboxError::Snapshot(format!("fetch frame: {e}")))?;
-            if current_idx != Some(frame.item_idx) {
-                current_idx = Some(frame.item_idx);
-                current.clear();
-            }
-            current.extend_from_slice(&frame.data);
-            if frame.last {
-                let idx = frame.item_idx as usize;
-                let hash = hashes.get(idx).ok_or_else(|| {
-                    SandboxError::Snapshot("divergence fetch: unknown item index".into())
-                })?;
-                cache
-                    .put_no_evict(*hash, &current)
+        let batch = hashes.len().div_ceil(STREAMS).max(1);
+        let mut tasks = Vec::new();
+        for chunk_hashes in hashes.chunks(batch) {
+            let source = source.clone();
+            let cache = cache.clone();
+            let export_id = export_id.to_string();
+            let chunk_hashes = chunk_hashes.to_vec();
+            tasks.push(tokio::spawn(async move {
+                let items: Vec<MigrationItem> = chunk_hashes
+                    .iter()
+                    .map(|h| MigrationItem::Chunk(*h.as_bytes()))
+                    .collect();
+                let mut stream = source
+                    .migration_fetch(&export_id, items)
                     .await
-                    .map_err(|e| SandboxError::Snapshot(format!("land chunk {hash}: {e}")))?;
-                landed += 1;
-                current = Vec::new();
-                current_idx = None;
-            }
+                    .map_err(|e| SandboxError::Snapshot(format!("divergence fetch: {e}")))?;
+                let mut current: Vec<u8> = Vec::new();
+                let mut current_idx: Option<u32> = None;
+                let mut landed = 0usize;
+                while let Some(frame) = stream.next().await {
+                    let frame =
+                        frame.map_err(|e| SandboxError::Snapshot(format!("fetch frame: {e}")))?;
+                    if current_idx != Some(frame.item_idx) {
+                        current_idx = Some(frame.item_idx);
+                        current.clear();
+                    }
+                    current.extend_from_slice(&frame.data);
+                    if frame.last {
+                        let idx = frame.item_idx as usize;
+                        let hash = chunk_hashes.get(idx).ok_or_else(|| {
+                            SandboxError::Snapshot("divergence fetch: unknown item index".into())
+                        })?;
+                        cache.put_no_evict(*hash, &current).await.map_err(|e| {
+                            SandboxError::Snapshot(format!("land chunk {hash}: {e}"))
+                        })?;
+                        landed += 1;
+                        current = Vec::new();
+                        current_idx = None;
+                    }
+                }
+                Ok::<usize, SandboxError>(landed)
+            }));
+        }
+        let mut landed = 0usize;
+        for t in tasks {
+            landed += t
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("pull task join: {e}")))??;
         }
         if let Err(e) = cache.sweep().await {
             tracing::warn!(error = %e, "post-pull cache sweep failed (non-fatal)");
@@ -3407,15 +3429,17 @@ impl SandboxBackend for PooledBackend {
         let migration = metadata.migration_source.take();
         if let Some(mig) = &migration {
             self.migration_prestage(&metadata, mig).await?;
-            // Warm the FULL session-manifest chunk set in the
-            // background, pulling from the SOURCE host (LAN) rather
-            // than GCS: the chain's prior-version chunks otherwise
-            // fault in cold (the residual post-teleport crawl; a 959-
-            // chunk GCS prefetch measured 115 s on canary 52d6d808).
-            // The export stays open until the coordinator's commit —
-            // which lands after the handshake — so the pull window is
-            // exactly the window that matters; anything unfinished
-            // falls back to per-fault GCS serving, correct as ever.
+            // Land the FULL session-manifest divergence BEFORE the
+            // guest resumes — synchronously, over N parallel streams
+            // from the SOURCE host. The background version lost the
+            // race every time: the guest resumes the instant restore
+            // returns, and its wake-up working set then faults at GCS
+            // round-trip speed through the single-threaded fault loop
+            // (~150 ms x ~200 chunks = the 25-45 s handshake band the
+            // prod canaries kept hitting; forensics on 9f2c3ef9 show
+            // the fault timeline directly). Paying ~3-6 s here at LAN
+            // line rate deletes that tail: every post-resume fault
+            // hits local NVMe.
             if let Some(cache) = self.chunk_cache.clone() {
                 if let Ok(m) = serde_json::from_slice::<engram_chunk_store::Manifest>(
                     &mig.memory_manifest_json,
@@ -3432,35 +3456,28 @@ impl SandboxBackend for PooledBackend {
                         .filter(|h| !staged.contains(h) && !cache.contains_on_disk(*h))
                         .collect();
                     if !remaining.is_empty() {
-                        let source_addr = mig.source_addr.clone();
-                        let export_id = mig.export_id.clone();
-                        tokio::spawn(tracing::Instrument::instrument(
-                            async move {
-                                let n = remaining.len();
-                                let t = std::time::Instant::now();
-                                match Self::pull_chunks_from_source(
-                                    &source_addr,
-                                    &export_id,
-                                    &remaining,
-                                    &cache,
-                                )
-                                .await
-                                {
-                                    Ok(pulled) => tracing::info!(
-                                        pulled,
-                                        of = n,
-                                        elapsed_ms = t.elapsed().as_millis() as u64,
-                                        "migration divergence pulled from source (ADR 0045 C1)"
-                                    ),
-                                    Err(e) => tracing::warn!(
-                                        error = %e,
-                                        of = n,
-                                        "source divergence pull failed; faults serve via GCS"
-                                    ),
-                                }
-                            },
-                            tracing::info_span!("restore.migration_pull_bg"),
-                        ));
+                        let n = remaining.len();
+                        let t = std::time::Instant::now();
+                        match Self::pull_chunks_from_source(
+                            &mig.source_addr,
+                            &mig.export_id,
+                            &remaining,
+                            &cache,
+                        )
+                        .await
+                        {
+                            Ok(pulled) => tracing::info!(
+                                pulled,
+                                of = n,
+                                elapsed_ms = t.elapsed().as_millis() as u64,
+                                "migration divergence pulled from source (ADR 0045 C1)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                of = n,
+                                "source divergence pull failed; faults serve via GCS"
+                            ),
+                        }
                     }
                 }
             }
