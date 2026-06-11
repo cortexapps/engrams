@@ -187,6 +187,27 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// migration capture for the `hot_chunks` rider.
 pub const WORKING_SET_TRACE_FILE: &str = "working-set-trace.json";
 
+/// ADR 0045 C2: the peer-mode handler's one-way control socket
+/// (Sealed/DrainProgress/DrainDone/PeerLost), bound in the jail dir.
+pub const UFFD_CONTROL_SOCK_FILE: &str = "uffd-control.sock";
+
+/// ADR 0045 C2: the marker the destination's prestage writes into the
+/// snapshot dir to arm a POST-COPY restore (peer-mode handler spawn,
+/// state.bin appears late via the fetch poller).
+pub const MIGRATION_PEER_FILE: &str = "migration-peer.json";
+
+/// ADR 0045 C2: `migration-peer.json` content.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MigrationPeerSpec {
+    /// `host:port` of the source's page server (9102).
+    pub peer_addr: String,
+    pub export_id: String,
+    /// Delivered to the handler via ENGRAM_PEER_TOKEN env (argv leaks
+    /// on /proc/*/cmdline). The file lives root-owned in the snapshot
+    /// staging dir for the restore's lifetime.
+    pub peer_token: String,
+}
+
 /// Host-wide knobs for `FirecrackerBackend`. The kernel image lives
 /// here rather than on `SandboxSpec` because it's tied to the host
 /// kernel ABI, not to a specific image — every sandbox on this host
@@ -1553,6 +1574,12 @@ impl FirecrackerBackend {
         prefault_trace_host: Option<uuid::Uuid>,
         publish_trace_host: Option<uuid::Uuid>,
         jail_dir: &Path,
+        // ADR 0045 C2: post-copy peer mode. The handler dials the
+        // source's page server and PARKS until the capture's SEAL; it
+        // binds the control sock immediately but the FC-facing UDS only
+        // post-seal — so this spawn waits on the CONTROL sock, and the
+        // load gate (not this fn) waits on the UDS.
+        peer: Option<&MigrationPeerSpec>,
     ) -> Result<Child, SandboxError> {
         // ADR 0014 M1.14: when the caller wires `working_set_trace_output`,
         // it's the bake's profile pass — destroy removes jail_dir
@@ -1628,6 +1655,14 @@ impl FirecrackerBackend {
         if let Some(path) = self.config.uffd_blob_root.as_ref() {
             cmd.arg("--blob-root").arg(path);
         }
+        if let Some(peer) = peer {
+            cmd.arg("--peer-addr").arg(&peer.peer_addr);
+            cmd.arg("--peer-export-id").arg(&peer.export_id);
+            cmd.arg("--control-sock")
+                .arg(jail_dir.join(UFFD_CONTROL_SOCK_FILE));
+            // Token via env: argv leaks on /proc/*/cmdline.
+            cmd.env("ENGRAM_PEER_TOKEN", &peer.peer_token);
+        }
         // ADR 0019: hand the handler our current span's W3C traceparent so
         // its process-root span (and the fault-serving spans
         // under it) stitch onto this restore's trace. Inert when OTLP is off
@@ -1652,11 +1687,21 @@ impl FirecrackerBackend {
                 ))
             })?;
 
-        if let Err(e) = wait_for_socket(uffd_uds, Duration::from_secs(5), &mut child).await {
+        // Peer mode binds the FC-facing UDS only after the source's
+        // SEAL arrives (which is what makes \"FC can load\" imply
+        // \"seal held\"); its immediately-bound control sock is the
+        // spawn-liveness signal instead. The load gate waits on the
+        // UDS with the long budget.
+        let spawn_gate = match peer {
+            Some(_) => jail_dir.join(UFFD_CONTROL_SOCK_FILE),
+            None => uffd_uds.to_path_buf(),
+        };
+        if let Err(e) = wait_for_socket(&spawn_gate, Duration::from_secs(5), &mut child).await {
             let _ = child.kill().await;
             let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
             return Err(vm_err(format!(
-                "uffd handler did not open UDS: {e}\n--- handler log ---\n{log_tail}"
+                "uffd handler did not open {}: {e}\n--- handler log ---\n{log_tail}",
+                spawn_gate.display()
             )));
         }
         Ok(child)
@@ -2375,7 +2420,11 @@ impl FirecrackerBackend {
                 }
             }
         }
-        if !state_path.exists() {
+        // ADR 0045 C2: a post-copy destination starts restoring BEFORE
+        // the source pauses — state.bin appears later via the fetch
+        // poller, and the pre-load gate below waits for it.
+        let post_copy = snapshot_dir.join(MIGRATION_PEER_FILE).exists();
+        if !post_copy && !state_path.exists() {
             return Err(SandboxError::Snapshot(format!(
                 "snapshot state.bin missing at {}",
                 state_path.display()
@@ -2527,6 +2576,18 @@ impl FirecrackerBackend {
                     let migration_manifest = snapshot_dir.join("migration-session-manifest.json");
                     let migration_manifest =
                         migration_manifest.exists().then_some(migration_manifest);
+                    // ADR 0045 C2: a post-copy destination additionally
+                    // stages the peer spec — the handler dials the
+                    // source's page server and parks for the SEAL.
+                    let peer_spec: Option<MigrationPeerSpec> = {
+                        let p = snapshot_dir.join(MIGRATION_PEER_FILE);
+                        match tokio::fs::read(&p).await {
+                            Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| {
+                                SandboxError::Snapshot(format!("parse {MIGRATION_PEER_FILE}: {e}"))
+                            })?),
+                            Err(_) => None,
+                        }
+                    };
                     // ADR 0007 Phase 5: prefault host from the sidecar (capture
                     // host); publish under THIS host so later restores here use
                     // the local trace.
@@ -2541,6 +2602,7 @@ impl FirecrackerBackend {
                             prefault_host,
                             publish_host,
                             jail_dir,
+                            peer_spec.as_ref(),
                         )
                         .await?;
                     Ok(Some((handler, uffd_uds)))
@@ -2643,6 +2705,33 @@ impl FirecrackerBackend {
                     .await?;
                 }
                 Some((_handler, uffd_uds)) => {
+                    // ADR 0045 C2 load gates: in post-copy mode the
+                    // handler binds its UDS only once SEALED, and
+                    // state.bin lands only once the fetch poller pulls
+                    // it from the captured source. Wait for both (the
+                    // blackout-side budget: capture + fetch; generous —
+                    // a timeout tears the restore down via the normal
+                    // failure path and the coordinator aborts the move).
+                    if post_copy {
+                        let budget = Duration::from_secs(240);
+                        let started = std::time::Instant::now();
+                        while !(uffd_uds.exists() && state_path.exists()) {
+                            if started.elapsed() > budget {
+                                return Err(SandboxError::Snapshot(format!(
+                                    "post-copy load gate timed out after {budget:?} \
+                                     (uds: {}, state.bin: {})",
+                                    uffd_uds.exists(),
+                                    state_path.exists(),
+                                )));
+                            }
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            waited_ms = started.elapsed().as_millis() as u64,
+                            "post-copy load gate open (sealed + state.bin staged)",
+                        );
+                    }
                     // ADR 0045 substrate: same canonical ref as the handler
                     // spawn (D4: the image base manifest when supplied, else
                     // the session manifest), so the derived base path always
@@ -3617,6 +3706,53 @@ impl SandboxBackend for FirecrackerBackend {
                     .join(WORKING_SET_TRACE_FILE),
             ),
         }
+    }
+
+    /// ADR 0045 C2: trait forwarding to the inherent composition (the
+    /// pooled wrapper reaches these through `dyn SandboxBackend`).
+    fn compose_live_sidecar(
+        &self,
+        id: SandboxId,
+        memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    ) -> Result<Vec<u8>, SandboxError> {
+        FirecrackerBackend::compose_live_sidecar(self, id, memory_manifest)
+    }
+
+    async fn snapshot_vmstate_only_package(
+        &self,
+        id: SandboxId,
+        sidecar_json: &[u8],
+    ) -> Result<(SnapshotId, PathBuf), SandboxError> {
+        FirecrackerBackend::snapshot_vmstate_only_package(self, id, sidecar_json).await
+    }
+
+    /// ADR 0045 C2: what the page server needs to read this paused
+    /// guest's memory from outside. `None` unless this is a live FC
+    /// sandbox on a substrate host (post-copy needs the base-file
+    /// mapping to translate guest offsets to FC virtual addresses).
+    fn post_copy_source_view(
+        &self,
+        id: SandboxId,
+    ) -> Option<engram_core::traits::sandbox::PostCopySourceView> {
+        let base_dir = self.config.uffd_base_dir.clone()?;
+        let live = self.sandboxes.get(&id)?;
+        let fc_pid = live.fc_pid?;
+        Some(engram_core::traits::sandbox::PostCopySourceView {
+            fc_pid,
+            uffd_base_dir: base_dir,
+        })
+    }
+
+    /// ADR 0045 C2 (destination): the peer-mode handler's control
+    /// socket. The path is deterministic per jail; existence implies
+    /// the handler was spawned in peer mode (it binds the listener
+    /// before connecting out).
+    fn post_copy_control_sock(&self, id: SandboxId) -> Option<PathBuf> {
+        let path = self
+            .work_dir
+            .join(id.to_string())
+            .join(UFFD_CONTROL_SOCK_FILE);
+        path.exists().then_some(path)
     }
 
     /// ADR 0045 C2: rewrite the sandbox manifest with the post-copy

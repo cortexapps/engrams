@@ -739,6 +739,7 @@ impl HostAgent {
             // backend so the capture path can reach the registry.
             let _migrate_peer_task = self.cfg.migrate_peer_listen_addr.map(|addr| {
                 let server = migrate_peer::PeerServer::new(
+                    addr.port(),
                     self.chunk_cache.clone(),
                     self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
                 );

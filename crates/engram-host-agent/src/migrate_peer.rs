@@ -164,6 +164,9 @@ pub fn read_guest_range(
 
 /// The page server: one per host-agent, holding the live exports.
 pub struct PeerServer {
+    /// The port the listener binds (presetup advertises it to the
+    /// coordinator, which pairs it with the source's host address).
+    port: u16,
     exports: DashMap<String, Arc<PeerExport>>,
     /// `GetChunk` backing. `None` ⇒ `GetChunk` answers `Error` (the dest
     /// falls back to GCS) — hosts without chunk machinery can't be
@@ -173,12 +176,19 @@ pub struct PeerServer {
 }
 
 impl PeerServer {
-    pub fn new(cache: Option<ChunkCache>, store: Option<ChunkStore>) -> Arc<Self> {
+    pub fn new(port: u16, cache: Option<ChunkCache>, store: Option<ChunkStore>) -> Arc<Self> {
         Arc::new(Self {
+            port,
             exports: DashMap::new(),
             cache,
             store,
         })
+    }
+
+    /// The listener port (the coordinator pairs it with the source's
+    /// advertised host address).
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Register a capture's export. Replaces any stale entry with the
@@ -536,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_export_and_bad_token_are_rejected() {
-        let server = PeerServer::new(None, None);
+        let server = PeerServer::new(9102, None, None);
         server.register(test_export("right"));
 
         let got = talk(server.clone(), vec![hello("nope", "right")], 1).await;
@@ -552,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_skew_is_rejected() {
-        let server = PeerServer::new(None, None);
+        let server = PeerServer::new(9102, None, None);
         server.register(test_export("t"));
         let got = talk(
             server,
@@ -571,7 +581,7 @@ mod tests {
 
     #[tokio::test]
     async fn good_hello_acks_and_pushes_seal_then_validates_need_at() {
-        let server = PeerServer::new(None, None);
+        let server = PeerServer::new(9102, None, None);
         server.register(test_export("t"));
         let got = talk(
             server,
@@ -622,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_chunk_outside_allowlist_is_rejected() {
-        let server = PeerServer::new(None, None);
+        let server = PeerServer::new(9102, None, None);
         server.register(test_export("t"));
         let got = talk(
             server,
@@ -643,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_done_marks_export_and_closes() {
-        let server = PeerServer::new(None, None);
+        let server = PeerServer::new(9102, None, None);
         server.register(test_export("t"));
         let _ = talk(
             server.clone(),

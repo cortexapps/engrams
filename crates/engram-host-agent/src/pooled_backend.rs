@@ -74,6 +74,29 @@ fn legacy_rootfs_path(cached: &CachedImage) -> Result<PathBuf, SandboxError> {
     })
 }
 
+/// ADR 0045 C2 (destination): a staged post-copy restore awaiting its
+/// fetch poller spawn (keyed by the restore metadata's snapshot id;
+/// consumed inside `restore_with` once the NBD handle exists). The
+/// fields drive the Linux-only poller; non-Linux builds never
+/// construct one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone)]
+struct PostCopyDestPending {
+    source_addr: String,
+    export_id: String,
+}
+
+/// ADR 0045 C2: a minted-but-not-yet-captured post-copy export. The
+/// capture (Linux-only) consumes it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct PendingPresetup {
+    export_id: String,
+    peer_token: String,
+    /// The chain ref the presetup advertised as the session manifest
+    /// (the capture validates the chain hasn't moved underneath).
+    chain_ref: engram_core::types::manifest::ManifestRef,
+}
+
 /// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
 /// resource resolution: image cache, chunk store, materialize-to-
 /// file, optional NBD daemon, optional egress proxy.
@@ -241,6 +264,12 @@ pub struct PooledBackend {
     /// host-agent startup when the 9102 listener is configured; the C2
     /// capture registers `PeerExport`s here after its pagemap scan.
     migrate_peer: Arc<std::sync::OnceLock<Arc<crate::migrate_peer::PeerServer>>>,
+    /// ADR 0045 C2: presetups awaiting their capture (export identity
+    /// minted pre-pause; `migration_capture_postcopy` consumes it).
+    pending_presetups: Arc<DashMap<SandboxId, PendingPresetup>>,
+    /// ADR 0045 C2 (destination): staged post-copy restores awaiting
+    /// their fetch-poller spawn inside `restore_with`.
+    postcopy_dests: Arc<DashMap<engram_core::types::SnapshotId, PostCopyDestPending>>,
     /// ADR 0045 C2: sandboxes currently playing a post-copy role. Both
     /// roles fence the normal lifecycle drivers (idle-evict nomination
     /// skips them; checkpoints/flush are already fenced by the capture
@@ -386,6 +415,23 @@ impl PooledBackend {
             tracing::info_span!("restore.prepare_nbd"),
         )
         .await?;
+        // ADR 0045 C2: a staged post-copy destination arms its fetch
+        // poller HERE — the earliest point the NBD handle exists. The
+        // attach above used the presetup's LIVE disk ref; the poller
+        // rebases to the drained manifest before landing state.bin
+        // (which is the FC load gate), and the publisher stays fenced
+        // until the pulled chunks are durable.
+        #[cfg(target_os = "linux")]
+        if let Some((_, pending)) = self.postcopy_dests.remove(&metadata.id) {
+            if let Some(nbd) = pending_nbd_state.as_ref() {
+                nbd.backend.set_migration_fence(true);
+            }
+            self.spawn_postcopy_fetch_poller(
+                pending,
+                self.inner.snapshot_path_for(metadata.id),
+                pending_nbd_state.as_ref().map(|n| n.backend.clone()),
+            );
+        }
 
         // Non-NBD fallback runs only when the NBD path didn't take.
         // On macOS this is the only path; on Linux it covers hosts
@@ -527,6 +573,8 @@ impl PooledBackend {
             migrations: Arc::new(crate::migration::MigrationRegistry::default()),
             inline_disk_manifests: Arc::new(DashMap::new()),
             migrate_peer: Arc::new(std::sync::OnceLock::new()),
+            pending_presetups: Arc::new(DashMap::new()),
+            postcopy_dests: Arc::new(DashMap::new()),
             migration_roles: Arc::new(DashMap::new()),
         }
     }
@@ -956,6 +1004,325 @@ impl PooledBackend {
             tracing::warn!(error = %e, "post-pull cache sweep failed (non-fatal)");
         }
         Ok(landed)
+    }
+
+    /// ADR 0045 C2 (destination): stage the presetup's restore package
+    /// — the sidecar, the inline session manifest, and the peer spec —
+    /// then arm the fetch poller (spawned inside `restore_with` once
+    /// the NBD handle exists). No export artifacts exist yet: the
+    /// source hasn't paused.
+    async fn postcopy_stage(
+        &self,
+        metadata: &SnapshotMetadata,
+        mig: &engram_core::types::snapshot::MigrationSourceInfo,
+    ) -> Result<(), SandboxError> {
+        let (Some(peer_addr), Some(peer_token)) = (&mig.peer_addr, &mig.peer_token) else {
+            return Err(SandboxError::InvalidSpec(
+                "post-copy rider missing peer_addr/peer_token".into(),
+            ));
+        };
+        if mig.sidecar_json.is_empty() {
+            return Err(SandboxError::InvalidSpec(
+                "post-copy rider missing the sidecar".into(),
+            ));
+        }
+        let dest = self.inner.snapshot_path_for(metadata.id);
+        fs::create_dir_all(&dest)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("create snapshot dir: {e}")))?;
+        fs::write(dest.join("manifest.json"), &mig.sidecar_json)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("write sidecar: {e}")))?;
+        fs::write(
+            dest.join("migration-session-manifest.json"),
+            &mig.memory_manifest_json,
+        )
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("write session manifest: {e}")))?;
+        let peer_spec = engram_sandbox_firecracker::MigrationPeerSpec {
+            peer_addr: peer_addr.clone(),
+            export_id: mig.export_id.clone(),
+            peer_token: peer_token.clone(),
+        };
+        fs::write(
+            dest.join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
+            serde_json::to_vec(&peer_spec)
+                .map_err(|e| SandboxError::Snapshot(format!("peer spec json: {e}")))?,
+        )
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("write peer spec: {e}")))?;
+        self.postcopy_dests.insert(
+            metadata.id,
+            PostCopyDestPending {
+                source_addr: mig.source_addr.clone(),
+                export_id: mig.export_id.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    /// ADR 0045 C2 (destination): the fetch poller. Once the source's
+    /// capture lands (the export starts answering), pull the drained
+    /// disk envelope + stage its chunks + REBASE the NBD attach, then
+    /// write `state.bin` LAST — its appearance is the FC load gate.
+    /// Afterwards (off the blackout): upload the staged disk chunks
+    /// and unfence the NBD publisher (the dest's publish gate).
+    #[cfg(target_os = "linux")]
+    fn spawn_postcopy_fetch_poller(
+        &self,
+        pending: PostCopyDestPending,
+        dest_dir: std::path::PathBuf,
+        nbd: Option<Arc<crate::disk_daemon::ChunkedDiskBackend>>,
+    ) {
+        use engram_core::types::snapshot::MigrationItem;
+        let cache = self.chunk_cache.clone();
+        let store = self.chunk_store.clone();
+        tokio::spawn(async move {
+            let budget = std::time::Duration::from_secs(240);
+            let started = std::time::Instant::now();
+            let tmp = dest_dir.join("postcopy-tmp");
+            let _ = fs::create_dir_all(&tmp).await;
+
+            // 1. Poll until the export serves (capture done).
+            let envelope_and_state = loop {
+                if started.elapsed() > budget {
+                    tracing::error!(
+                        export_id = %pending.export_id,
+                        "post-copy fetch poller timed out; the FC load gate will tear the restore down",
+                    );
+                    return;
+                }
+                match Self::fetch_export_items(
+                    &pending.source_addr,
+                    &pending.export_id,
+                    vec![MigrationItem::DiskManifest, MigrationItem::StateBin],
+                    &tmp,
+                )
+                .await
+                {
+                    Ok(()) => break (tmp.join("disk-manifest.json"), tmp.join("state.bin")),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "post-copy fetch not ready; retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            };
+            let (envelope_path, state_tmp) = envelope_and_state;
+
+            // 2. Parse the disk envelope; stage its chunks; rebase NBD.
+            let mut staged_disk_chunks: Vec<engram_chunk_store::manifest::ChunkHash> = Vec::new();
+            if let (Some(nbd), Ok(bytes)) = (&nbd, fs::read(&envelope_path).await) {
+                #[derive(serde::Deserialize)]
+                struct Envelope {
+                    new_chunks: Vec<String>,
+                    disk_ref_bincode: Option<Vec<u8>>,
+                }
+                match serde_json::from_slice::<Envelope>(&bytes) {
+                    Ok(env) => {
+                        let hashes: Vec<_> = env
+                            .new_chunks
+                            .iter()
+                            .filter_map(|h| {
+                                engram_chunk_store::manifest::ChunkHash::from_hex(h).ok()
+                            })
+                            .collect();
+                        if !hashes.is_empty() {
+                            let items: Vec<_> = hashes
+                                .iter()
+                                .map(|h| MigrationItem::Chunk(*h.as_bytes()))
+                                .collect();
+                            if let Err(e) = Self::fetch_export_chunks_to_cache(
+                                &pending.source_addr,
+                                &pending.export_id,
+                                items,
+                                cache.as_ref(),
+                            )
+                            .await
+                            {
+                                tracing::error!(error = %e,
+                                    "post-copy disk-chunk staging failed; NOT rebasing (stale-but-coherent attach)");
+                            } else {
+                                staged_disk_chunks = hashes;
+                                if let Some(rref) = env
+                                    .disk_ref_bincode
+                                    .as_deref()
+                                    .and_then(|b| bincode::deserialize(b).ok())
+                                {
+                                    nbd.rebase_manifest_ref(rref).await;
+                                    tracing::info!(
+                                        export_id = %pending.export_id,
+                                        chunks = staged_disk_chunks.len(),
+                                        "post-copy NBD rebased to the drained disk manifest",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "post-copy disk envelope parse failed");
+                    }
+                }
+            }
+
+            // 3. state.bin LAST — this opens the FC load gate.
+            if let Err(e) = fs::rename(&state_tmp, dest_dir.join("state.bin")).await {
+                tracing::error!(error = %e, "post-copy state.bin land failed");
+                return;
+            }
+            tracing::info!(
+                export_id = %pending.export_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "post-copy restore inputs staged (state.bin landed)",
+            );
+
+            // 4. Off the blackout: make the pulled disk chunks durable,
+            //    then unfence the publisher (the publish gate).
+            if let (Some(store), Some(cache)) = (store, cache) {
+                use futures::StreamExt as _;
+                let uploads = futures::stream::iter(staged_disk_chunks.into_iter().map(|h| {
+                    let store = store.clone();
+                    let cache = cache.clone();
+                    async move {
+                        match cache
+                            .get(h, || async move {
+                                Err(engram_chunk_store::error::ChunkStoreError::Internal(
+                                    "staged chunk must be cache-resident".into(),
+                                ))
+                            })
+                            .await
+                        {
+                            Ok(bytes) => store
+                                .put_chunk(&bytes)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| (h, e)),
+                            Err(e) => Err((h, e)),
+                        }
+                    }
+                }))
+                .buffer_unordered(16)
+                .collect::<Vec<_>>()
+                .await;
+                let failed = uploads.iter().filter(|r| r.is_err()).count();
+                if failed > 0 {
+                    tracing::error!(
+                        failed,
+                        "post-copy disk-chunk catch-up incomplete; NBD publisher stays fenced"
+                    );
+                    return;
+                }
+            }
+            if let Some(nbd) = &nbd {
+                nbd.set_migration_fence(false);
+                tracing::info!("post-copy disk catch-up durable; NBD publisher unfenced");
+            }
+        });
+    }
+
+    /// Fetch named export items into `dir` (each written under its
+    /// canonical filename). One-shot; errors when the export isn't
+    /// open yet (the poller's retry signal).
+    #[cfg(target_os = "linux")]
+    async fn fetch_export_items(
+        source_addr: &str,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+        dir: &std::path::Path,
+    ) -> Result<(), SandboxError> {
+        use engram_core::types::snapshot::MigrationItem;
+        let channel = tonic::transport::Endpoint::from_shared(source_addr.to_string())
+            .map_err(|e| SandboxError::InvalidSpec(format!("bad source_addr: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("dial migration source: {e}")))?;
+        let source = engram_protocol::grpc_client::GrpcHostClient::new(channel);
+        let item_specs = items.clone();
+        let mut stream = source
+            .migration_fetch(export_id, items)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration fetch: {e}")))?;
+        use futures::StreamExt;
+        let mut current: Vec<u8> = Vec::new();
+        let mut current_idx: Option<u32> = None;
+        while let Some(frame) = stream.next().await {
+            let frame = frame.map_err(|e| SandboxError::Snapshot(format!("fetch frame: {e}")))?;
+            if current_idx != Some(frame.item_idx) {
+                if !current.is_empty() {
+                    return Err(SandboxError::Snapshot(
+                        "migration fetch: out-of-order frame".into(),
+                    ));
+                }
+                current_idx = Some(frame.item_idx);
+            }
+            current.extend_from_slice(&frame.data);
+            if frame.last {
+                let idx = frame.item_idx as usize;
+                let name = match item_specs.get(idx) {
+                    Some(MigrationItem::StateBin) => "state.bin",
+                    Some(MigrationItem::Sidecar) => "manifest.json",
+                    Some(MigrationItem::DiskManifest) => "disk-manifest.json",
+                    _ => {
+                        return Err(SandboxError::Snapshot(
+                            "fetch_export_items: unexpected item".into(),
+                        ));
+                    }
+                };
+                fs::write(dir.join(name), &current)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("write {name}: {e}")))?;
+                current = Vec::new();
+                current_idx = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch chunk items into the local cache (no eviction sweep per
+    /// put; the staging path discipline from #184).
+    #[cfg(target_os = "linux")]
+    async fn fetch_export_chunks_to_cache(
+        source_addr: &str,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+        cache: Option<&ChunkCache>,
+    ) -> Result<(), SandboxError> {
+        use engram_core::types::snapshot::MigrationItem;
+        let Some(cache) = cache else {
+            return Err(SandboxError::InvalidSpec("no chunk cache".into()));
+        };
+        let channel = tonic::transport::Endpoint::from_shared(source_addr.to_string())
+            .map_err(|e| SandboxError::InvalidSpec(format!("bad source_addr: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("dial migration source: {e}")))?;
+        let source = engram_protocol::grpc_client::GrpcHostClient::new(channel);
+        let item_specs = items.clone();
+        let mut stream = source
+            .migration_fetch(export_id, items)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("migration fetch: {e}")))?;
+        use futures::StreamExt;
+        let mut current: Vec<u8> = Vec::new();
+        while let Some(frame) = stream.next().await {
+            let frame = frame.map_err(|e| SandboxError::Snapshot(format!("fetch frame: {e}")))?;
+            current.extend_from_slice(&frame.data);
+            if frame.last {
+                if let Some(MigrationItem::Chunk(h)) = item_specs.get(frame.item_idx as usize) {
+                    let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
+                    cache
+                        .put_no_evict(hash, &current)
+                        .await
+                        .map_err(|e| SandboxError::Snapshot(format!("stage chunk {hash}: {e}")))?;
+                }
+                current = Vec::new();
+            }
+        }
+        if let Err(e) = cache.sweep().await {
+            tracing::warn!(error = %e, "post-stage cache sweep failed (non-fatal)");
+        }
+        Ok(())
     }
 
     async fn migration_prestage(
@@ -3145,6 +3512,379 @@ impl SandboxBackend for PooledBackend {
             .map_err(|e| SandboxError::Snapshot(format!("snapshot upload task: {e}")))?
     }
 
+    /// ADR 0045 C2: the pre-pause presetup. Mints the export identity
+    /// + packages the restore inputs derivable BEFORE the pause: the
+    /// sidecar (live composition — nothing in it changes across the
+    /// freeze), the inline CHAIN manifest (the session manifest ref is
+    /// the chain's CURRENT durable ref: post-copy never re-chunks at
+    /// capture, sealed chunks override via the peer at fault time, and
+    /// the dest's first checkpoint is a safe Full = the durability
+    /// catch-up), the live disk ref, and the hot set. NO pause, no
+    /// fence — the guest runs until `migration_capture_postcopy`.
+    async fn migration_presetup(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        let Some(peer) = self.migrate_peer_server() else {
+            return Err(SandboxError::InvalidSpec(
+                "no page server on this host — use snapshot-rehome".into(),
+            ));
+        };
+        let Some((chain_ref, chain_manifest)) = self
+            .checkpoint_chains
+            .get(&id)
+            .map(|c| (c.manifest_ref, c.manifest.clone()))
+        else {
+            return Err(SandboxError::InvalidSpec(
+                "no checkpoint chain for this sandbox — use snapshot-rehome".into(),
+            ));
+        };
+        if self.migrations.validate_open(id) || self.pending_presetups.contains_key(&id) {
+            return Err(SandboxError::AlreadyExists);
+        }
+        if self.inner.post_copy_source_view(id).is_none() {
+            return Err(SandboxError::InvalidSpec(
+                "not a substrate sandbox (no base mapping) — use snapshot-rehome".into(),
+            ));
+        }
+
+        let sidecar_json = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
+        let memory_manifest_json = serde_json::to_vec(&chain_manifest)
+            .map_err(|e| SandboxError::Snapshot(format!("chain manifest json: {e}")))?;
+
+        #[cfg(target_os = "linux")]
+        let disk_manifest_ref = match self.nbd_sandboxes.get(&id) {
+            Some(entry) => Some(entry.backend.manifest_ref().await),
+            None => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let disk_manifest_ref: Option<engram_core::types::manifest::ManifestRef> = None;
+
+        let export_id = crate::migration::MigrationRegistry::mint_export_id();
+        let peer_token = crate::migration::MigrationRegistry::mint_export_id();
+        self.pending_presetups.insert(
+            id,
+            PendingPresetup {
+                export_id: export_id.clone(),
+                peer_token: peer_token.clone(),
+                chain_ref,
+            },
+        );
+
+        Ok(engram_core::types::snapshot::MigrationPresetupOut {
+            export_id,
+            peer_token,
+            peer_port: peer.port(),
+            sidecar_json,
+            memory_manifest_json,
+            memory_manifest_ref: chain_ref,
+            disk_manifest_ref,
+            hot_chunks: self.read_hot_chunks(id),
+        })
+    }
+
+    /// ADR 0045 C2: the blackout half. Pause → NBD host-cache fsync +
+    /// dirty-tail drain (kept local) → fork-v3 vmstate-only package →
+    /// pagemap scan → register the export (page server SEALS; the
+    /// parked dest handler unblocks). The guest stays paused serving
+    /// pages until commit (post-drain) or abort.
+    async fn migration_capture_postcopy(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, export_id);
+            Err(SandboxError::InvalidSpec(
+                "post-copy capture is Linux-only".into(),
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use engram_core::types::snapshot::PostCopyCaptureOut;
+            let Some((_, pending)) = self
+                .pending_presetups
+                .remove(&id)
+                .filter(|(_, p)| p.export_id == export_id)
+            else {
+                return Err(SandboxError::InvalidSpec(
+                    "no matching presetup for this capture (export id skew?)".into(),
+                ));
+            };
+            let Some((chain_ref, chain_manifest)) = self
+                .checkpoint_chains
+                .get(&id)
+                .map(|c| (c.manifest_ref, c.manifest.clone()))
+            else {
+                return Err(SandboxError::InvalidSpec(
+                    "checkpoint chain vanished since presetup".into(),
+                ));
+            };
+            if chain_ref != pending.chain_ref {
+                // A checkpoint landed between presetup and capture: the
+                // dest is restoring against a STALE manifest — its
+                // resolve() view would skew vs. ALT_SOURCE. Refuse; the
+                // coordinator retries the whole move.
+                return Err(SandboxError::InvalidSpec(
+                    "chain advanced between presetup and capture — retry the move".into(),
+                ));
+            }
+            let Some(peer) = self.migrate_peer_server() else {
+                return Err(SandboxError::InvalidSpec("page server vanished".into()));
+            };
+            let Some(view) = self.inner.post_copy_source_view(id) else {
+                return Err(SandboxError::InvalidSpec(
+                    "no post-copy source view (substrate mapping gone?)".into(),
+                ));
+            };
+            if self.migrations.validate_open(id) {
+                return Err(SandboxError::AlreadyExists);
+            }
+
+            // Checkpoint fence: held for the export's lifetime.
+            let capture_guard = self.capture_lock(id).lock_owned().await;
+
+            let paused_at = chrono::Utc::now();
+            self.inner
+                .pause(id)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("post-copy pause: {e}")))?;
+
+            // Disk: identical posture to the C1 capture — fsync the
+            // host block cache, drain the pending tier into the LOCAL
+            // cache, fence further publishes.
+            let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) = if let Some(entry) =
+                self.nbd_sandboxes.get(&id)
+            {
+                entry.backend.set_migration_fence(true);
+                let dev = entry.device_path().to_path_buf();
+                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&dev)?;
+                    f.sync_all()
+                })
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("nbd flush join: {e}")))?
+                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
+                entry.backend.wait_idle().await;
+                let pending =
+                    entry.backend.flush_local().await.map_err(|e| {
+                        SandboxError::Snapshot(format!("post-copy disk drain: {e}"))
+                    })?;
+                let (m, hashes) = entry
+                    .backend
+                    .flush_to_local_cache(&pending)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("post-copy disk cache: {e}")))?;
+                let dref = entry.backend.manifest_ref().await.next_version();
+                (
+                    serde_json::to_vec(&m)
+                        .map_err(|e| SandboxError::Snapshot(format!("disk manifest json: {e}")))?,
+                    Some(dref),
+                    hashes,
+                    Some(pending),
+                )
+            } else {
+                (Vec::new(), None, Vec::new(), None)
+            };
+
+            // Fork v3: state.bin + sidecar only — the memory artifact
+            // never materializes (the whole point).
+            let sidecar = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
+            let (snapshot_id, export_dir) = self
+                .inner
+                .snapshot_vmstate_only_package(id, &sidecar)
+                .await?;
+            let _ = snapshot_id;
+
+            // The drained disk manifest rides the export for the dest's
+            // fetch poller (enveloped with its chunk list so the dest
+            // can stage the not-yet-durable chunks before rebasing).
+            let disk_envelope = serde_json::json!({
+                "manifest": serde_json::value::RawValue::from_string(
+                    String::from_utf8_lossy(&disk_manifest_json).into_owned()
+                ).ok(),
+                "new_chunks": disk_hashes.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+                "disk_ref_bincode": disk_ref
+                    .as_ref()
+                    .and_then(|r| bincode::serialize(r).ok()),
+            });
+            tokio::fs::write(
+                export_dir.join("disk-manifest.json"),
+                serde_json::to_vec(&disk_envelope)
+                    .map_err(|e| SandboxError::Snapshot(format!("disk envelope: {e}")))?,
+            )
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("write disk envelope: {e}")))?;
+
+            // The pagemap dirty map (blackout-critical; measured).
+            let scan_started = std::time::Instant::now();
+            let base_path = crate::dirty_map::find_base_mapping(view.fc_pid, &view.uffd_base_dir)
+                .map_err(|e| SandboxError::Snapshot(format!("base mapping scan: {e}")))?
+                .ok_or_else(|| {
+                    SandboxError::Snapshot(
+                        "FC process maps no substrate base file — cannot post-copy".into(),
+                    )
+                })?;
+            let vmas = crate::dirty_map::guest_vmas(view.fc_pid, &base_path)
+                .map_err(|e| SandboxError::Snapshot(format!("guest vmas: {e}")))?;
+            if vmas.is_empty() {
+                return Err(SandboxError::Snapshot(
+                    "no base-backed guest VMAs — cannot post-copy".into(),
+                ));
+            }
+            let chunk_size = chain_manifest.chunk_size.as_u64();
+            let total_bytes = chain_manifest.total_bytes;
+            let seal =
+                crate::dirty_map::scan_dirty_chunks(view.fc_pid, &vmas, chunk_size, total_bytes)
+                    .map_err(|e| SandboxError::Snapshot(format!("pagemap scan: {e}")))?;
+            let scan_ms = scan_started.elapsed().as_millis() as u64;
+            let sealed_chunks = seal.count_ones();
+            let total_chunks = seal.chunk_count;
+
+            // durable_at: chunk idx -> the chain's hash at that offset
+            // (ALT_SOURCE comparisons), plus the GetChunk allowlist.
+            let mut durable_at: Vec<Option<engram_chunk_store::manifest::ChunkHash>> =
+                vec![None; total_bytes.div_ceil(chunk_size) as usize];
+            let mut allowed: std::collections::HashSet<engram_chunk_store::manifest::ChunkHash> =
+                chain_manifest.chunks.iter().map(|c| c.hash).collect();
+            for c in &chain_manifest.chunks {
+                let idx = (c.offset / chunk_size) as usize;
+                if let Some(slot) = durable_at.get_mut(idx) {
+                    *slot = Some(c.hash);
+                }
+            }
+            // The drained disk chunks are fetchable too (the dest
+            // stages them before its NBD rebase).
+            allowed.extend(disk_hashes.iter().copied());
+
+            // Register BOTH exports under the same identity, then the
+            // role. Page-server registration is what unparks the dest
+            // handler (the SEAL push) — last, after everything that
+            // could still fail.
+            let state_served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let last_activity =
+                std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+            let inserted = self.migrations.insert(crate::migration::MigrationExport {
+                export_id: export_id.to_string(),
+                sandbox_id: id,
+                snapshot_dir: export_dir,
+                allowed_chunks: allowed.clone(),
+                disk_pending,
+                created_at: std::time::Instant::now(),
+                post_copy: true,
+                state_served,
+                last_activity,
+                capture_guard,
+            });
+            if !inserted {
+                return Err(SandboxError::AlreadyExists);
+            }
+            self.set_migration_role(id, Some(crate::migration::MigrationRole::PostCopySource))
+                .await;
+            peer.register(crate::migrate_peer::PeerExport {
+                export_id: export_id.to_string(),
+                token: pending.peer_token,
+                sandbox_id: id,
+                fc_pid: view.fc_pid,
+                vmas,
+                seal,
+                durable_at,
+                allowed_chunks: allowed,
+                chunk_size,
+                total_bytes,
+                drained: std::sync::atomic::AtomicBool::new(false),
+            });
+
+            tracing::info!(
+                sandbox_id = %id,
+                export_id,
+                sealed_chunks,
+                total_chunks,
+                scan_ms,
+                "post-copy capture sealed; guest frozen as page server (ADR 0045 C2)",
+            );
+            Ok(PostCopyCaptureOut {
+                sealed_chunks,
+                total_chunks,
+                scan_ms,
+                disk_manifest_json,
+                disk_manifest_ref: disk_ref,
+                new_disk_chunk_hashes: disk_hashes.iter().map(|h| *h.as_bytes()).collect(),
+                paused_at_unix_ms: paused_at.timestamp_millis(),
+            })
+        }
+    }
+
+    /// ADR 0045 C2 (destination): await the drain's terminal outcome
+    /// via the peer-mode handler's control socket. `PeerLost` pauses
+    /// (poisons) the dest VM before returning — the caller rewinds.
+    async fn migration_drain_wait(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
+        use engram_core::types::snapshot::DrainOutcome;
+        let Some(sock) = self.inner.post_copy_control_sock(id) else {
+            return Err(SandboxError::InvalidSpec(
+                "no post-copy control socket for this sandbox".into(),
+            ));
+        };
+        let outcome = tokio::task::spawn_blocking(move || -> Result<DrainOutcome, String> {
+            let mut stream = std::os::unix::net::UnixStream::connect(&sock)
+                .map_err(|e| format!("dial control sock: {e}"))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(600)))
+                .map_err(|e| format!("control sock timeout: {e}"))?;
+            loop {
+                let msg: engram_migrate_proto::HandlerControl =
+                    engram_migrate_proto::read_frame(&mut stream)
+                        .map_err(|e| format!("control frame: {e}"))?;
+                match msg {
+                    engram_migrate_proto::HandlerControl::DrainDone {
+                        pulled,
+                        alt_sourced,
+                        zero_chunks,
+                        ms,
+                    } => {
+                        return Ok(DrainOutcome::Done {
+                            pulled,
+                            alt_sourced,
+                            zero_chunks,
+                            ms,
+                        });
+                    }
+                    engram_migrate_proto::HandlerControl::PeerLost { remaining, detail } => {
+                        return Ok(DrainOutcome::PeerLost { remaining, detail });
+                    }
+                    engram_migrate_proto::HandlerControl::Sealed { .. }
+                    | engram_migrate_proto::HandlerControl::DrainProgress { .. } => continue,
+                }
+            }
+        })
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("drain wait join: {e}")))?
+        .map_err(SandboxError::Snapshot)?;
+
+        if let DrainOutcome::PeerLost { remaining, detail } = &outcome {
+            tracing::error!(
+                sandbox_id = %id,
+                remaining,
+                detail,
+                "post-copy drain lost its peer — poisoning (pausing) the dest VM",
+            );
+            if let Err(e) = self.inner.pause(id).await {
+                tracing::warn!(sandbox_id = %id, error = %e, "poison-pause failed");
+            }
+        } else {
+            // Drain complete: the dest no longer depends on the source.
+            self.set_migration_role(id, None).await;
+        }
+        Ok(outcome)
+    }
+
     /// ADR 0045 C1: freeze for a live move. See `crate::migration`'s
     /// module docs for the lifecycle; the export holds the capture
     /// lock (= the checkpoint fence) and the NBD backend's
@@ -3474,6 +4214,13 @@ impl SandboxBackend for PooledBackend {
             return Err(SandboxError::NotFound);
         }
         let export = self.migrations.remove(id).expect("validated above");
+        // ADR 0045 C2: a post-copy commit also retires the page-server
+        // export (the dest reported DrainDone — or the coordinator gave
+        // up on it) and the source's role fence.
+        if let Some(peer) = self.migrate_peer_server() {
+            peer.remove(export_id);
+        }
+        self.note_migration_role(id, None);
         let snapshot_dir = export.snapshot_dir.clone();
         drop(export); // releases the capture guard (checkpoint fence)
         if let Err(e) = self.destroy(id).await {
@@ -3491,7 +4238,20 @@ impl SandboxBackend for PooledBackend {
         if !self.migrations.validate(id, export_id) {
             return Err(SandboxError::NotFound);
         }
+        // ADR 0045 C2 split-brain guard: once state.bin shipped off a
+        // post-copy export the dest may be RUNNING this state — an
+        // abort-unpause would fork it. Refuse; the TTL sweep's
+        // StayPaused/Destroy arms own the endgame.
+        if self.migrations.state_served(id) {
+            return Err(SandboxError::InvalidSpec(
+                "post-copy abort refused: state already served (split-brain guard)".into(),
+            ));
+        }
         let export = self.migrations.remove(id).expect("validated above");
+        if let Some(peer) = self.migrate_peer_server() {
+            peer.remove(export_id);
+        }
+        self.set_migration_role(id, None).await;
         #[cfg(target_os = "linux")]
         if let Some(entry) = self.nbd_sandboxes.get(&id) {
             if let Some(pending) = export.disk_pending {
@@ -3583,7 +4343,16 @@ impl SandboxBackend for PooledBackend {
         // coordinator via the existing `snapshot_wait`).
         let mut metadata = metadata;
         let migration = metadata.migration_source.take();
-        if let Some(mig) = &migration {
+        if let Some(mig) = migration.as_ref().filter(|m| m.post_copy) {
+            // ADR 0045 C2: the post-copy destination. Stage the
+            // presetup's package (no export exists yet — the source
+            // hasn't paused), arm the role fence, and spawn the
+            // fetch poller that lands state.bin + the drained disk
+            // manifest once the capture seals. The FC load gate
+            // (restore_in_jail) waits on those files; the handler
+            // parks at the page server for the SEAL.
+            self.postcopy_stage(&metadata, mig).await?;
+        } else if let Some(mig) = &migration {
             self.migration_prestage(&metadata, mig).await?;
             // Land the FULL session-manifest divergence BEFORE the
             // guest resumes — synchronously, over N parallel streams
@@ -3645,6 +4414,18 @@ impl SandboxBackend for PooledBackend {
         let row_template = migration.as_ref().map(|_| metadata.clone());
         let id = self.restore_with(metadata, /*fresh=*/ false).await?;
         match migration {
+            Some(mig) if mig.post_copy => {
+                // ADR 0045 C2: NO chain seed — sealed pages installed
+                // from the peer diverge from the chain content, so a
+                // diff against it would be unsound; with no chain the
+                // dest's first checkpoint is a safe FULL (that Full IS
+                // the memory durability catch-up, driven by the
+                // coordinator's finalize after the drain). Disk
+                // durability + the publish gate ride the fetch poller.
+                let _ = mig;
+                self.set_migration_role(id, Some(crate::migration::MigrationRole::PostCopyDest))
+                    .await;
+            }
             Some(mig) => {
                 self.migration_finish_restore(id, mig, row_template.expect("set above"))
                     .await?;

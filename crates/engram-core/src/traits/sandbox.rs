@@ -566,6 +566,32 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
+    /// ADR 0045 C2: compose the restore sidecar from LIVE sandbox
+    /// state (the presetup's pre-pause package; byte-identical to the
+    /// capture-time sidecar by construction).
+    fn compose_live_sidecar(
+        &self,
+        _id: SandboxId,
+        _memory_manifest: Option<crate::types::manifest::ManifestRef>,
+    ) -> Result<Vec<u8>, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `compose_live_sidecar`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: write a vmstate-only snapshot package (sidecar +
+    /// fork-v3 `state.bin`, no memory artifact). Caller holds the VM
+    /// paused and owns resume.
+    async fn snapshot_vmstate_only_package(
+        &self,
+        _id: SandboxId,
+        _sidecar_json: &[u8],
+    ) -> Result<(crate::types::SnapshotId, PathBuf), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `snapshot_vmstate_only_package`".into(),
+        ))
+    }
+
     /// ADR 0045 C2: persist (or clear, `None`) the sandbox's post-copy
     /// migration role into the backend's reattach manifest so a
     /// host-agent restart re-learns the lifecycle fences. No-op for

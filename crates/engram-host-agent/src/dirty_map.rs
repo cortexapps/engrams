@@ -122,6 +122,25 @@ pub fn guest_vmas(pid: u32, base_shm_path: &Path) -> io::Result<Vec<GuestVma>> {
     Ok(vmas)
 }
 
+/// Find the substrate base file `pid` maps under `base_dir` — the
+/// page server's discovery step (the host-agent knows the DIR from
+/// config; the exact per-image file is whatever the restore derived).
+/// Exactly one distinct base file is expected per FC process.
+pub fn find_base_mapping(pid: u32, base_dir: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    let prefix = format!("{}/", base_dir.to_string_lossy().trim_end_matches('/'));
+    let f = std::fs::File::open(format!("/proc/{pid}/maps"))?;
+    for line in BufReader::new(f).lines() {
+        let line = line?;
+        if let Some(idx) = line.find(&prefix) {
+            let path = line[idx..].trim_end();
+            if !path.ends_with(" (deleted)") {
+                return Ok(Some(std::path::PathBuf::from(path)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The per-page classification rule. `entry` is one raw 64-bit
 /// `/proc/<pid>/pagemap` entry.
 pub fn pagemap_entry_is_dirty(entry: u64) -> bool {
