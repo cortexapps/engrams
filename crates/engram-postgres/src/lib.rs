@@ -957,7 +957,8 @@ impl MetadataStore for PostgresStore {
                                running_sandboxes_count,
                                last_heartbeat_at, status, host_addr, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-            ON CONFLICT (hostname) DO UPDATE SET
+            ON CONFLICT (id) DO UPDATE SET
+                hostname                = EXCLUDED.hostname,
                 cloud_metadata          = EXCLUDED.cloud_metadata,
                 capacity_total_gb       = EXCLUDED.capacity_total_gb,
                 capacity_used_gb        = EXCLUDED.capacity_used_gb,
