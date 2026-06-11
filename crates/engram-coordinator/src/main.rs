@@ -98,6 +98,10 @@ struct Cli {
     )]
     harness_listen_addr: std::net::SocketAddr,
 
+    /// Address the orchestrator-facing app gRPC server binds to (ADR 0039).
+    #[arg(long, env = "APP_GRPC_ADDR", default_value = "127.0.0.1:50061")]
+    app_grpc_addr: std::net::SocketAddr,
+
     /// Address the Prometheus `/metrics` exporter listens on.
     /// Separate port from the main API so scrapers reach a
     /// bearer-free endpoint without going through nginx + IAP.
@@ -424,6 +428,7 @@ async fn main() -> Result<(), CoordinatorError> {
             .collect(),
         auth: build_auth_config(&cli)?,
         harness_listen_addr: cli.harness_listen_addr,
+        app_grpc_addr: cli.app_grpc_addr,
     };
 
     let pg = PostgresStore::connect(&cfg.database_url)

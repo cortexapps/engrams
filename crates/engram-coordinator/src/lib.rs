@@ -23,6 +23,7 @@ pub mod enable_scanner;
 pub mod error;
 pub mod evac_resumer;
 pub mod evacuation;
+pub mod grpc_app;
 pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_detect_backstop;
@@ -359,6 +360,25 @@ pub async fn run_with_registry_and_local(
             });
         });
         state.services.host.set_upload_sink(sink);
+    }
+
+    // ADR 0039 §2.3: the orchestrator-facing app gRPC server, beside
+    // the axum API for the duration of the migration (the axum web
+    // routes retire in Phase 5). Spawned rather than joined so an app
+    // gRPC bind/serve failure doesn't take the web surface down with
+    // it. Awaits the same `shutdown_signal()` future the axum side
+    // uses below — tokio signal listeners are multi-subscriber, so one
+    // SIGTERM/ctrl-c gracefully closes both servers.
+    {
+        let app_grpc = grpc_app::server(state.clone())
+            .serve_with_shutdown(cfg.app_grpc_addr, shutdown_signal());
+        let addr = cfg.app_grpc_addr;
+        tokio::spawn(async move {
+            tracing::info!(addr = %addr, "app gRPC server listening");
+            if let Err(e) = app_grpc.await {
+                tracing::error!(error = %e, "app gRPC server exited");
+            }
+        });
     }
 
     let app = api::router(state.clone());

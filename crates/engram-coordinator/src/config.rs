@@ -32,6 +32,13 @@ pub struct CoordinatorConfig {
     /// pick a free port; the coordinator reads back the bound address
     /// and plumbs it into the agent's env at session-create time.
     pub harness_listen_addr: std::net::SocketAddr,
+    /// Address the orchestrator-facing app gRPC server binds to
+    /// (ADR 0039 §2.3). Serves Session/ShellRelay/Fleet/Image/Secret
+    /// beside the axum API during the migration; the axum web routes
+    /// retire in Phase 5. Loopback by default — the orchestrator is
+    /// the only intended caller and co-locates with the coordinator
+    /// in dev.
+    pub app_grpc_addr: std::net::SocketAddr,
 }
 
 impl Default for CoordinatorConfig {
@@ -52,6 +59,9 @@ impl Default for CoordinatorConfig {
             harness_listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("default harness_listen_addr must parse"),
+            app_grpc_addr: "127.0.0.1:50061"
+                .parse()
+                .expect("default app_grpc_addr must parse"),
         }
     }
 }
