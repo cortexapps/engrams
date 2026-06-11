@@ -4,7 +4,7 @@
 # buf.gen.yaml drives TS codegen (`just gen-proto`).
 #
 # host_service.proto predates buf — it was authored for tonic-build
-# (ADR 0013) and fails four STANDARD rules. Those exceptions are
+# (ADR 0013) and fails six STANDARD rules. Those exceptions are
 # scoped to the legacy file ONLY: everything new (engram/app/...)
 # must be clean under full STANDARD.
 version: v2
@@ -12,9 +12,9 @@ lint:
   use:
     - STANDARD
   ignore_only:
-    ENUM_VALUE_PREFIX:
+    ENUM_VALUE_PREFIX: # surfaced by buf 1.69.0
       - host_service.proto
-    ENUM_ZERO_VALUE_SUFFIX:
+    ENUM_ZERO_VALUE_SUFFIX: # surfaced by buf 1.69.0
       - host_service.proto
     PACKAGE_DIRECTORY_MATCH:
       - host_service.proto

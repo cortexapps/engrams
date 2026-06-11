@@ -30,6 +30,11 @@ name: CI
 #                       patch_drive_swap, option_d_warm_lease.
 #   - web:              pnpm install + oxlint + tsc + vite build +
 #                       vitest
+#   - buf:              proto lint + PR breaking-change detection over
+#                       crates/engram-protocol/proto (buf CLI pinned,
+#                       see the job), plus the TS codegen drift check
+#                       (committed web/ + orchestrator/ gen output must
+#                       match `buf generate`; `just gen-proto` to fix).
 #   - bake-demo-image:  push-to-main only. Bakes the canonical
 #                       deploy/demo rootfs as a chunked-OCI artifact
 #                       and pushes to
@@ -431,6 +436,12 @@ jobs:
       - uses: actions/checkout@v6
       - uses: bufbuild/buf-action@v1
         with:
+          # Pin to the locally-verified buf CLI; bump deliberately. A
+          # new buf release can surface new lint rules — exactly what
+          # happened between plan-writing and implementation (1.69.0
+          # added ENUM_VALUE_PREFIX / ENUM_ZERO_VALUE_SUFFIX to
+          # STANDARD's findings on host_service.proto).
+          version: 1.69.0
           input: crates/engram-protocol/proto
           # host_service.proto predates `buf format`; don't gate on
           # formatting (the action runs it by default on PRs).
@@ -453,6 +464,10 @@ jobs:
         run: |
           if [ -d crates/engram-protocol/proto/engram/app ]; then
             buf generate
+            # `git add -N` (intent-to-add) makes brand-new generated files
+            # visible to `git diff` — without it the check misses UNTRACKED
+            # output, only catching edits to already-committed bindings.
+            git add -N -- web/src/gen orchestrator/src/gen
             git diff --exit-code -- web/src/gen orchestrator/src/gen
           else
             echo "engram/app contract not present yet (ADR 0039 Tasks 4-5) — skipping codegen drift check"

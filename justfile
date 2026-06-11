@@ -40,7 +40,9 @@ fmt:
 # from crates/engram-protocol/proto via the repo-root buf.gen.yaml.
 # Outputs: web/src/gen + orchestrator/src/gen — commit them; CI's `buf`
 # job re-generates and fails on drift. Guarded: until the app contract
-# lands (Tasks 4-5) there is nothing to generate. Install buf:
+# lands (Tasks 4-5) there is nothing to generate. CI's drift step
+# (.github/workflows/ci.yml, `buf` job) duplicates this dir-exists
+# guard — update both if the condition changes. Install buf:
 # `brew install bufbuild/buf/buf`.
 gen-proto:
     @if [ -d crates/engram-protocol/proto/engram/app ]; then \
