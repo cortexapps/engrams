@@ -1289,6 +1289,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-migrate-proto"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-oci"
 version = "0.1.0"
 dependencies = [
@@ -6233,7 +6242,9 @@ dependencies = [
  "percent-encoding",
  "phf_shared",
  "pkcs8",
+ "proc-macro2",
  "prost",
+ "quote",
  "rand 0.8.6",
  "rand_core 0.6.4",
  "regex",
