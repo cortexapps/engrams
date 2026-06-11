@@ -42,6 +42,64 @@ pub struct ConversationEntry {
     pub payload: serde_json::Value,
 }
 
+/// Transport-agnostic conversation-log core (ADR 0039, Task 12).
+///
+/// Returns entries for `kind=conversation` (the only supported kind
+/// post-ADR-0005). `kind` must be `None` or `Some("conversation")`;
+/// any other value maps to `ApiError::BadRequest`. `limit` is clamped
+/// to `[1, 1000]` with a default of 200.
+pub async fn get_log_core(
+    state: &SharedState,
+    id: SessionId,
+    kind: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<ConversationEntry>, ApiError> {
+    state.services.meta.get_session(id).await?;
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+    match kind.as_deref().unwrap_or("conversation") {
+        "conversation" => {
+            let rows = state
+                .services
+                .meta
+                .list_session_events_since(id, -1, limit)
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|e| ConversationEntry {
+                    idx: e.idx,
+                    kind: e.kind,
+                    at: e.created_at,
+                    payload: e.payload,
+                })
+                .collect())
+        }
+        other => Err(ApiError::BadRequest(format!(
+            "unknown kind `{other}` — only `conversation` is supported"
+        ))),
+    }
+}
+
+/// Transport-agnostic COW-state core (ADR 0039, Task 12).
+///
+/// Returns `None` when the session has no live sandbox (Idle, HostLost,
+/// Pending, terminal), exactly as the axum handler does.
+pub async fn cow_state_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<Option<CowStateView>, ApiError> {
+    let resp = cow_state(State(state.clone()), Path(id)).await?;
+    Ok(resp.0.state)
+}
+
+/// Transport-agnostic checkpoints core (ADR 0039, Task 12).
+pub async fn checkpoints_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<Vec<CheckpointSummary>, ApiError> {
+    let resp = checkpoints(State(state.clone()), Path(id)).await?;
+    Ok(resp.0.checkpoints)
+}
+
 pub async fn log(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,

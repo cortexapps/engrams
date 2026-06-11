@@ -90,6 +90,31 @@ pub struct SnapshotResponse {
     pub note: &'static str,
 }
 
+/// Transport-agnostic snapshot core (ADR 0039, Task 12). Delegates
+/// to the same implementation the axum handler uses.
+pub async fn snapshot_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<SnapshotResponse, ApiError> {
+    snapshot(State(state.clone()), Path(id)).await.map(|j| j.0)
+}
+
+/// Transport-agnostic resume core (ADR 0039, Task 12). Delegates
+/// to the same implementation the axum handler uses.
+pub async fn resume_core(state: &SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
+    resume_session(state.clone(), id).await
+}
+
+/// Transport-agnostic evict_local core (ADR 0039, Task 12). Delegates
+/// to the same implementation the axum handler uses and discards the
+/// HTTP status code (the gRPC handler returns an empty response on
+/// success, mirroring the 202 Accepted).
+pub async fn evict_local_core(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
+    evict_local(State(state.clone()), Path(id))
+        .await
+        .map(|_| ())
+}
+
 pub async fn snapshot(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
