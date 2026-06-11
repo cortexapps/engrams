@@ -3539,8 +3539,20 @@ impl SandboxBackend for PooledBackend {
                 "no checkpoint chain for this sandbox — use snapshot-rehome".into(),
             ));
         };
-        if self.migrations.validate_open(id) || self.pending_presetups.contains_key(&id) {
+        if self.migrations.validate_open(id) {
             return Err(SandboxError::AlreadyExists);
+        }
+        // A lingering pending presetup is an ABANDONED move (the
+        // coordinator died between the halves; nothing else can hold
+        // one — the session lease serializes movers). Last-write-wins:
+        // refusing here would brick every future move for this sandbox
+        // until a host-agent restart.
+        if let Some(stale) = self.pending_presetups.get(&id) {
+            tracing::warn!(
+                sandbox_id = %id,
+                stale_export = %stale.export_id,
+                "presetup superseding an abandoned pending presetup",
+            );
         }
         if self.inner.post_copy_source_view(id).is_none() {
             return Err(SandboxError::InvalidSpec(
