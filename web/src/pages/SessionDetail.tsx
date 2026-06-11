@@ -129,7 +129,7 @@ function SessionMeta({
     <div className="space-y-5">
       <div className="flex items-center gap-2">
         <StatusGlyph status={session.status} />
-        <span className="text-sm font-medium text-foreground">
+        <span data-testid="session-status" className="text-sm font-medium text-foreground">
           {session.status.replace(/_/g, " ")}
         </span>
       </div>
@@ -142,7 +142,9 @@ function SessionMeta({
           </dd>
         </div>
         <MetricRow label="created" value={`${relativeTime(session.created_at)} ago`} />
-        <MetricRow label="events" value={eventCount} />
+        {/* The count gets its own element: e2e polls Number(textContent) of
+            exactly this span — tagging surrounding prose would yield NaN. */}
+        <MetricRow label="events" value={<span data-testid="event-count">{eventCount}</span>} />
       </dl>
 
       {/* ADR 0016 Phase A + ADR 0028 A.log: per-session durability — "is my
@@ -271,6 +273,7 @@ function RawEvents({ events }: { events: ReturnType<typeof useSessionEvents> }) 
       {events.map((e) => (
         <div
           key={e.idx}
+          data-testid="event-row"
           className="grid items-baseline gap-3"
           style={{ gridTemplateColumns: "4ch min-content 1fr" }}
         >

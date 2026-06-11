@@ -153,7 +153,7 @@ function SkeletonRows() {
 
 function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }) {
   return (
-    <li>
+    <li data-testid="session-row">
       <Link
         to="/sessions/$id"
         params={{ id: s.id }}

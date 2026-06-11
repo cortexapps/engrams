@@ -232,6 +232,21 @@ integration-evac-test:
 integration-session:
     bash deploy/dev/integration-session.sh
 
+# ADR 0039 characterization net. Requires `just dev` and the no-harness
+# demo image (`just integration-session` once). Run before merging any
+# task of the ADR 0039 plan. (The snap spec self-skips here: it only
+# screenshots when SNAP_PATHS is set.)
+e2e:
+    cd web && pnpm e2e
+
+# Visual validation protocol: full-page screenshots of the given paths.
+# Usage: just snap "/,/sessions/<id>,/sessions/<id>?tab=raw"
+# Extras: `?tab=<id>` clicks that session-detail tab first; `#new` opens
+# the new-session dialog. Output: web/e2e/__shots__/<slug>.png — compare
+# (by reading the images) against web/e2e/__shots__/baseline/.
+snap paths="/":
+    cd web && SNAP_PATHS="{{paths}}" pnpm exec playwright test snap --reporter=list
+
 # Bake an image from a directory containing Dockerfile + engram.toml,
 # then push it to the local OCI registry. Auto-selects cross-compile
 # target + `--transport` flag based on host arch. Tag defaults to

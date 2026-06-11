@@ -104,7 +104,7 @@ export function NewSessionDialog({
     <Dialog open={open} onOpenChange={setOpen}>
       {showTrigger && (
         <DialogTrigger asChild>
-          <Button variant={variant} className={className}>
+          <Button data-testid="new-session" variant={variant} className={className}>
             New session
           </Button>
         </DialogTrigger>
@@ -145,7 +145,7 @@ export function NewSessionDialog({
                   <Field>
                     <FieldLabel htmlFor={field.name}>Image</FieldLabel>
                     <Select value={field.value} onValueChange={field.onChange}>
-                      <SelectTrigger id={field.name}>
+                      <SelectTrigger id={field.name} data-testid="image-select">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -225,7 +225,7 @@ export function NewSessionDialog({
                   Save your Claude token
                 </Button>
               ) : (
-                <Button type="submit" disabled={!canSubmit}>
+                <Button type="submit" data-testid="start-session" disabled={!canSubmit}>
                   {form.formState.isSubmitting ? "Starting…" : "Start"}
                 </Button>
               )}
