@@ -48,6 +48,13 @@ pub struct ConversationEntry {
 /// post-ADR-0005). `kind` must be `None` or `Some("conversation")`;
 /// any other value maps to `ApiError::BadRequest`. `limit` is clamped
 /// to `[1, 1000]` with a default of 200.
+///
+/// # DRIFT WARNING
+///
+/// This is a deliberate copy of the axum `GET /sessions/:id/log` handler —
+/// the axum handler was left untouched for wire-safety during the migration;
+/// Task 32 deletes the axum side, leaving this as the single copy. Until
+/// then, changes must be mirrored.
 pub async fn get_log_core(
     state: &SharedState,
     id: SessionId,

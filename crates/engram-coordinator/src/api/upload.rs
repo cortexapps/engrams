@@ -447,6 +447,13 @@ pub struct FromPathResponse {
 /// [`SharedArtifact`] that both the axum handler and the gRPC handler
 /// can encode into their respective wire shapes. The axum handler
 /// remains independent and unchanged.
+///
+/// # DRIFT WARNING
+///
+/// This is a deliberate copy of the axum `POST /sessions/:id/artifacts/from-path`
+/// handler (`create_from_path`) — the axum handler was left untouched for
+/// wire-safety during the migration; Task 32 deletes the axum side, leaving
+/// this as the single copy. Until then, changes must be mirrored.
 pub async fn create_artifact_from_path_core(
     state: &SharedState,
     session: SessionId,
@@ -583,6 +590,13 @@ fn exec_stdout_bytestream(events: ExecEventStream) -> ByteStream {
 ///
 /// `artifact_id` is the UUID string as received from the caller; an
 /// unparseable value maps to `ApiError::BadRequest`.
+///
+/// # DRIFT WARNING
+///
+/// This is a deliberate copy of the axum `GET /sessions/:id/artifacts/:id`
+/// handler (`serve_artifact`) — the axum handler was left untouched for
+/// wire-safety during the migration; Task 32 deletes the axum side, leaving
+/// this as the single copy. Until then, changes must be mirrored.
 pub async fn get_artifact_core(
     state: &SharedState,
     session: SessionId,

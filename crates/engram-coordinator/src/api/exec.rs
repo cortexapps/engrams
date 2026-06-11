@@ -160,6 +160,13 @@ fn build_exec(
 ///
 /// The caller supplies a `Sink`-like callback for each step so the
 /// function is not generic over the stream type.
+///
+/// # DRIFT WARNING
+///
+/// This is a deliberate copy of `exec()` and `exec_stream()` axum
+/// handlers above — the axum handlers were left untouched for wire-safety
+/// during the migration; Task 32 deletes the axum side, leaving this as
+/// the single copy. Until then, changes must be mirrored in all three.
 pub async fn exec_stream_core(
     state: &SharedState,
     id: SessionId,

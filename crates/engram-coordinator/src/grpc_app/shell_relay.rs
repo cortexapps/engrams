@@ -150,10 +150,11 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
             .map_err(into_status)?;
 
         let sandbox_id = self.state.registry.get(session_id).ok_or_else(|| {
-            Status::failed_precondition(
+            into_status(crate::error::ApiError::Conflict(
                 "session has no live sandbox after auto-resume; \
-                 try again or `engram session resume <id>` and retry",
-            )
+                 try again or `engram session resume <id>` and retry"
+                    .into(),
+            ))
         })?;
 
         // ---- 3. acquire_shell (warn-and-continue, non-fatal) ---------
@@ -209,11 +210,18 @@ fn relay_frame_name(f: &app::relay_shell_request::Frame) -> &'static str {
 }
 
 /// Map a proto `RelayShellRequest` frame to a `ShellFrame`.
+///
+/// # Panics
+///
+/// `Open` is consumed before the pump loop starts (and rejected mid-stream
+/// in the loop); reaching this arm is a programming error.
 fn proto_to_shell_frame(frame: app::relay_shell_request::Frame) -> ShellFrame {
     match frame {
         app::relay_shell_request::Frame::Open(_) => {
-            // open is consumed before we enter the pump; should not appear here.
-            ShellFrame::Close(None)
+            // Consumed before the pump (first frame), or rejected mid-stream
+            // in the g2t loop before this function is called.  Reaching here
+            // is a programming error.
+            unreachable!("Open frame must be handled before proto_to_shell_frame is called")
         }
         app::relay_shell_request::Frame::Text(t) => ShellFrame::Text(t),
         app::relay_shell_request::Frame::Binary(b) => ShellFrame::Binary(Bytes::from(b)),
@@ -292,6 +300,19 @@ fn build_relay_stream(
                     }
                     Ok(req) => {
                         let Some(frame) = req.frame else { continue };
+                        // A mid-stream `open` is a protocol error: `open` is
+                        // only valid as the first frame (consumed above before
+                        // the pump starts). Terminate the relay and signal the
+                        // client with InvalidArgument rather than silently
+                        // closing ttyd.
+                        if matches!(frame, app::relay_shell_request::Frame::Open(_)) {
+                            let _ = g2t_resp_tx
+                                .send(Err(Status::invalid_argument(
+                                    "open frame only valid as the first frame",
+                                )))
+                                .await;
+                            break;
+                        }
                         let shell_frame = proto_to_shell_frame(frame);
                         if g2t_tx.send(shell_frame).await.is_err() {
                             // Tunnel outbound closed (host side tore down).

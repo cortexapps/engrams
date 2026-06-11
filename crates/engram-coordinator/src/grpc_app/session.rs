@@ -260,12 +260,7 @@ impl app::session_service_server::SessionService for AppSessionService {
                     rusage,
                 } => app::exec_output::Event::Exit(app::ExecExit {
                     exit_status,
-                    rusage: Some(app::ExecRusage {
-                        wall_ms: rusage.wall_ms,
-                        peak_rss_kb: rusage.peak_rss_kb,
-                        user_cpu_ms: rusage.user_cpu_ms,
-                        sys_cpu_ms: rusage.sys_cpu_ms,
-                    }),
+                    rusage: Some(super::convert::exec_rusage_to_proto(rusage)),
                 }),
             };
             Ok(app::ExecOutput {
@@ -288,15 +283,7 @@ impl app::session_service_server::SessionService for AppSessionService {
             .map_err(into_status)?;
         let proto_entries = entries
             .into_iter()
-            .map(|e| app::ConversationEntry {
-                idx: e.idx,
-                kind: e.kind,
-                at: e.at.to_rfc3339(),
-                // The proto field is named payload_json to emphasise the
-                // envelope; the Rust type carries it as `payload` (a
-                // serde_json::Value). Serialize to a JSON string here.
-                payload_json: e.payload.to_string(),
-            })
+            .map(super::convert::conversation_entry_to_proto)
             .collect();
         Ok(Response::new(app::GetLogResponse {
             session_id: id.to_string(),
@@ -378,14 +365,7 @@ impl app::session_service_server::SessionService for AppSessionService {
             .map_err(into_status)?;
         let proto_checkpoints = summaries
             .into_iter()
-            .map(|s| app::CheckpointSummary {
-                snapshot_id: s.snapshot_id,
-                created_at: s.created_at.to_rfc3339(),
-                size_bytes: s.size_bytes,
-                events_cursor: s.events_cursor,
-                recoverable: s.recoverable,
-                is_latest: s.is_latest,
-            })
+            .map(super::convert::checkpoint_summary_to_proto)
             .collect();
         Ok(Response::new(app::ListCheckpointsResponse {
             session_id: id.to_string(),
@@ -427,57 +407,38 @@ impl app::session_service_server::SessionService for AppSessionService {
 
         let metadata_frame = app::GetArtifactResponse {
             msg: Some(app::get_artifact_response::Msg::Metadata(
-                app::ArtifactMetadata {
-                    media_type: meta.media_type,
-                    size_bytes: meta.size_bytes as u64,
-                    file_name: meta.file_name,
-                },
+                super::convert::artifact_meta_to_proto(meta),
             )),
         };
 
-        // Accumulate bytes into ARTIFACT_CHUNK_BYTES-sized frames.
-        let chunk_stream = byte_stream
-            .map(|res| res.map_err(|e| Status::internal(format!("artifact read: {e}"))))
-            // Buffer into fixed-size chunks. We use a stateful fold that
-            // emits a chunk when the buffer fills and drains the remainder
-            // after the stream ends, using `async_stream::stream!` for
-            // clarity and to avoid a complex `unfold`.
-            .collect::<Vec<_>>()
-            .await;
-
-        // Build the full chunked sequence from the buffered bytes.
-        // (We buffer fully because the ByteStream item size is arbitrary.)
-        let chunks: Vec<Result<app::GetArtifactResponse, Status>> = {
+        // Lazy incremental stream: emit the metadata frame first, then
+        // re-chunk the ByteStream into ≤64 KiB `chunk` frames as it's
+        // polled.  Dropping this stream aborts the read at the next poll
+        // (the ByteStream's own future is dropped), so client disconnect
+        // reliably cancels the read — no transient full-blob buffering.
+        let chunk_stream = async_stream::try_stream! {
             let mut acc: Vec<u8> = Vec::new();
-            let mut out = Vec::new();
-            for item in chunk_stream {
-                match item {
-                    Err(e) => {
-                        out.push(Err(e));
-                        break;
-                    }
-                    Ok(b) => {
-                        acc.extend_from_slice(&b);
-                        while acc.len() >= ARTIFACT_CHUNK_BYTES {
-                            let chunk: Vec<u8> = acc.drain(..ARTIFACT_CHUNK_BYTES).collect();
-                            out.push(Ok(app::GetArtifactResponse {
-                                msg: Some(app::get_artifact_response::Msg::Chunk(chunk)),
-                            }));
-                        }
-                    }
+            let mut stream = byte_stream;
+            while let Some(item) = stream.next().await {
+                let chunk = item.map_err(|e| Status::internal(format!("artifact read: {e}")))?;
+                acc.extend_from_slice(&chunk);
+                while acc.len() >= ARTIFACT_CHUNK_BYTES {
+                    let out: Vec<u8> = acc.drain(..ARTIFACT_CHUNK_BYTES).collect();
+                    yield app::GetArtifactResponse {
+                        msg: Some(app::get_artifact_response::Msg::Chunk(out)),
+                    };
                 }
             }
-            // Emit any remaining bytes (last partial chunk).
+            // Drain any remaining bytes (last partial chunk).
             if !acc.is_empty() {
-                out.push(Ok(app::GetArtifactResponse {
+                yield app::GetArtifactResponse {
                     msg: Some(app::get_artifact_response::Msg::Chunk(acc)),
-                }));
+                };
             }
-            out
         };
 
-        let full_stream = futures::stream::once(async move { Ok(metadata_frame) })
-            .chain(futures::stream::iter(chunks));
+        let full_stream =
+            futures::stream::once(async move { Ok(metadata_frame) }).chain(chunk_stream);
 
         Ok(Response::new(Box::pin(full_stream)))
     }

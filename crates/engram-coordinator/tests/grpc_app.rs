@@ -376,9 +376,12 @@ async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
     )
     .relay(outbound)
     .await
-    .expect_err("ShellRelayService stubs must still refuse (Task 21 pending)");
-    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
-    assert_eq!(err.message(), "ADR 0039 phase 2");
+    .expect_err("Relay: empty stream must return InvalidArgument (no open frame)");
+    // Task 12: Relay went live in Task 12; an empty inbound stream →
+    // InvalidArgument "relay stream ended before open frame" (the old
+    // Unimplemented stub is gone).
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert_eq!(err.message(), "relay stream ended before open frame");
 
     server.abort();
 }

@@ -176,6 +176,94 @@ pub(crate) fn cow_state_to_proto(v: &CowStateView) -> app::CowStateView {
     }
 }
 
+/// api `ConversationEntry` → proto `ConversationEntry`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `ConversationEntry` without updating this converter, the build
+/// will fail here rather than silently drop the new field.
+pub(crate) fn conversation_entry_to_proto(
+    e: crate::api::sessions_inspect::ConversationEntry,
+) -> app::ConversationEntry {
+    let crate::api::sessions_inspect::ConversationEntry {
+        idx,
+        kind,
+        at,
+        payload,
+    } = e;
+    app::ConversationEntry {
+        idx,
+        kind,
+        at: at.to_rfc3339(),
+        // `payload` is a serde_json::Value; serialize to a JSON string for the
+        // proto `payload_json` field, matching the SSE wire shape.
+        payload_json: payload.to_string(),
+    }
+}
+
+/// api `CheckpointSummary` → proto `CheckpointSummary`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `CheckpointSummary` without updating this converter, the build
+/// will fail here rather than silently drop the new field.
+pub(crate) fn checkpoint_summary_to_proto(
+    s: crate::api::sessions_inspect::CheckpointSummary,
+) -> app::CheckpointSummary {
+    let crate::api::sessions_inspect::CheckpointSummary {
+        snapshot_id,
+        created_at,
+        size_bytes,
+        events_cursor,
+        recoverable,
+        is_latest,
+    } = s;
+    app::CheckpointSummary {
+        snapshot_id,
+        created_at: created_at.to_rfc3339(),
+        size_bytes,
+        events_cursor,
+        recoverable,
+        is_latest,
+    }
+}
+
+/// api `ExecRusage` → proto `ExecRusage`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `ExecRusage` without updating this converter, the build will
+/// fail here rather than silently drop the new field.
+pub(crate) fn exec_rusage_to_proto(r: engram_core::types::ExecRusage) -> app::ExecRusage {
+    let engram_core::types::ExecRusage {
+        wall_ms,
+        peak_rss_kb,
+        user_cpu_ms,
+        sys_cpu_ms,
+    } = r;
+    app::ExecRusage {
+        wall_ms,
+        peak_rss_kb,
+        user_cpu_ms,
+        sys_cpu_ms,
+    }
+}
+
+/// api `ArtifactMeta` → proto `ArtifactMetadata`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `ArtifactMeta` without updating this converter, the build will
+/// fail here rather than silently drop the new field.
+pub(crate) fn artifact_meta_to_proto(m: crate::api::upload::ArtifactMeta) -> app::ArtifactMetadata {
+    let crate::api::upload::ArtifactMeta {
+        media_type,
+        size_bytes,
+        file_name,
+    } = m;
+    app::ArtifactMetadata {
+        media_type,
+        size_bytes: size_bytes as u64,
+        file_name,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +345,72 @@ mod tests {
         let p = list_sessions_to_proto(resp);
         assert_eq!(p.sessions.len(), 2);
         assert_eq!(p.sessions[1].owner_email.as_deref(), Some("x@y.z"));
+    }
+
+    #[test]
+    fn conversation_entry_round_trips() {
+        let now = chrono::Utc::now();
+        let entry = crate::api::sessions_inspect::ConversationEntry {
+            idx: 42,
+            kind: "status_changed".to_string(),
+            at: now,
+            payload: serde_json::json!({"status": "active"}),
+        };
+        let p = conversation_entry_to_proto(entry);
+        assert_eq!(p.idx, 42);
+        assert_eq!(p.kind, "status_changed");
+        assert_eq!(p.at, now.to_rfc3339());
+        assert!(
+            p.payload_json.contains("active"),
+            "payload_json must contain payload data"
+        );
+    }
+
+    #[test]
+    fn checkpoint_summary_round_trips() {
+        let now = chrono::Utc::now();
+        let s = crate::api::sessions_inspect::CheckpointSummary {
+            snapshot_id: "snap-abc".to_string(),
+            created_at: now,
+            size_bytes: 1024,
+            events_cursor: Some(7),
+            recoverable: true,
+            is_latest: true,
+        };
+        let p = checkpoint_summary_to_proto(s);
+        assert_eq!(p.snapshot_id, "snap-abc".to_string());
+        assert_eq!(p.created_at, now.to_rfc3339());
+        assert_eq!(p.size_bytes, 1024);
+        assert_eq!(p.events_cursor, Some(7));
+        assert!(p.recoverable);
+        assert!(p.is_latest);
+    }
+
+    #[test]
+    fn exec_rusage_round_trips() {
+        let r = engram_core::types::ExecRusage {
+            wall_ms: 150,
+            peak_rss_kb: Some(2048),
+            user_cpu_ms: Some(100),
+            sys_cpu_ms: Some(50),
+        };
+        let p = exec_rusage_to_proto(r);
+        assert_eq!(p.wall_ms, 150);
+        assert_eq!(p.peak_rss_kb, Some(2048));
+        assert_eq!(p.user_cpu_ms, Some(100));
+        assert_eq!(p.sys_cpu_ms, Some(50));
+    }
+
+    #[test]
+    fn artifact_meta_round_trips() {
+        let m = crate::api::upload::ArtifactMeta {
+            media_type: "image/png".to_string(),
+            size_bytes: 4096,
+            file_name: "abc123.png".to_string(),
+        };
+        let p = artifact_meta_to_proto(m);
+        assert_eq!(p.media_type, "image/png");
+        assert_eq!(p.size_bytes, 4096u64);
+        assert_eq!(p.file_name, "abc123.png");
     }
 }
