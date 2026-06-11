@@ -3330,6 +3330,59 @@ impl SandboxBackend for PooledBackend {
         let migration = metadata.migration_source.take();
         if let Some(mig) = &migration {
             self.migration_prestage(&metadata, mig).await?;
+            // Warm the FULL session-manifest chunk set in the
+            // background. The generic restore prefetch can't serve a
+            // migration (the v+1 manifest is unpublished by design —
+            // it 404s and falls back to on-demand), so the chain's
+            // PRIOR-version chunks were faulting in cold from GCS one
+            // at a time through the handler: the residual post-
+            // teleport crawl after the base prewarm + eager sweep
+            // (prod canary 973b2225, 11s handshake). Parse the INLINE
+            // manifest instead; the cache's parallel prefetch skips
+            // chunks the prestage already landed.
+            if let (Some(cs), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone()) {
+                match serde_json::from_slice::<engram_chunk_store::Manifest>(
+                    &mig.memory_manifest_json,
+                ) {
+                    Ok(m) => {
+                        let hashes: Vec<_> = m.chunks.iter().map(|c| c.hash).collect();
+                        tokio::spawn(tracing::Instrument::instrument(
+                            async move {
+                                let n = hashes.len();
+                                let store = cs.clone();
+                                match cache
+                                    .prefetch_chunks_parallel(
+                                        hashes,
+                                        MEMORY_PREFETCH_CONCURRENCY,
+                                        move |hash| {
+                                            let s = store.clone();
+                                            async move { s.get_chunk(hash).await }
+                                        },
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => tracing::info!(
+                                        chunks = n,
+                                        "migration inline-manifest prefetch complete (ADR 0045 C1)"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "migration inline-manifest prefetch failed; \
+                                         faults serve on-demand"
+                                    ),
+                                }
+                            },
+                            tracing::info_span!("restore.migration_prefetch_bg"),
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "inline memory manifest unparseable; skipping prefetch"
+                        );
+                    }
+                }
+            }
         }
         let memory_ref = metadata.memory_manifest;
         let row_template = migration.as_ref().map(|_| metadata.clone());
