@@ -73,17 +73,14 @@ pub struct ListRegistriesResponse {
     pub registries: Vec<RegistryCredentialSummary>,
 }
 
-pub async fn add_registry(
-    State(state): State<SharedState>,
-    Json(req): Json<AddRegistryRequest>,
-) -> Result<(StatusCode, Json<AddRegistryResponse>), ApiError> {
+/// Transport-agnostic core for AddRegistry.
+pub(crate) async fn add_registry_core(
+    state: &crate::state::SharedState,
+    req: AddRegistryRequest,
+) -> Result<AddRegistryResponse, ApiError> {
     if req.host.trim().is_empty() {
         return Err(ApiError::BadRequest("host must not be empty".into()));
     }
-
-    // Per-variant validation + variant->RegistryAuthSpec lift. The
-    // static branch seals the password; the cloud-IAM branches store
-    // no secret material so they're trivial pass-through.
     let auth = match req.auth {
         AddRegistryAuth::Static { username, password } => {
             if username.trim().is_empty() {
@@ -106,17 +103,10 @@ pub async fn add_registry(
             }
         }
         AddRegistryAuth::GcpWorkloadIdentity { impersonate_sa } => {
-            // No secret material; the host-agent's ambient GCP
-            // identity is the credential. We accept the row even
-            // though the host-agent may not actually be running on
-            // GCP — that's a pull-time error, not a configuration
-            // error, and surfacing it here would block a perfectly
-            // valid "configure now, deploy host-agent later" flow.
             RegistryAuthSpec::GcpWorkloadIdentity { impersonate_sa }
         }
         AddRegistryAuth::Anonymous => RegistryAuthSpec::Anonymous,
     };
-
     let cred = RegistryCredential {
         id: Uuid::new_v4(),
         registry_host: req.host.clone(),
@@ -129,16 +119,22 @@ pub async fn add_registry(
         .meta
         .upsert_registry_credential(cred.clone())
         .await?;
-
     let summary: RegistryCredentialSummary = cred.into();
+    Ok(AddRegistryResponse {
+        id: summary.id,
+        host: summary.registry_host,
+        auth_kind: summary.auth_kind,
+        auth_principal: summary.auth_principal,
+    })
+}
+
+pub async fn add_registry(
+    State(state): State<SharedState>,
+    Json(req): Json<AddRegistryRequest>,
+) -> Result<(StatusCode, Json<AddRegistryResponse>), ApiError> {
     Ok((
         StatusCode::CREATED,
-        Json(AddRegistryResponse {
-            id: summary.id,
-            host: summary.registry_host,
-            auth_kind: summary.auth_kind,
-            auth_principal: summary.auth_principal,
-        }),
+        Json(add_registry_core(&state, req).await?),
     ))
 }
 

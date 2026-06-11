@@ -96,11 +96,12 @@ pub(crate) fn list_sessions_to_proto(resp: ListSessionsResponse) -> app::ListSes
 /// matching the axum `#[serde(default)]`); an unknown mode is a
 /// `BadRequest`.
 ///
-/// `harness_secret_id` is read and rejected at the RPC layer (in
-/// `grpc_app/session.rs`) before this function is called — if the caller
-/// passes a non-empty value they get `Status::Unimplemented` immediately.
-/// It is NOT bound in the destructure here (the caller has already handled
-/// it); to keep the totality guard intact the proto struct is destructured
+/// `harness_secret_id` is handled at the RPC layer (in
+/// `grpc_app/session.rs`) before this function is called — the RPC
+/// handler unseals the secret and builds `identity_env` from it
+/// (ADR 0039 Task 13 wired via SecretService injection). It is NOT
+/// bound in the destructure here (the caller has already handled it);
+/// to keep the totality guard intact the proto struct is destructured
 /// exhaustively, binding `harness_secret_id: _` as the signal that the
 /// caller has taken responsibility for it.
 ///
@@ -111,13 +112,13 @@ pub(crate) fn create_request_from_proto(
     r: app::CreateSessionRequest,
 ) -> Result<CreateSessionRequest, ApiError> {
     // Totality guard: destructure ALL proto fields. `harness_secret_id` is
-    // checked and rejected by the caller (create_session RPC) before this
-    // function is reached; bind it as `_` here to acknowledge the drop.
+    // handled at the RPC layer (Task 13: wired via SecretService injection);
+    // bind it as `_` here to acknowledge the drop.
     let app::CreateSessionRequest {
         image_uri,
         mode,
         prompt,
-        harness_secret_id: _, // Checked + rejected at RPC layer (Task 13 wires it via SecretService).
+        harness_secret_id: _, // Handled at RPC layer (Task 13: SecretService harness injection).
         secrets,
     } = r;
     let mode = match mode.as_str() {
@@ -271,6 +272,308 @@ pub(crate) fn exec_rusage_to_proto(r: engram_core::types::ExecRusage) -> app::Ex
         user_cpu_ms,
         sys_cpu_ms,
     }
+}
+
+/// api `HostView` → proto `HostView`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `HostView` without updating this converter, the build will fail.
+pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostView {
+    let crate::api::hosts::HostView {
+        id,
+        hostname,
+        status,
+        capacity_total_mib,
+        capacity_used_mib,
+        running_sandboxes,
+        local_snapshots,
+        ready_images,
+        ready_image_digests,
+        util_disk_total_mib,
+        util_disk_used_mib,
+        util_mem_total_mib,
+        util_mem_used_mib,
+        util_cpu_pct,
+        last_heartbeat_at,
+    } = v;
+    app::HostView {
+        id: id.to_string(),
+        hostname: hostname.clone(),
+        status: status.to_string(),
+        capacity_total_mib: *capacity_total_mib,
+        capacity_used_mib: *capacity_used_mib,
+        running_sandboxes: *running_sandboxes,
+        local_snapshots: *local_snapshots as u64,
+        ready_images: *ready_images as u64,
+        ready_image_digests: ready_image_digests.clone(),
+        util_disk_total_mib: *util_disk_total_mib,
+        util_disk_used_mib: *util_disk_used_mib,
+        util_mem_total_mib: *util_mem_total_mib,
+        util_mem_used_mib: *util_mem_used_mib,
+        util_cpu_pct: *util_cpu_pct,
+        last_heartbeat_at: last_heartbeat_at.to_rfc3339(),
+    }
+}
+
+/// api `StorageSummaryResponse` → proto `GetStorageSummaryResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn storage_summary_to_proto(
+    r: crate::api::storage::StorageSummaryResponse,
+) -> app::GetStorageSummaryResponse {
+    let crate::api::storage::StorageSummaryResponse {
+        snapshots,
+        snapshot_bytes,
+        gc_pending,
+        tracked_sandboxes,
+        dirty_chunks,
+        unflushed_bytes,
+        avg_locality_pct,
+        rows,
+    } = r;
+    app::GetStorageSummaryResponse {
+        snapshots,
+        snapshot_bytes,
+        gc_pending,
+        tracked_sandboxes,
+        dirty_chunks,
+        unflushed_bytes,
+        avg_locality_pct,
+        rows: rows.into_iter().map(durability_row_to_proto).collect(),
+    }
+}
+
+fn durability_row_to_proto(r: crate::api::storage::DurabilityRow) -> app::DurabilityRow {
+    let crate::api::storage::DurabilityRow {
+        sandbox_id,
+        session_id,
+        host_id,
+        dirty_chunks,
+        dirty_bytes,
+        base_chunks,
+        base_chunks_local,
+        last_flush_at,
+    } = r;
+    app::DurabilityRow {
+        sandbox_id: sandbox_id.to_string(),
+        session_id: session_id.map(|s| s.to_string()),
+        host_id: host_id.to_string(),
+        dirty_chunks,
+        dirty_bytes,
+        base_chunks,
+        base_chunks_local,
+        last_flush_at: last_flush_at.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// api `FlushNowResult` → proto `FlushSessionResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn flush_now_result_to_proto(
+    r: crate::api::admin::FlushNowResult,
+) -> app::FlushSessionResponse {
+    let crate::api::admin::FlushNowResult {
+        outcome,
+        manifest_version,
+    } = r;
+    app::FlushSessionResponse {
+        outcome: match outcome {
+            crate::api::admin::FlushNowOutcome::Applied => "applied".to_string(),
+            crate::api::admin::FlushNowOutcome::Idle => "idle".to_string(),
+            crate::api::admin::FlushNowOutcome::Stale => "stale".to_string(),
+        },
+        manifest_version,
+    }
+}
+
+/// `ChunkGcSweepResult` → proto `ChunkGcResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn chunk_gc_result_to_proto(
+    r: crate::api::admin::ChunkGcSweepResult,
+) -> app::ChunkGcResponse {
+    let crate::api::admin::ChunkGcSweepResult {
+        listed_chunks,
+        malformed_keys,
+        pin_set_size,
+        candidates_marked,
+        restart_count,
+        restart_budget_exhausted,
+        promoted_deletes,
+        promote_delete_errors,
+        grace_secs,
+    } = r;
+    app::ChunkGcResponse {
+        listed_chunks: listed_chunks as u64,
+        malformed_keys: malformed_keys as u64,
+        pin_set_size: pin_set_size as u64,
+        candidates_marked: candidates_marked as u64,
+        restart_count,
+        restart_budget_exhausted,
+        promoted_deletes: promoted_deletes as u64,
+        promote_delete_errors: promote_delete_errors as u64,
+        grace_secs,
+    }
+}
+
+/// `BundleSweepReport` → proto `BundleGcResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn bundle_gc_result_to_proto(
+    r: crate::bundle_gc::BundleSweepReport,
+) -> app::BundleGcResponse {
+    let crate::bundle_gc::BundleSweepReport {
+        listed,
+        pin_set_size,
+        candidates_marked,
+        promoted_deletes,
+        promote_delete_errors,
+        restart_count,
+    } = r;
+    app::BundleGcResponse {
+        listed: listed as u64,
+        pin_set_size: pin_set_size as u64,
+        candidates_marked: candidates_marked as u64,
+        promoted_deletes: promoted_deletes as u64,
+        promote_delete_errors: promote_delete_errors as u64,
+        restart_count,
+    }
+}
+
+/// `SnapshotBlobSweepReport` → proto `SnapshotBlobGcResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn snapshot_blob_gc_result_to_proto(
+    r: crate::snapshot_blob_gc::SnapshotBlobSweepReport,
+) -> app::SnapshotBlobGcResponse {
+    let crate::snapshot_blob_gc::SnapshotBlobSweepReport {
+        listed,
+        malformed,
+        pin_set_size,
+        candidates_marked,
+        promoted_deletes,
+        promote_repinned_skips,
+        promote_delete_errors,
+        restart_count,
+    } = r;
+    app::SnapshotBlobGcResponse {
+        listed: listed as u64,
+        malformed: malformed as u64,
+        pin_set_size: pin_set_size as u64,
+        candidates_marked: candidates_marked as u64,
+        promoted_deletes: promoted_deletes as u64,
+        promote_repinned_skips: promote_repinned_skips as u64,
+        promote_delete_errors: promote_delete_errors as u64,
+        restart_count,
+    }
+}
+
+/// `EnabledImageSummary` → proto `EnabledImageSummary`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn enabled_image_summary_to_proto(
+    s: &engram_core::types::EnabledImageSummary,
+) -> app::EnabledImageSummary {
+    let engram_core::types::EnabledImageSummary {
+        id,
+        image_uri,
+        manifest_digest,
+        manifest_name,
+        manifest_description,
+        harness_name,
+        last_refreshed_at,
+        created_at,
+    } = s;
+    app::EnabledImageSummary {
+        id: id.to_string(),
+        image_uri: image_uri.clone(),
+        manifest_digest: manifest_digest.clone(),
+        manifest_name: manifest_name.clone(),
+        manifest_description: manifest_description.clone(),
+        harness_name: harness_name.clone(),
+        last_refreshed_at: last_refreshed_at.to_rfc3339(),
+        created_at: created_at.to_rfc3339(),
+    }
+}
+
+/// `EnableJob` → proto `EnableJob`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::EnableJob {
+    let engram_core::types::EnableJob {
+        id,
+        image_uri,
+        manifest_digest,
+        state,
+        chunks_total,
+        chunks_done,
+        attempts,
+        error,
+        created_at,
+        updated_at,
+    } = j;
+    app::EnableJob {
+        id: id.to_string(),
+        image_uri: image_uri.clone(),
+        manifest_digest: manifest_digest.clone(),
+        state: state.as_str().to_string(),
+        chunks_total: *chunks_total,
+        chunks_done: *chunks_done,
+        attempts: *attempts,
+        error: error.clone(),
+        created_at: created_at.to_rfc3339(),
+        updated_at: updated_at.to_rfc3339(),
+    }
+}
+
+/// `RegistryCredentialSummary` → proto `RegistryCredentialSummary`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn registry_credential_summary_to_proto(
+    s: &engram_core::types::RegistryCredentialSummary,
+) -> app::RegistryCredentialSummary {
+    let engram_core::types::RegistryCredentialSummary {
+        id,
+        registry_host,
+        auth_kind,
+        auth_principal,
+        created_at,
+        updated_at,
+    } = s;
+    app::RegistryCredentialSummary {
+        id: id.to_string(),
+        registry_host: registry_host.clone(),
+        auth_kind: auth_kind.clone(),
+        auth_principal: auth_principal.clone(),
+        created_at: created_at.to_rfc3339(),
+        updated_at: updated_at.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// proto `AddRegistryRequest` → api `AddRegistryRequest`.
+/// The `oneof auth` is mapped exhaustively to the serde-tagged `AddRegistryAuth` enum.
+pub(crate) fn add_registry_request_from_proto(
+    r: app::AddRegistryRequest,
+) -> Result<crate::api::registries::AddRegistryRequest, crate::error::ApiError> {
+    use app::add_registry_request::Auth;
+    let app::AddRegistryRequest { host, auth } = r;
+    let auth = match auth {
+        Some(Auth::Static(s)) => {
+            let app::StaticRegistryAuth { username, password } = s;
+            crate::api::registries::AddRegistryAuth::Static { username, password }
+        }
+        Some(Auth::GcpWorkloadIdentity(g)) => {
+            let app::GcpWorkloadIdentityRegistryAuth { impersonate_sa } = g;
+            crate::api::registries::AddRegistryAuth::GcpWorkloadIdentity { impersonate_sa }
+        }
+        Some(Auth::Anonymous(_a)) => crate::api::registries::AddRegistryAuth::Anonymous,
+        None => {
+            return Err(crate::error::ApiError::BadRequest(
+                "AddRegistryRequest.auth is required (oneof unset)".into(),
+            ))
+        }
+    };
+    Ok(crate::api::registries::AddRegistryRequest { host, auth })
 }
 
 /// api `ArtifactMeta` → proto `ArtifactMetadata`.

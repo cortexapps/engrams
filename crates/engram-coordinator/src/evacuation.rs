@@ -849,6 +849,28 @@ mod tests {
         async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
             unreachable!()
         }
+        async fn put_sealed_secret(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: Vec<u8>,
+            _: Vec<u8>,
+            _: String,
+        ) -> Result<(), MetaError> {
+            unimplemented!()
+        }
+        async fn has_sealed_secret(&self, _: &str) -> Result<bool, MetaError> {
+            unimplemented!()
+        }
+        async fn get_sealed_secret(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::traits::SealedSecretRow>, MetaError> {
+            unimplemented!()
+        }
+        async fn delete_sealed_secret(&self, _: &str) -> Result<(), MetaError> {
+            unimplemented!()
+        }
     }
 
     fn make_session(host: HostId, sandbox: SandboxId, status: SessionState) -> Session {

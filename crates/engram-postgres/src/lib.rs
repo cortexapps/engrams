@@ -2323,6 +2323,81 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    // ---- sealed secrets (ADR 0039 Task 13) ----
+
+    async fn put_sealed_secret(
+        &self,
+        key: &str,
+        wrapped_dek: Vec<u8>,
+        nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+        key_id: String,
+    ) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO sealed_secrets
+                (key, wrapped_dek, nonce, ciphertext, key_id, created_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            ON CONFLICT (key) DO UPDATE SET
+                wrapped_dek = EXCLUDED.wrapped_dek,
+                nonce       = EXCLUDED.nonce,
+                ciphertext  = EXCLUDED.ciphertext,
+                key_id      = EXCLUDED.key_id,
+                updated_at  = NOW()
+            "#,
+        )
+        .bind(key)
+        .bind(&wrapped_dek)
+        .bind(&nonce)
+        .bind(&ciphertext)
+        .bind(&key_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn has_sealed_secret(&self, key: &str) -> Result<bool, MetaError> {
+        let row = sqlx::query("SELECT 1 FROM sealed_secrets WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.is_some())
+    }
+
+    async fn get_sealed_secret(
+        &self,
+        key: &str,
+    ) -> Result<Option<engram_core::traits::SealedSecretRow>, MetaError> {
+        let row = sqlx::query(
+            "SELECT key, wrapped_dek, nonce, ciphertext, key_id FROM sealed_secrets WHERE key = $1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| {
+            Ok(engram_core::traits::SealedSecretRow {
+                key: r.try_get::<String, _>("key").map_err(db_err)?,
+                wrapped_dek: r.try_get::<Vec<u8>, _>("wrapped_dek").map_err(db_err)?,
+                nonce: r.try_get::<Vec<u8>, _>("nonce").map_err(db_err)?,
+                ciphertext: r.try_get::<Vec<u8>, _>("ciphertext").map_err(db_err)?,
+                key_id: r.try_get::<String, _>("key_id").map_err(db_err)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn delete_sealed_secret(&self, key: &str) -> Result<(), MetaError> {
+        sqlx::query("DELETE FROM sealed_secrets WHERE key = $1")
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — session_lease leasing row.
     // ----------------------------------------------------------------

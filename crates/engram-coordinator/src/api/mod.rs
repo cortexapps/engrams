@@ -4,7 +4,7 @@ use axum::Router;
 
 use crate::state::SharedState;
 
-mod admin;
+pub(crate) mod admin;
 pub mod auth;
 pub(crate) mod enabled_images;
 pub(crate) mod events;
@@ -15,11 +15,11 @@ pub(crate) mod forge;
 // baked at image-bake time).
 mod health;
 mod host_http;
-mod hosts;
+pub(crate) mod hosts;
 pub(crate) mod interrupt;
 pub mod principal;
 pub(crate) mod prompt;
-mod registries;
+pub(crate) mod registries;
 pub(crate) mod session_auth;
 // `pub(crate)`: `evacuation::resolve_cold_boot_spec` (ADR 0028 Fix B)
 // reuses `cold_boot_spec` / the resource helpers from outside `api`.
@@ -27,7 +27,7 @@ pub(crate) mod sessions;
 pub(crate) mod sessions_inspect;
 mod shell;
 pub mod snapshot;
-mod storage;
+pub(crate) mod storage;
 pub(crate) mod upload;
 
 pub fn router(state: SharedState) -> Router {

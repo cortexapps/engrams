@@ -71,9 +71,10 @@ pub struct StorageSummaryResponse {
     pub rows: Vec<DurabilityRow>,
 }
 
-pub async fn summary(
-    State(state): State<SharedState>,
-) -> Result<Json<StorageSummaryResponse>, ApiError> {
+/// Transport-agnostic core for GetStorageSummary.
+pub(crate) async fn storage_summary_core(
+    state: &crate::state::SharedState,
+) -> Result<StorageSummaryResponse, ApiError> {
     let hosts = state.services.meta.list_active_hosts().await?;
 
     let mut rows: Vec<DurabilityRow> = Vec::new();
@@ -139,7 +140,7 @@ pub async fn summary(
     let totals = state.services.meta.snapshot_totals().await?;
     let gc_pending = state.services.meta.count_gc_candidates().await?;
 
-    Ok(Json(StorageSummaryResponse {
+    Ok(StorageSummaryResponse {
         snapshots: totals.count,
         snapshot_bytes: totals.total_bytes,
         gc_pending,
@@ -148,5 +149,11 @@ pub async fn summary(
         unflushed_bytes,
         avg_locality_pct,
         rows,
-    }))
+    })
+}
+
+pub async fn summary(
+    State(state): State<SharedState>,
+) -> Result<Json<StorageSummaryResponse>, ApiError> {
+    Ok(Json(storage_summary_core(&state).await?))
 }

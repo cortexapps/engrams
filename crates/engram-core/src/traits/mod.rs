@@ -26,8 +26,8 @@ pub use cloud::{CloudBackend, PreemptionStream};
 pub use git::{ForgeKind, GitForge, PullRequest, PullRequestSpec, RepoRef, ScopedToken};
 pub use host_client::HostClient;
 pub use metadata::{
-    DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, SnapshotTotals, StaleSessionLease,
-    UpdateOutcome,
+    DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, SealedSecretRow, SnapshotTotals,
+    StaleSessionLease, UpdateOutcome,
 };
 pub use sandbox::{
     ForgeSink, HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend, UploadSink,

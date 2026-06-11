@@ -12,7 +12,11 @@
 
 pub mod auth;
 mod convert;
+mod fleet;
+mod image;
+mod secret;
 mod session;
+mod session_impl;
 mod shell_relay;
 
 use std::pin::Pin;
@@ -20,8 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_protocol::app;
-use tonic::{Request, Response, Status};
+use tonic::Status;
 
+pub use fleet::AppFleetService;
+pub use image::AppImageService;
+pub use secret::AppSecretService;
 pub use session::AppSessionService;
 pub use shell_relay::AppShellRelayService;
 
@@ -32,8 +39,6 @@ use crate::state::SharedState;
 /// streams arrive with the real implementations (Tasks 11-12); the
 /// stubs only need the associated types to satisfy the traits.
 pub(crate) type BoxStream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
-
-pub(crate) const UNIMPLEMENTED: &str = "ADR 0039 phase 2";
 
 /// Parse a wire session id (a UUID string) into a [`SessionId`], mapping a
 /// malformed id to `INVALID_ARGUMENT` rather than an opaque 500. Shared by
@@ -141,244 +146,6 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
         .add_service(app::secret_service_server::SecretServiceServer::new(
             AppSecretService { state, auth },
         ))
-}
-
-pub struct AppFleetService {
-    #[allow(dead_code)]
-    pub state: SharedState,
-    pub auth: Arc<auth::BearerAuth>,
-}
-
-// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
-#[tonic::async_trait]
-impl app::fleet_service_server::FleetService for AppFleetService {
-    async fn list_hosts(
-        &self,
-        req: Request<app::ListHostsRequest>,
-    ) -> Result<Response<app::ListHostsResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn get_host(
-        &self,
-        req: Request<app::GetHostRequest>,
-    ) -> Result<Response<app::GetHostResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn get_host_cow_state(
-        &self,
-        req: Request<app::GetHostCowStateRequest>,
-    ) -> Result<Response<app::GetHostCowStateResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn drain_host(
-        &self,
-        req: Request<app::DrainHostRequest>,
-    ) -> Result<Response<app::DrainHostResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn admin_drain_host(
-        &self,
-        req: Request<app::AdminDrainHostRequest>,
-    ) -> Result<Response<app::AdminDrainHostResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn cordon_host(
-        &self,
-        req: Request<app::CordonHostRequest>,
-    ) -> Result<Response<app::CordonHostResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn uncordon_host(
-        &self,
-        req: Request<app::UncordonHostRequest>,
-    ) -> Result<Response<app::UncordonHostResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn get_storage_summary(
-        &self,
-        req: Request<app::GetStorageSummaryRequest>,
-    ) -> Result<Response<app::GetStorageSummaryResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn flush_session(
-        &self,
-        req: Request<app::FlushSessionRequest>,
-    ) -> Result<Response<app::FlushSessionResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn evacuate_session(
-        &self,
-        req: Request<app::EvacuateSessionRequest>,
-    ) -> Result<Response<app::EvacuateSessionResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn chunk_gc(
-        &self,
-        req: Request<app::ChunkGcRequest>,
-    ) -> Result<Response<app::ChunkGcResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn bundle_gc(
-        &self,
-        req: Request<app::BundleGcRequest>,
-    ) -> Result<Response<app::BundleGcResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn snapshot_blob_gc(
-        &self,
-        req: Request<app::SnapshotBlobGcRequest>,
-    ) -> Result<Response<app::SnapshotBlobGcResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-}
-
-pub struct AppImageService {
-    #[allow(dead_code)]
-    pub state: SharedState,
-    pub auth: Arc<auth::BearerAuth>,
-}
-
-// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
-#[tonic::async_trait]
-impl app::image_service_server::ImageService for AppImageService {
-    async fn list_enabled_images(
-        &self,
-        req: Request<app::ListEnabledImagesRequest>,
-    ) -> Result<Response<app::ListEnabledImagesResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn enable_image(
-        &self,
-        req: Request<app::EnableImageRequest>,
-    ) -> Result<Response<app::EnableImageResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn disable_image(
-        &self,
-        req: Request<app::DisableImageRequest>,
-    ) -> Result<Response<app::DisableImageResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn refresh_image(
-        &self,
-        req: Request<app::RefreshImageRequest>,
-    ) -> Result<Response<app::RefreshImageResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn list_enable_jobs(
-        &self,
-        req: Request<app::ListEnableJobsRequest>,
-    ) -> Result<Response<app::ListEnableJobsResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn get_enable_job(
-        &self,
-        req: Request<app::GetEnableJobRequest>,
-    ) -> Result<Response<app::GetEnableJobResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn retry_enable_job(
-        &self,
-        req: Request<app::RetryEnableJobRequest>,
-    ) -> Result<Response<app::RetryEnableJobResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn list_registries(
-        &self,
-        req: Request<app::ListRegistriesRequest>,
-    ) -> Result<Response<app::ListRegistriesResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn add_registry(
-        &self,
-        req: Request<app::AddRegistryRequest>,
-    ) -> Result<Response<app::AddRegistryResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn delete_registry(
-        &self,
-        req: Request<app::DeleteRegistryRequest>,
-    ) -> Result<Response<app::DeleteRegistryResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-}
-
-pub struct AppSecretService {
-    #[allow(dead_code)]
-    pub state: SharedState,
-    pub auth: Arc<auth::BearerAuth>,
-}
-
-// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
-#[tonic::async_trait]
-impl app::secret_service_server::SecretService for AppSecretService {
-    async fn put_secret(
-        &self,
-        req: Request<app::PutSecretRequest>,
-    ) -> Result<Response<app::PutSecretResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn has_secret(
-        &self,
-        req: Request<app::HasSecretRequest>,
-    ) -> Result<Response<app::HasSecretResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn delete_secret(
-        &self,
-        req: Request<app::DeleteSecretRequest>,
-    ) -> Result<Response<app::DeleteSecretResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
 }
 
 #[cfg(test)]
@@ -495,6 +262,9 @@ mod convention {
         ("mod.rs", include_str!("mod.rs")),
         ("session.rs", include_str!("session.rs")),
         ("shell_relay.rs", include_str!("shell_relay.rs")),
+        ("fleet.rs", include_str!("fleet.rs")),
+        ("image.rs", include_str!("image.rs")),
+        ("secret.rs", include_str!("secret.rs")),
     ];
 
     /// The auth line that must open every RPC body. The trailing `;` is

@@ -272,6 +272,43 @@ pub enum FlushNowOutcome {
     Stale,
 }
 
+/// Transport-agnostic core for FlushSession (POST /admin/sessions/:id/flush-now).
+pub(crate) async fn flush_now_core(
+    state: &crate::state::SharedState,
+    session_id: engram_core::SessionId,
+) -> Result<FlushNowResult, crate::error::ApiError> {
+    let session = state.services.meta.get_session(session_id).await?;
+    let Some(sandbox_id) = session.sandbox_id else {
+        return Err(crate::error::ApiError::Conflict(format!(
+            "session {session_id} has no bound sandbox (status={})",
+            session.status.as_str(),
+        )));
+    };
+    let host_client = state.services.host.clone();
+    let flush_outcome = host_client.flush_sandbox(sandbox_id).await?;
+    let Some(manifest_ref) = flush_outcome else {
+        return Ok(FlushNowResult {
+            outcome: FlushNowOutcome::Idle,
+            manifest_version: None,
+        });
+    };
+    match state
+        .services
+        .meta
+        .update_live_disk_manifest(session_id, sandbox_id, manifest_ref)
+        .await?
+    {
+        engram_core::traits::UpdateOutcome::Applied => Ok(FlushNowResult {
+            outcome: FlushNowOutcome::Applied,
+            manifest_version: Some(manifest_ref.version),
+        }),
+        engram_core::traits::UpdateOutcome::DroppedStale => Ok(FlushNowResult {
+            outcome: FlushNowOutcome::Stale,
+            manifest_version: None,
+        }),
+    }
+}
+
 /// `POST /api/admin/sessions/:id/flush-now` — explicit trigger for
 /// the FlushScheduler primitive (ADR 0016 Phase B). Forces an
 /// immediate flush on the session's bound sandbox + writes the new
@@ -292,61 +329,7 @@ pub async fn flush_now(
     State(state): State<SharedState>,
     Path(session_id): Path<SessionId>,
 ) -> Result<Json<FlushNowResult>, ApiError> {
-    // Look up the session's bound sandbox. NotFound on the session
-    // row bubbles as 404; bound=None is a domain-level conflict.
-    let session = state.services.meta.get_session(session_id).await?;
-    let Some(sandbox_id) = session.sandbox_id else {
-        return Err(ApiError::Conflict(format!(
-            "session {session_id} has no bound sandbox (status={})",
-            session.status.as_str(),
-        )));
-    };
-    // Dispatch to the host that owns this sandbox.
-    let host_client = state.services.host.clone();
-    let flush_outcome = host_client.flush_sandbox(sandbox_id).await?;
-    let Some(manifest_ref) = flush_outcome else {
-        return Ok(Json(FlushNowResult {
-            outcome: FlushNowOutcome::Idle,
-            manifest_version: None,
-        }));
-    };
-    // Funnel directly into the same MetadataStore method the
-    // publisher's drain task uses. The sandbox_id guard inside the
-    // UPDATE catches the (rare) destroy-or-rebind race; coord just
-    // surfaces the outcome to the caller.
-    match state
-        .services
-        .meta
-        .update_live_disk_manifest(session_id, sandbox_id, manifest_ref)
-        .await?
-    {
-        engram_core::traits::UpdateOutcome::Applied => {
-            tracing::info!(
-                %session_id,
-                %sandbox_id,
-                manifest_id = %manifest_ref.manifest_id,
-                manifest_version = manifest_ref.version,
-                "admin flush_now: applied",
-            );
-            Ok(Json(FlushNowResult {
-                outcome: FlushNowOutcome::Applied,
-                manifest_version: Some(manifest_ref.version),
-            }))
-        }
-        engram_core::traits::UpdateOutcome::DroppedStale => {
-            tracing::warn!(
-                %session_id,
-                %sandbox_id,
-                manifest_id = %manifest_ref.manifest_id,
-                manifest_version = manifest_ref.version,
-                "admin flush_now: stale (sandbox_id mismatch on UPDATE)",
-            );
-            Ok(Json(FlushNowResult {
-                outcome: FlushNowOutcome::Stale,
-                manifest_version: None,
-            }))
-        }
-    }
+    Ok(Json(flush_now_core(&state, session_id).await?))
 }
 
 // ---------------------------------------------------------------------
@@ -398,18 +381,11 @@ pub struct EvacuateSessionResponse {
     pub status: &'static str,
 }
 
-/// `POST /api/admin/sessions/:id/evacuate` — mark the session
-/// `Evacuating`. Pre: Active session with a bound sandbox. Post: the
-/// source sandbox is paused, flushed, snapshotted, and destroyed;
-/// PG row is at `Evacuating`; `evac_resumer` will resume on a peer.
-///
-/// Returns 202 Accepted; the scanner is the actual deliverable. Use
-/// the session events stream to observe the resume completing.
-pub async fn evacuate_session(
-    State(state): State<SharedState>,
-    Path(session_id): Path<SessionId>,
-    Json(_req): Json<EvacuateSessionRequest>,
-) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
+/// Transport-agnostic core for EvacuateSession (POST /admin/sessions/:id/evacuate).
+pub(crate) async fn evacuate_session_core(
+    state: &crate::state::SharedState,
+    session_id: engram_core::SessionId,
+) -> Result<EvacuateSessionResponse, crate::error::ApiError> {
     let session = state.services.meta.get_session(session_id).await?;
     if !matches!(session.status, engram_core::types::SessionState::Active) {
         return Err(ApiError::Conflict(format!(
@@ -422,36 +398,112 @@ pub async fn evacuate_session(
             "session {session_id} has no bound sandbox",
         )));
     };
-
-    // Fire the shared eviction pipeline with `target_state =
-    // Evacuating`. Same pause → flush → memory-snapshot → destroy →
-    // PG transition the legacy `evict_idle_session` uses for Idle
-    // suspends — the *only* difference is the terminal state, so
-    // both flows inherit the same recoverability invariants (snapshot
-    // durable in BlobStorage before destroy, PG state flips before
-    // host-side destroy).
     crate::idle_evictor::evict_session_to_state(
-        &state,
+        state,
         session_id,
         sandbox_id,
         engram_core::types::SessionState::Evacuating,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("evac pipeline: {e}")))?;
+    Ok(EvacuateSessionResponse {
+        session_id,
+        status: "evacuating",
+    })
+}
 
+/// `POST /api/admin/sessions/:id/evacuate` — mark the session
+/// `Evacuating`. Pre: Active session with a bound sandbox. Post: the
+/// source sandbox is paused, flushed, snapshotted, and destroyed;
+/// PG row is at `Evacuating`; `evac_resumer` will resume on a peer.
+///
+/// Returns 202 Accepted; the scanner is the actual deliverable. Use
+/// the session events stream to observe the resume completing.
+pub async fn evacuate_session(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+    Json(_req): Json<EvacuateSessionRequest>,
+) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
     tracing::info!(
         %session_id,
-        %sandbox_id,
         "admin evacuate: session marked Evacuating; scanner will resume on peer",
     );
-
     Ok((
         StatusCode::ACCEPTED,
-        Json(EvacuateSessionResponse {
-            session_id,
-            status: "evacuating",
-        }),
+        Json(evacuate_session_core(&state, session_id).await?),
     ))
+}
+
+/// Transport-agnostic core for ChunkGc.
+pub(crate) async fn chunk_gc_core(
+    state: &crate::state::SharedState,
+    dry_run: bool,
+    grace_secs: Option<u64>,
+) -> Result<ChunkGcSweepResult, crate::error::ApiError> {
+    let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
+    if let Some(secs) = grace_secs {
+        cfg.grace_period = std::time::Duration::from_secs(secs);
+    }
+    let grace_secs_used = cfg.grace_period.as_secs();
+    let mode = if dry_run {
+        crate::chunk_gc::SweepMode::DryRun
+    } else {
+        crate::chunk_gc::SweepMode::Full
+    };
+    let report = crate::chunk_gc::run_one_sweep(state, &cfg, mode)
+        .await
+        .map_err(|e| crate::error::ApiError::Internal(format!("chunk-gc: {e}")))?;
+    Ok((report, grace_secs_used).into())
+}
+
+/// Transport-agnostic core for BundleGc.
+pub(crate) async fn bundle_gc_core(
+    state: &crate::state::SharedState,
+    dry_run: bool,
+    grace_secs: Option<u64>,
+) -> Result<crate::bundle_gc::BundleSweepReport, crate::error::ApiError> {
+    let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
+    if let Some(secs) = grace_secs {
+        cfg.grace_period = std::time::Duration::from_secs(secs);
+    }
+    let mode = if dry_run {
+        crate::chunk_gc::SweepMode::DryRun
+    } else {
+        crate::chunk_gc::SweepMode::Full
+    };
+    crate::bundle_gc::run_one_bundle_sweep(
+        state.services.meta.clone(),
+        state.services.blob.clone(),
+        &cfg,
+        mode,
+    )
+    .await
+    .map_err(|e| crate::error::ApiError::Internal(format!("bundle-gc: {e}")))
+}
+
+/// Transport-agnostic core for SnapshotBlobGc.
+pub(crate) async fn snapshot_blob_gc_core(
+    state: &crate::state::SharedState,
+    dry_run: bool,
+    grace_secs: Option<u64>,
+) -> Result<crate::snapshot_blob_gc::SnapshotBlobSweepReport, crate::error::ApiError> {
+    let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
+    if let Some(secs) = grace_secs {
+        cfg.grace_period = std::time::Duration::from_secs(secs);
+    }
+    let mode = if dry_run {
+        crate::chunk_gc::SweepMode::DryRun
+    } else {
+        crate::chunk_gc::SweepMode::Full
+    };
+    crate::snapshot_blob_gc::run_one_snapshot_blob_sweep(
+        state.services.meta.clone(),
+        state.services.blob.clone(),
+        &cfg,
+        mode,
+    )
+    .await
+    .map_err(|e| crate::error::ApiError::Internal(format!("snapshot-blob-gc: {e}")))
 }
 
 #[derive(serde::Deserialize)]

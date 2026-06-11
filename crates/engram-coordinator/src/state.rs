@@ -1243,6 +1243,28 @@ pub(crate) mod tests {
         async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
             Ok(())
         }
+        async fn put_sealed_secret(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: Vec<u8>,
+            _: Vec<u8>,
+            _: String,
+        ) -> Result<(), MetaError> {
+            unimplemented!()
+        }
+        async fn has_sealed_secret(&self, _: &str) -> Result<bool, MetaError> {
+            unimplemented!()
+        }
+        async fn get_sealed_secret(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::traits::SealedSecretRow>, MetaError> {
+            unimplemented!()
+        }
+        async fn delete_sealed_secret(&self, _: &str) -> Result<(), MetaError> {
+            unimplemented!()
+        }
 
         // ADR 0016 §A.1.5c: in-memory mirror of the
         // `session_lease` PG table so the trait's lease

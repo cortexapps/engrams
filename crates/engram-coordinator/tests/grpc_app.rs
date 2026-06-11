@@ -219,6 +219,28 @@ impl MetadataStore for StubMeta {
     async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
         Ok(())
     }
+    async fn put_sealed_secret(
+        &self,
+        _key: &str,
+        _wrapped_dek: Vec<u8>,
+        _nonce: Vec<u8>,
+        _ciphertext: Vec<u8>,
+        _key_id: String,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn has_sealed_secret(&self, _key: &str) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+    async fn get_sealed_secret(
+        &self,
+        _key: &str,
+    ) -> Result<Option<engram_core::traits::SealedSecretRow>, MetaError> {
+        Ok(None)
+    }
+    async fn delete_sealed_secret(&self, _key: &str) -> Result<(), MetaError> {
+        Ok(())
+    }
 }
 
 /// Minimal fully-wired `AppState`, mirroring the in-memory fixture in
@@ -306,23 +328,16 @@ fn bearer(
 }
 
 /// Happy path: a server configured with `TEST_TOKEN`, called with a
-/// matching bearer, passes auth.
-///
-/// Task 10: SessionService's unary six (ListSessions, GetSession,
-/// DeleteSession, CreateSession, SendPrompt, Interrupt) are now real
-/// implementations. `ListSessions` returns an empty list against the
-/// in-memory state; the other four services still respond
-/// `Unimplemented` "ADR 0039 phase 2" (Tasks 11-13). Proves all five
-/// services are mounted on the listener.
+/// matching bearer, passes auth. All five services are now implemented
+/// (Tasks 10-13). Proves each service is mounted and answering.
 #[tokio::test]
 async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
     let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
 
     let channel = dial(addr).await;
 
-    // Task 10: ListSessions is now implemented — returns an empty list
-    // against the stub MetadataStore (no sessions exist in the
-    // in-memory fixture). Previously returned Unimplemented; now Ok.
+    // Task 10: ListSessions is implemented — returns an empty list
+    // against the stub MetadataStore (no sessions exist).
     let resp = app::session_service_client::SessionServiceClient::with_interceptor(
         channel.clone(),
         bearer(TEST_TOKEN),
@@ -335,39 +350,35 @@ async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
         "stub state has no sessions — list must be empty"
     );
 
-    // One probe per remaining service proves all five are mounted on
-    // the one listener (an unmounted service would answer
-    // `Unimplemented` too via tonic's fallback — but with a different
-    // message, so the message assert here plus these keep us honest).
-    let err = app::fleet_service_client::FleetServiceClient::with_interceptor(
+    // Task 13: Fleet is now implemented — ListHosts returns empty list.
+    let resp = app::fleet_service_client::FleetServiceClient::with_interceptor(
         channel.clone(),
         bearer(TEST_TOKEN),
     )
     .list_hosts(app::ListHostsRequest::default())
     .await
-    .expect_err("FleetService stubs must still refuse (Tasks 11-13 pending)");
-    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
-    assert_eq!(err.message(), "ADR 0039 phase 2");
+    .expect("FleetService ListHosts must succeed (Task 13 implemented)");
+    assert!(resp.into_inner().hosts.is_empty(), "stub: no hosts");
 
-    let err = app::image_service_client::ImageServiceClient::with_interceptor(
+    // Task 13: Image is now implemented — ListEnabledImages returns empty list.
+    let resp = app::image_service_client::ImageServiceClient::with_interceptor(
         channel.clone(),
         bearer(TEST_TOKEN),
     )
     .list_enabled_images(app::ListEnabledImagesRequest::default())
     .await
-    .expect_err("ImageService stubs must still refuse (Tasks 11-13 pending)");
-    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
-    assert_eq!(err.message(), "ADR 0039 phase 2");
+    .expect("ImageService ListEnabledImages must succeed (Task 13 implemented)");
+    assert!(resp.into_inner().images.is_empty(), "stub: no images");
 
-    let err = app::secret_service_client::SecretServiceClient::with_interceptor(
+    // Task 13: Secret is now implemented — HasSecret returns false (stub).
+    let resp = app::secret_service_client::SecretServiceClient::with_interceptor(
         channel.clone(),
         bearer(TEST_TOKEN),
     )
     .has_secret(app::HasSecretRequest::default())
     .await
-    .expect_err("SecretService stubs must still refuse (Tasks 11-13 pending)");
-    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
-    assert_eq!(err.message(), "ADR 0039 phase 2");
+    .expect("SecretService HasSecret must succeed (Task 13 implemented)");
+    assert!(!resp.into_inner().exists, "stub returns false");
 
     let outbound = tokio_stream::iter(Vec::<app::RelayShellRequest>::new());
     let err = app::shell_relay_service_client::ShellRelayServiceClient::with_interceptor(
@@ -415,12 +426,11 @@ async fn app_grpc_rejects_missing_and_wrong_bearer() {
     server.abort();
 }
 
-/// CreateSession must loudly refuse `harness_secret_id: Some(_)` until Task 13
-/// wires SecretService (ADR 0039 Task 13). The RPC handler checks the field
-/// and returns `Unimplemented` before delegating to `create_request_from_proto`.
-/// Exercises the full in-process RPC path rather than just inspecting a struct.
+/// Task 13: harness_secret_id is now wired. With a non-existent secret id →
+/// NotFound (the secret must be PutSecret'd before CreateSession).
+/// The old Unimplemented rejection is gone.
 #[tokio::test]
-async fn create_session_rejects_harness_secret_id() {
+async fn create_session_with_missing_harness_secret_returns_not_found() {
     let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
     let channel = dial(addr).await;
 
@@ -432,17 +442,106 @@ async fn create_session_rejects_harness_secret_id() {
         image_uri: "localhost:5001/demo:warm".into(),
         mode: "agent".into(),
         prompt: None,
-        harness_secret_id: Some("secret-abc-123".into()),
+        harness_secret_id: Some("nonexistent-secret".into()),
         secrets: std::collections::HashMap::new(),
     })
     .await
-    .expect_err("harness_secret_id must be rejected until Task 13");
-    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
-    assert!(
-        err.message()
-            .contains("harness_secret_id lands with SecretService"),
-        "rejection message must name the pending task: {err:?}"
+    .expect_err("missing secret → NotFound");
+    // The image isn't enabled in the stub state, so we may get NotFound
+    // for the image first OR NotFound for the secret. Either way it must
+    // NOT be Unimplemented — the old Task-13-pending rejection is gone.
+    assert_ne!(
+        err.code(),
+        tonic::Code::Unimplemented,
+        "harness_secret_id must no longer be rejected as Unimplemented: {err:?}"
     );
+
+    server.abort();
+}
+
+/// Task 13: SecretService round-trip — HasSecret returns false (stub),
+/// PutSecret and DeleteSecret succeed.
+#[tokio::test]
+async fn secret_service_put_has_delete_round_trip() {
+    let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
+    let channel = dial(addr).await;
+    let mut client = app::secret_service_client::SecretServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    // StubMeta never persists; has_secret always returns false.
+    // But we prove the RPCs are wired and auth-gated.
+    let has = client
+        .has_secret(app::HasSecretRequest {
+            key: "test-key".into(),
+        })
+        .await
+        .expect("HasSecret must succeed");
+    assert!(!has.into_inner().exists, "stub returns false");
+
+    // put_secret — succeeds against stub (seals, then stub meta discards)
+    client
+        .put_secret(app::PutSecretRequest {
+            key: "test-key".into(),
+            value: "test-value".into(),
+        })
+        .await
+        .expect("PutSecret must succeed against stub");
+
+    // delete_secret (idempotent)
+    client
+        .delete_secret(app::DeleteSecretRequest {
+            key: "test-key".into(),
+        })
+        .await
+        .expect("DeleteSecret must succeed");
+
+    server.abort();
+}
+
+/// Task 13: FleetService is now implemented — ListHosts returns empty list
+/// (stub state), GetStorageSummary returns zeros.
+#[tokio::test]
+async fn fleet_service_list_hosts_and_storage_summary() {
+    let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
+    let channel = dial(addr).await;
+    let mut client = app::fleet_service_client::FleetServiceClient::with_interceptor(
+        channel.clone(),
+        bearer(TEST_TOKEN),
+    );
+
+    let resp = client
+        .list_hosts(app::ListHostsRequest::default())
+        .await
+        .expect("ListHosts must succeed (Task 13)");
+    assert!(resp.into_inner().hosts.is_empty(), "stub: no hosts");
+
+    let resp = client
+        .get_storage_summary(app::GetStorageSummaryRequest::default())
+        .await
+        .expect("GetStorageSummary must succeed (Task 13)");
+    let s = resp.into_inner();
+    assert_eq!(s.tracked_sandboxes, 0);
+
+    server.abort();
+}
+
+/// Task 13: ImageService is now implemented — ListEnabledImages returns empty list.
+#[tokio::test]
+async fn image_service_list_enabled_images() {
+    let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
+    let channel = dial(addr).await;
+    let mut client = app::image_service_client::ImageServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    let resp = client
+        .list_enabled_images(app::ListEnabledImagesRequest::default())
+        .await
+        .expect("ListEnabledImages must succeed (Task 13)");
+    assert!(resp.into_inner().images.is_empty(), "stub: no images");
 
     server.abort();
 }

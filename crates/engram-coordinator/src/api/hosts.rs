@@ -196,7 +196,7 @@ pub struct HostView {
 }
 
 impl HostView {
-    fn from_row_and_live(
+    pub(crate) fn from_row_and_live(
         row: engram_core::types::HostRecord,
         live: Option<crate::host_registry::HostState>,
     ) -> Self {
