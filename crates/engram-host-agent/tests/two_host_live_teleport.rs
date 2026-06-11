@@ -479,7 +479,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         .disk_manifest
         .expect("ext4 bake produces a chunked disk manifest");
 
-    let (pooled_a, work_a) = build_host_with_nbd(
+    let (pooled_a, _work_a) = build_host_with_nbd(
         "nbd-a",
         &kernel,
         &handler,
@@ -487,7 +487,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         &chunk_store,
         Some(&nbd_a),
     );
-    let (pooled_b, work_b) = build_host_with_nbd(
+    let (pooled_b, _work_b) = build_host_with_nbd(
         "nbd-b",
         &kernel,
         &handler,
