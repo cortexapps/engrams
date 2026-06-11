@@ -522,10 +522,13 @@ mod tests {
     async fn run_streaming_times_out_on_a_silent_stall() {
         // Emit one line, then go silent well past the idle window — the
         // exact signature of the prod hang. The guard must fire and carry
-        // the last line we saw.
+        // the last line we saw. 900ms (not 300ms) so the spawn + first
+        // echo land inside the window even on a loaded box running the
+        // full suite in parallel — while staying sub-second so the
+        // idle_secs rounding assertion below still exercises the 0 case.
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg("echo starting-step; sleep 30");
-        match run_streaming(cmd, "test", Some(Duration::from_millis(300))).await {
+        match run_streaming(cmd, "test", Some(Duration::from_millis(900))).await {
             Err(DockerError::Timeout {
                 tail, idle_secs, ..
             }) => {

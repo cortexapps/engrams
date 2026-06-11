@@ -1636,7 +1636,13 @@ fn parse_sse_block(block: &str) -> Option<SseEvent> {
 }
 
 const BRIEF: Duration = Duration::from_millis(2_000);
-const STREAMING_PROOF: Duration = Duration::from_millis(450);
+/// Drain budget for the streaming-proof test below. Must stay strictly
+/// LESS than the inter-chunk sleep in that test (buffering-to-completion
+/// would hold chunk-1 past the budget) while leaving generous room for
+/// process-spawn latency — at 450ms (and even 1.5s) the spawn alone blew
+/// the budget when the whole workspace suite ran in parallel on a loaded
+/// dev box (Tilt stack up + nextest saturating every core).
+const STREAMING_PROOF: Duration = Duration::from_secs(4);
 
 // ---------------------------------------------------------------------
 // Streaming exec
@@ -1724,9 +1730,10 @@ async fn exec_stream_chunks_arrive_before_process_exits() {
     let resp = post(
         app,
         &format!("/api/v1/sessions/{id}/exec/stream"),
-        // 500ms gap between chunks. If the API buffered to completion
-        // we'd never see chunk-1 inside the STREAMING_PROOF budget.
-        json!({"command": "printf chunk-1; sleep 0.5; printf chunk-2"}),
+        // 5s gap between chunks — strictly more than STREAMING_PROOF.
+        // If the API buffered to completion we'd never see chunk-1
+        // inside the STREAMING_PROOF budget.
+        json!({"command": "printf chunk-1; sleep 5; printf chunk-2"}),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);

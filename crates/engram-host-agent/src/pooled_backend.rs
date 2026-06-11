@@ -3985,6 +3985,11 @@ mod tests {
     async fn migration_fetch_rejects_unlisted_hash_and_bad_export_id() {
         use engram_core::types::snapshot::MigrationItem;
         use futures::StreamExt;
+        // Low-disk hosts (a dev box at >90% used) trip the cache's
+        // free-space floor and evict the cache-resident export chunk
+        // this test serves — same posture as migration_source.rs.
+        // Safe: nextest runs each test in its own process.
+        std::env::set_var(engram_chunk_store::cache::FREE_FLOOR_PCT_ENV_VAR, "0");
         let tmp = tempfile::tempdir().unwrap();
         let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
             engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
@@ -4926,6 +4931,11 @@ mod tests {
             cache::ChunkCacheConfig, ChunkCache, ChunkStore, ManifestKind, ManifestRef,
         };
 
+        // Low-disk hosts (a dev box at >90% used) trip the cache's
+        // free-space floor and evict the warmed chunks whose cache hits
+        // this test asserts — same posture as migration_source.rs.
+        // Safe: nextest runs each test in its own process.
+        std::env::set_var(engram_chunk_store::cache::FREE_FLOOR_PCT_ENV_VAR, "0");
         let tmp = tempfile::tempdir().unwrap();
         let blob_root = tmp.path().join("blob");
         let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
