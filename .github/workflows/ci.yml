@@ -696,6 +696,7 @@ jobs:
           cargo nextest run \
             -p engram-host-agent \
             --test nbd_chunked_disk \
+            --test nbd_netlink_reconfigure \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

@@ -18,8 +18,8 @@
 //! ```
 //!
 //! `sudo chmod 666 /dev/nbd0` used to suffice; newer Ubuntu kernels
-//! (observed on the dev-vm's 6.x, 2026-06) gate the NBD setup ioctls
-//! (`NBD_SET_SOCK` et al.) behind CAP_SYS_ADMIN regardless of the
+//! (observed on the dev-vm's 6.x, 2026-06) gate NBD configuration
+//! (netlink and ioctl alike) behind CAP_SYS_ADMIN regardless of the
 //! device's permission bits, so these tests now need to run under
 //! `sudo -E` (mirroring the root-required FC tests in
 //! `run-boot-test.sh`). Production is unaffected — the host-agent
@@ -27,15 +27,16 @@
 //!
 //! What this test covers that the pure-Rust e2e suite
 //! (`adr_0007_e2e.rs`) doesn't:
-//!  - The NBD ioctl orchestration with the actual Linux kernel
-//!    (`NBD_SET_SOCK` / `NBD_SET_BLKSIZE` / `NBD_SET_SIZE_BLOCKS` /
-//!    `NBD_DO_IT` / `NBD_DISCONNECT`).
+//!  - The netlink NBD orchestration with the actual Linux kernel
+//!    (`NBD_CMD_CONNECT` with size/flags/timeouts/socket attrs —
+//!    ADR 0044 K2 replaced the legacy `NBD_SET_SOCK`/`NBD_DO_IT`
+//!    ioctls so the data plane survives host-agent restarts).
 //!  - The kernel's NBD transmission protocol talking to our daemon's
 //!    `serve_loop` (request headers, response headers, payload).
 //!  - FC's virtio-blk frontend reading from `/dev/nbd0` and the guest
 //!    kernel mounting it as the rootfs.
-//!  - Clean tear-down: NBD_DISCONNECT releases NBD_DO_IT, the OS
-//!    thread joins, the slot returns to the pool.
+//!  - Clean tear-down: netlink `NBD_CMD_DISCONNECT` releases the
+//!    device and the slot returns to the pool.
 
 #![cfg(target_os = "linux")]
 

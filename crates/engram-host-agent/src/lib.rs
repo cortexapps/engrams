@@ -691,6 +691,21 @@ impl HostAgent {
                                         &resp.rehydrate_sandboxes,
                                     )
                                     .await;
+                                    // ADR 0044 K2: stale-binding sweep AFTER
+                                    // the survivors have claimed their slots
+                                    // — only still-free devices are probed,
+                                    // so a survivor's live (busy-by-design)
+                                    // device can never be disconnected by
+                                    // this pass. Replaces the old eager
+                                    // sweep at pool construction, which
+                                    // killed a survivor's disk in prod
+                                    // (2026-06-11, /dev/nbd4).
+                                    if let Some(nbd_pool) = pooled_for_rehydrate.nbd_pool() {
+                                        let unclaimed = nbd_pool.free_paths().await;
+                                        tokio::task::spawn_blocking(move || {
+                                            disk_daemon::recover_stuck_nbd_devices(&unclaimed);
+                                        });
+                                    }
                                 }
                                 #[cfg(not(target_os = "linux"))]
                                 {

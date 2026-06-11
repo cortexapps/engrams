@@ -495,19 +495,15 @@ async fn main() -> Result<(), HostAgentError> {
             .map(std::path::PathBuf::from)
             .collect();
         if !paths.is_empty() {
-            // ADR 0017 Phase B: probe for stale kernel-side NBD
-            // bindings BEFORE building the pool. If the previous
-            // host-agent exited ungracefully (panic, SIGKILL, OOM),
-            // some `/dev/nbdN` devices may still have `/sys/block/
-            // nbdN/pid` populated by a dead daemon. NBD_DISCONNECT
-            // + NBD_CLEAR_SOCK forces the kernel to release them so
-            // the fresh process can re-bind without operator
-            // intervention. Linux-gated; on macOS the function is
-            // not exported.
-            #[cfg(target_os = "linux")]
-            {
-                engram_host_agent::disk_daemon::recover_stuck_nbd_devices(&paths);
-            }
+            // ADR 0044 K2: stale-binding recovery does NOT run here
+            // anymore. A device bound to the dead previous
+            // generation might be a SURVIVOR's live disk (its FC
+            // keeps reading it; rehydrate RECONFIGUREs it) — the
+            // old eager pass actively disconnected one in prod
+            // (2026-06-11, /dev/nbd4 → guest rootfs EIO). The sweep
+            // now runs in `lib.rs` AFTER the registration-time
+            // survivor rehydrate, scoped to the slot pool's
+            // still-free paths.
             match engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(paths) {
                 Ok(pool) => {
                     tracing::info!(

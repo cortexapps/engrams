@@ -566,6 +566,18 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
+    /// ADR 0044 K2 survivor rehydrate: the host block device this
+    /// sandbox's rootfs drive reads (e.g. `/dev/nbd4` for a
+    /// chunked-NBD rootfs). After a host-agent restart the new
+    /// generation must re-serve EXACTLY this device — the surviving
+    /// FC holds an open fd to it, so attaching a fresh slot would
+    /// serve a device nobody reads. `None` for sandboxes whose
+    /// rootfs isn't a block device (file-backed, or backend doesn't
+    /// track it).
+    fn rootfs_device(&self, _id: SandboxId) -> Option<PathBuf> {
+        None
+    }
+
     /// ADR 0045 C2: compose the restore sidecar from LIVE sandbox
     /// state (the presetup's pre-pause package; byte-identical to the
     /// capture-time sidecar by construction).

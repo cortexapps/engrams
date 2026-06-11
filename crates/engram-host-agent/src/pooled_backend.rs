@@ -1755,6 +1755,13 @@ impl PooledBackend {
         self
     }
 
+    /// The NBD slot pool, when this host serves chunked rootfs via
+    /// NBD. Used by the post-rehydrate stale-binding sweep to scope
+    /// itself to still-free slots (ADR 0044 K2).
+    pub fn nbd_pool(&self) -> Option<Arc<crate::disk_daemon::NbdSlotAllocator>> {
+        self.nbd_pool.clone()
+    }
+
     /// Attach a chunk store + a per-host directory where chunked
     /// manifests get materialized. Once set, `create()` resolves the
     /// cached image's `bundle.json` → manifest → file via the chunk
@@ -4813,34 +4820,32 @@ impl SandboxBackend for PooledBackend {
 
 #[cfg(target_os = "linux")]
 impl PooledBackend {
-    /// ADR 0016 Phase B commit 7 — restart-time rehydration.
-    /// Coord hands the host a list of `(session_id, sandbox_id,
-    /// effective_disk_manifest)` rows at registration time;
-    /// this method rebuilds chunked-disk tracking for one entry.
+    /// ADR 0016 Phase B commit 7 / ADR 0044 K2 — restart-time
+    /// rehydration. Coord hands the host a list of `(session_id,
+    /// sandbox_id, effective_disk_manifest)` rows at registration
+    /// time; this method rebuilds the chunked-disk DATA PLANE for
+    /// one surviving sandbox.
     ///
     /// Steps:
-    /// 1. Acquire an NBD slot.
-    /// 2. Build `ChunkedDiskBackend` from the manifest_ref.
-    /// 3. Spawn the NBD daemon serving the slot.
-    /// 4. Insert into `nbd_sandboxes` keyed by `sandbox_id`.
-    /// 5. Install the FlushScheduler so continuous flush resumes
-    ///    for the survivor.
-    /// 6. Pre-populate `session_bindings[sandbox_id] = session_id`
-    ///    so the LiveManifestPublisher's resolver finds the
-    ///    binding on the first post-rehydrate flush.
-    ///
-    /// **Out of scope** (see commit 8 closing notes):
-    /// - Patching the FC sidecar (this code path doesn't re-launch
-    ///   FC; the sandbox is already running from before the
-    ///   host-agent restart).
-    /// - Recovery of FC virtio-blk I/O after NBD device loss. If
-    ///   the kernel left the device in a stuck state, the FC
-    ///   sandbox's I/O likely failed and it's a candidate for
-    ///   eviction-to-snapshot, not rehydration. Out of scope.
+    /// 1. Discover the survivor's existing `/dev/nbdN` from the
+    ///    reattached FC's rootfs drive and CLAIM that exact slot.
+    ///    The surviving FC holds an open fd to that device, so the
+    ///    pre-netlink behavior here — acquiring a FRESH slot —
+    ///    served a device nobody read while the survivor's real
+    ///    disk stayed dead (prod 2026-06-11: guest rootfs EIO after
+    ///    a pod roll).
+    /// 2. Build `ChunkedDiskBackend` from the manifest_ref and hand
+    ///    the kernel a fresh serve socket for the SAME device via
+    ///    netlink `NBD_CMD_RECONFIGURE`; guest I/O parked under
+    ///    `dead_conn_timeout` resumes.
+    /// 3. Insert into `nbd_sandboxes`, install the FlushScheduler,
+    ///    pre-populate `session_bindings[sandbox_id] = session_id`
+    ///    so the LiveManifestPublisher's resolver finds the binding
+    ///    on the first post-rehydrate flush.
     ///
     /// Skip (`Ok(false)`) on any short-circuit (no nbd_pool /
-    /// chunk_store / chunk_cache, or sandbox already present).
-    /// Callers log + move on.
+    /// chunk_store / chunk_cache, sandbox already present, or no
+    /// block-device rootfs to re-serve). Callers log + move on.
     pub async fn rehydrate_sandbox(
         &self,
         session_id: SessionId,
@@ -4862,17 +4867,51 @@ impl PooledBackend {
             );
             return Ok(false);
         }
+        let Some(device) = self.inner.rootfs_device(sandbox_id) else {
+            tracing::debug!(
+                %sandbox_id,
+                "rehydrate skipped: survivor has no block-device rootfs to re-serve",
+            );
+            return Ok(false);
+        };
+        let Some(slot) = pool.claim(&device).await else {
+            // Not in the free pool: either the device isn't part of
+            // this host's slot set, or something else already leased
+            // it — both mean re-serving here would fight another
+            // owner. Loud, because the survivor's disk stays dead.
+            tracing::warn!(
+                %sandbox_id,
+                device = %device.display(),
+                "rehydrate: survivor's NBD device could not be claimed from the slot \
+                 pool; its disk stays unserved (recover via evict_local → resume)",
+            );
+            return Ok(false);
+        };
 
         let store_arc = Arc::new(chunk_store.clone());
-        let mut state = crate::disk_daemon::attach_manifest(
+        let mut state = crate::disk_daemon::reattach_manifest(
             disk_manifest,
             chunk_cache.clone(),
             store_arc,
-            pool,
+            slot,
             self.flush_config.dirty_threshold_bytes,
         )
         .await
-        .map_err(|e| SandboxError::Vm(format!("rehydrate nbd attach: {e}").into()))?;
+        .map_err(|e| {
+            // RECONFIGURE refused — most likely a device configured by
+            // a pre-netlink host-agent generation (the one-roll
+            // transition window) or an identifier mismatch. The
+            // survivor's disk stays dead; the evict_local → resume
+            // ladder recovers the session.
+            SandboxError::Vm(
+                format!(
+                    "rehydrate nbd reconfigure at {}: {e} \
+                     (survivor disk unserved; recover via evict_local → resume)",
+                    device.display()
+                )
+                .into(),
+            )
+        })?;
 
         state.install_flush_scheduler(
             sandbox_id,
@@ -4892,7 +4931,8 @@ impl PooledBackend {
             %session_id,
             %sandbox_id,
             manifest = %disk_manifest,
-            "rehydrated chunked-disk tracking + scheduler for survivor sandbox",
+            device = %device.display(),
+            "rehydrated chunked-disk data plane (RECONFIGURE) for survivor sandbox",
         );
         Ok(true)
     }

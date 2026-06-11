@@ -3760,6 +3760,17 @@ impl SandboxBackend for FirecrackerBackend {
         path.exists().then_some(path)
     }
 
+    /// ADR 0044 K2: the rootfs `path_on_host` this sandbox's FC has
+    /// open — `/dev/nbdN` for a chunked rootfs. Survivor rehydrate
+    /// uses it to RECONFIGURE the same device instead of attaching a
+    /// fresh slot. Filtered to block-device paths so a file-backed
+    /// rootfs answers `None`.
+    fn rootfs_device(&self, id: SandboxId) -> Option<PathBuf> {
+        let live = self.sandboxes.get(&id)?;
+        let path = live.state.spec.rootfs_source.clone()?;
+        path.starts_with("/dev").then_some(path)
+    }
+
     /// ADR 0045 C2: rewrite the sandbox manifest with the post-copy
     /// role (atomic tmp+rename, same discipline as the original
     /// write). A missing manifest is an error — the role fence must

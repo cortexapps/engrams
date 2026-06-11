@@ -42,6 +42,8 @@ pub mod nbd;
 pub mod slot;
 
 #[cfg(target_os = "linux")]
+pub mod nbd_netlink;
+#[cfg(target_os = "linux")]
 pub mod runtime;
 
 pub use backend::{
@@ -60,6 +62,6 @@ pub use slot::{NbdSlot, NbdSlotAllocator};
 
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    attach_manifest, attach_manifest_content, recover_stuck_nbd_devices, spawn, NbdHandle,
-    NbdRuntimeError, NbdSandboxState, NBD_BLOCK_SIZE,
+    attach_manifest, attach_manifest_content, reattach, reattach_manifest,
+    recover_stuck_nbd_devices, spawn, NbdHandle, NbdRuntimeError, NbdSandboxState, NBD_BLOCK_SIZE,
 };
