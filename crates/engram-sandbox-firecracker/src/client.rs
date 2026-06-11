@@ -216,6 +216,7 @@ impl FirecrackerClient {
             snapshot_path: state_path.to_string_lossy().into_owned(),
             mem_file_path: mem_path.to_string_lossy().into_owned(),
             snapshot_type,
+            vmstate_only: false,
         };
         let create_res = self.put("/snapshot/create", &body).await;
 
@@ -231,6 +232,39 @@ impl FirecrackerClient {
             state_path,
             mem_path,
         })
+    }
+
+    /// ADR 0045 C2 (fork v3): vmstate-only snapshot create — writes the
+    /// state file at `state_path` and skips the guest-memory leg entirely.
+    /// The post-copy blackout primitive: the destination demand-faults the
+    /// dirty memory from this (still paused) source's address space, so no
+    /// memory file ever materializes.
+    ///
+    /// Deliberately NO pause/resume wrapper and NO `ResumeOnDrop` guard:
+    /// the migration blackout owns the pause, and an auto-resume of the
+    /// source mid-move is exactly the split-brain this rung is built to
+    /// prevent. The caller must hold the VM Paused before calling and owns
+    /// whatever happens to it afterwards (commit-destroy or abort-resume).
+    ///
+    /// Requires the fork-v3 binary: stock/older-fork FC rejects the
+    /// `vmstate_only` field (`deny_unknown_fields`), surfacing as a PUT
+    /// error — the capability gate for mixed-fleet rolls.
+    pub async fn create_snapshot_vmstate_only(
+        &self,
+        state_path: &Path,
+    ) -> Result<(), SandboxError> {
+        let body = SnapshotCreateBody {
+            snapshot_path: state_path.to_string_lossy().into_owned(),
+            // Ignored by fork v3; a sibling placeholder keeps the field
+            // present (it is required by FC's schema).
+            mem_file_path: state_path
+                .with_extension("memfile-ignored")
+                .to_string_lossy()
+                .into_owned(),
+            snapshot_type: SnapshotType::Full,
+            vmstate_only: true,
+        };
+        self.put("/snapshot/create", &body).await
     }
 
     /// Restore from `paths` with file-backed memory. Returns once the
@@ -707,6 +741,13 @@ struct SnapshotCreateBody {
     snapshot_path: String,
     mem_file_path: String,
     snapshot_type: SnapshotType,
+    /// ADR 0045 C2 (fork v3): write only the vmstate file; the memory leg
+    /// is skipped entirely and `mem_file_path` is ignored. Skipped from the
+    /// wire when false so the body stays byte-identical to stock — stock FC
+    /// rejects the unknown field (`deny_unknown_fields`), which is exactly
+    /// the fork-v3 capability gate.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    vmstate_only: bool,
 }
 
 /// PascalCase variant names match Firecracker's expected JSON values
@@ -1132,11 +1173,25 @@ mod tests {
             snapshot_path: "/snap/state.bin".into(),
             mem_file_path: "/snap/memory.bin".into(),
             snapshot_type: SnapshotType::Full,
+            vmstate_only: false,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["snapshot_path"], "/snap/state.bin");
         assert_eq!(v["mem_file_path"], "/snap/memory.bin");
         assert_eq!(v["snapshot_type"], "Full");
+        // ADR 0045 C2: when false the field is OMITTED — the body stays
+        // byte-identical to stock so non-migration captures keep working
+        // against any FC binary (R2 posture).
+        assert!(v.get("vmstate_only").is_none());
+
+        let body = SnapshotCreateBody {
+            snapshot_path: "/snap/state.bin".into(),
+            mem_file_path: "/snap/ignored".into(),
+            snapshot_type: SnapshotType::Full,
+            vmstate_only: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["vmstate_only"], true);
     }
 
     #[test]
