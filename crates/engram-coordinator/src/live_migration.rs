@@ -594,13 +594,15 @@ pub async fn migrate_session_live(
         // construction). Row-only-at-finalize; on any failure the
         // previous checkpoint stays the recovery point and the next
         // periodic checkpoint (also a Full) retries durability.
+        //
+        // The COMPOSED snapshot, NOT snapshot_begin: begin is the D5
+        // EVICTION flavor and RE-PAUSES the guest after capture ("it's
+        // being torn down") — on a live post-move dest that froze the
+        // session indefinitely (prod session 962011bf, stuck "working"
+        // until an admin resume). The composed path pauses only for
+        // the capture window and resumes the guest before uploading.
         let t_full = std::time::Instant::now();
-        if let Err(e) = state2.services.host.snapshot_begin(new_sandbox_id).await {
-            tracing::warn!(%session_id, error = %e,
-                "post-copy finalize: full-checkpoint begin failed; next periodic covers");
-            return;
-        }
-        let wait = state2.services.host.snapshot_wait(new_sandbox_id);
+        let wait = state2.services.host.snapshot(new_sandbox_id);
         tokio::pin!(wait);
         let row_meta = loop {
             tokio::select! {
