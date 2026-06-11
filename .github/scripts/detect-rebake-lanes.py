@@ -48,13 +48,24 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Binaries that bake into each artifact. uffd-handler ships ONLY on the FC
-# host image (spawned by host-agent), never in a container — so it gates the
-# host lanes but not images.
+# Binaries that bake into each artifact.
 FC_BINS = {"engram-host-agent", "engram-uffd-handler"}
 # engram-host-operator (ADR 0044 K3) bakes into its own container image; add
 # it so an operator-only crate change rebuilds the images lane.
-CONTAINER_BINS = {"engram-coordinator", "engram-host-agent", "engram-host-operator"}
+#
+# engram-uffd-handler: since ADR 0044 the host fleet is a K8s DaemonSet and
+# the handler ships INSIDE the host-agent container
+# (docker/host-agent.Dockerfile copies it to /usr/local/bin) — it is NOT a
+# cargo dependency of host-agent (a sibling binary spawned by path), so
+# without listing it here a handler-only change set images=False and landed
+# only in the dead GCE host_binaries lane: it deployed NOWHERE (PR #193's
+# handler fix sat unrolled until this was caught).
+CONTAINER_BINS = {
+    "engram-coordinator",
+    "engram-host-agent",
+    "engram-host-operator",
+    "engram-uffd-handler",
+}
 # Binaries baked INTO session images at image-build time by
 # engram-image-builder::inject_builtin_harness (pulled from the
 # harness-claude GHCR pack, written to /sbin/engram-harness-claude). The
