@@ -33,7 +33,23 @@ pub async fn prompt(
     Path(id): Path<SessionId>,
     Json(req): Json<PromptRequest>,
 ) -> Result<Json<PromptResponse>, ApiError> {
-    if req.text.is_empty() {
+    let note = send_prompt_core(&state, id, req.text).await?;
+    Ok(Json(PromptResponse {
+        session_id: id,
+        note,
+    }))
+}
+
+/// Transport-agnostic core: forward a prompt to the session's harness,
+/// auto-resuming an Idle session first. No authz — gated by the axum
+/// route layer / trusted gRPC caller (ADR 0039 §6). Returns the static
+/// diagnostic note both transports echo back.
+pub(crate) async fn send_prompt_core(
+    state: &SharedState,
+    id: SessionId,
+    text: String,
+) -> Result<&'static str, ApiError> {
+    if text.is_empty() {
         return Err(ApiError::BadRequest("`text` is required".into()));
     }
 
@@ -41,7 +57,7 @@ pub async fn prompt(
     // sessions surface 410 Gone here (ensure_active → resume_session
     // → ApiError::Gone for missing snapshots). Active sessions are a
     // no-op.
-    crate::api::snapshot::ensure_active(&state, id).await?;
+    crate::api::snapshot::ensure_active(state, id).await?;
 
     let sandbox_id = state.registry.get(id).ok_or_else(|| {
         // After ensure_active, an Active session must have a sandbox
@@ -54,7 +70,7 @@ pub async fn prompt(
         )
     })?;
 
-    let prompt_text = req.text;
+    let prompt_text = text;
     state
         .services
         .host
@@ -86,8 +102,5 @@ pub async fn prompt(
         tracing::warn!(session_id = %id, error = %e, "emit user prompt event failed");
     }
 
-    Ok(Json(PromptResponse {
-        session_id: id,
-        note: "prompt forwarded",
-    }))
+    Ok("prompt forwarded")
 }
