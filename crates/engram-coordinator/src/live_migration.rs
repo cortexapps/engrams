@@ -244,7 +244,13 @@ pub async fn migrate_session_live(
                     return Err(MigrateError::AbortedToSource(format!("dest restore: {e}")));
                 }
             }
-            return Err(MigrateError::Parachute(format!("dest restore: {e}")));
+            return Err(parachute_or_kill(
+                state,
+                session_id,
+                durable_row.is_some(),
+                format!("dest restore: {e}"),
+            )
+            .await);
         }
     };
     let restore_ms = t_restore.elapsed().as_millis();
@@ -282,7 +288,7 @@ pub async fn migrate_session_live(
         // orphan_reap, the frozen source to the export TTL.
         let _ = dest_backend.destroy(new_sandbox_id).await;
         state.teleport_targets.remove(&session_id);
-        return Err(MigrateError::Parachute(e));
+        return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
     }
     crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id).await;
     let session_refreshed = state
@@ -423,6 +429,51 @@ async fn source_host_addr(state: &SharedState, host_id: Option<HostId>) -> Optio
 /// Evacuating → Created → Active without relocating (the source VM was
 /// aborted back in place; its bindings never changed). Returns false if
 /// either transition is refused (the parachute then owns recovery).
+/// The parachute's landing depends on whether a durable checkpoint row
+/// exists. With one, leave the session `Evacuating` — the scanner
+/// rehomes from the row (rung-1 semantics, loss ≤ cadence). WITHOUT
+/// one there is nothing to rehome from: leaving `Evacuating` strands a
+/// zombie the scanner grinds on forever, so kill the session outright
+/// (operator decision, 2026-06-11 — the same call that dropped the
+/// first-move row gate).
+async fn parachute_or_kill(
+    state: &SharedState,
+    session_id: SessionId,
+    has_durable_row: bool,
+    msg: String,
+) -> MigrateError {
+    if has_durable_row {
+        return MigrateError::Parachute(msg);
+    }
+    tracing::error!(
+        %session_id,
+        error = %msg,
+        "live migration failed past the freeze with NO durable checkpoint \
+         row — killing the session (nothing to rehome from)",
+    );
+    if let Err(e) = state
+        .services
+        .meta
+        .transition_session(session_id, SessionState::Failed)
+        .await
+    {
+        tracing::warn!(%session_id, error = %e, "kill-on-parachute: transition to Failed failed");
+    }
+    let _ = state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Evacuating,
+                to: SessionState::Failed,
+                at: chrono::Utc::now(),
+            },
+        )
+        .await;
+    MigrateError::Fatal(format!(
+        "session lost (no durable checkpoint to rehome from): {msg}"
+    ))
+}
+
 async fn walk_back_to_active(state: &SharedState, session_id: SessionId) -> bool {
     for target in [SessionState::Created, SessionState::Active] {
         if let Err(e) = state
