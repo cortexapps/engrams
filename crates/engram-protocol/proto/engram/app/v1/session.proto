@@ -13,6 +13,7 @@ service SessionService {
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
   rpc SendPrompt(SendPromptRequest) returns (SendPromptResponse);
   rpc Interrupt(InterruptRequest) returns (InterruptResponse);
+  // Streams the event envelope itself, not a wrapped Response message.
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc StreamEvents(StreamEventsRequest) returns (stream SessionEvent);
   // One streaming RPC; the unary HTTP route's semantics are the
@@ -42,8 +43,46 @@ service ShellRelayService {
 
 message ListSessionsRequest {}
 
+message ListSessionsResponse {
+  repeated SessionListItem sessions = 1;
+}
+
+// A session list row — the session plus the owner's identity (ADR 0031),
+// folded in as optionals. `owner_kind` ("system" for warm-pool /
+// automated sessions, "user" or absent for human-launched) is a
+// TS-mirror-only field today — absent from the Rust wire
+// (SessionListItem), so absent is the norm.
+message SessionListItem {
+  Session session = 1;
+  optional string owner_email = 2;
+  optional string owner_name = 3;
+  optional string owner_kind = 4;
+}
+
+// Mirrors engram_core::types::Session as serialized on today's JSON wire
+// (web/src/types.ts Session). `user_id` is OMITTED — attribution leaves
+// the contract (ADR §2.1). String-literal unions stay strings:
+// status ∈ SessionState, mode ∈ {"agent","dev_vm"}. Timestamps are
+// ISO-8601 strings, as on the JSON wire.
+message Session {
+  string id = 1;
+  // engram_core SessionState, snake_case: "pending" | "created" |
+  // "guest_ready" | "active" | "idle" | "host_lost" | "evacuating" |
+  // "evicting" | "failed" | "completed" | "dead".
+  string status = 2;
+  optional string host_id = 3;
+  optional string sandbox_id = 4;
+  // Flat OCI URI (`<host>[:port]/<repo>:<tag>`) — Stage B1 wire shape.
+  string image = 5;
+  string mode = 6;
+  string created_at = 7;
+  string last_active_at = 8;
+}
+
 message CreateSessionRequest {
   string image_uri = 1;
+  // engram_core SessionMode, snake_case: "agent" (run the image's baked
+  // harness) | "dev_vm" (no harness driven; interact via shell / exec).
   string mode = 2;
   optional string prompt = 3;
   // Sealed-secret reference (SecretService key). When set and the image's
@@ -61,115 +100,9 @@ message CreateSessionResponse {
   string status = 2;
   string image_version = 3;
   // "warm" if the session was satisfied by a pre-restored warm-pool slot,
-  // "cold" if it took the full create path. (On the JSON wire today —
-  // api/sessions.rs CreateSessionResponse — but not yet in the TS mirror.)
+  // "cold" if it took the full create path. (On the Rust JSON wire —
+  // api/sessions.rs CreateSessionResponse — absent from the TS mirror.)
   string kind = 4;
-}
-
-// The typed event ENVELOPE. payload_json is NORMATIVELY the JSON object
-// today's SSE `data:` carries: the event payload with
-// _recovery_epoch/_rewound folded in via with_rewind_meta
-// (api/events.rs:144) — on BOTH the replay and live arms.
-message SessionEvent {
-  // optional: a broadcast-lag notification has no idx (today's SSE emits
-  // `event: lagged` with NO id: line so it never disturbs Last-Event-ID).
-  optional int64 idx = 1;
-  // The event's "type" discriminant. Special value "lagged": idx unset,
-  // payload_json = {"missed": n}.
-  string kind = 2;
-  string payload_json = 3;
-}
-
-message StreamEventsRequest {
-  string session_id = 1;
-  // Replay strictly-after this idx, then tail. UNSET = from the start
-  // (callers translate the HTTP -1 sentinel to unset; proto3 default 0
-  // would silently skip idx 0).
-  optional int64 since = 2;
-}
-
-message GetArtifactRequest {
-  string session_id = 1;
-  string artifact_id = 2;
-}
-
-message GetArtifactResponse {
-  oneof msg {
-    ArtifactMetadata metadata = 1; // always the first message
-    bytes chunk = 2;
-  }
-}
-
-message ArtifactMetadata {
-  string media_type = 1;
-  int64 size_bytes = 2;
-  string file_name = 3;
-}
-
-// Frame kinds mirror the WS frames / host ProxyShellMessage 1:1. Request
-// and response are separate types (RPC_REQUEST_RESPONSE_UNIQUE) and mark
-// directionality.
-message RelayShellRequest {
-  oneof frame {
-    ShellOpen open = 1; // first client frame: which session's shell
-    string text = 2;
-    bytes binary = 3;
-    bytes ping = 4;
-    bytes pong = 5;
-    ShellClose close = 6;
-  }
-}
-
-message RelayShellResponse {
-  oneof frame {
-    string text = 1;
-    bytes binary = 2;
-    bytes ping = 3;
-    bytes pong = 4;
-    ShellClose close = 5;
-  }
-}
-
-message ShellOpen {
-  string session_id = 1;
-}
-
-message ShellClose {
-  uint32 code = 1;
-  string reason = 2;
-}
-
-// Mirrors engram_core::types::Session as serialized on today's JSON wire
-// (web/src/types.ts Session). `user_id` is OMITTED — attribution leaves
-// the contract (ADR §2.1). String-literal unions stay strings:
-// status ∈ SessionState, mode ∈ {"agent","dev_vm"}. Timestamps are
-// ISO-8601 strings, as on the JSON wire.
-message Session {
-  string id = 1;
-  string status = 2;
-  optional string host_id = 3;
-  optional string sandbox_id = 4;
-  // Flat OCI URI (`<host>[:port]/<repo>:<tag>`) — Stage B1 wire shape.
-  string image = 5;
-  string mode = 6;
-  string created_at = 7;
-  string last_active_at = 8;
-}
-
-// A session list row — the session plus the owner's identity (ADR 0031),
-// folded in as optionals. `owner_kind` ("system" for warm-pool /
-// automated sessions, "user" or absent for human-launched) exists only
-// in the TS mirror today; the Rust SessionListItem does not serialize
-// it yet, so absent is the norm.
-message SessionListItem {
-  Session session = 1;
-  optional string owner_email = 2;
-  optional string owner_name = 3;
-  optional string owner_kind = 4;
-}
-
-message ListSessionsResponse {
-  repeated SessionListItem sessions = 1;
 }
 
 message GetSessionRequest {
@@ -195,6 +128,7 @@ message SendPromptRequest {
 
 message SendPromptResponse {
   string session_id = 1;
+  // Human-readable diagnostic; not machine-parsed, not stable.
   string note = 2;
 }
 
@@ -204,7 +138,30 @@ message InterruptRequest {
 
 message InterruptResponse {
   string session_id = 1;
+  // Human-readable diagnostic; not machine-parsed, not stable.
   string note = 2;
+}
+
+message StreamEventsRequest {
+  string session_id = 1;
+  // Replay strictly-after this idx, then tail. UNSET = from the start
+  // (callers translate the HTTP -1 sentinel to unset; proto3 default 0
+  // would silently skip idx 0).
+  optional int64 since = 2;
+}
+
+// The typed event ENVELOPE. payload_json is NORMATIVELY the JSON object
+// today's SSE `data:` carries: the event payload with
+// _recovery_epoch/_rewound folded in via with_rewind_meta
+// (api/events.rs) — on BOTH the replay and live arms.
+message SessionEvent {
+  // optional: a broadcast-lag notification has no idx (today's SSE emits
+  // `event: lagged` with NO id: line so it never disturbs Last-Event-ID).
+  optional int64 idx = 1;
+  // The event's "type" discriminant. Special value "lagged": idx unset,
+  // payload_json = {"missed": n}.
+  string kind = 2;
+  string payload_json = 3;
 }
 
 message ExecRequest {
@@ -289,6 +246,7 @@ message SnapshotResponse {
   string session_id = 1;
   optional string snapshot_id = 2;
   optional uint64 size_bytes = 3;
+  // Human-readable diagnostic; not machine-parsed, not stable.
   string note = 4;
 }
 
@@ -376,6 +334,26 @@ message CheckpointSummary {
   bool is_latest = 6;
 }
 
+message GetArtifactRequest {
+  string session_id = 1;
+  string artifact_id = 2;
+}
+
+message GetArtifactResponse {
+  oneof msg {
+    ArtifactMetadata metadata = 1; // always the first message
+    bytes chunk = 2;
+  }
+}
+
+message ArtifactMetadata {
+  string media_type = 1;
+  // uint64, deviating from the plan skeleton's int64: sizes are never
+  // negative, and every other size field in this file is uint64.
+  uint64 size_bytes = 2;
+  string file_name = 3;
+}
+
 // ADR 0026 trusted operator file pull: capture ANY file in the session
 // by path, no MIME restriction, same size cap + quota.
 message CreateArtifactFromPathRequest {
@@ -388,4 +366,41 @@ message CreateArtifactFromPathResponse {
   string artifact_id = 1;
   string media_type = 2;
   uint64 size_bytes = 3;
+}
+
+// ---------------------------------------------------------------------
+// ShellRelayService messages.
+// ---------------------------------------------------------------------
+
+// Frame kinds mirror the WS frames / host ProxyShellMessage 1:1. Request
+// and response are separate types (RPC_REQUEST_RESPONSE_UNIQUE) and mark
+// directionality.
+message RelayShellRequest {
+  oneof frame {
+    ShellOpen open = 1; // first client frame: which session's shell
+    string text = 2;
+    bytes binary = 3;
+    bytes ping = 4;
+    bytes pong = 5;
+    ShellClose close = 6;
+  }
+}
+
+message RelayShellResponse {
+  oneof frame {
+    string text = 1;
+    bytes binary = 2;
+    bytes ping = 3;
+    bytes pong = 4;
+    ShellClose close = 5;
+  }
+}
+
+message ShellOpen {
+  string session_id = 1;
+}
+
+message ShellClose {
+  uint32 code = 1;
+  string reason = 2;
 }
