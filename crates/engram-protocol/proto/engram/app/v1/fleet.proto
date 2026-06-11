@@ -76,7 +76,10 @@ message HostView {
   uint64 util_mem_total_mib = 12;
   uint64 util_mem_used_mib = 13;
   float util_cpu_pct = 14;
-  // ISO-8601.
+  // ISO-8601. Always present — the Rust field is a non-optional
+  // DateTime<Utc>, stamped Utc::now() at registration
+  // (api/host_http.rs) and refreshed on every heartbeat. A
+  // never-heartbeated host still carries its registration stamp.
   string last_heartbeat_at = 15;
 }
 
@@ -238,6 +241,13 @@ message ChunkGcRequest {
   // true = classify + count only, no writes (today's /dry-run route);
   // false = full pipeline with candidate upserts + promote-pass deletes
   // (today's /sweep route).
+  //
+  // WARNING — proto3 footgun: an UNSET dry_run is indistinguishable
+  // from false, and false means a LIVE SWEEP WITH DELETIONS. Today's
+  // HTTP makes the choice explicit via separate /dry-run and /sweep
+  // routes; this RPC does not. Callers MUST set dry_run deliberately
+  // on every call. The surface is admin-gated at the orchestrator,
+  // which bounds — but does not remove — the risk.
   bool dry_run = 1;
   // Override the grace period (seconds) for this sweep only. Tests use
   // 0 so candidates promote immediately; operators typically leave
@@ -270,7 +280,8 @@ message ChunkGcResponse {
 }
 
 message BundleGcRequest {
-  // See ChunkGcRequest — same dry-run/full split.
+  // See ChunkGcRequest — same dry-run/full split, and the same WARNING:
+  // unset/false = LIVE SWEEP with deletions. Set deliberately.
   bool dry_run = 1;
   optional uint64 grace_secs = 2;
 }
@@ -289,7 +300,8 @@ message BundleGcResponse {
 }
 
 message SnapshotBlobGcRequest {
-  // See ChunkGcRequest — same dry-run/full split.
+  // See ChunkGcRequest — same dry-run/full split, and the same WARNING:
+  // unset/false = LIVE SWEEP with deletions. Set deliberately.
   bool dry_run = 1;
   optional uint64 grace_secs = 2;
 }

@@ -4,7 +4,8 @@ package engram.app.v1;
 
 import "engram/app/v1/session.proto";
 
-// The application aggregate root (ADR §3). ORCHESTRATOR-NATIVE: the
+// The application aggregate root (ADR 0039 §3, rev 2026-06-10).
+// ORCHESTRATOR-NATIVE: the
 // control plane neither implements nor knows about tasks — this file
 // lives in the same package so web gets one uniform generated API, and
 // it is excluded from the Rust build.
@@ -14,6 +15,13 @@ service TaskService {
   // ability, never by a client-supplied filter.
   rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
   rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  // BLAST RADIUS (plan Task 19): requires ability "delete" on the
+  // task. The orchestrator first calls the control plane's
+  // DeleteSession for each task_session row — deleting a task tears
+  // down its session(s), sandboxes included — then deletes the task
+  // row (task_session rows go by FK cascade). Idempotent-ish: the
+  // session teardown inherits DeleteSession's racy-idempotent
+  // semantics.
   rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
 }
 
@@ -43,7 +51,7 @@ message Task {
   // Type-specific trigger ref (jsonb passthrough).
   string source_json = 6;
   repeated TaskSessionRef sessions = 7;
-  // RFC3339.
+  // ISO-8601.
   string created_at = 8;
 }
 

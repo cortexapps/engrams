@@ -172,6 +172,10 @@ message RegistryCredentialSummary {
 message AddRegistryRequest {
   string host = 1;
   oneof auth {
+    // Named `static` to stay aligned with the Rust serde tag
+    // (`kind: "static"`) deliberately — cross-language keyword renames
+    // are the generators' job (prost emits `Static`, protobuf-es emits
+    // case "static").
     StaticRegistryAuth static = 2;
     GcpWorkloadIdentityRegistryAuth gcp_workload_identity = 3;
     AnonymousRegistryAuth anonymous = 4;
