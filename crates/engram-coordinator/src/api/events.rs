@@ -178,7 +178,11 @@ pub(crate) fn indexed_to_sse(indexed: IndexedEvent) -> Event {
 /// Merge ADR 0028 A.log rewind metadata into an event's data object.
 /// Non-object payloads (shouldn't happen for our typed events) pass
 /// through unchanged.
-pub(crate) fn with_rewind_meta(mut payload: serde_json::Value, recovery_epoch: i64, rewound: bool) -> String {
+pub(crate) fn with_rewind_meta(
+    mut payload: serde_json::Value,
+    recovery_epoch: i64,
+    rewound: bool,
+) -> String {
     if let serde_json::Value::Object(map) = &mut payload {
         map.insert("_recovery_epoch".into(), recovery_epoch.into());
         map.insert("_rewound".into(), rewound.into());

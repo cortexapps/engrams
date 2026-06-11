@@ -26,7 +26,9 @@ fn grpc_addr_and_token() -> Option<(String, String)> {
     let addr = match std::env::var("ENGRAM_SMOKE_GRPC") {
         Ok(v) => v,
         Err(_) => {
-            println!("SKIP: ENGRAM_SMOKE_GRPC not set — run `just dev` then `just smoke-control-plane`");
+            println!(
+                "SKIP: ENGRAM_SMOKE_GRPC not set — run `just dev` then `just smoke-control-plane`"
+            );
             return None;
         }
     };
@@ -63,8 +65,8 @@ async fn find_no_harness_image() -> Option<String> {
     // HTTP base address for the coordinator REST surface, read from
     // `ENGRAM_SMOKE_HTTP` (default: http://127.0.0.1:8090 — the dev HTTP
     // port set by Tiltfile). Override when the coordinator listens elsewhere.
-    let http_addr = std::env::var("ENGRAM_SMOKE_HTTP")
-        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+    let http_addr =
+        std::env::var("ENGRAM_SMOKE_HTTP").unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
     let url = format!("{http_addr}/api/v1/enabled-images");
 
     let resp = match reqwest::get(&url).await {
@@ -116,24 +118,6 @@ async fn find_no_harness_image() -> Option<String> {
          Enable a no-harness image first (e.g. `just enable-image localhost:5001/demo:warm`)."
     );
     None
-}
-
-/// Parse `id:` lines from an SSE event stream body, returning the idx
-/// values in order. Stops when the accumulated vec has `limit` entries
-/// or the text is exhausted.
-fn parse_sse_idx_sequence(body: &str, limit: usize) -> Vec<i64> {
-    let mut idxs = Vec::new();
-    for line in body.lines() {
-        if let Some(raw) = line.strip_prefix("id:") {
-            if let Ok(idx) = raw.trim().parse::<i64>() {
-                idxs.push(idx);
-                if idxs.len() >= limit {
-                    break;
-                }
-            }
-        }
-    }
-    idxs
 }
 
 /// StreamEvents smoke: create a session, stream events from the start
@@ -237,39 +221,110 @@ async fn stream_events_smoke() {
         !grpc_idxs.is_empty(),
         "StreamEvents must yield at least one event (status_changed) for a newly created session"
     );
-    println!(
-        "smoke(stream_events): gRPC idx sequence: {grpc_idxs:?}"
-    );
+    println!("smoke(stream_events): gRPC idx sequence: {grpc_idxs:?}");
 
     // ---- 3. Compare against legacy SSE feed idx sequence ----
-    let http_addr = std::env::var("ENGRAM_SMOKE_HTTP")
-        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let sse_url = format!("{http_addr}/api/v1/sessions/{session_id}/events");
+    //
+    // We read the SSE stream INCREMENTALLY via `bytes_stream()` so we can
+    // stop as soon as we have collected `grpc_idxs.len()` `id:` lines.
+    // A plain `.timeout(5s).text()` would always time out (SSE never
+    // sends EOF while the session is live), making the comparison silently
+    // no-op via the WARN-skip path every run.
+    //
+    // WARN-skip is kept ONLY for a genuine connection failure (Err arm).
+    // If the stream connects but yields fewer id: lines than expected
+    // within the 10 s deadline, the test FAILS — that is a real bug.
+    {
+        use futures::StreamExt as _;
 
-    // Request the SSE stream with a short read — just enough to collect
-    // events. The `since=-1` query asks for everything from the start,
-    // mirroring the gRPC `since=None`.
-    let sse_client = reqwest::Client::new();
-    let sse_resp = sse_client
-        .get(&sse_url)
-        .query(&[("since", "-1")])
-        .header("Accept", "text/event-stream")
-        // Bearer auth — the SSE endpoint uses the same session-level
-        // cookie/synthetic auth in tests; try cookie-free first (dev
-        // mode with synthetic admin should work without a cookie).
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await;
+        let http_addr = std::env::var("ENGRAM_SMOKE_HTTP")
+            .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+        let sse_url = format!("{http_addr}/api/v1/sessions/{session_id}/events");
 
-    match sse_resp {
-        Ok(resp) if resp.status().is_success() => {
-            let body = resp.text().await.unwrap_or_default();
-            let sse_idxs = parse_sse_idx_sequence(&body, grpc_idxs.len());
-            println!("smoke(stream_events): SSE idx sequence (first {}): {sse_idxs:?}", grpc_idxs.len());
+        // No .timeout() on the send — we want the connection to succeed and
+        // then we impose a per-stream deadline via tokio::time::timeout below.
+        let sse_client = reqwest::Client::new();
+        let sse_send = sse_client
+            .get(&sse_url)
+            .query(&[("since", "-1")])
+            .header("Accept", "text/event-stream")
+            .send()
+            .await;
 
-            // The idx sequences must match — gRPC and SSE share the
-            // same core and the same persistent log.
-            if !sse_idxs.is_empty() {
+        match sse_send {
+            Err(e) => {
+                // Genuine connection failure (stack unreachable) — skip, not fail.
+                println!(
+                    "smoke(stream_events): WARN — SSE GET failed ({e}) — skipping SSE comparison"
+                );
+            }
+            Ok(resp) if !resp.status().is_success() => {
+                // Non-2xx (e.g. auth required, 404) — skip with a note.
+                println!(
+                    "smoke(stream_events): WARN — SSE GET returned {} — skipping SSE comparison",
+                    resp.status()
+                );
+            }
+            Ok(resp) => {
+                // Connected successfully — read incrementally until we have
+                // the expected number of id: lines or the deadline expires.
+                let want = grpc_idxs.len();
+                let sse_deadline = std::time::Duration::from_secs(10);
+
+                let mut byte_stream = resp.bytes_stream();
+                let mut partial = String::new();
+                let mut sse_idxs: Vec<i64> = Vec::new();
+
+                let collect_result = tokio::time::timeout(sse_deadline, async {
+                    while sse_idxs.len() < want {
+                        match byte_stream.next().await {
+                            None => break, // stream ended (session terminal)
+                            Some(Err(e)) => {
+                                // Transport error mid-stream — propagate so
+                                // the outer timeout arm handles it.
+                                eprintln!("smoke(stream_events): SSE read error: {e}");
+                                break;
+                            }
+                            Some(Ok(chunk)) => {
+                                partial.push_str(&String::from_utf8_lossy(&chunk));
+                                // Parse all complete lines, keep remainder.
+                                let last_newline = partial.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                                let complete = partial[..last_newline].to_string();
+                                partial = partial[last_newline..].to_string();
+                                for line in complete.lines() {
+                                    if let Some(raw) = line.strip_prefix("id:") {
+                                        if let Ok(idx) = raw.trim().parse::<i64>() {
+                                            sse_idxs.push(idx);
+                                            if sse_idxs.len() >= want {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+
+                println!(
+                    "smoke(stream_events): SSE idx sequence (collected {}/{}): {sse_idxs:?}",
+                    sse_idxs.len(),
+                    want
+                );
+
+                if collect_result.is_err() && sse_idxs.len() < want {
+                    // Stream connected but timed out before delivering enough
+                    // id: lines — this is a real bug, not a skip.
+                    panic!(
+                        "smoke(stream_events): SSE stream connected but only yielded {} id: \
+                         lines within {sse_deadline:?}; expected {want} — \
+                         gRPC idx sequence was {grpc_idxs:?}",
+                        sse_idxs.len(),
+                    );
+                }
+
+                // Hard assert: the idx sequences must match.
                 let compare_len = grpc_idxs.len().min(sse_idxs.len());
                 assert_eq!(
                     &grpc_idxs[..compare_len],
@@ -277,25 +332,10 @@ async fn stream_events_smoke() {
                     "gRPC and SSE must yield identical idx sequences for session {session_id}"
                 );
                 println!(
-                    "smoke(stream_events): gRPC and SSE idx sequences match ({compare_len} events)"
-                );
-            } else {
-                println!(
-                    "smoke(stream_events): WARN — SSE body yielded no id: lines \
-                     (body may have been truncated by the short timeout); skipping SSE comparison"
+                    "smoke(stream_events): gRPC idx sequence {grpc_idxs:?} == \
+                     SSE idx sequence {sse_idxs:?} — match confirmed ({compare_len} events)"
                 );
             }
-        }
-        Ok(resp) => {
-            println!(
-                "smoke(stream_events): WARN — SSE GET returned {} — skipping SSE comparison",
-                resp.status()
-            );
-        }
-        Err(e) => {
-            println!(
-                "smoke(stream_events): WARN — SSE GET failed ({e}) — skipping SSE comparison"
-            );
         }
     }
 
@@ -313,11 +353,8 @@ async fn stream_events_smoke() {
         .into_inner();
 
     // Collect the next event from the reopen (or time out).
-    let reopen_result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        reopen_stream.message(),
-    )
-    .await;
+    let reopen_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), reopen_stream.message()).await;
 
     match reopen_result {
         Ok(Ok(Some(ev))) => {
@@ -432,7 +469,10 @@ async fn session_crud_smoke() {
         "newly created session {session_id} must appear in ListSessions; got {} rows",
         list_resp.sessions.len(),
     );
-    println!("smoke: ListSessions returned {} rows, found our session", list_resp.sessions.len());
+    println!(
+        "smoke: ListSessions returned {} rows, found our session",
+        list_resp.sessions.len()
+    );
 
     // ---- 3. GetSession ----
     let mut get_req = tonic::Request::new(app::GetSessionRequest {

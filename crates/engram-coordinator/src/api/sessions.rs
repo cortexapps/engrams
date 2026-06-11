@@ -549,8 +549,14 @@ async fn build_principal_identity_env(
     let image_uri: ImageRef = req.image.clone();
     if let Ok(Some(enabled)) = state.services.meta.get_enabled_image(&image_uri).await {
         if let Ok(manifest) = toml::from_str::<ImageManifest>(&enabled.manifest_toml) {
-            inject_user_claude_token(state, principal, manifest.harness.as_ref(), req.mode, &mut env)
-                .await;
+            inject_user_claude_token(
+                state,
+                principal,
+                manifest.harness.as_ref(),
+                req.mode,
+                &mut env,
+            )
+            .await;
         }
     }
     env

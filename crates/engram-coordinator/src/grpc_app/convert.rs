@@ -82,7 +82,10 @@ pub(crate) fn session_list_item_to_proto(item: SessionListItem) -> app::SessionL
 pub(crate) fn list_sessions_to_proto(resp: ListSessionsResponse) -> app::ListSessionsResponse {
     let ListSessionsResponse { sessions } = resp;
     app::ListSessionsResponse {
-        sessions: sessions.into_iter().map(session_list_item_to_proto).collect(),
+        sessions: sessions
+            .into_iter()
+            .map(session_list_item_to_proto)
+            .collect(),
     }
 }
 

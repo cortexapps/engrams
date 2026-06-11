@@ -144,10 +144,9 @@ impl app::session_service_server::SessionService for AppSessionService {
         // translation is the orchestrator's job; we do not touch it here.
         let since: Option<i64> = r.since;
 
-        let (replayed, live_rx) =
-            crate::api::events::events_core(&self.state, id, since)
-                .await
-                .map_err(super::into_status)?;
+        let (replayed, live_rx) = crate::api::events::events_core(&self.state, id, since)
+            .await
+            .map_err(super::into_status)?;
 
         let replay_high_water = replayed
             .last()
@@ -181,31 +180,28 @@ impl app::session_service_server::SessionService for AppSessionService {
         // Lagged → special SessionEvent with kind="lagged", idx unset,
         // payload_json={"missed":n} — exact rule from events.rs:102-106.
         use tokio_stream::wrappers::BroadcastStream;
-        let live_stream = BroadcastStream::new(live_rx).filter_map(
-            move |recv| async move {
-                match recv {
-                    Ok(indexed) if indexed.idx > replay_high_water => {
-                        let payload =
-                            serde_json::to_value(&indexed.event).unwrap_or(serde_json::Value::Null);
-                        let payload_json =
-                            crate::api::events::with_rewind_meta(payload, 0, false);
-                        Some(Ok(app::SessionEvent {
-                            idx: Some(indexed.idx),
-                            kind: indexed.event.kind().to_string(),
-                            payload_json,
-                        }))
-                    }
-                    Ok(_) => None,
-                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                        Some(Ok(app::SessionEvent {
-                            idx: None,
-                            kind: "lagged".to_string(),
-                            payload_json: format!(r#"{{"missed":{n}}}"#),
-                        }))
-                    }
+        let live_stream = BroadcastStream::new(live_rx).filter_map(move |recv| async move {
+            match recv {
+                Ok(indexed) if indexed.idx > replay_high_water => {
+                    let payload =
+                        serde_json::to_value(&indexed.event).unwrap_or(serde_json::Value::Null);
+                    let payload_json = crate::api::events::with_rewind_meta(payload, 0, false);
+                    Some(Ok(app::SessionEvent {
+                        idx: Some(indexed.idx),
+                        kind: indexed.event.kind().to_string(),
+                        payload_json,
+                    }))
                 }
-            },
-        );
+                Ok(_) => None,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    Some(Ok(app::SessionEvent {
+                        idx: None,
+                        kind: "lagged".to_string(),
+                        payload_json: format!(r#"{{"missed":{n}}}"#),
+                    }))
+                }
+            }
+        });
 
         // RAII teardown guard: when the stream future is dropped
         // (client disconnects), log at debug level. The broadcast
