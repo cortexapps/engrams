@@ -822,6 +822,16 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// Peek: is the per-session lease currently held (an eviction /
+    /// resume / live migration in flight)? Read-only — never acquires.
+    /// Used by user-facing forwards (prompt) to HOLD delivery instead
+    /// of writing into a frozen sandbox's vsock buffer, which a live
+    /// move then destroys with the source (prod session 284d72e3: a
+    /// prompt sent mid-teleport vanished and the UI hung "working…").
+    async fn session_lease_held(&self, _session_id: SessionId) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
     /// ADR 0045 D5 / issue #147: refresh a held lease's `locked_at` so a
     /// long-running owner (the eviction finalize task awaiting a slow
     /// upload) is never reaped mid-work by `sweep_stale_session_leases`.

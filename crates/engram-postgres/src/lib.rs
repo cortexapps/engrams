@@ -2360,6 +2360,16 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn session_lease_held(&self, session_id: SessionId) -> Result<bool, MetaError> {
+        let row: Option<(uuid::Uuid,)> =
+            sqlx::query_as("SELECT session_id FROM session_lease WHERE session_id = $1")
+                .bind(session_id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        Ok(row.is_some())
+    }
+
     async fn touch_session_lease(
         &self,
         session_id: SessionId,

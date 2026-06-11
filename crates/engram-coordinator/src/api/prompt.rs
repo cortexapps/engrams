@@ -43,6 +43,42 @@ pub async fn prompt(
     // no-op.
     crate::api::snapshot::ensure_active(&state, id).await?;
 
+    // HOLD delivery while a lease-holding op (live migration /
+    // eviction / resume) is in flight. The freeze window starts at
+    // the capture pause — BEFORE any session-state transition — so
+    // state checks can't cover it, but the lease (taken before the
+    // pause) can. Forwarding into the window writes the prompt into
+    // a frozen sandbox's vsock buffer, which the move's commit then
+    // destroys with the source: the message vanishes and the UI hangs
+    // "working…" (prod session 284d72e3). Poll until released (a
+    // worst-case move is ~20s; budget 60s), then resolve the sandbox
+    // FRESH so the forward lands on the post-move sandbox.
+    let hold_budget = std::time::Duration::from_secs(60);
+    let hold_start = std::time::Instant::now();
+    let mut held = false;
+    while state
+        .services
+        .meta
+        .session_lease_held(id)
+        .await
+        .unwrap_or(false)
+    {
+        if hold_start.elapsed() > hold_budget {
+            return Err(ApiError::Conflict(
+                "session is mid-move (lease held for over 60s); retry shortly".into(),
+            ));
+        }
+        held = true;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if held {
+        tracing::info!(
+            session_id = %id,
+            held_ms = hold_start.elapsed().as_millis() as u64,
+            "prompt held during an in-flight session move, delivering now",
+        );
+    }
+
     let sandbox_id = state.registry.get(id).ok_or_else(|| {
         // After ensure_active, an Active session must have a sandbox
         // bound. If not, we hit a state we don't have a clean
