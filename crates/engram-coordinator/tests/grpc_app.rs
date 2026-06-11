@@ -306,38 +306,46 @@ fn bearer(
 }
 
 /// Happy path: a server configured with `TEST_TOKEN`, called with a
-/// matching bearer, passes auth and reaches the Task 8 stub on all five
-/// services — `Unimplemented` "ADR 0039 phase 2". Proves auth lets the
-/// right caller through and that every service is mounted.
+/// matching bearer, passes auth.
+///
+/// Task 10: SessionService's unary six (ListSessions, GetSession,
+/// DeleteSession, CreateSession, SendPrompt, Interrupt) are now real
+/// implementations. `ListSessions` returns an empty list against the
+/// in-memory state; the other four services still respond
+/// `Unimplemented` "ADR 0039 phase 2" (Tasks 11-13). Proves all five
+/// services are mounted on the listener.
 #[tokio::test]
 async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
     let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
 
     let channel = dial(addr).await;
 
-    // The plan's Task 8 outcome, now gated behind auth: ListSessions
-    // answers Unimplemented for an authenticated caller.
-    let err = app::session_service_client::SessionServiceClient::with_interceptor(
+    // Task 10: ListSessions is now implemented — returns an empty list
+    // against the stub MetadataStore (no sessions exist in the
+    // in-memory fixture). Previously returned Unimplemented; now Ok.
+    let resp = app::session_service_client::SessionServiceClient::with_interceptor(
         channel.clone(),
         bearer(TEST_TOKEN),
     )
     .list_sessions(app::ListSessionsRequest::default())
     .await
-    .expect_err("scaffold must refuse ListSessions");
-    assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
-    assert_eq!(err.message(), "ADR 0039 phase 2");
+    .expect("ListSessions must succeed with a valid bearer (Task 10 implemented)");
+    assert!(
+        resp.into_inner().sessions.is_empty(),
+        "stub state has no sessions — list must be empty"
+    );
 
     // One probe per remaining service proves all five are mounted on
     // the one listener (an unmounted service would answer
     // `Unimplemented` too via tonic's fallback — but with a different
-    // message, so the message assert above plus these keep us honest).
+    // message, so the message assert here plus these keep us honest).
     let err = app::fleet_service_client::FleetServiceClient::with_interceptor(
         channel.clone(),
         bearer(TEST_TOKEN),
     )
     .list_hosts(app::ListHostsRequest::default())
     .await
-    .expect_err("scaffold must refuse ListHosts");
+    .expect_err("FleetService stubs must still refuse (Tasks 11-13 pending)");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
 
@@ -347,7 +355,7 @@ async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
     )
     .list_enabled_images(app::ListEnabledImagesRequest::default())
     .await
-    .expect_err("scaffold must refuse ListEnabledImages");
+    .expect_err("ImageService stubs must still refuse (Tasks 11-13 pending)");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
 
@@ -357,7 +365,7 @@ async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
     )
     .has_secret(app::HasSecretRequest::default())
     .await
-    .expect_err("scaffold must refuse HasSecret");
+    .expect_err("SecretService stubs must still refuse (Tasks 11-13 pending)");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
 
@@ -368,7 +376,7 @@ async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
     )
     .relay(outbound)
     .await
-    .expect_err("scaffold must refuse Relay");
+    .expect_err("ShellRelayService stubs must still refuse (Task 21 pending)");
     assert_eq!(err.code(), tonic::Code::Unimplemented, "{err:?}");
     assert_eq!(err.message(), "ADR 0039 phase 2");
 
