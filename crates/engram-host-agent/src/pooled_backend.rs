@@ -237,6 +237,10 @@ pub struct PooledBackend {
     /// `prepare_resume_nbd_attach` (keyed by the provisional ref).
     inline_disk_manifests:
         Arc<DashMap<engram_core::types::manifest::ManifestRef, engram_chunk_store::Manifest>>,
+    /// ADR 0045 C2 (source): the post-copy page server. Set once at
+    /// host-agent startup when the 9102 listener is configured; the C2
+    /// capture registers `PeerExport`s here after its pagemap scan.
+    migrate_peer: Arc<std::sync::OnceLock<Arc<crate::migrate_peer::PeerServer>>>,
 }
 
 impl PooledBackend {
@@ -516,7 +520,21 @@ impl PooledBackend {
             snapshot_waits: Arc::new(DashMap::new()),
             migrations: Arc::new(crate::migration::MigrationRegistry::default()),
             inline_disk_manifests: Arc::new(DashMap::new()),
+            migrate_peer: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// ADR 0045 C2: install the page server handle (startup wiring; a
+    /// second call is a startup-order bug and is ignored with a warn).
+    pub fn set_migrate_peer_server(&self, server: Arc<crate::migrate_peer::PeerServer>) {
+        if self.migrate_peer.set(server).is_err() {
+            tracing::warn!("migrate-peer server already set; ignoring duplicate");
+        }
+    }
+
+    /// ADR 0045 C2: the page server, when the host runs one.
+    pub fn migrate_peer_server(&self) -> Option<Arc<crate::migrate_peer::PeerServer>> {
+        self.migrate_peer.get().cloned()
     }
 
     /// ADR 0028 Fix A: enable checkpoint chains, rooted at `dir`

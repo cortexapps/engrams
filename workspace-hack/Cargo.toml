@@ -44,7 +44,7 @@ idna = { version = "1" }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-nix = { version = "0.31", default-features = false, features = ["fs", "sched", "signal"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "sched", "signal", "uio"] }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }

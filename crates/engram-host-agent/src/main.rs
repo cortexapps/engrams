@@ -74,6 +74,18 @@ struct Cli {
     #[arg(long, env = "ENGRAM_GRPC_ADVERTISE_ADDR")]
     grpc_advertise_addr: Option<String>,
 
+    /// ADR 0045 C2: bind address for the post-copy page-server
+    /// listener. The DEST sandbox's uffd-handler dials it during a
+    /// live migration; per-export token auth keeps it inert
+    /// otherwise. `0.0.0.0:9102` by default; empty string or
+    /// `disabled` skips it.
+    #[arg(
+        long,
+        env = "ENGRAM_MIGRATE_PEER_LISTEN_ADDR",
+        default_value = "0.0.0.0:9102"
+    )]
+    migrate_peer_listen_addr: String,
+
     /// Which sandbox backend to wrap. `firecracker` (Linux+KVM) or
     /// `vz` (macOS Apple Silicon). The Process backend is a test
     /// fixture and is intentionally not selectable here.
@@ -209,6 +221,8 @@ async fn main() -> Result<(), HostAgentError> {
     // split-mode where the coord and host-agent run on the same box).
     let (grpc_listen_addr, grpc_port) = parse_grpc_listen(&cli.grpc_listen_addr);
     let grpc_advertise_addr = resolve_advertise_addr(cli.grpc_advertise_addr.clone(), grpc_port);
+    // ADR 0045 C2: same empty/"disabled" semantics as the gRPC listener.
+    let (migrate_peer_listen_addr, _) = parse_grpc_listen(&cli.migrate_peer_listen_addr);
 
     let cfg = HostAgentConfig {
         work_dir: cli.work_dir.clone(),
@@ -216,6 +230,7 @@ async fn main() -> Result<(), HostAgentError> {
         coordinator_token: cli.coordinator_token.clone(),
         grpc_listen_addr,
         grpc_advertise_addr,
+        migrate_peer_listen_addr,
         ..HostAgentConfig::default()
     };
 

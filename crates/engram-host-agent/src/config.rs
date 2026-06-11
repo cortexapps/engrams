@@ -35,6 +35,13 @@ pub struct HostAgentConfig {
     /// `POST /api/hosts/register`. Typically `http://<pod-ip>:9101`,
     /// injected by the chart on K8s. `None` skips registration (mode=all).
     pub grpc_advertise_addr: Option<String>,
+    /// ADR 0045 C2: bind address for the post-copy page-server listener
+    /// (`migrate_peer::PeerServer`, default `0.0.0.0:9102` in
+    /// production). The DEST sandbox's uffd-handler dials it during a
+    /// live migration; auth is the per-export token, so the listener is
+    /// inert without an in-flight export. `None` disables it (mode=all
+    /// dev, non-Linux).
+    pub migrate_peer_listen_addr: Option<std::net::SocketAddr>,
 }
 
 impl Default for HostAgentConfig {
@@ -50,6 +57,7 @@ impl Default for HostAgentConfig {
                 .expect("default harness_listen_addr must parse"),
             grpc_listen_addr: None,
             grpc_advertise_addr: None,
+            migrate_peer_listen_addr: None,
         }
     }
 }

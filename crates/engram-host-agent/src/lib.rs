@@ -26,11 +26,13 @@ pub mod bundles;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
+pub mod dirty_map;
 pub mod disk_daemon;
 pub mod egress;
 pub mod grpc_server;
 pub mod harness;
 pub mod host_client;
+pub mod migrate_peer;
 pub mod migration;
 pub use host_client::LocalHostClient;
 pub mod heartbeat;
@@ -641,6 +643,23 @@ impl HostAgent {
                 tokio::spawn(async move {
                     if let Err(e) = grpc_server::boot(addr, local_for_grpc, admin_for_grpc).await {
                         tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
+                    }
+                })
+            });
+
+            // ADR 0045 C2: the post-copy page server (TCP 9102). Auth is
+            // the per-export token, so the listener is inert until a C2
+            // capture registers an export. The handle rides on the pooled
+            // backend so the capture path can reach the registry.
+            let _migrate_peer_task = self.cfg.migrate_peer_listen_addr.map(|addr| {
+                let server = migrate_peer::PeerServer::new(
+                    self.chunk_cache.clone(),
+                    self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
+                );
+                pooled.set_migrate_peer_server(server.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = server.serve(addr).await {
+                        tracing::error!(addr = %addr, error = %e, "migrate-peer server terminated with error");
                     }
                 })
             });

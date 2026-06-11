@@ -28,6 +28,7 @@ path = "src/main.rs"
 engram-core.workspace = true
 engram-protocol.workspace = true
 engram-chunk-store.workspace = true
+engram-migrate-proto.workspace = true
 engram-storage-local.workspace = true
 engram-storage-gcs.workspace = true
 engram-egress-proxy.workspace = true
@@ -68,9 +69,11 @@ reqwest.workspace = true
 # For the disk-pressure detector's statvfs-based free-space probe.
 # Linux + macOS both expose statvfs; nix's `fs` feature wraps it.
 # `sched` is needed on Linux for ADR 0014 issue #6's ProxyShell
-# netns-dial (setns + CloneFlags). The `sched` module compiles to
-# a no-op on non-Linux so adding the feature here is portable.
-nix = { version = "0.31", default-features = false, features = ["fs", "sched"] }
+# netns-dial (setns + CloneFlags). `uio` wraps process_vm_readv for
+# ADR 0045 C2's page server (a safe API — no new unsafe in this
+# crate). The extra modules compile to no-ops on non-Linux so the
+# features are portable.
+nix = { version = "0.31", default-features = false, features = ["fs", "sched", "uio"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 engram-telemetry.workspace = true
