@@ -876,14 +876,33 @@ async fn get_artifact_not_found_smoke() {
 }
 
 /// `ShellRelayService.Relay` smoke: open a relay to a dev_vm session,
-/// send an `open` frame, verify the stream opens cleanly, drop the
-/// client, and confirm a second acquire works (lease released).
+/// drive a live `echo hi` through the shell, assert output is received,
+/// then drop cleanly and confirm health via GetSession.
+///
+/// ## Why mpsc instead of a fixed iterator
+///
+/// The server bridge (`grpc_app/shell_relay.rs`) runs `g2t` and `t2g`
+/// in a `select!`. When the client → server stream ends (iterator
+/// exhausted), `g2t` finishes, `select!` picks it up and the relay
+/// task tears down before ttyd's output arrives. The correct approach
+/// is to keep the request stream OPEN while reading, and only close it
+/// (drop the sender) once we have confirmed output.
+///
+/// ## ttyd wire protocol
+///
+/// Mirrored from `web/src/components/TerminalPane.tsx`:
+/// - First frame (text, JSON): `{"AuthToken":"","columns":80,"rows":24}`
+///   — ttyd requires this to initialize the PTY.
+/// - Subsequent input (text): `"0"` + raw bytes  (ASCII 0x30 = output)
+/// - Server output (binary): byte 0x30 (`'0'`) + terminal bytes
+/// - Server title/prefs (binary): bytes 0x31/0x32 + payload (ignored here)
 ///
 /// Env-gated like the other smokes.
 #[tokio::test]
 #[ignore = "requires a running dev stack (just dev + just smoke-control-plane)"]
 async fn shell_relay_smoke() {
     use engram_protocol::app::shell_relay_service_client::ShellRelayServiceClient;
+    use tokio_stream::wrappers::ReceiverStream;
 
     let Some((addr, token)) = grpc_addr_and_token() else {
         return;
@@ -922,113 +941,255 @@ async fn shell_relay_smoke() {
         .session_id;
     println!("smoke(relay): session {session_id}");
 
-    // Open a Relay stream, send input, and verify we get output back.
+    // Open a Relay stream held open via mpsc, drive a live echo, assert output.
     {
         let mut relay_client = ShellRelayServiceClient::with_interceptor(
             channel.clone(),
             bearer_interceptor(token.clone()),
         );
 
-        // Build a request stream: open + one echo command.
-        // The \r (carriage return) is what ttyd/the terminal expects as the
-        // line terminator (it's a pseudo-TTY, not a pipe).
-        let open_frame = app::RelayShellRequest {
-            frame: Some(app::relay_shell_request::Frame::Open(app::ShellOpen {
-                session_id: session_id.clone(),
-            })),
-        };
-        let echo_frame = app::RelayShellRequest {
-            frame: Some(app::relay_shell_request::Frame::Text(
-                "echo hi\r".to_string(),
-            )),
-        };
-        let req_stream = futures::stream::iter(vec![open_frame, echo_frame]);
-        let mut relay_req = tonic::Request::new(req_stream);
-        relay_req.set_timeout(std::time::Duration::from_secs(15));
+        // Drive the request stream from an mpsc sender so we can keep it
+        // open while reading response frames. Dropping the sender closes
+        // the stream and signals the server bridge to tear down cleanly.
+        //
+        // IMPORTANT: the `open` frame and the ttyd auth JSON are buffered
+        // into the channel (capacity 8) BEFORE calling `.relay()`. The
+        // server's `relay` handler awaits `inbound.next()` for the open
+        // frame before it even starts processing; if we send it after
+        // `.relay().await`, we deadlock — the client waits for the server
+        // to accept the RPC, and the server waits for the first frame.
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel::<app::RelayShellRequest>(8);
 
-        match relay_client.relay(relay_req).await {
-            Ok(resp) => {
-                // Stream opened — read frames looking for any output after input.
-                let mut stream = resp.into_inner();
-                let mut got_output_frame = false;
-                let echo_deadline = std::time::Duration::from_secs(15);
+        // ---- 1. Buffer the `open` frame ----
+        req_tx
+            .try_send(app::RelayShellRequest {
+                frame: Some(app::relay_shell_request::Frame::Open(app::ShellOpen {
+                    session_id: session_id.clone(),
+                })),
+            })
+            .expect("buffer open frame (channel is empty)");
 
-                let read_result = tokio::time::timeout(echo_deadline, async {
-                    // Read frames until we see a text/binary output frame.
-                    loop {
-                        match stream.message().await {
-                            Ok(Some(msg)) => {
-                                match &msg.frame {
-                                    Some(engram_protocol::app::relay_shell_response::Frame::Text(t)) => {
-                                        println!("smoke(relay): got text output frame: {:?}", &t[..t.len().min(80)]);
-                                        got_output_frame = true;
-                                        break;
-                                    }
-                                    Some(engram_protocol::app::relay_shell_response::Frame::Binary(b)) => {
-                                        println!("smoke(relay): got binary output frame ({} bytes)", b.len());
-                                        got_output_frame = true;
-                                        break;
-                                    }
-                                    other => {
-                                        println!("smoke(relay): got non-output frame: {:?}", other.as_ref().map(|f| match f {
-                                            engram_protocol::app::relay_shell_response::Frame::Close(_) => "close",
-                                            engram_protocol::app::relay_shell_response::Frame::Ping(_) => "ping",
-                                            engram_protocol::app::relay_shell_response::Frame::Pong(_) => "pong",
-                                            _ => "?",
-                                        }));
-                                        // Keep reading — skip non-output frames.
-                                    }
-                                }
+        // ---- 2. Buffer the ttyd auth/resize JSON (first content frame) ----
+        // ttyd's WebSocket protocol requires this JSON as the very first
+        // non-handshake frame before it will honour input. Without it the
+        // PTY is not initialized and keystrokes are silently dropped.
+        // (Mirrored from TerminalPane.tsx `localWs.onopen` handler.)
+        req_tx
+            .try_send(app::RelayShellRequest {
+                frame: Some(app::relay_shell_request::Frame::Text(
+                    r#"{"AuthToken":"","columns":80,"rows":24}"#.to_string(),
+                )),
+            })
+            .expect("buffer ttyd auth frame (channel has room)");
+
+        let req_stream = ReceiverStream::new(req_rx);
+        let relay_req = tonic::Request::new(req_stream);
+        // No RPC-level timeout on the request itself: we impose per-step
+        // deadlines on the response reads below, which is the right place.
+        // A request-level timeout races our response reads and cancels the
+        // entire bidi stream when the first deadline fires (the panic we
+        // saw: "Cancelled: Timeout expired" at relay() call time).
+
+        let mut stream = match relay_client.relay(relay_req).await {
+            Ok(resp) => resp.into_inner(),
+            Err(e) => {
+                if e.code() == tonic::Code::Unavailable {
+                    // ttyd may not be running on this no-harness image; skip
+                    // rather than fail so CI doesn't go red on infra variance.
+                    println!(
+                        "smoke(relay): SKIP — proxy_shell unavailable (ttyd not running on this \
+                         image): {e}"
+                    );
+                    // Cleanup the session we created.
+                    let mut del_req = tonic::Request::new(app::DeleteSessionRequest {
+                        session_id: session_id.clone(),
+                    });
+                    del_req.set_timeout(rpc_timeout);
+                    let _ = session_client.delete_session(del_req).await;
+                    return;
+                }
+                panic!("smoke(relay): unexpected error opening relay: {e}");
+            }
+        };
+
+        // ---- 3. Await the first output frame(s) (ttyd handshake / prompt) ----
+        // ttyd sends a preferences frame (0x32) and/or prompt output immediately
+        // on WS open. Wait for the first binary or text output frame before
+        // sending keystrokes — this synchronises us with ttyd's PTY boot.
+        let handshake_deadline = std::time::Duration::from_secs(10);
+        let got_handshake = tokio::time::timeout(handshake_deadline, async {
+            loop {
+                match stream.message().await {
+                    Ok(Some(msg)) => {
+                        match &msg.frame {
+                            Some(engram_protocol::app::relay_shell_response::Frame::Binary(b)) => {
+                                let decoded = String::from_utf8_lossy(b);
+                                println!(
+                                    "smoke(relay): handshake binary frame ({} bytes): {:?}",
+                                    b.len(),
+                                    &decoded[..decoded.len().min(120)],
+                                );
+                                return true;
                             }
-                            Ok(None) => {
-                                println!("smoke(relay): stream ended before output frame");
-                                break;
+                            Some(engram_protocol::app::relay_shell_response::Frame::Text(t)) => {
+                                println!(
+                                    "smoke(relay): handshake text frame: {:?}",
+                                    &t[..t.len().min(120)],
+                                );
+                                return true;
                             }
-                            Err(e) => {
-                                println!("smoke(relay): stream error reading output: {e}");
-                                break;
+                            other => {
+                                println!(
+                                    "smoke(relay): handshake non-output frame: {:?}",
+                                    other.as_ref().map(frame_kind_name),
+                                );
+                                // keep reading — ping/pong/close from ttyd setup
                             }
                         }
                     }
-                })
-                .await;
-
-                if read_result.is_err() {
-                    // Timed out waiting for output — not a hard failure if the
-                    // shell environment doesn't support echo (e.g. no PTY).
-                    // Print a loud diagnostic rather than panic so CI doesn't
-                    // go red on infra variance.
-                    println!(
-                        "smoke(relay): WARN — no output frame received within {echo_deadline:?} \
-                         after `echo hi\\r` input; ttyd PTY may not be fully interactive in this \
-                         image. The relay stream opened cleanly, which verifies the core path."
-                    );
-                } else if got_output_frame {
-                    println!("smoke(relay): relay stream opened, input sent, output frame received — full interactive loop verified");
-                } else {
-                    println!(
-                        "smoke(relay): relay stream opened and dropped cleanly (no output frame \
-                         before stream ended — shell may have closed immediately)"
-                    );
+                    Ok(None) => {
+                        panic!(
+                            "smoke(relay): stream ended during handshake — ttyd may have closed \
+                             immediately; check proxy_shell bridge or ttyd health"
+                        );
+                    }
+                    Err(e) => {
+                        panic!("smoke(relay): stream error during handshake: {e}");
+                    }
                 }
             }
-            Err(e) => {
-                // UNAVAILABLE is only tolerated for the initial open — the shell
-                // infra (ttyd) may be cold on the no-harness image.
-                if e.code() == tonic::Code::Unavailable {
-                    println!(
-                        "smoke(relay): WARN — proxy_shell unavailable (ttyd not running?): {e}"
-                    );
-                    println!("smoke(relay): lease guard drop-path exercised; skipping echo check");
-                } else {
-                    panic!("smoke(relay): unexpected error opening relay: {e}");
+        })
+        .await;
+
+        if got_handshake.is_err() {
+            panic!(
+                "smoke(relay): no output from ttyd within {handshake_deadline:?} after auth \
+                 frame — ttyd may not be responding; check proxy_shell bridge"
+            );
+        }
+
+        // ---- 4. Send `echo hi\r` with the ttyd input prefix ----
+        // ttyd's tty subprotocol: client input frames are text frames
+        // prefixed with the character '0' (ASCII 0x30). Without the
+        // prefix, ttyd treats the frame as an unknown command and discards
+        // the bytes. (See TerminalPane.tsx: `localWs.send(ttyClient.INPUT + data)`)
+        req_tx
+            .send(app::RelayShellRequest {
+                frame: Some(app::relay_shell_request::Frame::Text(
+                    "0echo hi\r".to_string(),
+                )),
+            })
+            .await
+            .expect("send echo input frame");
+
+        // ---- 5. Read until we see "hi" in an output frame ----
+        // ttyd output frames are binary with a 0x30 ('0') type prefix
+        // followed by the raw terminal bytes.  We decode lossily and
+        // check for the literal string "hi".  We also accept text frames
+        // (legacy ttyd behaviour) decoded directly.
+        let echo_deadline = std::time::Duration::from_secs(15);
+        let mut found_hi = false;
+        let mut echo_evidence: Option<String> = None;
+
+        let echo_result = tokio::time::timeout(echo_deadline, async {
+            loop {
+                match stream.message().await {
+                    Ok(Some(msg)) => {
+                        match &msg.frame {
+                            Some(engram_protocol::app::relay_shell_response::Frame::Binary(b)) => {
+                                // Strip the 0x30 output-type prefix if present.
+                                let payload = if b.first() == Some(&0x30) {
+                                    &b[1..]
+                                } else {
+                                    b.as_slice()
+                                };
+                                let decoded = String::from_utf8_lossy(payload).to_string();
+                                println!(
+                                    "smoke(relay): output binary frame ({} bytes): {:?}",
+                                    b.len(),
+                                    &decoded[..decoded.len().min(200)],
+                                );
+                                if decoded.contains("hi") {
+                                    return Some(decoded);
+                                }
+                            }
+                            Some(engram_protocol::app::relay_shell_response::Frame::Text(t)) => {
+                                println!(
+                                    "smoke(relay): output text frame: {:?}",
+                                    &t[..t.len().min(200)],
+                                );
+                                if t.contains("hi") {
+                                    return Some(t.clone());
+                                }
+                            }
+                            other => {
+                                println!(
+                                    "smoke(relay): non-output frame while waiting for echo: {:?}",
+                                    other.as_ref().map(frame_kind_name),
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Stream ended — relay torn down before we saw "hi".
+                        return None;
+                    }
+                    Err(e) => {
+                        panic!("smoke(relay): stream error while waiting for echo: {e}");
+                    }
                 }
+            }
+        })
+        .await;
+
+        match echo_result {
+            Ok(Some(evidence)) => {
+                found_hi = true;
+                echo_evidence = Some(evidence);
+            }
+            Ok(None) => {
+                // Stream closed before "hi" appeared.
+            }
+            Err(_) => {
+                // Timeout elapsed — will be caught by the assert below.
             }
         }
+
+        // HARD assertion: the echo must have been observed.
+        assert!(
+            found_hi,
+            "smoke(relay): FAIL — did not observe 'hi' in any output frame within \
+             {echo_deadline:?} after sending `echo hi\\r`; this indicates the relay bridge \
+             is not forwarding input to ttyd or ttyd is not sending output back"
+        );
+        println!(
+            "smoke(relay): PASS — echo evidence: {:?}",
+            echo_evidence
+                .as_deref()
+                .unwrap_or("<none>")
+                .chars()
+                .take(200)
+                .collect::<String>(),
+        );
+
+        // ---- 6. Drop the sender to close the request stream cleanly ----
+        // This signals the server bridge (g2t loop) that the client is done.
+        // The bridge tears down, releases the shell lease, and closes the
+        // response stream.
+        drop(req_tx);
+
+        // Drain any trailing frames until the response stream closes.
+        let drain_deadline = std::time::Duration::from_secs(3);
+        let _ = tokio::time::timeout(drain_deadline, async {
+            while let Ok(Some(_)) = stream.message().await {}
+        })
+        .await;
+
+        println!("smoke(relay): response stream drained cleanly after sender drop");
     }
 
     // Small sleep to let the drop-path lease release complete (async spawn).
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Verify the coordinator is still healthy: GetSession should work.
     let mut get_req = tonic::Request::new(app::GetSessionRequest {
@@ -1051,4 +1212,16 @@ async fn shell_relay_smoke() {
         .await
         .expect("DeleteSession");
     println!("smoke(relay): all checks passed");
+}
+
+/// Human-readable frame variant name for diagnostic prints.
+fn frame_kind_name(f: &engram_protocol::app::relay_shell_response::Frame) -> &'static str {
+    use engram_protocol::app::relay_shell_response::Frame;
+    match f {
+        Frame::Text(_) => "text",
+        Frame::Binary(_) => "binary",
+        Frame::Ping(_) => "ping",
+        Frame::Pong(_) => "pong",
+        Frame::Close(_) => "close",
+    }
 }
