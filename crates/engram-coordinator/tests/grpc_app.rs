@@ -276,6 +276,17 @@ async fn serve(state: Arc<AppState>) -> (std::net::SocketAddr, tokio::task::Join
     (addr, handle)
 }
 
+/// Dial the app-gRPC server at `addr` and return a connected channel.
+/// Extracted from the three tests below, which all open the same
+/// plaintext-HTTP/2 channel to an ephemeral 127.0.0.1 port.
+async fn dial(addr: std::net::SocketAddr) -> tonic::transport::Channel {
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint uri")
+        .connect()
+        .await
+        .expect("dial app gRPC")
+}
+
 /// tonic interceptor that stamps `Authorization: Bearer <token>` onto
 /// every outbound request — the only way to set per-call metadata short
 /// of hand-building each request.
@@ -302,11 +313,7 @@ fn bearer(
 async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
     let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
 
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-        .expect("endpoint uri")
-        .connect()
-        .await
-        .expect("dial app gRPC");
+    let channel = dial(addr).await;
 
     // The plan's Task 8 outcome, now gated behind auth: ListSessions
     // answers Unimplemented for an authenticated caller.
@@ -375,11 +382,7 @@ async fn app_grpc_scaffold_answers_unimplemented_with_valid_bearer() {
 async fn app_grpc_rejects_missing_and_wrong_bearer() {
     let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
 
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-        .expect("endpoint uri")
-        .connect()
-        .await
-        .expect("dial app gRPC");
+    let channel = dial(addr).await;
 
     // No Authorization metadata at all.
     let err = app::session_service_client::SessionServiceClient::new(channel.clone())
@@ -410,11 +413,7 @@ async fn app_grpc_rejects_missing_and_wrong_bearer() {
 async fn app_grpc_fails_closed_with_no_tokens_configured() {
     let (addr, server) = serve(test_state(vec![])).await;
 
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-        .expect("endpoint uri")
-        .connect()
-        .await
-        .expect("dial app gRPC");
+    let channel = dial(addr).await;
 
     let err = app::session_service_client::SessionServiceClient::with_interceptor(
         channel,

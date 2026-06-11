@@ -256,12 +256,13 @@ otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 # orchestrator's machine credential, deliberately separate from the
 # host-agents' ENGRAM_AUTH_TOKENS (different caller, different blast
 # radius). A fixed dev literal is fine here: deterministic across
-# restarts, never leaves loopback, never ships. The SAME value is
-# exported as CONTROL_PLANE_BEARER for the (future) orchestrator
-# resource (Task 14) so the two ends agree with no later wiring task —
-# Task 14 just reads `app_grpc_dev_token` / sets CONTROL_PLANE_BEARER.
+# restarts, never leaves loopback, never ships. The SAME value will
+# back the (future) orchestrator resource's CONTROL_PLANE_BEARER so the
+# two ends agree with no later wiring task — but that export does not
+# happen yet; Task 14 reads `app_grpc_dev_token` and sets it then.
 app_grpc_dev_token = env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token')
-control_plane_bearer = app_grpc_dev_token  # orchestrator (Task 14) → CONTROL_PLANE_BEARER
+# placeholder — consumed by the orchestrator resource in ADR 0039 Task 14 as CONTROL_PLANE_BEARER
+control_plane_bearer = app_grpc_dev_token
 
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',

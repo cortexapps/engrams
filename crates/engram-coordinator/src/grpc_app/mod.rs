@@ -86,6 +86,7 @@ pub struct AppSessionService {
     pub auth: Arc<auth::BearerAuth>,
 }
 
+// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::session_service_server::SessionService for AppSessionService {
     async fn list_sessions(
@@ -229,6 +230,7 @@ pub struct AppShellRelayService {
     pub auth: Arc<auth::BearerAuth>,
 }
 
+// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService {
     type RelayStream = BoxStream<app::RelayShellResponse>;
@@ -248,6 +250,7 @@ pub struct AppFleetService {
     pub auth: Arc<auth::BearerAuth>,
 }
 
+// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::fleet_service_server::FleetService for AppFleetService {
     async fn list_hosts(
@@ -361,6 +364,7 @@ pub struct AppImageService {
     pub auth: Arc<auth::BearerAuth>,
 }
 
+// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::image_service_server::ImageService for AppImageService {
     async fn list_enabled_images(
@@ -450,6 +454,7 @@ pub struct AppSecretService {
     pub auth: Arc<auth::BearerAuth>,
 }
 
+// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::secret_service_server::SecretService for AppSecretService {
     async fn put_secret(
@@ -474,5 +479,70 @@ impl app::secret_service_server::SecretService for AppSecretService {
     ) -> Result<Response<app::DeleteSecretResponse>, Status> {
         self.auth.check(&req)?;
         Err(Status::unimplemented(UNIMPLEMENTED))
+    }
+}
+
+#[cfg(test)]
+mod convention {
+    //! Source-scan guard for the fail-closed auth convention (ADR 0039
+    //! §5): EVERY app-gRPC RPC body must begin with `self.auth.check(&req)?`
+    //! before it does anything else. The five service impls hand-roll
+    //! that line in each method (no tower layer — see `auth::BearerAuth`),
+    //! so nothing structural stops a future RPC from silently skipping it.
+    //! This test counts, in the source, one auth check per `async fn` and
+    //! fails loudly if they ever diverge.
+    //!
+    //! ==========================================================
+    //! IMPLEMENTERS, READ THIS — Tasks 10-13 rewrite all 43 stub
+    //! bodies and WILL split the services into per-file modules.
+    //! When you add a new file under `src/grpc_app/` that holds RPC
+    //! `async fn`s, ADD IT to `SOURCES` below (one `include_str!`
+    //! line per file). The scan only sees files listed here; a new
+    //! service file that isn't listed is invisible to this guard and
+    //! its missing auth checks will NOT be caught.
+    //! ==========================================================
+
+    /// Every grpc_app source file that contains RPC `async fn`s. Each
+    /// entry is `include_str!`'d and scanned. Append new per-service
+    /// files here as Tasks 10-13 split them out of `mod.rs`.
+    const SOURCES: &[(&str, &str)] = &[("mod.rs", include_str!("mod.rs"))];
+
+    /// The auth line that must open every RPC body. The trailing `;` is
+    /// load-bearing: it distinguishes a real call site from the prose
+    /// banner comment above each impl block (which writes the same
+    /// expression followed by ` — see auth.rs …`, no semicolon) so the
+    /// banners don't inflate the count.
+    const AUTH_CHECK: &str = "self.auth.check(&req)?;";
+
+    /// Marker that begins this test module. We scan only the source
+    /// *above* it so the literals in this very file (the `AUTH_CHECK`
+    /// const, the failure messages, the `async fn` in any future test
+    /// helpers) don't pollute the counts.
+    const TEST_MODULE_MARKER: &str = "#[cfg(test)]\nmod convention";
+
+    #[test]
+    fn every_rpc_starts_with_an_auth_check() {
+        for (name, full_src) in SOURCES {
+            // Scan only the non-test portion of each file.
+            let src = match full_src.find(TEST_MODULE_MARKER) {
+                Some(idx) => &full_src[..idx],
+                None => full_src,
+            };
+
+            let rpc_count = src.matches("async fn ").count();
+            let check_count = src.matches(AUTH_CHECK).count();
+
+            assert_eq!(
+                check_count, rpc_count,
+                "AUTH CONVENTION VIOLATED in src/grpc_app/{name}: found {rpc_count} \
+                 `async fn ` RPC method(s) but {check_count} `{AUTH_CHECK}` call(s). \
+                 Every app-gRPC RPC body MUST begin with `{AUTH_CHECK}` before any \
+                 other logic (ADR 0039 §5, fail-closed machine auth — see \
+                 src/grpc_app/auth.rs). Open src/grpc_app/{name}, find the RPC `async fn` \
+                 that is missing the leading `{AUTH_CHECK}`, and add it. If you added a \
+                 NEW per-service file, also add it to the `SOURCES` list in this test \
+                 (src/grpc_app/mod.rs, mod convention)."
+            );
+        }
     }
 }

@@ -19,8 +19,15 @@ pub struct BearerAuth {
 }
 
 impl BearerAuth {
+    /// Drops empty-string tokens at construction: an empty token can
+    /// never be valid credentials (and would otherwise match an empty
+    /// presented bearer). The CLI layer in `main.rs` already filters
+    /// these out; this is defense in depth for other construction sites
+    /// (tests, future callers) that don't.
     pub fn new(tokens: Vec<String>) -> Self {
-        Self { tokens }
+        Self {
+            tokens: tokens.into_iter().filter(|t| !t.is_empty()).collect(),
+        }
     }
 
     /// Per-RPC check, called at the top of every stub. Sync on purpose
@@ -40,6 +47,11 @@ impl BearerAuth {
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
+            // Byte-exact, case-sensitive scheme match: RFC 9110 makes the
+            // `Bearer` scheme token case-insensitive, but we deliberately
+            // don't honor that — one in-house machine caller we control,
+            // which always sends exactly `Bearer `, so a stricter match is
+            // a smaller surface with zero real-world cost.
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| tonic::Status::unauthenticated("missing bearer token"))?;
         // Linear scan + constant-time byte compare per entry, the same
