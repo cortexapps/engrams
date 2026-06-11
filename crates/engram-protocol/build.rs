@@ -1,13 +1,25 @@
-//! Compile the `host_service.proto` schema (ADR 0013) into Rust
-//! tonic + prost bindings. Output goes to `$OUT_DIR/engram.host.v1.rs`
-//! and is `include!`'d from `src/grpc.rs`.
+//! Compile the proto schemas into Rust tonic + prost bindings:
 //!
-//! Reruns the codegen only when the proto file itself changes — the
+//! - `host_service.proto` (ADR 0013) → `$OUT_DIR/engram.host.v1.rs`,
+//!   `include!`'d from `src/grpc.rs`.
+//! - `engram/app/v1/*.proto` (ADR 0039 control plane) →
+//!   `$OUT_DIR/engram.app.v1.rs`, `include!`'d from `src/app.rs`.
+//!   `task.proto` is deliberately absent: tasks are orchestrator-native
+//!   (ADR 0039 §3) and the coordinator must not accrete task concepts.
+//!
+//! Reruns the codegen only when the proto files themselves change — the
 //! `tonic-build` defaults already do this via cargo's
 //! `rerun-if-changed` directive on the protos we pass.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let protos = ["proto/host_service.proto"];
+    let protos = [
+        "proto/host_service.proto",
+        "proto/engram/app/v1/session.proto",
+        "proto/engram/app/v1/fleet.proto",
+        "proto/engram/app/v1/image.proto",
+        "proto/engram/app/v1/secret.proto",
+        // task.proto is deliberately absent: orchestrator-native (ADR §3).
+    ];
     let includes = ["proto"];
     tonic_build::configure()
         .build_server(true)
