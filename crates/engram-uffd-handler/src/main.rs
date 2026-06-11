@@ -164,6 +164,20 @@ mod linux {
         /// MISSING|MINOR; canonical faults resolve via UFFDIO_CONTINUE
         /// (shared), divergent via UFFDIO_COPY (private). Off when unset.
         pub base_shm: Option<PathBuf>,
+        /// ADR 0045 C2 (post-copy destination): `host:port` of the SOURCE
+        /// host-agent's page server. With `--peer-export-id`, arms peer
+        /// mode: connect + authenticate + block for the `Seal` BEFORE
+        /// binding the FC-facing UDS (so "FC can load" ⇒ "seal held"),
+        /// then serve sealed faults from the peer and drain the rest in
+        /// the background. The token rides `ENGRAM_PEER_TOKEN` (argv
+        /// leaks via /proc/*/cmdline); `--peer-token` is a dev override.
+        pub peer_addr: Option<String>,
+        pub peer_export_id: Option<String>,
+        pub peer_token: Option<String>,
+        /// ADR 0045 C2: bind a UnixListener here and stream one-way
+        /// `HandlerControl` reports (Sealed/DrainProgress/DrainDone/
+        /// PeerLost) to whichever host-agent dials in.
+        pub control_sock: Option<PathBuf>,
     }
 
     pub fn parse_args() -> Result<Args, String> {
@@ -179,6 +193,10 @@ mod linux {
         let mut cache_budget_bytes: u64 = DEFAULT_CACHE_BUDGET_BYTES;
         let mut recorder_window_ms: u64 = DEFAULT_RECORDER_WINDOW_MS;
         let mut base_shm: Option<PathBuf> = None;
+        let mut peer_addr: Option<String> = None;
+        let mut peer_export_id: Option<String> = None;
+        let mut peer_token: Option<String> = None;
+        let mut control_sock: Option<PathBuf> = None;
 
         let mut argv = std::env::args().skip(1);
         while let Some(arg) = argv.next() {
@@ -262,6 +280,30 @@ mod linux {
                         .parse::<u64>()
                         .map_err(|e| format!("--recorder-window-ms {v:?}: {e}"))?;
                 }
+                "--peer-addr" => {
+                    peer_addr = Some(
+                        argv.next()
+                            .ok_or_else(|| "--peer-addr requires a value".to_string())?,
+                    );
+                }
+                "--peer-export-id" => {
+                    peer_export_id = Some(
+                        argv.next()
+                            .ok_or_else(|| "--peer-export-id requires a value".to_string())?,
+                    );
+                }
+                "--peer-token" => {
+                    peer_token = Some(
+                        argv.next()
+                            .ok_or_else(|| "--peer-token requires a value".to_string())?,
+                    );
+                }
+                "--control-sock" => {
+                    control_sock =
+                        Some(PathBuf::from(argv.next().ok_or_else(|| {
+                            "--control-sock requires a value".to_string()
+                        })?));
+                }
                 "-h" | "--help" => {
                     eprintln!("{HELP}");
                     std::process::exit(0);
@@ -277,6 +319,25 @@ mod linux {
             .ok_or_else(|| "--session-manifest <uuid>@v<n> is required".to_string())?;
         let cache_root = cache_root.unwrap_or_else(|| PathBuf::from("/var/cache/engram/chunks"));
 
+        // Peer mode is all-or-nothing: addr + export id together, the
+        // token from the env (or the dev-override flag).
+        if peer_addr.is_some() != peer_export_id.is_some() {
+            return Err("--peer-addr and --peer-export-id are required together".to_string());
+        }
+        if peer_addr.is_some() {
+            if peer_token.is_none() {
+                peer_token = std::env::var("ENGRAM_PEER_TOKEN")
+                    .ok()
+                    .filter(|t| !t.is_empty());
+            }
+            if peer_token.is_none() {
+                return Err(
+                    "peer mode needs a token: set ENGRAM_PEER_TOKEN (or --peer-token in dev)"
+                        .to_string(),
+                );
+            }
+        }
+
         Ok(Args {
             listen,
             canonical_manifest,
@@ -290,6 +351,10 @@ mod linux {
             cache_budget_bytes,
             recorder_window: Duration::from_millis(recorder_window_ms),
             base_shm,
+            peer_addr,
+            peer_export_id,
+            peer_token,
+            control_sock,
         })
     }
 
@@ -382,6 +447,60 @@ mod linux {
             None
         };
 
+        // ADR 0045 C2: peer mode. Ordering is the soundness story:
+        //   1. bind the control sock (host-agent can subscribe NOW);
+        //   2. connect the peer session — BLOCKS until the source's
+        //      capture registers the export and pushes the Seal (the
+        //      page server parks pre-capture Hellos);
+        //   3. only then bind the FC-facing UDS (inside run_listener).
+        // FC's snapshot load waits on the UDS path, so "FC can touch
+        // guest memory" structurally implies "seal held" — no fault is
+        // ever served without a classification.
+        let peer_wiring = match (args.peer_addr.as_ref(), args.peer_export_id.as_ref()) {
+            (Some(addr), Some(export_id)) => {
+                let control = match args.control_sock.as_ref() {
+                    Some(path) => {
+                        let tx = engram_uffd_handler::peer::ControlTx::bind(path)
+                            .map_err(|e| format!("bind --control-sock {}: {e}", path.display()))?;
+                        Some(Arc::new(tx))
+                    }
+                    None => None,
+                };
+                let token = args.peer_token.clone().expect("validated in parse_args");
+                let addr = addr.clone();
+                let export_id = export_id.clone();
+                let chunk_size = backend.chunk_size();
+                let total_bytes = backend.total_bytes();
+                // The dial blocks (server parks until capture) — do it off
+                // the async runtime.
+                let session = tokio::task::spawn_blocking(move || {
+                    engram_uffd_handler::peer::PeerSession::connect(
+                        addr,
+                        export_id,
+                        token,
+                        chunk_size,
+                        total_bytes,
+                    )
+                })
+                .await
+                .map_err(|e| format!("peer connect join: {e}"))?
+                .map_err(|e| format!("peer connect: {e}"))?;
+                let session = Arc::new(session);
+                if let Some(control) = control.as_ref() {
+                    control.report(engram_migrate_proto::HandlerControl::Sealed {
+                        dirty_chunks: session.seal().count_ones(),
+                        total_chunks: session.seal().chunk_count,
+                        at_unix_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0),
+                    });
+                }
+                Some((session, control))
+            }
+            _ => None,
+        };
+
         // ADR 0045 substrate (v2b): create + size the base shm file NOW —
         // before run_listener binds the UDS. The host-agent orders FC's
         // load (which open(O_RDONLY)s + mmaps this file) after the socket
@@ -408,7 +527,16 @@ mod linux {
             let trace_out = args.trace_output.clone();
             move || {
                 engram_uffd_handler::runtime::run_listener(
-                    listen, backend, handle, prefault, window, trace_out, base_shm,
+                    listen,
+                    backend,
+                    handle,
+                    engram_uffd_handler::runtime::RunListenerOpts {
+                        prefault_trace: prefault,
+                        recorder_window: window,
+                        trace_output: trace_out,
+                        base_shm,
+                        peer: peer_wiring,
+                    },
                 )
             }
         })
@@ -537,7 +665,16 @@ mod linux {
   [--publish-trace-host <host-uuid>] \\
   [--cache-root <path>] \\
   [--cache-budget-bytes <bytes>] \\
-  [--recorder-window-ms <ms>]
+  [--recorder-window-ms <ms>] \\
+  [--peer-addr <host:port> --peer-export-id <id> [--peer-token <tok>]] \\
+  [--control-sock <sock>]
+
+Peer mode (ADR 0045 C2, post-copy destination): with --peer-addr +
+--peer-export-id (token via ENGRAM_PEER_TOKEN), the handler connects
+to the SOURCE host-agent's page server, blocks for the sealed dirty
+bitmap BEFORE binding <sock>, serves sealed faults from the peer
+(sha-verified) and drains the rest in the background. --control-sock
+streams Sealed/DrainProgress/DrainDone/PeerLost to the host-agent.
 
 UFFD page-fault handler (ADR 0020 Route B). Firecracker connects to
 <sock>, hands over the guest's UFFD, and the handler serves every
