@@ -79,6 +79,9 @@ use crate::manifest::ChunkHash;
 /// floor is a host-level / env concern resolved inside
 /// [`ChunkCache::new`]. Override it via [`FREE_FLOOR_PCT_ENV_VAR`] /
 /// [`FREE_FLOOR_BYTES_ENV_VAR`].
+/// Default populate-path sweep debounce (see `write_local`).
+pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
+
 #[derive(Clone, Debug)]
 pub struct ChunkCacheConfig {
     /// Where cached chunks live. Typically a subdirectory of the
@@ -91,6 +94,9 @@ pub struct ChunkCacheConfig {
     /// alone. Enforced lazily: each `put` over the ceiling evicts oldest
     /// entries.
     pub budget_bytes: u64,
+    /// Minimum interval between populate-path eviction sweeps (see
+    /// `write_local`). 0 = sweep on every populate (test determinism).
+    pub sweep_debounce_ms: i64,
 }
 
 /// Default value for [`ChunkCacheConfig::budget_bytes`]: no absolute
@@ -131,6 +137,7 @@ impl ChunkCacheConfig {
         Self {
             root: root.into(),
             budget_bytes: NO_CEILING,
+            sweep_debounce_ms: DEFAULT_SWEEP_DEBOUNCE_MS,
         }
     }
 
@@ -317,6 +324,9 @@ struct CacheInner {
     /// the floor/ceiling is too tight for the working set. Drives
     /// `engram_chunk_cache_refetch_after_evict_total`.
     evicted_ring: Mutex<EvictedRing>,
+    /// Debounce for the populate-path eviction sweep (unix millis of
+    /// the last sweep). See `write_local`.
+    last_sweep_ms: std::sync::atomic::AtomicI64,
 }
 
 impl ChunkCache {
@@ -329,6 +339,7 @@ impl ChunkCache {
                 inflight: Mutex::new(HashMap::new()),
                 pinned: Mutex::new(HashMap::new()),
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
+                last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
             }),
         }
     }
@@ -346,6 +357,7 @@ impl ChunkCache {
                 inflight: Mutex::new(HashMap::new()),
                 pinned: Mutex::new(HashMap::new()),
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
+                last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
             }),
         }
     }
@@ -752,10 +764,38 @@ impl ChunkCache {
         fs::write(&tmp, bytes).await?;
         fs::rename(&tmp, &target).await?;
 
-        // Best-effort eviction sweep. Done synchronously so the
-        // caller's budget is honored on the next request; spawn it
-        // off-thread if profiling shows it's hurting tail latency.
-        self.evict_to_budget().await?;
+        // Best-effort eviction sweep, DEBOUNCED to at most once per
+        // interval across all writers. The previous per-write sweep
+        // (full two-level readdir + statvfs) cost 100-500 ms per
+        // populate on a loaded cache and sat under EVERY miss-path
+        // consumer — UFFD fault serving, parallel prefetch, the
+        // migration source's fetch fallback — compounding into the
+        // 25-115 s post-teleport tails (ADR 0045 C1; #184 fixed only
+        // the explicit put() callers). Budget enforcement still
+        // happens within the interval, which is plenty: the budget is
+        // a soft ceiling probed against a multi-GB cache.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let last = self
+            .inner
+            .last_sweep_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) >= self.inner.config.sweep_debounce_ms
+            && self
+                .inner
+                .last_sweep_ms
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            self.evict_to_budget().await?;
+        }
         Ok(())
     }
 
@@ -1069,6 +1109,7 @@ mod tests {
             ChunkCacheConfig {
                 root: cache_dir.path().to_path_buf(),
                 budget_bytes: budget,
+                sweep_debounce_ms: 0,
             },
             0.0,
         );
@@ -1278,6 +1319,7 @@ mod tests {
         let cfg = ChunkCacheConfig {
             root: std::path::PathBuf::from("/tmp/engram-pin-batch-test"),
             budget_bytes: 1024,
+            sweep_debounce_ms: 0,
         };
         let cache = ChunkCache::new(cfg);
         let shared = ChunkHash::of(b"shared-base-chunk");
@@ -1303,6 +1345,7 @@ mod tests {
         let cfg = ChunkCacheConfig {
             root: std::path::PathBuf::from("/tmp/engram-unpin-noop-test"),
             budget_bytes: 1024,
+            sweep_debounce_ms: 0,
         };
         let cache = ChunkCache::new(cfg);
         let h = ChunkHash::of(b"never-pinned");
@@ -1813,7 +1856,8 @@ mod tests {
         let cache = ChunkCache::new_with_floor(
             ChunkCacheConfig {
                 root: cache_dir.path().to_path_buf(),
-                budget_bytes: NO_CEILING, // floor governs, not a byte ceiling
+                budget_bytes: NO_CEILING, // floor governs, not a byte ceiling,
+                sweep_debounce_ms: 0,
             },
             1.0,
         );
@@ -1841,6 +1885,7 @@ mod tests {
             ChunkCacheConfig {
                 root: cache_dir.path().to_path_buf(),
                 budget_bytes: NO_CEILING,
+                sweep_debounce_ms: 0,
             },
             1.0,
         );

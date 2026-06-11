@@ -822,6 +822,7 @@ mod tests {
         let cache = ChunkCache::new(ChunkCacheConfig {
             root: dir.path().join("cache"),
             budget_bytes: 256 * 1024 * 1024,
+            sweep_debounce_ms: 0,
         });
         // Distinct disk + memory payloads so a mix-up would be caught.
         let disk_bytes = (0..37u8).cycle().take(2 * 1024 * 1024).collect::<Vec<_>>();

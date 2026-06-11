@@ -462,6 +462,7 @@ async fn materialize_to_file_cached_uses_caller_supplied_store() {
     let cache = ChunkCache::new(ChunkCacheConfig {
         root: cache_dir.path().to_path_buf(),
         budget_bytes: 100 * 1024 * 1024,
+        sweep_debounce_ms: 0,
     });
 
     // materialize_to_file_cached on the tiered store: cache misses

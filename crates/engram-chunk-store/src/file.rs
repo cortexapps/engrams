@@ -657,6 +657,7 @@ mod tests {
         let cache = ChunkCache::new(ChunkCacheConfig {
             root: cache_dir.path().to_path_buf(),
             budget_bytes: 1024 * 1024 * 1024,
+            sweep_debounce_ms: 0,
         });
         let work = tempfile::tempdir().unwrap();
         let data = (0..40u8).cycle().take(5 * 1024 * 1024).collect::<Vec<_>>();
@@ -731,6 +732,7 @@ mod tests {
         let cache = ChunkCache::new(ChunkCacheConfig {
             root: cache_dir.path().to_path_buf(),
             budget_bytes: 1024 * 1024,
+            sweep_debounce_ms: 0,
         });
         let work = tempfile::tempdir().unwrap();
 
