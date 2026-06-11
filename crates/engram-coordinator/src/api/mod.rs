@@ -16,9 +16,9 @@ pub(crate) mod forge;
 mod health;
 mod host_http;
 mod hosts;
-mod interrupt;
+pub(crate) mod interrupt;
 pub mod principal;
-mod prompt;
+pub(crate) mod prompt;
 mod registries;
 pub(crate) mod session_auth;
 // `pub(crate)`: `evacuation::resolve_cold_boot_spec` (ADR 0028 Fix B)

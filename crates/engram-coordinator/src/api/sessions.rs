@@ -501,12 +501,75 @@ pub struct CreateSessionResponse {
 // propagation works the moment a collector is wired up.
 #[tracing::instrument(name = "session.create", skip_all)]
 pub async fn create_session(
-    state: State<SharedState>,
-    current: crate::api::principal::CurrentUser,
-    req: Json<CreateSessionRequest>,
+    State(state): State<SharedState>,
+    crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
+    Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
+    // The axum shim supplies, from its principal, exactly the
+    // attribution data the principal-free core takes as plain
+    // parameters: the owner id and the per-session identity env
+    // (git author + auto-injected Claude token). The gRPC path passes
+    // `None` / empty (ADR §2.1 — no calling user there).
+    let owner = Some(principal.user_id.to_string());
+    let identity_env = build_principal_identity_env(&state, &principal, &req).await;
+    let body = create_session_core(&state, owner, identity_env, req).await?;
+    Ok((StatusCode::CREATED, Json(body)))
+}
+
+/// Build the per-session identity env the axum principal would stamp:
+/// git author (`ENGRAM_USER_EMAIL` / `ENGRAM_USER_NAME`, skipped for the
+/// service principal whose email isn't a valid commit author) plus the
+/// auto-injected saved Claude OAuth token for built-in `claude` agent
+/// sessions. Kept on the axum side so the core stays principal-free; the
+/// gRPC path supplies an empty map (Task 13's SecretService handles the
+/// token via `harness_secret_id` instead).
+async fn build_principal_identity_env(
+    state: &SharedState,
+    principal: &engram_core::types::user::Principal,
+    req: &CreateSessionRequest,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+
+    // ADR 0031: attribute git commits to the initiating user. Skip the
+    // service principal: its service_email isn't a valid commit author.
+    if !state
+        .auth
+        .as_ref()
+        .is_some_and(|rt| principal.is_service(&rt.config.service_email))
+    {
+        env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
+        env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+    }
+
+    // ADR 0031: auto-inject the user's saved Claude Code OAuth token for
+    // built-in claude sessions. Best-effort — needs the image's harness
+    // manifest, which the core resolves; we resolve it here too so the
+    // axum behaviour is byte-identical. A missing/unopenable token is a
+    // no-op (the harness falls back to its own login path).
+    let image_uri: ImageRef = req.image.clone();
+    if let Ok(Some(enabled)) = state.services.meta.get_enabled_image(&image_uri).await {
+        if let Ok(manifest) = toml::from_str::<ImageManifest>(&enabled.manifest_toml) {
+            inject_user_claude_token(state, principal, manifest.harness.as_ref(), req.mode, &mut env)
+                .await;
+        }
+    }
+    env
+}
+
+/// Transport-agnostic create core, with the metrics wrapper inside so
+/// gRPC creations are counted too (ADR 0039 Task 10). `owner` is the
+/// session's `user_id` (axum: the principal's id; gRPC: `None`).
+/// `identity_env` is the per-session git-author / Claude-token env the
+/// axum principal would have stamped (gRPC: empty). No principal, no
+/// authz — the caller is trusted (ADR §6).
+pub(crate) async fn create_session_core(
+    state: &SharedState,
+    owner: Option<String>,
+    identity_env: HashMap<String, String>,
+    req: CreateSessionRequest,
+) -> Result<CreateSessionResponse, ApiError> {
     let start = std::time::Instant::now();
-    let result = create_session_inner(state, current, req).await;
+    let result = create_session_compute(state, owner, identity_env, req).await;
     let elapsed = start.elapsed().as_secs_f64();
     let outcome = match &result {
         Ok(_) => "success",
@@ -520,7 +583,7 @@ pub async fn create_session(
     // we knew to fall through, or the spec failed validation
     // pre-scheduling), so label as `unknown`.
     let kind = match &result {
-        Ok((_, body)) => body.kind,
+        Ok(body) => body.kind,
         Err(_) => "unknown",
     };
     metrics::histogram!(
@@ -538,11 +601,12 @@ pub async fn create_session(
     result
 }
 
-async fn create_session_inner(
-    State(state): State<SharedState>,
-    crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
-    Json(req): Json<CreateSessionRequest>,
-) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
+async fn create_session_compute(
+    state: &SharedState,
+    owner: Option<String>,
+    identity_env: HashMap<String, String>,
+    req: CreateSessionRequest,
+) -> Result<CreateSessionResponse, ApiError> {
     // -------- 0. Validate orthogonal axes --------
     // ADR 0021 P1.3: `mode = DevVm + non-empty prompt` is meaningless
     // — even if the image carries a baked harness, a DevVm session
@@ -628,8 +692,10 @@ async fn create_session_inner(
     let spec = SessionSpec {
         image: req.image.clone(),
         mode: req.mode,
-        // ADR 0031: owner is the authenticated principal, server-stamped.
-        user_id: Some(principal.user_id.to_string()),
+        // ADR 0031: owner is supplied by the caller — the axum shim
+        // passes the authenticated principal's id; the gRPC path passes
+        // `None` (no calling user, ADR §2.1).
+        user_id: owner.clone(),
     };
 
     // -------- 3. Mint a SessionId (no DB write yet) --------
@@ -732,34 +798,20 @@ async fn create_session_inner(
     let mut session_env = spec_env.clone();
     session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
 
-    // ADR 0031: attribute git commits inside the session to the initiating
-    // user. `render_gitconfig` writes these into `/etc/gitconfig [user]`. Skip
-    // the service principal: its service_email isn't a valid commit author, so
-    // injecting it makes GitHub reject the squash-merge.
-    if !state
-        .auth
-        .as_ref()
-        .is_some_and(|rt| principal.is_service(&rt.config.service_email))
-    {
-        session_env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-        session_env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
+    // ADR 0031 / ADR 0039: the caller-supplied per-session identity env —
+    // git author (`ENGRAM_USER_EMAIL` / `ENGRAM_USER_NAME`) and, for
+    // built-in claude sessions, the auto-injected saved OAuth token. The
+    // axum shim derived these from the authenticated principal
+    // (`build_principal_identity_env`); the gRPC path passes an empty map
+    // (no calling user — Task 13's SecretService injects via
+    // `harness_secret_id` instead). Folded in here so they reach the
+    // harness / `/exec` / shell exactly as before.
+    for (k, v) in &identity_env {
+        session_env.insert(k.clone(), v.clone());
     }
 
-    // ADR 0031: for built-in Claude sessions, auto-inject the user's saved
-    // Claude Code OAuth token — we never prompt per-session. Best-effort: a
-    // missing/unopenable token must not fail create (the harness then falls
-    // back to its own login path; the web gates create on a saved token).
-    inject_user_claude_token(
-        &state,
-        &principal,
-        manifest.harness.as_ref(),
-        req.mode,
-        &mut session_env,
-    )
-    .await;
-
     let mut agent_for_session = resolve_harness(
-        &state,
+        state,
         manifest.harness.as_ref(),
         req.mode,
         session_id,
@@ -772,7 +824,7 @@ async fn create_session_inner(
     // session_env). dev_vm sessions have no harness; their `/exec` path
     // mints the token per request instead.
     if let Some(agent) = agent_for_session.as_mut() {
-        inject_harness_env(&state, session_id, manifest.git.as_ref(), &mut agent.env);
+        inject_harness_env(state, session_id, manifest.git.as_ref(), &mut agent.env);
     }
 
     // Network policy: image manifest's `[network]` block, verbatim.
@@ -815,7 +867,7 @@ async fn create_session_inner(
     let memory_mib = resolved_memory_mib(&manifest);
 
     let (host_id, sandbox_id) = try_restore_base_snapshot(
-        &state,
+        state,
         session_id,
         base_snapshot_id,
         &image_repo,
@@ -883,7 +935,7 @@ async fn create_session_inner(
     // re-prompts for credentials (the harness still gets them on the
     // initial boot via vm_spec.env).
     if let Some(overrides) = deferred_session_secrets {
-        if let Err(e) = persist_session_secrets(&state, session_id, &overrides).await {
+        if let Err(e) = persist_session_secrets(state, session_id, &overrides).await {
             tracing::warn!(
                 session_id = %session_id,
                 error = %e,
@@ -1064,16 +1116,13 @@ async fn create_session_inner(
         }
     }
 
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateSessionResponse {
-            session_id,
-            status: SessionState::Active.as_str(),
-            image_version: image_tag,
-            // ADR 0020: every session is a base-snapshot restore now.
-            kind: "restored",
-        }),
-    ))
+    Ok(CreateSessionResponse {
+        session_id,
+        status: SessionState::Active.as_str(),
+        image_version: image_tag,
+        // ADR 0020: every session is a base-snapshot restore now.
+        kind: "restored",
+    })
 }
 
 /// ADR 0020 P1: attempt to restore a session from the image's base
@@ -1258,8 +1307,17 @@ pub async fn get_session(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<Json<Session>, ApiError> {
-    let s = state.services.meta.get_session(id).await?;
-    Ok(Json(s))
+    Ok(Json(get_session_core(&state, id).await?))
+}
+
+/// Transport-agnostic core: fetch one session row by id (404 on unknown).
+/// No authz — the axum route's `require_session_owner` layer gates the
+/// shim; the gRPC caller is trusted (ADR §6).
+pub(crate) async fn get_session_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<Session, ApiError> {
+    Ok(state.services.meta.get_session(id).await?)
 }
 
 /// One row of the session list. Flattens the `Session` (so existing
@@ -1309,34 +1367,59 @@ pub async fn list_sessions(
         _ => false,
     };
 
-    let all = state.services.meta.list_active_sessions().await?;
-    let mine = principal.user_id.to_string();
-    let filtered: Vec<Session> = if show_all {
-        all
+    // The core returns ALL live sessions, owner-annotated. The axum shim
+    // keeps today's principal scoping on its side: a member sees only
+    // their own rows, and — preserving the pre-extraction wire exactly —
+    // the `mine` view carries NO owner chips (owner is implicit: you).
+    let resp = list_sessions_core(&state).await?;
+    let sessions = if show_all {
+        resp.sessions
     } else {
-        all.into_iter()
-            .filter(|s| s.user_id.as_deref() == Some(mine.as_str()))
+        let mine = principal.user_id.to_string();
+        resp.sessions
+            .into_iter()
+            .filter(|item| item.session.user_id.as_deref() == Some(mine.as_str()))
+            .map(|item| SessionListItem {
+                session: item.session,
+                owner_email: None,
+                owner_name: None,
+            })
             .collect()
     };
+    Ok(Json(ListSessionsResponse { sessions }))
+}
 
-    // For the All view, attach owner identity (one batch lookup → map).
-    let owners: HashMap<String, (Option<String>, String)> = if show_all {
-        match state.auth.as_ref() {
-            Some(rt) => rt
-                .users
-                .list_users()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|u| (u.id.to_string(), (u.display_name, u.email)))
-                .collect(),
-            None => HashMap::new(),
-        }
-    } else {
-        HashMap::new()
+/// Transport-agnostic core: returns ALL live sessions (the gRPC caller is
+/// a trusted service; filtering/authz is the orchestrator's job, ADR §6),
+/// each annotated with owner identity (one batch user lookup → map). The
+/// axum shim applies today's principal scoping before returning.
+///
+/// Behaviour-identical to the old `scope=all` arm of the handler — the
+/// `mine` arm just filters this set down. Owner annotation is computed
+/// unconditionally now (it was `scope=all`-only before); the cost is one
+/// `list_users` call, paid once per list, and the result is exactly what
+/// the admin view already showed.
+pub(crate) async fn list_sessions_core(
+    state: &SharedState,
+) -> Result<ListSessionsResponse, ApiError> {
+    let all = state.services.meta.list_active_sessions().await?;
+
+    // Batch owner-identity lookup → map. Empty when there's no auth
+    // runtime (dev / tests), which falls through to unannotated rows —
+    // the same `None` the old `mine` arm produced.
+    let owners: HashMap<String, (Option<String>, String)> = match state.auth.as_ref() {
+        Some(rt) => rt
+            .users
+            .list_users()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|u| (u.id.to_string(), (u.display_name, u.email)))
+            .collect(),
+        None => HashMap::new(),
     };
 
-    let sessions = filtered
+    let sessions = all
         .into_iter()
         .map(|s| {
             let (owner_name, owner_email) = s
@@ -1352,13 +1435,25 @@ pub async fn list_sessions(
             }
         })
         .collect();
-    Ok(Json(ListSessionsResponse { sessions }))
+    Ok(ListSessionsResponse { sessions })
 }
 
 pub async fn delete_session(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<StatusCode, ApiError> {
+    delete_session_core(&state, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Transport-agnostic core: drive a session to terminal and tear down its
+/// sandbox, idempotently. Returns `Ok(())` on success or already-terminal
+/// (the axum shim maps this to 204; gRPC to an empty `DeleteSessionResponse`).
+/// No authz — gated by the axum route layer / trusted gRPC caller (ADR §6).
+pub(crate) async fn delete_session_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<(), ApiError> {
     // Drive the session to its FSM-legal terminal BEFORE destroying the
     // sandbox. `terminate_session` reads the current state and picks the
     // terminal `SessionState::terminal_target` permits — `Completed` for
@@ -1383,7 +1478,7 @@ pub async fn delete_session(
     // An unknown id surfaces as 404 from `terminate_session`'s own
     // `get_session` — matching the get/exec contract — before any teardown.
     match state.services.meta.terminate_session(id).await {
-        Ok(None) => return Ok(StatusCode::NO_CONTENT),
+        Ok(None) => return Ok(()),
         Ok(Some((prev, target))) => {
             state
                 .emit(
@@ -1410,7 +1505,7 @@ pub async fn delete_session(
                 let _ = state.services.host.destroy(sandbox_id).await;
             }
             state.services.host.unbind_session(id).await;
-            return Ok(StatusCode::NO_CONTENT);
+            return Ok(());
         }
         Err(e) => return Err(e.into()),
     }
@@ -1437,7 +1532,7 @@ pub async fn delete_session(
     // think exist" matches reality.
     let _ = state.services.meta.assign_session_sandbox(id, None).await;
     state.services.host.unbind_session(id).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// ADR 0023: when a forge is configured and the image declares `[git]`,

@@ -11,6 +11,8 @@
 //! authz lives over there, not here.
 
 pub mod auth;
+mod convert;
+mod session;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,14 +21,30 @@ use std::time::Duration;
 use engram_protocol::app;
 use tonic::{Request, Response, Status};
 
+pub use session::AppSessionService;
+
 use crate::state::SharedState;
 
 /// Boxed response stream for the server-streaming RPCs. The concrete
 /// streams arrive with the real implementations (Tasks 11-12); the
 /// stubs only need the associated types to satisfy the traits.
-type BoxStream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
+pub(crate) type BoxStream<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
 
-const UNIMPLEMENTED: &str = "ADR 0039 phase 2";
+pub(crate) const UNIMPLEMENTED: &str = "ADR 0039 phase 2";
+
+/// Parse a wire session id (a UUID string) into a [`SessionId`], mapping a
+/// malformed id to `INVALID_ARGUMENT` rather than an opaque 500. Shared by
+/// every SessionService RPC that takes a `session_id`.
+//
+// `clippy::result_large_err`: `tonic::Status` is the unavoidable RPC error
+// type — the `?` at each call site flows straight into a
+// `Result<_, Status>`, so boxing here would just force an unbox. Same
+// rationale as `auth::BearerAuth::check`.
+#[allow(clippy::result_large_err)]
+pub(crate) fn parse_session_id(s: &str) -> Result<engram_core::SessionId, Status> {
+    s.parse()
+        .map_err(|_| Status::invalid_argument(format!("malformed session_id: {s:?}")))
+}
 
 /// ADR 0039 §9.4: keepalive PINGs so a dead orchestrator's streams
 /// are detected and torn down (releasing leases/subscriptions)
@@ -77,151 +95,6 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
         .add_service(app::secret_service_server::SecretServiceServer::new(
             AppSecretService { state, auth },
         ))
-}
-
-pub struct AppSessionService {
-    // Consumed from Task 10 onward; the scaffold only carries it.
-    #[allow(dead_code)]
-    pub state: SharedState,
-    pub auth: Arc<auth::BearerAuth>,
-}
-
-// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
-#[tonic::async_trait]
-impl app::session_service_server::SessionService for AppSessionService {
-    async fn list_sessions(
-        &self,
-        req: Request<app::ListSessionsRequest>,
-    ) -> Result<Response<app::ListSessionsResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn create_session(
-        &self,
-        req: Request<app::CreateSessionRequest>,
-    ) -> Result<Response<app::CreateSessionResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn get_session(
-        &self,
-        req: Request<app::GetSessionRequest>,
-    ) -> Result<Response<app::GetSessionResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn delete_session(
-        &self,
-        req: Request<app::DeleteSessionRequest>,
-    ) -> Result<Response<app::DeleteSessionResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn send_prompt(
-        &self,
-        req: Request<app::SendPromptRequest>,
-    ) -> Result<Response<app::SendPromptResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn interrupt(
-        &self,
-        req: Request<app::InterruptRequest>,
-    ) -> Result<Response<app::InterruptResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    type StreamEventsStream = BoxStream<app::SessionEvent>;
-
-    async fn stream_events(
-        &self,
-        req: Request<app::StreamEventsRequest>,
-    ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    type ExecStream = BoxStream<app::ExecOutput>;
-
-    async fn exec(
-        &self,
-        req: Request<app::ExecRequest>,
-    ) -> Result<Response<Self::ExecStream>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn get_log(
-        &self,
-        req: Request<app::GetLogRequest>,
-    ) -> Result<Response<app::GetLogResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn snapshot(
-        &self,
-        req: Request<app::SnapshotRequest>,
-    ) -> Result<Response<app::SnapshotResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn resume(
-        &self,
-        req: Request<app::ResumeRequest>,
-    ) -> Result<Response<app::ResumeResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn evict_local(
-        &self,
-        req: Request<app::EvictLocalRequest>,
-    ) -> Result<Response<app::EvictLocalResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn get_cow_state(
-        &self,
-        req: Request<app::GetCowStateRequest>,
-    ) -> Result<Response<app::GetCowStateResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn list_checkpoints(
-        &self,
-        req: Request<app::ListCheckpointsRequest>,
-    ) -> Result<Response<app::ListCheckpointsResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    type GetArtifactStream = BoxStream<app::GetArtifactResponse>;
-
-    async fn get_artifact(
-        &self,
-        req: Request<app::GetArtifactRequest>,
-    ) -> Result<Response<Self::GetArtifactStream>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
-
-    async fn create_artifact_from_path(
-        &self,
-        req: Request<app::CreateArtifactFromPathRequest>,
-    ) -> Result<Response<app::CreateArtifactFromPathResponse>, Status> {
-        self.auth.check(&req)?;
-        Err(Status::unimplemented(UNIMPLEMENTED))
-    }
 }
 
 pub struct AppShellRelayService {
@@ -505,7 +378,10 @@ mod convention {
     /// Every grpc_app source file that contains RPC `async fn`s. Each
     /// entry is `include_str!`'d and scanned. Append new per-service
     /// files here as Tasks 10-13 split them out of `mod.rs`.
-    const SOURCES: &[(&str, &str)] = &[("mod.rs", include_str!("mod.rs"))];
+    const SOURCES: &[(&str, &str)] = &[
+        ("mod.rs", include_str!("mod.rs")),
+        ("session.rs", include_str!("session.rs")),
+    ];
 
     /// The auth line that must open every RPC body. The trailing `;` is
     /// load-bearing: it distinguishes a real call site from the prose

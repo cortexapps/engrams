@@ -1,0 +1,15 @@
+-- ADR 0039 §2.1 / Task 10: `sessions.user_id` is now nullable.
+--
+-- The app-gRPC SessionService.CreateSession (the orchestrator-facing
+-- surface) carries no calling user — attribution leaves the coordinator
+-- contract and lives in the orchestrator's task model. So a gRPC-created
+-- session inserts a NULL owner, while the legacy axum path still stamps
+-- the authenticated principal's id. Both must be insertable.
+--
+-- The column was declared `user_id TEXT` (already NULL-able) in
+-- 0001_initial.sql, so on a clean lineage this is a documented no-op.
+-- `DROP NOT NULL` is idempotent and harmless if a NOT NULL ever crept in
+-- on a divergent deployment — making the nullable contract explicit and
+-- migration-checked rather than incidental. The column is dropped
+-- entirely in Task 32 once the legacy web routes retire.
+ALTER TABLE sessions ALTER COLUMN user_id DROP NOT NULL;

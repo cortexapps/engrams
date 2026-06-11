@@ -68,7 +68,12 @@ impl ApiError {
         }
     }
 
-    fn slug(&self) -> &'static str {
+    /// Stable, machine-readable error slug. `pub` so the app-gRPC
+    /// surface (`grpc_app::into_status`) can attach it as
+    /// `engram-error-slug` Status metadata — the web distinguishes
+    /// slugs that share an HTTP code (`snapshot_invalidated` vs
+    /// `host_lost`, both 410) and the orchestrator relays it.
+    pub fn slug(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
@@ -85,7 +90,7 @@ impl ApiError {
         }
     }
 
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             Self::BadRequest(m)
             | Self::NotFound(m)
