@@ -1,5 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
+import { TransportProvider } from "@connectrpc/connect-query";
+import { createConnectTransport } from "@connectrpc/connect-web";
 import { AuthProvider, useOptionalAuth } from "./auth/AuthProvider";
 import { router } from "./router";
 
@@ -12,25 +14,24 @@ const queryClient = new QueryClient({
   },
 });
 
-// ADR 0039 Task 22: AuthProvider recomposed on better-auth.
-// AuthProvider resolves the principal (authClient.useSession + GET /api/v1/me/claude-token)
-// and renders children once the session query has settled — loading → BootScreen;
-// error → AuthErrorScreen; resolved-null OR resolved-session → render here.
-//
-// The auth gate (redirect signed-out requests → /login) lives in the router's
-// appLayoutRoute.beforeLoad (router.tsx). This means /login is always reachable
-// signed-out without a reload loop.
+// ADR 0039 Task 23: Connect transport targeting /rpc (Vite proxy → orchestrator :8787).
+// TransportProvider makes it available to all useQuery/useMutation connect-query hooks
+// without threading a transport prop everywhere.
+const transport = createConnectTransport({ baseUrl: "/rpc" });
+
 function InnerApp() {
-  const auth = useOptionalAuth(); // null when signed out; AuthState when signed in
+  const auth = useOptionalAuth();
   return <RouterProvider router={router} context={{ auth }} />;
 }
 
 export function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <InnerApp />
-      </AuthProvider>
-    </QueryClientProvider>
+    <TransportProvider transport={transport}>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <InnerApp />
+        </AuthProvider>
+      </QueryClientProvider>
+    </TransportProvider>
   );
 }

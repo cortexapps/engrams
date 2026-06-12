@@ -1,5 +1,5 @@
 import { useNavigate } from "@tanstack/react-router";
-import { useSessions } from "../../hooks/useSessions";
+import { useTasksAsSessionList } from "../../hooks/useTasks";
 import { useAuth } from "../../auth/AuthProvider";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,7 @@ import { SessionsList } from "./sessions-list";
 
 export function MySessions() {
   const { principal } = useAuth();
-  const { data: sessions, isPending, error } = useSessions("mine");
+  const { data: sessions, isPending, error } = useTasksAsSessionList();
   const navigate = useNavigate();
   const showTokenNudge = !principal.is_admin && !principal.has_claude_token;
 

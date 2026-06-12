@@ -18,6 +18,11 @@ import {
 } from "@tanstack/react-router";
 import { render, type RenderOptions } from "@testing-library/react";
 import { type ReactElement } from "react";
+import { TransportProvider } from "@connectrpc/connect-query";
+import { createRouterTransport } from "@connectrpc/connect";
+import type { Transport } from "@connectrpc/connect";
+import { TaskService } from "./gen/engram/app/v1/task_pb";
+import { ImageService } from "./gen/engram/app/v1/image_pb";
 import { AuthContextProvider, type AuthState } from "./auth/AuthProvider";
 import type { Principal } from "./types";
 
@@ -36,6 +41,31 @@ const DEFAULT_PRINCIPAL: Principal = {
   can_sign_out: true,
 };
 
+/** ADR 0039 Task 23: default in-process transport that stubs both
+ * TaskService and ImageService with empty/success responses. Tests that
+ * exercise CreateTask should supply their own transport via the
+ * `transport` option so they can control the response. */
+export const testTransport: Transport = createRouterTransport((router) => {
+  router.service(TaskService, {
+    listTasks: () => ({ tasks: [] }),
+    createTask: () => ({ task: undefined }),
+    getTask: () => ({ task: undefined }),
+    deleteTask: () => ({}),
+  });
+  router.service(ImageService, {
+    listEnabledImages: () => ({ images: [] }),
+    enableImage: () => ({ job: undefined }),
+    disableImage: () => ({}),
+    refreshImage: () => ({ job: undefined }),
+    listEnableJobs: () => ({ jobs: [] }),
+    getEnableJob: () => ({ job: undefined }),
+    retryEnableJob: () => ({ job: undefined }),
+    listRegistries: () => ({ registries: [] }),
+    addRegistry: () => ({ id: "", host: "", authKind: "", authPrincipal: undefined }),
+    deleteRegistry: () => ({}),
+  });
+});
+
 export interface RenderWithProvidersOptions extends Omit<RenderOptions, "wrapper"> {
   /** Reuse a caller-supplied client (rare — for multi-step tests that need
    * cache continuity). Default: a fresh client per call. */
@@ -43,11 +73,20 @@ export interface RenderWithProvidersOptions extends Omit<RenderOptions, "wrapper
   /** Principal injected into the auth context (bypasses the /me query so tests
    * don't each need a fetch mock). Defaults to a local admin. */
   principal?: Principal;
+  /** Connect transport to use. Defaults to `testTransport` (stubs all RPCs
+   * with empty success responses). Pass a custom transport for tests that
+   * need to control TaskService/ImageService responses. */
+  transport?: Transport;
 }
 
 export function renderWithProviders(
   ui: ReactElement,
-  { queryClient, principal = DEFAULT_PRINCIPAL, ...renderOptions }: RenderWithProvidersOptions = {},
+  {
+    queryClient,
+    principal = DEFAULT_PRINCIPAL,
+    transport,
+    ...renderOptions
+  }: RenderWithProvidersOptions = {},
 ) {
   const client =
     queryClient ??
@@ -64,13 +103,17 @@ export function renderWithProviders(
     refresh: () => {},
   };
 
+  const resolvedTransport = transport ?? testTransport;
+
   const rootRoute = createRootRouteWithContext<TestRouterContext>()({
-    // Wrap in AuthContextProvider + QueryClientProvider so components that read
-    // those contexts (most of them) work, while the router supplies Link/params.
+    // Wrap in TransportProvider + QueryClientProvider + AuthContextProvider so
+    // components that use connect-query hooks or auth contexts work.
     component: () => (
-      <QueryClientProvider client={client}>
-        <AuthContextProvider value={authValue}>{ui}</AuthContextProvider>
-      </QueryClientProvider>
+      <TransportProvider transport={resolvedTransport}>
+        <QueryClientProvider client={client}>
+          <AuthContextProvider value={authValue}>{ui}</AuthContextProvider>
+        </QueryClientProvider>
+      </TransportProvider>
     ),
   });
 
