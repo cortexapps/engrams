@@ -1517,9 +1517,10 @@ jobs:
       - name: Seed GHCR credential in coord PG
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENGRAM_APP_TOKEN: dev-app-grpc-token
+          ENGRAM_APP_GRPC: http://127.0.0.1:50061
         run: |
           printf '%s' "$GHCR_TOKEN" | ./target/release/engram-cli \
-              --endpoint http://localhost:8090 \
               registry add \
               --host ghcr.io \
               --username "${{ github.actor }}" \

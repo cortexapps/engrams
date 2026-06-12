@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Persistent dev session — bakes + enables + creates a session and
-# leaves it running so you can poke at it with curl, wscat, or the
-# web UI. Companion to `integration-test.sh` (which always deletes
+# leaves it running so you can poke at it with engram-cli, wscat, or
+# the web UI. Companion to `integration-test.sh` (which always deletes
 # at the end).
 #
 # Idempotent across iterations:
@@ -11,12 +11,12 @@
 #     id and exit — don't keep stacking.
 #
 # Common invocations:
-#   bash deploy/dev/integration-session.sh            # default
+#   bash deploy/dev/integration-session.sh            # default (dev_vm)
 #   HARNESS=claude bash deploy/dev/integration-session.sh
 #   PROMPT='hi' HARNESS=claude bash deploy/dev/integration-session.sh
 #
 # Cleanup: `just dev-down` reaps the session along with everything
-# else; or curl -X DELETE $COORD/api/v1/sessions/$SID directly.
+# else; or `engram-cli session delete $SID` directly.
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -25,9 +25,15 @@ COORD="http://127.0.0.1:8090"
 HARNESS="${HARNESS:-none}"
 PROMPT="${PROMPT:-}"
 
-AUTH_HEADER=()
-if [ -n "${ENGRAM_TOKEN:-}" ]; then
-    AUTH_HEADER=(-H "Authorization: Bearer $ENGRAM_TOKEN")
+# gRPC address and bearer token for the app surface (ADR 0039).
+# Set ENGRAM_APP_GRPC to override; default matches the Tiltfile.
+export ENGRAM_APP_GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
+# ENGRAM_APP_TOKEN is read by engram-cli from env; no default — dev
+# mode runs without token enforcement.
+
+CLI_TOKEN_FLAG=()
+if [ -n "${ENGRAM_APP_TOKEN:-}" ]; then
+    CLI_TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
 fi
 
 if ! curl -fsS "$COORD/healthz" >/dev/null 2>&1; then
@@ -40,9 +46,16 @@ SHORT=$(git rev-parse --short HEAD)
 LOCAL_REGISTRY="localhost:5001"
 IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
-# Already enabled?
-already_enabled=$(curl -fsS ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$COORD/api/v1/enabled-images" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); print(any(i.get('image_uri')=='$IMAGE_URI' for i in d.get('images',[])))" 2>/dev/null || echo False)
+# Already enabled? Use the CLI to check via gRPC.
+already_enabled=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" --json image list 2>/dev/null \
+    | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    d={}
+print(any(i.get('image_uri')=='$IMAGE_URI' for i in d.get('images',[])))
+" 2>/dev/null || echo False)
 
 if [ "$already_enabled" = "True" ]; then
     echo "==> image $IMAGE_URI already enabled; skipping bake"
@@ -89,37 +102,18 @@ else
         --inject-agent "target/$TARGET/release/engram-agentd" \
         --push "$IMAGE_URI" \
         2>&1 | tail -3
-    # Base snapshot is captured at enable time (ADR 0020), not at bake — the
-    # old --capture-canonical-* flags were removed from `engram-cli image build`.
+    # Base snapshot is captured at enable time (ADR 0020), not at bake.
 
-    echo "==> POST /api/enabled-images (ADR 0036: async — poll the job)"
-    ENABLE_BODY=$(printf '{"image_uri": "%s"}' "$IMAGE_URI")
-    JOB_ID=$(curl -fsS -X POST ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} \
-        -H "Content-Type: application/json" \
-        -d "$ENABLE_BODY" \
-        "$COORD/api/v1/enabled-images" \
-        | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-    while :; do
-        JOB_STATE=$(curl -fsS ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$COORD/api/v1/enable-jobs/$JOB_ID" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
-        case "$JOB_STATE" in
-            ready) echo "    enable job ready"; break ;;
-            failed)
-                echo "ERROR: enable job $JOB_ID failed" >&2
-                curl -fsS ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$COORD/api/v1/enable-jobs/$JOB_ID" >&2 || true
-                exit 1
-                ;;
-            *) sleep 2 ;;
-        esac
-    done
+    echo "==> enabling image (ADR 0036: async — polls to completion)"
+    ./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" \
+        image enable --uri "$IMAGE_URI"
 fi
 
-# Look for an existing dev-session row (status=active, this image,
-# tagged via metadata-style harness so we can find it). The session
-# row doesn't carry a label field, so we filter by image+status and
-# pick the most recent. Best-effort: stale rows from prior runs are
+# Look for an existing dev-session row (status=active, this image).
+# The session row carries the image URI, so we filter by image+status
+# and pick the first match. Best-effort: stale rows from prior runs are
 # possible if `just dev-down` didn't reap.
-existing_sid=$(curl -fsS ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} "$COORD/api/v1/sessions" 2>/dev/null \
+existing_sid=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" --json session list 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -135,48 +129,39 @@ if [ -n "$existing_sid" ]; then
     SID="$existing_sid"
     echo "==> reusing existing active session $SID"
 else
-    echo "==> POST /sessions  (harness=$HARNESS)"
-    if [ -n "$PROMPT" ]; then
-        SESS_BODY=$(python3 -c "
-import json
-print(json.dumps({
-    'image': '$IMAGE_URI',
-    'harness': {'kind': 'builtin', 'name': '$HARNESS'} if '$HARNESS' != 'none' else {'kind': 'none'},
-    'prompt': '$PROMPT',
-    'secrets': {'ANTHROPIC_API_KEY': 'sk-bogus-dev-session'},
-}))
-")
+    echo "==> creating session (harness=$HARNESS)"
+    # ADR 0021 P1.3: mode=dev_vm leaves the baked harness undriven.
+    # HARNESS=none (the default) → --dev-vm; HARNESS=<name> → agent mode
+    # (the image's baked harness drives automatically).
+    if [ "$HARNESS" = "none" ]; then
+        MODE_FLAG=(--dev-vm)
     else
-        SESS_BODY=$(python3 -c "
-import json
-print(json.dumps({
-    'image': '$IMAGE_URI',
-    'harness': {'kind': 'builtin', 'name': '$HARNESS'} if '$HARNESS' != 'none' else {'kind': 'none'},
-}))
-")
+        MODE_FLAG=()
     fi
-    SESS_RESP=$(curl -fsS -X POST ${AUTH_HEADER[@]+"${AUTH_HEADER[@]}"} \
-        -H "Content-Type: application/json" \
-        -d "$SESS_BODY" \
-        "$COORD/api/v1/sessions")
-    SID=$(echo "$SESS_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("session_id","?"))')
-    KIND=$(echo "$SESS_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kind","?"))')
-    echo "    session_id=$SID  kind=$KIND"
+    if [ -n "$PROMPT" ]; then
+        PROMPT_FLAG=(--prompt "$PROMPT")
+    else
+        PROMPT_FLAG=()
+    fi
+    SID=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" \
+        session create \
+        --image "$IMAGE_URI" \
+        "${MODE_FLAG[@]}" \
+        "${PROMPT_FLAG[@]}")
+    echo "    session_id=$SID"
 fi
 
 echo ""
 echo "✓ session $SID is live — iterate:"
 echo ""
 echo "  # exec a one-shot command"
-echo "  curl -s -XPOST $COORD/api/v1/sessions/$SID/exec \\"
-echo "    -H 'Content-Type: application/json' \\"
-echo "    -d '{\"command\":\"ls /\"}' | jq ."
+echo "  ./target/release/engram-cli session exec $SID 'ls /'"
 echo ""
 echo "  # open the shell (browser, after port-forwarding)"
 echo "  open http://localhost:5173/sessions/$SID"
 echo ""
-echo "  # raw events"
-echo "  curl -s $COORD/api/v1/sessions/$SID/events | tail"
+echo "  # tail live events"
+echo "  ./target/release/engram-cli session logs $SID"
 echo ""
 echo "  # tear down"
-echo "  curl -s -XDELETE $COORD/api/v1/sessions/$SID"
+echo "  ./target/release/engram-cli session delete $SID"

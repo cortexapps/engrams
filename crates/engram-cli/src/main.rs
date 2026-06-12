@@ -1,7 +1,7 @@
-//! Ops/admin CLI. Talks to the coordinator's HTTP API for session
-//! lifecycle operations; invokes the `engram-image-builder` library
-//! directly for `image build` (it doesn't go through the coordinator).
-//! Implementations land progressively as the surface grows.
+//! Ops/admin CLI. Talks to the coordinator's app gRPC surface (ADR 0039)
+//! for session/host/image/registry lifecycle operations; invokes the
+//! `engram-image-builder` library directly for `image build` (it doesn't
+//! go through the coordinator).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -9,18 +9,37 @@ use std::process::ExitCode;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use engram_image_builder::{BuildRequest, Builder, DockerCli, Format};
+use engram_protocol::app::{
+    add_registry_request, fleet_service_client::FleetServiceClient,
+    image_service_client::ImageServiceClient, session_service_client::SessionServiceClient,
+    AddRegistryRequest, CreateSessionRequest, DeleteRegistryRequest, DeleteSessionRequest,
+    DisableImageRequest, DrainHostRequest, EnableImageRequest, ExecRequest, FlushSessionRequest,
+    GcpWorkloadIdentityRegistryAuth, GetEnableJobRequest, GetHostRequest, GetLogRequest,
+    GetSessionRequest, ListEnabledImagesRequest, ListHostsRequest, ListRegistriesRequest,
+    ListSessionsRequest, RefreshImageRequest, ResumeRequest, SendPromptRequest, StaticRegistryAuth,
+    StreamEventsRequest,
+};
 use serde_json::Value;
+use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
+use tonic::Request;
 
 #[derive(Parser, Debug)]
 #[command(name = "engram", version, about = "Engram ops CLI")]
 struct Cli {
-    #[arg(long, env = "ENGRAM_ENDPOINT", default_value = "http://localhost:8080")]
-    endpoint: String,
+    /// gRPC address for the coordinator's app surface.
+    #[arg(
+        long,
+        env = "ENGRAM_APP_GRPC",
+        default_value = "http://127.0.0.1:50061"
+    )]
+    grpc_addr: String,
 
-    /// Bearer token for the coordinator's protected endpoints. When
-    /// the coordinator runs without `ENGRAM_AUTH_TOKENS` (dev mode),
-    /// leave this unset.
-    #[arg(long, env = "ENGRAM_TOKEN")]
+    /// Bearer token for the coordinator's app gRPC surface. When the
+    /// coordinator runs without `ENGRAM_APP_GRPC_TOKENS` (dev mode),
+    /// leave this unset. Set via env `ENGRAM_APP_TOKEN` — no baked-in
+    /// default is intentional.
+    #[arg(long, env = "ENGRAM_APP_TOKEN")]
     token: Option<String>,
 
     /// Print raw JSON instead of the human-readable view. Off by
@@ -50,9 +69,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImageCmd,
     },
-    /// Manage Docker registry credentials (Phase 5+). Credentials
-    /// are envelope-encrypted in Postgres; the password never leaves
-    /// the coordinator in plaintext after the initial POST.
+    /// Manage Docker registry credentials. Credentials are
+    /// envelope-encrypted in Postgres; the password never leaves
+    /// the coordinator in plaintext after the initial call.
     Registry {
         #[command(subcommand)]
         cmd: RegistryCmd,
@@ -63,8 +82,7 @@ enum Cmd {
     // deleted with the rest of the standalone subsystem.
     /// Admin operations — explicit triggers for primitives whose
     /// production driver is implicit (disk-pressure detector etc.).
-    /// Auth-gated behind the same bearer token as the rest of the
-    /// API.
+    /// Auth-gated behind the same bearer token as the rest of the API.
     Admin {
         #[command(subcommand)]
         cmd: AdminCmd,
@@ -74,24 +92,17 @@ enum Cmd {
 #[derive(Subcommand, Debug)]
 enum AdminCmd {
     /// Force a cold-tier flush of one Idle session's snapshot.
-    /// Errors with 409 if the session isn't Idle (no snapshot to
-    /// flush). Returns the FlushOutcome JSON.
+    /// Errors if the session isn't chunk-tracked. Returns the outcome.
     Flush { id: String },
-    /// Flush every Idle session in the cluster, in parallel
-    /// (bounded). Useful for "drain before redeploy" + integration
-    /// tests. Returns one entry per session — success or
-    /// per-session error.
-    FlushIdle,
+    // `FlushIdle` was retired server-side along with
+    // `POST /api/admin/flush-idle` (coordinator admin.rs). The RPC
+    // never existed in the gRPC surface (ADR 0039); removed here to
+    // match. Use per-session `admin flush <id>` instead.
 }
 
 #[derive(Subcommand, Debug)]
 enum SessionCmd {
     /// Create a new session. Prints the new session_id on stdout.
-    ///
-    /// Two axes shape a session: `image`, `harness`. The bake image's
-    /// `/workspace` is the workspace; ADR 0005 retired the platform's
-    /// git surface, so agents that want to push code do it themselves
-    /// inside the sandbox using credentials mounted via `[secrets.X]`.
     Create {
         /// Image to boot, as a flat OCI URI. Required.
         ///
@@ -100,20 +111,16 @@ enum SessionCmd {
         image: String,
         /// Boot the image as a pure dev VM — leave the baked harness
         /// (if any) resident-but-undriven. Default is to drive the
-        /// image's harness (ADR 0021 P1.3 replaced the per-session
+        /// image's harness (ADR 0021 P1.3 replaced per-session
         /// harness selection: which harness an image runs is now an
         /// image property).
         #[arg(long, default_value_t = false)]
         dev_vm: bool,
         /// Initial prompt for the agent. Only meaningful in the
         /// default (agent) mode against an image that has a baked
-        /// harness; the API rejects with 400 if a prompt is supplied
-        /// alongside `--dev-vm`.
+        /// harness.
         #[arg(long)]
         prompt: Option<String>,
-        /// Free-form user identifier surfaced on the row.
-        #[arg(long)]
-        user_id: Option<String>,
     },
     /// List sessions in `pending` / `active` / `idle` status.
     List,
@@ -131,9 +138,8 @@ enum SessionCmd {
     },
     /// Mark the session completed and tear down its sandbox.
     Delete { id: String },
-    /// Tail the persistent event log via SSE. Stays open; Ctrl-C to
-    /// stop. `--since N` resumes after a given idx (matches
-    /// `?since=N` on the events endpoint).
+    /// Tail the persistent event log via gRPC StreamEvents. Stays
+    /// open; Ctrl-C to stop. `--since N` resumes after a given idx.
     Logs {
         id: String,
         #[arg(long)]
@@ -150,60 +156,51 @@ enum SessionCmd {
     /// can't be resumed (snapshot invalidated).
     Resume { id: String },
     /// Push a prompt to a running session's agent. Auto-resumes
-    /// Idle sessions; 410 Gone for Dead.
+    /// Idle sessions; Gone for Dead.
     Prompt { id: String, text: String },
 }
 
 #[derive(Subcommand, Debug)]
 enum HostCmd {
-    /// List hosts the coordinator knows about (Postgres rows + live
-    /// scheduler view).
+    /// List hosts the coordinator knows about.
     List,
     /// Print one host's row + capacity / local-snapshot view.
     Get { id: String },
     /// Flip a host to `draining`. New sessions won't be assigned to
-    /// it; in-flight sessions stay (evacuation lands in 3d).
+    /// it; in-flight sessions stay (evacuation lands separately).
     Drain { id: String },
 }
 
 #[derive(Subcommand, Debug)]
 enum RegistryCmd {
-    /// Add (or update) a Docker registry credential. Two auth kinds
-    /// today; the schema is designed for AWS instance role and
-    /// service-account impersonation to slot in later as siblings.
+    /// Add (or update) a Docker registry credential.
     ///
     /// - `--auth-kind static` (default): paste a username + password
     ///   / PAT / service-account JSON. Sealed under the deployment
     ///   KEK, decrypted on each pull.
     /// - `--auth-kind gcp-workload-identity`: Engram's host-agent
-    ///   uses its ambient GCP identity (GKE WI, GCE/Cloud Run SA)
-    ///   to fetch a short-lived OAuth token per pull. No stored
-    ///   password. `--impersonate-sa <email>` chains identity
-    ///   through IAM Credentials API (deferred — schema-ready).
+    ///   uses its ambient GCP identity to fetch a short-lived OAuth
+    ///   token per pull.
     Add {
         /// Registry host. Examples: `gcr.io`, `ghcr.io`,
-        /// `us-east1-docker.pkg.dev`,
-        /// `123456.dkr.ecr.us-east-1.amazonaws.com`, `localhost:5001`.
+        /// `us-east1-docker.pkg.dev`.
         #[arg(long)]
         host: String,
-        /// Authentication kind. Defaults to `static` for backward-
-        /// compat with the original v1 surface.
+        /// Authentication kind. Defaults to `static`.
         #[arg(long, default_value = "static")]
         auth_kind: String,
-        /// Static-only: registry username. For GCP SA-JSON-keys, use
-        /// the literal string `_json_key`.
+        /// Static-only: registry username.
         #[arg(long, required_if_eq("auth_kind", "static"))]
         username: Option<String>,
-        /// Static-only: path to a file containing the password / PAT
-        /// / service-account JSON. Trailing newline is stripped.
+        /// Static-only: path to a file containing the password / PAT.
+        /// Trailing newline is stripped.
         #[arg(long, conflicts_with = "password_stdin")]
         password_file: Option<PathBuf>,
         /// Static-only: read the password from stdin until EOF.
         #[arg(long)]
         password_stdin: bool,
         /// GCP-WI-only: impersonate this service account via IAM
-        /// Credentials API. Omit for ambient-identity (the common
-        /// case — same SA the host-agent runs under).
+        /// Credentials API. Omit for ambient-identity.
         #[arg(long)]
         impersonate_sa: Option<String>,
     },
@@ -216,27 +213,19 @@ enum RegistryCmd {
     },
 }
 
-// ADR 0021 P1.7 retired `HarnessCmd` entirely. The built-in harness
-// publish primitive lives in `crates/engram-publish-builtin-harness`
-// (CI-only); user-facing `engram harness {add,list,rm}` retired with
-// the `/api/harnesses` registry in P1.5a.
+// ADR 0021 P1.7 retired `HarnessCmd` entirely.
 
-// `Build` has many optional path fields (rootfs source, agent
-// injection, bootstrap injection, canonical-capture kernel + FC
-// binary, …). Boxing each one to silence `large_enum_variant`
-// would just move the bytes off the stack without gaining anything
-// — clap parses this enum exactly once at startup, so the size
-// doesn't matter on any hot path.
+// `Build` has many optional path fields. Boxing each to silence
+// `large_enum_variant` would just move the bytes off the stack without
+// gaining anything — clap parses this enum exactly once at startup.
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum ImageCmd {
-    /// List the operator-curated set of enabled images on the
-    /// coordinator. Sessions may only reference URIs in this set.
+    /// List the operator-curated set of enabled images on the coordinator.
     List,
     /// Enable an image: tell the coordinator to fetch and cache the
-    /// engram manifest from the given OCI URI so sessions can
-    /// reference it. The bytes must already exist at the URI (push
-    /// via `engram image build --push <uri>`).
+    /// engram manifest from the given OCI URI. The bytes must already
+    /// exist at the URI (push via `engram image build --push <uri>`).
     Enable {
         /// Full OCI URI: `<host>[:port]/<repo>:<tag>`.
         #[arg(long)]
@@ -253,16 +242,14 @@ enum ImageCmd {
         uri: String,
     },
     /// Re-fetch the manifest layer for an already-enabled image.
-    /// Useful when a moved tag (e.g. `:latest`) now resolves to a new
-    /// digest.
+    /// Useful when a moved tag (e.g. `:latest`) resolves to a new digest.
     Refresh {
         #[arg(long)]
         uri: String,
     },
     /// Bake an image from a Dockerfile + engram.toml in the source repo.
     Build {
-        /// Repo identifier (e.g. `cortex/api`). Determines the registry
-        /// path the produced image lands at.
+        /// Repo identifier (e.g. `cortex/api`).
         #[arg(long)]
         repo: String,
 
@@ -274,8 +261,7 @@ enum ImageCmd {
         #[arg(long)]
         tag: Option<String>,
 
-        /// Where the registry lives — must match the coordinator's
-        /// `<storage_local_path>/images`.
+        /// Where the registry lives.
         #[arg(
             long,
             env = "ENGRAM_IMAGES_DIR",
@@ -292,46 +278,21 @@ enum ImageCmd {
         #[arg(long, value_parser = parse_image_format, default_value = "directory")]
         format: Format,
 
-        /// Inject a static-musl `engram-agentd` binary into the
-        /// rootfs at `/sbin/engram-agentd` and write a `/sbin/engram-init`
-        /// shim that exec's it on the reserved vsock port (1024).
-        /// Required for Firecracker images; without it the host
-        /// can't `exec()` against the VM. Pre-build the binary with
-        /// `cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release`.
+        /// Inject a static-musl `engram-agentd` binary into the rootfs.
         #[arg(long)]
         inject_agent: Option<PathBuf>,
 
         /// Which `engram-transport` impl the in-VM binaries should
-        /// select at runtime. The init shim writes
-        /// `ENGRAM_TRANSPORT=<value>` into the rootfs.
-        ///
-        /// `vsock` (default): AF_VSOCK on Linux, used by the
-        /// Firecracker production path. Requires
-        /// `CONFIG_VIRTIO_VSOCKETS=y` in the guest kernel.
-        ///
-        /// `console`: virtio-console on Apple Virtualization.framework,
-        /// used by the vz-bake-* recipes. Universally available in
-        /// every Linux kernel.
+        /// select at runtime.
         #[arg(long, value_parser = parse_transport, default_value = "vsock")]
         transport: engram_image_builder::Transport,
 
-        /// Guest platform to resolve a built-in `[harness]` artifact for
-        /// (`harness-<name>:<ver>-<platform>`). The harness runs inside
-        /// the guest, so this is the rootfs's arch. Defaults to the
-        /// host's arch — correct for the dev bake recipes, which
-        /// cross-compile the rootfs for the host. Set explicitly only
-        /// when baking cross-arch. Accepts `linux-x86_64` | `linux-arm64`.
+        /// Guest platform to resolve a built-in `[harness]` artifact for.
         #[arg(long, value_parser = parse_harness_platform)]
         harness_platform: Option<engram_image_builder::Platform>,
 
         /// Push the baked image to a Docker registry as an Engram OCI
-        /// artifact. Accepts either `host/repo` (auto-appends the
-        /// produced tag) or `host/repo:tag`. Format must be `ext4`.
-        ///
-        /// The bake step intentionally does NOT touch Postgres — once
-        /// pushed, an image is reachable to engram by URI alone (the
-        /// host-agent pulls via the auth resolver). Engram learns
-        /// about the image when a session references its URI.
+        /// artifact.
         #[arg(long)]
         push: Option<String>,
     },
@@ -367,8 +328,8 @@ async fn main() -> ExitCode {
 
     match run(&cli).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(CliError::Http(status, body)) => {
-            eprintln!("engram-cli: server returned {status}: {body}");
+        Err(CliError::Grpc(code, msg)) => {
+            eprintln!("engram-cli: gRPC {code}: {msg}");
             ExitCode::from(1)
         }
         Err(CliError::Other(e)) => {
@@ -380,7 +341,7 @@ async fn main() -> ExitCode {
 
 #[derive(Debug)]
 enum CliError {
-    Http(u16, String),
+    Grpc(tonic::Code, String),
     Other(String),
 }
 
@@ -390,531 +351,463 @@ impl<E: std::error::Error> From<E> for CliError {
     }
 }
 
+fn grpc_err(s: tonic::Status) -> CliError {
+    CliError::Grpc(s.code(), s.message().to_string())
+}
+
+/// Wrap a request body with a bearer token in the gRPC metadata.
+fn with_bearer<T>(body: T, token: &Option<String>) -> Request<T> {
+    let mut req = Request::new(body);
+    if let Some(tok) = token {
+        let val: MetadataValue<_> = format!("Bearer {tok}")
+            .parse()
+            .expect("token bytes are valid ASCII");
+        req.metadata_mut().insert("authorization", val);
+    }
+    req
+}
+
+async fn connect(addr: &str) -> Result<Channel, CliError> {
+    Channel::from_shared(addr.to_string())
+        .map_err(|e| CliError::Other(format!("invalid gRPC address `{addr}`: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| CliError::Other(format!("gRPC connect to `{addr}`: {e}")))
+}
+
 async fn run(cli: &Cli) -> Result<(), CliError> {
-    let client = build_client(cli.token.as_deref())?;
+    // image build never touches the coordinator — skip the channel build.
+    if let Cmd::Image {
+        cmd: ImageCmd::Build { .. },
+    } = &cli.cmd
+    {
+        return run_image_build(cli).await;
+    }
+
+    let channel = connect(&cli.grpc_addr).await?;
+    let tok = &cli.token;
+
     match &cli.cmd {
-        Cmd::Session { cmd } => match cmd {
-            SessionCmd::Create {
-                image,
-                dev_vm,
-                prompt,
-                user_id,
-            } => {
-                session_create(
-                    &client,
-                    &cli.endpoint,
+        Cmd::Session { cmd } => {
+            let mut sc = SessionServiceClient::new(channel);
+            match cmd {
+                SessionCmd::Create {
                     image,
-                    *dev_vm,
-                    prompt.as_deref(),
-                    user_id.as_deref(),
-                    cli.json,
-                )
-                .await
+                    dev_vm,
+                    prompt,
+                } => {
+                    session_create(&mut sc, tok, image, *dev_vm, prompt.as_deref(), cli.json).await
+                }
+                SessionCmd::List => session_list(&mut sc, tok, cli.json).await,
+                SessionCmd::Get { id } => session_get(&mut sc, tok, id, cli.json).await,
+                SessionCmd::Exec {
+                    id,
+                    cmd: shell,
+                    timeout_secs,
+                } => session_exec(&mut sc, tok, id, shell, *timeout_secs).await,
+                SessionCmd::Delete { id } => session_delete(&mut sc, tok, id).await,
+                SessionCmd::Logs { id, since } => session_logs(&mut sc, tok, id, *since).await,
+                SessionCmd::Log { id, limit } => {
+                    session_log(&mut sc, tok, id, *limit, cli.json).await
+                }
+                SessionCmd::Resume { id } => session_resume(&mut sc, tok, id, cli.json).await,
+                SessionCmd::Prompt { id, text } => {
+                    session_prompt(&mut sc, tok, id, text, cli.json).await
+                }
             }
-            SessionCmd::List => session_list(&client, &cli.endpoint, cli.json).await,
-            SessionCmd::Get { id } => session_get(&client, &cli.endpoint, id, cli.json).await,
-            SessionCmd::Exec {
-                id,
-                cmd: shell,
-                timeout_secs,
-            } => session_exec(&client, &cli.endpoint, id, shell, *timeout_secs, cli.json).await,
-            SessionCmd::Delete { id } => session_delete(&client, &cli.endpoint, id).await,
-            SessionCmd::Logs { id, since } => {
-                session_logs(&client, &cli.endpoint, id, *since).await
+        }
+        Cmd::Image { cmd } => {
+            let mut ic = ImageServiceClient::new(channel);
+            match cmd {
+                ImageCmd::List => image_list(&mut ic, tok, cli.json).await,
+                ImageCmd::Enable { uri, no_wait } => {
+                    image_enable(&mut ic, tok, uri, cli.json, *no_wait).await
+                }
+                ImageCmd::Disable { uri } => image_disable(&mut ic, tok, uri).await,
+                ImageCmd::Refresh { uri } => image_refresh(&mut ic, tok, uri, cli.json).await,
+                ImageCmd::Build { .. } => unreachable!("handled above"),
             }
-            SessionCmd::Log { id, limit } => {
-                session_log(&client, &cli.endpoint, id, *limit, cli.json).await
+        }
+        Cmd::Host { cmd } => {
+            let mut fc = FleetServiceClient::new(channel);
+            match cmd {
+                HostCmd::List => host_list(&mut fc, tok, cli.json).await,
+                HostCmd::Get { id } => host_get(&mut fc, tok, id, cli.json).await,
+                HostCmd::Drain { id } => host_drain(&mut fc, tok, id).await,
             }
-            SessionCmd::Resume { id } => session_resume(&client, &cli.endpoint, id, cli.json).await,
-            SessionCmd::Prompt { id, text } => {
-                session_prompt(&client, &cli.endpoint, id, text, cli.json).await
-            }
-        },
-        Cmd::Image { cmd } => match cmd {
-            ImageCmd::Build {
-                repo,
-                source,
-                tag,
-                images_dir,
-                docker_bin,
-                format,
-                inject_agent,
-                transport,
-                harness_platform,
-                push,
-            } => {
-                image_build(
-                    repo,
-                    source,
-                    tag.as_deref(),
-                    images_dir,
-                    docker_bin.as_deref(),
-                    *format,
-                    inject_agent.as_deref(),
-                    *transport,
-                    *harness_platform,
-                    push.as_deref(),
-                )
-                .await
-            }
-            ImageCmd::List => image_list(&client, &cli.endpoint, cli.json).await,
-            ImageCmd::Enable { uri, no_wait } => {
-                image_enable(&client, &cli.endpoint, uri, cli.json, *no_wait).await
-            }
-            ImageCmd::Disable { uri } => image_disable(&client, &cli.endpoint, uri).await,
-            ImageCmd::Refresh { uri } => image_refresh(&client, &cli.endpoint, uri, cli.json).await,
-        },
-        Cmd::Host { cmd } => match cmd {
-            HostCmd::List => host_list(&client, &cli.endpoint, cli.json).await,
-            HostCmd::Get { id } => host_get(&client, &cli.endpoint, id, cli.json).await,
-            HostCmd::Drain { id } => host_drain(&client, &cli.endpoint, id).await,
-        },
-        Cmd::Registry { cmd } => match cmd {
-            RegistryCmd::Add {
-                host,
-                auth_kind,
-                username,
-                password_file,
-                password_stdin,
-                impersonate_sa,
-            } => {
-                registry_add(
-                    &client,
-                    &cli.endpoint,
+        }
+        Cmd::Registry { cmd } => {
+            let mut ic = ImageServiceClient::new(channel);
+            match cmd {
+                RegistryCmd::Add {
                     host,
                     auth_kind,
-                    username.as_deref(),
-                    password_file.as_deref(),
-                    *password_stdin,
-                    impersonate_sa.as_deref(),
-                    cli.json,
-                )
-                .await
+                    username,
+                    password_file,
+                    password_stdin,
+                    impersonate_sa,
+                } => {
+                    registry_add(
+                        &mut ic,
+                        tok,
+                        host,
+                        auth_kind,
+                        username.as_deref(),
+                        password_file.as_deref(),
+                        *password_stdin,
+                        impersonate_sa.as_deref(),
+                        cli.json,
+                    )
+                    .await
+                }
+                RegistryCmd::List => registry_list(&mut ic, tok, cli.json).await,
+                RegistryCmd::Rm { host } => registry_rm(&mut ic, tok, host).await,
             }
-            RegistryCmd::List => registry_list(&client, &cli.endpoint, cli.json).await,
-            RegistryCmd::Rm { host } => registry_rm(&client, &cli.endpoint, host).await,
-        },
+        }
         // ADR 0021 P1.7 retired the `Cmd::Harness` arm.
-        Cmd::Admin { cmd } => match cmd {
-            AdminCmd::Flush { id } => admin_flush(&client, &cli.endpoint, id, cli.json).await,
-            AdminCmd::FlushIdle => admin_flush_idle(&client, &cli.endpoint, cli.json).await,
-        },
+        Cmd::Admin { cmd } => {
+            let mut fc = FleetServiceClient::new(channel);
+            match cmd {
+                AdminCmd::Flush { id } => admin_flush(&mut fc, tok, id, cli.json).await,
+            }
+        }
     }
 }
 
 // ---- admin subcommands -------------------------------------------------
 
 async fn admin_flush(
-    client: &reqwest::Client,
-    endpoint: &str,
+    fc: &mut FleetServiceClient<Channel>,
+    tok: &Option<String>,
     id: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let resp = client
-        .post(format!("{endpoint}/api/v1/admin/sessions/{id}/flush"))
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    let parsed: Value =
-        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    let resp = fc
+        .flush_session(with_bearer(
+            FlushSessionRequest {
+                session_id: id.to_string(),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
     if json {
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        let v = serde_json::json!({
+            "session_id": id,
+            "outcome": resp.outcome,
+            "manifest_version": resp.manifest_version,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
+    let ver = resp
+        .manifest_version
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "(none)".to_string());
     println!(
-        "flushed {}: {} bytes in {}ms",
-        parsed["session_id"].as_str().unwrap_or(id),
-        parsed["blob_size_bytes"].as_u64().unwrap_or(0),
-        parsed["took_ms"].as_u64().unwrap_or(0),
+        "flushed {id}: outcome={} manifest_version={ver}",
+        resp.outcome
     );
-    Ok(())
-}
-
-async fn admin_flush_idle(
-    client: &reqwest::Client,
-    endpoint: &str,
-    json: bool,
-) -> Result<(), CliError> {
-    let resp = client
-        .post(format!("{endpoint}/api/v1/admin/flush-idle"))
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    let parsed: Value =
-        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
-        return Ok(());
-    }
-    let empty = Vec::new();
-    let results = parsed["results"].as_array().unwrap_or(&empty);
-    if results.is_empty() {
-        println!("(no idle sessions to flush)");
-        return Ok(());
-    }
-    let (mut ok, mut err) = (0usize, 0usize);
-    for r in results {
-        if r["ok"].as_bool().unwrap_or(false) {
-            ok += 1;
-            let oc = &r["outcome"];
-            println!(
-                "ok  {} ({} bytes, {}ms)",
-                r["session_id"].as_str().unwrap_or(""),
-                oc["blob_size_bytes"].as_u64().unwrap_or(0),
-                oc["took_ms"].as_u64().unwrap_or(0),
-            );
-        } else {
-            err += 1;
-            println!(
-                "err {}: {}",
-                r["session_id"].as_str().unwrap_or(""),
-                r["error"].as_str().unwrap_or(""),
-            );
-        }
-    }
-    println!("\n{ok} flushed, {err} failed");
     Ok(())
 }
 
 // ---- session subcommands ------------------------------------------------
 
 async fn session_list(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/v1/sessions")).await?;
+    let resp = sc
+        .list_sessions(with_bearer(ListSessionsRequest {}, tok))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        // Produce the same JSON shape that scripts parse:
+        // {"sessions": [{"id": ..., "status": ..., "image": ..., "mode": ...}]}
+        let sessions: Vec<Value> = resp
+            .sessions
+            .iter()
+            .filter_map(|item| item.session.as_ref())
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "status": s.status,
+                    "image": s.image,
+                    "mode": s.mode,
+                    "host_id": s.host_id,
+                    "created_at": s.created_at,
+                    "last_active_at": s.last_active_at,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({ "sessions": sessions });
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
-    let empty = Vec::new();
-    let sessions = body["sessions"].as_array().unwrap_or(&empty);
+
+    let sessions: Vec<_> = resp
+        .sessions
+        .iter()
+        .filter_map(|item| item.session.as_ref())
+        .collect();
     if sessions.is_empty() {
         println!("(no active sessions)");
         return Ok(());
     }
-    // Plain columnar layout: header + rows. Avoids pulling a TUI dep
-    // for what's effectively two-line output most of the time.
     println!(
         "{:<36}  {:<10}  {:<10}  {:<24}  BRANCH",
         "ID", "STATUS", "KIND", "REPO"
     );
     for s in sessions {
         println!(
-            "{:<36}  {:<10}  {:<10}  {:<24}  {}",
-            s["id"].as_str().unwrap_or(""),
-            s["status"].as_str().unwrap_or(""),
-            s["session_kind"].as_str().unwrap_or(""),
-            truncate(s["repo"].as_str().unwrap_or(""), 24),
-            s["branch"].as_str().unwrap_or(""),
+            "{:<36}  {:<10}  {:<10}  {:<24}  -",
+            s.id,
+            s.status,
+            s.mode,
+            truncate(&s.image, 24),
         );
     }
     Ok(())
 }
 
 async fn session_get(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     id: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/v1/sessions/{id}")).await?;
+    let resp = sc
+        .get_session(with_bearer(
+            GetSessionRequest {
+                session_id: id.to_string(),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
+    let s = resp
+        .session
+        .ok_or_else(|| CliError::Other("server returned no session".to_string()))?;
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        let v = serde_json::json!({
+            "id": s.id,
+            "status": s.status,
+            "image": s.image,
+            "mode": s.mode,
+            "host_id": s.host_id,
+            "sandbox_id": s.sandbox_id,
+            "created_at": s.created_at,
+            "last_active_at": s.last_active_at,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    println!("id              : {}", body["id"].as_str().unwrap_or(""));
-    println!(
-        "status          : {}",
-        body["status"].as_str().unwrap_or("")
-    );
-    println!("image           : {}", body["image"].as_str().unwrap_or(""),);
-    if let Some(uid) = body["user_id"].as_str() {
-        println!("user_id         : {uid}");
+    println!("id              : {}", s.id);
+    println!("status          : {}", s.status);
+    println!("image           : {}", s.image);
+    println!("mode            : {}", s.mode);
+    if let Some(h) = &s.host_id {
+        println!("host_id         : {h}");
     }
-    println!(
-        "created_at      : {}",
-        body["created_at"].as_str().unwrap_or(""),
-    );
-    println!(
-        "last_active     : {}",
-        body["last_active_at"].as_str().unwrap_or(""),
-    );
+    if let Some(sb) = &s.sandbox_id {
+        println!("sandbox_id      : {sb}");
+    }
+    println!("created_at      : {}", s.created_at);
+    println!("last_active     : {}", s.last_active_at);
     Ok(())
 }
 
 async fn session_delete(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     id: &str,
 ) -> Result<(), CliError> {
-    let resp = client
-        .delete(format!("{endpoint}/api/v1/sessions/{id}"))
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(CliError::Http(status.as_u16(), body));
-    }
+    sc.delete_session(with_bearer(
+        DeleteSessionRequest {
+            session_id: id.to_string(),
+        },
+        tok,
+    ))
+    .await
+    .map_err(grpc_err)?;
     println!("deleted");
     Ok(())
 }
 
 async fn session_create(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     image: &str,
     dev_vm: bool,
     prompt: Option<&str>,
-    user_id: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut payload = serde_json::Map::new();
-    // Stage B1+: image is a flat OCI URI string.
-    payload.insert("image".into(), Value::from(image));
-    // ADR 0021 P1.3: the session axis is mode, not harness selection.
-    // Omit on Agent (the server default) so the wire stays minimal.
-    if dev_vm {
-        payload.insert("mode".into(), Value::from("dev_vm"));
-    }
-    if let Some(u) = user_id {
-        payload.insert("user_id".into(), Value::from(u));
-    }
-    if let Some(p) = prompt {
-        payload.insert("prompt".into(), Value::from(p));
-    }
-    let resp = client
-        .post(format!("{endpoint}/api/v1/sessions"))
-        .json(&Value::Object(payload))
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    let parsed: Value =
-        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    let mode = if dev_vm { "dev_vm" } else { "agent" }.to_string();
+    let resp = sc
+        .create_session(with_bearer(
+            CreateSessionRequest {
+                image_uri: image.to_string(),
+                mode,
+                prompt: prompt.map(str::to_string),
+                harness_secret_id: None,
+                secrets: Default::default(),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        let v = serde_json::json!({
+            "session_id": resp.session_id,
+            "status": resp.status,
+            "kind": resp.kind,
+            "image_version": resp.image_version,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
-        println!("{}", parsed["session_id"].as_str().unwrap_or(""));
+        println!("{}", resp.session_id);
     }
     Ok(())
 }
 
 async fn session_exec(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     id: &str,
     cmd: &str,
     timeout_secs: Option<u64>,
-    json: bool,
 ) -> Result<(), CliError> {
-    let mut payload = serde_json::Map::new();
-    payload.insert("command".into(), Value::from(cmd));
-    if let Some(t) = timeout_secs {
-        payload.insert("timeout_secs".into(), Value::from(t));
-    }
-    let resp = client
-        .post(format!("{endpoint}/api/v1/sessions/{id}/exec"))
-        .json(&Value::Object(payload))
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    let parsed: Value =
-        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
-        return Ok(());
-    }
-    // Plain mode: stdout to stdout, stderr to stderr. Exit code
-    // mirrors the remote process's exit so shell pipelines compose.
-    if let Some(s) = parsed["stdout"].as_str() {
-        if !s.is_empty() {
-            print!("{s}");
+    use futures::StreamExt;
+
+    let mut stream = sc
+        .exec(with_bearer(
+            ExecRequest {
+                session_id: id.to_string(),
+                command: Some(cmd.to_string()),
+                argv: vec![],
+                env: Default::default(),
+                workdir: None,
+                timeout_secs,
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
+    let mut exit_code: Option<i32> = None;
+    while let Some(msg) = stream.next().await {
+        let msg = msg.map_err(grpc_err)?;
+        use engram_protocol::app::exec_output::Event;
+        match msg.event {
+            Some(Event::Started(_)) => {}
+            Some(Event::Stdout(bytes)) => {
+                print!("{}", String::from_utf8_lossy(&bytes));
+            }
+            Some(Event::Stderr(bytes)) => {
+                eprint!("{}", String::from_utf8_lossy(&bytes));
+            }
+            Some(Event::Exit(ex)) => {
+                exit_code = ex.exit_status;
+            }
+            None => {}
         }
     }
-    if let Some(s) = parsed["stderr"].as_str() {
-        if !s.is_empty() {
-            eprint!("{s}");
+    if let Some(code) = exit_code {
+        if code != 0 {
+            return Err(CliError::Other(format!("exec exited with {code}")));
         }
     }
-    if let Some(exit) = parsed["exit_status"].as_i64() {
-        if exit != 0 {
-            return Err(CliError::Other(format!("exec exited with {exit}")));
-        }
-    }
-    Ok(())
-}
-
-// ---- host subcommands ---------------------------------------------------
-
-async fn host_list(client: &reqwest::Client, endpoint: &str, json: bool) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/v1/hosts")).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
-        return Ok(());
-    }
-    let empty = Vec::new();
-    let hosts = body["hosts"].as_array().unwrap_or(&empty);
-    if hosts.is_empty() {
-        println!("(no hosts registered)");
-        return Ok(());
-    }
-    println!(
-        "{:<36}  {:<10}  {:<10}  {:<10}  SNAPSHOTS",
-        "ID", "STATUS", "USED_MIB", "TOTAL_MIB"
-    );
-    for h in hosts {
-        let snap_count = h["local_snapshots"].as_u64().unwrap_or(0);
-        println!(
-            "{:<36}  {:<10}  {:<10}  {:<10}  {}",
-            h["id"].as_str().unwrap_or(""),
-            h["status"].as_str().unwrap_or(""),
-            h["capacity_used_mib"].as_u64().unwrap_or(0),
-            h["capacity_total_mib"].as_u64().unwrap_or(0),
-            snap_count,
-        );
-    }
-    Ok(())
-}
-
-async fn host_get(
-    client: &reqwest::Client,
-    endpoint: &str,
-    id: &str,
-    json: bool,
-) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/v1/hosts/{id}")).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
-        return Ok(());
-    }
-    println!("id              : {}", body["id"].as_str().unwrap_or(""));
-    println!(
-        "hostname        : {}",
-        body["hostname"].as_str().unwrap_or("")
-    );
-    println!(
-        "status          : {}",
-        body["status"].as_str().unwrap_or("")
-    );
-    println!(
-        "capacity_used   : {} MiB",
-        body["capacity_used_mib"].as_u64().unwrap_or(0)
-    );
-    println!(
-        "capacity_total  : {} MiB",
-        body["capacity_total_mib"].as_u64().unwrap_or(0)
-    );
-    println!(
-        "running_sandboxes: {}",
-        body["running_sandboxes"].as_u64().unwrap_or(0)
-    );
-    println!(
-        "local_snapshots : {}",
-        body["local_snapshots"].as_u64().unwrap_or(0)
-    );
-    Ok(())
-}
-
-async fn host_drain(client: &reqwest::Client, endpoint: &str, id: &str) -> Result<(), CliError> {
-    let resp = client
-        .post(format!("{endpoint}/api/v1/hosts/{id}/drain"))
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    println!("draining");
     Ok(())
 }
 
 async fn session_logs(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     id: &str,
     since: Option<i64>,
 ) -> Result<(), CliError> {
     use futures::StreamExt;
 
-    let mut url = format!("{endpoint}/api/v1/sessions/{id}/events");
-    if let Some(s) = since {
-        url.push_str(&format!("?since={s}"));
-    }
-    let resp = client
-        .get(url)
-        .header("accept", "text/event-stream")
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(CliError::Http(status.as_u16(), body));
-    }
+    let mut stream = sc
+        .stream_events(with_bearer(
+            StreamEventsRequest {
+                session_id: id.to_string(),
+                since,
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
 
-    // Minimal SSE parser: split on "\n\n" frame boundaries; print
-    // `event:` + `data:` per frame. Server-sent comments (`:`-prefix
-    // keep-alives) are ignored. We rely on the body being closed
-    // upstream (or the user Ctrl-C'ing) to end the stream.
-    let mut buf = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(idx) = buf.find("\n\n") {
-            let frame = buf[..idx].to_string();
-            buf.drain(..idx + 2);
-            print_sse_frame(&frame);
-        }
+    while let Some(msg) = stream.next().await {
+        let ev = msg.map_err(grpc_err)?;
+        let idx_str = ev
+            .idx
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!("[{idx_str:>6}] {}: {}", ev.kind, ev.payload_json);
     }
     Ok(())
 }
 
 async fn session_log(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     id: &str,
     limit: Option<i64>,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut url = format!("{endpoint}/api/v1/sessions/{id}/log?kind=conversation");
-    if let Some(l) = limit {
-        url.push_str(&format!("&limit={l}"));
-    }
-    let body = get_json(client, &url).await?;
+    let resp = sc
+        .get_log(with_bearer(
+            GetLogRequest {
+                session_id: id.to_string(),
+                kind: Some("conversation".to_string()),
+                limit,
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        let events: Vec<Value> = resp
+            .events
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "idx": e.idx,
+                    "kind": e.kind,
+                    "at": e.at,
+                    "payload_json": e.payload_json,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({ "events": events });
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
-    let empty = Vec::new();
-    let events = body["events"].as_array().unwrap_or(&empty);
-    if events.is_empty() {
+
+    if resp.events.is_empty() {
         println!("(no events)");
         return Ok(());
     }
     println!("{:<6}  {:<28}  {:<25}  PAYLOAD", "IDX", "KIND", "AT");
-    for e in events {
-        let payload = e["payload"].clone();
-        let summary = match payload {
-            Value::Object(map) if !map.is_empty() => {
+    for e in &resp.events {
+        // payload_json is a raw JSON string; parse for display summary.
+        let summary = match serde_json::from_str::<Value>(&e.payload_json) {
+            Ok(Value::Object(map)) if !map.is_empty() => {
                 let pairs: Vec<String> = map
                     .iter()
                     .take(3)
@@ -922,14 +815,14 @@ async fn session_log(
                     .collect();
                 pairs.join(" ")
             }
-            Value::Null => String::new(),
-            other => short_value(&other),
+            Ok(Value::Null) | Err(_) => String::new(),
+            Ok(other) => short_value(&other),
         };
         println!(
             "{:<6}  {:<28}  {:<25}  {}",
-            e["idx"].as_i64().unwrap_or(0),
-            truncate(e["kind"].as_str().unwrap_or(""), 28),
-            e["at"].as_str().unwrap_or(""),
+            e.idx,
+            truncate(&e.kind, 28),
+            e.at,
             truncate(&summary, 80),
         );
     }
@@ -948,223 +841,200 @@ fn short_value(v: &Value) -> String {
 }
 
 async fn session_resume(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     id: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let url = format!("{endpoint}/api/v1/sessions/{id}/resume");
-    let resp = client.post(url).send().await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    let parsed: Value =
-        serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
+    let resp = sc
+        .resume(with_bearer(
+            ResumeRequest {
+                session_id: id.to_string(),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
     if json {
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        let v = serde_json::json!({
+            "session_id": resp.session_id,
+            "note": resp.note,
+            "snapshot_id": resp.snapshot_id,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    println!("{}", parsed["note"].as_str().unwrap_or("resumed"));
+    let note = if resp.note.is_empty() {
+        "resumed".to_string()
+    } else {
+        resp.note
+    };
+    println!("{note}");
     Ok(())
 }
 
 async fn session_prompt(
-    client: &reqwest::Client,
-    endpoint: &str,
+    sc: &mut SessionServiceClient<Channel>,
+    tok: &Option<String>,
     id: &str,
     text: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let payload = serde_json::json!({ "text": text });
-    let resp = client
-        .post(format!("{endpoint}/api/v1/sessions/{id}/prompt"))
-        .json(&payload)
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
+    let resp = sc
+        .send_prompt(with_bearer(
+            SendPromptRequest {
+                session_id: id.to_string(),
+                text: text.to_string(),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
     if json {
-        let parsed: Value = serde_json::from_str(&body)
-            .map_err(|e| CliError::Other(format!("invalid JSON: {e}")))?;
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        let v = serde_json::json!({
+            "session_id": resp.session_id,
+            "note": resp.note,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
-        println!("prompt forwarded");
+        let note = if resp.note.is_empty() {
+            "prompt forwarded".to_string()
+        } else {
+            resp.note
+        };
+        println!("{note}");
     }
     Ok(())
 }
 
-fn print_sse_frame(frame: &str) {
-    if let Some(line) = format_sse_frame(frame) {
-        println!("{line}");
-    }
-}
+// ---- host subcommands ---------------------------------------------------
 
-/// Render one SSE frame as a single human-readable line. `None` for
-/// frames that carry only a comment / keep-alive (no `event:` or
-/// `data:` field). Pulled out of `print_sse_frame` so it's unit-testable.
-fn format_sse_frame(frame: &str) -> Option<String> {
-    let mut event: Option<String> = None;
-    let mut id: Option<String> = None;
-    let mut data_lines: Vec<&str> = Vec::new();
-    for line in frame.lines() {
-        if line.starts_with(':') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("event:") {
-            event = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("id:") {
-            id = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.trim_start_matches(' '));
-        }
-    }
-    if event.is_none() && data_lines.is_empty() {
-        return None;
-    }
-    let event = event.unwrap_or_else(|| "message".to_string());
-    let data = data_lines.join("\n");
-    let parsed: Value = serde_json::from_str(&data).unwrap_or(Value::String(data));
-    let id_str = id.as_deref().unwrap_or("-");
-    Some(format!("[{id_str:>6}] {event}: {parsed}"))
-}
-
-// ---- image subcommand ---------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-async fn image_build(
-    repo: &str,
-    source: &Path,
-    tag: Option<&str>,
-    images_dir: &Path,
-    docker_bin: Option<&str>,
-    format: Format,
-    inject_agent: Option<&Path>,
-    transport: engram_image_builder::Transport,
-    harness_platform: Option<engram_image_builder::Platform>,
-    push: Option<&str>,
+async fn host_list(
+    fc: &mut FleetServiceClient<Channel>,
+    tok: &Option<String>,
+    json: bool,
 ) -> Result<(), CliError> {
-    let resolved_tag = tag
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("warm-{}", Utc::now().format("%Y%m%dT%H%M%SZ")));
-    let agent_injection = inject_agent.map(|p| engram_image_builder::AgentInjection {
-        agent_binary: p.to_path_buf(),
-        // Reserved port engram-agentd listens on inside the guest.
-        // Hard-coded here (and in engram-sandbox-firecracker as
-        // ENGRAM_AGENTD_PORT) so the bake and the host's connect
-        // logic agree without a config flow.
-        vsock_port: 1024,
-        transport,
-        init_script: None,
-    });
-    let req = BuildRequest {
-        source: source.to_path_buf(),
-        repo: repo.to_string(),
-        tag: resolved_tag.clone(),
-        images_dir: images_dir.to_path_buf(),
-        format,
-        agent_injection,
-    };
-    let docker = match docker_bin {
-        Some(bin) => DockerCli::with_binary(bin.to_string()),
-        None => DockerCli::new(),
-    };
-    // ADR 0007: chunked-storage layout. Chunks land at
-    // `<images_dir>/store/` so a single bake produces a
-    // self-contained tree (mirrors the image-builder binary's
-    // wiring).
-    let chunk_root = images_dir.join("store");
-    tokio::fs::create_dir_all(&chunk_root)
+    let resp = fc
+        .list_hosts(with_bearer(ListHostsRequest {}, tok))
         .await
-        .map_err(|e| CliError::Other(format!("chunk store root: {e}")))?;
-    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
-        std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(chunk_root));
-    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
-    // One OCI client for both built-in harness pulls (during `build`,
-    // when `engram.toml` carries `[harness] builtin = ...`) and the
-    // optional registry push afterwards. Auth resolves from the
-    // standard docker config — `docker login <registry>` upstream,
-    // or any docker/login-action equivalent in CI; with no config the
-    // resolver returns no creds and pull/push fall through to
-    // anonymous (matches public/local-registry behaviour).
-    let oci =
-        engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
-    let mut builder = Builder::new(docker, chunk_store).with_oci(oci);
-    // Default is the host's arch (Builder::host); only override when the
-    // operator asked for a cross-arch bake.
-    if let Some(platform) = harness_platform {
-        builder = builder.with_harness_platform(platform);
-    }
-    let outcome = builder
-        .build(&req)
-        .await
-        .map_err(|e| CliError::Other(e.to_string()))?;
-    println!(
-        "{repo} {tag} -> {dir} ({size} bytes)",
-        repo = repo,
-        tag = resolved_tag,
-        dir = outcome.image_dir.display(),
-        size = outcome.size_bytes,
-    );
+        .map_err(grpc_err)?
+        .into_inner();
 
-    // Optional push to OCI registry. The bake step intentionally does
-    // NOT touch Postgres — once pushed, the image is reachable to
-    // engram by URI alone. The auth resolver wired into the host-
-    // agent's OCI client handles credential lookup at pull time.
-    if let Some(target) = push {
-        let push = builder
-            .push_to_registry(&req, &outcome, target)
-            .await
-            .map_err(|e| CliError::Other(format!("push: {e}")))?;
+    if json {
+        // Produce the same JSON shape that scripts parse:
+        // {"hosts": [{"id": ..., "hostname": ..., "ready_image_digests": [...], ...}]}
+        let hosts: Vec<Value> = resp
+            .hosts
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.id,
+                    "hostname": h.hostname,
+                    "status": h.status,
+                    "capacity_used_mib": h.capacity_used_mib,
+                    "capacity_total_mib": h.capacity_total_mib,
+                    "running_sandboxes": h.running_sandboxes,
+                    "local_snapshots": h.local_snapshots,
+                    "ready_images": h.ready_images,
+                    "ready_image_digests": h.ready_image_digests,
+                    "last_heartbeat_at": h.last_heartbeat_at,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({ "hosts": hosts });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if resp.hosts.is_empty() {
+        println!("(no hosts registered)");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:<10}  {:<10}  {:<10}  SNAPSHOTS",
+        "ID", "STATUS", "USED_MIB", "TOTAL_MIB"
+    );
+    for h in &resp.hosts {
         println!(
-            "✓ pushed {uri} (digest {digest})",
-            uri = push.uri,
-            digest = push.manifest_digest.as_str(),
+            "{:<36}  {:<10}  {:<10}  {:<10}  {}",
+            h.id, h.status, h.capacity_used_mib, h.capacity_total_mib, h.local_snapshots,
         );
     }
-
     Ok(())
 }
 
-// ---- shared helpers -----------------------------------------------------
+async fn host_get(
+    fc: &mut FleetServiceClient<Channel>,
+    tok: &Option<String>,
+    id: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let resp = fc
+        .get_host(with_bearer(
+            GetHostRequest {
+                host_id: id.to_string(),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
 
-fn build_client(token: Option<&str>) -> Result<reqwest::Client, CliError> {
-    let mut builder = reqwest::Client::builder();
-    if let Some(t) = token {
-        // Default header travels on every request (incl. SSE GETs).
-        // Errors here mean the token has illegal header bytes —
-        // surface that early instead of letting reqwest 4xx for us.
-        let mut headers = reqwest::header::HeaderMap::new();
-        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}"))
-            .map_err(|e| CliError::Other(format!("invalid token for header: {e}")))?;
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        builder = builder.default_headers(headers);
+    let h = resp
+        .host
+        .ok_or_else(|| CliError::Other("server returned no host".to_string()))?;
+
+    if json {
+        let v = serde_json::json!({
+            "id": h.id,
+            "hostname": h.hostname,
+            "status": h.status,
+            "capacity_used_mib": h.capacity_used_mib,
+            "capacity_total_mib": h.capacity_total_mib,
+            "running_sandboxes": h.running_sandboxes,
+            "local_snapshots": h.local_snapshots,
+            "ready_images": h.ready_images,
+            "ready_image_digests": h.ready_image_digests,
+            "last_heartbeat_at": h.last_heartbeat_at,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
     }
-    builder
-        .build()
-        .map_err(|e| CliError::Other(format!("http client: {e}")))
+    println!("id              : {}", h.id);
+    println!("hostname        : {}", h.hostname);
+    println!("status          : {}", h.status);
+    println!("capacity_used   : {} MiB", h.capacity_used_mib);
+    println!("capacity_total  : {} MiB", h.capacity_total_mib);
+    println!("running_sandboxes: {}", h.running_sandboxes);
+    println!("local_snapshots : {}", h.local_snapshots);
+    Ok(())
 }
 
-async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value, CliError> {
-    let resp = client.get(url).send().await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    serde_json::from_str(&body).map_err(|e| CliError::Other(format!("invalid JSON: {e}")))
+async fn host_drain(
+    fc: &mut FleetServiceClient<Channel>,
+    tok: &Option<String>,
+    id: &str,
+) -> Result<(), CliError> {
+    fc.drain_host(with_bearer(
+        DrainHostRequest {
+            host_id: id.to_string(),
+        },
+        tok,
+    ))
+    .await
+    .map_err(grpc_err)?;
+    println!("draining");
+    Ok(())
 }
 
 // ---- registry subcommands ---------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 async fn registry_add(
-    client: &reqwest::Client,
-    endpoint: &str,
+    ic: &mut ImageServiceClient<Channel>,
+    tok: &Option<String>,
     host: &str,
     auth_kind: &str,
     username: Option<&str>,
@@ -1173,20 +1043,15 @@ async fn registry_add(
     impersonate_sa: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
-    // Per-kind validation + auth-payload assembly. Shape mirrors the
-    // server's `AddRegistryAuth` discriminated enum (serde tag = "kind").
     let auth = match auth_kind {
         "static" => {
             let username = username
-                .ok_or_else(|| CliError::Other("--auth-kind static requires --username".into()))?;
+                .ok_or_else(|| CliError::Other("--auth-kind static requires --username".into()))?
+                .to_string();
             let password = match (password_file, password_stdin) {
                 (Some(path), false) => {
                     let raw = std::fs::read_to_string(path)
                         .map_err(|e| CliError::Other(format!("read {}: {e}", path.display())))?;
-                    // Strip a single trailing newline if present
-                    // (common for `echo "$pat" > file` flows). Other
-                    // whitespace is left intact — service-account
-                    // JSON has internal newlines.
                     raw.strip_suffix('\n').unwrap_or(&raw).to_string()
                 }
                 (None, true) => {
@@ -1207,22 +1072,12 @@ async fn registry_add(
             if password.is_empty() {
                 return Err(CliError::Other("password is empty".into()));
             }
-            serde_json::json!({
-                "kind": "static",
-                "username": username,
-                "password": password,
-            })
+            add_registry_request::Auth::Static(StaticRegistryAuth { username, password })
         }
         "gcp-workload-identity" | "gcp_workload_identity" => {
-            // No secret material; the host-agent's ambient GCP
-            // identity is the credential. `--impersonate-sa` chains
-            // identity to a target SA via IAM Credentials API
-            // (server-side support deferred — schema is ready).
-            let mut obj = serde_json::json!({ "kind": "gcp_workload_identity" });
-            if let Some(sa) = impersonate_sa {
-                obj["impersonate_sa"] = serde_json::Value::String(sa.into());
-            }
-            obj
+            add_registry_request::Auth::GcpWorkloadIdentity(GcpWorkloadIdentityRegistryAuth {
+                impersonate_sa: impersonate_sa.map(str::to_string),
+            })
         }
         other => {
             return Err(CliError::Other(format!(
@@ -1231,73 +1086,96 @@ async fn registry_add(
         }
     };
 
-    let body = serde_json::json!({ "host": host, "auth": auth });
-    let resp = client
-        .post(format!("{endpoint}/api/v1/registries"))
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await?;
-    let status = resp.status();
-    let resp_body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), resp_body));
-    }
+    let resp = ic
+        .add_registry(with_bearer(
+            AddRegistryRequest {
+                host: host.to_string(),
+                auth: Some(auth),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
     if json {
-        println!("{resp_body}");
+        let v = serde_json::json!({
+            "id": resp.id,
+            "host": resp.host,
+            "auth_kind": resp.auth_kind,
+            "auth_principal": resp.auth_principal,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
-        let v: Value = serde_json::from_str(&resp_body)
-            .map_err(|e| CliError::Other(format!("invalid JSON from server: {e}")))?;
         println!(
             "added: host={} auth_kind={} principal={}",
-            v["host"].as_str().unwrap_or(""),
-            v["auth_kind"].as_str().unwrap_or(""),
-            v["auth_principal"].as_str().unwrap_or("(none)"),
+            resp.host,
+            resp.auth_kind,
+            resp.auth_principal.as_deref().unwrap_or("(none)"),
         );
     }
     Ok(())
 }
 
 async fn registry_list(
-    client: &reqwest::Client,
-    endpoint: &str,
+    ic: &mut ImageServiceClient<Channel>,
+    tok: &Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/v1/registries")).await?;
+    let resp = ic
+        .list_registries(with_bearer(ListRegistriesRequest {}, tok))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        let regs: Vec<Value> = resp
+            .registries
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "registry_host": r.registry_host,
+                    "auth_kind": r.auth_kind,
+                    "auth_principal": r.auth_principal,
+                    "created_at": r.created_at,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({ "registries": regs });
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
-    let empty = Vec::new();
-    let regs = body["registries"].as_array().unwrap_or(&empty);
-    if regs.is_empty() {
+
+    if resp.registries.is_empty() {
         println!("(no registries configured)");
         return Ok(());
     }
     println!("{:<40}  {:<24}  PRINCIPAL", "HOST", "AUTH_KIND");
-    for r in regs {
+    for r in &resp.registries {
         println!(
             "{:<40}  {:<24}  {}",
-            r["registry_host"].as_str().unwrap_or(""),
-            r["auth_kind"].as_str().unwrap_or(""),
-            r["auth_principal"].as_str().unwrap_or("(none)"),
+            r.registry_host,
+            r.auth_kind,
+            r.auth_principal.as_deref().unwrap_or("(none)"),
         );
     }
     Ok(())
 }
 
-async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Result<(), CliError> {
-    // URL-encode the host so `:` in `localhost:5001` survives the path.
-    let encoded = urlencode(host);
-    let resp = client
-        .delete(format!("{endpoint}/api/v1/registries/{encoded}"))
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(CliError::Http(status.as_u16(), body));
-    }
+async fn registry_rm(
+    ic: &mut ImageServiceClient<Channel>,
+    tok: &Option<String>,
+    host: &str,
+) -> Result<(), CliError> {
+    ic.delete_registry(with_bearer(
+        DeleteRegistryRequest {
+            host: host.to_string(),
+        },
+        tok,
+    ))
+    .await
+    .map_err(grpc_err)?;
     println!("removed");
     Ok(())
 }
@@ -1309,92 +1187,143 @@ async fn registry_rm(client: &reqwest::Client, endpoint: &str, host: &str) -> Re
 
 // ---- enabled-images subcommands ---------------------------------------
 
-async fn image_list(client: &reqwest::Client, endpoint: &str, json: bool) -> Result<(), CliError> {
-    let body = get_json(client, &format!("{endpoint}/api/v1/enabled-images")).await?;
+async fn image_list(
+    ic: &mut ImageServiceClient<Channel>,
+    tok: &Option<String>,
+    json: bool,
+) -> Result<(), CliError> {
+    let resp = ic
+        .list_enabled_images(with_bearer(ListEnabledImagesRequest {}, tok))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&body)?);
+        // Produce the same JSON shape that scripts parse:
+        // {"images": [{"image_uri": ..., "manifest_digest": ..., ...}]}
+        let images: Vec<Value> = resp
+            .images
+            .iter()
+            .map(|img| {
+                serde_json::json!({
+                    "id": img.id,
+                    "image_uri": img.image_uri,
+                    "manifest_digest": img.manifest_digest,
+                    "manifest_name": img.manifest_name,
+                    "manifest_description": img.manifest_description,
+                    "harness_name": img.harness_name,
+                    "last_refreshed_at": img.last_refreshed_at,
+                    "created_at": img.created_at,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({ "images": images });
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
-    let empty = Vec::new();
-    let images = body["images"].as_array().unwrap_or(&empty);
-    if images.is_empty() {
+
+    if resp.images.is_empty() {
         println!("(no images enabled — `engram image enable --uri <uri>` to add one)");
         return Ok(());
     }
-    println!("{:<48}  {:<22}  DIGEST", "URI", "NAME",);
-    for img in images {
+    println!("{:<48}  {:<22}  DIGEST", "URI", "NAME");
+    for img in &resp.images {
         println!(
             "{:<48}  {:<22}  {}",
-            img["image_uri"].as_str().unwrap_or(""),
-            img["manifest_name"].as_str().unwrap_or("(unparsed)"),
-            img["manifest_digest"].as_str().unwrap_or(""),
+            img.image_uri,
+            img.manifest_name.as_deref().unwrap_or("(unparsed)"),
+            img.manifest_digest,
         );
     }
     Ok(())
 }
 
 async fn image_enable(
-    client: &reqwest::Client,
-    endpoint: &str,
+    ic: &mut ImageServiceClient<Channel>,
+    tok: &Option<String>,
     uri: &str,
     json: bool,
     no_wait: bool,
 ) -> Result<(), CliError> {
-    // ADR 0036: POST returns 202 + an enable job; the coordinator's
-    // scanner drives the pipeline. Default UX polls the job to a
-    // terminal state with a live chunk progress line.
-    let resp = client
-        .post(format!("{endpoint}/api/v1/enabled-images"))
-        .json(&serde_json::json!({ "image_uri": uri }))
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
-    let job: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-    let job_id = job["id"].as_str().unwrap_or_default().to_string();
+    // ADR 0036: enabling is async — returns an enable job.
+    let resp = ic
+        .enable_image(with_bearer(
+            EnableImageRequest {
+                image_uri: uri.to_string(),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+
+    let job = resp
+        .job
+        .ok_or_else(|| CliError::Other("server returned no enable job".to_string()))?;
+
     if no_wait {
         if json {
-            println!("{body}");
+            let v = enable_job_to_json(&job);
+            println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
-            println!(
-                "enable job {job_id} accepted; poll with \
-                 `GET {endpoint}/api/v1/enable-jobs/{job_id}`"
-            );
+            println!("enable job {} accepted (state={})", job.id, job.state);
         }
         return Ok(());
     }
-    poll_enable_job(client, endpoint, &job_id, json).await
+    poll_enable_job(ic, tok, &job.id, json).await
+}
+
+fn enable_job_to_json(job: &engram_protocol::app::EnableJob) -> Value {
+    serde_json::json!({
+        "id": job.id,
+        "image_uri": job.image_uri,
+        "manifest_digest": job.manifest_digest,
+        "state": job.state,
+        "chunks_total": job.chunks_total,
+        "chunks_done": job.chunks_done,
+        "error": job.error,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    })
 }
 
 /// Poll an enable job until `ready`/`failed`, rendering progress.
 async fn poll_enable_job(
-    client: &reqwest::Client,
-    endpoint: &str,
+    ic: &mut ImageServiceClient<Channel>,
+    tok: &Option<String>,
     job_id: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let url = format!("{endpoint}/api/v1/enable-jobs/{job_id}");
     let mut last_line_len = 0usize;
     loop {
-        let job = get_json(client, &url).await?;
-        let state = job["state"].as_str().unwrap_or("unknown").to_string();
-        let done = job["chunks_done"].as_u64().unwrap_or(0);
-        let total = job["chunks_total"].as_u64();
-        match state.as_str() {
+        let resp = ic
+            .get_enable_job(with_bearer(
+                GetEnableJobRequest {
+                    job_id: job_id.to_string(),
+                },
+                tok,
+            ))
+            .await
+            .map_err(grpc_err)?
+            .into_inner();
+        let job = resp
+            .job
+            .ok_or_else(|| CliError::Other("server returned no job".to_string()))?;
+        match job.state.as_str() {
             "ready" => {
                 if last_line_len > 0 {
                     eprintln!();
                 }
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&job)?);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&enable_job_to_json(&job))?
+                    );
                 } else {
                     println!(
                         "enabled: uri={} digest={}",
-                        job["image_uri"].as_str().unwrap_or(""),
-                        job["manifest_digest"].as_str().unwrap_or(""),
+                        job.image_uri,
+                        job.manifest_digest.as_deref().unwrap_or(""),
                     );
                 }
                 return Ok(());
@@ -1403,18 +1332,17 @@ async fn poll_enable_job(
                 if last_line_len > 0 {
                     eprintln!();
                 }
-                let err = job["error"].as_str().unwrap_or("unknown error");
+                let err = job.error.as_deref().unwrap_or("unknown error");
                 return Err(CliError::Other(format!(
-                    "enable job {job_id} failed: {err} \
-                     (retry: POST {endpoint}/api/v1/enable-jobs/{job_id}/retry)"
+                    "enable job {job_id} failed: {err}"
                 )));
             }
             _ => {
-                let progress = match total {
-                    Some(t) if t > 0 => format!("{done}/{t} chunks"),
+                let progress = match job.chunks_total {
+                    Some(t) if t > 0 => format!("{}/{t} chunks", job.chunks_done),
                     _ => String::new(),
                 };
-                let line = format!("\r{state:<14} {progress:<24}");
+                let line = format!("\r{:<14} {:<24}", job.state, progress);
                 eprint!("{line}");
                 last_line_len = line.len();
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1424,61 +1352,156 @@ async fn poll_enable_job(
 }
 
 async fn image_disable(
-    client: &reqwest::Client,
-    endpoint: &str,
+    ic: &mut ImageServiceClient<Channel>,
+    tok: &Option<String>,
     uri: &str,
 ) -> Result<(), CliError> {
-    let resp = client
-        .post(format!("{endpoint}/api/v1/enabled-images/disable"))
-        .json(&serde_json::json!({ "image_uri": uri }))
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(CliError::Http(status.as_u16(), body));
-    }
+    ic.disable_image(with_bearer(
+        DisableImageRequest {
+            image_uri: uri.to_string(),
+        },
+        tok,
+    ))
+    .await
+    .map_err(grpc_err)?;
     println!("disabled");
     Ok(())
 }
 
 async fn image_refresh(
-    client: &reqwest::Client,
-    endpoint: &str,
+    ic: &mut ImageServiceClient<Channel>,
+    tok: &Option<String>,
     uri: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let resp = client
-        .post(format!("{endpoint}/api/v1/enabled-images/refresh"))
-        .json(&serde_json::json!({ "image_uri": uri }))
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::Http(status.as_u16(), body));
-    }
+    let resp = ic
+        .refresh_image(with_bearer(
+            RefreshImageRequest {
+                image_uri: uri.to_string(),
+            },
+            tok,
+        ))
+        .await
+        .map_err(grpc_err)?
+        .into_inner();
+    let job = resp
+        .job
+        .ok_or_else(|| CliError::Other("server returned no refresh job".to_string()))?;
     // ADR 0036: refresh is an enable job too — poll it like enable.
-    let job: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-    let job_id = job["id"].as_str().unwrap_or_default().to_string();
-    poll_enable_job(client, endpoint, &job_id, json).await
+    poll_enable_job(ic, tok, &job.id, json).await
 }
 
-/// Minimal percent-encoder for the path components that registry/host
-/// names contain (`:`, `/`). Avoids pulling in the `url` crate just
-/// for this — these are always single-segment paths.
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
+// ---- image build (no coordinator contact) ----------------------------
+
+async fn run_image_build(cli: &Cli) -> Result<(), CliError> {
+    let Cmd::Image {
+        cmd:
+            ImageCmd::Build {
+                repo,
+                source,
+                tag,
+                images_dir,
+                docker_bin,
+                format,
+                inject_agent,
+                transport,
+                harness_platform,
+                push,
+            },
+    } = &cli.cmd
+    else {
+        unreachable!()
+    };
+    image_build(
+        repo,
+        source,
+        tag.as_deref(),
+        images_dir,
+        docker_bin.as_deref(),
+        *format,
+        inject_agent.as_deref(),
+        *transport,
+        *harness_platform,
+        push.as_deref(),
+    )
+    .await
 }
+
+#[allow(clippy::too_many_arguments)]
+async fn image_build(
+    repo: &str,
+    source: &Path,
+    tag: Option<&str>,
+    images_dir: &Path,
+    docker_bin: Option<&str>,
+    format: Format,
+    inject_agent: Option<&Path>,
+    transport: engram_image_builder::Transport,
+    harness_platform: Option<engram_image_builder::Platform>,
+    push: Option<&str>,
+) -> Result<(), CliError> {
+    let resolved_tag = tag
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("warm-{}", Utc::now().format("%Y%m%dT%H%M%SZ")));
+    let agent_injection = inject_agent.map(|p| engram_image_builder::AgentInjection {
+        agent_binary: p.to_path_buf(),
+        vsock_port: 1024,
+        transport,
+        init_script: None,
+    });
+    let req = BuildRequest {
+        source: source.to_path_buf(),
+        repo: repo.to_string(),
+        tag: resolved_tag.clone(),
+        images_dir: images_dir.to_path_buf(),
+        format,
+        agent_injection,
+    };
+    let docker = match docker_bin {
+        Some(bin) => DockerCli::with_binary(bin.to_string()),
+        None => DockerCli::new(),
+    };
+    let chunk_root = images_dir.join("store");
+    tokio::fs::create_dir_all(&chunk_root)
+        .await
+        .map_err(|e| CliError::Other(format!("chunk store root: {e}")))?;
+    let blob: std::sync::Arc<dyn engram_core::traits::BlobStorage> =
+        std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(chunk_root));
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+    let oci =
+        engram_oci::OciClient::new(std::sync::Arc::new(engram_oci::DockerConfigResolver::new()));
+    let mut builder = Builder::new(docker, chunk_store).with_oci(oci);
+    if let Some(platform) = harness_platform {
+        builder = builder.with_harness_platform(platform);
+    }
+    let outcome = builder
+        .build(&req)
+        .await
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    println!(
+        "{repo} {tag} -> {dir} ({size} bytes)",
+        repo = repo,
+        tag = resolved_tag,
+        dir = outcome.image_dir.display(),
+        size = outcome.size_bytes,
+    );
+
+    if let Some(target) = push {
+        let push = builder
+            .push_to_registry(&req, &outcome, target)
+            .await
+            .map_err(|e| CliError::Other(format!("push: {e}")))?;
+        println!(
+            "✓ pushed {uri} (digest {digest})",
+            uri = push.uri,
+            digest = push.manifest_digest.as_str(),
+        );
+    }
+
+    Ok(())
+}
+
+// ---- shared output helpers ---------------------------------------------
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -1513,48 +1536,6 @@ mod tests {
         // Each emoji is one char; max=2 should leave one + ellipsis.
         let s = "🦀🦀🦀";
         assert_eq!(truncate(s, 2), "🦀…");
-    }
-
-    #[test]
-    fn format_sse_frame_pretty_prints_event_id_data() {
-        let frame = "event:exec_completed\nid:7\ndata:{\"exec_id\":\"x\",\"exit_status\":0}";
-        let out = format_sse_frame(frame).unwrap();
-        assert!(out.contains("exec_completed"), "got {out}");
-        assert!(out.contains("\"exec_id\":\"x\""), "got {out}");
-        assert!(
-            out.contains("[     7]"),
-            "id should be right-aligned: {out}"
-        );
-    }
-
-    #[test]
-    fn format_sse_frame_defaults_event_to_message() {
-        let frame = "data:hello";
-        let out = format_sse_frame(frame).unwrap();
-        // No `event:` field -> default per the SSE spec.
-        assert!(out.contains("message"), "got {out}");
-    }
-
-    #[test]
-    fn format_sse_frame_skips_keepalive_comments() {
-        // axum's keep-alive emits `: keep-alive\n\n` — there's no
-        // event or data, just a comment line. Filtering at the
-        // formatter stops every keep-alive from polluting the
-        // user's terminal.
-        assert!(format_sse_frame(": keep-alive").is_none());
-        assert!(format_sse_frame(":").is_none());
-    }
-
-    #[test]
-    fn format_sse_frame_treats_non_json_data_as_string() {
-        let out = format_sse_frame("event:raw\ndata:not-json").unwrap();
-        assert!(out.contains("\"not-json\""), "got {out}");
-    }
-
-    #[test]
-    fn format_sse_frame_uses_dash_for_missing_id() {
-        let out = format_sse_frame("event:x\ndata:1").unwrap();
-        assert!(out.contains("[     -]"), "got {out}");
     }
 
     #[test]

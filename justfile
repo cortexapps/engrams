@@ -362,16 +362,14 @@ watch:
 smoke-health:
     curl -s http://localhost:8090/healthz | jq
 
-# POST a session and print the session_id. Requires a demo image in
-# the registry (`just bake-demo`).
+# Create a session and print the JSON response. Requires a demo image
+# to be enabled (`just bake-demo` + `engram image enable`).
+# Uses the app gRPC surface (ADR 0039); the old REST body shape is
+# retired — the image URI is a flat OCI string and mode replaces harness.
 smoke-create:
-    curl -s -X POST http://localhost:8090/sessions \
-        -H 'content-type: application/json' \
-        -d '{ \
-              "image": {"kind":"registry","repo":"local://demo","tag":"warm-1"}, \
-              "workspace": {"kind":"empty"}, \
-              "harness": {"kind":"none"} \
-            }' | jq
+    ./target/release/engram-cli --json session create \
+        --image ghcr.io/cortex/demo:warm-1 \
+        --dev-vm
 
 # Promote a user to admin role in the orchestrator DB (ADR 0039 Task 16).
 #
@@ -390,18 +388,15 @@ dev-admin email='dev@engram.local':
         psql -U engram -d engram_orchestrator \
         -c "UPDATE \"user\" SET role='admin' WHERE email='{{email}}'; SELECT email, role FROM \"user\" WHERE email='{{email}}';"
 
-# Smallest-possible dev session: empty workspace, no agent. Useful
-# for confirming the orthogonal axes in isolation — no git remote
-# to clone, no harness binary to attach, just a VM with a shell.
-# Pair with the dashboard's SHELL tab or `engram session exec`.
+# Smallest-possible dev session: no agent driven. Useful for confirming
+# the orthogonal axes in isolation — no harness to attach, just a VM
+# with a shell. Pair with the dashboard's SHELL tab or `engram session exec`.
+# Uses the app gRPC surface (ADR 0039); mode=dev_vm leaves the baked
+# harness resident-but-undriven.
 dev-shell:
-    curl -s -X POST http://localhost:8090/sessions \
-        -H 'content-type: application/json' \
-        -d '{ \
-              "image": {"kind":"registry","repo":"local://demo","tag":"warm-1"}, \
-              "workspace": {"kind":"empty"}, \
-              "harness": {"kind":"none"} \
-            }' | jq -r '.session_id'
+    ./target/release/engram-cli session create \
+        --image ghcr.io/cortex/demo:warm-1 \
+        --dev-vm
 
 # Live smoke of the app-gRPC surface (ADR 0039 Task 10 stage gate).
 # Requires `just dev` running. The dev bearer matches the Tiltfile's

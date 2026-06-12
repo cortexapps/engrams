@@ -35,7 +35,8 @@ setsid bash -c "exec tilt up --stream >'$LOG' 2>&1" &
 disown 2>/dev/null || true
 echo "==> tilt up started (log: $LOG)"
 
-# Wait for the coordinator HTTP API.
+# Wait for the coordinator HTTP API. /healthz is a retained HTTP route
+# (ADR 0039 Task 32) so this curl is correct here.
 echo "==> waiting for coord /healthz"
 for _ in $(seq 1 180); do
     curl -fsS http://127.0.0.1:8090/healthz >/dev/null 2>&1 && break
@@ -48,22 +49,25 @@ if ! curl -fsS http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
 fi
 echo "    coord up"
 
-# Wait for at least one host-agent to register (FC backend always runs
-# the split topology, so a host-agent is expected).
-#
-# `{ grep || true; }` scopes grep's no-match exit-1 so `set -o pipefail`
-# + `set -e` don't abort the script on the first poll (before any host
-# has registered, /api/hosts is `{"hosts":[]}` and grep matches nothing).
-# Same guard integration-up.sh used; omitting it kills the loop instantly.
+# Wait for at least one host-agent to register, via the app gRPC surface
+# (ADR 0039). The engram-cli binary is available — it was built in a
+# prior CI step (ENGRAM_INTEG_BIN_DIR or ./target/release).
+CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
+GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
+TOKEN_FLAG=()
+if [ -n "${ENGRAM_APP_TOKEN:-}" ]; then
+    TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
+fi
+
 echo "==> waiting for host registration"
 for _ in $(seq 1 180); do
-    n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
-        | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
+    n=$("$CLI" "${TOKEN_FLAG[@]}" --grpc-addr "$GRPC" --json host list 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('hosts',[])))" 2>/dev/null || echo 0)
     [ "${n:-0}" -ge 1 ] && break
     sleep 1
 done
-n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
-    | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
+n=$("$CLI" "${TOKEN_FLAG[@]}" --grpc-addr "$GRPC" --json host list 2>/dev/null \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('hosts',[])))" 2>/dev/null || echo 0)
 if [ "${n:-0}" -lt 1 ]; then
     echo "ERROR: no host-agent registered" >&2
     tail -80 "$LOG" >&2 || true
