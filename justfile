@@ -423,11 +423,18 @@ smoke-control-plane:
 smoke-orchestrator:
     SMOKE=1 bun test --cwd orchestrator src/smoke.live.test.ts
 
+# Cross-stack parity smoke (ADR 0039 Task 21b — SCAFFOLDING, deleted in Task 28).
+# Requires `just dev` running (coordinator :8090, orchestrator :8787).
+# Reads every overlapping resource through both the legacy axum REST and the
+# new gated /rpc, normalises and diffs. Exits non-zero on any diff.
+smoke-parity:
+    bun run --cwd orchestrator scripts/parity.ts
+
 # Umbrella stage gate: run all smoke-* recipes in sequence. Each task
 # that adds a new smoke-* recipe appends its name to this recipe's
 # dependencies. (A just recipe cannot reference recipes that don't
 # exist yet, so each task is responsible for appending here.)
-smoke: smoke-control-plane smoke-orchestrator
+smoke: smoke-control-plane smoke-orchestrator smoke-parity
 
 # Drop everything in ./var/* (sandbox cwds + snapshots).
 clean-var:
