@@ -142,7 +142,9 @@ export function makeArtifactsRoute(deps?: ArtifactsDeps): Hono {
           }
         }
       } catch (err) {
-        // Client disconnect (AbortError) is expected — suppress.
+        // Client disconnect is expected — suppress. connect-es surfaces
+        // aborts as ConnectError(Canceled), plain fetch as AbortError.
+        if (err instanceof ConnectError && err.code === Code.Canceled) return;
         if (err instanceof Error && err.name === "AbortError") return;
         throw err;
       }
