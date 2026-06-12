@@ -454,6 +454,60 @@ pub async fn evacuate_session(
     ))
 }
 
+#[derive(Serialize)]
+pub struct EvictIdleResponse {
+    pub session_id: SessionId,
+    /// "idle" — the session was paused, flushed, snapshotted, and its
+    /// local sandbox destroyed; the PG row is at `Idle` and a
+    /// subsequent `POST /sessions/:id/resume` rebinds it.
+    pub status: &'static str,
+}
+
+/// `POST /api/admin/sessions/:id/evict-idle` — the explicit admin
+/// trigger for the idle-eviction pipeline. Fires the exact same
+/// primitive (`idle_evictor::evict_idle_session`) the host-side idle
+/// detector and the coord `idle_detect_backstop` scanner drive on a
+/// timeout, so it's a faithful stand-in for "the session went idle" —
+/// without waiting out (or globally lowering) the idle TTL. Pre:
+/// Active session with a bound sandbox. Post: session at `Idle`,
+/// memory snapshot durable in BlobStorage, resumable.
+///
+/// Synchronous (unlike `evacuate`, which hands off to the resumer
+/// scanner): the pipeline runs inline and the session is `Idle` by the
+/// time this returns 200.
+pub async fn evict_idle(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<EvictIdleResponse>, ApiError> {
+    let session = state.services.meta.get_session(session_id).await?;
+    if !matches!(session.status, engram_core::types::SessionState::Active) {
+        return Err(ApiError::Conflict(format!(
+            "evict-idle only supported for Active sessions (got {})",
+            session.status.as_str(),
+        )));
+    }
+    let Some(sandbox_id) = session.sandbox_id else {
+        return Err(ApiError::Conflict(format!(
+            "session {session_id} has no bound sandbox",
+        )));
+    };
+
+    crate::idle_evictor::evict_idle_session(&state, session_id, sandbox_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("idle-evict pipeline: {e}")))?;
+
+    tracing::info!(
+        %session_id,
+        %sandbox_id,
+        "admin evict-idle: session suspended to Idle via the idle-eviction primitive",
+    );
+
+    Ok(Json(EvictIdleResponse {
+        session_id,
+        status: "idle",
+    }))
+}
+
 #[derive(serde::Deserialize)]
 pub struct TeleportSessionRequest {
     /// The destination host to relocate the session onto.

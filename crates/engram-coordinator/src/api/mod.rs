@@ -141,6 +141,10 @@ pub fn router(state: SharedState) -> Router {
             "/admin/sessions/:id/teleport",
             post(admin::teleport_session),
         )
+        // Explicit admin trigger for the idle-eviction primitive, so
+        // tests/operators can drive Active→Idle deterministically
+        // instead of waiting out (or globally lowering) the idle TTL.
+        .route("/admin/sessions/:id/evict-idle", post(admin::evict_idle))
         // ADR 0045 Phase F: freeze / unfreeze a microVM in place.
         .route("/admin/sessions/:id/pause", post(admin::pause_session))
         .route("/admin/sessions/:id/resume", post(admin::resume_session))

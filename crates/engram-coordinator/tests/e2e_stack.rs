@@ -290,6 +290,27 @@ impl Driver {
         assert!(status.is_success(), "resume failed: {status} body={text}");
     }
 
+    /// `POST /admin/sessions/:id/evict-idle` — the explicit admin
+    /// trigger for the idle-eviction primitive. Synchronous: the
+    /// session is `Idle` by the time this returns. Lets the test drive
+    /// Active→Idle through the real idle pipeline (pause → flush →
+    /// snapshot → destroy) without waiting out the idle TTL.
+    async fn evict_idle(&self, sid: SessionId) {
+        let path = format!("/api/v1/admin/sessions/{sid}/evict-idle");
+        let resp = self
+            .req(reqwest::Method::POST, &path)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("POST /admin/sessions/:id/evict-idle");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "evict_idle failed: {status} body={text}"
+        );
+    }
+
     /// `GET /sessions/:id/cow-state`. ADR 0016 Phase A diagnostic.
     /// Returns `Some(json)` when the sandbox is NBD-tracked
     /// (Phase B's chunked-disk pipeline live), `None` when the
@@ -340,6 +361,108 @@ impl Driver {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         None
+    }
+
+    /// `GET /sessions/:id` → the full `Session` JSON. Black-box read:
+    /// the lifecycle tests observe `status` (snake_case `SessionState`
+    /// — "active" / "idle" / "evacuating") and `host_id` exactly as a
+    /// real client would, instead of probing internal diagnostics. A
+    /// pure read; it does not bump the session's activity clock, so
+    /// the idle-eviction test can poll it without keeping the session
+    /// warm.
+    async fn get_session(&self, sid: SessionId) -> Value {
+        let path = format!("/api/v1/sessions/{sid}");
+        let resp = self
+            .req(reqwest::Method::GET, &path)
+            .send()
+            .await
+            .expect("GET /sessions/:id");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "GET /sessions/:id failed: {status} body={text}"
+        );
+        serde_json::from_str(&text).expect("decode Session json")
+    }
+
+    /// The session's `status` string (snake_case `SessionState`).
+    async fn session_status(&self, sid: SessionId) -> String {
+        self.get_session(sid)
+            .await
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The session's bound `host_id` (`None` while Idle / unbound).
+    /// Used by the teleport test to assert the session relocated.
+    async fn session_host_id(&self, sid: SessionId) -> Option<String> {
+        self.get_session(sid)
+            .await
+            .get("host_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// `GET /hosts` → the registered hosts' ids. The teleport test uses
+    /// this to discover a peer to relocate onto.
+    async fn list_host_ids(&self) -> Vec<String> {
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/hosts")
+            .send()
+            .await
+            .expect("GET /hosts");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "GET /hosts failed: {status} body={text}"
+        );
+        let body: Value = serde_json::from_str(&text).expect("decode ListHostsResponse");
+        body.get("hosts")
+            .and_then(Value::as_array)
+            .map(|hs| {
+                hs.iter()
+                    .filter_map(|h| h.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `POST /admin/sessions/:id/teleport` `{target_host_id}` — relocate
+    /// an Active session to a chosen host. Returns 202 (snapshot-rehome)
+    /// or 200 (live); either way the `evac_resumer` lands it on the
+    /// pinned host. Asserts only that the request was accepted; the
+    /// caller polls `wait_for_status(active)` + `session_host_id` for the
+    /// observable outcome.
+    async fn teleport(&self, sid: SessionId, target_host_id: &str) {
+        let path = format!("/api/v1/admin/sessions/{sid}/teleport");
+        let resp = self
+            .req(reqwest::Method::POST, &path)
+            .json(&serde_json::json!({ "target_host_id": target_host_id }))
+            .send()
+            .await
+            .expect("POST /admin/sessions/:id/teleport");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(status.is_success(), "teleport failed: {status} body={text}");
+    }
+
+    /// Poll `GET /sessions/:id` until `status == want` or the deadline
+    /// elapses. Returns true on match. Used to observe Active→Idle
+    /// (eviction) and Idle/Evacuating→Active (resume / teleport
+    /// rejoin) through the public API alone.
+    async fn wait_for_status(&self, sid: SessionId, want: &str, deadline: Duration) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < deadline {
+            if self.session_status(sid).await == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        false
     }
 
     /// Stream session_events until the deadline, watching for an
@@ -690,6 +813,19 @@ fn nbd_required() -> bool {
     )
 }
 
+/// Whether this environment is REQUIRED to have ≥2 hosts (the teleport
+/// scenario). Set `ENGRAM_EXPECT_TWO_HOSTS=1` on the CI lane that boots
+/// the two-host stack (`ENGRAM_INTEG_TWO_HOSTS=1`) so a single-host
+/// environment becomes a hard failure instead of a silent skip. Unset
+/// (default single-host lane, local runs) keeps the graceful-skip path,
+/// so the test is safe to land before the lane flips to two hosts.
+fn two_hosts_required() -> bool {
+    matches!(
+        std::env::var("ENGRAM_EXPECT_TWO_HOSTS").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// ADR 0016 Phase B commit 4b: end-to-end exercise of the
 /// FlushScheduler primitive via the admin `flush-now` endpoint.
 /// Explicit-trigger counterpart to the scheduler's 30s implicit
@@ -1017,6 +1153,175 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
     driver.delete(sid).await;
 }
 
+/// Lifecycle e2e: idle→active resume preserves BOTH disk and memory,
+/// proven the only way a user would see it — write through the API,
+/// run the snapshot→evict→resume cycle, read back through the API.
+///
+/// Unlike `e2e_resume_rejoins_chunked_disk_tracking` (which asserts on
+/// the internal `disk_manifest_version`), this is pure black-box: it
+/// never inspects cow-state or manifest internals. Two guarantees:
+///
+///   - **Disk data survives byte-identical.** A UUID sentinel written
+///     to `/var/sentinel.txt` is `cat`'d back after resume and must
+///     match. This is the user-facing "no data loss on resume" claim.
+///     It holds on any backend (NBD-attached OR materialize-to-file),
+///     so the test does NOT gate on NBD.
+///   - **The kernel was memory-restored, not rebooted.**
+///     `/proc/sys/kernel/random/boot_id` is minted once per kernel
+///     boot and lives only in kernel memory — the FC memory snapshot
+///     captures it, a cold reboot regenerates it. Asserting it's
+///     unchanged across the cycle proves resume is a true warm
+///     memory-restore, not a disk-only re-boot (which would silently
+///     drop any in-memory process state a real session depends on).
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_resume_preserves_disk_and_memory() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+
+    let sid = driver.create_session_none_harness(&image).await;
+
+    // Disk sentinel: a fresh UUID so stale state can't satisfy the
+    // readback. `/var` is the proven-writable anchor the other tests
+    // use. sync so it reaches the disk backend, not the guest cache.
+    let disk_sentinel = uuid::Uuid::new_v4().to_string();
+    let write = driver
+        .exec(
+            sid,
+            &format!("printf '%s' {disk_sentinel} > /var/sentinel.txt && sync"),
+        )
+        .await;
+    assert_eq!(
+        write.exit_status,
+        Some(0),
+        "sentinel write should succeed; stderr=<{}>",
+        write.stderr,
+    );
+
+    // Memory-continuity witness: the kernel's boot_id, captured BEFORE
+    // the snapshot. Survives a memory-restore; changes on a reboot.
+    let boot_id_before = driver
+        .exec(sid, "cat /proc/sys/kernel/random/boot_id")
+        .await;
+    assert_eq!(
+        boot_id_before.exit_status,
+        Some(0),
+        "reading boot_id should succeed; stderr=<{}>",
+        boot_id_before.stderr,
+    );
+    let boot_id_before = boot_id_before.stdout.trim().to_string();
+    assert!(!boot_id_before.is_empty(), "boot_id must be non-empty");
+
+    // The idle→active cycle prod exercises (minus the 30s idle wait):
+    // snapshot the running VM, drop the local sandbox, resume.
+    driver.snapshot(sid).await;
+    driver.evict_local(sid).await;
+    driver.resume(sid).await;
+    assert!(
+        driver
+            .wait_for_status(sid, "active", Duration::from_secs(30))
+            .await,
+        "session should be Active after resume",
+    );
+
+    // Disk survived byte-identical.
+    let readback = driver.exec(sid, "cat /var/sentinel.txt").await;
+    assert_eq!(
+        readback.exit_status,
+        Some(0),
+        "sentinel readback should succeed; stderr=<{}>",
+        readback.stderr,
+    );
+    assert_eq!(
+        readback.stdout.trim(),
+        disk_sentinel,
+        "disk data lost across resume: /var/sentinel.txt content changed",
+    );
+
+    // Kernel was memory-restored, not rebooted.
+    let boot_id_after = driver
+        .exec(sid, "cat /proc/sys/kernel/random/boot_id")
+        .await;
+    assert_eq!(
+        boot_id_after.stdout.trim(),
+        boot_id_before,
+        "boot_id changed across resume — the VM cold-rebooted instead of \
+         restoring from the memory snapshot (in-memory state would be lost)",
+    );
+
+    driver.delete(sid).await;
+}
+
+/// Lifecycle e2e: active→idle eviction via the real idle pipeline, then
+/// resume with data intact — all through the public API.
+///
+/// `e2e_resume_preserves_disk_and_memory` drives Active→Idle with the
+/// manual `snapshot` + `evict-local` handlers; this one fires the
+/// `evict-idle` admin trigger, which runs the *same* primitive the
+/// host idle-detector and the coord backstop scanner drive on a
+/// timeout (`idle_evictor::evict_idle_session`). That's the deterministic
+/// stand-in for "the session went idle" — no global TTL lowering (which
+/// would race-evict the other serial tests' sessions).
+///
+/// Asserts the observable contract: the session reaches `idle`, is
+/// resumable, and the pre-eviction disk sentinel survives byte-identical.
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_idle_evict_then_resume_preserves_data() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+
+    let sid = driver.create_session_none_harness(&image).await;
+
+    let sentinel = uuid::Uuid::new_v4().to_string();
+    let write = driver
+        .exec(
+            sid,
+            &format!("printf '%s' {sentinel} > /var/idle-sentinel.txt && sync"),
+        )
+        .await;
+    assert_eq!(
+        write.exit_status,
+        Some(0),
+        "sentinel write should succeed; stderr=<{}>",
+        write.stderr,
+    );
+
+    // Fire the idle-eviction primitive. Synchronous → Idle on return,
+    // but assert the observable state transition through the API.
+    driver.evict_idle(sid).await;
+    assert!(
+        driver
+            .wait_for_status(sid, "idle", Duration::from_secs(30))
+            .await,
+        "session should be Idle after evict-idle; got {}",
+        driver.session_status(sid).await,
+    );
+
+    // Resumable, and the data written before eviction is intact.
+    driver.resume(sid).await;
+    assert!(
+        driver
+            .wait_for_status(sid, "active", Duration::from_secs(30))
+            .await,
+        "session should be Active after resume",
+    );
+    let readback = driver.exec(sid, "cat /var/idle-sentinel.txt").await;
+    assert_eq!(
+        readback.exit_status,
+        Some(0),
+        "sentinel readback should succeed; stderr=<{}>",
+        readback.stderr,
+    );
+    assert_eq!(
+        readback.stdout.trim(),
+        sentinel,
+        "disk data lost across idle-evict→resume",
+    );
+
+    driver.delete(sid).await;
+}
+
 // ---------------------------------------------------------------------
 // ADR 0016 Phase C commit 6a — chunk-GC admin-endpoint e2e regression
 // ---------------------------------------------------------------------
@@ -1333,6 +1638,112 @@ async fn e2e_evac_admin_endpoint_shape() {
     assert!(
         body.get("session_id").is_some(),
         "202 body must echo session_id; got {body:?}",
+    );
+
+    driver.delete(sid).await;
+}
+
+/// Full-stack 2-host teleport: relocate a live session to a chosen peer
+/// and prove its disk data crosses the move — the e2e the
+/// `e2e_evac_admin_endpoint_shape` doc calls out as "dev-vm only".
+/// Driven entirely through the public API.
+///
+/// Requires the two-host stack (`ENGRAM_INTEG_TWO_HOSTS=1`, which the CI
+/// lane sets alongside `ENGRAM_EXPECT_TWO_HOSTS=1`). On a single-host
+/// environment it skips with a `::warning::` — unless
+/// `ENGRAM_EXPECT_TWO_HOSTS` is set, where <2 hosts is a hard failure.
+/// This mirrors the `nbd_required()` gate so the test is safe to land
+/// before the lane flips to two hosts.
+///
+/// Flow: create on host A → write a UUID sentinel → `teleport` to host B
+/// → wait for Active → assert `host_id` is now B (the pinned target) →
+/// `cat` the sentinel back and assert byte-identical.
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image + a 2-host stack; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_two_host_teleport_preserves_sentinel() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+
+    let hosts = driver.list_host_ids().await;
+    if hosts.len() < 2 {
+        assert!(
+            !two_hosts_required(),
+            "ENGRAM_EXPECT_TWO_HOSTS is set but only {} host(s) registered — the \
+             two-host stack didn't come up (check ENGRAM_INTEG_TWO_HOSTS + the \
+             tilt-up-ci.sh >=2 host wait + NBD device split).",
+            hosts.len(),
+        );
+        eprintln!(
+            "::warning title=Teleport e2e skipped::only {} host registered; \
+             teleport needs >=2. Set ENGRAM_INTEG_TWO_HOSTS=1 on the lane to \
+             exercise this.",
+            hosts.len(),
+        );
+        return;
+    }
+
+    let sid = driver.create_session_none_harness(&image).await;
+    let src = driver
+        .session_host_id(sid)
+        .await
+        .expect("Active session must have a bound host_id");
+
+    let sentinel = uuid::Uuid::new_v4().to_string();
+    let write = driver
+        .exec(
+            sid,
+            &format!("printf '%s' {sentinel} > /var/tele-sentinel.txt && sync"),
+        )
+        .await;
+    assert_eq!(
+        write.exit_status,
+        Some(0),
+        "sentinel write should succeed; stderr=<{}>",
+        write.stderr,
+    );
+
+    // Pick a destination host that isn't the source, and teleport.
+    let dest = hosts
+        .iter()
+        .find(|h| **h != src)
+        .expect("a peer host distinct from the source");
+    driver.teleport(sid, dest).await;
+
+    // The evac_resumer drives Evacuating → Created → Active on the pinned
+    // host. Generous deadline: first restore on the peer may cold-fetch
+    // chunks. 180s mirrors the cold-create budget.
+    assert!(
+        driver
+            .wait_for_status(sid, "active", Duration::from_secs(180))
+            .await,
+        "session should be Active on the destination host after teleport; \
+         last status={}",
+        driver.session_status(sid).await,
+    );
+
+    // Landed on the pinned target, not the source.
+    let after = driver
+        .session_host_id(sid)
+        .await
+        .expect("resumed session must have a bound host_id");
+    assert_ne!(after, src, "session must leave the source host");
+    assert_eq!(
+        after, *dest,
+        "session must land on the pinned teleport target",
+    );
+
+    // Disk data crossed the move byte-identical.
+    let readback = driver.exec(sid, "cat /var/tele-sentinel.txt").await;
+    assert_eq!(
+        readback.exit_status,
+        Some(0),
+        "sentinel readback on the destination host should succeed; stderr=<{}>",
+        readback.stderr,
+    );
+    assert_eq!(
+        readback.stdout.trim(),
+        sentinel,
+        "disk data lost across the host teleport",
     );
 
     driver.delete(sid).await;

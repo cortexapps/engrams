@@ -48,25 +48,31 @@ if ! curl -fsS http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
 fi
 echo "    coord up"
 
-# Wait for at least one host-agent to register (FC backend always runs
-# the split topology, so a host-agent is expected).
+# Wait for the host-agent(s) to register. The two-host topology
+# (`ENGRAM_INTEG_TWO_HOSTS=1`, used by the teleport e2e) brings up
+# host-agent + host-agent-b, so require both before returning — else the
+# bake/teleport step races a half-up fleet. Single-host default needs 1.
 #
 # `{ grep || true; }` scopes grep's no-match exit-1 so `set -o pipefail`
 # + `set -e` don't abort the script on the first poll (before any host
 # has registered, /api/hosts is `{"hosts":[]}` and grep matches nothing).
 # Same guard integration-up.sh used; omitting it kills the loop instantly.
-echo "==> waiting for host registration"
+case "${ENGRAM_INTEG_TWO_HOSTS:-}" in
+    1 | true | yes) want_hosts=2 ;;
+    *) want_hosts=1 ;;
+esac
+echo "==> waiting for host registration (want >= $want_hosts)"
 for _ in $(seq 1 180); do
     n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
         | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
-    [ "${n:-0}" -ge 1 ] && break
+    [ "${n:-0}" -ge "$want_hosts" ] && break
     sleep 1
 done
 n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
     | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
-if [ "${n:-0}" -lt 1 ]; then
-    echo "ERROR: no host-agent registered" >&2
+if [ "${n:-0}" -lt "$want_hosts" ]; then
+    echo "ERROR: expected >= $want_hosts host-agent(s), got ${n:-0}" >&2
     tail -80 "$LOG" >&2 || true
     exit 1
 fi
-echo "    host registered; prod-shape stack ready"
+echo "    $n host(s) registered; prod-shape stack ready"

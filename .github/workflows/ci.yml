@@ -118,6 +118,35 @@ env:
   HARNESS_PLATFORM: linux-x86_64
 
 jobs:
+  # Change-detection for the expensive, NON-REQUIRED e2e lane. Reuses the
+  # same cargo-dep-closure detector as bake-images.yml so "any crate in
+  # the e2e binaries' release closure" is expressed precisely (a glob
+  # filter can't). Only the `e2e` output is consumed here; the rest are
+  # emitted for free. The e2e jobs gate on this for pull_request events;
+  # push-to-main and merge_group always run them (see their `if:`).
+  detect:
+    name: detect changed lanes
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      e2e: ${{ steps.lanes.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history so the PR base SHA is present for the diff.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Detect changed lanes
+        id: lanes
+        run: |
+          # PRs diff against the base SHA (an ancestor of the checked-out
+          # merge commit under fetch-depth:0). Other events fall back to
+          # HEAD^! — irrelevant since their e2e `if:` runs unconditionally.
+          BASE=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          fi
+          python3 .github/scripts/detect-rebake-lanes.py --base "$BASE" --head HEAD
+
   lint:
     name: fmt + clippy + check
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -1153,6 +1182,14 @@ jobs:
     name: build e2e binaries
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 25
+    # Only consumed by test-e2e-stack, so gate it on the same condition —
+    # no point building the e2e binaries when the e2e lane won't run.
+    needs:
+      - detect
+    if: >-
+      needs.detect.outputs.e2e == 'true'
+      || github.event_name == 'merge_group'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v6
 
@@ -1236,8 +1273,40 @@ jobs:
   # flaky `proxy_e2e` doesn't suppress e2e-stack signal.
   # ------------------------------------------------------------------
   test-e2e-stack:
-    name: e2e stack (coord HTTP → gRPC → FC)
+    name: e2e stack ${{ matrix.variant }} (coord HTTP → gRPC → FC)
+    # Two variants of the same prod-shape stack (egress proxy on for
+    # both — the proven config):
+    #   - suite: single host. Runs every e2e_stack test EXCEPT the
+    #     teleport one (incl. the egress-dependent claude auth test,
+    #     which a single host serves reliably).
+    #   - teleport: two hosts (host-a + host-b). Runs ONLY the teleport
+    #     test, hard-asserting >=2 hosts. The egress-dependent claude
+    #     test is NOT run here — two FC host-agents sharing one runner
+    #     with egress on destabilizes that test specifically (the claude
+    #     session can land on host-b and emit no events); the teleport
+    #     test uses mode=dev_vm and doesn't touch egress, so it's stable.
+    # e2e stack is not a required check, so the matrix-suffixed job names
+    # don't affect branch protection.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: suite
+            two_hosts: ""
+            expect_two_hosts: ""
+            nextest_filter: "not test(e2e_two_host_teleport_preserves_sentinel)"
+          - variant: teleport
+            two_hosts: "1"
+            expect_two_hosts: "1"
+            nextest_filter: "test(e2e_two_host_teleport_preserves_sentinel)"
+    # Gate (e2e is not required → a skip can't block merge): run on any
+    # e2e-relevant change, and always on merge_group + push-to-main.
+    if: >-
+      needs.detect.outputs.e2e == 'true'
+      || github.event_name == 'merge_group'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs:
+      - detect
       - lint
       - test-linux
       - web
@@ -1395,14 +1464,18 @@ jobs:
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release
           ENGRAM_SKIP_WEB: "1"
-          # Enable the per-session egress proxy. The local dev path
-          # defaults to disabled (unfiltered network — relies on the
-          # dev VM's host masquerade). The Blacksmith runner doesn't
-          # NAT FC TAP traffic to its outbound interface, so guests
-          # need to route via the proxy. Mirrors what `e2e_harness.rs`
-          # in test-firecracker already does at the PooledBackend
-          # layer.
+          # Per-session egress proxy. The local dev path defaults to
+          # disabled (unfiltered network — relies on the dev VM's host
+          # masquerade). The Blacksmith runner doesn't NAT FC TAP
+          # traffic to its outbound interface, so guests need to route
+          # via the proxy. Mirrors what `e2e_harness.rs` in
+          # test-firecracker already does at the PooledBackend layer.
+          # (Host-b gets a distinct port in the two-host variant; see
+          # the Tiltfile.)
           ENGRAM_EGRESS_PROXY_PORT: "14443"
+          # Empty for suite (single host), "1" for teleport (host-a +
+          # host-b). tilt-up-ci.sh waits for the matching host count.
+          ENGRAM_INTEG_TWO_HOSTS: "${{ matrix.two_hosts }}"
         run: |
           # ADR 0025/0027: boot the OWNED guest kernel (6.1.102) the fetch
           # script provides + prod runs — it carries CONFIG_SQUASHFS_ZSTD=y so
@@ -1541,13 +1614,21 @@ jobs:
           # regression, not the old "no nbd.ko" environment gap, so the
           # Phase B chunked-disk tests fail loud instead of skipping.
           ENGRAM_EXPECT_NBD: "1"
+          # suite: "" → teleport test self-skips (and is filtered out
+          # below anyway). teleport: "1" → the teleport test hard-asserts
+          # >=2 hosts instead of skipping.
+          ENGRAM_EXPECT_TWO_HOSTS: "${{ matrix.expect_two_hosts }}"
+          # Per-variant nextest filterset: suite runs everything except
+          # the teleport test; teleport runs only it.
+          E2E_NEXTEST_FILTER: "${{ matrix.nextest_filter }}"
         run: |
           cargo nextest run \
               -p engram-coordinator \
               --test e2e_stack \
               --run-ignored ignored-only \
               --no-fail-fast \
-              --test-threads=1
+              --test-threads=1 \
+              -E "$E2E_NEXTEST_FILTER"
 
       - name: Dump tilt + stack logs on failure
         if: failure()
