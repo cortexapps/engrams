@@ -728,6 +728,21 @@ mod tests {
             2,
         )
         .await;
-        assert!(server.get("exp-1").unwrap().drained.load(Ordering::SeqCst));
+        // `talk` returns once the CLIENT has its two reply frames
+        // (HelloAck + Seal); the server's blocking conn loop may not
+        // have consumed the trailing DrainDone yet. Poll with a
+        // deadline instead of asserting instantly (flaked on CI,
+        // 2026-06-12).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if server.get("exp-1").unwrap().drained.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DrainDone never marked the export drained",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }
