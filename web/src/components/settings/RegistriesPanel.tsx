@@ -3,7 +3,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
 import { useAddRegistry, useDeleteRegistry, useRegistries } from "../../hooks/useRegistries";
-import type { RegistryAuthKind, RegistryCredentialSummary } from "../../types";
+import type { RegistryAuthKind, RegistryCredentialSummary } from "../../lib/types";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";
 import { textVariants } from "@/components/ui/text";

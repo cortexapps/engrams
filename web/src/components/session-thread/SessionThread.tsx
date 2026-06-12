@@ -14,7 +14,7 @@ import {
 } from "../../gen/engram/app/v1/session-SessionService_connectquery";
 import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
-import type { IndexedEvent, SessionState } from "../../types";
+import type { IndexedEvent, SessionState } from "../../lib/types";
 
 // The transcript tab, on assistant-ui. The session's SSE event stream is the
 // single source of truth: `buildMessages` reduces it to the assistant-ui

@@ -31,7 +31,7 @@ import { SystemMessage } from "@/components/session-thread/SystemMessage";
 import { RunFooter } from "@/components/session-thread/RunFooter";
 import { SHELL_TOOL } from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
-import type { SessionState } from "@/types";
+import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
 // the stream is a server-authoritative log, so the chat-only affordances the

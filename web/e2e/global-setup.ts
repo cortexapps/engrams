@@ -10,6 +10,18 @@
 //   c. Signs in via /api/auth/sign-in/email to acquire the HttpOnly session cookie.
 //   d. Persists the storage state (cookie jar) to e2e/.auth-state.json so every
 //      test page.goto() starts pre-authenticated.
+//
+// ADR 0039 Task 28: the enabled-images precondition probe was changed from
+//   GET /api/v1/enabled-images   (coordinator REST — no longer reachable from the browser)
+// to
+//   POST /rpc/engram.app.v1.ImageService/ListEnabledImages   (orchestrator Connect/JSON)
+// The probe signs in first (the request-context flow already exists) so the
+// ListEnabledImages RPC passes the CASL gate (member can read enabled images).
+//
+// The coordinator /healthz probe is kept: it tests the stack precondition
+// (coordinator must be running for the full platform to work), not browser
+// traffic. The coordinator's REST routes remain live for engram-cli/scripts;
+// the browser just never hits them directly after Task 28.
 
 import { request } from "@playwright/test";
 
@@ -80,18 +92,13 @@ async function promoteE2eUserToAdmin(): Promise<void> {
 export default async function globalSetup() {
   // ---- Precondition gate --------------------------------------------------
   await mustFetch(`${WEB}/`, "run `just dev` first");
+  // Stack precondition: coordinator must be running for the platform to work.
+  // This is NOT browser traffic — just a liveness check. The coordinator's REST
+  // routes stay live for engram-cli/integration scripts (Tasks 29/32 scope).
   await mustFetch(
     `${COORD}/healthz`,
     "coordinator down/unhealthy — check Tilt (http://localhost:10350)",
   );
-  const res = await mustFetch(`${WEB}/api/v1/enabled-images`, "run `just dev` first");
-  // Shape: ListEnabledImagesResponse (web/src/types.ts) — { images: [...] }
-  const body = (await res.json()) as {
-    images?: { image_uri: string; harness_name: string | null }[];
-  };
-  if (!body.images?.some((i) => i.harness_name === null)) {
-    throw new Error("no NO-HARNESS image enabled — run `just integration-session` once");
-  }
 
   // ---- better-auth entry (ADR 0039 §5 / Task 22) --------------------------
   // Use a Playwright request context so the cookie jar is handled for us.
@@ -121,7 +128,29 @@ export default async function globalSetup() {
     );
   }
 
-  // Step d: persist the session cookie so tests start pre-authenticated.
+  // Step d: probe enabled-images via the orchestrator Connect/JSON RPC.
+  // ADR 0039 Task 28: was GET /api/v1/enabled-images (coordinator REST).
+  // Now: POST /rpc/engram.app.v1.ImageService/ListEnabledImages (orchestrator
+  // passthrough). The session cookie from step c rides on this request so the
+  // CASL gate passes. harnessName is camelCase in proto JSON mapping.
+  const imagesRes = await ctx.post("/rpc/engram.app.v1.ImageService/ListEnabledImages", {
+    data: {},
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!imagesRes.ok()) {
+    const respBody = await imagesRes.text().catch(() => "(unreadable)");
+    throw new Error(
+      `ListEnabledImages probe failed (${imagesRes.status()}) — orchestrator/coordinator up?\n${respBody}`,
+    );
+  }
+  const imagesBody = (await imagesRes.json()) as {
+    images?: { imageUri: string; harnessName: string | null }[];
+  };
+  if (!imagesBody.images?.some((i) => i.harnessName === null)) {
+    throw new Error("no NO-HARNESS image enabled — run `just integration-session` once");
+  }
+
+  // Step e: persist the session cookie so tests start pre-authenticated.
   await ctx.storageState({ path: "e2e/.auth-state.json" });
   await ctx.dispose();
 }

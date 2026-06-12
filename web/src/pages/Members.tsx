@@ -20,7 +20,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import type { AdminUser, Role } from "../types";
+import type { AdminUser, Role } from "../lib/types";
 
 // BaUser: shape from better-auth admin.listUsers
 interface BaUser {

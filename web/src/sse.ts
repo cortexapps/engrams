@@ -1,6 +1,6 @@
-import { API_BASE } from "./api";
+import { API_BASE } from "./lib/base";
 import { parseOrchestratorFrame } from "./events";
-import type { IndexedEvent, SessionEventKind } from "./types";
+import type { IndexedEvent, SessionEventKind } from "./lib/types";
 
 // The native EventSource does not let us pass a Last-Event-ID header
 // directly — but it sends one automatically on auto-reconnect, and we
@@ -19,9 +19,8 @@ export interface SseHandlers {
  * Subscribe to `GET /api/v1/sessions/:id/events`. Returns a `close()` thunk.
  * `since` defaults to -1 (replay everything from the start of the log).
  *
- * The EventSource points at the orchestrator-proxied route (Task 26);
- * the vite proxy regex rule routes /api/v1/sessions/:id/events → 8787
- * BEFORE the coordinator /api catch-all.
+ * The EventSource points at the orchestrator route (Task 26, Task 28);
+ * the vite proxy /api catch-all routes all /api/v1/… → orchestrator :8787.
  *
  * Wire format: orchestrator SSE envelope
  *   event: <kind>

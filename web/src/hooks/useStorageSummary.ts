@@ -1,6 +1,6 @@
 import { useQuery } from "@connectrpc/connect-query";
 import { getStorageSummary } from "../gen/engram/app/v1/fleet-FleetService_connectquery";
-import type { StorageSummaryResponse, DurabilityRow } from "../types";
+import type { StorageSummaryResponse, DurabilityRow } from "../lib/types";
 import type {
   GetStorageSummaryResponse,
   DurabilityRow as ProtoDurabilityRow,

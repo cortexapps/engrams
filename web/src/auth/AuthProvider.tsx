@@ -9,9 +9,8 @@
 //     cookie (HttpOnly, same-origin). The admin plugin writes `role` onto the
 //     user object; `role === 'admin'` drives isAdmin.
 //   - has_claude_token: GET /api/v1/me/claude-token (orchestrator sealed-store
-//     route). The vite proxy has an exact-path rule for this path → :8787
-//     BEFORE the general /api/v1 → :8090 coordinator rule; Task 28 collapses
-//     this once all /api/v1 traffic moves to the orchestrator.
+//     route). ADR 0039 Task 28: all /api/v1 traffic now routes to the orchestrator
+//     (:8787); the vite proxy is a single catch-all and the per-path rules are gone.
 //   - Unauthenticated path: AuthProvider renders children even when session is
 //     null (resolved-unauthenticated). The auth gate lives in the router's
 //     appLayoutRoute.beforeLoad (see router.tsx), which redirects to /login.
@@ -22,8 +21,8 @@
 //   - sign-out: authClient.signOut() + window.location.assign("/login").
 //
 // Principal shape compatibility:
-//   The Principal type (types.ts) was written for the coordinator's GET /me
-//   response. We synthesise an equivalent object from the better-auth session
+//   The Principal type (lib/types.ts) mirrors the coordinator's GET /me
+//   response shape. We synthesise an equivalent object from the better-auth session
 //   so that every consumer reads `principal.email`, `principal.role`,
 //   `principal.is_admin`, `principal.has_claude_token`, `principal.display_name`,
 //   and `principal.can_sign_out` exactly as before.
@@ -31,7 +30,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { createContext, useContext, useMemo, type ReactNode } from "react";
 import { authClient } from "@/lib/auth-client";
-import type { Principal } from "../types";
+import type { Principal } from "../lib/types";
 import { abilityFor, type AppAbility } from "@/lib/ability";
 import { EngramMark } from "../components/EngramMark";
 import { Button } from "@/components/ui/button";
@@ -66,9 +65,8 @@ export function AuthContextProvider({
 
 // ---- Token presence query -----------------------------------------------
 // GET /api/v1/me/claude-token → { has_claude_token: boolean }
-// Routed to the orchestrator (:8787) via the exact-path vite proxy rule
-// added in Task 22. Task 28 removes the special rule once /api/v1 fully
-// moves to the orchestrator.
+// ADR 0039 Task 28: /api/v1 fully routes to the orchestrator (:8787) now;
+// the single /api Vite proxy catch-all handles it.
 async function fetchClaudeTokenPresence(): Promise<boolean> {
   const res = await fetch("/api/v1/me/claude-token", {
     headers: { Accept: "application/json" },

@@ -6,9 +6,9 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
-import { createSession } from "../api";
 import { useAuth } from "../auth/AuthProvider";
 import { useEnabledImages } from "../hooks/useEnabledImages";
+import { createSession } from "../gen/engram/app/v1/session-SessionService_connectquery";
 import { createTask, listTasks } from "../gen/engram/app/v1/task-TaskService_connectquery";
 import { Button } from "@/components/ui/button";
 import {
@@ -70,10 +70,12 @@ export function NewSessionDialog({
   const qc = useQueryClient();
   const navigate = useNavigate();
 
-  // ADR 0039 Task 23: CreateTask (chat) replaces REST createSession for
-  // agent mode. dev_vm stays on the legacy REST path — Task 28/29 will
-  // resolve when we drop the coordinator's web routes.
+  // ADR 0039 Task 23: CreateTask (chat) replaces REST createSession for agent mode.
+  // ADR 0039 Task 28: dev_vm migrated to SessionService.CreateSession (connect-query
+  // passthrough) — the REST /api/v1/sessions route is no longer reachable from the
+  // browser after the proxy flip. The proto CreateSessionRequest maps imageUri+mode.
   const createTaskMutation = useMutation(createTask);
+  const createSessionMutation = useMutation(createSession);
 
   const form = useForm<NewSessionValues>({
     resolver: zodResolver(newSessionSchema),
@@ -100,17 +102,18 @@ export function NewSessionDialog({
     if (!selected) return;
     try {
       if (data.mode === "dev_vm") {
-        // dev_vm is not a chat task; keep on the legacy REST path until
-        // Task 28/29 removes the coordinator's web routes.
-        const res = await createSession({
-          image: selected.image_uri,
+        // dev_vm via SessionService.CreateSession (connect-query passthrough).
+        // The proto CreateSessionRequest uses imageUri (camelCase) + mode string.
+        const res = await createSessionMutation.mutateAsync({
+          imageUri: selected.image_uri,
           mode: "dev_vm",
-          prompt: undefined,
         });
-        qc.invalidateQueries({ queryKey: ["sessions"] });
+        qc.invalidateQueries({
+          queryKey: createConnectQueryKey({ schema: listTasks, cardinality: "finite" }),
+        });
         setOpen(false);
         form.reset();
-        onCreated(res.session_id);
+        onCreated(res.sessionId);
       } else {
         // agent mode → CreateTask(type:'chat')
         const res = await createTaskMutation.mutateAsync({

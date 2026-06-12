@@ -1,7 +1,7 @@
 import { useQuery } from "@connectrpc/connect-query";
 import { getCowState } from "../gen/engram/app/v1/session-SessionService_connectquery";
 import type { CowStateView as ProtoCowStateView } from "../gen/engram/app/v1/session_pb";
-import type { CowStateView, SessionCowStateResponse } from "../types";
+import type { CowStateView, SessionCowStateResponse } from "../lib/types";
 
 // ADR 0016 Phase A: per-session COW diagnostic data.
 //

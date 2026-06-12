@@ -1,7 +1,7 @@
 import { useQuery } from "@connectrpc/connect-query";
 import { listCheckpoints } from "../gen/engram/app/v1/session-SessionService_connectquery";
 import type { CheckpointSummary as ProtoCheckpointSummary } from "../gen/engram/app/v1/session_pb";
-import type { CheckpointSummary, CheckpointsResponse } from "../types";
+import type { CheckpointSummary, CheckpointsResponse } from "../lib/types";
 
 // ADR 0028 A.log: the session's checkpoint chain feeds the durability
 // timeline + chain list. Polls at 5s — checkpoints land on a

@@ -1,5 +1,8 @@
-// Mirrors the wire format produced by engram-coordinator. Hand-written
-// rather than generated — kept narrow to what the UI consumes.
+// Canonical UI type definitions (ADR 0039 Task 28: moved from web/src/types.ts).
+//
+// Wire shapes mirror the coordinator's REST responses and the orchestrator's
+// gRPC/Connect mappings. These types are the target shape; hooks in hooks/
+// convert proto camelCase → snake_case here before handing to consumers.
 //
 // Shapes traced from:
 //   crates/engram-core/src/types/session.rs       (Session, SessionState)
@@ -239,7 +242,13 @@ export interface CreateSessionResponse {
 //
 // Canonical types live in ./events.ts (moved Task 26); re-exported here
 // so existing consumers need no import changes.
-export type { AgentRole, ExecRusage, IndexedEvent, SessionEvent, SessionEventKind } from "./events";
+export type {
+  AgentRole,
+  ExecRusage,
+  IndexedEvent,
+  SessionEvent,
+  SessionEventKind,
+} from "../events";
 
 // ADR 0028 A.log: one checkpoint in a session's chain.
 export interface CheckpointSummary {

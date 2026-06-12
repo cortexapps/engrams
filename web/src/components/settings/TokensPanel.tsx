@@ -3,7 +3,28 @@ import { useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
-import { saveClaudeToken, deleteClaudeToken } from "../../api";
+import { API_BASE } from "../../lib/base";
+
+// ADR 0039 Task 28: POST/DELETE /api/v1/me/claude-token now routes to the
+// orchestrator (not the coordinator). Inline the thin fetch rather than
+// importing the deleted api.ts helpers.
+async function saveClaudeToken(token: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/me/claude-token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ token }),
+  });
+  if (!res.ok) throw new Error(`/me/claude-token POST → ${res.status}`);
+}
+
+async function deleteClaudeToken(): Promise<void> {
+  const res = await fetch(`${API_BASE}/me/claude-token`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(`/me/claude-token DELETE → ${res.status}`);
+}
 import { useAuth } from "../../auth/AuthProvider";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";

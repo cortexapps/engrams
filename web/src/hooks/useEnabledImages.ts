@@ -7,7 +7,7 @@ import {
   refreshImage,
   listEnableJobs,
 } from "../gen/engram/app/v1/image-ImageService_connectquery";
-import type { EnabledImageSummary } from "../types";
+import type { EnabledImageSummary } from "../lib/types";
 import type { EnabledImageSummary as ProtoEnabledImageSummary } from "../gen/engram/app/v1/image_pb";
 
 function protoImageToLegacy(img: ProtoEnabledImageSummary): EnabledImageSummary {

@@ -25,7 +25,7 @@ import { useHosts } from "../hooks/useHosts";
 import { useTeleportSession } from "../hooks/useTeleportSession";
 import { usePauseResumeSession } from "../hooks/usePauseResumeSession";
 import { useIsAdmin } from "../auth/AuthProvider";
-import type { Session } from "../types";
+import type { Session } from "../lib/types";
 
 type ViewTab = "transcript" | "shell" | "raw";
 

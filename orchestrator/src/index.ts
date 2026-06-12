@@ -7,6 +7,7 @@ import authRoute from "./routes/auth.ts";
 import eventsRoute from "./routes/events.ts";
 import artifactsRoute from "./routes/artifacts.ts";
 import meRoute from "./routes/me.ts";
+import adminRoute from "./routes/admin.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { registerTasks } from "./rpc/tasks.ts";
@@ -33,6 +34,8 @@ app.route("/", authRoute);
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
 app.route("/", meRoute);
+// ADR 0039 Task 28: admin REST proxy (pause/resume session — no gRPC equiv yet).
+app.route("/", adminRoute);
 
 // ADR 0039 Task 21: Shell WebSocket route.
 const { app: shellApp, injectUpgrade } = makeShellRoute();

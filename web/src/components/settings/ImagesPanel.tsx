@@ -9,7 +9,7 @@ import {
   useRefreshEnabledImage,
 } from "../../hooks/useEnabledImages";
 import { isJobActive, useEnableJobs, useRetryEnableJob } from "../../hooks/useEnableJobs";
-import type { EnableJob, EnabledImageSummary } from "../../types";
+import type { EnableJob, EnabledImageSummary } from "../../lib/types";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";

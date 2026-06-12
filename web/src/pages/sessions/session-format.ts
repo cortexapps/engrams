@@ -1,4 +1,4 @@
-import type { SessionState } from "../../types";
+import type { SessionState } from "../../lib/types";
 
 export function shortId(id: string): string {
   return id.length <= 12 ? id : `${id.slice(0, 8)}…`;

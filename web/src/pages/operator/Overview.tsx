@@ -10,7 +10,7 @@ import { Gauge, type Tone, type Zone } from "../../components/gauge";
 import { Text } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
 import { deriveHealthMetrics, operatorIssues, type HealthMetrics } from "../../operator-health";
-import type { SessionListItem } from "../../types";
+import type { SessionListItem } from "../../lib/types";
 
 // The Operator cockpit: a read-only instrument cluster that answers "is the
 // platform healthy?" in one read, then hands off to the detail surfaces. The

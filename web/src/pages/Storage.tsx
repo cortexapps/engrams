@@ -12,7 +12,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import type { DurabilityRow } from "../types";
+import type { DurabilityRow } from "../lib/types";
 
 export function Storage() {
   const { data, isPending, error } = useStorageSummary();

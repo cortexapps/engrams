@@ -1,4 +1,4 @@
-import type { HostView, StorageSummaryResponse } from "./types";
+import type { HostView, StorageSummaryResponse } from "./lib/types";
 import { secondsSince } from "./format";
 
 // The single source of truth for what counts as a fleet/storage problem and how

@@ -1,6 +1,6 @@
 import { useQuery } from "@connectrpc/connect-query";
 import { listHosts } from "../gen/engram/app/v1/fleet-FleetService_connectquery";
-import type { HostView, HostStatus } from "../types";
+import type { HostView, HostStatus } from "../lib/types";
 import type { HostView as ProtoHostView } from "../gen/engram/app/v1/fleet_pb";
 
 function protoHostToLegacy(h: ProtoHostView): HostView {

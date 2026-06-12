@@ -11,7 +11,7 @@
  *   crates/engram-harness-proto/src/lib.rs   (AgentRole)
  */
 
-import type { SessionState } from "./types";
+import type { SessionState } from "./lib/types";
 
 export type AgentRole = "assistant" | "user" | "system";
 

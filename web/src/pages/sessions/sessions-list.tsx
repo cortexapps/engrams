@@ -4,7 +4,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusGlyph } from "../../components/Glyph";
-import type { SessionListItem } from "../../types";
+import type { SessionListItem } from "../../lib/types";
 import {
   compareSessions,
   lifecycleOf,

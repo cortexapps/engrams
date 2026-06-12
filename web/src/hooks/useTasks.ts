@@ -1,7 +1,7 @@
 import { useQuery } from "@connectrpc/connect-query";
 import { useQuery as useTanstackQuery } from "@tanstack/react-query";
 import { listTasks } from "../gen/engram/app/v1/task-TaskService_connectquery";
-import type { SessionListItem } from "../types";
+import type { SessionListItem } from "../lib/types";
 import type { Task } from "../gen/engram/app/v1/task_pb";
 import { authClient } from "../lib/auth-client";
 

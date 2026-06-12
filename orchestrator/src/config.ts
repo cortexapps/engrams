@@ -13,6 +13,10 @@ export interface Config {
   databaseUrl: string;
   /** CONTROL_PLANE_GRPC_URL — default http://127.0.0.1:50061 */
   controlPlaneGrpcUrl: string;
+  /** CONTROL_PLANE_HTTP_URL — coordinator REST base URL. Used by admin REST
+   * proxy routes (pause/resume session) that have no gRPC equivalent yet.
+   * Default: http://127.0.0.1:8090 (coordinator HTTP port in dev). */
+  controlPlaneHttpUrl: string;
   /** CONTROL_PLANE_BEARER — required: the coordinator app-gRPC bearer token */
   controlPlaneBearer: string;
   /** TRUSTED_ORIGINS — comma-separated list; dev default: http://localhost:5173 */
@@ -60,6 +64,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const port = parseInt(portStr, 10);
   const controlPlaneBearer = require("CONTROL_PLANE_BEARER");
   const controlPlaneGrpcUrl = optional("CONTROL_PLANE_GRPC_URL", "http://127.0.0.1:50061");
+  const controlPlaneHttpUrl = optional("CONTROL_PLANE_HTTP_URL", "http://127.0.0.1:8090");
   const databaseUrl = require("ORCHESTRATOR_DATABASE_URL");
   const trustedOriginsRaw = optional("TRUSTED_ORIGINS", "http://localhost:5173");
   const trustedOrigins = trustedOriginsRaw
@@ -90,6 +95,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     port,
     databaseUrl,
     controlPlaneGrpcUrl,
+    controlPlaneHttpUrl,
     controlPlaneBearer,
     trustedOrigins,
     betterAuthSecret,

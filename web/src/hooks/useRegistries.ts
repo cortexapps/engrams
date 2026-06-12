@@ -5,7 +5,7 @@ import {
   addRegistry,
   deleteRegistry,
 } from "../gen/engram/app/v1/image-ImageService_connectquery";
-import type { RegistryCredentialSummary, RegistryAuthKind } from "../types";
+import type { RegistryCredentialSummary, RegistryAuthKind } from "../lib/types";
 import type { RegistryCredentialSummary as ProtoRegistryCredentialSummary } from "../gen/engram/app/v1/image_pb";
 
 function protoRegistryToLegacy(r: ProtoRegistryCredentialSummary): RegistryCredentialSummary {

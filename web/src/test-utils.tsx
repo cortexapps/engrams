@@ -27,7 +27,7 @@ import { SessionService } from "./gen/engram/app/v1/session_pb";
 import { FleetService } from "./gen/engram/app/v1/fleet_pb";
 import { AuthContextProvider, type AuthState } from "./auth/AuthProvider";
 import { abilityFor } from "./lib/ability";
-import type { Principal } from "./types";
+import type { Principal } from "./lib/types";
 
 interface TestRouterContext {
   auth: AuthState;

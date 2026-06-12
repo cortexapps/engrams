@@ -1,5 +1,5 @@
 import { createContext, useContext } from "react";
-import type { SessionState } from "../../types";
+import type { SessionState } from "../../lib/types";
 
 // Carries the session lifecycle state into the Thread subtree so the composer
 // can show the right banner/hint (terminal states block sending; idle/starting

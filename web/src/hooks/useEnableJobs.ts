@@ -6,7 +6,7 @@ import {
   retryEnableJob,
   listEnabledImages,
 } from "../gen/engram/app/v1/image-ImageService_connectquery";
-import type { EnableJob } from "../types";
+import type { EnableJob } from "../lib/types";
 import type { EnableJob as ProtoEnableJob } from "../gen/engram/app/v1/image_pb";
 
 // ADR 0036: enabling an image is asynchronous. POST returns 202 with

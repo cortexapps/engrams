@@ -19,7 +19,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
-import type { HostStatus, HostView, SessionListItem } from "../types";
+import type { HostStatus, HostView, SessionListItem } from "../lib/types";
 
 const statusVariant = (s: HostStatus) =>
   s === "ready" ? "default" : s === "draining" ? "secondary" : "destructive";

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { API_BASE } from "../api";
+import { API_BASE } from "../lib/base";
 
 // In-browser shell tab. Lazy-loads `ghostty-web` (~400 KB WASM) on
 // first mount, opens a WebSocket to `/sessions/:id/shell`, and bridges
