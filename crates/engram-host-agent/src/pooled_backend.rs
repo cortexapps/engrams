@@ -1360,7 +1360,10 @@ impl PooledBackend {
     #[cfg(target_os = "linux")]
     fn flush_block_device_cache(device: &std::path::Path) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
-        const BLKFLSBUF: libc::c_ulong = 0x1261; // _IO(0x12, 97)
+        // libc::Ioctl is the per-target request type: c_ulong on gnu,
+        // c_int on musl (the prod artifact) — a bare c_ulong breaks
+        // the musl cross-compile.
+        const BLKFLSBUF: libc::Ioctl = 0x1261; // _IO(0x12, 97)
         let f = std::fs::OpenOptions::new().read(true).open(device)?;
         // SAFETY: BLKFLSBUF takes no argument; the fd is valid for the
         // duration of the call.
