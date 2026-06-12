@@ -24,14 +24,6 @@ name: nbd-probe
 
 on:
   workflow_dispatch:
-  # Temporary: workflow_dispatch only fires for files already on the
-  # default branch, so this push trigger (scoped to the probe branch)
-  # lets us get the answer from the PR before merge. Remove before
-  # merging — the workflow is meant to be manual-only.
-  push:
-    branches:
-      # NB: '+' is a glob metachar in GitHub branch filters, escape it.
-      - worktree-ci\+nbd-blacksmith-probe
 
 permissions:
   contents: read
