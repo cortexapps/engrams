@@ -1559,13 +1559,15 @@ mod tests {
                     {
                         let resp = match chunk_offset / chunk_size {
                             1 => {
-                                let bytes = vec![PEER_BYTE; chunk_size as usize];
+                                let raw = vec![PEER_BYTE; chunk_size as usize];
+                                let (bytes, lz4) = engram_migrate_proto::compress_page(raw);
                                 let sha256: [u8; 32] = Sha256::digest(&bytes).into();
                                 FromSource::Page {
                                     req_id,
                                     chunk_offset,
                                     bytes,
                                     sha256,
+                                    lz4,
                                 }
                             }
                             3 => FromSource::ZeroChunk {

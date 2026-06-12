@@ -442,12 +442,20 @@ impl PeerServer {
                 chunk_offset,
                 durable_sha256: *hash.as_bytes(),
             },
-            ServedChunk::Page(bytes, hash) => FromSource::Page {
-                req_id,
-                chunk_offset,
-                bytes,
-                sha256: *hash.as_bytes(),
-            },
+            ServedChunk::Page(bytes, _raw_hash) => {
+                // v2: ship the smaller of lz4/raw; integrity covers
+                // the wire bytes (and hashing the smaller payload is
+                // itself a win on this no-SHA-NI fleet).
+                let (wire, lz4) = engram_migrate_proto::compress_page(bytes);
+                let sha256: [u8; 32] = Sha256::digest(&wire).into();
+                FromSource::Page {
+                    req_id,
+                    chunk_offset,
+                    bytes: wire,
+                    sha256,
+                    lz4,
+                }
+            }
         }
     }
 

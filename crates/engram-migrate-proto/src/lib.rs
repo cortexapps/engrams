@@ -52,7 +52,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Protocol version carried in `Hello`/`HelloAck`. Bump on any
 /// wire-incompatible change; the server rejects mismatches loudly.
-pub const PROTO_VERSION: u32 = 1;
+///
+/// v2: `Page.lz4` — payloads ship lz4-block-compressed when that is
+/// smaller, and `sha256` covers the WIRE bytes. The measured per-fault
+/// cost on the no-SHA-NI fleet was ~6.7 ms, dominated by the 512 KiB
+/// transfer + double sha256 — compression cuts all three.
+pub const PROTO_VERSION: u32 = 2;
 
 /// Default TCP port for the source host-agent's page-server listener.
 pub const DEFAULT_PEER_PORT: u16 = 9102;
@@ -187,8 +192,13 @@ pub enum FromSource {
     Page {
         req_id: u64,
         chunk_offset: u64,
+        /// WIRE bytes: lz4-block-compressed (size-prepended) when
+        /// `lz4`, raw otherwise (the source ships whichever is
+        /// smaller — incompressible chunks go raw).
         bytes: Vec<u8>,
+        /// Over the WIRE bytes — verify BEFORE decompressing.
         sha256: [u8; 32],
+        lz4: bool,
     },
     /// The whole chunk is zero bytes — install via the zero path instead
     /// of shipping 512 KiB of zeros.
@@ -210,6 +220,25 @@ pub enum FromSource {
         req_id: Option<u64>,
         message: String,
     },
+}
+
+/// Compress a page payload for the wire: returns the smaller of the
+/// lz4 block (size-prepended) and the raw bytes, plus the `lz4` flag.
+pub fn compress_page(raw: Vec<u8>) -> (Vec<u8>, bool) {
+    let compressed = lz4_flex::block::compress_prepend_size(&raw);
+    if compressed.len() < raw.len() {
+        (compressed, true)
+    } else {
+        (raw, false)
+    }
+}
+
+/// Reverse [`compress_page`] AFTER wire-integrity verification.
+pub fn decompress_page(wire: Vec<u8>, lz4: bool) -> Result<Vec<u8>, String> {
+    if !lz4 {
+        return Ok(wire);
+    }
+    lz4_flex::block::decompress_size_prepended(&wire).map_err(|e| format!("lz4 decompress: {e}"))
 }
 
 /// handler → host-agent over the `--control-sock` UDS (same framing).
@@ -348,7 +377,23 @@ mod tests {
             chunk_offset: 0,
             bytes: vec![0xCD; 512 * 1024],
             sha256: [0x11; 32],
+            lz4: false,
         });
+        // The v2 compression helpers: a compressible chunk round-trips
+        // through lz4; an incompressible one ships raw.
+        let raw = vec![0xCD; 512 * 1024];
+        let (wire, lz4) = compress_page(raw.clone());
+        assert!(
+            lz4 && wire.len() < raw.len(),
+            "repetitive chunk must compress"
+        );
+        assert_eq!(decompress_page(wire, lz4).unwrap(), raw);
+        let noise: Vec<u8> = (0..4096u32)
+            .flat_map(|i| i.wrapping_mul(2654435761).to_le_bytes())
+            .collect();
+        let (wire, lz4) = compress_page(noise.clone());
+        assert!(!lz4, "incompressible bytes must ship raw");
+        assert_eq!(decompress_page(wire, lz4).unwrap(), noise);
         round_trip(&FromSource::ZeroChunk {
             req_id: 2,
             chunk_offset: 512 * 1024,

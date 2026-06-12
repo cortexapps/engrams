@@ -392,6 +392,7 @@ pub fn decode_page(
             chunk_offset,
             bytes,
             sha256,
+            lz4,
         } => {
             if req_id != want_req || chunk_offset != want_offset {
                 return Err(PeerError::Server(format!(
@@ -399,13 +400,19 @@ pub fn decode_page(
                      {chunk_offset:#x}/{want_offset:#x}"
                 )));
             }
+            // Integrity covers the WIRE bytes; decompress only after.
             let got: [u8; 32] = Sha256::digest(&bytes).into();
             if got != sha256 {
                 return Err(PeerError::ShaMismatch {
                     chunk_offset: want_offset,
                 });
             }
-            Ok(PeerPage::Bytes(bytes))
+            let raw = engram_migrate_proto::decompress_page(bytes, lz4)
+                // Verified-but-undecompressable = the source is
+                // serving garbage; terminal, same class as a sha
+                // mismatch.
+                .map_err(PeerError::Server)?;
+            Ok(PeerPage::Bytes(raw))
         }
         FromSource::ZeroChunk { req_id, .. } if req_id == want_req => Ok(PeerPage::Zero),
         FromSource::AltSource {
@@ -576,13 +583,16 @@ mod tests {
     }
 
     fn page_resp(req_id: u64, chunk_offset: u64) -> FromSource {
-        let bytes = vec![0xAB; CHUNK as usize];
+        // Through the REAL compression path — the canned server
+        // serves exactly what the prod source serves.
+        let (bytes, lz4) = engram_migrate_proto::compress_page(vec![0xAB; CHUNK as usize]);
         let sha256: [u8; 32] = Sha256::digest(&bytes).into();
         FromSource::Page {
             req_id,
             chunk_offset,
             bytes,
             sha256,
+            lz4,
         }
     }
 
@@ -628,6 +638,7 @@ mod tests {
                         chunk_offset: o,
                         bytes,
                         sha256: [0u8; 32],
+                        lz4: false,
                     }
                 }
             },
