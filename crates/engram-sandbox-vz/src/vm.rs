@@ -257,9 +257,13 @@ impl VzVm {
         .await
     }
 
-    /// Pause the VM. Required before `save`. Used by snapshot
-    /// in task 29 — reachable but unused as of task 27.
-    #[allow(dead_code)]
+    /// Pause the VM by freezing its vCPUs via
+    /// `VZVirtualMachine.pauseWithCompletionHandler`. Called from
+    /// two paths: (1) the snapshot flow in `VzBackend::snapshot`
+    /// (quiesces the guest before the APFS-clone so no new writes
+    /// race the clone), and (2) `VzBackend::pause` — the
+    /// `SandboxBackend::pause` override that powers the coordinator's
+    /// freeze/pause endpoint (ADR 0039).
     pub async fn pause(&self) -> Result<(), VzError> {
         self.dispatch_op("pause", |vm, completion| {
             // SAFETY: see `start`.
@@ -268,8 +272,12 @@ impl VzVm {
         .await
     }
 
-    /// Resume from a paused state. Used by snapshot in task 29.
-    #[allow(dead_code)]
+    /// Resume from a paused state via
+    /// `VZVirtualMachine.resumeWithCompletionHandler`. Called from
+    /// two paths: (1) the snapshot flow in `VzBackend::snapshot`
+    /// (restores vCPUs after the APFS-clone), and (2)
+    /// `VzBackend::resume` — the `SandboxBackend::resume` override
+    /// that powers the coordinator's resume endpoint (ADR 0039).
     pub async fn resume(&self) -> Result<(), VzError> {
         self.dispatch_op("resume", |vm, completion| {
             // SAFETY: see `start`.
