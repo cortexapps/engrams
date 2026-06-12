@@ -322,4 +322,3 @@ export function makeShellRoute(deps?: ShellDeps): {
   return { app, injectUpgrade };
 }
 
-export default makeShellRoute();
