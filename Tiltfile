@@ -256,12 +256,11 @@ otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 # orchestrator's machine credential, deliberately separate from the
 # host-agents' ENGRAM_AUTH_TOKENS (different caller, different blast
 # radius). A fixed dev literal is fine here: deterministic across
-# restarts, never leaves loopback, never ships. The SAME value will
-# back the (future) orchestrator resource's CONTROL_PLANE_BEARER so the
-# two ends agree with no later wiring task — but that export does not
-# happen yet; Task 14 reads `app_grpc_dev_token` and sets it then.
+# restarts, never leaves loopback, never ships.
 app_grpc_dev_token = env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token')
-# placeholder — consumed by the orchestrator resource in ADR 0039 Task 14 as CONTROL_PLANE_BEARER
+# ADR 0039 Task 14: consumed by the orchestrator resource below as CONTROL_PLANE_BEARER.
+# Both ends agree on this value — the coordinator's ENGRAM_APP_GRPC_TOKENS and
+# the orchestrator's CONTROL_PLANE_BEARER are set from the same source.
 control_plane_bearer = app_grpc_dev_token
 
 coord_env = {
@@ -540,7 +539,45 @@ if not skip_web:
         trigger_mode=TRIGGER_MODE_MANUAL,
         auto_init=True)
 
+# ----------------------------------------------------------------
+# Orchestrator (Bun HTTP server, ADR 0039 Task 14+).
+#
+# Runs Hono on Bun with a Connect/gRPC seam at /rpc/*. Depends on
+# postgres (future drizzle migrations in Task 15) and coordinator
+# (gRPC transport to the app-gRPC surface). Bun's native HTTP is
+# used; no cargo build required.
+#
+# CONTROL_PLANE_BEARER is wired from `control_plane_bearer` above so
+# the orchestrator and coordinator agree on the same dev token without
+# any manual coordination.
+# ----------------------------------------------------------------
+
+local_resource('orchestrator',
+    serve_cmd=(
+        'cd orchestrator && ' +
+        'bun install --silent && ' +
+        'bun src/index.ts'
+    ),
+    serve_env={
+        'CONTROL_PLANE_BEARER': control_plane_bearer,
+        'CONTROL_PLANE_GRPC_URL': 'http://127.0.0.1:50061',
+        'TRUSTED_ORIGINS': 'http://localhost:5173',
+        'ORCHESTRATOR_PORT': '8787',
+    },
+    resource_deps=['postgres'],
+    readiness_probe=probe(
+        period_secs=30,
+        timeout_secs=2,
+        tcp_socket=tcp_socket_action(port=8787),
+    ),
+    links=[
+        link('http://127.0.0.1:8787/healthz', 'healthz'),
+    ],
+    labels=['app'],
+    trigger_mode=TRIGGER_MODE_MANUAL,
+    auto_init=True)
+
 # Resources are grouped in the Tilt UI by `labels` above:
 # infra (postgres, registry) → setup (seed-buckets) → app (coordinator,
-# web). Click any one to jump to its log stream / readiness state /
-# restart button.
+# web, orchestrator). Click any one to jump to its log stream / readiness
+# state / restart button.
