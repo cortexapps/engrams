@@ -54,10 +54,12 @@ echo "    coord up"
 # prior CI step (ENGRAM_INTEG_BIN_DIR or ./target/release).
 CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
 GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
-TOKEN_FLAG=()
-if [ -n "${ENGRAM_APP_TOKEN:-}" ]; then
-    TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
-fi
+# Fail-closed app surface (ADR 0039 Task 9): a bearer is always required.
+# Default to the Tiltfile's dev literal (CI's coordinator gets the same
+# value via the Tiltfile env_or default) — without this the registration
+# poll dies silently unauthenticated.
+ENGRAM_APP_TOKEN="${ENGRAM_APP_TOKEN:-dev-app-grpc-token}"
+TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
 
 echo "==> waiting for host registration"
 for _ in $(seq 1 180); do
