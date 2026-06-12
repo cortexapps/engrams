@@ -1,5 +1,5 @@
 /**
- * Orchestrator live smoke test (ADR 0039 Tasks 18 & 19).
+ * Orchestrator live smoke test (ADR 0039 Tasks 18, 19, & 20).
  *
  * Env-gated: set SMOKE=1 to enable.
  * Default ORCHESTRATOR_URL: http://127.0.0.1:8787
@@ -27,6 +27,10 @@
  *       8. CreateTask(chat, no-harness image) → task returned with live session state
  *       9. ListTasks → task visible with session; GetTask → task returned
  *      10. DeleteTask → ListTasks empty (member's view of created task)
+ *   11–13. SSE + token (Task 20):
+ *      11. GET /api/v1/sessions/:id/events with member cookie → ≥1 SSE frame with id:
+ *      12. Reconnect with Last-Event-ID → no duplicate (cursor respected)
+ *      13. claude-token POST→GET(true)→DELETE→GET(false) with member cookie
  *
  * Honest skip: tests skip without SMOKE=1 (bun test --cwd orchestrator
  * passes 0 failures even without the stack running).
@@ -411,6 +415,211 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
 
       console.log(
         `Smoke 10/10 PASS: DeleteTask → task ${smokeTaskId} gone from ListTasks`,
+      );
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 11–13. SSE + token (Task 20)
+  //
+  // Uses the task + session created in test 8 (smokeTaskId).
+  // -------------------------------------------------------------------------
+
+  test.skipIf(!SMOKE)(
+    "11/13 GET SSE events with member cookie → ≥1 frame with id:",
+    async () => {
+      // smokeTaskId was set in test 8; extract the session id from GetTask.
+      expect(smokeTaskId).toBeTruthy();
+
+      const getRes = await rpc(
+        "engram.app.v1.TaskService",
+        "GetTask",
+        { taskId: smokeTaskId },
+        memberCookie,
+      );
+      expect(getRes.status).toBe(200);
+      const getBody = (await getRes.json()) as {
+        task?: { sessions?: Array<{ sessionId?: string }> };
+      };
+      const sessionId = getBody.task?.sessions?.[0]?.sessionId;
+      expect(sessionId).toBeTruthy();
+
+      // Fetch SSE stream; read until we have ≥1 data line with id:.
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 5_000); // 5s timeout
+
+      let foundIdLine = false;
+      let firstEventId: string | undefined;
+
+      try {
+        const res = await fetch(
+          `${BASE}/api/v1/sessions/${sessionId}/events?since=0`,
+          {
+            headers: { Cookie: memberCookie },
+            signal: ac.signal,
+          },
+        );
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-type")).toMatch(/text\/event-stream/);
+
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        outer: while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          // Parse lines for id: fields.
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (line.startsWith("id:")) {
+              foundIdLine = true;
+              firstEventId = line.slice(3).trim();
+              break outer;
+            }
+          }
+        }
+      } catch (err) {
+        // AbortError is expected after finding the first event.
+        if (
+          !(err instanceof Error) ||
+          (err.name !== "AbortError" && !String(err).includes("aborted"))
+        ) {
+          throw err;
+        }
+      }
+
+      expect(foundIdLine).toBe(true);
+      expect(firstEventId).toBeDefined();
+      console.log(
+        `Smoke 11/13 PASS: SSE stream has id: line (first id=${firstEventId})`,
+      );
+
+      // Store for test 12.
+      (globalThis as Record<string, unknown>).__smokeFirstEventId__ =
+        firstEventId;
+      (globalThis as Record<string, unknown>).__smokeSessionId__ = sessionId;
+    },
+  );
+
+  test.skipIf(!SMOKE)(
+    "12/13 reconnect with Last-Event-ID → no duplicate (cursor respected)",
+    async () => {
+      const g = globalThis as Record<string, unknown>;
+      const firstEventId = g.__smokeFirstEventId__ as string | undefined;
+      const sessionId = g.__smokeSessionId__ as string | undefined;
+
+      // If test 11 was skipped or failed, skip gracefully.
+      if (!firstEventId || !sessionId) {
+        console.log(
+          "Smoke 12/13 SKIP: no firstEventId/sessionId from test 11",
+        );
+        return;
+      }
+
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 5_000);
+
+      let idAfterCursor: string | undefined;
+
+      try {
+        const res = await fetch(
+          `${BASE}/api/v1/sessions/${sessionId}/events`,
+          {
+            headers: {
+              Cookie: memberCookie,
+              // Reconnect cursor: send Last-Event-ID so server replays from there.
+              "Last-Event-ID": firstEventId,
+            },
+            signal: ac.signal,
+          },
+        );
+        expect(res.status).toBe(200);
+
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        outer: while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (line.startsWith("id:")) {
+              idAfterCursor = line.slice(3).trim();
+              break outer;
+            }
+          }
+        }
+      } catch (err) {
+        if (
+          !(err instanceof Error) ||
+          (err.name !== "AbortError" && !String(err).includes("aborted"))
+        ) {
+          throw err;
+        }
+      }
+
+      // If the stream emitted any id after reconnect, it must be > firstEventId.
+      // (It's fine if the stream is empty if all events were already replayed.)
+      if (idAfterCursor !== undefined) {
+        expect(Number(idAfterCursor)).toBeGreaterThan(Number(firstEventId));
+      }
+
+      console.log(
+        `Smoke 12/13 PASS: reconnect with Last-Event-ID=${firstEventId} → next id=${idAfterCursor ?? "(none — stream empty)"} (no duplicate)`,
+      );
+    },
+  );
+
+  test.skipIf(!SMOKE)(
+    "13/13 claude-token POST→GET(true)→DELETE→GET(false) with member cookie",
+    async () => {
+      const tokenEndpoint = `${BASE}/api/v1/me/claude-token`;
+      const headers = {
+        Cookie: memberCookie,
+        "Content-Type": "application/json",
+      };
+
+      // POST → 204.
+      const postRes = await fetch(tokenEndpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ token: "sk-ant-oat01-smoke-test-token" }),
+      });
+      expect(postRes.status).toBe(204);
+      console.log("Smoke 13/13a PASS: POST /me/claude-token → 204");
+
+      // GET → has_claude_token: true.
+      const getRes1 = await fetch(tokenEndpoint, {
+        headers: { Cookie: memberCookie },
+      });
+      expect(getRes1.status).toBe(200);
+      const body1 = (await getRes1.json()) as { has_claude_token?: boolean };
+      expect(body1.has_claude_token).toBe(true);
+      console.log("Smoke 13/13b PASS: GET /me/claude-token → {has_claude_token:true}");
+
+      // DELETE → 204.
+      const delRes = await fetch(tokenEndpoint, {
+        method: "DELETE",
+        headers: { Cookie: memberCookie },
+      });
+      expect(delRes.status).toBe(204);
+      console.log("Smoke 13/13c PASS: DELETE /me/claude-token → 204");
+
+      // GET → has_claude_token: false.
+      const getRes2 = await fetch(tokenEndpoint, {
+        headers: { Cookie: memberCookie },
+      });
+      expect(getRes2.status).toBe(200);
+      const body2 = (await getRes2.json()) as { has_claude_token?: boolean };
+      expect(body2.has_claude_token).toBe(false);
+      console.log(
+        "Smoke 13/13 PASS: DELETE confirmed; GET → {has_claude_token:false}",
       );
     },
   );

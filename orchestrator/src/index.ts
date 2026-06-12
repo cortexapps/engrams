@@ -3,6 +3,9 @@ import { config } from "./config.ts";
 import { buildServer } from "./server.ts";
 import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
+import eventsRoute from "./routes/events.ts";
+import artifactsRoute from "./routes/artifacts.ts";
+import meRoute from "./routes/me.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { SURFACE } from "./rpc/surface.ts";
@@ -14,6 +17,10 @@ const app = new Hono();
 // Mount routes.
 app.route("/", health);
 app.route("/", authRoute);
+// ADR 0039 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/claude-token).
+app.route("/", eventsRoute);
+app.route("/", artifactsRoute);
+app.route("/", meRoute);
 
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));
