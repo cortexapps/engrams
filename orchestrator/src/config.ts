@@ -9,8 +9,8 @@
 export interface Config {
   /** ORCHESTRATOR_PORT — default 8787 */
   port: number;
-  /** ORCHESTRATOR_DATABASE_URL — optional now; Task 15 makes it required */
-  databaseUrl: string | undefined;
+  /** ORCHESTRATOR_DATABASE_URL — required (Task 15) */
+  databaseUrl: string;
   /** CONTROL_PLANE_GRPC_URL — default http://127.0.0.1:50061 */
   controlPlaneGrpcUrl: string;
   /** CONTROL_PLANE_BEARER — required: the coordinator app-gRPC bearer token */
@@ -36,7 +36,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const port = parseInt(portStr, 10);
   const controlPlaneBearer = require("CONTROL_PLANE_BEARER");
   const controlPlaneGrpcUrl = optional("CONTROL_PLANE_GRPC_URL", "http://127.0.0.1:50061");
-  const databaseUrl = env["ORCHESTRATOR_DATABASE_URL"];
+  const databaseUrl = require("ORCHESTRATOR_DATABASE_URL");
   const trustedOriginsRaw = optional("TRUSTED_ORIGINS", "http://localhost:5173");
   const trustedOrigins = trustedOriginsRaw
     .split(",")

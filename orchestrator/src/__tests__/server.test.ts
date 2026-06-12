@@ -27,7 +27,8 @@ let server: ReturnType<typeof buildServer>;
 
 beforeAll(async () => {
   const app = new Hono();
-  app.get("/healthz", (c) => c.json({ ok: true }));
+  // Unit test: static healthz (no DB). The live DB shape is tested in db.test.ts.
+  app.get("/healthz", (c) => c.json({ ok: true, db: true }));
   app.notFound((c) => c.json({ error: "not found" }, 404));
 
   server = buildServer(app);
@@ -52,11 +53,11 @@ afterAll(async () => {
 // 1. Health check
 // ---------------------------------------------------------------------------
 
-test("GET /healthz → 200 {ok:true}", async () => {
+test("GET /healthz → 200 {ok:true, db:true}", async () => {
   const res = await fetch(`${baseUrl}/healthz`);
   expect(res.status).toBe(200);
   const body = await res.json();
-  expect(body).toEqual({ ok: true });
+  expect(body).toEqual({ ok: true, db: true });
 });
 
 // ---------------------------------------------------------------------------

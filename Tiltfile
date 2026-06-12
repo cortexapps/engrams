@@ -543,16 +543,37 @@ if not skip_web:
 # Orchestrator (Bun HTTP server, ADR 0039 Task 14+).
 #
 # Runs Hono on Bun with a Connect/gRPC seam at /rpc/*. Depends on
-# postgres (future drizzle migrations in Task 15). Bun's native HTTP
-# is used; no cargo build required.
+# postgres (drizzle migrations via orchestrator-migrate). Bun's native
+# HTTP is used; no cargo build required.
 #
-# resource_deps=['postgres'] only — coordinator is added in Task 17
-# once the control-plane transport (bearer + clients) is wired.
+# resource_deps=['postgres', 'orchestrator-migrate'] — coordinator is
+# added in Task 17 once the control-plane transport is wired.
 #
 # CONTROL_PLANE_BEARER is wired from `control_plane_bearer` above so
 # the orchestrator and coordinator agree on the same dev token without
 # any manual coordination.
 # ----------------------------------------------------------------
+
+# Dev URL for the orchestrator's dedicated DB (ADR 0039 §10).
+orchestrator_db_url = 'postgres://engram:engram@localhost:5435/engram_orchestrator'
+
+# Task 15: one-shot migrate resource.
+#
+# Step 1 creates the database (idempotent: `|| true` swallows "already
+# exists"). Step 2 runs drizzle-kit migrate, which is also idempotent —
+# it applies only unapplied migrations. Running on every `tilt up` is
+# intentional: fresh machines get the schema automatically, and on
+# existing machines it's a no-op.
+local_resource('orchestrator-migrate',
+    cmd=(
+        'docker compose -f deploy/docker-compose.dev.yml exec -T postgres ' +
+        'createdb -U engram engram_orchestrator || true && ' +
+        'bash -c "cd orchestrator && ' +
+        'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
+        'bunx drizzle-kit migrate"'
+    ),
+    resource_deps=['postgres'],
+    labels=['setup'])
 
 local_resource('orchestrator',
     serve_cmd=(
@@ -565,8 +586,9 @@ local_resource('orchestrator',
         'CONTROL_PLANE_GRPC_URL': 'http://127.0.0.1:50061',
         'TRUSTED_ORIGINS': 'http://localhost:5173',
         'ORCHESTRATOR_PORT': '8787',
+        'ORCHESTRATOR_DATABASE_URL': orchestrator_db_url,
     },
-    resource_deps=['postgres'],
+    resource_deps=['postgres', 'orchestrator-migrate'],
     readiness_probe=probe(
         period_secs=30,
         timeout_secs=2,
