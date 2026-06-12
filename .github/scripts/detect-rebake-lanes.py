@@ -83,6 +83,18 @@ SESSION_HARNESS_BINS = {"engram-harness-claude"}
 # agentd must match the deployed coordinator, so a change to either binary (or
 # anything in its release closure) must republish cli-tools.
 CLI_TOOLS_BINS = {"engram-cli", "engram-agentd"}
+# The binaries the `test-e2e-stack` lane builds + boots: coord + host-agent
+# (the stack), cli (drives enable/registry), agentd (injected into the demo
+# image), and harness-claude (baked into demo-claude). A change anywhere in
+# their release closure means the e2e lane could behave differently, so run
+# it. Gates the (expensive, non-required) e2e lane — see `e2e` below.
+E2E_BINS = {
+    "engram-coordinator",
+    "engram-host-agent",
+    "engram-cli",
+    "engram-agentd",
+    "engram-harness-claude",
+}
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
 # script/the bake workflow conservatively trip the binary lanes.
@@ -116,6 +128,20 @@ DEV_IMAGE_PATHS = ["justfile", "flake.nix", "flake.lock", "Tiltfile", "deploy/de
 # node-assets + roll the host fleet — folded into the `images` lane below.
 # Inert until the submodule exists (these paths don't change today).
 FC_FORK_PATHS = ["third_party/firecracker", ".gitmodules"]
+# Non-crate inputs to the `test-e2e-stack` lane: the dev-orchestration
+# scripts + Tiltfile that bring the stack up, the demo image sources it
+# bakes, the RO bundles it stages, and the workflow / detector themselves.
+# (The e2e test file lives under crates/engram-coordinator/, so it's already
+# covered by that crate being in E2E_BINS' closure.)
+E2E_PATHS = [
+    "deploy/dev/",
+    "Tiltfile",
+    "deploy/demo-claude/",
+    "deploy/demo/",
+    "deploy/bundles/",
+    ".github/workflows/ci.yml",
+    ".github/scripts/detect-rebake-lanes.py",
+]
 
 
 def cargo_meta():
@@ -203,6 +229,7 @@ def main():
     cont = release_closure(meta, CONTAINER_BINS)
     harness = release_closure(meta, SESSION_HARNESS_BINS)
     cli_tools_closure = release_closure(meta, CLI_TOOLS_BINS)
+    e2e_closure = release_closure(meta, E2E_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
     # FC binary in the node-assets image, so it trips the images lane (which
@@ -234,13 +261,18 @@ def main():
         or harness_changed
         or any_path(changed, DEV_IMAGE_PATHS)
     )
+    # The expensive, non-required e2e lane: run it when any binary it builds
+    # moved or any of its non-crate inputs changed. Skipping it on
+    # doc/TF/web-only PRs is the win; a false positive just runs it
+    # needlessly (safe), so this errs toward running.
+    e2e = bool(cc & e2e_closure) or any_path(changed, E2E_PATHS)
 
     print(f"changed files: {len(changed)}", file=sys.stderr)
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
     print(f"-> images={images} host_binaries={host_binaries} "
           f"host_base={host_base} host_image={host_image} cli_tools={cli_tools} "
           f"tf_or_helm={tf_or_helm} bundles={bundles} dev_image={dev_image} "
-          f"fc_fork={fc_fork}",
+          f"fc_fork={fc_fork} e2e={e2e}",
           file=sys.stderr)
 
     out = os.environ.get("GITHUB_OUTPUT")
@@ -255,6 +287,7 @@ def main():
             f.write(f"bundles={'true' if bundles else 'false'}\n")
             f.write(f"dev_image={'true' if dev_image else 'false'}\n")
             f.write(f"fc_fork={'true' if fc_fork else 'false'}\n")
+            f.write(f"e2e={'true' if e2e else 'false'}\n")
 
 
 if __name__ == "__main__":
