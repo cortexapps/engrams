@@ -19,20 +19,36 @@ export interface Config {
   trustedOrigins: string[];
   /**
    * BETTER_AUTH_SECRET — signing/encryption key for better-auth cookies and
-   * tokens (Task 16). Optional here: better-auth falls back to a hard-coded
-   * dev literal when absent (logs a warning in dev, throws in production).
-   * Wire a dev literal through the Tiltfile so the value is deterministic
-   * without requiring a manual .env step.
+   * tokens (Task 16). Required: better-auth 1.6.16 has NO silent fallback —
+   * it silently uses a publicly known constant with zero warning when the var
+   * is absent, and its NODE_ENV production guard is meaningless if the deploy
+   * forgets to set NODE_ENV. We make it required here so the server refuses
+   * to start without it. The Tiltfile injects a deterministic dev literal;
+   * production must rotate this via .env or a secrets manager before Phase 4.
    */
-  betterAuthSecret: string | undefined;
+  betterAuthSecret: string;
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const missing: string[] = [];
 
+  // TEST-ONLY ESCAPE: when NODE_ENV==='test' (set automatically by `bun test`)
+  // missing required vars get explicit placeholders instead of throwing.
+  // This lets unit tests import config without a full env setup.
+  // Prod/dev MUST set real values — the Tiltfile already injects all three
+  // required vars (BETTER_AUTH_SECRET, CONTROL_PLANE_BEARER,
+  // ORCHESTRATOR_DATABASE_URL) into the orchestrator resource.
+  const isTest = env["NODE_ENV"] === "test";
+
   function require(key: string): string {
     const v = env[key];
-    if (!v) missing.push(key);
+    if (!v) {
+      if (isTest) {
+        // test-only placeholder — never used in prod/dev
+        return `test-only-${key.toLowerCase().replace(/_/g, "-")}`;
+      }
+      missing.push(key);
+    }
     return v ?? "";
   }
 
@@ -51,10 +67,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     .map((s) => s.trim())
     .filter(Boolean);
 
-  // Optional: better-auth uses this for cookie signing / encryption.
-  // Falls back to a dev literal when absent (with a console warning);
-  // throws in production if unset. Wire through Tiltfile as a dev literal.
-  const betterAuthSecret = env["BETTER_AUTH_SECRET"] || undefined;
+  // REQUIRED: better-auth 1.6.16 has NO silent dev fallback — it silently
+  // uses a publicly known constant when absent, making the secret hole
+  // exploitable in any deploy that forgets to set this var. We require it
+  // here so the server refuses to start without it. The test-mode escape
+  // above applies equally (see isTest comment). Prod/dev must set the real var.
+  const betterAuthSecret = require("BETTER_AUTH_SECRET");
 
   if (missing.length > 0) {
     throw new Error(

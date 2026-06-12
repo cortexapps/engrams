@@ -39,10 +39,11 @@ let baseUrl: string;
 let srv: ReturnType<typeof buildServer>;
 
 beforeAll(async () => {
-  // Set env vars so better-auth config resolves. Tests that need a live DB
-  // set ORCHESTRATOR_DATABASE_URL; the non-gated test doesn't.
-  // better-auth reads BETTER_AUTH_SECRET from env — set a test literal.
-  process.env["BETTER_AUTH_SECRET"] = process.env["BETTER_AUTH_SECRET"] ?? "test-better-auth-secret-32bytes!";
+  // NOTE: BETTER_AUTH_SECRET is no longer set here — betterAuth() is called
+  // eagerly at module-load time (when better-auth.ts is imported via server.ts),
+  // so any env mutation here arrives too late. config.ts now handles the
+  // test-mode escape: when NODE_ENV==='test' and the var is absent it injects a
+  // placeholder at module load. Setting it here would be a no-op.
 
   const app = new Hono();
   app.route("/", health);
@@ -144,11 +145,9 @@ describe("auth live round-trip (requires ORCHESTRATOR_DATABASE_URL)", () => {
   test.skipIf(!dbReachable)(
     "get-session with session cookie → user record returned",
     async () => {
-      // Skip silently if sign-up didn't produce a cookie (previous test failed).
-      if (!sessionCookie) {
-        console.warn("auth.test: no session cookie from sign-up — skipping get-session check");
-        return;
-      }
+      // Fail explicitly if sign-up didn't produce a cookie — a silent return
+      // would mask regressions where sign-up broke but the DB gate passed.
+      expect(sessionCookie).toBeTruthy();
 
       const res = await fetch(`${baseUrl}/api/auth/get-session`, {
         headers: {

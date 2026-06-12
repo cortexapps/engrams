@@ -11,14 +11,15 @@
  *     "member". There is no JWT plugin and no JWKS — nothing downstream
  *     consumes user identity anymore (ADR §5).
  *   - drizzle adapter: writes to the same engram_orchestrator postgres
- *     database via the lazy getDb() singleton. better-auth needs the
- *     resolved drizzle instance, so we call getDb() at module evaluation
- *     time; that is safe because the adapter only captures a reference here
- *     and opens no connection until the first auth request.
- *   - secret: BETTER_AUTH_SECRET env var. better-auth falls back to a hard-
- *     coded dev literal when the var is absent (it logs a warning in dev and
- *     throws in production). We pass it explicitly from config so the value
- *     is consistent with what we inject via the Tiltfile.
+ *     database via the lazy getDb() singleton. We pass a Proxy that defers
+ *     the getDb() call until the first property access so this module can
+ *     be imported in test mode without ORCHESTRATOR_DATABASE_URL set. Any
+ *     actual DB operation (sign-up, get-session, etc.) requires the real URL.
+ *   - secret: BETTER_AUTH_SECRET env var. This is now REQUIRED — better-auth
+ *     1.6.16 has no silent dev fallback (it uses a publicly known constant with
+ *     zero warning, making it exploitable). config.ts enforces the requirement;
+ *     the Tiltfile injects a deterministic dev literal for local dev; prod must
+ *     rotate via .env or a secrets manager before Phase 4 deployment.
  *   - trustedOrigins: wired from TRUSTED_ORIGINS (config.trustedOrigins) so
  *     the vite dev server at http://localhost:5173 passes the built-in CSRF
  *     check. Without this, better-auth 403s every non-GET auth route.
@@ -36,16 +37,27 @@ export const auth = betterAuth({
   // Origin: http://localhost:5173 — without trustedOrigins, better-auth
   // 403s every non-GET auth route (CSRF protection).
   trustedOrigins: config.trustedOrigins,
-  database: drizzleAdapter(getDb(), { provider: "pg" }),
+  // Lazy Proxy: defers getDb() until better-auth first accesses the db
+  // object (i.e., on the first actual auth request). This lets the module
+  // be imported in `bun test` without ORCHESTRATOR_DATABASE_URL set — the
+  // non-gated tests never touch the DB path, so the proxy is never resolved.
+  // In prod/dev the real URL is always present and the proxy is transparent.
+  database: drizzleAdapter(
+    new Proxy({} as ReturnType<typeof getDb>, {
+      get(_target, prop) {
+        return Reflect.get(getDb(), prop);
+      },
+    }),
+    { provider: "pg" },
+  ),
   // Dev/self-hosted door. NOTE: public sign-up = open registration.
   // Acceptable in dev only; production posture (disable sign-up /
   // allowlist) is decided in Task 22 — do not deploy past Phase 4
   // without it.
   emailAndPassword: { enabled: true },
-  // BETTER_AUTH_SECRET: better-auth uses this for cookie signing, encryption,
-  // and hashing. Falls back to "better-auth-secret-123456789" in dev (with a
-  // console warning). In production it throws if unset. We wire it from config
-  // so Tilt can inject a known dev literal without requiring a manual .env step.
+  // BETTER_AUTH_SECRET: required — config.ts enforces it (test-mode escape
+  // injects a placeholder; prod/dev must set the real var). The Tiltfile
+  // injects a deterministic dev literal; prod must rotate before Phase 4.
   secret: config.betterAuthSecret,
   plugins: [
     admin(), // role field ('admin'|'user'), setRole/ban/list APIs → Members UI
