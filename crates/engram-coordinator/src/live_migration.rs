@@ -411,6 +411,13 @@ pub async fn migrate_session_live(
         }
     };
     let restore_ms = t_restore.elapsed().as_millis();
+    // The guest is RUNNING on the dest from here (FC resumed inside
+    // the load) — this is where the guest-observed blackout ends. The
+    // rebind + harness rebuild below happen while the guest executes,
+    // so folding them into `blackout_ms` (the old shape) overstated
+    // the user-facing gap by the `finish_resume_to_active` wall.
+    let blackout_wall_ms = t_blackout.elapsed().as_millis() as u64;
+    let t_reactivate = std::time::Instant::now();
 
     // ---- 6. The Committing persist + reactivate ----
     state.host_registry.invalidate_sandbox(sandbox_id);
@@ -505,13 +512,18 @@ pub async fn migrate_session_live(
         sealed_disk_chunks = capture.sealed_disk_chunks,
         // Blackout decomposition (source-measured, under the freeze):
         // pause + disk_drain + vmstate + scan ≈ the host-side blackout;
-        // `blackout_ms` is the coordinator wall incl. the RPC round trip.
+        // `blackout_ms` is the coordinator wall from capture start to
+        // the dest restore returning (guest running) — the closest
+        // coordinator-side proxy for the guest-observed gap.
+        // `reactivate_ms` (rebind + emits + harness rebuild) runs
+        // while the guest already executes.
         blackout_pause_ms = capture.pause_ms,
         blackout_disk_drain_ms = capture.disk_drain_ms,
         blackout_vmstate_ms = capture.vmstate_ms,
         scan_ms = capture.scan_ms,
-        blackout_ms = t_blackout.elapsed().as_millis() as u64,
+        blackout_ms = blackout_wall_ms,
         restore_await_ms = restore_ms,
+        reactivate_ms = t_reactivate.elapsed().as_millis() as u64,
         total_ms = t_total.elapsed().as_millis(),
         "post-copy live teleport landed (ADR 0045 C2); drain + durability finalizing",
     );

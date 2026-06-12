@@ -2747,7 +2747,11 @@ impl FirecrackerBackend {
                                     state_path.exists(),
                                 )));
                             }
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            // 2 ms: a file-existence check is ~µs and
+                            // this wait sits inside the guest-observed
+                            // blackout — the old 25 ms grain was pure
+                            // tax.
+                            tokio::time::sleep(Duration::from_millis(2)).await;
                         }
                         tracing::info!(
                             sandbox_id = %sandbox_id,
@@ -2762,6 +2766,7 @@ impl FirecrackerBackend {
                     let base = base_memory_manifest
                         .or(manifest.memory_manifest)
                         .and_then(|r| self.uffd_base_path(&r));
+                    let t_load = std::time::Instant::now();
                     tracing::Instrument::instrument(
                         async {
                             api.load_snapshot_uffd_opts(
@@ -2777,6 +2782,16 @@ impl FirecrackerBackend {
                         tracing::info_span!("fc.load_snapshot", mode = "uffd"),
                     )
                     .await?;
+                    // Restore-tail attribution (blackout-critical on a
+                    // post-copy dest: the load demand-faults early
+                    // guest pages through the handler → P2P, and the
+                    // resume rides this call when no aux swap runs).
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        load_ms = t_load.elapsed().as_millis() as u64,
+                        resumed_in_load = aux_swap_plan.is_empty(),
+                        "fc snapshot load complete (uffd)",
+                    );
                 }
             }
             if !aux_swap_plan.is_empty() {
