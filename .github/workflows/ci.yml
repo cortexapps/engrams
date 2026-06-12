@@ -1403,11 +1403,17 @@ jobs:
           # in test-firecracker already does at the PooledBackend
           # layer.
           ENGRAM_EGRESS_PROXY_PORT: "14443"
-          # Two-host stack: brings up host-agent + host-agent-b (Tiltfile
-          # splits the /dev/nbd* devices + gives host-b a distinct proxy
-          # port). Required for e2e_two_host_teleport_preserves_sentinel;
-          # tilt-up-ci.sh waits for both to register.
-          ENGRAM_INTEG_TWO_HOSTS: "1"
+          # NOTE: single-host. The two-host stack (for the teleport e2e)
+          # is incompatible with this shared lane: the egress-dependent
+          # claude auth test needs a working per-session proxy, and
+          # running two FC host-agents on one Blacksmith runner with
+          # egress enabled destabilizes it (the claude session can land
+          # on the second host and produce no events). e2e_two_host_
+          # teleport_preserves_sentinel (which uses mode=dev_vm, no
+          # egress) therefore self-skips here and runs in its own
+          # dedicated egress-off two-host job (follow-up). The Tiltfile +
+          # tilt-up-ci.sh two-host wiring (ENGRAM_INTEG_TWO_HOSTS) stays
+          # in place for that job.
         run: |
           # ADR 0025/0027: boot the OWNED guest kernel (6.1.102) the fetch
           # script provides + prod runs — it carries CONFIG_SQUASHFS_ZSTD=y so
@@ -1546,10 +1552,9 @@ jobs:
           # regression, not the old "no nbd.ko" environment gap, so the
           # Phase B chunked-disk tests fail loud instead of skipping.
           ENGRAM_EXPECT_NBD: "1"
-          # The bring-up sets ENGRAM_INTEG_TWO_HOSTS=1, so the teleport
-          # test must find >=2 hosts — make a single-host fleet a hard
-          # failure here (the test self-skips with a warning when unset).
-          ENGRAM_EXPECT_TWO_HOSTS: "1"
+          # ENGRAM_EXPECT_TWO_HOSTS intentionally unset on this single-host
+          # lane → the teleport test self-skips with a ::warning::. It runs
+          # (and hard-asserts >=2 hosts) in its own dedicated two-host job.
         run: |
           cargo nextest run \
               -p engram-coordinator \
