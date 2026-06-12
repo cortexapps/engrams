@@ -995,6 +995,7 @@ impl Runtime {
     pub fn drain_from_peer(
         &self,
         peer: &crate::peer::PeerSession,
+        hot: Option<&engram_chunk_store::working_set::WorkingSetTrace>,
     ) -> Result<crate::peer::DrainStats, HandlerError> {
         use crate::peer::{DrainStats, PeerPage};
 
@@ -1009,11 +1010,33 @@ impl Runtime {
         let next_req = std::sync::atomic::AtomicU64::new(1_000_000); // distinct from fault-conn ids in logs
 
         // Pending sealed chunk offsets, skipping anything already
-        // installed by a racing fault.
-        let todo: Vec<u64> = (0..seal.chunk_count)
-            .filter(|i| seal.get(*i))
-            .map(|i| i * chunk_size)
-            .collect();
+        // installed by a racing fault. HOT-FIRST: the source's
+        // resume-time working set (in first-fault order) leads, so
+        // the chunks the guest touches first are installed first and
+        // most would-be faults are already local when they happen —
+        // the no-added-pause version of a hot-set pre-install. The
+        // cold remainder keeps offset order.
+        let mut todo: Vec<u64> = Vec::with_capacity(seal.count_ones() as usize);
+        let mut queued = std::collections::HashSet::new();
+        if let Some(trace) = hot {
+            for hash in &trace.chunks {
+                for offset in self.backend.session_positions_of(*hash) {
+                    let idx = offset / chunk_size;
+                    if seal.get(idx) && queued.insert(idx) {
+                        todo.push(idx * chunk_size);
+                    }
+                }
+            }
+        }
+        let hot_leading = todo.len();
+        for i in (0..seal.chunk_count).filter(|i| seal.get(*i)) {
+            if !queued.contains(&i) {
+                todo.push(i * chunk_size);
+            }
+        }
+        if hot_leading > 0 {
+            tracing::info!(hot_leading, total = todo.len(), "drain ordered hot-first");
+        }
         let total_sealed = todo.len();
 
         let mut in_flight: std::collections::VecDeque<(u64, u64)> = Default::default(); // (req_id, offset)
@@ -1234,7 +1257,7 @@ pub fn run_listener(
                 // whole VM; warming a doomed guest is wasted I/O.
                 if let Some(peer) = rt.peer.clone() {
                     let started = std::time::Instant::now();
-                    match rt.drain_from_peer(&peer) {
+                    match rt.drain_from_peer(&peer, prefault_trace.as_ref()) {
                         Ok(stats) => {
                             let (faults, fault_us, fault_max_us) = peer.fault_stats();
                             tracing::info!(
@@ -1658,7 +1681,7 @@ mod tests {
         let rt_drain = Arc::clone(&rt);
         let sess = Arc::clone(&session);
         let stats = std::thread::spawn(move || {
-            let stats = rt_drain.drain_from_peer(&sess).expect("drain");
+            let stats = rt_drain.drain_from_peer(&sess, None).expect("drain");
             rt_drain.sweep_all().expect("sweep");
             stats
         })

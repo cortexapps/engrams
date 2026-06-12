@@ -115,13 +115,16 @@ mod linux {
     const DEFAULT_RECORDER_WINDOW_MS: u64 = 5_000;
 
     /// Which trace to consume on restore.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     pub enum PrefaultTraceSpec {
         /// `traces/<manifest_id>/canonical.json` (image-bake-time).
         Canonical,
         /// `traces/<manifest_id>/<host_id>.json` (this host's prior
         /// recording for the same manifest).
         Host(Uuid),
+        /// A local trace JSON staged by the spawn (post-copy: the
+        /// SOURCE's hot set — drives drain ordering + prefault).
+        File(PathBuf),
     }
 
     pub struct Args {
@@ -383,9 +386,13 @@ mod linux {
     fn parse_trace_spec(s: &str) -> Result<PrefaultTraceSpec, String> {
         if s.eq_ignore_ascii_case("canonical") {
             Ok(PrefaultTraceSpec::Canonical)
+        } else if let Some(path) = s.strip_prefix("file:") {
+            Ok(PrefaultTraceSpec::File(PathBuf::from(path)))
         } else {
             let host = Uuid::parse_str(s).map_err(|e| {
-                format!("--prefault-trace {s:?} (expected `canonical` or <uuid>): {e}")
+                format!(
+                    "--prefault-trace {s:?} (expected `canonical`, `file:<path>`, or <uuid>): {e}"
+                )
             })?;
             Ok(PrefaultTraceSpec::Host(host))
         }
@@ -421,23 +428,35 @@ mod linux {
         let backend = Arc::new(backend);
 
         let prefault = if let Some(spec) = args.prefault_trace {
-            let trace_ref = match spec {
-                PrefaultTraceSpec::Canonical => {
-                    TraceRef::canonical(args.session_manifest.manifest_id)
-                }
-                PrefaultTraceSpec::Host(host) => {
-                    TraceRef::host(args.session_manifest.manifest_id, host)
-                }
+            let loaded = match &spec {
+                PrefaultTraceSpec::File(path) => tokio::fs::read(path)
+                    .await
+                    .map_err(|e| format!("read {}: {e}", path.display()))
+                    .and_then(|bytes| {
+                        serde_json::from_slice(&bytes).map_err(|e| format!("parse trace: {e}"))
+                    }),
+                PrefaultTraceSpec::Canonical => load_trace_via_blob(
+                    blob.clone(),
+                    TraceRef::canonical(args.session_manifest.manifest_id),
+                )
+                .await
+                .map_err(|e| e.to_string()),
+                PrefaultTraceSpec::Host(host) => load_trace_via_blob(
+                    blob.clone(),
+                    TraceRef::host(args.session_manifest.manifest_id, *host),
+                )
+                .await
+                .map_err(|e| e.to_string()),
             };
-            match load_trace_via_blob(blob.clone(), trace_ref).await {
+            match loaded {
                 Ok(t) => {
-                    tracing::info!(chunks = t.chunks.len(), ?trace_ref, "loaded prefault trace");
+                    tracing::info!(chunks = t.chunks.len(), ?spec, "loaded prefault trace");
                     Some(t)
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        ?trace_ref,
+                        ?spec,
                         "prefault trace requested but couldn't be loaded; proceeding without"
                     );
                     None

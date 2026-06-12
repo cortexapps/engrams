@@ -196,6 +196,10 @@ pub const UFFD_CONTROL_SOCK_FILE: &str = "uffd-control.sock";
 /// state.bin appears late via the fetch poller).
 pub const MIGRATION_PEER_FILE: &str = "migration-peer.json";
 
+/// ADR 0045 C2 (E2B fold): the staged source-hot-set trace the spawn
+/// writes into the jail for the handler's drain ordering + prefault.
+pub const MIGRATION_HOT_TRACE_FILE: &str = "migration-hot-trace.json";
+
 /// ADR 0045 C2: `migration-peer.json` content.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MigrationPeerSpec {
@@ -206,6 +210,14 @@ pub struct MigrationPeerSpec {
     /// on /proc/*/cmdline). The file lives root-owned in the snapshot
     /// staging dir for the restore's lifetime.
     pub peer_token: String,
+    /// E2B fold: the SOURCE's resume-time working set (the capture
+    /// rider's `hot_chunks`) — the prediction of exactly the pages
+    /// the dest guest will fault first. The spawn stages it as a
+    /// local trace file so the handler drains hot-first AND the
+    /// post-drain prefault walks it. Serde-default: an old spec
+    /// simply yields no hot ordering.
+    #[serde(default)]
+    pub hot_chunks: Vec<[u8; 32]>,
 }
 
 /// Host-wide knobs for `FirecrackerBackend`. The kernel image lives
@@ -1631,7 +1643,37 @@ impl FirecrackerBackend {
             }
             cmd.arg("--base-shm").arg(&base);
         }
-        if let Some(host) = prefault_trace_host {
+        // Post-copy: the source's hot set beats any host-local trace —
+        // it is the working set of THIS guest measured minutes ago,
+        // not a same-template cousin's. Staged as a local file; the
+        // handler both orders its drain by it and prefaults from it.
+        let migration_hot_trace = match peer {
+            Some(p) if !p.hot_chunks.is_empty() => {
+                let trace = engram_chunk_store::working_set::WorkingSetTrace {
+                    schema_version: 1,
+                    captured_at: chrono::Utc::now(),
+                    vcpu_count: 0, // unknown here; replay ignores it
+                    capture_window_ms: 0,
+                    chunks: p
+                        .hot_chunks
+                        .iter()
+                        .map(|h| engram_chunk_store::manifest::ChunkHash::from_bytes(*h))
+                        .collect(),
+                };
+                let path = jail_dir.join(MIGRATION_HOT_TRACE_FILE);
+                let json = serde_json::to_vec(&trace)
+                    .map_err(|e| vm_err(format!("serialize migration hot trace: {e}")))?;
+                tokio::fs::write(&path, json)
+                    .await
+                    .map_err(|e| vm_err(format!("write migration hot trace: {e}")))?;
+                Some(path)
+            }
+            _ => None,
+        };
+        if let Some(path) = migration_hot_trace.as_ref() {
+            cmd.arg("--prefault-trace")
+                .arg(format!("file:{}", path.display()));
+        } else if let Some(host) = prefault_trace_host {
             cmd.arg("--prefault-trace").arg(host.to_string());
         }
         if let Some(host) = publish_trace_host {

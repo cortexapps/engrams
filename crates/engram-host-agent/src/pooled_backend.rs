@@ -1171,6 +1171,7 @@ impl PooledBackend {
             peer_addr: peer_addr.clone(),
             export_id: mig.export_id.clone(),
             peer_token: peer_token.clone(),
+            hot_chunks: mig.hot_chunks.clone(),
         };
         fs::write(
             dest.join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
