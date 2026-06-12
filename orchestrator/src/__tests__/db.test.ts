@@ -3,17 +3,15 @@
  *
  * All live tests are env-gated on ORCHESTRATOR_DATABASE_URL being set AND
  * the database being reachable. When the variable is absent or the DB is
- * unreachable the tests skip cleanly so the suite passes in environments
- * without a Postgres instance.
+ * unreachable the tests are reported as SKIP (not silent pass) so CI surfaces
+ * the gap honestly.
+ *
+ * Bun test files support top-level await, so we probe reachability once at
+ * module load and pass the result directly to test.skipIf — no beforeAll trick
+ * needed, and no early-return wrapper that masks skips as passes.
  *
  * In the Tilt dev loop ORCHESTRATOR_DATABASE_URL is always set (via
  * serve_env), so the live tests run automatically there.
- *
- * Note on test.skipIf: Bun evaluates the skipIf predicate at module-parse
- * time, before any beforeAll hook runs. So we cannot use a top-level async
- * flag for the skip condition. Instead we probe the DB synchronously at
- * module load (via a top-level Promise.resolve trick) and fall back to
- * early-return inside each test body for the reachability guard.
  */
 
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
@@ -26,28 +24,13 @@ import healthRoute from "../routes/health.ts";
 import type { AddressInfo } from "net";
 
 // ---------------------------------------------------------------------------
-// Gate: skip everything when URL is absent (known at parse time).
-// Reachability is checked in beforeAll and used as an early-return guard.
+// Gate: compute reachability once at module load (top-level await is fine in
+// Bun test files). test.skipIf receives the resolved boolean so skipped tests
+// are reported as SKIP, not as silent passes.
 // ---------------------------------------------------------------------------
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
-let dbReachable = false;
-
-beforeAll(async () => {
-  if (!DB_URL) return;
-  dbReachable = await checkDb();
-});
-
-// Helper: skip a test when the DB is not reachable (called at test body start).
-function skipIfNoDb(t: () => void | Promise<void>) {
-  return async () => {
-    if (!DB_URL || !dbReachable) {
-      // Signal skip via a console note; the test body does nothing.
-      return;
-    }
-    await t();
-  };
-}
+const dbReachable = DB_URL ? await checkDb() : false;
 
 // ---------------------------------------------------------------------------
 // checkDb() unit-like behaviour when URL is absent
@@ -72,16 +55,16 @@ describe("live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
   const testTaskId = `test-task-${Date.now()}`;
   const testSessionId = `test-session-${Date.now()}`;
 
-  test(
+  test.skipIf(!dbReachable)(
     "checkDb() returns true when DB is reachable",
-    skipIfNoDb(async () => {
+    async () => {
       expect(await checkDb()).toBe(true);
-    }),
+    },
   );
 
-  test(
+  test.skipIf(!dbReachable)(
     "insert + read + delete a task row",
-    skipIfNoDb(async () => {
+    async () => {
       const db = getDb();
 
       // Insert
@@ -112,12 +95,12 @@ describe("live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
         .from(task)
         .where(eq(task.id, testTaskId));
       expect(afterDelete).toHaveLength(0);
-    }),
+    },
   );
 
-  test(
+  test.skipIf(!dbReachable)(
     "insert + read + delete a task_session row (cascade on task delete)",
-    skipIfNoDb(async () => {
+    async () => {
       const db = getDb();
 
       // Insert parent task first
@@ -152,7 +135,7 @@ describe("live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
         .from(taskSession)
         .where(eq(taskSession.taskId, testTaskId + "-ts"));
       expect(afterCascade).toHaveLength(0);
-    }),
+    },
   );
 });
 
@@ -168,7 +151,7 @@ describe("healthz with live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
   let srv: ReturnType<typeof buildServer>;
 
   beforeAll(async () => {
-    if (!DB_URL || !dbReachable) return;
+    if (!dbReachable) return;
 
     const app = new Hono();
     app.route("/", healthRoute);
@@ -191,13 +174,13 @@ describe("healthz with live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
     });
   });
 
-  test(
+  test.skipIf(!dbReachable)(
     "GET /healthz → 200 {ok:true, db:true} when DB is live",
-    skipIfNoDb(async () => {
+    async () => {
       const res = await fetch(`${baseUrl}/healthz`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body).toEqual({ ok: true, db: true });
-    }),
+    },
   );
 });

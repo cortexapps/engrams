@@ -8,8 +8,12 @@
  *    so the orchestrator boots even when ORCHESTRATOR_DATABASE_URL is unset
  *    (healthz can then report {ok:false, db:false} rather than crashing at
  *    import time).
- *  - `checkDb()` issues a `SELECT 1` with a 2-second statement_timeout so a
- *    dead or slow DB never hangs the /healthz endpoint.
+ *  - `checkDb()` issues a `SELECT 1` inside a transaction with
+ *    `SET LOCAL statement_timeout = 2000` so the timeout is scoped to that
+ *    transaction only and does not leak onto the pooled connection for
+ *    subsequent callers. A `connectionTimeoutMillis` cap on the Pool ensures
+ *    that even a black-holed DB host cannot hang /healthz indefinitely (pg's
+ *    default is 0 = wait forever).
  */
 
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -33,7 +37,14 @@ export function getDb(): NodePgDatabase<typeof schema> {
     );
   }
 
-  _pool = new Pool({ connectionString: url, max: 10 });
+  _pool = new Pool({
+    connectionString: url,
+    max: 10,
+    // Cap how long pool.connect() waits for a TCP connection. pg's default is
+    // 0 (wait forever), which would cause /healthz to hang ~75 s on a
+    // black-holed host before the OS gives up.
+    connectionTimeoutMillis: 2000,
+  });
   _db = drizzle(_pool, { schema });
   return _db;
 }
@@ -52,9 +63,17 @@ export async function checkDb(): Promise<boolean> {
 
     const client = await pool.connect();
     try {
-      await client.query("SET statement_timeout = 2000");
+      // Use SET LOCAL so the timeout is scoped to this transaction only.
+      // A plain SET would persist for the lifetime of the pooled connection
+      // and silently apply to all subsequent queries issued by other callers.
+      await client.query("BEGIN");
+      await client.query("SET LOCAL statement_timeout = 2000");
       await client.query("SELECT 1");
+      await client.query("COMMIT");
       return true;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
     } finally {
       client.release();
     }
