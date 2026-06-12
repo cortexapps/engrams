@@ -13,24 +13,12 @@
 //!
 //! The Tiltfile configures the coordinator with bearer `dev-app-grpc-token`
 //! (overridable via `ENGRAM_APP_GRPC_TOKENS`). The smoke discovers a
-//! no-harness image via `ImageService.ListEnabledImages` over gRPC (Task 13
-//! is live — the legacy REST surface is bearer-gated post-Task-31 and no
-//! longer usable without the REST service token). It then drives
-//! create → list → get → delete over gRPC.
+//! no-harness image via `ImageService.ListEnabledImages` over gRPC and then
+//! drives create → list → get → delete over gRPC.
 //!
-//! ## SSE comparison in `stream_events_smoke`
-//!
-//! The SSE leg (`GET /api/v1/sessions/{id}/events` on 8090) returns 401
-//! post-Task-31: the coordinator's REST surface authenticates via
-//! `ENGRAM_AUTH_TOKENS` (the deployment service-bearer allow-list), which
-//! is NOT set in the Tiltfile dev stack — only `ENGRAM_APP_GRPC_TOKENS`
-//! is configured (the gRPC-surface token). Sending `Authorization: Bearer
-//! dev-app-grpc-token` to the REST port confirms 401 (curl evidence:
-//! `curl -s -H 'Authorization: Bearer dev-app-grpc-token' \
-//!   http://127.0.0.1:8090/api/v1/sessions/<id>/events --max-time 3`
-//! → HTTP 401). The existing WARN-skip path in `stream_events_smoke` for
-//! non-2xx responses handles this gracefully; the comparison is retired
-//! in Task 32 when the REST surface is deleted entirely.
+//! ADR 0039 Task 32: the SSE REST surface (`GET /api/v1/sessions/{id}/events`)
+//! is removed. The SSE comparison block in `stream_events_smoke` (step 3) is
+//! retired — `StreamEvents` is now the sole events surface.
 
 use engram_protocol::app;
 use engram_protocol::app::image_service_client::ImageServiceClient;
@@ -230,124 +218,11 @@ async fn stream_events_smoke() {
     );
     println!("smoke(stream_events): gRPC idx sequence: {grpc_idxs:?}");
 
-    // ---- 3. Compare against legacy SSE feed idx sequence ----
-    //
-    // We read the SSE stream INCREMENTALLY via `bytes_stream()` so we can
-    // stop as soon as we have collected `grpc_idxs.len()` `id:` lines.
-    // A plain `.timeout(5s).text()` would always time out (SSE never
-    // sends EOF while the session is live), making the comparison silently
-    // no-op via the WARN-skip path every run.
-    //
-    // WARN-skip is kept ONLY for a genuine connection failure (Err arm).
-    // If the stream connects but yields fewer id: lines than expected
-    // within the 10 s deadline, the test FAILS — that is a real bug.
-    {
-        use futures::StreamExt as _;
+    // ADR 0039 Task 32: Step 3 (SSE feed comparison) retired.
+    // The coordinator's REST events surface (`GET /api/v1/sessions/{id}/events`)
+    // is removed in Task 32. `StreamEvents` gRPC is the sole events surface.
 
-        let http_addr = std::env::var("ENGRAM_SMOKE_HTTP")
-            .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-        let sse_url = format!("{http_addr}/api/v1/sessions/{session_id}/events");
-
-        // No .timeout() on the send — we want the connection to succeed and
-        // then we impose a per-stream deadline via tokio::time::timeout below.
-        let sse_client = reqwest::Client::new();
-        let sse_send = sse_client
-            .get(&sse_url)
-            .query(&[("since", "-1")])
-            .header("Accept", "text/event-stream")
-            .send()
-            .await;
-
-        match sse_send {
-            Err(e) => {
-                // Genuine connection failure (stack unreachable) — skip, not fail.
-                println!(
-                    "smoke(stream_events): WARN — SSE GET failed ({e}) — skipping SSE comparison"
-                );
-            }
-            Ok(resp) if !resp.status().is_success() => {
-                // Non-2xx (e.g. auth required, 404) — skip with a note.
-                println!(
-                    "smoke(stream_events): WARN — SSE GET returned {} — skipping SSE comparison",
-                    resp.status()
-                );
-            }
-            Ok(resp) => {
-                // Connected successfully — read incrementally until we have
-                // the expected number of id: lines or the deadline expires.
-                let want = grpc_idxs.len();
-                let sse_deadline = std::time::Duration::from_secs(10);
-
-                let mut byte_stream = resp.bytes_stream();
-                let mut partial = String::new();
-                let mut sse_idxs: Vec<i64> = Vec::new();
-
-                let collect_result = tokio::time::timeout(sse_deadline, async {
-                    while sse_idxs.len() < want {
-                        match byte_stream.next().await {
-                            None => break, // stream ended (session terminal)
-                            Some(Err(e)) => {
-                                // Transport error mid-stream — hard fail so we
-                                // don't silently weaken the comparison. If this
-                                // fires, the SSE path has a real transport bug.
-                                // (Comparison NOT weakened: panic immediately.)
-                                panic!("smoke(stream_events): SSE read error mid-stream: {e}");
-                            }
-                            Some(Ok(chunk)) => {
-                                partial.push_str(&String::from_utf8_lossy(&chunk));
-                                // Parse all complete lines, keep remainder.
-                                let last_newline = partial.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                let complete = partial[..last_newline].to_string();
-                                partial = partial[last_newline..].to_string();
-                                for line in complete.lines() {
-                                    if let Some(raw) = line.strip_prefix("id:") {
-                                        if let Ok(idx) = raw.trim().parse::<i64>() {
-                                            sse_idxs.push(idx);
-                                            if sse_idxs.len() >= want {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                })
-                .await;
-
-                println!(
-                    "smoke(stream_events): SSE idx sequence (collected {}/{}): {sse_idxs:?}",
-                    sse_idxs.len(),
-                    want
-                );
-
-                if collect_result.is_err() && sse_idxs.len() < want {
-                    // Stream connected but timed out before delivering enough
-                    // id: lines — this is a real bug, not a skip.
-                    panic!(
-                        "smoke(stream_events): SSE stream connected but only yielded {} id: \
-                         lines within {sse_deadline:?}; expected {want} — \
-                         gRPC idx sequence was {grpc_idxs:?}",
-                        sse_idxs.len(),
-                    );
-                }
-
-                // Hard assert: the idx sequences must match.
-                let compare_len = grpc_idxs.len().min(sse_idxs.len());
-                assert_eq!(
-                    &grpc_idxs[..compare_len],
-                    &sse_idxs[..compare_len],
-                    "gRPC and SSE must yield identical idx sequences for session {session_id}"
-                );
-                println!(
-                    "smoke(stream_events): gRPC idx sequence {grpc_idxs:?} == \
-                     SSE idx sequence {sse_idxs:?} — match confirmed ({compare_len} events)"
-                );
-            }
-        }
-    }
-
-    // ---- 4. Reopen with since=last_idx — no gap, no dup ----
+    // ---- 3. Reopen with since=last_idx — no gap, no dup ----
     let last_idx = *grpc_idxs.last().expect("at least one idx");
     let mut reopen_req = tonic::Request::new(app::StreamEventsRequest {
         session_id: session_id.clone(),
@@ -396,7 +271,7 @@ async fn stream_events_smoke() {
         }
     }
 
-    // ---- 5. DeleteSession ----
+    // ---- 4. DeleteSession ----
     let mut del_req = tonic::Request::new(app::DeleteSessionRequest {
         session_id: session_id.clone(),
     });

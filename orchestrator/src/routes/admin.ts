@@ -23,12 +23,14 @@
  * Note: teleportSession uses FleetService.EvacuateSession (gRPC, already
  * passing through the CASL gate) — no proxy route needed for it.
  *
- * DEV-ONLY SCAFFOLDING — do not deploy mid-span. The forwarded bearer is
- * CONTROL_PLANE_BEARER (the app-gRPC token); the coordinator's REST chain
- * authenticates bearers against a DIFFERENT knob (--auth-tokens). Dev works
- * because AuthMode::None accepts everything; prod would 401. Acceptable
- * only because ADR 0039 declares Tasks 23-32 a single non-deployable span;
- * the Task 32 promotion to gRPC deletes this file.
+ * Production auth note (ADR 0039 Task 32): The forwarded bearer is
+ * CONTROL_PLANE_BEARER. In production, ENGRAM_AUTH_TOKENS on the coordinator
+ * must include this bearer so the coordinator's REST chain accepts the
+ * orchestrator's forwarded requests for /pause and /resume. Ensure both
+ * tokens agree at deploy time.
+ *
+ * TODO: promote pause/resume to gRPC (PauseSession/ResumeSession RPCs) and
+ * delete this file. Until then, these two routes remain as REST proxies.
  */
 
 import { Hono } from "hono";

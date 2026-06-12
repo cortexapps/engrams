@@ -18,28 +18,16 @@
 //! highest replayed idx and skipping live events at or below it.
 
 use std::convert::Infallible;
-use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::Event;
 use engram_core::SessionId;
 use futures::stream::{Stream, StreamExt};
-use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use crate::error::ApiError;
 use crate::state::{IndexedEvent, SharedState};
 
 pub(crate) const REPLAY_LIMIT: i64 = 1000;
-
-#[derive(Deserialize)]
-pub struct EventsQuery {
-    /// Replay events with `idx > since`. Combine with `Last-Event-ID`
-    /// header (EventSource auto-reconnect) — the larger of the two
-    /// wins so an explicit query never goes backward across reconnect.
-    pub since: Option<i64>,
-}
 
 /// A single item from the unified replay→live event stream.
 ///
@@ -183,34 +171,9 @@ pub(crate) async fn events_core(
     Ok((replayed, live_rx))
 }
 
-pub async fn events(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-    Query(query): Query<EventsQuery>,
-    headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    // Pick the higher of explicit query and Last-Event-ID — explicit
-    // query wins ties. Default of -1 means "from the start of the log."
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok());
-    let since = match (query.since, last_event_id) {
-        (Some(q), Some(h)) => Some(q.max(h)),
-        (Some(q), None) => Some(q),
-        (None, Some(h)) => Some(h),
-        (None, None) => None,
-    };
+// ADR 0039 Task 32: `events` axum shim removed. See `events_core` for the gRPC entry point.
 
-    let (replayed, live_rx) = events_core(&state, id, since).await?;
-    let stream = build_event_stream(replayed, live_rx, since);
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
-}
-
+#[allow(dead_code)]
 fn build_event_stream(
     replayed: Vec<engram_core::types::PersistedEvent>,
     live_rx: broadcast::Receiver<IndexedEvent>,

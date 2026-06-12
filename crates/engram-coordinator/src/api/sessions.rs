@@ -1,8 +1,5 @@
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
 use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionState};
@@ -473,15 +470,9 @@ pub struct CreateSessionResponse {
 // `OTEL_EXPORTER_OTLP_ENDPOINT` is set, but the span is always created so
 // propagation works the moment a collector is wired up.
 #[tracing::instrument(name = "session.create", skip_all)]
-pub async fn create_session(
-    State(state): State<SharedState>,
-    crate::api::principal::CurrentUser(_principal): crate::api::principal::CurrentUser,
-    Json(req): Json<CreateSessionRequest>,
-) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    // ADR 0039 Task 31: owner stamping and identity env removed (users table dropped).
-    let body = create_session_core(&state, HashMap::new(), req).await?;
-    Ok((StatusCode::CREATED, Json(body)))
-}
+// ADR 0039 Task 32: the `create_session` axum shim is removed.
+// The `create_session_core` function below is the only entry point
+// (called by the gRPC SessionService).
 
 /// Transport-agnostic create core, with the metrics wrapper inside so
 /// gRPC creations are counted too (ADR 0039 Task 10).
@@ -1182,12 +1173,9 @@ async fn try_restore_base_snapshot(
     }
 }
 
-pub async fn get_session(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<Session>, ApiError> {
-    Ok(Json(get_session_core(&state, id).await?))
-}
+// ADR 0039 Task 32: the `get_session` axum shim is removed.
+// The `get_session_core` function below is the only entry point
+// (called by the gRPC SessionService).
 
 /// Transport-agnostic core: fetch one session row by id (404 on unknown).
 /// No authz — the axum route's `require_session_owner` layer gates the
@@ -1216,26 +1204,9 @@ pub struct ListSessionsResponse {
     pub sessions: Vec<SessionListItem>,
 }
 
-#[derive(serde::Deserialize, Default)]
-pub struct ListSessionsParams {
-    /// Retained for wire compatibility; scoping is now the orchestrator's job
-    /// (ADR 0039 Task 31). Will be removed in Task 32.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub scope: Option<String>,
-}
-
-/// `GET /sessions` — ADR 0039 Task 31: user_id column dropped; all sessions
-/// returned without owner scoping. The orchestrator owns authz and filtering.
-pub async fn list_sessions(
-    State(state): State<SharedState>,
-    crate::api::principal::CurrentUser(_principal): crate::api::principal::CurrentUser,
-    axum::extract::Query(_params): axum::extract::Query<ListSessionsParams>,
-) -> Result<Json<ListSessionsResponse>, ApiError> {
-    // ADR 0039 Task 31: user_id column dropped; all sessions returned without owner scoping.
-    let resp = list_sessions_core(&state).await?;
-    Ok(Json(resp))
-}
+// ADR 0039 Task 32: `ListSessionsParams` and the `list_sessions` axum shim
+// are removed. The `list_sessions_core` function below is the only entry
+// point (called by the gRPC SessionService).
 
 /// Transport-agnostic core: returns ALL live sessions (the gRPC caller is
 /// a trusted service; filtering/authz is the orchestrator's job, ADR §6).
@@ -1255,13 +1226,9 @@ pub(crate) async fn list_sessions_core(
     Ok(ListSessionsResponse { sessions })
 }
 
-pub async fn delete_session(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<StatusCode, ApiError> {
-    delete_session_core(&state, id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
+// ADR 0039 Task 32: the `delete_session` axum shim is removed.
+// The `delete_session_core` function below is the only entry point
+// (called by the gRPC SessionService).
 
 /// Transport-agnostic core: drive a session to terminal and tear down its
 /// sandbox, idempotently. Returns `Ok(())` on success or already-terminal

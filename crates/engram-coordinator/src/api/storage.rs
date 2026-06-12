@@ -20,8 +20,6 @@
 
 use std::collections::HashMap;
 
-use axum::extract::State;
-use axum::Json;
 use chrono::{DateTime, Utc};
 use engram_core::types::cow_state::unix_ms_to_dt;
 use engram_core::{HostId, SandboxId, SessionId};
@@ -29,7 +27,6 @@ use serde::Serialize;
 
 use crate::cow_state::fetch_for_host;
 use crate::error::ApiError;
-use crate::state::SharedState;
 
 /// One per-sandbox row of the durability ledger.
 #[derive(Serialize)]
@@ -152,8 +149,4 @@ pub(crate) async fn storage_summary_core(
     })
 }
 
-pub async fn summary(
-    State(state): State<SharedState>,
-) -> Result<Json<StorageSummaryResponse>, ApiError> {
-    Ok(Json(storage_summary_core(&state).await?))
-}
+// ADR 0039 Task 32: `summary` axum shim removed. See `storage_summary_core` for the gRPC entry point.

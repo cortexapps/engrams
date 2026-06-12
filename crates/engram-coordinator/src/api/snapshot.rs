@@ -17,9 +17,6 @@
 
 use std::time::Duration;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::Json;
 use chrono::Utc;
 use engram_core::traits::storage::BlobStorage;
 use engram_core::types::manifest::ManifestRef;
@@ -82,7 +79,7 @@ fn placeholder_egress_policy(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SnapshotResponse {
     pub session_id: SessionId,
     pub snapshot_id: Option<String>,
@@ -90,35 +87,11 @@ pub struct SnapshotResponse {
     pub note: &'static str,
 }
 
-/// Transport-agnostic snapshot core (ADR 0039, Task 12). Delegates
-/// to the same implementation the axum handler uses.
+/// Transport-agnostic snapshot core (ADR 0039, Task 32).
 pub async fn snapshot_core(
     state: &SharedState,
     id: SessionId,
 ) -> Result<SnapshotResponse, ApiError> {
-    snapshot(State(state.clone()), Path(id)).await.map(|j| j.0)
-}
-
-/// Transport-agnostic resume core (ADR 0039, Task 12). Delegates
-/// to the same implementation the axum handler uses.
-pub async fn resume_core(state: &SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
-    resume_session(state.clone(), id).await
-}
-
-/// Transport-agnostic evict_local core (ADR 0039, Task 12). Delegates
-/// to the same implementation the axum handler uses and discards the
-/// HTTP status code (the gRPC handler returns an empty response on
-/// success, mirroring the 202 Accepted).
-pub async fn evict_local_core(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
-    evict_local(State(state.clone()), Path(id))
-        .await
-        .map(|_| ())
-}
-
-pub async fn snapshot(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
     state.services.meta.get_session(id).await?;
 
     let sandbox_id = state.registry.get(id).ok_or_else(|| {
@@ -216,20 +189,22 @@ pub async fn snapshot(
 
     // Snapshot does NOT change session state — the live sandbox keeps
     // running. evict_local is the explicit "drop from RAM" action.
-    Ok(Json(SnapshotResponse {
+    Ok(SnapshotResponse {
         session_id: id,
         snapshot_id: Some(metadata.id.to_string()),
         size_bytes: Some(metadata.size_bytes),
         note: "snapshot recorded; live sandbox still running",
-    }))
+    })
 }
 
-pub async fn resume(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
-    resume_session(state, id).await.map(Json)
+// ADR 0039 Task 32: `snapshot` axum shim removed. See `snapshot_core` for the gRPC entry point.
+
+/// Transport-agnostic resume core (ADR 0039, Task 32).
+pub async fn resume_core(state: &SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
+    resume_session(state.clone(), id).await
 }
+
+// ADR 0039 Task 32: `resume` axum shim removed. See `resume_core` for the gRPC entry point.
 
 /// Auto-resume an `Idle` session if needed, before routing an
 /// exec / exec_stream / events request to it. Track B's pack-hosts
@@ -1301,10 +1276,9 @@ pub(crate) async fn bind_session_routing(
     state.services.host.bind_session(id, sandbox_id).await;
 }
 
-pub async fn evict_local(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<StatusCode, ApiError> {
+/// Transport-agnostic evict_local core (ADR 0039, Task 32). The gRPC
+/// handler returns an empty response on success, mirroring the 202 Accepted.
+pub async fn evict_local_core(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
 
     if session.status != SessionState::Active {
@@ -1366,8 +1340,10 @@ pub async fn evict_local(
             },
         )
         .await?;
-    Ok(StatusCode::ACCEPTED)
+    Ok(())
 }
+
+// ADR 0039 Task 32: `evict_local` axum shim removed. See `evict_local_core` for the gRPC entry point.
 
 /// ADR 0009 Phase 2: HEAD-verify the chunked manifests are durable
 /// in BlobStorage. Returns `true` only when every present manifest
@@ -1966,16 +1942,15 @@ mod evicting_gate_tests {
         );
     }
 
-    /// A direct /resume mid-eviction gets the same honest 409.
+    /// A direct resume mid-eviction gets the same honest 409.
     #[tokio::test]
     async fn resume_during_evicting_is_retryable_conflict() {
         let id = SessionId::new();
         let (state, _local) = build_state_for_session(evicting_session(id));
 
-        let err = match resume(State(state.clone()), Path(id)).await {
-            Err(e) => e,
-            Ok(_) => panic!("Evicting must not resume"),
-        };
+        let err = resume_core(&state, id)
+            .await
+            .expect_err("Evicting must not resume");
         assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
         let after = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(after.status, SessionState::Evicting);
@@ -1998,10 +1973,9 @@ mod evicting_gate_tests {
             .sandbox_id
             .unwrap();
 
-        let code = crate::api::sessions::delete_session(State(state.clone()), Path(id))
+        crate::api::sessions::delete_session_core(&state, id)
             .await
             .expect("delete mid-eviction");
-        assert_eq!(code, StatusCode::NO_CONTENT);
         let after = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(after.status, SessionState::Completed);
 

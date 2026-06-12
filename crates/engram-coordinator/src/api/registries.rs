@@ -13,20 +13,15 @@
 //! `GET /api/registries` returns [`RegistryCredentialSummary`] only
 //! — never plaintext passwords, never ciphertext bytes.
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::Json;
 use chrono::Utc;
 use engram_core::types::registry::{
     RegistryAuthSpec, RegistryCredential, RegistryCredentialSummary,
 };
-use engram_core::MetaError;
 use engram_crypto::CredCipher;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::state::SharedState;
 
 /// Wire shape: discriminated on `kind`. Static carries plaintext
 /// `password`; cloud-IAM kinds skip it. Validation lives entirely in
@@ -66,11 +61,6 @@ pub struct AddRegistryResponse {
     pub host: String,
     pub auth_kind: String,
     pub auth_principal: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct ListRegistriesResponse {
-    pub registries: Vec<RegistryCredentialSummary>,
 }
 
 /// Transport-agnostic core for AddRegistry.
@@ -128,36 +118,8 @@ pub(crate) async fn add_registry_core(
     })
 }
 
-pub async fn add_registry(
-    State(state): State<SharedState>,
-    Json(req): Json<AddRegistryRequest>,
-) -> Result<(StatusCode, Json<AddRegistryResponse>), ApiError> {
-    Ok((
-        StatusCode::CREATED,
-        Json(add_registry_core(&state, req).await?),
-    ))
-}
+// ADR 0039 Task 32: `add_registry` axum shim removed. See `add_registry_core` for the gRPC entry point.
 
-pub async fn list_registries(
-    State(state): State<SharedState>,
-) -> Result<Json<ListRegistriesResponse>, ApiError> {
-    let creds = state.services.meta.list_registry_credentials().await?;
-    let registries = creds
-        .into_iter()
-        .map(RegistryCredentialSummary::from)
-        .collect();
-    Ok(Json(ListRegistriesResponse { registries }))
-}
+// ADR 0039 Task 32: `list_registries` axum shim removed. See `add_registry_core` for the gRPC entry point.
 
-pub async fn delete_registry(
-    State(state): State<SharedState>,
-    Path(host): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    match state.services.meta.delete_registry_credential(&host).await {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(MetaError::NotFound) => Err(ApiError::NotFound(format!(
-            "no registry credential for host {host:?}"
-        ))),
-        Err(e) => Err(e.into()),
-    }
-}
+// ADR 0039 Task 32: `delete_registry` axum shim removed. See `add_registry_core` for the gRPC entry point.

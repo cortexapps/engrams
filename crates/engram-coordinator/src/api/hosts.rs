@@ -1,117 +1,16 @@
-//! Read-only host listing endpoints. ADR 0013 retired the
-//! bincode-over-WebSocket `connect` handler — host registration +
-//! heartbeats + auth + harness events all live in
-//! [`super::host_http`] now as plain HTTP POSTs that any coord
-//! pod can serve. What remains here is the read-side surface for
-//! the SPA / operator CLI:
+//! Host types and helpers used by the gRPC fleet service and the
+//! internal host-http routes.
 //!
-//! - `GET /api/hosts` — list every host with merged PG-row +
-//!   in-memory scheduler state.
-//! - `GET /api/hosts/:id` — one host's view.
-//! - `POST /api/hosts/:id/drain` — flip the row + scheduler view
-//!   to Draining so the scheduler stops picking it.
-//! - `GET /api/hosts/:id/cow-state` — ADR 0016 Phase A: per-sandbox
-//!   COW diagnostic for every chunk-tracked sandbox on this host.
+//! ADR 0039 Task 32: the axum shims `list`, `get`, `cow_state`, and `drain`
+//! are removed. The gRPC FleetService now owns all fleet read/write surface.
+//! `HostView`, `enrichment_for_session`, and `from_row_and_live` remain,
+//! used by gRPC fleet handlers.
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::Json;
 use chrono::{DateTime, Utc};
-use engram_core::types::host::HostStatus;
 use engram_core::HostId;
 use serde::Serialize;
 
-use crate::cow_state::{fetch_for_host, CowStateView};
-use crate::error::ApiError;
 use crate::state::SharedState;
-
-/// `GET /api/hosts` — list all hosts the coordinator knows about,
-/// merging persisted Postgres rows with live in-memory scheduler
-/// state (capacity, local snapshots, draining).
-pub async fn list(State(state): State<SharedState>) -> Result<Json<ListHostsResponse>, ApiError> {
-    let rows = state.services.meta.list_active_hosts().await?;
-    let hosts = rows
-        .into_iter()
-        .map(|row| {
-            let live = state.host_registry.snapshot_state(row.id);
-            HostView::from_row_and_live(row, live)
-        })
-        .collect();
-    Ok(Json(ListHostsResponse { hosts }))
-}
-
-/// `GET /api/hosts/:id`. NotFound if the row isn't in Postgres.
-pub async fn get(
-    State(state): State<SharedState>,
-    Path(host_id): Path<HostId>,
-) -> Result<Json<HostView>, ApiError> {
-    let rows = state.services.meta.list_active_hosts().await?;
-    let row = rows
-        .into_iter()
-        .find(|r| r.id == host_id)
-        .ok_or_else(|| ApiError::NotFound("host not found".into()))?;
-    let live = state.host_registry.snapshot_state(host_id);
-    Ok(Json(HostView::from_row_and_live(row, live)))
-}
-
-/// `GET /api/hosts/:id/cow-state`. ADR 0016 Phase A. Returns one
-/// row per chunk-tracked sandbox on the host — each enriched with
-/// its session_id (joined from `sessions.host_for_sandbox`) so the
-/// web app can pivot the same payload by host or by session.
-/// Backed by [`crate::cow_state::CowStateCache`] (1s TTL) so the
-/// web app's 1-2s polling doesn't fan out to the host on every
-/// request.
-///
-/// gRPC counterpart delegates to the same `enrichment_for_session`
-/// helper — no DRIFT WARNING needed there.
-pub async fn cow_state(
-    State(state): State<SharedState>,
-    Path(host_id): Path<HostId>,
-) -> Result<Json<HostCowStateResponse>, ApiError> {
-    let backend = state
-        .host_registry
-        .backend_of(host_id)
-        .ok_or_else(|| ApiError::NotFound("host not registered".into()))?;
-    let records = fetch_for_host(&state.cow_state_cache, host_id, backend)
-        .await
-        .map_err(ApiError::from)?;
-
-    // Build a `sandbox_id → session_id` map for this host once via
-    // the M3-era `list_active_sandbox_assignments_on_host` query
-    // (already indexed on `(host_id, status)` per its docstring),
-    // then iterate the host's per-sandbox records. One PG round
-    // trip + one PG snapshot lookup per session — bounded by N
-    // sandboxes/host (tens, typical), not N total sessions.
-    let assignments = state
-        .services
-        .meta
-        .list_active_sandbox_assignments_on_host(host_id)
-        .await
-        .map_err(ApiError::from)?;
-    let session_for: std::collections::HashMap<engram_core::SandboxId, engram_core::SessionId> =
-        assignments.into_iter().map(|(sid, sb)| (sb, sid)).collect();
-
-    let mut sessions = Vec::with_capacity(records.len());
-    for record in records {
-        let session_id = session_for.get(&record.sandbox_id).copied();
-        // Memory-tier enrichment: project the session's latest
-        // snapshot row into `memory_manifest` + `last_snapshot_at`.
-        // No snapshot → `CowStateView` falls back to the host's
-        // `last_snapshot_unix_ms` (often also `0`, rendered as
-        // "never" by the consumer).
-        let (memory_manifest, last_snapshot_at) = match session_id {
-            Some(sid) => enrichment_for_session(&state, sid).await,
-            None => (None, None),
-        };
-        sessions.push(CowStateView::from_record(
-            &record,
-            session_id,
-            memory_manifest,
-            last_snapshot_at,
-        ));
-    }
-    Ok(Json(HostCowStateResponse { host_id, sessions }))
-}
 
 /// Memory-tier enrichment: project the session's latest snapshot row
 /// into the diagnostic view's `memory_manifest` +
@@ -147,29 +46,10 @@ pub(crate) async fn enrichment_for_session(
     }
 }
 
-/// `POST /api/hosts/:id/drain`. Flips both the Postgres row and the
-/// in-memory scheduler view to Draining; new sessions won't be
-/// assigned to this host. In-flight sessions stay put.
-pub async fn drain(
-    State(state): State<SharedState>,
-    Path(host_id): Path<HostId>,
-) -> Result<StatusCode, ApiError> {
-    state
-        .services
-        .meta
-        .set_host_status(host_id, HostStatus::Draining)
-        .await?;
-    if let Some(mut s) = state.host_registry.snapshot_state(host_id) {
-        s.draining = true;
-        state.host_registry.update_state(host_id, s);
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Serialize)]
-pub struct ListHostsResponse {
-    pub hosts: Vec<HostView>,
-}
+// ADR 0039 Task 32: `drain` axum shim removed.
+// `ListHostsResponse` and `HostCowStateResponse` removed (axum-only types).
+// The gRPC FleetService uses proto-generated `app::ListHostsResponse` /
+// `app::GetHostCowStateResponse` instead.
 
 #[derive(Serialize)]
 pub struct HostView {
@@ -265,12 +145,5 @@ impl HostView {
     }
 }
 
-/// `GET /api/hosts/:id/cow-state` response shape (ADR 0016 Phase A).
-#[derive(Serialize)]
-pub struct HostCowStateResponse {
-    pub host_id: HostId,
-    /// One entry per chunk-tracked sandbox on this host. Sandboxes
-    /// without a chunk view (Process backend, VZ-without-NBD) are
-    /// omitted by the host-agent — they don't appear here either.
-    pub sessions: Vec<CowStateView>,
-}
+// ADR 0039 Task 32: `HostCowStateResponse` removed (axum-only type).
+// The gRPC FleetService uses proto-generated `app::GetHostCowStateResponse`.

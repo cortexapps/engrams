@@ -16,9 +16,8 @@
 //! ProcessBackend loopback land in later phases.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap};
-use axum::response::Response;
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
@@ -426,34 +425,15 @@ pub async fn upload_forward(
 
 // ---- trusted operator pull (any file by path) --------------------------
 
-#[derive(serde::Deserialize)]
-pub struct FromPathRequest {
-    pub path: String,
-    #[serde(default)]
-    pub caption: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-pub struct FromPathResponse {
-    pub artifact_id: String,
-    pub media_type: String,
-    pub size_bytes: u64,
-}
+// ADR 0039 Task 32: `create_from_path` axum shim removed. See `create_artifact_from_path_core` for the gRPC entry point.
+// ADR 0039 Task 32: `FromPathRequest` and `FromPathResponse` removed (only used by `create_from_path`).
 
 /// Transport-agnostic `CreateArtifactFromPath` core (ADR 0039, Task 12).
 ///
 /// Ensures the session is active, streams `cat <path>` from the guest,
 /// and stores the result via [`process_upload`]. Returns a
 /// [`SharedArtifact`] that both the axum handler and the gRPC handler
-/// can encode into their respective wire shapes. The axum handler
-/// remains independent and unchanged.
-///
-/// # DRIFT WARNING
-///
-/// This is a deliberate copy of the axum `POST /sessions/:id/artifacts/from-path`
-/// handler (`create_from_path`) — the axum handler was left untouched for
-/// wire-safety during the migration; Task 32 deletes the axum side, leaving
-/// this as the single copy. Until then, changes must be mirrored.
+/// can encode into their respective wire shapes.
 pub async fn create_artifact_from_path_core(
     state: &SharedState,
     session: SessionId,
@@ -490,58 +470,6 @@ pub async fn create_artifact_from_path_core(
     )
     .await
     .map_err(ApiError::from)
-}
-
-/// `POST /sessions/:id/artifacts/from-path` — ADR 0026 trusted operator
-/// file pull. Mounted in the bearer/IAP group (NOT broker-token-authed):
-/// a trusted operator can capture **any** file in the session, with no
-/// MIME restriction (`Trust::Trusted`), same size cap + quota.
-///
-/// `ensure_active` auto-resumes a recoverable (Idle) session; the file is
-/// read out of the guest by streaming `cat` over the existing exec
-/// channel (works in-proc + split mode — no new gRPC surface), so the
-/// body never buffers host-side. A missing/unreadable path surfaces as a
-/// non-zero `cat` exit → the stream errors and the upload aborts.
-// Mirrored by create_artifact_from_path_core() (gRPC) — see its DRIFT WARNING; changes here must be reflected there until Task 32.
-pub async fn create_from_path(
-    State(state): State<SharedState>,
-    Path(session): Path<SessionId>,
-    Json(req): Json<FromPathRequest>,
-) -> Result<Json<FromPathResponse>, ApiError> {
-    crate::api::snapshot::ensure_active(&state, session).await?;
-    let sandbox_id = state.registry.get(session).ok_or_else(|| {
-        ApiError::Conflict(
-            "session has no live sandbox — create a new session or resume from snapshot".into(),
-        )
-    })?;
-    let exec_req = ExecRequest {
-        command: vec!["cat".into(), "--".into(), req.path.clone()],
-        stdin: None,
-        env: std::collections::HashMap::new(),
-        workdir: None,
-        timeout: Some(std::time::Duration::from_secs(600)),
-    };
-    let stream = state
-        .services
-        .host
-        .exec_stream(sandbox_id, exec_req)
-        .await?;
-    let body = exec_stdout_bytestream(stream.events);
-    let ext = ext_from_path(&req.path);
-    let a = process_upload(
-        &state,
-        session,
-        body,
-        &ext,
-        sanitize_caption(req.caption),
-        Trust::Trusted,
-    )
-    .await?;
-    Ok(Json(FromPathResponse {
-        artifact_id: a.artifact_id,
-        media_type: a.media_type,
-        size_bytes: a.size_bytes,
-    }))
 }
 
 fn ext_from_path(path: &str) -> String {
@@ -644,56 +572,7 @@ pub struct ArtifactMeta {
     pub file_name: String,
 }
 
-/// `GET /sessions/:id/artifacts/:artifact_id` — stream an artifact back
-/// to the dashboard. Mounted in the bearer-authed group (in prod the
-/// browser reaches it via the IAP cookie at the LB; nginx stamps the
-/// bearer), so artifacts are never world-readable.
-///
-/// **MIME-agnostic hardening** (applies to media + arbitrary
-/// operator-pulled types alike): the response carries the
-/// server-DETECTED `Content-Type`, `X-Content-Type-Options: nosniff`,
-/// `Content-Disposition: inline`, a `Content-Security-Policy: sandbox`
-/// (a scriptless, opaque-origin context even if the bytes are somehow an
-/// HTML document), and `no-store`. This — not the upload allowlist — is
-/// what makes serving attacker-controlled bytes to operators safe.
-// Mirrored by get_artifact_core() (gRPC) — see its DRIFT WARNING; changes here must be reflected there until Task 32.
-pub async fn serve_artifact(
-    State(state): State<SharedState>,
-    Path((session, artifact_id)): Path<(SessionId, String)>,
-) -> Result<Response, ApiError> {
-    let aid = uuid::Uuid::parse_str(&artifact_id)
-        .map_err(|_| ApiError::BadRequest("invalid artifact id".into()))?;
-    // Scoped to the session: a valid-but-mismatched pair 404s.
-    let row = state
-        .services
-        .meta
-        .get_artifact(session, aid)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("artifact not found".into()))?;
-    let stream = state
-        .services
-        .blob
-        .get_streaming(&row.blob_key)
-        .await
-        .map_err(|e| match e {
-            BlobError::NotFound => ApiError::NotFound("artifact blob missing".into()),
-            other => ApiError::Internal(format!("read artifact blob: {other}")),
-        })?;
-
-    let filename = format!("{}.{}", aid.simple(), ext_for_media(&row.media_type));
-    Response::builder()
-        .header(header::CONTENT_TYPE, row.media_type)
-        .header(header::CONTENT_LENGTH, row.size_bytes)
-        .header("X-Content-Type-Options", "nosniff")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("inline; filename=\"{filename}\""),
-        )
-        .header("Content-Security-Policy", "sandbox")
-        .header(header::CACHE_CONTROL, "private, no-store")
-        .body(Body::from_stream(stream))
-        .map_err(|e| ApiError::Internal(format!("build artifact response: {e}")))
-}
+// ADR 0039 Task 32: `serve_artifact` axum shim removed. See `get_artifact_core` for the gRPC entry point.
 
 /// File extension for a stored media type — used only for the
 /// `Content-Disposition` filename (not for sniffing). Unknown → `bin`.
