@@ -31,7 +31,10 @@ for (const p of paths) {
     await page.waitForLoadState("networkidle");
     if (openNew) {
       await page.getByTestId("new-session").click();
-      await page.getByTestId("start-session").waitFor({ timeout: 15_000 });
+      // Wait on the image picker, not start-session: when images[0] is a
+      // Claude-harness image and the user has no saved token, the submit
+      // button is replaced by a save-token link (by design).
+      await page.getByTestId("image-select").waitFor({ timeout: 15_000 });
     }
     if (tab) {
       await page.getByTestId(`tab-${tab}`).click();
