@@ -543,12 +543,72 @@ pub async fn spawn(
 /// original CONNECT registered (the kernel verifies it via
 /// `/sys/block/nbdN/backend`, so a slot-accounting bug can't splice
 /// our socket into someone else's device).
+///
+/// ADOPTION IS VERIFIED, NOT TRUSTED: the kernel's reconfigure
+/// handler converts `-ENOSPC` ("no dead connection slot to replace
+/// yet") into a clean ACK and quietly drops the socket — observed
+/// live when the predecessor's serve fd lingered in a child and the
+/// dead-marking only happened at the next request timeout. A
+/// dropped socket EOFs our serve loop within milliseconds (the
+/// kernel `sockfd_put`s its only reference), so after each attempt
+/// we wait briefly and check the serve task is still alive,
+/// retrying with a fresh socketpair until the kernel has actually
+/// marked the old connection dead. Budget covers a full 90s request
+/// timeout straggler.
 pub async fn reattach(
     backend: Arc<ChunkedDiskBackend>,
     nbd_device: &Path,
     backend_id: &str,
 ) -> Result<NbdHandle, NbdRuntimeError> {
-    serve_at(backend, nbd_device, backend_id, ConnectMode::Reconfigure).await
+    let budget = std::time::Duration::from_secs(150);
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let handle = serve_at(
+            backend.clone(),
+            nbd_device,
+            backend_id,
+            ConnectMode::Reconfigure,
+        )
+        .await?;
+        // An adopted socket stays open (the kernel holds its dup);
+        // a rejected one EOFs the serve loop near-instantly.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if !handle
+            .serve_task
+            .as_ref()
+            .map(|t| t.is_finished())
+            .unwrap_or(true)
+        {
+            if attempt > 1 {
+                tracing::info!(
+                    device = %nbd_device.display(),
+                    attempt,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "NBD RECONFIGURE adopted after retries",
+                );
+            }
+            return Ok(handle);
+        }
+        // Not adopted. Drop WITHOUT the netlink disconnect (the
+        // device must stay configured for the next attempt — and
+        // for the parked guest I/O).
+        handle.abandon();
+        if started.elapsed() > budget {
+            return Err(NbdRuntimeError::Io(io::Error::other(format!(
+                "NBD RECONFIGURE not adopted within {budget:?} ({attempt} attempts): \
+                 the kernel reports success but closes the socket — predecessor's \
+                 connection never marked dead?"
+            ))));
+        }
+        tracing::debug!(
+            device = %nbd_device.display(),
+            attempt,
+            "NBD RECONFIGURE socket not adopted (kernel-swallowed ENOSPC); retrying",
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 enum ConnectMode {
@@ -625,7 +685,25 @@ fn unix_socketpair() -> io::Result<(OwnedFd, std::os::unix::net::UnixStream)> {
     // SAFETY: array sized for the AF_UNIX socketpair contract.
     // Kernel writes both fds; we wrap them in OwnedFd /
     // UnixStream immediately to take ownership.
-    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    //
+    // SOCK_CLOEXEC is LOAD-BEARING for the survivor contract: these
+    // fds are created with raw libc (no CLOEXEC by default), so
+    // every child spawned afterwards — Firecracker above all —
+    // inherited the server half. The child then kept the socket
+    // open past the host-agent's death, the kernel's recv worker
+    // never saw EOF, the dead nsock was only marked at the next
+    // 90s request timeout, and the successor's RECONFIGURE within
+    // that window met the kernel's silently-ACKed -ENOSPC ("no
+    // dead connection to replace") — prod canary 2026-06-12,
+    // "Receive control failed (result -32)" arriving ~90s late.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }

@@ -152,6 +152,18 @@ async fn survivor_reconfigure_resumes_parked_io() {
     let read1 = pread_direct(&device, 0, 4096).expect("gen-1 read");
     assert_eq!(&read1[..16], &bytes[..16], "gen-1 content mismatch");
 
+    // Children spawned while the daemon serves (FC, in prod) must
+    // NOT inherit the serve socket — a leaked fd keeps the kernel's
+    // connection "alive" past the parent's death, so the dead-mark
+    // only happens at the next 90s request timeout and the
+    // successor's RECONFIGURE hits the kernel's silently-ACKed
+    // ENOSPC (prod canary 2026-06-12). SOCK_CLOEXEC pins this; the
+    // sleeper below would re-break it if that flag ever regresses.
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn fd-inheritance sleeper");
+
     // 2. "Pod roll": the serve loop dies without a disconnect. The
     //    slot lease drops back to the pool (in prod the new process
     //    builds a fresh pool; same shape).
@@ -212,6 +224,8 @@ async fn survivor_reconfigure_resumes_parked_io() {
 
     // Clean teardown (netlink disconnect) so the device is free for
     // the next test run.
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
     drop(state2);
     tokio::time::sleep(Duration::from_millis(300)).await;
 }
