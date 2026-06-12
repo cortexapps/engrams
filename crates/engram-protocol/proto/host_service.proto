@@ -255,6 +255,10 @@ message PostCopyCaptureResponse {
   bytes disk_manifest_ref = 5;     // bincode Option<ManifestRef> (empty = none)
   repeated bytes new_disk_chunk_hashes = 6;
   int64 paused_at_unix_ms = 7;
+  // ADR 0045 C2 PR 10: blackout decomposition (all under the freeze).
+  uint64 pause_ms = 8;
+  uint64 disk_drain_ms = 9;
+  uint64 vmstate_ms = 10;
 }
 
 message DrainOutcomeResponse {

@@ -257,6 +257,17 @@ pub struct PostCopyCaptureOut {
     /// Sealed (peer-authoritative) chunk count — observability.
     pub sealed_chunks: u64,
     pub total_chunks: u64,
+    /// Blackout decomposition (R6, all under the freeze; ADR 0045 C2
+    /// PR 10). The coordinator's `blackout_ms` is the wall across the
+    /// whole `migration_capture_postcopy` call; these break it into
+    /// the legs that actually cost — so an optimization (e.g. the
+    /// dest-side diff seed) targets the real hot leg instead of a
+    /// guess. `scan_ms` is consistently ~single-digit ms; the bulk is
+    /// `disk_drain_ms` (NBD fsync + local re-chunk) + `vmstate_ms`
+    /// (fork-v3 state.bin write).
+    pub pause_ms: u64,
+    pub disk_drain_ms: u64,
+    pub vmstate_ms: u64,
     /// Pagemap scan wall time (blackout attribution, R6).
     pub scan_ms: u64,
     /// The drained coherent disk manifest (inline JSON + provisional

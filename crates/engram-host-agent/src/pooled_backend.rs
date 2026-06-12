@@ -3683,15 +3683,19 @@ impl SandboxBackend for PooledBackend {
             // Checkpoint fence: held for the export's lifetime.
             let capture_guard = self.capture_lock(id).lock_owned().await;
 
+            // Blackout leg 1: pause. (PR 10 decomposition.)
+            let t_pause = std::time::Instant::now();
             let paused_at = chrono::Utc::now();
             self.inner
                 .pause(id)
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("post-copy pause: {e}")))?;
+            let pause_ms = t_pause.elapsed().as_millis() as u64;
 
-            // Disk: identical posture to the C1 capture — fsync the
-            // host block cache, drain the pending tier into the LOCAL
-            // cache, fence further publishes.
+            // Blackout leg 2: disk drain — identical posture to the C1
+            // capture — fsync the host block cache, drain the pending
+            // tier into the LOCAL cache, fence further publishes.
+            let t_disk = std::time::Instant::now();
             let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) = if let Some(entry) =
                 self.nbd_sandboxes.get(&id)
             {
@@ -3728,15 +3732,19 @@ impl SandboxBackend for PooledBackend {
             } else {
                 (Vec::new(), None, Vec::new(), None)
             };
+            let disk_drain_ms = t_disk.elapsed().as_millis() as u64;
 
-            // Fork v3: state.bin + sidecar only — the memory artifact
-            // never materializes (the whole point).
+            // Blackout leg 3: vmstate. Fork v3: state.bin + sidecar
+            // only — the memory artifact never materializes (the whole
+            // point).
+            let t_vmstate = std::time::Instant::now();
             let sidecar = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
             let (snapshot_id, export_dir) = self
                 .inner
                 .snapshot_vmstate_only_package(id, &sidecar)
                 .await?;
             let _ = snapshot_id;
+            let vmstate_ms = t_vmstate.elapsed().as_millis() as u64;
 
             // The drained disk manifest rides the export for the dest's
             // fetch poller (enveloped with its chunk list so the dest
@@ -3842,12 +3850,18 @@ impl SandboxBackend for PooledBackend {
                 export_id,
                 sealed_chunks,
                 total_chunks,
+                pause_ms,
+                disk_drain_ms,
+                vmstate_ms,
                 scan_ms,
                 "post-copy capture sealed; guest frozen as page server (ADR 0045 C2)",
             );
             Ok(PostCopyCaptureOut {
                 sealed_chunks,
                 total_chunks,
+                pause_ms,
+                disk_drain_ms,
+                vmstate_ms,
                 scan_ms,
                 disk_manifest_json,
                 disk_manifest_ref: disk_ref,

@@ -329,6 +329,9 @@ impl GrpcHostClient {
         Ok(engram_core::types::snapshot::PostCopyCaptureOut {
             sealed_chunks: resp.sealed_chunks,
             total_chunks: resp.total_chunks,
+            pause_ms: resp.pause_ms,
+            disk_drain_ms: resp.disk_drain_ms,
+            vmstate_ms: resp.vmstate_ms,
             scan_ms: resp.scan_ms,
             disk_manifest_json: resp.disk_manifest_json,
             disk_manifest_ref: decode_bincode(&resp.disk_manifest_ref, "Option<ManifestRef>")?,

@@ -356,6 +356,9 @@ impl HostService for HostServiceImpl {
             sealed_chunks: out.sealed_chunks,
             total_chunks: out.total_chunks,
             scan_ms: out.scan_ms,
+            pause_ms: out.pause_ms,
+            disk_drain_ms: out.disk_drain_ms,
+            vmstate_ms: out.vmstate_ms,
             disk_manifest_json: out.disk_manifest_json,
             disk_manifest_ref: encode_bincode(&out.disk_manifest_ref, "Option<ManifestRef>")?,
             new_disk_chunk_hashes: out

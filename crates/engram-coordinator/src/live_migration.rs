@@ -473,6 +473,18 @@ pub async fn migrate_session_live(
         .record(restore_ms as f64 / 1000.0);
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "total")
         .record(t_total.elapsed().as_secs_f64());
+    // PR 10 blackout decomposition: the legs that actually cost, so an
+    // optimization targets the real hot leg. Source-measured (under the
+    // freeze); the coordinator-side `blackout_ms` is the wall including
+    // the round trip.
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "blackout_pause")
+        .record(capture.pause_ms as f64 / 1000.0);
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "blackout_disk_drain")
+        .record(capture.disk_drain_ms as f64 / 1000.0);
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "blackout_vmstate")
+        .record(capture.vmstate_ms as f64 / 1000.0);
+    metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "blackout_scan")
+        .record(capture.scan_ms as f64 / 1000.0);
     metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "migrated_postcopy")
         .increment(1);
     tracing::info!(
@@ -483,6 +495,12 @@ pub async fn migrate_session_live(
         presetup_ms,
         sealed_chunks = capture.sealed_chunks,
         total_chunks = capture.total_chunks,
+        // Blackout decomposition (source-measured, under the freeze):
+        // pause + disk_drain + vmstate + scan ≈ the host-side blackout;
+        // `blackout_ms` is the coordinator wall incl. the RPC round trip.
+        blackout_pause_ms = capture.pause_ms,
+        blackout_disk_drain_ms = capture.disk_drain_ms,
+        blackout_vmstate_ms = capture.vmstate_ms,
         scan_ms = capture.scan_ms,
         blackout_ms = t_blackout.elapsed().as_millis() as u64,
         restore_await_ms = restore_ms,
@@ -929,6 +947,9 @@ mod tests {
                 Ok(engram_core::types::snapshot::PostCopyCaptureOut {
                     sealed_chunks: 3,
                     total_chunks: 16,
+                    pause_ms: 1,
+                    disk_drain_ms: 1,
+                    vmstate_ms: 1,
                     scan_ms: 1,
                     disk_manifest_json: Vec::new(),
                     disk_manifest_ref: None,
@@ -1119,6 +1140,9 @@ mod tests {
                 Ok(engram_core::types::snapshot::PostCopyCaptureOut {
                     sealed_chunks: 3,
                     total_chunks: 16,
+                    pause_ms: 1,
+                    disk_drain_ms: 1,
+                    vmstate_ms: 1,
                     scan_ms: 1,
                     disk_manifest_json: Vec::new(),
                     disk_manifest_ref: None,
