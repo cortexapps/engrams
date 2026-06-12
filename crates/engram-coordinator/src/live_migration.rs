@@ -15,9 +15,16 @@
 //! emit `evacuating → active` (post-blackout; the prompt-hold keeps
 //! "messages deliver" honest through the harness rebuild) → finalize
 //! task: `migration_drain_wait` (the dest pulls every sealed chunk) →
-//! commit (destroy) the source → a FULL checkpoint on the dest (the
-//! dest seeds NO chain, so its first checkpoint is a safe Full — that
-//! IS the memory durability catch-up) → row-only-at-finalize.
+//! commit (destroy) the source. Durability is NOT migration's job
+//! (operator decision, 2026-06-12, superseding the opening bookend's
+//! D-decision): the dest simply joins the periodic checkpoint cadence
+//! like any resumed session — its first periodic capture is a safe
+//! Full (no chain) — and until that lands, recovery rewinds to the
+//! SOURCE's last periodic row (RPO ≤ cadence, the accepted model).
+//! The old finalize took an immediate post-move Full here; that was a
+//! guest-visible 2-4s pause seconds after landing, paid on every
+//! single move to shave the rewind window — backwards, given the
+//! goal is a teleport humans can't notice.
 //!
 //! Failure arms: presetup/dest-prep failures before the pause ⇒
 //! `Unsupported`/`Fatal`, session untouched (snapshot-rehome fallback).
@@ -514,7 +521,6 @@ pub async fn migrate_session_live(
     // server until DrainDone.
     let state2 = state.clone();
     let export_id = presetup.export_id.clone();
-    let row_at = chrono::Utc::now();
     tokio::spawn(async move {
         let lease = lease;
         let _gate_guard = gate_guard;
@@ -607,67 +613,20 @@ pub async fn migrate_session_live(
                 "post-copy source commit failed; export TTL will clean up");
         }
 
-        // 7c. Memory durability catch-up: the dest has NO chain, so
-        // this is a FULL checkpoint (sealed pages included by
-        // construction). Row-only-at-finalize; on any failure the
-        // previous checkpoint stays the recovery point and the next
-        // periodic checkpoint (also a Full) retries durability.
-        //
-        // The COMPOSED snapshot, NOT snapshot_begin: begin is the D5
-        // EVICTION flavor and RE-PAUSES the guest after capture ("it's
-        // being torn down") — on a live post-move dest that froze the
-        // session indefinitely (prod session 962011bf, stuck "working"
-        // until an admin resume). The composed path pauses only for
-        // the capture window and resumes the guest before uploading.
-        let t_full = std::time::Instant::now();
-        let wait = state2.services.host.snapshot(new_sandbox_id);
-        tokio::pin!(wait);
-        let row_meta = loop {
-            tokio::select! {
-                res = &mut wait => break res,
-                _ = touch.tick() => {
-                    if !lease.touch().await {
-                        tracing::error!(%session_id, "post-copy finalize: lease lost; no row");
-                        return;
-                    }
-                }
-            }
-        };
-        let row_meta = match row_meta {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(%session_id, error = %e,
-                    "post-copy finalize: full checkpoint failed; previous checkpoint stays the fallback");
-                return;
-            }
-        };
-        metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "full_checkpoint")
-            .record(t_full.elapsed().as_secs_f64());
-        let record = engram_core::types::snapshot::SnapshotRecord {
-            id: row_meta.id,
-            session_id: Some(session_id),
-            host_id: Some(target_host_id),
-            image_version: row_meta.image_version.clone(),
-            size_bytes: row_meta.size_bytes,
-            created_at: row_meta.created_at,
-            last_accessed_at: row_at,
-            disk_manifest: row_meta.disk_manifest,
-            memory_manifest: row_meta.memory_manifest,
-            recoverable: crate::api::snapshot::verify_snapshot_recoverable(
-                state2.services.blob.as_ref(),
-                row_meta.disk_manifest.as_ref(),
-                row_meta.memory_manifest.as_ref(),
-            )
-            .await,
-            aux_bundles: row_meta.aux_bundles.clone(),
-            events_cursor: None,
-        };
-        if let Err(e) = state2.services.meta.record_snapshot(record).await {
-            tracing::warn!(%session_id, error = %e, "post-copy finalize: record_snapshot failed");
-            return;
-        }
-        tracing::info!(%session_id, snapshot_id = %row_meta.id,
-            "post-copy migration durability finalized (Full checkpoint, row-only-at-finalize)");
+        // That's it — durability is deliberately NOT migration's job
+        // (operator decision 2026-06-12; supersedes the bookend's
+        // "memory durability catch-up" arm). The dest joined the
+        // periodic checkpoint cadence at restore like any resumed
+        // session; its first periodic capture is a safe Full (no
+        // chain), and until that lands recovery rewinds to the
+        // source's last periodic row — RPO ≤ cadence, the accepted
+        // model. The immediate post-move Full that used to live here
+        // cost a guest-visible 2-4s pause seconds after EVERY move
+        // (prod 962011bf was its pathological form) to shave a rewind
+        // window nobody asked to shave; the teleport's job ends when
+        // the guest is live on the dest and the source is released.
+        tracing::info!(%session_id,
+            "post-copy migration finalized (source released; durability rides the periodic cadence)");
     });
     Ok(())
 }
@@ -1086,6 +1045,7 @@ mod tests {
 
         struct MigratableHappyPath {
             commit_called: Arc<AtomicBool>,
+            snapshot_called: Arc<AtomicBool>,
         }
         #[async_trait::async_trait]
         impl engram_core::traits::SandboxBackend for MigratableHappyPath {
@@ -1113,6 +1073,10 @@ mod tests {
                 &self,
                 _: SandboxId,
             ) -> Result<SnapshotMetadata, engram_core::SandboxError> {
+                // Durability is the periodic cadence's job, not the
+                // finalize's — reaching here means the post-move Full
+                // regressed back in.
+                self.snapshot_called.store(true, Ordering::SeqCst);
                 Err(engram_core::SandboxError::NotFound)
             }
             async fn migration_presetup(
@@ -1187,8 +1151,10 @@ mod tests {
         let old_sandbox = session.sandbox_id.expect("source sandbox");
         let (state, meta, target) = build_state(session);
         let commit_called = Arc::new(AtomicBool::new(false));
+        let snapshot_called = Arc::new(AtomicBool::new(false));
         let happy: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(MigratableHappyPath {
             commit_called: commit_called.clone(),
+            snapshot_called: snapshot_called.clone(),
         });
         state.host_registry.register(
             target,
@@ -1275,6 +1241,24 @@ mod tests {
             after.sandbox_id,
             Some(old_sandbox),
             "session points at the new sandbox",
+        );
+        // Durability is NOT migration's job (operator decision
+        // 2026-06-12): the finalize must NOT take a post-move
+        // checkpoint or record a row — the dest rides the periodic
+        // cadence, and until its first periodic capture, recovery
+        // rewinds to the source's last row (RPO ≤ cadence). Settle
+        // briefly so a regressed snapshot call (it followed commit in
+        // the same task) would have landed before the negative check.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !snapshot_called.load(Ordering::SeqCst),
+            "finalize took a post-move checkpoint — the guest-visible \
+             post-move pause regressed back in",
+        );
+        assert_eq!(
+            meta.snapshots.lock().len(),
+            1,
+            "no migration-authored snapshot row; the seeded source row stays the recovery point",
         );
     }
 
