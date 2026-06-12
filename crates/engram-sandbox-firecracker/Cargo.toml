@@ -26,6 +26,7 @@ bytes.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 libc = "0.2"
+futures-util.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,6 +36,11 @@ tracing.workspace = true
 metrics.workspace = true
 uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+# netlink is Linux-only at the SOCKET level (AF_NETLINK) — the crate
+# doesn't build on macOS, so gate it with the code that uses it.
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink.workspace = true
 
 [dev-dependencies]
 engram-image-builder.workspace = true

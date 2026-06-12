@@ -105,6 +105,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3"
+# Lever 3 (ADR 0045 C2 restore tail): netlink-first netns provisioning —
+# the ~14 ip/iptables subprocess spawns were ~90-95ms of every sandbox
+# boot AND the teleport dest pipeline.
+rtnetlink = "0.21"
 bytes = "1"
 pin-project-lite = "0.2"
 base64 = "0.22"
