@@ -680,9 +680,9 @@ jobs:
         id: nbd_setup
         run: |
           if sudo modprobe nbd nbds_max=4 2>/dev/null \
-             && sudo chmod 666 /dev/nbd0 /dev/nbd1 2>/dev/null; then
+             && sudo chmod 666 /dev/nbd0 /dev/nbd1 /dev/nbd2 /dev/nbd3 2>/dev/null; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-            ls -la /dev/nbd0
+            ls -la /dev/nbd0 /dev/nbd2
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "::warning title=NBD test skipped on Blacksmith::nbd.ko unavailable in the runner kernel; nbd_chunked_disk runs locally via the dev VM. Tracking a self-hosted-runner follow-up to close the CI gap."
@@ -697,6 +697,25 @@ jobs:
             -p engram-host-agent \
             --test nbd_chunked_disk \
             --test nbd_netlink_reconfigure \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+
+      # ADR 0045 C2: the POST-COPY two-host teleport e2e. Needs nbd
+      # (two devices) so it runs HERE, after the NBD setup step — the
+      # earlier migration block predates `modprobe nbd`. Runs as root:
+      # post-copy is substrate-only (fork FC, staged at
+      # ENGRAM_FC_FORK_BIN above), newer kernels gate NBD config behind
+      # CAP_SYS_ADMIN, and the guest does `drop_caches`. `sudo -E`
+      # carries the cargo env + the fork-bin var; the binary self-skips
+      # cleanly if ENGRAM_FC_FORK_BIN is unset (fork artifact not yet
+      # published on a submodule-bump PR).
+      - name: ADR 0045 C2 post-copy teleport e2e (root — nbd + fork FC)
+        if: steps.nbd_setup.outputs.available == 'true'
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent \
+            --test two_host_postcopy_teleport \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
