@@ -1,0 +1,184 @@
+# Probe: is the NBD client driver (CONFIG_BLK_DEV_NBD) available in the
+# Blacksmith runner kernel?
+#
+# Context: our `nbd_chunked_disk` integration test boots a real FC
+# microVM with `/dev/nbd0` as the rootfs and needs the host kernel's
+# NBD client (`nbd.ko` or built-in). Today that test is skipped in CI
+# because `modprobe nbd` fails on Blacksmith runners (see the "Detect
+# NBD kernel module" step in ci.yml). Blacksmith support says NBD is
+# in fact enabled now — this workflow settles who's right with hard
+# evidence, and emits a copy-pasteable report either way.
+#
+# It is manual-only (workflow_dispatch). Runs three runners side by
+# side so the Blacksmith result can be read against a known-good
+# GitHub-hosted control where NBD ships as a loadable module:
+#   - blacksmith-2vcpu-ubuntu-2404  (what `lint` / FC jobs use)
+#   - blacksmith-4vcpu-ubuntu-2404  (what the heavier jobs use)
+#   - ubuntu-24.04                  (GitHub-hosted control)
+#
+# Each runner gathers: kernel identity, kernel config (CONFIG_BLK_DEV_NBD),
+# whether the module is present on disk, whether modprobe / built-in
+# makes /dev/nbd0 appear, and a real functional round trip via qemu-nbd.
+# The conclusion lands in the job summary AND in the step log.
+name: nbd-probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: nbd probe (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - blacksmith-2vcpu-ubuntu-2404
+          - blacksmith-4vcpu-ubuntu-2404
+          - ubuntu-24.04
+    steps:
+      - name: Probe NBD availability
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # Accumulate the report into a file so we can dump it to both
+          # the step log and the job summary verbatim.
+          report=$(mktemp)
+          exec 3>"$report"
+          say() { echo "$*" | tee /dev/fd/3; }
+
+          say "## NBD probe — runner: ${{ matrix.runner }}"
+          say ""
+
+          say "### 1. Kernel identity"
+          say '```'
+          say "uname -a : $(uname -a)"
+          say "uname -r : $(uname -r)"
+          say '```'
+          say ""
+
+          # ---- 2. Kernel config -------------------------------------
+          # CONFIG_BLK_DEV_NBD=y means built-in (no module needed),
+          # =m means a loadable module, absent/unset means not compiled.
+          say "### 2. Kernel config (CONFIG_BLK_DEV_NBD)"
+          config=""
+          config_src=""
+          if [[ -r /proc/config.gz ]]; then
+            config=$(zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_BLK_DEV_NBD\b' || true)
+            config_src=/proc/config.gz
+          elif [[ -r "/boot/config-$(uname -r)" ]]; then
+            config=$(grep -E 'CONFIG_BLK_DEV_NBD\b' "/boot/config-$(uname -r)" || true)
+            config_src="/boot/config-$(uname -r)"
+          fi
+          say '```'
+          if [[ -n "$config" ]]; then
+            say "source: $config_src"
+            say "$config"
+          elif [[ -n "$config_src" ]]; then
+            say "source: $config_src"
+            say "CONFIG_BLK_DEV_NBD is not set (driver not compiled into this kernel)"
+          else
+            say "no kernel config exposed (/proc/config.gz and /boot/config-\$(uname -r) both unreadable)"
+          fi
+          say '```'
+          say ""
+
+          # ---- 3. Module on disk ------------------------------------
+          say "### 3. nbd module on disk"
+          say '```'
+          modpath=$(find "/lib/modules/$(uname -r)" -name 'nbd.ko*' 2>/dev/null || true)
+          if [[ -n "$modpath" ]]; then
+            say "found: $modpath"
+          else
+            say "no nbd.ko under /lib/modules/$(uname -r) (this is normal if it is built-in =y)"
+          fi
+          say "modinfo nbd:"
+          modinfo nbd 2>&1 | head -n 5 || say "  modinfo nbd failed"
+          say '```'
+          say ""
+
+          # ---- 4. Load + device node --------------------------------
+          # If built-in (=y) the device may already exist and modprobe is
+          # a harmless no-op. If =m, modprobe loads it. Either way, a
+          # working NBD client means /dev/nbd0 exists afterward.
+          say "### 4. modprobe + device node"
+          say '```'
+          if sudo modprobe nbd nbds_max=16 2>&1; then
+            say "modprobe nbd nbds_max=16 : OK"
+          else
+            say "modprobe nbd nbds_max=16 : FAILED (exit $?)"
+          fi
+          say "lsmod | grep nbd:"
+          lsmod | grep -E '^nbd\b' || say "  (nbd not listed in lsmod — expected when built-in =y)"
+          say "ls -la /dev/nbd0:"
+          ls -la /dev/nbd0 2>&1 || say "  /dev/nbd0 absent"
+          say '```'
+          say ""
+
+          # ---- 5. Functional round trip -----------------------------
+          # The decisive test: serve a real backing file over NBD with
+          # qemu-nbd, attach it to /dev/nbd0, write a sentinel through
+          # the block device, read it back. This is exactly the
+          # kernel<->userspace NBD boundary our integration test needs.
+          say "### 5. Functional round trip (qemu-nbd)"
+          say '```'
+          functional="UNKNOWN"
+          if [[ -e /dev/nbd0 ]]; then
+            sudo apt-get update -qq >/dev/null 2>&1 || true
+            if ! command -v qemu-nbd >/dev/null 2>&1; then
+              sudo apt-get install -y -qq qemu-utils >/dev/null 2>&1 || true
+            fi
+            if command -v qemu-nbd >/dev/null 2>&1; then
+              img=$(mktemp /tmp/nbd-probe.XXXXXX.img)
+              truncate -s 16M "$img"
+              if sudo qemu-nbd --connect=/dev/nbd0 --format=raw "$img" 2>&1; then
+                sleep 1
+                say "attached $img to /dev/nbd0"
+                # write a sentinel through the block layer and read it back
+                echo -n "ENGRAM-NBD-OK" | sudo dd of=/dev/nbd0 bs=512 count=1 conv=notrunc status=none 2>&1 || true
+                sudo blockdev --flushbufs /dev/nbd0 2>/dev/null || true
+                got=$(sudo dd if=/dev/nbd0 bs=512 count=1 status=none 2>/dev/null | head -c 13 || true)
+                say "read back from /dev/nbd0: '$got'"
+                if [[ "$got" == "ENGRAM-NBD-OK" ]]; then
+                  functional="PASS"
+                else
+                  functional="FAIL (sentinel mismatch)"
+                fi
+                sudo qemu-nbd --disconnect /dev/nbd0 >/dev/null 2>&1 || true
+              else
+                functional="FAIL (qemu-nbd --connect errored)"
+                say "qemu-nbd --connect failed"
+              fi
+              rm -f "$img"
+            else
+              functional="SKIPPED (qemu-nbd unavailable)"
+              say "qemu-nbd not installable"
+            fi
+          else
+            functional="FAIL (no /dev/nbd0 to attach)"
+            say "/dev/nbd0 does not exist — cannot run functional test"
+          fi
+          say '```'
+          say ""
+
+          # ---- Verdict ----------------------------------------------
+          say "### Verdict"
+          if [[ -e /dev/nbd0 && "$functional" == "PASS" ]]; then
+            say "✅ NBD is AVAILABLE and FUNCTIONAL on ${{ matrix.runner }}."
+          elif [[ -e /dev/nbd0 ]]; then
+            say "⚠️ /dev/nbd0 exists but the functional round trip did not pass: $functional"
+          else
+            say "❌ NBD is NOT available on ${{ matrix.runner }} — modprobe did not yield /dev/nbd0."
+          fi
+
+          # Mirror the whole report into the job summary.
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+          # Non-control runners shouldn't hard-fail the job — we want all
+          # three matrix legs to complete and report, not abort early.
+          # The verdict is in the summary; exit 0 regardless.
+          exit 0
