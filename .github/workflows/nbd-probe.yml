@@ -30,7 +30,8 @@ on:
   # merging — the workflow is meant to be manual-only.
   push:
     branches:
-      - worktree-ci+nbd-blacksmith-probe
+      # NB: '+' is a glob metachar in GitHub branch filters, escape it.
+      - worktree-ci\+nbd-blacksmith-probe
 
 permissions:
   contents: read
