@@ -114,8 +114,10 @@ export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs
       if (response.status !== 200) {
         // Auth/guard rejected the request.  Use handleUpgrade+close because
         // Bun's socket.write() is a no-op in the upgrade event handler.
-        // Close code 4400+httpStatus encodes the rejection reason for clients.
-        const closeCode = 4400 + Math.min(response.status, 99);
+        // Close code 4400+httpStatus encodes the rejection reason for clients
+        // (e.g. 4401 = Unauthorized, 4404 = Not Found).
+        // Cap at 4499 (WS close codes 4000–4999 are reserved for application use).
+        const closeCode = Math.min(4400 + response.status, 4499);
         wss.handleUpgrade(request, socket, head, (ws) => {
           ws.close(closeCode, response.statusText || String(response.status));
         });

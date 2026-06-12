@@ -37,6 +37,9 @@
  */
 
 import { expect, test, describe, beforeAll } from "bun:test";
+// ws is used for test 14b because Bun's native WebSocket strips the Cookie
+// header from HTTP upgrade requests; the ws npm package sends it correctly.
+import WsClient from "ws";
 
 const SMOKE = process.env["SMOKE"] === "1";
 
@@ -713,25 +716,52 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       const abortTimer = setTimeout(() => ac.abort(), 15_000);
 
       try {
-        // Bun native WebSocket with cookie header.
-        // Bun's WebSocket supports a third-arg options object with headers.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const ws = new (WebSocket as any)(wsUrl, [], { headers: { Cookie: memberCookie } }) as WebSocket;
-        ws.binaryType = "arraybuffer";
+        // Use the ws npm package (not Bun's native WebSocket) so that the
+        // Cookie header is included in the HTTP upgrade request.
+        // Bun 1.3.14's native WebSocket strips custom headers (including Cookie)
+        // from the upgrade handshake — confirmed by inspecting server-side
+        // IncomingMessage.headers during the upgrade event.  The ws package
+        // sends them correctly, matching real browser behaviour (browsers
+        // auto-attach cookies by domain; ws sends them explicitly).
+        const ws = new WsClient(wsUrl, {
+          headers: { Cookie: memberCookie },
+        });
 
         await new Promise<void>((resolve, reject) => {
-          ws.onopen = () => {
+          // Mirror the Rust shell_relay_smoke protocol exactly:
+          //   1. onopen: send ttyd auth/resize JSON (PTY init frame)
+          //   2. onmessage phase 1: await handshake output frame before sending keystrokes —
+          //      input sent before ttyd boots the PTY is silently discarded
+          //   3. onmessage phase 2: send "0echo hi\r" then watch for "hi" in output frames
+          let handshakeDone = false;
+
+          ws.on("open", () => {
+            // ttyd requires this JSON as the very first content frame; without it
+            // the PTY never initialises and all subsequent input is silently dropped.
             ws.send(JSON.stringify({ AuthToken: "", columns: 80, rows: 24 }));
-            setTimeout(() => { ws.send("0echo hi\r"); }, 500);
-          };
-          ws.onmessage = (e) => {
+            // Do NOT send keystrokes here — wait for the handshake frame first.
+          });
+          ws.on("message", (data: Buffer | string, isBinary: boolean) => {
             let bytes: Uint8Array;
-            if (typeof e.data === "string") {
-              bytes = new TextEncoder().encode(e.data);
+            if (!isBinary) {
+              // Text frame: convert to bytes for uniform handling.
+              bytes = new TextEncoder().encode(typeof data === "string" ? data : data.toString("utf-8"));
             } else {
-              bytes = new Uint8Array(e.data as ArrayBuffer);
+              bytes = data instanceof Buffer
+                ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+                : new Uint8Array(data as unknown as ArrayBuffer);
             }
-            // Strip ttyd discriminator byte (0x30 = '0' = output)
+
+            if (!handshakeDone) {
+              // Phase 1: any output frame (binary or text) from ttyd means PTY is booted.
+              // The first frame is typically ttyd's preferences (0x32) or prompt output (0x30).
+              // Once we see it, send the echo keystroke with the ttyd input prefix '0'.
+              handshakeDone = true;
+              ws.send("0echo hi\r");
+              return;
+            }
+
+            // Phase 2: strip ttyd discriminator byte (0x30 = '0' = output) and look for "hi".
             const text = new TextDecoder().decode(bytes.subarray(1));
             if (text.includes("hi")) {
               foundHi = true;
@@ -739,9 +769,9 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
               ws.close();
               resolve();
             }
-          };
-          ws.onerror = (e) => reject(new Error(`WS error: ${String(e)}`));
-          ws.onclose = () => { if (!foundHi) resolve(); };
+          });
+          ws.on("error", (e: Error) => reject(new Error(`WS error: ${String(e)}`)));
+          ws.on("close", () => { if (!foundHi) resolve(); });
           ac.signal.addEventListener("abort", () => { ws.close(); resolve(); });
         });
       } finally {
