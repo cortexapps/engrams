@@ -4,6 +4,7 @@ import { buildServer } from "./server.ts";
 import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
+import { registerTasks } from "./rpc/tasks.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
@@ -18,6 +19,10 @@ app.route("/", authRoute);
 app.notFound((c) => c.json({ error: "not found" }, 404));
 
 const server = buildServer(app, (router: ConnectRouter) => {
+  // Native TaskService: orchestrator-owned task model (ADR 0039 §3, Task 19).
+  // Registered BEFORE the passthrough so it wins the /rpc/engram.app.v1.TaskService/* prefix.
+  registerTasks(router);
+
   // Generic passthrough: forwards SessionService, FleetService, ImageService
   // to the control plane with per-method CASL authz gate (ADR 0039 Task 18).
   registerPassthrough(router, SURFACE, controlPlaneTransport);

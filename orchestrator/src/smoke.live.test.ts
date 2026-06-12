@@ -1,5 +1,5 @@
 /**
- * Orchestrator live smoke test (ADR 0039 Task 18).
+ * Orchestrator live smoke test (ADR 0039 Tasks 18 & 19).
  *
  * Env-gated: set SMOKE=1 to enable.
  * Default ORCHESTRATOR_URL: http://127.0.0.1:8787
@@ -10,19 +10,23 @@
  *   - Control plane reachable from the orchestrator
  *
  * Tests (printed as human-readable gate lines):
- *   1. healthz → 200 {"ok":true,"db":true}
- *   2. Provision a fresh MEMBER user (smoke-member-<ts>@engram.local);
- *      capture the session cookie from Set-Cookie.
- *   3. Authz matrix (plain fetch, content-type: application/json):
- *      a. anonymous  GetSession           → HTTP 401 (code: unauthenticated)
- *      b. member     GetSession (bad id)  → 404 (code: not_found; anti-enum)
- *      c. member     ListHosts            → 403 (code: permission_denied)
- *      d. member     ListEnabledImages    → 200
- *   4. Admin half:
- *      a. Provision smoke-admin@engram.local (sign-up; tolerate already-exists).
- *      b. Promote via docker compose exec psql (Bun.spawn; idempotent).
- *      c. Fresh sign-in → admin cookie.
- *      d. Admin ListHosts → 200 with hosts array.
+ *   1.  healthz → 200 {"ok":true,"db":true}
+ *   2.  Provision a fresh MEMBER user (smoke-member-<ts>@engram.local);
+ *       capture the session cookie from Set-Cookie.
+ *   3–6. Authz matrix (passthrough gate):
+ *       3. anonymous  GetSession           → HTTP 401 (code: unauthenticated)
+ *       4. member     GetSession (bad id)  → 404 (code: not_found; anti-enum)
+ *       5. member     ListHosts            → 403 (code: permission_denied)
+ *       6. member     ListEnabledImages    → 200
+ *   7.  Admin half:
+ *       a. Provision smoke-admin@engram.local (sign-up; tolerate already-exists).
+ *       b. Promote via docker compose exec psql (Bun.spawn; idempotent).
+ *       c. Fresh sign-in → admin cookie.
+ *       d. Admin ListHosts → 200 with hosts array.
+ *   8.  Task lifecycle (native TaskService — Task 19):
+ *       8. CreateTask(chat, no-harness image) → task returned with live session state
+ *       9. ListTasks → task visible with session; GetTask → task returned
+ *      10. DeleteTask → ListTasks empty (member's view of created task)
  *
  * Honest skip: tests skip without SMOKE=1 (bun test --cwd orchestrator
  * passes 0 failures even without the stack running).
@@ -117,12 +121,12 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   // -------------------------------------------------------------------------
   // 1. Health check
   // -------------------------------------------------------------------------
-  test.skipIf(!SMOKE)("1/7 healthz → 200 {ok:true,db:true}", async () => {
+  test.skipIf(!SMOKE)("1/10 healthz → 200 {ok:true,db:true}", async () => {
     const res = await fetch(`${BASE}/healthz`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toMatchObject({ ok: true, db: true });
-    console.log("Smoke 1/7 PASS: healthz → 200 {ok:true,db:true}");
+    console.log("Smoke 1/10 PASS: healthz → 200 {ok:true,db:true}");
   });
 
   // -------------------------------------------------------------------------
@@ -133,7 +137,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   let memberCookie = "";
 
   test.skipIf(!SMOKE)(
-    "2/7 provision fresh MEMBER user and capture session cookie",
+    "2/10 provision fresh MEMBER user and capture session cookie",
     async () => {
       const ts = Date.now();
       const email = `smoke-member-${ts}@engram.local`;
@@ -152,12 +156,12 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       expect(res.status).toBe(200);
       memberCookie = extractSessionCookie(res);
       expect(memberCookie).toMatch(/^better-auth\.session_token=/);
-      console.log(`Smoke 2/7 PASS: provisioned member ${email}`);
+      console.log(`Smoke 2/10 PASS: provisioned member ${email}`);
     },
   );
 
   test.skipIf(!SMOKE)(
-    "3/7 anonymous GetSession → 401 (unauthenticated)",
+    "3/10 anonymous GetSession → 401 (unauthenticated)",
     async () => {
       const res = await rpc(
         "engram.app.v1.SessionService",
@@ -170,13 +174,13 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       const body = (await res.json()) as { code?: string };
       expect(body.code).toBe("unauthenticated");
       console.log(
-        "Smoke 3/7 PASS: anonymous GetSession → 401 unauthenticated",
+        "Smoke 3/10 PASS: anonymous GetSession → 401 unauthenticated",
       );
     },
   );
 
   test.skipIf(!SMOKE)(
-    "4/7 member GetSession (non-existent id) → 404 not_found (anti-enum)",
+    "4/10 member GetSession (non-existent id) → 404 not_found (anti-enum)",
     async () => {
       const res = await rpc(
         "engram.app.v1.SessionService",
@@ -188,12 +192,12 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       expect(res.status).toBe(404);
       const body = (await res.json()) as { code?: string };
       expect(body.code).toBe("not_found");
-      console.log("Smoke 4/7 PASS: member GetSession (bad id) → 404 not_found");
+      console.log("Smoke 4/10 PASS: member GetSession (bad id) → 404 not_found");
     },
   );
 
   test.skipIf(!SMOKE)(
-    "5/7 member ListHosts → 403 permission_denied",
+    "5/10 member ListHosts → 403 permission_denied",
     async () => {
       const res = await rpc(
         "engram.app.v1.FleetService",
@@ -204,12 +208,12 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       expect(res.status).toBe(403);
       const body = (await res.json()) as { code?: string };
       expect(body.code).toBe("permission_denied");
-      console.log("Smoke 5/7 PASS: member ListHosts → 403 permission_denied");
+      console.log("Smoke 5/10 PASS: member ListHosts → 403 permission_denied");
     },
   );
 
   test.skipIf(!SMOKE)(
-    "6/7 member ListEnabledImages → 200 (member-readable)",
+    "6/10 member ListEnabledImages → 200 (member-readable)",
     async () => {
       const res = await rpc(
         "engram.app.v1.ImageService",
@@ -221,7 +225,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       const body = (await res.json()) as { images?: unknown[] };
       expect(Array.isArray(body.images)).toBe(true);
       console.log(
-        `Smoke 6/7 PASS: member ListEnabledImages → 200 (${(body.images ?? []).length} image(s))`,
+        `Smoke 6/10 PASS: member ListEnabledImages → 200 (${(body.images ?? []).length} image(s))`,
       );
     },
   );
@@ -230,7 +234,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   // 7. Admin half
   // -------------------------------------------------------------------------
   test.skipIf(!SMOKE)(
-    "7/7 admin ListHosts → 200 with hosts array",
+    "7/10 admin ListHosts → 200 with hosts array",
     async () => {
       const ADMIN_EMAIL = "smoke-admin@engram.local";
       const ADMIN_PASS = "SmokeAdmin123!";
@@ -283,7 +287,130 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       const body = (await res.json()) as { hosts?: unknown[] };
       expect(Array.isArray(body.hosts)).toBe(true);
       console.log(
-        `Smoke 7/7 PASS: admin ListHosts → 200 (${(body.hosts ?? []).length} host(s))`,
+        `Smoke 7/10 PASS: admin ListHosts → 200 (${(body.hosts ?? []).length} host(s))`,
+      );
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 8–10. Task lifecycle — native TaskService (Task 19)
+  //
+  // Uses the member account provisioned in test 2 (memberCookie).
+  // Picks the first no-harness image from ListEnabledImages (harnessName null/
+  // absent). The created task id is shared across tests 8–10.
+  // -------------------------------------------------------------------------
+
+  let smokeTaskId = "";
+
+  test.skipIf(!SMOKE)(
+    "8/10 member CreateTask(chat, no-harness image) → task with live session state",
+    async () => {
+      // Pick a no-harness image.
+      const imagesRes = await rpc(
+        "engram.app.v1.ImageService",
+        "ListEnabledImages",
+        {},
+        memberCookie,
+      );
+      expect(imagesRes.status).toBe(200);
+      const imagesBody = (await imagesRes.json()) as { images?: Array<{ imageUri?: string; harnessName?: string }> };
+      const images = imagesBody.images ?? [];
+      const noHarnessImage = images.find((img) => !img.harnessName);
+      if (!noHarnessImage?.imageUri) {
+        throw new Error(
+          "No no-harness image found in ListEnabledImages — stack may not have images enabled",
+        );
+      }
+
+      const createRes = await rpc(
+        "engram.app.v1.TaskService",
+        "CreateTask",
+        { type: "chat", imageUri: noHarnessImage.imageUri, title: "Smoke task" },
+        memberCookie,
+      );
+      expect(createRes.status).toBe(200);
+      const createBody = (await createRes.json()) as {
+        task?: { id?: string; type?: string; status?: string; sessions?: unknown[] };
+      };
+      expect(createBody.task).toBeDefined();
+      expect(createBody.task!.type).toBe("chat");
+      // Status should be "working" (session just created → pending/created → working).
+      // Accept "open" as well in case the session transitions faster than the
+      // status read (unlikely but possible in a slow CI).
+      const taskStatus: string = createBody.task!.status ?? "open";
+      expect(["working", "open"]).toContain(taskStatus);
+      expect(Array.isArray(createBody.task!.sessions)).toBe(true);
+      expect((createBody.task!.sessions ?? []).length).toBeGreaterThan(0);
+
+      smokeTaskId = createBody.task!.id!;
+      expect(smokeTaskId).toBeTruthy();
+      console.log(
+        `Smoke 8/10 PASS: CreateTask → task ${smokeTaskId} status=${createBody.task!.status} sessions=${(createBody.task!.sessions ?? []).length}`,
+      );
+    },
+  );
+
+  test.skipIf(!SMOKE)(
+    "9/10 ListTasks shows created task with session; GetTask returns it",
+    async () => {
+      // ListTasks.
+      const listRes = await rpc(
+        "engram.app.v1.TaskService",
+        "ListTasks",
+        {},
+        memberCookie,
+      );
+      expect(listRes.status).toBe(200);
+      const listBody = (await listRes.json()) as { tasks?: Array<{ id?: string; sessions?: unknown[] }> };
+      const tasks = listBody.tasks ?? [];
+      const found = tasks.find((t) => t.id === smokeTaskId);
+      expect(found).toBeDefined();
+      expect(Array.isArray(found!.sessions)).toBe(true);
+      expect((found!.sessions ?? []).length).toBeGreaterThan(0);
+
+      // GetTask.
+      const getRes = await rpc(
+        "engram.app.v1.TaskService",
+        "GetTask",
+        { taskId: smokeTaskId },
+        memberCookie,
+      );
+      expect(getRes.status).toBe(200);
+      const getBody = (await getRes.json()) as { task?: { id?: string } };
+      expect(getBody.task?.id).toBe(smokeTaskId);
+
+      console.log(
+        `Smoke 9/10 PASS: ListTasks shows task; GetTask returns task ${smokeTaskId}`,
+      );
+    },
+  );
+
+  test.skipIf(!SMOKE)(
+    "10/10 DeleteTask → ListTasks no longer shows the task (member's view)",
+    async () => {
+      const deleteRes = await rpc(
+        "engram.app.v1.TaskService",
+        "DeleteTask",
+        { taskId: smokeTaskId },
+        memberCookie,
+      );
+      expect(deleteRes.status).toBe(200);
+
+      // ListTasks should no longer show the task.
+      const listRes = await rpc(
+        "engram.app.v1.TaskService",
+        "ListTasks",
+        {},
+        memberCookie,
+      );
+      expect(listRes.status).toBe(200);
+      const listBody = (await listRes.json()) as { tasks?: Array<{ id?: string }> };
+      const tasks = listBody.tasks ?? [];
+      const found = tasks.find((t) => t.id === smokeTaskId);
+      expect(found).toBeUndefined();
+
+      console.log(
+        `Smoke 10/10 PASS: DeleteTask → task ${smokeTaskId} gone from ListTasks`,
       );
     },
   );
