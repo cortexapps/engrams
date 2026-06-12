@@ -61,6 +61,9 @@ pub async fn get(
 /// Backed by [`crate::cow_state::CowStateCache`] (1s TTL) so the
 /// web app's 1-2s polling doesn't fan out to the host on every
 /// request.
+///
+/// gRPC counterpart delegates to the same `enrichment_for_session`
+/// helper — no DRIFT WARNING needed there.
 pub async fn cow_state(
     State(state): State<SharedState>,
     Path(host_id): Path<HostId>,
@@ -115,7 +118,10 @@ pub async fn cow_state(
 /// `last_snapshot_at` fields. Returns `(None, None)` when the
 /// session has never been snapshotted — `CowStateView` falls back to
 /// the host's in-memory `last_snapshot_unix_ms` in that case.
-async fn enrichment_for_session(
+///
+/// `pub(crate)` so `grpc_app/fleet.rs::get_host_cow_state` can reuse
+/// it rather than re-inlining the same logic.
+pub(crate) async fn enrichment_for_session(
     state: &SharedState,
     session_id: engram_core::SessionId,
 ) -> (

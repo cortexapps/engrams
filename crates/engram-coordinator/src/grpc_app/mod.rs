@@ -325,6 +325,11 @@ mod convention {
     /// either listed in `SOURCES` (scanned for auth) or in `NON_RPC_HELPERS`
     /// (explicitly allowlisted). Files in `NON_RPC_HELPERS` must not contain
     /// `_server::` — an RPC service impl hiding there would bypass the auth scan.
+    ///
+    /// `read_dir` is non-recursive (it sees only the flat `src/grpc_app/`
+    /// directory). This test asserts that no subdirectories exist so we
+    /// never silently miss a nested service file. If you ever add one,
+    /// convert the read_dir loop to a recursive walk and update this guard.
     #[test]
     fn file_sweep_every_grpc_app_file_is_accounted_for() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -341,6 +346,19 @@ mod convention {
         for entry in entries {
             let entry = entry.expect("dir entry");
             let path = entry.path();
+
+            // Guard: read_dir is non-recursive. Assert no subdirectories
+            // exist so we never silently miss a nested service file.
+            if path.is_dir() {
+                panic!(
+                    "src/grpc_app/ has a subdirectory {:?} — \
+                     the file_sweep test uses non-recursive read_dir and would miss \
+                     any service files inside it. Either remove the subdirectory or \
+                     convert the loop to a recursive walk.",
+                    path.file_name().unwrap_or_default()
+                );
+            }
+
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }

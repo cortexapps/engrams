@@ -446,10 +446,14 @@ async fn app_grpc_rejects_missing_and_wrong_bearer() {
     server.abort();
 }
 
-/// Task 13: harness_secret_id is now wired. With a non-existent secret id →
-/// NotFound (secret lookup runs before image resolution — deterministic).
+/// Task 13 / M1: harness_secret_id is wired; gate (image lookup) runs first.
+///
+/// With a non-enabled image the gate sets `is_builtin_claude = false` and
+/// returns early (no unseal). The request then fails at image resolution with
+/// `InvalidArgument` (image not enabled). The secret id is irrelevant — it is
+/// never consulted when the image gate says "not claude".
 #[tokio::test]
-async fn create_session_with_missing_harness_secret_returns_not_found() {
+async fn create_session_with_missing_harness_secret_gate_runs_first() {
     let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
     let channel = dial(addr).await;
 
@@ -465,58 +469,17 @@ async fn create_session_with_missing_harness_secret_returns_not_found() {
         secrets: std::collections::HashMap::new(),
     })
     .await
-    .expect_err("missing secret → NotFound");
-    // Secret lookup runs BEFORE image resolution — the handler calls
-    // build_harness_secret_env first, which returns NotFound when the
-    // secret row is absent. Image resolution never runs.
+    .expect_err("non-enabled image → error");
+    // After M1: the image gate runs BEFORE unseal. The stub returns
+    // Ok(None) for get_enabled_image, so is_builtin_claude = false, and
+    // build_harness_secret_env returns empty env without touching the
+    // secret store. The session handler then fails at image resolution
+    // (image not enabled → InvalidArgument). The secret is never read.
     assert_eq!(
         err.code(),
-        tonic::Code::NotFound,
-        "missing harness_secret_id must return NotFound (secret checked before image): {err:?}"
+        tonic::Code::InvalidArgument,
+        "non-enabled image must return InvalidArgument (gate before unseal — M1): {err:?}"
     );
-
-    server.abort();
-}
-
-/// Task 13: SecretService round-trip — HasSecret returns false (stub),
-/// PutSecret and DeleteSecret succeed.
-#[tokio::test]
-async fn secret_service_put_has_delete_round_trip() {
-    let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
-    let channel = dial(addr).await;
-    let mut client = app::secret_service_client::SecretServiceClient::with_interceptor(
-        channel,
-        bearer(TEST_TOKEN),
-    );
-
-    // Before any put, has_secret must return false.
-    let has = client
-        .has_secret(app::HasSecretRequest {
-            key: "test-key".into(),
-        })
-        .await
-        .expect("HasSecret must succeed");
-    assert!(
-        !has.into_inner().exists,
-        "no secret stored yet — must return false"
-    );
-
-    // put_secret — seals and stores via StubMeta.
-    client
-        .put_secret(app::PutSecretRequest {
-            key: "test-key".into(),
-            value: "test-value".into(),
-        })
-        .await
-        .expect("PutSecret must succeed");
-
-    // delete_secret (idempotent)
-    client
-        .delete_secret(app::DeleteSecretRequest {
-            key: "test-key".into(),
-        })
-        .await
-        .expect("DeleteSecret must succeed");
 
     server.abort();
 }

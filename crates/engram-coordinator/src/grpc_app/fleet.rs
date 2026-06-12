@@ -80,9 +80,9 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
-        // DRIFT WARNING: this replicates the logic from api/hosts.rs::cow_state
-        // (HostCowStateResponse assembly). If that handler changes, this must
-        // change too. Back-pointer: api/hosts.rs::cow_state.
+        // Delegates to the same helpers as api/hosts.rs::cow_state.
+        // enrichment_for_session is pub(crate) — reused here instead of
+        // re-inlining. No DRIFT WARNING needed: there is no copy left.
         let backend = self
             .state
             .host_registry
@@ -111,22 +111,7 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         for record in records {
             let session_id = session_for.get(&record.sandbox_id).copied();
             let (memory_manifest, last_snapshot_at) = match session_id {
-                Some(sid) => {
-                    match self
-                        .state
-                        .services
-                        .meta
-                        .latest_snapshot_for_session(sid)
-                        .await
-                    {
-                        Ok(Some(rec)) => (rec.memory_manifest, Some(rec.created_at)),
-                        Ok(None) => (None, None),
-                        Err(e) => {
-                            tracing::debug!(%sid, error = %e, "get_host_cow_state: snapshot lookup failed");
-                            (None, None)
-                        }
-                    }
-                }
+                Some(sid) => crate::api::hosts::enrichment_for_session(&self.state, sid).await,
                 None => (None, None),
             };
             let view = crate::cow_state::CowStateView::from_record(
@@ -154,6 +139,9 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
         // Soft drain: mirrors api/hosts.rs::drain (POST /hosts/:id/drain).
+        // DRIFT WARNING: this replicates api/hosts.rs::drain.
+        // If that handler changes, this must change too.
+        // Back-pointer: api/hosts.rs::drain.
         self.state
             .services
             .meta
@@ -177,78 +165,22 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
-        // Admin drain: delegates to the axum admin handler logic.
-        // DRIFT WARNING: this replicates api/admin.rs::drain_host.
-        // Back-pointer: api/admin.rs::drain_host.
-        if !self.state.host_registry.cordon(host_id) {
-            return Err(into_status(crate::error::ApiError::NotFound(format!(
-                "host {host_id} not registered"
-            ))));
-        }
-        if let Err(e) = self
-            .state
-            .services
-            .meta
-            .set_host_status(host_id, engram_core::types::HostStatus::Draining)
+        // Delegates to the shared core (api/admin.rs::admin_drain_host_core).
+        // SessionId → String conversion happens here at the gRPC edge.
+        let result = crate::api::admin::admin_drain_host_core(&self.state, host_id)
             .await
-        {
-            tracing::warn!(%host_id, error = %e, "admin_drain_host: PG write failed; in-memory flag set");
-        }
-        let assignments = self
-            .state
-            .services
-            .meta
-            .list_active_sandbox_assignments_on_host(host_id)
-            .await
-            .map_err(|e| {
-                into_status(crate::error::ApiError::Internal(format!(
-                    "drain: list sessions: {e}"
-                )))
-            })?;
-        if assignments.is_empty() {
-            return Ok(Response::new(app::AdminDrainHostResponse {
-                host_id: host_id.to_string(),
-                evacuating: Vec::new(),
-                failures: Vec::new(),
-            }));
-        }
-        let mut tasks = tokio::task::JoinSet::new();
-        for (session_id, sandbox_id) in &assignments {
-            let st = self.state.clone();
-            let sid = *session_id;
-            let sb = *sandbox_id;
-            tasks.spawn(async move {
-                let outcome = crate::idle_evictor::evict_session_to_state(
-                    &st,
-                    sid,
-                    sb,
-                    engram_core::types::SessionState::Evacuating,
-                )
-                .await;
-                (sid, outcome)
-            });
-        }
-        let mut evacuating: Vec<String> = Vec::new();
-        let mut failures: Vec<app::DrainFailure> = Vec::new();
-        while let Some(join) = tasks.join_next().await {
-            match join {
-                Ok((sid, Ok(()))) => evacuating.push(sid.to_string()),
-                Ok((sid, Err(e))) => {
-                    tracing::warn!(%sid, %host_id, error = %e, "admin_drain_host: per-session evict failed");
-                    failures.push(app::DrainFailure {
-                        session_id: sid.to_string(),
-                        error: e.to_string(),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(%host_id, error = %e, "admin_drain_host: join error");
-                }
-            }
-        }
+            .map_err(into_status)?;
         Ok(Response::new(app::AdminDrainHostResponse {
-            host_id: host_id.to_string(),
-            evacuating,
-            failures,
+            host_id: result.host_id.to_string(),
+            evacuating: result.evacuating.iter().map(|s| s.to_string()).collect(),
+            failures: result
+                .failures
+                .into_iter()
+                .map(|f| app::DrainFailure {
+                    session_id: f.session_id.to_string(),
+                    error: f.error,
+                })
+                .collect(),
         }))
     }
 
@@ -262,6 +194,9 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
+        // DRIFT WARNING: this replicates api/admin.rs::cordon_host.
+        // If that handler changes, this must change too.
+        // Back-pointer: api/admin.rs::cordon_host.
         if !self.state.host_registry.cordon(host_id) {
             return Err(into_status(crate::error::ApiError::NotFound(format!(
                 "host {host_id} not registered"
@@ -292,6 +227,9 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
+        // DRIFT WARNING: this replicates api/admin.rs::uncordon_host.
+        // If that handler changes, this must change too.
+        // Back-pointer: api/admin.rs::uncordon_host.
         if !self.state.host_registry.uncordon(host_id) {
             return Err(into_status(crate::error::ApiError::NotFound(format!(
                 "host {host_id} not registered"

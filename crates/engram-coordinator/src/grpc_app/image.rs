@@ -88,10 +88,26 @@ impl app::image_service_server::ImageService for AppImageService {
             Outcome::Disabled | Outcome::AlreadyDisabled => {
                 Ok(Response::new(app::DisableImageResponse {}))
             }
-            Outcome::Blocked(_sessions) => {
+            Outcome::Blocked(sessions) => {
                 // image_in_use → FailedPrecondition (proto comment says so).
+                // Include the first few blocking session ids so operators can
+                // see exactly what is in the way without querying separately.
+                const MAX_SHOWN: usize = 5;
+                let shown: Vec<String> = sessions
+                    .iter()
+                    .take(MAX_SHOWN)
+                    .map(|(sid, _)| sid.to_string())
+                    .collect();
+                let suffix = if sessions.len() > MAX_SHOWN {
+                    format!(" … and {} more", sessions.len() - MAX_SHOWN)
+                } else {
+                    String::new()
+                };
                 Err(into_status(crate::error::ApiError::Conflict(format!(
-                    "image `{image_uri}` is in use by active sessions"
+                    "image `{image_uri}` is in use by {} active session(s): [{}]{}",
+                    sessions.len(),
+                    shown.join(", "),
+                    suffix,
                 ))))
             }
         }

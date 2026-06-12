@@ -394,6 +394,11 @@ pub struct EvacuateSessionResponse {
     /// to `GET /sessions/:id/events` to watch the
     /// `Evacuating → Created → Active` chain land.
     pub status: &'static str,
+    /// The sandbox that was evicted. Returned by the core so the
+    /// axum wrapper can log it without a second `get_session` call
+    /// (the sandbox is already destroyed by the time we return).
+    #[serde(skip)]
+    pub sandbox_id: Option<engram_core::SandboxId>,
 }
 
 /// Transport-agnostic core for EvacuateSession (POST /admin/sessions/:id/evacuate).
@@ -424,6 +429,7 @@ pub(crate) async fn evacuate_session_core(
     Ok(EvacuateSessionResponse {
         session_id,
         status: "evacuating",
+        sandbox_id: Some(sandbox_id),
     })
 }
 
@@ -434,24 +440,18 @@ pub(crate) async fn evacuate_session_core(
 ///
 /// Returns 202 Accepted; the scanner is the actual deliverable. Use
 /// the session events stream to observe the resume completing.
+///
+/// // Mirrored by evacuate_session() (gRPC FleetService) — see its DRIFT WARNING
 pub async fn evacuate_session(
     State(state): State<SharedState>,
     Path(session_id): Path<SessionId>,
     Json(_req): Json<EvacuateSessionRequest>,
 ) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
-    // Capture sandbox_id before the core evicts it (sandbox is destroyed
-    // by the pipeline; the registry entry is gone by the time we return).
-    let sandbox_id = state
-        .services
-        .meta
-        .get_session(session_id)
-        .await
-        .ok()
-        .and_then(|s| s.sandbox_id);
     let resp = evacuate_session_core(&state, session_id).await?;
     // Log AFTER the core succeeds so the message only appears when the
     // evac pipeline has actually completed (pause+flush+snapshot+destroy).
-    match sandbox_id {
+    // sandbox_id comes from the core — no second get_session needed.
+    match resp.sandbox_id {
         Some(sb) => tracing::info!(
             %session_id,
             sandbox_id = %sb,
@@ -603,6 +603,7 @@ pub async fn teleport_session(
                     Json(EvacuateSessionResponse {
                         session_id,
                         status: "migrated",
+                        sandbox_id: None,
                     }),
                 ));
             }
@@ -656,6 +657,7 @@ pub async fn teleport_session(
         Json(EvacuateSessionResponse {
             session_id,
             status: "evacuating",
+            sandbox_id: None,
         }),
     ))
 }
@@ -785,6 +787,8 @@ pub struct CordonResponse {
 /// pod) observes the cordon. No effect on already-bound sessions on
 /// this host — for that, the operator calls `/drain` (or evacs each
 /// session by hand).
+///
+/// // Mirrored by cordon_host() (gRPC FleetService) — see its DRIFT WARNING
 pub async fn cordon_host(
     State(state): State<SharedState>,
     Path(host_id): Path<engram_core::HostId>,
@@ -821,6 +825,8 @@ pub async fn cordon_host(
 
 /// `POST /api/admin/hosts/:id/uncordon` — inverse of cordon. The
 /// host returns to the picker's view immediately.
+///
+/// // Mirrored by uncordon_host() (gRPC FleetService) — see its DRIFT WARNING
 pub async fn uncordon_host(
     State(state): State<SharedState>,
     Path(host_id): Path<engram_core::HostId>,
@@ -860,22 +866,21 @@ pub struct DrainFailure {
     pub error: String,
 }
 
-/// `POST /api/admin/hosts/:id/drain` — cordon the host, then fire
-/// `evict_session_to_state(Evacuating)` for every Active session on
-/// it. Returns 202 with the per-session outcomes; the `evac_resumer`
-/// scanner is responsible for completing each transition to Active
-/// on a peer host.
+/// Transport-agnostic core for DrainHost (POST /admin/hosts/:id/drain and
+/// gRPC FleetService::AdminDrainHost). Cordons the host, queries PG for
+/// Active sessions, and fans out `evict_session_to_state(Evacuating)` in
+/// parallel. Returns the per-session outcomes so each transport layer can
+/// encode them in its own wire type.
 ///
-/// Concurrency: each session's eviction is independent and runs in
-/// parallel — the source sandbox is paused on the source host
-/// concurrently across sessions. The eviction lease serialises
-/// per-session retries; two coord pods both running /drain on the
-/// same host will see one win per session, the other no-op via the
-/// lease guard.
-pub async fn drain_host(
-    State(state): State<SharedState>,
-    Path(host_id): Path<engram_core::HostId>,
-) -> Result<(StatusCode, Json<DrainHostResponse>), ApiError> {
+/// Both callers bridge the SessionId-vs-String difference at their own
+/// edge:
+///  - axum `drain_host`: SessionId is already the wire type → direct.
+///  - gRPC `admin_drain_host`: maps SessionId → `.to_string()` before
+///    building the proto response.
+pub(crate) async fn admin_drain_host_core(
+    state: &crate::state::SharedState,
+    host_id: engram_core::HostId,
+) -> Result<DrainHostResponse, crate::error::ApiError> {
     if !state.host_registry.cordon(host_id) {
         return Err(ApiError::NotFound(format!("host {host_id} not registered")));
     }
@@ -904,14 +909,11 @@ pub async fn drain_host(
 
     if assignments.is_empty() {
         tracing::info!(%host_id, "admin drain: host cordoned; no Active sessions to evacuate");
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(DrainHostResponse {
-                host_id,
-                evacuating: Vec::new(),
-                failures: Vec::new(),
-            }),
-        ));
+        return Ok(DrainHostResponse {
+            host_id,
+            evacuating: Vec::new(),
+            failures: Vec::new(),
+        });
     }
 
     // Fan out per-session evictions. JoinSet so we collect outcomes
@@ -959,14 +961,34 @@ pub async fn drain_host(
         "admin drain: per-session evac pipeline dispatched; scanner will resume each on a peer",
     );
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(DrainHostResponse {
-            host_id,
-            evacuating,
-            failures,
-        }),
-    ))
+    Ok(DrainHostResponse {
+        host_id,
+        evacuating,
+        failures,
+    })
+}
+
+/// `POST /api/admin/hosts/:id/drain` — cordon the host, then fire
+/// `evict_session_to_state(Evacuating)` for every Active session on
+/// it. Returns 202 with the per-session outcomes; the `evac_resumer`
+/// scanner is responsible for completing each transition to Active
+/// on a peer host.
+///
+/// Concurrency: each session's eviction is independent and runs in
+/// parallel — the source sandbox is paused on the source host
+/// concurrently across sessions. The eviction lease serialises
+/// per-session retries; two coord pods both running /drain on the
+/// same host will see one win per session, the other no-op via the
+/// lease guard.
+///
+/// // Mirrored by admin_drain_host() (gRPC FleetService) — delegates to
+/// // admin_drain_host_core; see its DRIFT WARNING for the gRPC side.
+pub async fn drain_host(
+    State(state): State<SharedState>,
+    Path(host_id): Path<engram_core::HostId>,
+) -> Result<(StatusCode, Json<DrainHostResponse>), ApiError> {
+    let resp = admin_drain_host_core(&state, host_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(resp)))
 }
 
 // ---------------------------------------------------------------------
