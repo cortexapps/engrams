@@ -15,6 +15,11 @@
  *
  * ## Inert posture (dev / local)
  *
+ * DEPLOY LANDMINE (resolve before any IAP prod deploy): GCP load-balancer
+ * HEALTH CHECKS bypass IAP and carry no assertion — with IAP_AUDIENCE set,
+ * /healthz would 401 and the backend gets marked unhealthy. The deploy needs
+ * a health-check path exemption in this bridge (or LB-level config) first.
+ *
  * When `IAP_AUDIENCE` is unset the bridge is fully inert — it returns
  * immediately without touching headers, allocating memory, or reading env.
  * This is the dev-mode default; the Tiltfile does not set IAP_AUDIENCE.
@@ -228,6 +233,8 @@ async function jitCreateSession(email: string): Promise<string> {
     user = await ia.createUser({
       email,
       name: email.split("@")[0] ?? email,
+      // IAP only forwards requests for Google-verified accounts, and we just
+      // verified IAP's own ES256 assertion — the email is attested by GCP.
       emailVerified: true,
       // role is set by the admin plugin; default is 'user' for new users.
       // The admin plugin reads the `role` column; we don't set it here so
@@ -332,8 +339,12 @@ export async function iapBridge(
 
     if (iapJwt) {
       // We have both: check for user-switch without full verification overhead.
-      // Decode the email claim without verifying (we'll verify only if needed).
-      // For user-switch detection we parse the payload cheaply.
+      // Decode the email claim WITHOUT verifying. This is sound because the
+      // HMAC session cookie is the credential — the unverified email only
+      // chooses skip-vs-reverify. No cookie → full verification; a stolen
+      // valid cookie already owns that session (the no-header branch passes
+      // it anyway); a forged MISMATCHING email forces full verification and
+      // 401s. Zero privilege derives from the unverified claim.
       try {
         const parts = iapJwt.split(".");
         if (parts.length === 3) {
