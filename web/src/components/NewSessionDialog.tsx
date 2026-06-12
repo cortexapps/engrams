@@ -47,9 +47,17 @@ export function NewSessionDialog({
   showTrigger = true,
 }: {
   onCreated: (id: string) => void;
+  /** Trigger styling. Defaults to the primary (lime) button; the sessions rail
+   * passes `secondary` + `w-full` so it reads quietly beside the active row. */
   variant?: ComponentProps<typeof Button>["variant"];
   className?: string;
+  /** Test id for the trigger button. Pass it from at most ONE mounted instance
+   * per page (the header actions today) — a second instance with the same id
+   * breaks strict-mode getByTestId when both render (e.g. empty list + header). */
   triggerTestId?: string;
+  /** Controlled open state. Omit for the self-contained trigger usage; pass it
+   * (with `showTrigger={false}`) for the global, keyboard/palette-driven mount
+   * in RootLayout. */
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   showTrigger?: boolean;
@@ -114,13 +122,16 @@ export function NewSessionDialog({
         qc.invalidateQueries({
           queryKey: createConnectQueryKey({ schema: listTasks, cardinality: "finite" }),
         });
-        setOpen(false);
-        form.reset();
         // Navigate to the session the task's primary session ref created.
         const sessionId = res.task?.sessions[0]?.sessionId;
         if (sessionId) {
+          // Success: close the dialog and reset before handing off.
+          setOpen(false);
+          form.reset();
           onCreated(sessionId);
         } else {
+          // Defensive: task created but no session id returned — keep the
+          // dialog open so the error is visible to the user.
           form.setError("root", { message: "Task created but no session id returned." });
         }
       }
@@ -186,6 +197,9 @@ export function NewSessionDialog({
                         ))}
                       </SelectContent>
                     </Select>
+                    {/* data-harness carries the machine-readable harness state
+                        ("" = harness-less) so tests pin it structurally
+                        instead of coupling to the prose. */}
                     <FieldDescription
                       data-testid="image-harness-state"
                       data-harness={harnessName ?? ""}
@@ -237,7 +251,7 @@ export function NewSessionDialog({
 
               {needsToken && (
                 <FieldDescription>
-                  This image runs built-in Claude, which uses your saved token — you don't have one
+                  This image runs built-in Claude, which uses your saved token — you don’t have one
                   yet.
                 </FieldDescription>
               )}
