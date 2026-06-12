@@ -31,6 +31,21 @@ export interface Config {
    * production must rotate this via .env or a secrets manager before Phase 4.
    */
   betterAuthSecret: string;
+  /**
+   * IAP_AUDIENCE — GCP IAP audience string (e.g. /projects/PROJECT_NUM/apps/APP_ID).
+   * When unset the IAP bridge is fully inert (zero overhead, no header reads).
+   * Set this in production when the orchestrator sits behind GCP IAP.
+   * This is the production door story: IAP bridge + disabled public sign-up
+   * (see Task 22 comment chain) replace password auth in prod.
+   */
+  iapAudience: string | undefined;
+  /**
+   * IAP_JWKS_URL — override the GCP IAP JWKS endpoint URL.
+   * Default: https://www.gstatic.com/iap/verify/public_key-jwk (ES256 keys,
+   * iss=https://cloud.google.com/iap). Override in tests to point at a local
+   * fixture server. Not needed in prod.
+   */
+  iapJwksUrl: string;
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -79,6 +94,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // above applies equally (see isTest comment). Prod/dev must set the real var.
   const betterAuthSecret = require("BETTER_AUTH_SECRET");
 
+  // OPTIONAL: IAP bridge config. When IAP_AUDIENCE is unset the bridge is
+  // fully inert in dev (no overhead, no header reads). Set in prod only.
+  // No test placeholder needed — unset is valid and means "inert".
+  const iapAudience = env["IAP_AUDIENCE"] || undefined;
+  const iapJwksUrl = optional(
+    "IAP_JWKS_URL",
+    "https://www.gstatic.com/iap/verify/public_key-jwk",
+  );
+
   if (missing.length > 0) {
     throw new Error(
       `Orchestrator: missing required environment variable(s): ${missing.join(", ")}`,
@@ -99,6 +123,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     controlPlaneBearer,
     trustedOrigins,
     betterAuthSecret,
+    iapAudience,
+    iapJwksUrl,
   };
 }
 

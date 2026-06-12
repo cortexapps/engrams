@@ -45,6 +45,7 @@ import { getRequestListener } from "@hono/node-server";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import type { ConnectRouter } from "@connectrpc/connect";
 import type { NodeWebSocket } from "@hono/node-ws";
+import { iapBridge } from "./auth/iap-bridge.ts";
 
 export type RouteRegistrar = (router: ConnectRouter) => void;
 
@@ -71,16 +72,21 @@ export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs
   const honoListener = getRequestListener(app.fetch);
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const url = req.url ?? "/";
+    // IAP bridge runs first — before /rpc vs Hono dispatch — so it covers
+    // every HTTP entry path. See iap-bridge.ts for placement rationale.
+    // When IAP_AUDIENCE is unset this is a synchronous no-op.
+    iapBridge(req, res, () => {
+      const url = req.url ?? "/";
 
-    if (url.startsWith("/rpc/") || url === "/rpc") {
-      // Connect adapter takes over: handles Connect/gRPC/gRPC-Web protocols.
-      connectHandler(req, res);
-      return;
-    }
+      if (url.startsWith("/rpc/") || url === "/rpc") {
+        // Connect adapter takes over: handles Connect/gRPC/gRPC-Web protocols.
+        connectHandler(req, res);
+        return;
+      }
 
-    // Everything else: delegate to Hono via getRequestListener.
-    honoListener(req, res);
+      // Everything else: delegate to Hono via getRequestListener.
+      honoListener(req, res);
+    });
   });
 
   // Wire WebSocket upgrade handler if @hono/node-ws is provided.
