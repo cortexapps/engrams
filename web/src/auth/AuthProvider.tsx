@@ -12,9 +12,14 @@
 //     route). The vite proxy has an exact-path rule for this path → :8787
 //     BEFORE the general /api/v1 → :8090 coordinator rule; Task 28 collapses
 //     this once all /api/v1 traffic moves to the orchestrator.
-//   - 401 path: no longer hard-navigates to /api/v1/auth/login.
-//     Instead, we redirect the SPA to /login (the new Login page).
-//   - sign-out: authClient.signOut() replaces the coordinator POST /auth/logout.
+//   - Unauthenticated path: AuthProvider renders children even when session is
+//     null (resolved-unauthenticated). The auth gate lives in the router's
+//     appLayoutRoute.beforeLoad (see router.tsx), which redirects to /login.
+//     This avoids the infinite-reload loop that window.location.replace("/login")
+//     caused before RouterProvider mounted.
+//   - Orchestrator-down path: authClient.useSession() error → AuthErrorScreen
+//     with retry (not the login redirect — unreachable backend ≠ signed-out).
+//   - sign-out: authClient.signOut() + window.location.assign("/login").
 //
 // Principal shape compatibility:
 //   The Principal type (types.ts) was written for the coordinator's GET /me
@@ -81,12 +86,16 @@ async function fetchClaudeTokenPresence(): Promise<boolean> {
 export function AuthProvider({ children }: { children: ReactNode }) {
   // better-auth session — provides authn + role via the admin plugin.
   // `isPending` is true only on the very first render before the cookie
-  // round-trip completes; thereafter it's synchronous from the in-memory
-  // cache.
-  const { data: session, isPending: sessionPending } = authClient.useSession();
+  // round-trip completes; thereafter it's synchronous from the in-memory cache.
+  // `error` is non-null when the orchestrator is unreachable (network/500).
+  const {
+    data: session,
+    isPending: sessionPending,
+    error: sessionError,
+    refetch: refetchSession,
+  } = authClient.useSession();
 
-  // Claude-token presence — only fetched when the session is resolved.
-  // Enabled: we have a valid session (not null).
+  // Claude-token presence — only fetched when the session is resolved + present.
   const {
     data: hasClaudeToken,
     isLoading: tokenLoading,
@@ -105,16 +114,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return <BootScreen />;
   }
 
-  // Unauthenticated — redirect to the SPA login page.
-  // We use window.location rather than TanStack Router's navigate() because
-  // AuthProvider mounts OUTSIDE the RouterProvider (App.tsx: AuthProvider →
-  // InnerApp → RouterProvider). A hard-assign to /login works the same as the
-  // old pattern that assigned to /api/v1/auth/login; the SPA router picks up
-  // /login and renders the Login component without a full reload because Vite
-  // serves index.html for all paths.
+  // Orchestrator unreachable — backend error is not the same as signed-out.
+  // Show a retry screen rather than redirecting to /login (which would be
+  // misleading and unhelpful when the server is simply down).
+  if (sessionError) {
+    return <AuthErrorScreen message={sessionError.message} onRetry={() => void refetchSession()} />;
+  }
+
+  // Session resolved (null = unauthenticated, or a valid session object).
+  // The auth gate lives in the router (appLayoutRoute.beforeLoad in router.tsx)
+  // so that /login itself is never caught in a redirect loop. AuthProvider
+  // always renders children at this point — the router decides what to render.
   if (!session) {
-    window.location.replace("/login");
-    return null;
+    // No principal — pass null context; router redirects unauthenticated routes.
+    return <AuthContext.Provider value={null}>{children}</AuthContext.Provider>;
   }
 
   // Session resolved but token presence query in flight — show boot screen
@@ -158,15 +171,21 @@ export function useAuth(): AuthState {
   return ctx;
 }
 
+/** Returns the current auth state, or null when signed out.
+ * Used by App.tsx's InnerApp to pass nullable context to the router
+ * (which handles the unauthenticated redirect in appLayoutRoute.beforeLoad). */
+export function useOptionalAuth(): AuthState | null {
+  return useContext(AuthContext);
+}
+
 export function useIsAdmin(): boolean {
   return useAuth().isAdmin;
 }
 
 // ---- Sign-out helper (replaces the old coordinator POST /auth/logout) ----
 //
-// Used by user-menu.tsx (and anywhere else that calls the old `logout` from
-// api.ts — both are supported; the old `logout` also still works during the
-// coordinator-auth-in-parallel period, but this one is the canonical path).
+// Used by user-menu.tsx. Hard-navigates to /login so the session query
+// re-initialises from a clean state and the router lands on the login page.
 export async function signOut(): Promise<void> {
   await authClient.signOut();
   window.location.assign("/login");
@@ -193,9 +212,8 @@ function BootScreen() {
   );
 }
 
-// Kept for API surface compatibility (was used in the old AuthProvider).
-// The new provider never renders this — unauthenticated users go to /login.
-// Exported in case any consumer imports it directly.
+// Shown when authClient.useSession() returns an error (orchestrator unreachable).
+// Exported so tests can import the component directly.
 export function AuthErrorScreen({ message, onRetry }: { message?: string; onRetry: () => void }) {
   return (
     <AuthStage>

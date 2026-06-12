@@ -7,9 +7,12 @@
 //   - Before production: disable sign-up here AND in better-auth config, or gate
 //     on an admin-managed allowlist (Task 30/31). Do NOT ship open registration
 //     to a public-facing deployment.
+//
+// On success: hard-navigates to / via window.location.assign so AuthProvider's
+// session query re-initialises from scratch and the router re-evaluates the
+// appLayoutRoute.beforeLoad guard with the fresh session.
 
 import { useState } from "react";
-import { useNavigate } from "@tanstack/react-router";
 import { authClient } from "@/lib/auth-client";
 import { EngramMark } from "@/components/EngramMark";
 import { Button } from "@/components/ui/button";
@@ -23,7 +26,6 @@ import { Label } from "@/components/ui/label";
 const ENABLE_SIGNUP = true;
 
 export function Login() {
-  const navigate = useNavigate();
   const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -50,8 +52,10 @@ export function Login() {
           return;
         }
       }
-      // Successful auth — navigate to the app root (AuthProvider resolves the session).
-      await navigate({ to: "/" });
+      // Hard-navigate to / so AuthProvider's session query re-initialises and
+      // the router re-evaluates the appLayoutRoute.beforeLoad guard with the
+      // freshly issued session cookie.
+      window.location.assign("/");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Authentication failed");
     } finally {
@@ -65,7 +69,7 @@ export function Login() {
         {/* Identity mark */}
         <div className="flex flex-col items-center gap-2">
           <EngramMark size={48} mode="static" />
-          <span className="font-['Saira',_sans-serif] text-sm font-semibold tracking-widest text-muted-foreground uppercase">
+          <span className="font-display text-sm font-semibold tracking-widest text-muted-foreground uppercase">
             engrams
           </span>
         </div>

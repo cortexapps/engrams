@@ -37,14 +37,18 @@ async function mustFetch(url: string, fixit: string): Promise<Response> {
  *  is safe to repeat. Must run BEFORE sign-in so the role is baked into
  *  the initial session.
  *
+ *  HARD-FAILS if psql does not confirm "UPDATE 1". A silent failure here yields
+ *  opaque downstream locator timeouts in admin-gated tests — we fail loudly
+ *  with a fix-it message instead.
+ *
  *  Uses a dynamic import of child_process to avoid the tsconfig needing
  *  full @types/node (which would leak Node globals into src/).  */
 async function promoteE2eUserToAdmin(): Promise<void> {
+  const { execSync } = await import("child_process");
+  // Playwright runs with cwd=web/ — the compose file lives at the repo root.
+  let stdout: string;
   try {
-    // Dynamic import avoids the ambient @types/node requirement across all files.
-    const { execSync } = await import("child_process");
-    // Playwright runs with cwd=web/ — the compose file lives at the repo root.
-    execSync(
+    const result = execSync(
       [
         "docker compose",
         "-f ../deploy/docker-compose.dev.yml",
@@ -54,10 +58,22 @@ async function promoteE2eUserToAdmin(): Promise<void> {
       ].join(" "),
       { stdio: "pipe" },
     );
+    stdout = result.toString();
   } catch (err) {
-    // Non-fatal: if docker isn't up or the user row doesn't exist yet,
-    // log a warning but don't abort — the sign-up above may have raced.
-    console.warn(`[global-setup] Could not promote e2e user to admin: ${String(err)}`);
+    throw new Error(
+      `[global-setup] psql promote failed — is docker compose up?\n` +
+        `  Run: just dev\n  Error: ${String(err)}`,
+    );
+  }
+
+  // psql prints "UPDATE 1" on success, "UPDATE 0" when no row matched.
+  if (!stdout.includes("UPDATE 1")) {
+    throw new Error(
+      `[global-setup] e2e user promote returned "${stdout.trim()}" instead of "UPDATE 1".\n` +
+        `  The user row does not exist yet — did the sign-up step above succeed?\n` +
+        `  Check: docker compose -f ../deploy/docker-compose.dev.yml exec -T postgres ` +
+        `psql -U engram -d engram_orchestrator -c 'SELECT email,role FROM "user"'`,
+    );
   }
 }
 

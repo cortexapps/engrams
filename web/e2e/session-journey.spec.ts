@@ -4,7 +4,7 @@ import { test, expect } from "@playwright/test";
 // browser: these assertions must hold identically before and after the
 // orchestration-tier migration.
 test("create a session and watch it come alive", async ({ page }) => {
-  await page.goto("/"); // no login (SyntheticAdmin today); redirects to /sessions
+  await page.goto("/"); // pre-authenticated via better-auth storageState; redirects to /sessions
   await page.getByTestId("new-session").click();
 
   // Explicitly select the no-harness demo image — images[0] is auto-selected

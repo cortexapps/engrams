@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
-import { AuthProvider, useAuth } from "./auth/AuthProvider";
+import { AuthProvider, useOptionalAuth } from "./auth/AuthProvider";
 import { router } from "./router";
 
 const queryClient = new QueryClient({
@@ -14,12 +14,14 @@ const queryClient = new QueryClient({
 
 // ADR 0039 Task 22: AuthProvider recomposed on better-auth.
 // AuthProvider resolves the principal (authClient.useSession + GET /api/v1/me/claude-token)
-// and renders a boot screen until both are settled. Unauthenticated sessions
-// trigger window.location.replace("/login") before RouterProvider mounts.
-// Once resolved, InnerApp passes the auth state to the router context that
-// beforeLoad admin guards read.
+// and renders children once the session query has settled — loading → BootScreen;
+// error → AuthErrorScreen; resolved-null OR resolved-session → render here.
+//
+// The auth gate (redirect signed-out requests → /login) lives in the router's
+// appLayoutRoute.beforeLoad (router.tsx). This means /login is always reachable
+// signed-out without a reload loop.
 function InnerApp() {
-  const auth = useAuth();
+  const auth = useOptionalAuth(); // null when signed out; AuthState when signed in
   return <RouterProvider router={router} context={{ auth }} />;
 }
 

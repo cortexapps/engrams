@@ -24,7 +24,7 @@ export function UserMenu() {
       <SidebarMenuItem>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <SidebarMenuButton size="lg" aria-label={label}>
+            <SidebarMenuButton size="lg" aria-label={label} data-testid="user-menu-trigger">
               <Avatar className="size-8 rounded-md">
                 <AvatarFallback className="rounded-md">{initial}</AvatarFallback>
               </Avatar>
