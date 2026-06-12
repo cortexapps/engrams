@@ -3,6 +3,10 @@ import { config } from "./config.ts";
 import { buildServer } from "./server.ts";
 import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
+import { registerPassthrough } from "./rpc/passthrough.ts";
+import { SURFACE } from "./rpc/surface.ts";
+import { controlPlaneTransport } from "./control-plane/transport.ts";
+import type { ConnectRouter } from "@connectrpc/connect";
 
 const app = new Hono();
 
@@ -13,7 +17,11 @@ app.route("/", authRoute);
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));
 
-const server = buildServer(app);
+const server = buildServer(app, (router: ConnectRouter) => {
+  // Generic passthrough: forwards SessionService, FleetService, ImageService
+  // to the control plane with per-method CASL authz gate (ADR 0039 Task 18).
+  registerPassthrough(router, SURFACE, controlPlaneTransport);
+});
 
 server.listen(config.port, "0.0.0.0", () => {
   console.log(`Orchestrator listening on port ${config.port}`);

@@ -1,0 +1,226 @@
+/**
+ * Generic passthrough forwarder with authz gate (ADR 0039 Task 18).
+ *
+ * For every method in every PassthroughSpec:
+ *   1. Verify the caller has a valid better-auth session (Unauthenticated if not).
+ *   2. Look up the per-method PolicyEntry (PermissionDenied if absent — fail-closed).
+ *   3. Build a CASL ability for the session's user.
+ *   4. For session-scoped methods: resolve the session owner and check
+ *      ownership.  Returns NotFound for unowned/unknown sessions — anti-
+ *      enumeration behaviour (ADR §6).
+ *   5. Forward the RPC to the control-plane upstream and pipe response
+ *      headers/trailers back to the caller.
+ *
+ * GetSession signature of better-auth is injectable for tests
+ * (`getSession?: GetSession`). When omitted, the real auth.api.getSession
+ * from better-auth is used.
+ *
+ * Excluded from this layer (served elsewhere):
+ *   - StreamEvents / GetArtifact → Hono routes (Task 20)
+ *   - ShellRelayService.Relay   → WS route (Task 21)
+ *   - SecretService.*           → keys come from the session
+ *   - TaskService.*             → native impl (Task 19)
+ */
+
+import { ConnectError, Code } from "@connectrpc/connect";
+import type { ConnectRouter, Transport, HandlerContext } from "@connectrpc/connect";
+import type { DescService } from "@bufbuild/protobuf";
+import { subject } from "@casl/ability";
+import { POLICY, policyKey } from "../authz/policy-map.ts";
+import { abilityFor } from "../authz/ability.ts";
+import { resolveSessionOwner } from "../authz/resolve.ts";
+import { auth } from "../auth/better-auth.ts";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface PassthroughSpec {
+  service: DescService;
+  /**
+   * If provided, only forward methods whose proto-name (PascalCase) is in
+   * this list. Omit to forward all methods in the service.
+   */
+  methods?: string[];
+}
+
+/**
+ * Injected getSession implementation. The default is better-auth's
+ * auth.api.getSession; tests inject a stub.
+ */
+export type GetSession = (
+  headers: Headers,
+) => Promise<{
+  user: { id: string; role?: string | null; email?: string | null };
+} | null>;
+
+/**
+ * Injected session-owner resolver. The default is the DB-backed
+ * resolveSessionOwner; tests inject a stub that doesn't need a DB.
+ */
+export type ResolveOwner = (sessionId: string) => Promise<string | null>;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Copy all headers from a source Headers object into a destination.
+ */
+function copyHeaders(src: Headers | undefined, dst: Headers): void {
+  if (!src) return;
+  src.forEach((value, key) => dst.set(key, value));
+}
+
+/**
+ * Build a Web-standard Headers object from a HandlerContext's requestHeader.
+ * better-auth.api.getSession accepts HeadersInit; the context provides a
+ * Headers instance already.
+ */
+function headersOf(ctx: HandlerContext): Headers {
+  return ctx.requestHeader;
+}
+
+// ---------------------------------------------------------------------------
+// Main registration
+// ---------------------------------------------------------------------------
+
+/**
+ * Register passthrough handlers on the ConnectRouter.
+ *
+ * @param router        The ConnectRouter to register handlers on.
+ * @param specs         Which services (and optionally which methods) to forward.
+ * @param upstream      The control-plane Transport to forward calls to.
+ * @param getSession    Optional override for better-auth session resolution.
+ * @param resolveOwner  Optional override for session-owner DB lookup (tests).
+ */
+export function registerPassthrough(
+  router: ConnectRouter,
+  specs: PassthroughSpec[],
+  upstream: Transport,
+  getSession?: GetSession,
+  resolveOwner?: ResolveOwner,
+): void {
+  const resolveSession: GetSession =
+    getSession ??
+    ((headers) =>
+      auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
+
+  const ownerResolver: ResolveOwner = resolveOwner ?? resolveSessionOwner;
+
+  for (const { service, methods } of specs) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const impl: Record<string, any> = {};
+
+    for (const m of service.methods) {
+      // Skip methods not in the allowlist.
+      if (methods && !methods.includes(m.name)) continue;
+
+      // Only support unary and server-streaming (bidi/client-streaming live
+      // on dedicated routes).
+      if (
+        m.methodKind !== "unary" &&
+        m.methodKind !== "server_streaming"
+      ) {
+        continue;
+      }
+
+      /**
+       * Authz gate — runs before any upstream call.
+       * Throws a ConnectError on failure.
+       */
+      const gate = async (req: unknown, ctx: HandlerContext): Promise<void> => {
+        // 1. Authenticate.
+        const session = await resolveSession(headersOf(ctx));
+        if (!session) {
+          throw new ConnectError("unauthenticated", Code.Unauthenticated);
+        }
+
+        // 2. Look up policy (fail-closed: no entry → denied).
+        const key = policyKey(service.typeName, m);
+        const entry = POLICY[key];
+        if (!entry) {
+          throw new ConnectError(
+            `no policy for ${key}`,
+            Code.PermissionDenied,
+          );
+        }
+
+        // 3. Build ability.
+        const ability = abilityFor({
+          id: session.user.id,
+          role: session.user.role ?? "user",
+        });
+
+        // 4. Ownership check (session-scoped methods).
+        if (entry.sessionIdField) {
+          const sid = (req as Record<string, string>)[entry.sessionIdField];
+          if (!sid) {
+            // No session_id in the request → treat as not found.
+            throw new ConnectError("not found", Code.NotFound);
+          }
+
+          const ownerId = await ownerResolver(sid);
+
+          // Anti-enumeration: return NotFound even when the session exists
+          // but is not owned by the caller — don't confirm existence.
+          if (
+            !ability.can(
+              entry.action,
+              subject("Session", { createdByUserId: ownerId }),
+            )
+          ) {
+            throw new ConnectError("not found", Code.NotFound);
+          }
+        } else {
+          // Non-session-scoped (Fleet, admin Image, etc.).
+          if (!ability.can(entry.action, entry.subject)) {
+            throw new ConnectError("forbidden", Code.PermissionDenied);
+          }
+        }
+      };
+
+      // Register handler.
+      if (m.methodKind === "unary") {
+        impl[m.localName] = async (req: unknown, ctx: HandlerContext) => {
+          await gate(req, ctx);
+          const res = await upstream.unary(
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            m as any,
+            ctx.signal,
+            undefined,
+            ctx.requestHeader,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            req as any,
+            ctx.values,
+          );
+          copyHeaders(res.header, ctx.responseHeader);
+          copyHeaders(res.trailer, ctx.responseTrailer);
+          return res.message;
+        };
+      } else {
+        // server_streaming
+        impl[m.localName] = async function* (req: unknown, ctx: HandlerContext) {
+          await gate(req, ctx);
+          const res = await upstream.stream(
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            m as any,
+            ctx.signal,
+            undefined,
+            ctx.requestHeader,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (async function* () { yield req as any; })(),
+            ctx.values,
+          );
+          copyHeaders(res.header, ctx.responseHeader);
+          for await (const msg of res.message) {
+            yield msg;
+          }
+        };
+      }
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    router.service(service as any, impl);
+  }
+}

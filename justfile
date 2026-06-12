@@ -415,11 +415,19 @@ smoke-control-plane:
     ENGRAM_SMOKE_GRPC=127.0.0.1:50061 ENGRAM_SMOKE_GRPC_TOKEN=dev-app-grpc-token \
         cargo test -p engram-coordinator --test grpc_smoke -- --ignored --nocapture --test-threads=1
 
+# Live smoke of the orchestrator authz surface (ADR 0039 Task 18 stage gate).
+# Requires `just dev` running (orchestrator on 127.0.0.1:3100 by default).
+# Tests: unauthenticated → Unauthenticated, member + ListHosts → PermissionDenied,
+#        member + ListEnabledImages → OK.
+# Skips gracefully when ORCHESTRATOR_URL is not reachable.
+smoke-orchestrator:
+    SMOKE=1 bun test --cwd orchestrator src/smoke.live.test.ts
+
 # Umbrella stage gate: run all smoke-* recipes in sequence. Each task
 # that adds a new smoke-* recipe appends its name to this recipe's
 # dependencies. (A just recipe cannot reference recipes that don't
 # exist yet, so each task is responsible for appending here.)
-smoke: smoke-control-plane
+smoke: smoke-control-plane smoke-orchestrator
 
 # Drop everything in ./var/* (sandbox cwds + snapshots).
 clean-var:
