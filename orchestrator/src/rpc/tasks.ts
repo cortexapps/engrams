@@ -322,8 +322,12 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       try {
         const { exists } = await secretsClient.hasSecret({ key: user.id });
         harnessSecretId = exists ? user.id : undefined;
-      } catch {
+      } catch (secretErr) {
         // hasSecret failure is non-fatal — proceed without harness token.
+        console.warn(
+          `[TaskService] createTask: hasSecret check failed for user ${user.id} — booting without harness token`,
+          secretErr,
+        );
         harnessSecretId = undefined;
       }
 

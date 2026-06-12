@@ -593,8 +593,60 @@ describe("TaskService — admin list sees all + synthetic unattributed rows", ()
 });
 
 // ---------------------------------------------------------------------------
+// 5b. Member scoping — orphan sessions are invisible to members
+// ---------------------------------------------------------------------------
+
+describe("TaskService — member scoping: orphan sessions excluded from member ListTasks", () => {
+  test.skipIf(!dbReachable)(
+    "member ListTasks with orphan upstream session → no synthetic unattributed- row",
+    async () => {
+      const db = getDb();
+      const orphanSessionId = `member-orphan-${Date.now()}`;
+
+      // Upstream exposes one session that has NO task_session row in the DB.
+      const fakeSessions = makeFakeSessions({
+        existing: [
+          {
+            id: orphanSessionId,
+            status: "active",
+            image: "img",
+            mode: "agent",
+            createdAt: new Date().toISOString(),
+            lastActiveAt: new Date().toISOString(),
+          },
+        ],
+      });
+
+      const srv = await spawnServer({
+        getSession: makeGetSession(MEMBER_A),
+        sessions: fakeSessions,
+        secrets: makeFakeSecrets(),
+        db,
+      });
+
+      try {
+        const client = makeClient(srv.serverUrl);
+        const resp = await client.listTasks({});
+        const taskIds = resp.tasks.map((t) => t.id);
+
+        // Members must NEVER see a synthetic unattributed- row.
+        const syntheticId = `unattributed-${orphanSessionId}`;
+        expect(taskIds).not.toContain(syntheticId);
+        // Also sanity: no row whose id starts with "unattributed-".
+        const hasSynthetic = taskIds.some((id) => id.startsWith("unattributed-"));
+        expect(hasSynthetic).toBe(false);
+      } finally {
+        await srv.close();
+      }
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // 6. Compensation path — upstream create OK + DB insert fails
 // ---------------------------------------------------------------------------
+
+const TX_ERROR_MESSAGE = "forced DB failure for compensation test";
 
 describe("TaskService — compensation: upstream OK + DB fail → DeleteSession called", () => {
   test("DB insert failure triggers upstream DeleteSession", async () => {
@@ -616,7 +668,7 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
     // Inject a fake DB whose transaction always throws.
     const fakeDb = {
       transaction: async (_fn: unknown) => {
-        throw new Error("forced DB failure for compensation test");
+        throw new Error(TX_ERROR_MESSAGE);
       },
       // Other methods unused by createTask but present for type compat.
       select: () => { throw new Error("unreachable"); },
@@ -634,13 +686,28 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
     try {
       const client = makeClient(srv.serverUrl);
       // The request should fail (DB error → rethrown as Internal).
+      let caughtErr: unknown;
       try {
         await client.createTask({ type: "chat", imageUri: "registry/img:latest" });
         throw new Error("Expected createTask to throw");
       } catch (err) {
-        // Either a ConnectError or a plain Error is acceptable — the key check
-        // is that upstream.deleteSession was called for compensation.
-        expect(err).toBeDefined();
+        caughtErr = err;
+      }
+
+      // The original DB error must surface. Connect serialises non-ConnectErrors
+      // as Code.Internal with the message scrubbed for security, so we assert:
+      //   (a) the error is a ConnectError with Code.Internal, OR
+      //   (b) it's a plain Error whose message contains the original tx message
+      //       (happens when the call is made in-process without HTTP serialisation).
+      expect(caughtErr).toBeDefined();
+      if (caughtErr instanceof ConnectError) {
+        // Connect serialises plain errors as Internal — the code must be Internal,
+        // which proves the original tx error (not some other path) caused the failure.
+        expect(caughtErr.code).toBe(Code.Internal);
+      } else if (caughtErr instanceof Error) {
+        expect(caughtErr.message).toContain(TX_ERROR_MESSAGE);
+      } else {
+        throw new Error(`Unexpected error type: ${String(caughtErr)}`);
       }
 
       // Compensation: upstream session should have been deleted.
