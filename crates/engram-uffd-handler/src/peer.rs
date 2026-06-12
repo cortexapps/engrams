@@ -123,6 +123,15 @@ pub struct PeerSession {
     /// the serial P2P cost inside the FC load + early execution.
     fault_count: AtomicU64,
     fault_us: AtomicU64,
+    fault_max_us: AtomicU64,
+    /// Fault-priority gate for the drain: guest faults in flight +
+    /// the µs-since-`epoch` stamp of the last fault completion. The
+    /// drain parks while a fault is active-or-recent so the fault
+    /// never queues behind the drain's bulk bytes on the wire (the
+    /// measured ~7 ms/fault was exactly that queueing).
+    faults_inflight: AtomicU64,
+    last_fault_us: AtomicU64,
+    epoch: std::time::Instant,
 }
 
 /// Dial + `Hello` + `HelloAck` + `Seal` on a fresh connection,
@@ -222,15 +231,34 @@ impl PeerSession {
             lost: AtomicBool::new(false),
             fault_count: AtomicU64::new(0),
             fault_us: AtomicU64::new(0),
+            fault_max_us: AtomicU64::new(0),
+            faults_inflight: AtomicU64::new(0),
+            last_fault_us: AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
         })
     }
 
-    /// Fault-path totals: `(count, cumulative_µs)`.
-    pub fn fault_stats(&self) -> (u64, u64) {
+    /// Fault-path totals: `(count, cumulative_µs, max_µs)`.
+    pub fn fault_stats(&self) -> (u64, u64, u64) {
         (
             self.fault_count.load(Ordering::Relaxed),
             self.fault_us.load(Ordering::Relaxed),
+            self.fault_max_us.load(Ordering::Relaxed),
         )
+    }
+
+    /// True while a guest fault is in flight or one completed within
+    /// `window` — the drain's park condition.
+    pub fn fault_active_within(&self, window: std::time::Duration) -> bool {
+        if self.faults_inflight.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        let last = self.last_fault_us.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = self.epoch.elapsed().as_micros() as u64;
+        now.saturating_sub(last) < window.as_micros() as u64
     }
 
     /// The sealed dirty map (held from construction — no waiting).
@@ -266,9 +294,7 @@ impl PeerSession {
         if self.is_lost() {
             return Err(PeerError::Lost("peer already marked lost".into()));
         }
-        let t_fault = std::time::Instant::now();
-        self.fault_count.fetch_add(1, Ordering::Relaxed);
-        let _stamp = scopeguard_us(&self.fault_us, t_fault);
+        let _fault = self.begin_fault();
         let mut conn = self.fault_conn.lock().expect("fault conn poisoned");
         let mut last_err: Option<PeerError> = None;
         for attempt in 0..=RECONNECT_ATTEMPTS {
@@ -312,17 +338,28 @@ impl PeerSession {
     }
 }
 
-/// Add the elapsed µs since `start` into `acc` on drop — covers every
-/// return path of the instrumented scope.
-fn scopeguard_us(acc: &AtomicU64, start: std::time::Instant) -> impl Drop + '_ {
-    struct G<'a>(&'a AtomicU64, std::time::Instant);
-    impl Drop for G<'_> {
-        fn drop(&mut self) {
-            self.0
-                .fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+impl PeerSession {
+    /// Fault-scope guard: counts the fault, marks it in-flight (the
+    /// drain's park condition), and on drop — every return path —
+    /// accumulates the elapsed wall, tracks the max, and stamps the
+    /// completion time for the drain's recent-fault window.
+    fn begin_fault(&self) -> impl Drop + '_ {
+        self.fault_count.fetch_add(1, Ordering::Relaxed);
+        self.faults_inflight.fetch_add(1, Ordering::Relaxed);
+        struct G<'a>(&'a PeerSession, std::time::Instant);
+        impl Drop for G<'_> {
+            fn drop(&mut self) {
+                let us = self.1.elapsed().as_micros() as u64;
+                self.0.fault_us.fetch_add(us, Ordering::Relaxed);
+                self.0.fault_max_us.fetch_max(us, Ordering::Relaxed);
+                self.0.faults_inflight.fetch_sub(1, Ordering::Relaxed);
+                self.0
+                    .last_fault_us
+                    .store(self.0.epoch.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
         }
+        G(self, std::time::Instant::now())
     }
-    G(acc, start)
 }
 
 /// One `NeedAt` round-trip on `conn` (used by the fault path and, with

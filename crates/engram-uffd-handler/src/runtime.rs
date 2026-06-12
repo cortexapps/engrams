@@ -1020,7 +1020,17 @@ impl Runtime {
         let mut iter = todo.into_iter();
         let mut processed = 0usize;
         loop {
-            // Fill the pipeline.
+            // Fill the pipeline — but YIELD to guest faults. A fault
+            // request queuing behind the drain's in-flight bulk bytes
+            // was the measured ~7 ms/fault (vs ~1 ms on a quiet wire);
+            // during a post-resume fault storm the guest's stall
+            // matters and the drain's finish time does not (it only
+            // delays the source release). Parking REFILLS only: the
+            // up-to-8 outstanding responses flush in a few ms, then
+            // the wire belongs to the fault path until it goes quiet.
+            while peer.fault_active_within(std::time::Duration::from_millis(2)) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
             while in_flight.len() < PIPELINE_DEPTH {
                 let Some(offset) = iter.next() else { break };
                 if self.chunk_installed((offset / chunk_size) as usize) {
@@ -1226,7 +1236,7 @@ pub fn run_listener(
                     let started = std::time::Instant::now();
                     match rt.drain_from_peer(&peer) {
                         Ok(stats) => {
-                            let (faults, fault_us) = peer.fault_stats();
+                            let (faults, fault_us, fault_max_us) = peer.fault_stats();
                             tracing::info!(
                                 pulled = stats.pulled,
                                 alt_sourced = stats.alt_sourced,
@@ -1234,6 +1244,7 @@ pub fn run_listener(
                                 ms = started.elapsed().as_millis() as u64,
                                 faults,
                                 fault_us,
+                                fault_max_us,
                                 "post-copy drain complete"
                             );
                             if let Some(control) = rt.control.as_ref() {
@@ -1244,6 +1255,7 @@ pub fn run_listener(
                                     ms: started.elapsed().as_millis() as u64,
                                     faults,
                                     fault_us,
+                                    fault_max_us,
                                 });
                             }
                         }

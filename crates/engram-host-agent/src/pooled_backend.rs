@@ -4157,6 +4157,7 @@ impl SandboxBackend for PooledBackend {
                         ms,
                         faults,
                         fault_us,
+                        fault_max_us,
                     } => {
                         // Restore-tail attribution: the fault-path
                         // totals are the serial P2P cost inside the FC
@@ -4165,6 +4166,7 @@ impl SandboxBackend for PooledBackend {
                         tracing::info!(
                             faults,
                             fault_ms = fault_us / 1000,
+                            fault_max_us,
                             "post-copy memory drain done (handler fault-path totals)",
                         );
                         return Ok(DrainOutcome::Done {

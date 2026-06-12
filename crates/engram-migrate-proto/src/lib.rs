@@ -242,6 +242,7 @@ pub enum HandlerControl {
         ms: u64,
         faults: u64,
         fault_us: u64,
+        fault_max_us: u64,
     },
     /// The peer is gone (dial/reconnect exhausted, frame error, or sha
     /// mismatch) with sealed chunks still uninstalled. FATAL by design:
@@ -385,6 +386,7 @@ mod tests {
             ms: 1234,
             faults: 42,
             fault_us: 55_000,
+            fault_max_us: 9_000,
         });
         round_trip(&HandlerControl::PeerLost {
             remaining: 3,
