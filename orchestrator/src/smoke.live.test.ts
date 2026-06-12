@@ -668,9 +668,13 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   test.skipIf(!SMOKE)(
     "14a/14b anonymous shell WS → 401 (no upgrade)",
     async () => {
-      const res = await fetch(`${BASE}/api/v1/sessions/any-id/shell`, {
-        headers: { Upgrade: "websocket", Connection: "Upgrade" },
-      });
+      // Plain HTTP GET — no Upgrade headers.  The auth guard runs in the Hono
+      // request handler and returns HTTP 401 before any WS upgrade is attempted.
+      // Under Bun 1.3.14, fetch() with Upgrade headers triggers the node:http
+      // 'upgrade' event (not the HTTP request handler), and socket.write() is
+      // a no-op there, so the client would hang.  A plain GET correctly exercises
+      // the pre-upgrade gate and returns a real HTTP 401.
+      const res = await fetch(`${BASE}/api/v1/sessions/any-id/shell`);
       expect(res.status).toBe(401);
       console.log("Smoke 14a PASS: anonymous shell WS → 401");
     },

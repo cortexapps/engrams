@@ -136,7 +136,9 @@ async function startWsServer(deps: ShellDeps) {
     }
     return c.json({ error: String(err) }, 500);
   });
-  const server = buildServer(app, () => {}, { injectWebSocket } as Parameters<typeof buildServer>[2]);
+  // Pass the full NodeWebSocket handle so buildServer can install the
+  // Bun-compatible upgrade handler (wss.handleUpgrade instead of socket.end).
+  const server = buildServer(app, () => {}, { upgradeWebSocket, injectWebSocket, wss });
   return new Promise<{ wsUrl: string; baseUrl: string; server: ReturnType<typeof buildServer> }>(
     (resolve) => {
       server.listen(0, "127.0.0.1", () => {
