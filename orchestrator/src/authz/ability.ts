@@ -40,10 +40,12 @@ export type Subjects =
 export type TaskSubject = { createdByUserId: string | null };
 export type SessionSubject = { createdByUserId: string | null };
 
-// We use the generic MongoAbility without subject-shape constraints so that
-// we can use plain strings as subjects AND call `subject(name, obj)` for
-// ownership checks. The conditions are validated at runtime by CASL's
-// MongoDB matcher.
+// We use `MongoAbility<[Actions, any]>` rather than the fully-typed
+// `MongoAbility<[Actions, Subjects]>` because CASL's `subject()` helper
+// overloads fight the union-subject constraint at call sites when mixing
+// plain string subjects ("Fleet") with shaped objects ({ createdByUserId }).
+// If this file grows team/sharing semantics, that is the OpenFGA trigger —
+// stop and write the ADR first.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AppAbility = MongoAbility<[Actions, any]>;
 

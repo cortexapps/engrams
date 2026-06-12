@@ -177,7 +177,18 @@ export function registerPassthrough(
           role: session.user.role ?? "user",
         });
 
-        // 4. Ownership check (session-scoped methods).
+        // 4. Config guard: a Session-subject entry without sessionIdField would
+        // fall into the flat string-subject branch below where CASL ignores
+        // conditions and returns true for any member — latent fail-open.
+        // Catch it loud so a policy-map edit doesn't silently open the gate.
+        if (entry.subject === "Session" && !entry.sessionIdField) {
+          throw new ConnectError(
+            `policy misconfiguration: Session-subject entry for ${key} has no sessionIdField`,
+            Code.Internal,
+          );
+        }
+
+        // 5. Ownership check (session-scoped methods).
         if (entry.sessionIdField) {
           const sid = (req as Record<string, string>)[entry.sessionIdField];
           if (!sid) {

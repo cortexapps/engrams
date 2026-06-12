@@ -416,10 +416,10 @@ smoke-control-plane:
         cargo test -p engram-coordinator --test grpc_smoke -- --ignored --nocapture --test-threads=1
 
 # Live smoke of the orchestrator authz surface (ADR 0039 Task 18 stage gate).
-# Requires `just dev` running (orchestrator on 127.0.0.1:3100 by default).
+# Requires `just dev` running (orchestrator on 127.0.0.1:8787 by default).
 # Tests: unauthenticated → Unauthenticated, member + ListHosts → PermissionDenied,
-#        member + ListEnabledImages → OK.
-# Skips gracefully when ORCHESTRATOR_URL is not reachable.
+#        member + ListEnabledImages → OK, admin + ListHosts → OK.
+# Gate is SMOKE=1 — without it all tests are skipped (zero failures reported).
 smoke-orchestrator:
     SMOKE=1 bun test --cwd orchestrator src/smoke.live.test.ts
 

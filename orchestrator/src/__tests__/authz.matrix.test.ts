@@ -11,6 +11,8 @@
  *   - admin calling any method → allowed
  *   - method with no policy entry → 403 PermissionDenied (fail-closed)
  *   - member reading image catalog → allowed
+ *   - POLICY structural: every Session-subject entry carries sessionIdField
+ *   - fail-closed: no-policy-entry → PermissionDenied, zero upstream calls
  *
  * Both getSession and resolveOwner are injected so no DB is needed.
  * Clients use the /rpc base path since the server routes /rpc/* to Connect.
@@ -33,6 +35,7 @@ import { buildServer } from "../server.ts";
 import { registerPassthrough } from "../rpc/passthrough.ts";
 import type { GetSession, ResolveOwner } from "../rpc/passthrough.ts";
 import { SURFACE } from "../rpc/surface.ts";
+import { POLICY } from "../authz/policy-map.ts";
 import { clearOwnerCache } from "../authz/resolve.ts";
 
 import { SessionService } from "../gen/engram/app/v1/session_pb.ts";
@@ -333,6 +336,58 @@ describe("authz.matrix — member reads image catalog", () => {
       expect(result).toBeDefined();
       expect(orch.upstreamCallCount.value).toBe(1);
     } finally {
+      await orch.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 1b: POLICY structural guard — every Session-subject entry must carry
+// sessionIdField, or the flat string-subject branch in the gate would be
+// reached and CASL would return true for any member (latent fail-open).
+// ---------------------------------------------------------------------------
+
+describe("POLICY structural: every Session-subject entry carries sessionIdField", () => {
+  test("no Session-subject entry lacks sessionIdField", () => {
+    const violations: string[] = [];
+    for (const [key, entry] of Object.entries(POLICY)) {
+      if (entry.subject === "Session" && !entry.sessionIdField) {
+        violations.push(key);
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 3: Fail-closed — a method with no POLICY entry must yield PermissionDenied
+// with zero upstream calls. POLICY is a module constant so we can't inject a
+// replacement map; instead we temporarily delete an entry, verify the gate
+// fires, then restore it.
+// ---------------------------------------------------------------------------
+
+describe("authz.matrix — fail-closed: no POLICY entry → PermissionDenied (zero upstream)", () => {
+  test("erasing a POLICY entry makes the gate deny with zero upstream calls", async () => {
+    // Temporarily remove GetSession from POLICY to prove no-entry → denied.
+    const KEY = "SessionService.GetSession";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const saved = (POLICY as Record<string, any>)[KEY];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    delete (POLICY as Record<string, any>)[KEY];
+
+    const orch = await spawnOrchestrator(makeGetSession(MEMBER_A, "user"));
+    try {
+      const client = createClient(SessionService, makeTransport(orch.serverUrl));
+      await expectCode(
+        () => client.getSession({ sessionId: SESSION_OF_A }),
+        Code.PermissionDenied,
+      );
+      // The upstream must never be reached when the policy entry is absent.
+      expect(orch.upstreamCallCount.value).toBe(0);
+    } finally {
+      // Restore the entry so other tests are not affected.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (POLICY as Record<string, any>)[KEY] = saved;
       await orch.close();
     }
   });

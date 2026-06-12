@@ -77,3 +77,14 @@ export async function resolveSessionOwner(
 export function clearOwnerCache(): void {
   cache.clear();
 }
+
+/**
+ * Evict a single session from the owner cache.
+ *
+ * Task 19's createTask MUST call this after inserting task_session rows so
+ * that a just-created session is not served a stale null from the ≤5 s
+ * negative-cache window.
+ */
+export function evictOwnerCacheEntry(sessionId: string): void {
+  cache.delete(sessionId);
+}

@@ -4,10 +4,14 @@
  * For every method in SURFACE, verifies that:
  *   1. A request deterministically filled with sentinel values reaches the
  *      upstream byte-for-byte identical.
- *   2. The upstream response (server-streaming: two messages) reaches the
- *      client unchanged.
- *   3. The upstream receives the bearer authorization header.
- *   4. The upstream's x-fake-upstream response header propagates to the client.
+ *   2. The upstream response (server-streaming: exactly 2 messages) reaches
+ *      the client unchanged — "≥1" would pass even on truncation.
+ *   3. The upstream does NOT receive cookie/authorization headers (the
+ *      upstreamHeaders() scrub). Note: the in-process createRouterTransport
+ *      does not carry real HTTP bearer headers, so we assert the scrub
+ *      (cookie/authorization absent) rather than asserting a forwarded token.
+ *   4. The upstream's x-fake-upstream response header survives copyHeaders to
+ *      the client (exercises copyHeaders, currently untested by the matrix).
  *
  * Run as an admin user so the policy gate passes — transport fidelity and
  * authz are exercised orthogonally (authz matrix lives in authz.matrix.test.ts).
@@ -270,10 +274,10 @@ describe("passthrough conformance", () => {
         const fakeImpl: Record<string, any> = {};
 
         if (m.methodKind === "unary") {
-          fakeImpl[m.localName] = (upstreamReq: unknown, ctx: { requestHeader: Headers }) => {
+          fakeImpl[m.localName] = (upstreamReq: unknown, ctx: { requestHeader: Headers; responseHeader: Headers }) => {
             capturedUpstreamReq = upstreamReq;
             capturedUpstreamHeaders = ctx.requestHeader;
-            ctx.requestHeader; // just access it (header is on ctx)
+            ctx.responseHeader.set("x-fake-upstream", "1");
             return res;
           };
         } else {
@@ -308,7 +312,10 @@ describe("passthrough conformance", () => {
           if (m.methodKind === "unary") {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const client = createClient(service as any, transport) as any;
-            const clientRes = await client[m.localName](req);
+            let capturedResponseHeader: Headers | null = null;
+            const clientRes = await client[m.localName](req, {
+              onHeader(h: Headers) { capturedResponseHeader = h; },
+            });
 
             // The upstream received the request byte-for-byte.
             expect(toBinary(m.input, capturedUpstreamReq as never)).toEqual(
@@ -319,16 +326,42 @@ describe("passthrough conformance", () => {
             expect(toBinary(m.output, clientRes as never)).toEqual(
               toBinary(m.output, res),
             );
+
+            // (a) Scrub: upstream must NOT have seen cookie or authorization.
+            // createRouterTransport is in-process and carries no real bearer,
+            // so we assert absence rather than presence — the scrub still applies.
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            expect(capturedUpstreamHeaders!.has("cookie")).toBe(false);
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            expect(capturedUpstreamHeaders!.has("authorization")).toBe(false);
+
+            // (b) copyHeaders: x-fake-upstream set by upstream must survive to client.
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            expect(capturedResponseHeader!.get("x-fake-upstream")).toBe("1");
           } else {
             // server_streaming: collect all messages.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const client = createClient(service as any, transport) as any;
             const messages: unknown[] = [];
-            for await (const msg of client[m.localName](req)) {
+            let capturedResponseHeader: Headers | null = null;
+            for await (const msg of client[m.localName](req, {
+              onHeader(h: Headers) { capturedResponseHeader = h; },
+            })) {
               messages.push(msg);
             }
 
-            expect(messages.length).toBeGreaterThanOrEqual(1);
+            // (c) Exact count: "≥1" would pass on truncation; the fake yields 2.
+            expect(messages.length).toBe(2);
+
+            // (a) Scrub: upstream must NOT have seen cookie or authorization.
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            expect(capturedUpstreamHeaders!.has("cookie")).toBe(false);
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            expect(capturedUpstreamHeaders!.has("authorization")).toBe(false);
+
+            // (b) copyHeaders: x-fake-upstream must propagate to the client.
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            expect(capturedResponseHeader!.get("x-fake-upstream")).toBe("1");
 
             // Upstream saw the request.
             expect(toBinary(m.input, capturedUpstreamReq as never)).toEqual(
