@@ -17,9 +17,6 @@
 //! captured by the bus subscription; we de-dupe by tracking the
 //! highest replayed idx and skipping live events at or below it.
 
-use std::convert::Infallible;
-
-use axum::response::sse::Event;
 use engram_core::SessionId;
 use futures::stream::{Stream, StreamExt};
 use tokio::sync::broadcast;
@@ -172,23 +169,7 @@ pub(crate) async fn events_core(
 }
 
 // ADR 0039 Task 32: `events` axum shim removed. See `events_core` for the gRPC entry point.
-
-#[allow(dead_code)]
-fn build_event_stream(
-    replayed: Vec<engram_core::types::PersistedEvent>,
-    live_rx: broadcast::Receiver<IndexedEvent>,
-    since: Option<i64>,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    merged_event_stream(replayed, live_rx, since).map(|ev| {
-        let (idx, kind, payload_json) = merged_to_parts(ev);
-        // SSE framing: `id:` line present iff idx is Some (not for lagged).
-        let mut sse = Event::default().event(kind).data(payload_json);
-        if let Some(i) = idx {
-            sse = sse.id(i.to_string());
-        }
-        Ok::<Event, Infallible>(sse)
-    })
-}
+// ADR 0039 final cleanup: `build_event_stream` removed (SSE shim; no references after axum routes dropped).
 
 /// Merge ADR 0028 A.log rewind metadata into an event's data object.
 /// Non-object payloads (shouldn't happen for our typed events) pass

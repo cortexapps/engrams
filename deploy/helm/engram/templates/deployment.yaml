@@ -111,65 +111,7 @@ spec:
                   name: {{ .Values.auth.existingSecret }}
                   key: {{ .Values.auth.secretKey }}
             {{- end }}
-            {{- /* ADR 0031 human authentication. `auth.mode` selects the
-                   verifier (oidc | forward-auth | none=synthetic-admin).
-                   `ENGRAM_AUTH_TOKENS` above stays for the host-agent's
-                   internal-router path regardless of mode. */}}
-            {{- if .Values.auth.mode }}
-            - name: ENGRAM_AUTH_MODE
-              value: {{ .Values.auth.mode | quote }}
-            {{- end }}
-            {{- if .Values.auth.bootstrapAdmins }}
-            - name: ENGRAM_BOOTSTRAP_ADMINS
-              value: {{ join "," .Values.auth.bootstrapAdmins | quote }}
-            {{- end }}
-            {{- if .Values.auth.cookieSecure }}
-            - name: ENGRAM_COOKIE_SECURE
-              value: "true"
-            {{- end }}
-            {{- with .Values.auth.forwardAuth }}
-            {{- if .header }}
-            - name: ENGRAM_FORWARD_AUTH_HEADER
-              value: {{ .header | quote }}
-            {{- end }}
-            {{- if .jwksUrl }}
-            - name: ENGRAM_FORWARD_AUTH_JWKS_URL
-              value: {{ .jwksUrl | quote }}
-            {{- end }}
-            {{- if .issuer }}
-            - name: ENGRAM_FORWARD_AUTH_ISSUER
-              value: {{ .issuer | quote }}
-            {{- end }}
-            {{- if .audience }}
-            - name: ENGRAM_FORWARD_AUTH_AUDIENCE
-              value: {{ .audience | quote }}
-            {{- end }}
-            {{- if .emailClaim }}
-            - name: ENGRAM_FORWARD_AUTH_EMAIL_CLAIM
-              value: {{ .emailClaim | quote }}
-            {{- end }}
-            {{- end }}
-            {{- with .Values.auth.oidc }}
-            {{- if .issuer }}
-            - name: ENGRAM_OIDC_ISSUER
-              value: {{ .issuer | quote }}
-            {{- end }}
-            {{- if .clientId }}
-            - name: ENGRAM_OIDC_CLIENT_ID
-              value: {{ .clientId | quote }}
-            {{- end }}
-            {{- if .redirectUrl }}
-            - name: ENGRAM_OIDC_REDIRECT_URL
-              value: {{ .redirectUrl | quote }}
-            {{- end }}
-            {{- if .clientSecret.existingSecret }}
-            - name: ENGRAM_OIDC_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .clientSecret.existingSecret }}
-                  key: {{ .clientSecret.secretKey }}
-            {{- end }}
-            {{- end }}
+            {{- /* Human auth lives in the orchestrator (ADR 0039 §5). */}}
             {{- if eq .Values.forge.provider "github" }}
             # ADR 0023: the GitHub App private key (PEM). The coord reads
             # ENGRAM_GITHUB_APP_PRIVATE_KEY in preference to a key path.
