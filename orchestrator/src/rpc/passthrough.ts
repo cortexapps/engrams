@@ -81,6 +81,31 @@ function headersOf(ctx: HandlerContext): Headers {
   return ctx.requestHeader;
 }
 
+/**
+ * Build clean upstream headers from an inbound request.
+ *
+ * The inbound Connect/gRPC-Web request carries protocol-specific headers
+ * (content-type: application/json, connect-protocol-version, etc.) that must
+ * NOT be forwarded to the outbound gRPC/HTTP-2 call — Tonic rejects them as
+ * NGHTTP2_PROTOCOL_ERROR. Only safe, application-level headers (x-request-id,
+ * x-trace-id, etc.) are forwarded; the gRPC transport adds its own content-type
+ * and the bearer interceptor injects the Authorization header.
+ */
+function upstreamHeaders(inbound: Headers): Headers {
+  const out = new Headers();
+  // Allowlist of safe headers to propagate to the control plane.
+  // Content-type, connect-*, accept, and other protocol headers must be
+  // omitted — they belong to the inbound Connect protocol, not gRPC.
+  const ALLOWED_PREFIXES = ["x-request-id", "x-trace-id", "x-b3-", "traceparent", "tracestate"];
+  inbound.forEach((value, key) => {
+    const lower = key.toLowerCase();
+    if (ALLOWED_PREFIXES.some((p) => lower.startsWith(p))) {
+      out.set(key, value);
+    }
+  });
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Main registration
 // ---------------------------------------------------------------------------
@@ -189,7 +214,11 @@ export function registerPassthrough(
             m as any,
             ctx.signal,
             undefined,
-            ctx.requestHeader,
+            // Use clean headers — inbound Connect headers (content-type: application/json,
+            // connect-protocol-version, etc.) must NOT be forwarded to the outbound gRPC
+            // transport or Tonic returns NGHTTP2_PROTOCOL_ERROR. The transport's
+            // bearerInterceptor injects Authorization; only safe tracing headers are passed.
+            upstreamHeaders(ctx.requestHeader),
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             req as any,
             ctx.values,
@@ -207,7 +236,8 @@ export function registerPassthrough(
             m as any,
             ctx.signal,
             undefined,
-            ctx.requestHeader,
+            // Same header-scrubbing rationale as the unary case above.
+            upstreamHeaders(ctx.requestHeader),
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (async function* () { yield req as any; })(),
             ctx.values,
