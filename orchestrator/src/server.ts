@@ -28,8 +28,10 @@
  *
  *   For auth-failure cases: the upgrade completes (101) but the WS is immediately
  *   closed with code 4401 ("Unauthorized") or 4404 ("Not Found") so the client
- *   can distinguish the rejection reason.  Browsers see onerror/onclose(4401)
- *   rather than an HTTP 401; this is a known limitation of the Bun socket bug.
+ *   can distinguish the rejection reason.  WS close codes 4000–4999 are reserved
+ *   for application use; we encode HTTP status as 4000+status (4401, 4404, etc.).
+ *   Browsers see onerror/onclose(4401) rather than an HTTP 401; this is a known
+ *   limitation of the Bun socket bug.
  *
  *   For smoke test 14a ("anonymous WS → 401 (no upgrade)"): the test is now a
  *   plain HTTP GET (no Upgrade headers) so the guard fires in the Hono request
@@ -93,7 +95,7 @@ export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs
     //   2a. Auth passes (response 200) → wss.handleUpgrade + wss.emit("connection")
     //       → @hono/node-ws's internal wss.on("connection") resolves the waiter
     //       → upgradeWebSocket's async closure runs → onOpen/onMessage/onClose fire.
-    //   2b. Auth fails (response 4xx) → wss.handleUpgrade + ws.close(4400+status)
+    //   2b. Auth fails (response 4xx) → wss.handleUpgrade + ws.close(4000+status)
     //       so the WS close code encodes the HTTP status (4401 = Unauthorized,
     //       4404 = Not Found, etc.).  Bun socket.end() is not used at all.
     const { wss } = nodeWs;
@@ -114,10 +116,10 @@ export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs
       if (response.status !== 200) {
         // Auth/guard rejected the request.  Use handleUpgrade+close because
         // Bun's socket.write() is a no-op in the upgrade event handler.
-        // Close code 4400+httpStatus encodes the rejection reason for clients
+        // Close code 4000+httpStatus encodes the rejection reason for clients
         // (e.g. 4401 = Unauthorized, 4404 = Not Found).
-        // Cap at 4499 (WS close codes 4000–4999 are reserved for application use).
-        const closeCode = Math.min(4400 + response.status, 4499);
+        // Cap at 4999 (WS application close codes run 4000–4999).
+        const closeCode = Math.min(4000 + response.status, 4999);
         wss.handleUpgrade(request, socket, head, (ws) => {
           ws.close(closeCode, response.statusText || String(response.status));
         });

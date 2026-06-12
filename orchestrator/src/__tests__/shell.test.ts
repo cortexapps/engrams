@@ -3,6 +3,7 @@
  * No SMOKE env needed for these tests.
  */
 import { expect, test, describe } from "bun:test";
+import WebSocketClient from "ws";
 import {
   pushableQueue,
   isAbortLike,
@@ -186,6 +187,48 @@ describe("Shell WS route — guard", () => {
       expect(res.status).toBe(404);
     } finally {
       await stopWsServer(server);
+    }
+  });
+
+  test("8: unauthenticated WS upgrade → close code 4401", async () => {
+    // Use the `ws` npm client (not Bun's native WebSocket) because Bun's native
+    // WS strips custom request headers, breaking any auth that relies on them.
+    // The ws client sends a real HTTP Upgrade request with full headers.
+    const { wsUrl, server } = await startWsServer({
+      shellRelay: fastFakeRelay,
+      getSession: makeGetSessionWs(null), // null → no session → 401
+      resolveOwner: makeResolveOwnerWs(),
+    });
+    try {
+      const closeCode = await new Promise<number>((resolve, reject) => {
+        const ws = new WebSocketClient(
+          `${wsUrl}/api/v1/sessions/${SESSION_OF_A_WS}/shell`,
+          ["tty"],
+        );
+        const t = setTimeout(() => {
+          ws.terminate();
+          reject(new Error("timeout waiting for close"));
+        }, 4000);
+        ws.on("close", (code: number) => {
+          clearTimeout(t);
+          // setImmediate defers the resolve so Bun's event loop can flush the
+          // ws-client microtasks before the Promise continuation runs.
+          setImmediate(() => resolve(code));
+        });
+        ws.on("error", (_err: Error) => {
+          // ws may emit an error before close on non-101 responses; ignore and
+          // wait for the close event which carries the code.
+        });
+      });
+      expect(closeCode).toBe(4401);
+    } finally {
+      // closeAllConnections() forces immediate teardown of any lingering sockets
+      // (e.g. the handleUpgrade connection); without it server.close() blocks
+      // waiting for the WS connection to drain.  After closing connections we
+      // call server.close() directly (stopWsServer would throw ERR_SERVER_NOT_RUNNING
+      // if closeAllConnections already stopped it in Bun 1.3).
+      (server as ReturnType<typeof buildServer> & { closeAllConnections(): void }).closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
     }
   });
 });

@@ -53,9 +53,10 @@ const server = buildServer(
     // to the control plane with per-method CASL authz gate (ADR 0039 Task 18).
     registerPassthrough(router, SURFACE, controlPlaneTransport);
   },
-  // Pass only the injectWebSocket method from the NodeWebSocket handle.
-  // buildServer only calls nodeWs.injectWebSocket(server); the other fields
-  // (upgradeWebSocket, wss) are not needed at the server layer.
+  // Pass the full NodeWebSocket handle so buildServer can install the
+  // Bun-compatible upgrade handler (wss.handleUpgrade instead of socket.end).
+  // injectWebSocket is included for completeness but the custom upgrade handler
+  // is used instead of calling nodeWs.injectWebSocket(server).
   { upgradeWebSocket, wss, injectWebSocket },
 );
 

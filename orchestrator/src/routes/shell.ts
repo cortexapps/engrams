@@ -11,7 +11,7 @@
  * - Pump IIFE is void'd; Canceled/Aborted errors are swallowed → no unhandledRejection.
  * - Server-side keepalive: ping every 20 s, close on missed pong.
  * - Backpressure: pause consuming upstream when bufferedAmount > 1 MiB.
- * - Sec-WebSocket-Protocol: tty echoed (set via wss.options.handleProtocols in server).
+ * - Sec-WebSocket-Protocol: tty echoed (set via wss.options.handleProtocols in index.ts).
  */
 
 import { Hono } from "hono";
