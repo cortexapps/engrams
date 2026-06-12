@@ -929,6 +929,33 @@ impl PooledBackend {
         // memory capture below is paired with it.
         #[cfg(target_os = "linux")]
         let nbd_pending_flush = if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            // Push the HOST's block-device page cache down to the
+            // daemon BEFORE draining. FC's virtio-blk writes to
+            // /dev/nbdN through the kernel page cache (drive
+            // cache_type = Unsafe: guest FLUSH does not propagate), so
+            // without this fsync the drain captures only what
+            // background writeback (~30 s) happened to deliver — a
+            // session that wrote recently snapshots a TORN chunk (the
+            // delivered front + a stale tail). The migration captures
+            // each carried this fsync already; the standard pipeline
+            // (periodic checkpoint / idle-evict / rehome) relied on
+            // "quiescent sessions age past the writeback interval",
+            // which the disk post-copy canary disproved: write → evac
+            // 15 s later published chunk 34 with its last 56 KiB
+            // reverted, and a periodic checkpoint of an actively-
+            // writing guest has the same hole (recovery from it would
+            // be corrupt).
+            let dev = entry.device_path().to_path_buf();
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&dev)?;
+                f.sync_all()
+            })
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
+            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
             // Drain in-flight NBD requests so the drain sees a quiescent
             // dirty buffer. With FC paused above, no new virtio writes
             // are issued, and wait_idle returns once already-in-flight
