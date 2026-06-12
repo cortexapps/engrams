@@ -402,6 +402,24 @@ impl NbdSandboxState {
     pub fn device_path(&self) -> &Path {
         self.slot.path()
     }
+
+    /// Graceful-shutdown teardown that leaves the KERNEL side alive
+    /// for the successor host-agent generation (ADR 0044 K2). Without
+    /// this, process exit drops [`NbdHandle`] → netlink disconnect →
+    /// the survivor's disk is torn down by its own dying parent
+    /// ("Disconnected due to user request", prod 2026-06-12 canary)
+    /// and the successor's RECONFIGURE meets "not configured". The
+    /// serve task + scheduler are aborted (in-process resources); the
+    /// device config, with its parked-I/O dead_conn window, persists.
+    /// The slot lease is forgotten rather than released — the pool
+    /// dies with the process, and `NbdSlot::Drop` would
+    /// `tokio::spawn` during runtime teardown.
+    pub fn abandon_for_shutdown(self) {
+        drop(self.scheduler);
+        self.handle.abandon();
+        std::mem::forget(self.slot);
+        drop(self.backend);
+    }
 }
 
 /// One-call setup for a sandbox's NBD-backed rootfs:

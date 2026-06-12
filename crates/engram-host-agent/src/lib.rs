@@ -1142,6 +1142,27 @@ impl HostAgent {
             // *controlled* node drain migrates active sessions off first
             // (the K3 operator / admin endpoints), so by the time SIGTERM
             // lands there is nothing left here to lose.
+            //
+            // ADR 0044 K2: the NBD data planes must be ABANDONED, not
+            // dropped — process unwind would otherwise run
+            // NbdHandle::Drop → netlink disconnect and tear down the
+            // survivors' disks on the way out (the 2026-06-12 canary:
+            // "Disconnected due to user request" at old-pod SIGTERM,
+            // then the successor's RECONFIGURE met "not configured").
+            // Abandon kills only in-process resources; the kernel
+            // config persists with guest I/O parked under
+            // dead_conn_timeout until the successor reconfigures.
+            #[cfg(target_os = "linux")]
+            {
+                let abandoned = pooled.abandon_nbd_data_planes_for_shutdown();
+                if abandoned > 0 {
+                    tracing::info!(
+                        abandoned,
+                        "SIGTERM: abandoned NBD data planes (kernel configs left \
+                         alive for the successor to RECONFIGURE)",
+                    );
+                }
+            }
             tracing::info!(
                 "SIGTERM: detaching running microVMs (left alive for the successor \
                  host-agent to reattach); not checkpointing"

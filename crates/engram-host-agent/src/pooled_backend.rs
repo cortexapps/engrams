@@ -1762,6 +1762,25 @@ impl PooledBackend {
         self.nbd_pool.clone()
     }
 
+    /// ADR 0044 K2 graceful shutdown: abandon every live NBD data
+    /// plane WITHOUT disconnecting the kernel side, so surviving FC
+    /// VMs keep their (parked) devices for the successor generation
+    /// to RECONFIGURE. Called from the SIGTERM path right before the
+    /// process exits; per-sandbox destroy keeps its normal
+    /// disconnect-on-drop.
+    #[cfg(target_os = "linux")]
+    pub fn abandon_nbd_data_planes_for_shutdown(&self) -> usize {
+        let ids: Vec<_> = self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
+        let mut abandoned = 0;
+        for id in ids {
+            if let Some((_, state)) = self.nbd_sandboxes.remove(&id) {
+                state.abandon_for_shutdown();
+                abandoned += 1;
+            }
+        }
+        abandoned
+    }
+
     /// Attach a chunk store + a per-host directory where chunked
     /// manifests get materialized. Once set, `create()` resolves the
     /// cached image's `bundle.json` → manifest → file via the chunk
