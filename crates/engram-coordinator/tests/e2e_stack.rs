@@ -677,6 +677,19 @@ async fn e2e_claude_with_bogus_key_surfaces_anthropic_auth_error() {
     driver.delete(sid).await;
 }
 
+/// Whether this environment is REQUIRED to exercise the NBD
+/// chunked-disk path. Set `ENGRAM_EXPECT_NBD=1` on runners where NBD
+/// is known-available (Blacksmith ships `CONFIG_BLK_DEV_NBD=y`
+/// built-in; the dev VM loads `nbd.ko`) so a null `cow-state` becomes
+/// a hard failure instead of a silent skip. Unset (local macOS / VZ,
+/// any NBD-less box) keeps the graceful-degrade warning path.
+fn nbd_required() -> bool {
+    matches!(
+        std::env::var("ENGRAM_EXPECT_NBD").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// ADR 0016 Phase B commit 4b: end-to-end exercise of the
 /// FlushScheduler primitive via the admin `flush-now` endpoint.
 /// Explicit-trigger counterpart to the scheduler's 30s implicit
@@ -743,22 +756,28 @@ async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
     );
 
     // Step 3: probe whether this environment can actually exercise
-    // the chunked-disk path. `cow-state` returns Some(...) only
-    // when the sandbox is NBD-tracked (the demo image got NBD-
-    // attached, not materialized-to-file). On Blacksmith CI today
-    // `nbd.ko` isn't in the guest kernel → integration-up.sh
-    // falls back to materialize-to-file → cow-state is null →
-    // skip the rest with a loud warning so the gap is visible in
-    // every CI run.
+    // the chunked-disk path. `cow-state` returns Some(...) only when
+    // the sandbox is NBD-tracked (the demo image got NBD-attached,
+    // not materialized-to-file). Where NBD is known-available
+    // (ENGRAM_EXPECT_NBD set — Blacksmith ships it built-in), a null
+    // here is a real regression and we FAIL. Elsewhere (macOS / VZ /
+    // NBD-less) we skip with a loud warning so the gap stays visible.
     let cow = driver.cow_state(sid).await;
     if cow.is_none() {
+        assert!(
+            !nbd_required(),
+            "ENGRAM_EXPECT_NBD is set but cow-state is null for session {sid}: the \
+             host-agent fell back to materialize-to-file instead of NBD-attaching the \
+             chunked disk. NBD is available on this runner, so this is a regression in \
+             the chunked-disk wiring, not an environment gap."
+        );
         eprintln!(
             "::warning title=Phase B flush-now e2e partial coverage::\
              cow-state returned null for session {sid} — the runner's host-agent \
              fell back to materialize-to-file (no nbd.ko / no nbd_pool wired). \
              Pre-write flush_now=idle assertion verified the endpoint wiring, but \
              the chunked-disk write → flush → publish round-trip can't be exercised \
-             here. See ci.yml line 518-532 + the dev-vm self-hosted runner follow-up."
+             here."
         );
         driver.delete(sid).await;
         return;
@@ -878,13 +897,19 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
     // which already pins the always-on endpoint shape.
     let pre_cow = driver.cow_state(sid).await;
     if pre_cow.is_none() {
+        assert!(
+            !nbd_required(),
+            "ENGRAM_EXPECT_NBD is set but cow-state is null for session {sid} \
+             (pre-snapshot): the host-agent didn't NBD-attach the chunked disk. \
+             NBD is available on this runner, so this is a regression, not an \
+             environment gap."
+        );
         eprintln!(
             "::warning title=Phase B resume regression partial coverage::\
              cow-state returned null for session {sid} (pre-snapshot) — runner \
              can't exercise the NBD path. Snapshot+resume API wiring will \
              still be exercised below; cow-state-post-resume + \
-             flush-now-post-resume assertions skipped. \
-             See ci.yml line 518-532 + dev-vm self-hosted runner follow-up."
+             flush-now-post-resume assertions skipped."
         );
         driver.delete(sid).await;
         return;
