@@ -118,6 +118,11 @@ pub struct PeerSession {
     fault_conn: Mutex<TcpStream>,
     next_req: AtomicU64,
     lost: AtomicBool,
+    /// Fault-path accounting (restore-tail attribution): how many
+    /// guest faults round-tripped the peer and their cumulative wall —
+    /// the serial P2P cost inside the FC load + early execution.
+    fault_count: AtomicU64,
+    fault_us: AtomicU64,
 }
 
 /// Dial + `Hello` + `HelloAck` + `Seal` on a fresh connection,
@@ -215,7 +220,17 @@ impl PeerSession {
             fault_conn: Mutex::new(stream),
             next_req: AtomicU64::new(1),
             lost: AtomicBool::new(false),
+            fault_count: AtomicU64::new(0),
+            fault_us: AtomicU64::new(0),
         })
+    }
+
+    /// Fault-path totals: `(count, cumulative_µs)`.
+    pub fn fault_stats(&self) -> (u64, u64) {
+        (
+            self.fault_count.load(Ordering::Relaxed),
+            self.fault_us.load(Ordering::Relaxed),
+        )
     }
 
     /// The sealed dirty map (held from construction — no waiting).
@@ -251,6 +266,9 @@ impl PeerSession {
         if self.is_lost() {
             return Err(PeerError::Lost("peer already marked lost".into()));
         }
+        let t_fault = std::time::Instant::now();
+        self.fault_count.fetch_add(1, Ordering::Relaxed);
+        let _stamp = scopeguard_us(&self.fault_us, t_fault);
         let mut conn = self.fault_conn.lock().expect("fault conn poisoned");
         let mut last_err: Option<PeerError> = None;
         for attempt in 0..=RECONNECT_ATTEMPTS {
@@ -292,6 +310,19 @@ impl PeerSession {
             last_err.map(|e| e.to_string()).unwrap_or_default()
         )))
     }
+}
+
+/// Add the elapsed µs since `start` into `acc` on drop — covers every
+/// return path of the instrumented scope.
+fn scopeguard_us(acc: &AtomicU64, start: std::time::Instant) -> impl Drop + '_ {
+    struct G<'a>(&'a AtomicU64, std::time::Instant);
+    impl Drop for G<'_> {
+        fn drop(&mut self) {
+            self.0
+                .fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+    G(acc, start)
 }
 
 /// One `NeedAt` round-trip on `conn` (used by the fault path and, with

@@ -1226,11 +1226,14 @@ pub fn run_listener(
                     let started = std::time::Instant::now();
                     match rt.drain_from_peer(&peer) {
                         Ok(stats) => {
+                            let (faults, fault_us) = peer.fault_stats();
                             tracing::info!(
                                 pulled = stats.pulled,
                                 alt_sourced = stats.alt_sourced,
                                 zero_chunks = stats.zero_chunks,
                                 ms = started.elapsed().as_millis() as u64,
+                                faults,
+                                fault_us,
                                 "post-copy drain complete"
                             );
                             if let Some(control) = rt.control.as_ref() {
@@ -1239,6 +1242,8 @@ pub fn run_listener(
                                     alt_sourced: stats.alt_sourced,
                                     zero_chunks: stats.zero_chunks,
                                     ms: started.elapsed().as_millis() as u64,
+                                    faults,
+                                    fault_us,
                                 });
                             }
                         }

@@ -229,12 +229,19 @@ pub enum HandlerControl {
     DrainProgress { pulled: u64, remaining: u64 },
     /// All sealed chunks installed or demoted; the peer connections are
     /// closed and the handler is byte-identical to a C1 restore from
-    /// here on.
+    /// here on. `faults`/`fault_us` are the FAULT-path totals (guest
+    /// faults that round-tripped the peer + their cumulative wall) —
+    /// the serial P2P cost inside the FC load + early execution, the
+    /// restore-tail attribution the drain numbers can't show. Control
+    /// sock is same-host (handler ↔ its own host-agent, one image), so
+    /// extending the variant is bincode-safe.
     DrainDone {
         pulled: u64,
         alt_sourced: u64,
         zero_chunks: u64,
         ms: u64,
+        faults: u64,
+        fault_us: u64,
     },
     /// The peer is gone (dial/reconnect exhausted, frame error, or sha
     /// mismatch) with sealed chunks still uninstalled. FATAL by design:
@@ -376,6 +383,8 @@ mod tests {
             alt_sourced: 1,
             zero_chunks: 1,
             ms: 1234,
+            faults: 42,
+            fault_us: 55_000,
         });
         round_trip(&HandlerControl::PeerLost {
             remaining: 3,

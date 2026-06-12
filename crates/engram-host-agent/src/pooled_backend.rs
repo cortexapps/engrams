@@ -4155,7 +4155,18 @@ impl SandboxBackend for PooledBackend {
                         alt_sourced,
                         zero_chunks,
                         ms,
+                        faults,
+                        fault_us,
                     } => {
+                        // Restore-tail attribution: the fault-path
+                        // totals are the serial P2P cost inside the FC
+                        // load + early guest execution (cross-ref with
+                        // the load_ms log).
+                        tracing::info!(
+                            faults,
+                            fault_ms = fault_us / 1000,
+                            "post-copy memory drain done (handler fault-path totals)",
+                        );
                         return Ok(DrainOutcome::Done {
                             pulled,
                             alt_sourced,
