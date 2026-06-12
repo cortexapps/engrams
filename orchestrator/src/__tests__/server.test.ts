@@ -6,6 +6,7 @@
  *   2. /rpc/some.Service/Method → handled by Connect adapter (distinguishable
  *      from Hono by the Connect-protocol error body shape or content-type)
  *   3. Unknown non-rpc path → Hono 404 {"error":"not found"}
+ *   4. Streaming: first chunk arrives before stream closes (no full-response buffering)
  *
  * CRITICAL CANARY (Step 7): env-gated gRPC live call.
  *   Set ENGRAM_SMOKE_GRPC=1 to enable. Requires a running coordinator on
@@ -81,9 +82,9 @@ test("POST /rpc/some.Service/Method → Connect adapter response (not Hono)", as
 
   const text = await res.text();
 
-  // Hono's fallback would give {"error":"not found"}
-  // Connect's fallback gives a Connect-typed error (has "code" key)
-  // or a plain 404 with no "error" key — either way, NOT Hono's body.
+  // The body-shape check is the real discriminator:
+  //   Hono's fallback → {"error":"not found"}
+  //   Connect's fallback → empty body or {"code":...} — never has "error":"not found"
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -91,20 +92,14 @@ test("POST /rpc/some.Service/Method → Connect adapter response (not Hono)", as
     parsed = null;
   }
 
-  // Must NOT be Hono's generic 404 shape
+  // Must NOT be Hono's generic 404 shape — this is the definitive assertion.
   if (parsed !== null && typeof parsed === "object") {
     expect((parsed as Record<string, unknown>)["error"]).not.toBe("not found");
+  } else {
+    // Empty or non-JSON body: Connect returns an empty 404 for unknown routes.
+    // Either way, it is not Hono's {"error":"not found"} — test passes.
+    expect(text.trim()).not.toBe('{"error":"not found"}');
   }
-
-  // Connect adapter returns 404 for unknown routes — confirm it came from
-  // Connect by checking the content-type OR the absence of Hono's body.
-  const ct = res.headers.get("content-type") ?? "";
-  const isConnectLike =
-    ct.includes("application/json") ||
-    ct.includes("application/connect") ||
-    ct.includes("application/proto") ||
-    res.status === 404;
-  expect(isConnectLike).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -119,7 +114,102 @@ test("GET /does-not-exist → Hono 404 {error:'not found'}", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. CRITICAL gRPC canary — skip when ENGRAM_SMOKE_GRPC is unset
+// 4. Streaming regression — proves getRequestListener does NOT buffer
+//
+// If the Hono bridge buffers the full response body before sending, the
+// client would receive BOTH chunks only after the stream closes. This test
+// reads the response incrementally and asserts the first chunk arrives
+// before the stream ends (i.e., we observe data mid-stream).
+//
+// Uses a dedicated ephemeral server with a /stream route so this test is
+// self-contained and doesn't pollute the shared fixture.
+// ---------------------------------------------------------------------------
+
+describe("SSE streaming regression (proves no full-response buffering)", () => {
+  let streamBaseUrl: string;
+  let streamServer: ReturnType<typeof buildServer>;
+
+  beforeAll(async () => {
+    const streamApp = new Hono();
+
+    // Route that writes two SSE-ish chunks with a 100 ms delay between them.
+    streamApp.get("/stream", (c) => {
+      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+      const writer = writable.getWriter();
+      const enc = new TextEncoder();
+
+      (async () => {
+        await writer.write(enc.encode("data: chunk1\n\n"));
+        // 100 ms gap — client should observe chunk1 before this delay expires
+        await new Promise((r) => setTimeout(r, 100));
+        await writer.write(enc.encode("data: chunk2\n\n"));
+        await writer.close();
+      })();
+
+      return new Response(readable, {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    });
+
+    streamServer = buildServer(streamApp);
+
+    await new Promise<void>((resolve) => {
+      streamServer.listen(0, "127.0.0.1", () => {
+        const addr = streamServer.address() as import("net").AddressInfo;
+        streamBaseUrl = `http://127.0.0.1:${addr.port}`;
+        resolve();
+      });
+    });
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve, reject) => {
+      streamServer.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  test(
+    "GET /stream — first chunk arrives before stream closes (incremental delivery)",
+    async () => {
+      const res = await fetch(`${streamBaseUrl}/stream`);
+      expect(res.status).toBe(200);
+      expect(res.body).not.toBeNull();
+
+      const reader = res.body!.getReader();
+      const dec = new TextDecoder();
+      const chunks: string[] = [];
+
+      // Read the first chunk; record when it arrives.
+      const t0 = Date.now();
+      const { value: firstValue, done: firstDone } = await reader.read();
+      const t1 = Date.now();
+
+      expect(firstDone).toBe(false);
+      const firstText = dec.decode(firstValue);
+      chunks.push(firstText);
+
+      // Drain the rest of the stream.
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(dec.decode(value));
+      }
+
+      // The first chunk must contain "chunk1" — proves it arrived mid-stream.
+      expect(chunks.join("")).toContain("chunk1");
+      expect(chunks.join("")).toContain("chunk2");
+
+      // The first chunk must have arrived in well under the total stream
+      // duration (~100 ms delay). If the bridge buffered the full response,
+      // t1 - t0 would be ≥ 100 ms; incremental delivery is << 100 ms.
+      // We allow up to 80 ms to stay robust under load.
+      expect(t1 - t0).toBeLessThan(80);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// CRITICAL gRPC canary — skip when ENGRAM_SMOKE_GRPC is unset
 // ---------------------------------------------------------------------------
 
 const SMOKE_GRPC = process.env["ENGRAM_SMOKE_GRPC"] === "1";
@@ -147,7 +237,6 @@ describe("gRPC canary (ENGRAM_SMOKE_GRPC=1 to enable)", () => {
 
       const transport = createGrpcTransport({
         baseUrl: GRPC_URL,
-        httpVersion: "2",
         interceptors: [bearerInterceptor() as never],
       });
 

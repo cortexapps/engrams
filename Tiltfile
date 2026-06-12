@@ -543,9 +543,11 @@ if not skip_web:
 # Orchestrator (Bun HTTP server, ADR 0039 Task 14+).
 #
 # Runs Hono on Bun with a Connect/gRPC seam at /rpc/*. Depends on
-# postgres (future drizzle migrations in Task 15) and coordinator
-# (gRPC transport to the app-gRPC surface). Bun's native HTTP is
-# used; no cargo build required.
+# postgres (future drizzle migrations in Task 15). Bun's native HTTP
+# is used; no cargo build required.
+#
+# resource_deps=['postgres'] only — coordinator is added in Task 17
+# once the control-plane transport (bearer + clients) is wired.
 #
 # CONTROL_PLANE_BEARER is wired from `control_plane_bearer` above so
 # the orchestrator and coordinator agree on the same dev token without
