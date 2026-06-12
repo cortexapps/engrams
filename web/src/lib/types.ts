@@ -1,8 +1,9 @@
 // Canonical UI type definitions (ADR 0039 Task 28: moved from web/src/types.ts).
 //
-// Wire shapes mirror the coordinator's REST responses and the orchestrator's
-// gRPC/Connect mappings. These types are the target shape; hooks in hooks/
-// convert proto camelCase → snake_case here before handing to consumers.
+// These are UI-VIEW shapes (mapping TARGETS), not wire mirrors: hooks in
+// hooks/ convert generated proto types into these before handing them to
+// consumers. Do NOT add raw wire/response types here — the generated
+// bindings in src/gen are the only wire contract (ADR 0039 §7).
 //
 // Shapes traced from:
 //   crates/engram-core/src/types/session.rs       (Session, SessionState)
@@ -90,10 +91,6 @@ export interface SessionListItem extends Session {
   /** `'system'` for warm-pool / automated sessions; `'user'` or absent for
    * human-launched sessions. Drives the OwnerCell badge choice. */
   owner_kind?: "user" | "system" | null;
-}
-
-export interface ListSessionsResponse {
-  sessions: SessionListItem[];
 }
 
 // ---- ADR 0031: identity ------------------------------------------------
@@ -231,12 +228,6 @@ export interface SessionCowStateResponse {
 // surface — harnesses aren't a deployment-wide registry anymore.
 
 // ---- Session creation -------------------------------------------------
-
-export interface CreateSessionResponse {
-  session_id: string;
-  status: string;
-  image_version: string;
-}
 
 // ---- Session events (SSE) ----------------------------------------------
 //

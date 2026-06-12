@@ -22,6 +22,13 @@
  *
  * Note: teleportSession uses FleetService.EvacuateSession (gRPC, already
  * passing through the CASL gate) — no proxy route needed for it.
+ *
+ * DEV-ONLY SCAFFOLDING — do not deploy mid-span. The forwarded bearer is
+ * CONTROL_PLANE_BEARER (the app-gRPC token); the coordinator's REST chain
+ * authenticates bearers against a DIFFERENT knob (--auth-tokens). Dev works
+ * because AuthMode::None accepts everything; prod would 401. Acceptable
+ * only because ADR 0039 declares Tasks 23-32 a single non-deployable span;
+ * the Task 32 promotion to gRPC deletes this file.
  */
 
 import { Hono } from "hono";
@@ -75,7 +82,7 @@ export function makeAdminRoute(
   app.post("/api/v1/admin/sessions/:id/pause", async (c) => {
     await requireAdmin(c.req.raw.headers);
     const id = c.req.param("id");
-    const upstream = await forwardPost(`/api/v1/admin/sessions/${id}/pause`, {});
+    const upstream = await forwardPost(`/api/v1/admin/sessions/${encodeURIComponent(id)}/pause`, {});
     const body = upstream.status === 204 ? null : await upstream.text();
     return new Response(body, {
       status: upstream.status,
@@ -89,7 +96,7 @@ export function makeAdminRoute(
   app.post("/api/v1/admin/sessions/:id/resume", async (c) => {
     await requireAdmin(c.req.raw.headers);
     const id = c.req.param("id");
-    const upstream = await forwardPost(`/api/v1/admin/sessions/${id}/resume`, {});
+    const upstream = await forwardPost(`/api/v1/admin/sessions/${encodeURIComponent(id)}/resume`, {});
     const body = upstream.status === 204 ? null : await upstream.text();
     return new Response(body, {
       status: upstream.status,

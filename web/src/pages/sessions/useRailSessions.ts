@@ -13,7 +13,11 @@ import { compareSessions } from "./session-format";
 // ADR 0039 Task 28: migrated from useSessions (REST /api/v1/sessions) to
 // useTasksAsSessionList (connect-query ListTasks → orchestrator native
 // TaskService). The REST surface is no longer reachable from the browser after
-// the vite proxy flips all /api to the orchestrator. Behaviour is unchanged:
+// the vite proxy flips all /api to the orchestrator. One deliberate scope
+// change: ListTasks has no scope param, so an ADMIN's rail now previews ALL
+// tasks (incl. unattributed rows) like the list page, where the old
+// useSessions("mine") was own-only even for admins. Members are unaffected
+// (server-side CASL scoping). Otherwise behaviour is unchanged:
 // member sees own tasks, admin sees all (CASL gate on the server).
 
 export const RAIL_CAP = 10;
