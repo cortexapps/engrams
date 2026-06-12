@@ -29,9 +29,10 @@
 //   and `principal.can_sign_out` exactly as before.
 
 import { useQuery } from "@tanstack/react-query";
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useMemo, type ReactNode } from "react";
 import { authClient } from "@/lib/auth-client";
 import type { Principal } from "../types";
+import { abilityFor, type AppAbility } from "@/lib/ability";
 import { EngramMark } from "../components/EngramMark";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -41,6 +42,8 @@ export interface AuthState {
    * principal has resolved. */
   principal: Principal;
   isAdmin: boolean;
+  /** CASL ability instance for the current user (ADR 0039 §6). */
+  ability: AppAbility;
   /** Re-fetch the claude-token presence flag (e.g. after saving a token
    * flips has_claude_token). The better-auth session itself is live via
    * authClient.useSession() and needs no manual refresh. */
@@ -154,9 +157,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // in this deployment tier); leave role_source undefined (optional field).
   };
 
+  // ADR 0039 §6: build CASL ability from the resolved session.
+  // useMemo keeps the instance stable across re-renders unless id/role changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const ability = useMemo(
+    () => abilityFor({ id: session.user.id, role: rawRole }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [session.user.id, rawRole],
+  );
+
   const value: AuthState = {
     principal,
     isAdmin,
+    ability,
     refresh: () => void refetchToken(),
   };
 
@@ -180,6 +193,12 @@ export function useOptionalAuth(): AuthState | null {
 
 export function useIsAdmin(): boolean {
   return useAuth().isAdmin;
+}
+
+/** Returns the CASL AppAbility instance for the current user.
+ * Use `ability.can('manage', 'all')` to gate admin-only UI. */
+export function useAbility(): AppAbility {
+  return useAuth().ability;
 }
 
 // ---- Sign-out helper (replaces the old coordinator POST /auth/logout) ----

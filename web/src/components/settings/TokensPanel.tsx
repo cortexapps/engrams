@@ -3,7 +3,7 @@ import { useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
-import { saveClaudeToken } from "../../api";
+import { saveClaudeToken, deleteClaudeToken } from "../../api";
 import { useAuth } from "../../auth/AuthProvider";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";
@@ -22,6 +22,14 @@ export function TokensPanel() {
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
   const saved = principal.has_claude_token;
+
+  const remove = useMutation({
+    mutationFn: deleteClaudeToken,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["me"] });
+      refresh();
+    },
+  });
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -49,13 +57,25 @@ export function TokensPanel() {
               }}
             />
           ) : (
-            <Button
-              size="sm"
-              variant={saved ? "outline" : "default"}
-              onClick={() => setEditing(true)}
-            >
-              {saved ? "Replace" : "Add token"}
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                variant={saved ? "outline" : "default"}
+                onClick={() => setEditing(true)}
+              >
+                {saved ? "Replace" : "Add token"}
+              </Button>
+              {saved && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => remove.mutate()}
+                  disabled={remove.isPending}
+                >
+                  {remove.isPending ? "Removing…" : "Remove"}
+                </Button>
+              )}
+            </div>
           )}
         </CardContent>
       </Card>

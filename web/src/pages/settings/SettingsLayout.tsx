@@ -1,6 +1,6 @@
 import { KeyRound, Users, UserCircle } from "lucide-react";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
-import { useIsAdmin } from "../../auth/AuthProvider";
+import { useAbility } from "../../auth/AuthProvider";
 import {
   Sidebar,
   SidebarContent,
@@ -24,7 +24,8 @@ const MINE: NavItem[] = [
 const ORG: NavItem[] = [{ to: "/settings/members", label: "Members", icon: Users }];
 
 export function SettingsLayout() {
-  const isAdmin = useIsAdmin();
+  const ability = useAbility();
+  const isAdmin = ability.can("manage", "all");
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const group = (label: string, items: NavItem[]) => (
     <SidebarGroup key={label}>

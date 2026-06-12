@@ -24,7 +24,9 @@ import type { Transport } from "@connectrpc/connect";
 import { TaskService } from "./gen/engram/app/v1/task_pb";
 import { ImageService } from "./gen/engram/app/v1/image_pb";
 import { SessionService } from "./gen/engram/app/v1/session_pb";
+import { FleetService } from "./gen/engram/app/v1/fleet_pb";
 import { AuthContextProvider, type AuthState } from "./auth/AuthProvider";
+import { abilityFor } from "./lib/ability";
 import type { Principal } from "./types";
 
 interface TestRouterContext {
@@ -64,6 +66,56 @@ export const testTransport: Transport = createRouterTransport((router) => {
     listRegistries: () => ({ registries: [] }),
     addRegistry: () => ({ id: "", host: "", authKind: "", authPrincipal: undefined }),
     deleteRegistry: () => ({}),
+  });
+  router.service(FleetService, {
+    listHosts: () => ({ hosts: [] }),
+    getHost: () => ({ host: undefined }),
+    getHostCowState: () => ({ hostId: "", sessions: [] }),
+    drainHost: () => ({}),
+    adminDrainHost: () => ({ hostId: "", evacuating: [], failures: [] }),
+    cordonHost: () => ({ hostId: "", status: "" }),
+    uncordonHost: () => ({ hostId: "", status: "" }),
+    getStorageSummary: () => ({
+      snapshots: 0n,
+      snapshotBytes: 0n,
+      gcPending: 0n,
+      trackedSandboxes: 0n,
+      dirtyChunks: 0n,
+      unflushedBytes: 0n,
+      avgLocalityPct: 0,
+      rows: [],
+    }),
+    flushSession: () => ({ outcome: "", manifestVersion: undefined }),
+    evacuateSession: () => ({ sessionId: "", status: "" }),
+    chunkGc: () => ({
+      listedChunks: 0n,
+      malformedKeys: 0n,
+      pinSetSize: 0n,
+      candidatesMarked: 0n,
+      restartCount: 0,
+      restartBudgetExhausted: false,
+      promotedDeletes: 0n,
+      promoteDeleteErrors: 0n,
+      graceSecs: 0n,
+    }),
+    bundleGc: () => ({
+      listed: 0n,
+      pinSetSize: 0n,
+      candidatesMarked: 0n,
+      promotedDeletes: 0n,
+      promoteDeleteErrors: 0n,
+      restartCount: 0,
+    }),
+    snapshotBlobGc: () => ({
+      listed: 0n,
+      malformed: 0n,
+      pinSetSize: 0n,
+      candidatesMarked: 0n,
+      promotedDeletes: 0n,
+      promoteRepinnedSkips: 0n,
+      promoteDeleteErrors: 0n,
+      restartCount: 0,
+    }),
   });
   // ADR 0039 Task 24: stub SessionService so components that call
   // getSession / getCowState / listCheckpoints / sendPrompt / interrupt
@@ -124,6 +176,7 @@ export function renderWithProviders(
   const authValue: AuthState = {
     principal,
     isAdmin: principal.is_admin,
+    ability: abilityFor({ id: "test-user-id", role: principal.is_admin ? "admin" : "user" }),
     refresh: () => {},
   };
 

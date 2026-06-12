@@ -1,5 +1,5 @@
 import { useHosts } from "../hooks/useHosts";
-import { useSessions } from "../hooks/useSessions";
+import { useTasksAsSessionList } from "../hooks/useTasks";
 import { useDrainHost } from "../hooks/useDrainHost";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeading } from "../components/page-heading";
@@ -19,7 +19,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
-import type { HostStatus, HostView, Session } from "../types";
+import type { HostStatus, HostView, SessionListItem } from "../types";
 
 const statusVariant = (s: HostStatus) =>
   s === "ready" ? "default" : s === "draining" ? "secondary" : "destructive";
@@ -65,7 +65,7 @@ function Meter({
 
 export function Fleet() {
   const { data: hosts } = useHosts();
-  const { data: sessions } = useSessions();
+  const { data: sessions } = useTasksAsSessionList();
   const drain = useDrainHost();
   const h = hosts ?? [];
   const s = sessions ?? [];
@@ -76,7 +76,7 @@ export function Fleet() {
   const totGiB = (h.reduce((a, x) => a + x.util_disk_total_mib, 0) / 1024).toFixed(0);
   const anyDraining = h.some((x) => x.status === "draining");
   const liveByHost = (id: string) =>
-    s.filter((x: Session) => x.host_id === id && x.status === "active").length;
+    s.filter((x: SessionListItem) => x.host_id === id && x.status === "active").length;
 
   return (
     <div className="space-y-6">
@@ -103,7 +103,7 @@ export function Fleet() {
               key={host.id}
               host={host}
               live={liveByHost(host.id)}
-              onDrain={() => drain.mutate(host.id)}
+              onDrain={() => drain.mutate({ hostId: host.id })}
               draining={drain.isPending}
             />
           ))}

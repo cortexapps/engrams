@@ -1,7 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { ArrowRight } from "lucide-react";
 import { useHosts } from "../../hooks/useHosts";
-import { useSessions } from "../../hooks/useSessions";
+import { useTasksAsSessionList } from "../../hooks/useTasks";
 import { useStorageSummary } from "../../hooks/useStorageSummary";
 import { fmtBytes } from "../../format";
 import { PageHeading } from "../../components/page-heading";
@@ -10,7 +10,7 @@ import { Gauge, type Tone, type Zone } from "../../components/gauge";
 import { Text } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
 import { deriveHealthMetrics, operatorIssues, type HealthMetrics } from "../../operator-health";
-import type { Session } from "../../types";
+import type { SessionListItem } from "../../types";
 
 // The Operator cockpit: a read-only instrument cluster that answers "is the
 // platform healthy?" in one read, then hands off to the detail surfaces. The
@@ -39,7 +39,7 @@ interface Verdict {
 
 export function Overview() {
   const { data: hosts } = useHosts();
-  const { data: sessions } = useSessions();
+  const { data: sessions } = useTasksAsSessionList();
   const { data: storage } = useStorageSummary();
 
   const h = hosts ?? [];
@@ -50,7 +50,7 @@ export function Overview() {
   // as the rail signal. The rest are display-only extras the cockpit shows.
   const m = deriveHealthMetrics(h, storage);
   const ready = h.filter((x) => x.status === "ready").length;
-  const liveSandboxes = s.filter((x: Session) => x.status === "active").length;
+  const liveSandboxes = s.filter((x: SessionListItem) => x.status === "active").length;
   const gcPending = storage?.gc_pending ?? 0;
 
   const verdict = computeVerdict(h.length === 0, m);

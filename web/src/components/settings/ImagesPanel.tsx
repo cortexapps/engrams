@@ -157,7 +157,7 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => refresh.mutate(row.image_uri)}
+            onClick={() => refresh.mutate({ imageUri: row.image_uri })}
             disabled={refresh.isPending}
           >
             {refresh.isPending ? "Refreshing…" : "Refresh"}
@@ -178,7 +178,7 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction onClick={() => del.mutate(row.image_uri)}>
+                <AlertDialogAction onClick={() => del.mutate({ imageUri: row.image_uri })}>
                   Disable image
                 </AlertDialogAction>
               </AlertDialogFooter>
@@ -215,7 +215,7 @@ function EnableImageDialog() {
 
   const onSubmit = async (data: EnableImageValues) => {
     try {
-      await enable.mutateAsync(data.imageUri);
+      await enable.mutateAsync({ imageUri: data.imageUri });
       form.reset();
       setOpen(false);
     } catch (err) {
@@ -324,7 +324,7 @@ function EnableJobRow({ job }: { job: EnableJob }) {
                 variant="ghost"
                 size="sm"
                 className="ml-auto"
-                onClick={() => retry.mutate(job.id)}
+                onClick={() => retry.mutate({ jobId: job.id })}
                 disabled={retry.isPending}
               >
                 {retry.isPending ? "Retrying…" : "Retry"}

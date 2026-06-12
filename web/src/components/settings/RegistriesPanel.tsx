@@ -3,7 +3,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
 import { useAddRegistry, useDeleteRegistry, useRegistries } from "../../hooks/useRegistries";
-import type { AddRegistryAuth, RegistryAuthKind, RegistryCredentialSummary } from "../../types";
+import type { RegistryAuthKind, RegistryCredentialSummary } from "../../types";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";
 import { textVariants } from "@/components/ui/text";
@@ -140,7 +140,7 @@ function RegistryRow({ row }: { row: RegistryCredentialSummary }) {
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction onClick={() => del.mutate(row.registry_host)}>
+                <AlertDialogAction onClick={() => del.mutate({ host: row.registry_host })}>
                   Remove registry
                 </AlertDialogAction>
               </AlertDialogFooter>
@@ -217,13 +217,19 @@ function AddRegistryDialog() {
   const authKind = form.watch("authKind");
 
   const onSubmit = async (data: RegistryValues) => {
-    let auth: AddRegistryAuth;
+    // Build the proto oneof auth field. MessageInitShape allows plain objects
+    // for message fields; we assert the type here to satisfy the compiler.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let auth: any;
     if (data.authKind === "static") {
-      auth = { kind: "static", username: data.username.trim(), password: data.password };
+      auth = {
+        case: "static",
+        value: { username: data.username.trim(), password: data.password },
+      };
     } else {
       auth = {
-        kind: "gcp_workload_identity",
-        impersonate_sa: data.impersonateSa.trim() || undefined,
+        case: "gcpWorkloadIdentity",
+        value: { impersonateSa: data.impersonateSa.trim() || undefined },
       };
     }
     try {
