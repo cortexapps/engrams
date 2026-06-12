@@ -114,10 +114,22 @@ export default defineConfig({
         agent: proxyAgent,
       },
 
-      // ---- Coordinator catch-all (REST + SSE + /shell WebSocket) ----
+      // Task 27: orchestrator shell WebSocket relay.
+      // The TerminalPane connects to /api/v1/sessions/:id/shell with the
+      // 'tty' subprotocol; the orchestrator bridges it to the host's ttyd.
+      // Regex must come BEFORE the coordinator /api catch-all.
+      // Task 28 removes this rule when all of /api/v1 moves to the orchestrator.
+      "^/api/v1/sessions/[^/]+/shell": {
+        target: ORCHESTRATOR,
+        changeOrigin: true,
+        ws: true,
+      },
+
+      // ---- Coordinator catch-all (REST + SSE) ----
       //
       // All remaining /api/v1 traffic proxies to the coordinator until Task 28
-      // migrates the full surface to the orchestrator.
+      // migrates the full surface to the orchestrator. ws:true retained for
+      // any other coordinator WS paths (none remain post-Task 27).
       "/api": {
         target: COORDINATOR,
         changeOrigin: true,
