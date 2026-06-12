@@ -103,6 +103,17 @@ export default defineConfig({
         agent: proxyAgent,
       },
 
+      // Task 26: orchestrator SSE event feed for session detail.
+      // Vite proxy keys support regex strings (^/regex/). This rule must
+      // come BEFORE the coordinator /api catch-all so the orchestrator
+      // envelope is served instead of the coordinator's direct-wire shape.
+      // Task 28 removes this rule when all of /api/v1 moves to 8787.
+      "^/api/v1/sessions/[^/]+/events": {
+        target: ORCHESTRATOR,
+        changeOrigin: true,
+        agent: proxyAgent,
+      },
+
       // ---- Coordinator catch-all (REST + SSE + /shell WebSocket) ----
       //
       // All remaining /api/v1 traffic proxies to the coordinator until Task 28
