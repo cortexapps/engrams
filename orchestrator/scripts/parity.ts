@@ -329,6 +329,25 @@ function sortArrays(val: unknown, sortKeys: string[] = ["id", "snapshot_id", "sa
  * NOTE: booleans false are NOT dropped — proto emits false as absent but
  * we keep it to avoid hiding real boolean mismatches. They surface in
  * per-probe volatile lists instead.
+ *
+ * KNOWN LIMITS of the symmetric drop rule (accepted for scaffolding):
+ *
+ * (a) A field default-valued on BOTH sides is invisible BY CONSTRUCTION:
+ *     Connect JSON (emitDefaults=false) omits it at serialization, before
+ *     any normalizer runs. No drop rule — symmetric or asymmetric — can
+ *     recover information the wire never carried. Closing this would need
+ *     emitDefaultValues:true on the orchestrator or binary comparison;
+ *     disproportionate for Task-28-doomed code.
+ *
+ * (b) For explicit-presence (`optional`) proto fields, Connect JSON DOES
+ *     emit set-to-default values (Some(0) → "0"), so dropping defaults
+ *     from both sides deliberately erases the Some(0)-vs-None presence
+ *     distinction — a converter conflating them (unwrap_or_default class)
+ *     passes silently. Accepted: a schema-BLIND asymmetric rule would
+ *     false-diff every legitimately-zero optional field, and a
+ *     schema-AWARE one means walking protobuf-es descriptors — a rebuild
+ *     this scaffolding doesn't earn. convert.rs maps Rust Option → proto
+ *     optional directly, keeping the conflation class narrow.
  */
 function normalizeDefaults(val: unknown): unknown {
   if (Array.isArray(val)) {
@@ -847,7 +866,10 @@ function normalizeEventPayload(payload: string): string {
 }
 
 async function runSseProbe(sid: string, adminCookie: string): Promise<ProbeResult> {
-  const N = 5;
+  // Plan says first 20 events; a quiet demo session usually has fewer, so
+  // both collectors stop early at whatever arrives before TIMEOUT — the
+  // comparison below requires the two SEQUENCES to match, not the count.
+  const N = 20;
   const TIMEOUT = 10_000;
 
   let legacyEvents: SseEvent[];
