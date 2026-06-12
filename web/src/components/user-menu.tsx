@@ -1,6 +1,6 @@
 import { ChevronsUpDown, LogOut, Settings } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
-import { logout } from "../api";
+import { signOut } from "../auth/AuthProvider";
 import { useAuth } from "../auth/AuthProvider";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
@@ -47,7 +47,7 @@ export function UserMenu() {
               <Settings /> Settings
             </DropdownMenuItem>
             {principal.can_sign_out && (
-              <DropdownMenuItem onClick={() => void logout()}>
+              <DropdownMenuItem onClick={() => void signOut()}>
                 <LogOut /> Sign out
               </DropdownMenuItem>
             )}

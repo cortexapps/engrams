@@ -12,5 +12,9 @@ export default defineConfig({
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",
+    // ADR 0039 Task 22: load the better-auth session cookie so tests start
+    // pre-authenticated. The state file is written by global-setup.ts and
+    // gitignored (contains sensitive session data — never commit it).
+    storageState: "e2e/.auth-state.json",
   },
 });

@@ -36,7 +36,7 @@ const TABS = [
 ];
 
 export function SessionDetail() {
-  const { id } = useParams({ from: "/sessions/$id" });
+  const { id } = useParams({ from: "/_app/sessions/$id" });
   const { data: session } = useSession(id);
   const events = useSessionEvents(id);
   const [tab, setTab] = useState<ViewTab>("transcript");

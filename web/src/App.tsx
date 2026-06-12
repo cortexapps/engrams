@@ -12,9 +12,11 @@ const queryClient = new QueryClient({
   },
 });
 
-// AuthProvider resolves the principal (GET /me) and renders boot/not-member/
-// error screens until it does — so by the time InnerApp mounts the router,
-// `auth` is fully resolved and safe to hand to the router context that
+// ADR 0039 Task 22: AuthProvider recomposed on better-auth.
+// AuthProvider resolves the principal (authClient.useSession + GET /api/v1/me/claude-token)
+// and renders a boot screen until both are settled. Unauthenticated sessions
+// trigger window.location.replace("/login") before RouterProvider mounts.
+// Once resolved, InnerApp passes the auth state to the router context that
 // beforeLoad admin guards read.
 function InnerApp() {
   const auth = useAuth();

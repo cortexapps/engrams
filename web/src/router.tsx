@@ -21,6 +21,7 @@ import {
 } from "@tanstack/react-router";
 import type { AuthState } from "./auth/AuthProvider";
 import { RootLayout } from "./pages/RootLayout";
+import { Login } from "./pages/Login";
 import { SessionsLayout } from "./pages/sessions/SessionsLayout";
 import { MySessions } from "./pages/sessions/MySessions";
 import { AllSessions } from "./pages/sessions/AllSessions";
@@ -49,10 +50,30 @@ function requireAdmin({ context }: { context: RouterContext }) {
 }
 
 const createRootRoute = createRootRouteWithContext<RouterContext>();
-const rootRoute = createRootRoute({ component: RootLayout });
+
+// The true root is a bare passthrough (no component) so the tree can host
+// both the app shell (RootLayout) and the /login page (no chrome) as siblings.
+const rootRoute = createRootRoute();
+
+// /login — unauthenticated entry point; no app chrome.
+const loginRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/login",
+  component: Login,
+});
+
+// The app shell — pathless layout wrapping all authenticated routes.
+// Using id (no path) makes TanStack Router treat this as a layout-only segment
+// that contributes no URL prefix — children like /sessions still resolve
+// as /sessions, not /app/sessions.
+const appLayoutRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  id: "_app",
+  component: RootLayout,
+});
 
 const indexRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/",
   beforeLoad: () => {
     throw redirect({ to: "/sessions" });
@@ -61,7 +82,7 @@ const indexRoute = createRoute({
 
 // /sessions layout route (second sidebar) ----------------------------------
 const sessionsLayoutRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/sessions",
   component: SessionsLayout,
 });
@@ -88,7 +109,7 @@ const sessionDetailRoute = createRoute({
 // /operator layout route (second sidebar) — the admin hat. The whole section
 // is admin-gated here, so the child telemetry/config routes don't each re-guard.
 const operatorLayoutRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/operator",
   beforeLoad: requireAdmin,
   component: OperatorLayout,
@@ -121,7 +142,7 @@ const operatorRegistriesRoute = createRoute({
 
 // /settings layout route (second sidebar) ----------------------------------
 const settingsLayoutRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/settings",
   component: SettingsLayout,
 });
@@ -150,16 +171,21 @@ const membersRoute = createRoute({
 });
 
 const routeTree = rootRoute.addChildren([
-  indexRoute,
-  sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
-  operatorLayoutRoute.addChildren([
-    operatorIndexRoute,
-    operatorFleetRoute,
-    operatorStorageRoute,
-    operatorImagesRoute,
-    operatorRegistriesRoute,
+  // /login — bare page, no app chrome
+  loginRoute,
+  // Authenticated app shell — all authenticated routes nested here
+  appLayoutRoute.addChildren([
+    indexRoute,
+    sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
+    operatorLayoutRoute.addChildren([
+      operatorIndexRoute,
+      operatorFleetRoute,
+      operatorStorageRoute,
+      operatorImagesRoute,
+      operatorRegistriesRoute,
+    ]),
+    settingsLayoutRoute.addChildren([settingsIndexRoute, profileRoute, tokensRoute, membersRoute]),
   ]),
-  settingsLayoutRoute.addChildren([settingsIndexRoute, profileRoute, tokensRoute, membersRoute]),
 ]);
 
 export const router = createRouter({

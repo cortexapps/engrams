@@ -9,3 +9,5 @@ e2e/__shots__/*
 # playwright scratch
 test-results
 playwright-report
+# better-auth session state — contains HttpOnly cookie data, never commit
+e2e/.auth-state.json

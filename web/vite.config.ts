@@ -1,10 +1,10 @@
 /// <reference types="vitest" />
-import http from 'node:http';
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
-import { defineConfig, type Plugin } from 'vite';
-import react from '@vitejs/plugin-react';
-import tailwindcss from '@tailwindcss/vite';
+import http from "node:http";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { defineConfig, type Plugin } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 // ghostty-web embeds the WASM as a data: URI in its JS bundle, but the
 // SPA's CSP (connect-src 'self') blocks fetch() of data: URIs, causing
@@ -18,25 +18,25 @@ import tailwindcss from '@tailwindcss/vite';
 // the dist root for production so nginx serves the file before reaching
 // the try_files fallback.
 function ghosttyWasmPlugin(): Plugin {
-  const wasmSrc = 'node_modules/ghostty-web/ghostty-vt.wasm';
+  const wasmSrc = "node_modules/ghostty-web/ghostty-vt.wasm";
   return {
-    name: 'ghostty-wasm',
+    name: "ghostty-wasm",
     configureServer(server) {
-      server.middlewares.use('/ghostty-vt.wasm', async (_req, res) => {
+      server.middlewares.use("/ghostty-vt.wasm", async (_req, res) => {
         try {
           const buf = await readFile(wasmSrc);
-          res.setHeader('Content-Type', 'application/wasm');
+          res.setHeader("Content-Type", "application/wasm");
           res.end(buf);
         } catch {
           res.statusCode = 404;
-          res.end('not found');
+          res.end("not found");
         }
       });
     },
     async generateBundle() {
       this.emitFile({
-        type: 'asset',
-        fileName: 'ghostty-vt.wasm',
+        type: "asset",
+        fileName: "ghostty-vt.wasm",
         source: await readFile(wasmSrc),
       });
     },
@@ -47,7 +47,15 @@ function ghosttyWasmPlugin(): Plugin {
 // The whole coord API lives under /api/v1, so proxy /api straight
 // through to the coord; everything else (incl. the SPA's /sessions/:id
 // deep links) is served by Vite as index.html.
-const COORDINATOR = process.env.ENGRAM_COORDINATOR_URL ?? 'http://127.0.0.1:8090';
+const COORDINATOR = process.env.ENGRAM_COORDINATOR_URL ?? "http://127.0.0.1:8090";
+
+// Orchestrator binds to 127.0.0.1:8787. The following paths route to it:
+//   /api/auth   — better-auth session endpoints (sign-in, sign-up, sign-out)
+//   /rpc        — connect-query tRPC/gRPC bridge (Task 23+)
+//   /api/v1/me/claude-token — sealed-store token presence (exact path; see below)
+// Task 28 collapses the /api/v1/me/claude-token special rule when all of
+// /api/v1 moves to the orchestrator and the coordinator rule is removed.
+const ORCHESTRATOR = process.env.ENGRAM_ORCHESTRATOR_URL ?? "http://127.0.0.1:8787";
 
 // http-proxy defaults to `agent: false`, which forces a fresh TCP
 // connection plus `Connection: close` on every proxied request. On
@@ -60,16 +68,46 @@ const proxyAgent = new http.Agent({ keepAlive: true });
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), ghosttyWasmPlugin()],
-  resolve: { alias: { '@': path.resolve(__dirname, './src') } },
+  resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
   server: {
     port: 5173,
     proxy: {
-      // The entire coord API (REST + SSE + the /shell WebSocket) lives
-      // under /api/v1, which no longer overlaps any SPA route — so a
-      // single prefix proxy suffices and the old Accept-header bypass is
-      // gone. `ws: true` carries the /api/v1/sessions/:id/shell upgrade;
-      // http-proxy streams SSE through unchanged.
-      '/api': {
+      // ---- Orchestrator routes (must come BEFORE the coordinator /api rule) ----
+      //
+      // Vite matches proxy rules in insertion order. These exact / prefix rules
+      // must be listed BEFORE '/api' so they shadow the coordinator catch-all.
+
+      // better-auth session endpoints: sign-in, sign-up, sign-out, get-session.
+      "/api/auth": {
+        target: ORCHESTRATOR,
+        changeOrigin: true,
+        agent: proxyAgent,
+      },
+
+      // connect-query / tRPC bridge (Task 23+).
+      "/rpc": {
+        target: ORCHESTRATOR,
+        changeOrigin: true,
+        agent: proxyAgent,
+        ws: true,
+      },
+
+      // Exact path: token presence + CRUD from the orchestrator sealed-store.
+      // NOTE: Vite does NOT match exact paths natively — prefix match on
+      // '/api/v1/me/claude-token' means any path that STARTS WITH this string.
+      // That's fine: there are no sub-paths under /api/v1/me/claude-token/…
+      // Task 28 removes this rule when /api/v1 fully moves to the orchestrator.
+      "/api/v1/me/claude-token": {
+        target: ORCHESTRATOR,
+        changeOrigin: true,
+        agent: proxyAgent,
+      },
+
+      // ---- Coordinator catch-all (REST + SSE + /shell WebSocket) ----
+      //
+      // All remaining /api/v1 traffic proxies to the coordinator until Task 28
+      // migrates the full surface to the orchestrator.
+      "/api": {
         target: COORDINATOR,
         changeOrigin: true,
         agent: proxyAgent,
@@ -78,9 +116,9 @@ export default defineConfig({
     },
   },
   test: {
-    environment: 'jsdom',
+    environment: "jsdom",
     globals: false,
-    setupFiles: ['./src/test-setup.ts'],
-    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    setupFiles: ["./src/test-setup.ts"],
+    include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },
 });
