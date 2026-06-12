@@ -656,11 +656,13 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         // Deterministic zero free-space floor — the default 10% floor
         // trips on a nearly-full dev disk and evicts the chunks whose
-        // presence this test asserts below.
+        // presence this test asserts below. `sweep_debounce_ms: 0`
+        // (from main) keeps the populate-path eviction sweep eager.
         let cache = ChunkCache::new_with_floor(
             ChunkCacheConfig {
                 root: cache_dir.path().to_path_buf(),
                 budget_bytes: 1024 * 1024 * 1024,
+                sweep_debounce_ms: 0,
             },
             0.0,
         );
@@ -737,6 +739,7 @@ mod tests {
         let cache = ChunkCache::new(ChunkCacheConfig {
             root: cache_dir.path().to_path_buf(),
             budget_bytes: 1024 * 1024,
+            sweep_debounce_ms: 0,
         });
         let work = tempfile::tempdir().unwrap();
 

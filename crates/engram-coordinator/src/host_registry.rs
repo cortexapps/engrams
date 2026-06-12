@@ -874,6 +874,31 @@ impl HostClient for HostRegistry {
         backend.snapshot_wait(id).await
     }
 
+    async fn migration_presetup(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.migration_presetup(id).await
+    }
+
+    async fn migration_capture_postcopy(
+        &self,
+        id: SandboxId,
+        export_id: &str,
+    ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.migration_capture_postcopy(id, export_id).await
+    }
+
+    async fn migration_drain_wait(
+        &self,
+        id: SandboxId,
+    ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.migration_drain_wait(id).await
+    }
+
     async fn migration_capture(
         &self,
         id: SandboxId,

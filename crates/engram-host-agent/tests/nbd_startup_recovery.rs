@@ -14,7 +14,10 @@
 //!    after an ungraceful host-agent exit; OR, in CI, ENGRAM_NBD_STUCK
 //!    DEVICES=/dev/nbdX env var points at one). Asserts the helper
 //!    reports `recovered >= 1` and `/sys/block/nbdX/pid` is cleared
-//!    afterwards.
+//!    afterwards. (ADR 0044 K2: recovery is netlink
+//!    `NBD_CMD_DISCONNECT` now, and the caller scopes the sweep to
+//!    slots NOT claimed by surviving sandboxes — a survivor's busy
+//!    device is alive by design.)
 
 #![cfg(target_os = "linux")]
 

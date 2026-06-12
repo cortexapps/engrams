@@ -211,11 +211,17 @@ chmod 1777 /tmp 2>/dev/null || true
 mark fs_mounts_done
 # DNS for userspace. The kernel handled IP+routes via `ip=dhcp` (see
 # vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so
-# we do it here. 192.168.64.1 is the VZ NAT gateway, which Apple's
-# network stack also answers DNS on. 1.1.1.1 is a public fallback in
-# case the gateway resolver is unreachable (e.g. on Linux/FC where
-# the bridge isn't VZ NAT). Writing both is safe — glibc tries them
-# in order. Skip if /etc/resolv.conf already exists (operator override).
+# we do it here. Backend-aware by the guest's OWN address: VZ guests
+# get 192.168.64.x from Apple's DHCP and the NAT gateway
+# (192.168.64.1) answers DNS, so it goes first with 1.1.1.1 as
+# fallback. FC guests live in the 10.200/16 netns pool where
+# NOTHING answers on 192.168.64.1 — listing it first cost every
+# uncached lookup a ~5s first-nameserver timeout (and pushed
+# A+AAAA lookups past client budgets entirely; prod-found
+# 2026-06-12), so FC writes 1.1.1.1 only (the host's FORWARD
+# chain explicitly ACCEPTs VM→1.1.1.1:53). timeout:2/attempts:2
+# bounds the residual worst case on either backend. Skip if
+# /etc/resolv.conf already exists (operator override).
 #
 # FIXME(dns-exfil): the egress proxy enforces `manifest.network.
 # allow_hosts` for outbound *connections*, but DNS itself goes
@@ -229,7 +235,24 @@ mark fs_mounts_done
 # DNS path is an unfiltered side channel.
 mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
-    printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+    # Shell-pure VZ detection (no ip/grep dependency — the shim only
+    # assumes /bin/sh): the guest's local addresses appear in
+    # /proc/net/fib_trie; a 192.168.64.x entry means Apple's VZ NAT.
+    # Readability-guarded so a kernel without the file can't trip
+    # `set -e` and kill init.
+    vz_nat=""
+    if [ -r /proc/net/fib_trie ]; then
+        while read -r fib_line; do
+            case "$fib_line" in
+                *192.168.64.*) vz_nat=1; break ;;
+            esac
+        done < /proc/net/fib_trie
+    fi
+    if [ -n "$vz_nat" ]; then
+        printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n' > /etc/resolv.conf
+    else
+        printf 'nameserver 1.1.1.1\noptions timeout:2 attempts:2\n' > /etc/resolv.conf
+    fi
 fi
 # /etc/hosts: a slim rootfs (debian-slim etc.) ships an empty one, so
 # `localhost` has no entry and `nsswitch` (files then dns) falls through to

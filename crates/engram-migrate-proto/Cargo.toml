@@ -1,0 +1,20 @@
+[package]
+name = "engram-migrate-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire types for the ADR 0045 C2 post-copy page channel: dest uffd-handler ↔ source host-agent (TCP 9102) and handler → host-agent control socket."
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bincode.workspace = true
+serde.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]

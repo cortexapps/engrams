@@ -81,6 +81,15 @@ pub struct GuestMemoryStats {
     pub sampled: u32,
 }
 
+/// ADR 0045 C2: see [`SandboxBackend::post_copy_source_view`].
+#[derive(Clone, Debug)]
+pub struct PostCopySourceView {
+    pub fc_pid: u32,
+    /// The substrate base dir (tmpfs) — the page server resolves the
+    /// exact base file by scanning the FC process's maps for it.
+    pub uffd_base_dir: PathBuf,
+}
+
 #[async_trait]
 pub trait SandboxBackend: Send + Sync {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError>;
@@ -241,6 +250,49 @@ pub trait SandboxBackend: Send + Sync {
     ) -> Result<crate::types::snapshot::MigrationCaptureOut, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `migration_capture`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: the pre-pause half of a post-copy move. Mints the
+    /// export identity (the page server parks the dest handler's Hello
+    /// until the capture registers it) and packages everything the
+    /// destination can use BEFORE the source pauses: the sidecar, the
+    /// inline v+1 session manifest (post-copy never re-chunks at
+    /// capture), the live disk ref, the hot set. NO pause, no fence —
+    /// the guest keeps running until `migration_capture_postcopy`.
+    async fn migration_presetup(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::snapshot::MigrationPresetupOut, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `migration_presetup`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: the blackout half. Pause → NBD fsync + dirty-tail
+    /// drain → vmstate-only snapshot (fork v3) → pagemap scan → seal
+    /// the page server's export (the parked dest handler unblocks).
+    /// The guest stays paused serving pages until commit (post-drain)
+    /// or abort; `state.bin` becomes fetchable via `migration_fetch`.
+    async fn migration_capture_postcopy(
+        &self,
+        _id: SandboxId,
+        _export_id: &str,
+    ) -> Result<crate::types::snapshot::PostCopyCaptureOut, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `migration_capture_postcopy`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2 (destination): await the background drain's
+    /// terminal outcome — `Done` (source releasable) or `PeerLost`
+    /// (dest poisoned + paused; the caller rewinds the session).
+    async fn migration_drain_wait(
+        &self,
+        _id: SandboxId,
+    ) -> Result<crate::types::snapshot::DrainOutcome, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `migration_drain_wait`".into(),
         ))
     }
 
@@ -487,6 +539,82 @@ pub trait SandboxBackend: Send + Sync {
     /// FC-style files into it — the caller checks for individual
     /// files before reading.
     fn snapshot_path_for(&self, snapshot_id: crate::types::SnapshotId) -> PathBuf;
+
+    /// ADR 0045 C2 (E2B fold): where this sandbox's uffd-handler dumps
+    /// its working-set trace (fault-order hot set), when the backend
+    /// runs one. The migration capture reads it best-effort to ship a
+    /// `hot_chunks` rider so the destination warms the guest's hot set
+    /// first. `None` = backend has no per-sandbox trace (VZ, process).
+    fn working_set_trace_path(&self, _id: SandboxId) -> Option<PathBuf> {
+        None
+    }
+
+    /// ADR 0045 C2: what the source page server needs to read this
+    /// sandbox's guest memory from outside: FC's pid (this process is
+    /// its parent, so `process_vm_readv` is YAMA-legal) and the tmpfs
+    /// dir holding the substrate base file its guest RAM is
+    /// MAP_PRIVATE of (the `/proc/<pid>/maps` filter key). `None` ⇒
+    /// not a substrate-restored FC sandbox (cannot post-copy).
+    fn post_copy_source_view(&self, _id: SandboxId) -> Option<PostCopySourceView> {
+        None
+    }
+
+    /// ADR 0045 C2 (destination): the uffd-handler's control socket
+    /// for this sandbox, when it was spawned in peer mode (drain
+    /// progress / PeerLost reports). `None` otherwise.
+    fn post_copy_control_sock(&self, _id: SandboxId) -> Option<PathBuf> {
+        None
+    }
+
+    /// ADR 0044 K2 survivor rehydrate: the host block device this
+    /// sandbox's rootfs drive reads (e.g. `/dev/nbd4` for a
+    /// chunked-NBD rootfs). After a host-agent restart the new
+    /// generation must re-serve EXACTLY this device — the surviving
+    /// FC holds an open fd to it, so attaching a fresh slot would
+    /// serve a device nobody reads. `None` for sandboxes whose
+    /// rootfs isn't a block device (file-backed, or backend doesn't
+    /// track it).
+    fn rootfs_device(&self, _id: SandboxId) -> Option<PathBuf> {
+        None
+    }
+
+    /// ADR 0045 C2: compose the restore sidecar from LIVE sandbox
+    /// state (the presetup's pre-pause package; byte-identical to the
+    /// capture-time sidecar by construction).
+    fn compose_live_sidecar(
+        &self,
+        _id: SandboxId,
+        _memory_manifest: Option<crate::types::manifest::ManifestRef>,
+    ) -> Result<Vec<u8>, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `compose_live_sidecar`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: write a vmstate-only snapshot package (sidecar +
+    /// fork-v3 `state.bin`, no memory artifact). Caller holds the VM
+    /// paused and owns resume.
+    async fn snapshot_vmstate_only_package(
+        &self,
+        _id: SandboxId,
+        _sidecar_json: &[u8],
+    ) -> Result<(crate::types::SnapshotId, PathBuf), SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "this backend doesn't support `snapshot_vmstate_only_package`".into(),
+        ))
+    }
+
+    /// ADR 0045 C2: persist (or clear, `None`) the sandbox's post-copy
+    /// migration role into the backend's reattach manifest so a
+    /// host-agent restart re-learns the lifecycle fences. No-op for
+    /// backends with no reattach story (VZ, process).
+    async fn set_manifest_migration_role(
+        &self,
+        _id: SandboxId,
+        _role: Option<&str>,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
 
     /// ADR 0014 issue #1/#2: commit a snapshot that was just produced
     /// by [`Self::snapshot`]. Signals to the backend that the caller's

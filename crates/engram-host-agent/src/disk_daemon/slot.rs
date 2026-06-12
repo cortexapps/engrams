@@ -213,6 +213,32 @@ impl NbdSlotAllocator {
         }
     }
 
+    /// Claim a SPECIFIC device out of the pool — the survivor-
+    /// rehydrate path, where the kernel already serves the device
+    /// under a surviving FC and the new host-agent generation must
+    /// take ownership of exactly that slot (then RECONFIGURE it)
+    /// rather than acquire a fresh one. Deliberately skips the
+    /// kernel-busy probe: a survivor's device is busy BY DESIGN.
+    ///
+    /// `None` if the path isn't in the free list (not part of this
+    /// pool, or already held by another lease).
+    pub async fn claim(self: &Arc<Self>, path: &Path) -> Option<NbdSlot> {
+        let mut free = self.free.lock().await;
+        let pos = free.iter().position(|p| p == path)?;
+        let path = free.remove(pos)?;
+        Some(NbdSlot {
+            path,
+            allocator: self.clone(),
+        })
+    }
+
+    /// Snapshot of the currently-free device paths. Used by the
+    /// post-rehydrate startup recovery to scope its stale-binding
+    /// sweep to slots NOT claimed by surviving sandboxes.
+    pub async fn free_paths(&self) -> Vec<PathBuf> {
+        self.free.lock().await.iter().cloned().collect()
+    }
+
     /// Return a path to the pool. Wakes one waiter (if any).
     /// `Drop` on `NbdSlot` calls this; direct callers shouldn't
     /// need to.

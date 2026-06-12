@@ -3,18 +3,22 @@
 //! The host-agent calls [`spawn`] with an allocated `/dev/nbdN`
 //! path and a [`ChunkedDiskBackend`]. The function:
 //!
-//! 1. Opens `/dev/nbdN` (O_RDWR).
-//! 2. Creates a `socketpair(AF_UNIX, SOCK_STREAM)` — one end goes
-//!    to the kernel via `NBD_SET_SOCK`, the other stays in-process
-//!    so the daemon can serve requests over it.
-//! 3. Calls a sequence of NBD ioctls to size the block device:
-//!    `NBD_SET_BLKSIZE` (4096), `NBD_SET_SIZE_BLOCKS` (total /
-//!    4096), `NBD_SET_FLAGS` (HAS_FLAGS | SEND_FLUSH | SEND_TRIM),
-//!    `NBD_SET_SOCK`.
-//! 4. Spawns a dedicated OS thread that calls `NBD_DO_IT` — this
-//!    syscall blocks until the kernel sees a disconnect, and the
-//!    kernel won't accept I/O until something is in this loop.
-//! 5. Spawns a tokio task that reads NBD requests over the
+//! 1. Creates a `socketpair(AF_UNIX, SOCK_STREAM)` — one end goes
+//!    to the kernel, the other stays in-process so the daemon can
+//!    serve requests over it.
+//! 2. Configures the device via the NBD **netlink** interface
+//!    (`NBD_CMD_CONNECT` with size / block-size / flags / timeouts
+//!    / the kernel-side socket fd). Netlink, not the legacy
+//!    `NBD_SET_SOCK`+`NBD_DO_IT` ioctls: the ioctl mode welds the
+//!    device's data plane to a thread of THIS process, so a
+//!    host-agent pod roll killed the disk under every surviving FC
+//!    VM and could wedge the slot until reboot (prod 2026-06-11,
+//!    /dev/nbd4). In netlink mode the kernel runs its own receive
+//!    machinery, `NBD_ATTR_DEAD_CONN_TIMEOUT` parks guest I/O while
+//!    no server is connected, and [`reattach`] hands the kernel a
+//!    fresh socket via `NBD_CMD_RECONFIGURE` after a restart — the
+//!    survivor-rehydrate primitive.
+//! 3. Spawns a tokio task that reads NBD requests over the
 //!    server-side `UnixStream`, dispatches to the backend, and
 //!    writes replies. Each request is served sequentially —
 //!    in-flight pipelining is a follow-up optimization (the kernel
@@ -22,21 +26,20 @@
 //!    serve is correct).
 //!
 //! Shutdown: drop the returned [`NbdHandle`] to tear down. The
-//! `Drop` impl issues `NBD_DISCONNECT` (which unblocks
-//! `NBD_DO_IT`), aborts the serve task, joins the kernel thread,
-//! and `NBD_CLEAR_SOCK` to release the kernel-side fd reference.
+//! `Drop` impl aborts the serve task and issues a netlink
+//! `NBD_CMD_DISCONNECT` from a detached thread (no fd, no blocked
+//! `NBD_DO_IT` thread to join — that whole failure family is gone).
 //!
 //! `unsafe` blocks are the unavoidable kernel-syscall surface
-//! (raw `libc::ioctl`, `libc::socketpair`, fd ownership transfer).
-//! Each is annotated.
+//! (raw `libc::socketpair`, fd ownership transfer). Each is
+//! annotated.
 
 #![cfg(target_os = "linux")]
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
@@ -44,62 +47,11 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 use super::backend::{ChunkedDiskBackend, DiskBackendError};
 use super::nbd::{NbdCommand, NbdReply, NbdRequest, REQUEST_HEADER_LEN};
+use super::nbd_netlink::{self, NbdNetlinkParams};
 use super::slot::{NbdSlot, NbdSlotAllocator};
-
-// ---------------------------------------------------------------------
-// NBD ioctl constants
-// ---------------------------------------------------------------------
-//
-// Per `<linux/nbd.h>`:
-//   #define NBD_SET_SOCK         _IO(0xab, 0)
-//   #define NBD_SET_BLKSIZE      _IO(0xab, 1)
-//   #define NBD_SET_SIZE         _IO(0xab, 2)
-//   #define NBD_DO_IT            _IO(0xab, 3)
-//   #define NBD_CLEAR_SOCK       _IO(0xab, 4)
-//   #define NBD_SET_SIZE_BLOCKS  _IO(0xab, 7)
-//   #define NBD_DISCONNECT       _IO(0xab, 8)
-//   #define NBD_SET_TIMEOUT      _IO(0xab, 9)
-//   #define NBD_SET_FLAGS        _IO(0xab, 10)
-//
-// `_IO(type, nr)` on Linux is `((type) << _IOC_TYPESHIFT) |
-// ((nr) << _IOC_NRSHIFT)` where TYPESHIFT=8, NRSHIFT=0. So:
-//
-// The `| 0` / `<< 0` below are deliberate visual alignment with the
-// `_IO(0xab, N)` source convention — clippy's identity_op fires
-// even though removing them would change nothing.
-
-// Typed as `libc::Ioctl` (NOT `u64`) so the same `libc::ioctl` call
-// site type-checks on glibc (`Ioctl = c_ulong`) AND musl
-// (`Ioctl = c_int`). The OSS CI cross-musl lane only covers
-// agentd/bootstrap/harness binaries today, so musl-build of the
-// host-agent first showed this gap in the bake CI. All these NBD
-// command numbers are small (`(0xab << 8) | N`, max ~44_000) so the
-// values fit either width without a cast.
-#[allow(clippy::identity_op)]
-const NBD_SET_SOCK: libc::Ioctl = (0xab << 8) | 0;
-const NBD_SET_BLKSIZE: libc::Ioctl = (0xab << 8) | 1;
-const NBD_DO_IT: libc::Ioctl = (0xab << 8) | 3;
-const NBD_CLEAR_SOCK: libc::Ioctl = (0xab << 8) | 4;
-const NBD_SET_SIZE_BLOCKS: libc::Ioctl = (0xab << 8) | 7;
-const NBD_DISCONNECT: libc::Ioctl = (0xab << 8) | 8;
-const NBD_SET_TIMEOUT: libc::Ioctl = (0xab << 8) | 9;
-const NBD_SET_FLAGS: libc::Ioctl = (0xab << 8) | 10;
-
-/// `NBD_FLAG_HAS_FLAGS` bit. Required so the kernel honours the
-/// other capability bits we set. From `<linux/nbd.h>`.
-#[allow(clippy::identity_op)]
-const NBD_FLAG_HAS_FLAGS: u32 = 1 << 0;
-/// `NBD_FLAG_SEND_FLUSH`. Tells the kernel `NBD_CMD_FLUSH` is
-/// available so fsync()s inside the guest translate into our
-/// daemon-side FLUSH dispatch.
-const NBD_FLAG_SEND_FLUSH: u32 = 1 << 2;
-/// `NBD_FLAG_SEND_TRIM`. The guest's discard / fstrim flows
-/// through as `NBD_CMD_TRIM`.
-const NBD_FLAG_SEND_TRIM: u32 = 1 << 5;
 
 /// Block size the daemon hard-pins. 4096 matches the kernel's
 /// page size on x86_64 and the chunk-aligned units we serve.
-/// `NBD_SET_SIZE_BLOCKS` uses this as its unit.
 pub const NBD_BLOCK_SIZE: u64 = 4096;
 
 /// Kernel-side NBD request timeout in seconds, set via
@@ -131,6 +83,22 @@ fn nbd_kernel_timeout_secs() -> u64 {
         .unwrap_or(90)
 }
 
+/// `NBD_ATTR_DEAD_CONN_TIMEOUT` in seconds: how long guest I/O is
+/// PARKED (requeued, not failed) while the device has no live server
+/// connection. This is the pod-roll grace window — the old host-agent
+/// dies with the serve socket, the new one comes up, registers,
+/// learns its survivors, and [`reattach`]es a fresh socket; the guest
+/// rides the gap in D-state instead of taking EIO + an errored ext4.
+/// Sized to cover restart + registration + rehydrate with slack.
+/// Override via `ENGRAM_NBD_DEAD_CONN_TIMEOUT_SECS`.
+fn nbd_dead_conn_timeout_secs() -> u64 {
+    std::env::var("ENGRAM_NBD_DEAD_CONN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(300)
+}
+
 /// Anything that can go wrong launching or running the daemon.
 #[derive(Debug)]
 pub enum NbdRuntimeError {
@@ -144,10 +112,6 @@ pub enum NbdRuntimeError {
         total_bytes: u64,
         block_size: u64,
     },
-    /// `ioctl(NBD_DO_IT)` exited unexpectedly (the kernel returns
-    /// 0 on disconnect; non-zero means the device disappeared or
-    /// the kernel-side socket closed prematurely).
-    KernelLoopExited(i32),
 }
 
 impl std::fmt::Display for NbdRuntimeError {
@@ -161,9 +125,6 @@ impl std::fmt::Display for NbdRuntimeError {
                 f,
                 "manifest total_bytes={total_bytes} not aligned to NBD block_size={block_size}"
             ),
-            Self::KernelLoopExited(rc) => {
-                write!(f, "NBD_DO_IT returned {rc}; expected 0 (clean disconnect)")
-            }
         }
     }
 }
@@ -182,21 +143,19 @@ impl From<DiskBackendError> for NbdRuntimeError {
     }
 }
 
-/// Live NBD daemon handle. Holds the spawned tokio serve task,
-/// the kernel-side ioctl thread, and the `/dev/nbdN` file
-/// descriptor. Dropping cleanly tears everything down.
+/// Live NBD daemon handle. Holds the spawned tokio serve task and
+/// the device's netlink identity. Dropping cleanly tears everything
+/// down. Deliberately NO open fd to the device and NO kernel-blocked
+/// thread: the netlink configuration lives in the kernel, decoupled
+/// from this process — that decoupling is what lets a surviving FC's
+/// disk outlive a host-agent restart.
 pub struct NbdHandle {
     nbd_device: PathBuf,
-    /// Kept alive for the lifetime of the daemon. Dropping closes
-    /// the kernel-side fd, which the kernel reacts to by tearing
-    /// down the block device.
-    nbd_fd: Option<OwnedFd>,
+    /// Device minor (`N` of `/dev/nbdN`) for netlink commands.
+    index: u32,
     /// Background tokio task running the NBD serve loop. Aborted
     /// on `Drop`.
     serve_task: Option<TokioJoinHandle<()>>,
-    /// OS thread blocked in `NBD_DO_IT`. Joined on `Drop` after
-    /// `NBD_DISCONNECT` releases the kernel-side wait.
-    kernel_thread: Option<JoinHandle<()>>,
 }
 
 impl NbdHandle {
@@ -205,129 +164,80 @@ impl NbdHandle {
     pub fn device_path(&self) -> &Path {
         &self.nbd_device
     }
+
+    /// Kill the serve loop WITHOUT disconnecting the kernel config —
+    /// the device stays configured with a dead connection, exactly
+    /// what the kernel observes when the whole host-agent process
+    /// dies (pod roll). Guest I/O then parks under
+    /// `dead_conn_timeout` until a successor [`reattach`]es. Test
+    /// support for the survivor-rehydrate path; production death is
+    /// the real thing.
+    pub fn abandon(mut self) {
+        if let Some(task) = self.serve_task.take() {
+            task.abort();
+        }
+        // Skip Drop (which would netlink-disconnect).
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for NbdHandle {
     fn drop(&mut self) {
-        // ADR 0017 Phase A: tear-down used to run the
-        // `kernel_thread.join()` inline, which blocks the calling
-        // tokio worker thread until the kernel-side NBD_DO_IT
-        // loop exits. When FC is SIGKILLed and the virtio-blk
-        // backend leaves in-flight I/O against /dev/nbdN, the
-        // kernel doesn't release NBD_DO_IT even after
-        // NBD_DISCONNECT — the join blocks indefinitely, and
-        // each destroy locks one tokio worker. With ~4 worker
-        // threads on prod hosts, four destroys are enough to
-        // stall the runtime (no heartbeat, no gRPC, coord
-        // declares the host dead). Observed on dev-vm 2026-05-24.
-        //
-        // Fix: do the cheap synchronous steps inline (NBD_DISCONNECT
-        // + serve-task abort) so the kernel side has its
-        // shutdown signal, then move the join + CLEAR_SOCK + fd
-        // close into a detached `std::thread::spawn`. Drop returns
-        // immediately; the kernel-side cleanup completes in the
-        // background. If the kernel never exits NBD_DO_IT (the
-        // ungraceful-FC case), this thread leaks rather than
-        // wedging the runtime. The `/dev/nbdN` path stays
-        // "kernel-busy" — the pool allocator (commit 1, this
-        // ADR) probes /sys/block/nbdN/pid on acquire so a busy
-        // slot is structurally invisible until it's actually
-        // recovered (by NBD_DISCONNECT completing, or by the
-        // startup cleanup in Phase B of this ADR).
-        let device_path = self.nbd_device.clone();
-        if let Some(fd) = self.nbd_fd.as_ref() {
-            // SAFETY: fd is owned by this struct; ioctl with a
-            // direction-less command + no argument is the kernel's
-            // documented shutdown path. Errors are logged + ignored.
-            let raw = fd.as_raw_fd();
-            let rc = unsafe { libc::ioctl(raw, NBD_DISCONNECT) };
-            if rc != 0 {
-                tracing::warn!(
-                    rc,
-                    errno = io::Error::last_os_error().raw_os_error(),
-                    device = %device_path.display(),
-                    "NBD_DISCONNECT ioctl failed during shutdown",
-                );
-            }
-        }
+        // Abort the serve loop first (its socket half dying is what
+        // the kernel's recv worker observes), then issue the netlink
+        // disconnect from a detached thread: the genl round-trip is
+        // normally instant, but it can wait on in-flight kernel-side
+        // teardown and Drop often runs on a tokio worker (ADR 0017
+        // Phase A taught us not to block those — four blocked
+        // destroys once stalled the whole runtime). No fd to close
+        // and no NBD_DO_IT thread to join in netlink mode; if the
+        // disconnect errors, the slot allocator's
+        // /sys/block/nbdN/pid probe keeps the device structurally
+        // invisible until the startup recovery (or reboot) frees it.
         if let Some(task) = self.serve_task.take() {
             task.abort();
         }
-        // Move the kernel-thread join + CLEAR_SOCK + fd close into
-        // a detached std::thread so Drop returns immediately. The
-        // closure takes ownership of:
-        //   - kernel_thread (a JoinHandle<()>)
-        //   - nbd_fd (OwnedFd; close-on-drop)
-        let kernel_thread = self.kernel_thread.take();
-        let nbd_fd = self.nbd_fd.take();
-        if kernel_thread.is_some() || nbd_fd.is_some() {
-            std::thread::Builder::new()
-                .name(format!(
-                    "nbd-detach-{}",
-                    device_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "?".into())
-                ))
-                .spawn(move || {
-                    if let Some(t) = kernel_thread {
-                        if let Err(panic) = t.join() {
-                            tracing::warn!(
-                                ?panic,
-                                device = %device_path.display(),
-                                "NBD kernel thread panicked",
-                            );
-                        }
-                    }
-                    if let Some(fd) = nbd_fd.as_ref() {
-                        // SAFETY: fd still owned by the closure;
-                        // CLEAR_SOCK releases the kernel's reference
-                        // to the socketpair half we handed it.
-                        // Without this the kernel may keep the fd
-                        // alive past Drop.
-                        let raw = fd.as_raw_fd();
-                        let rc = unsafe { libc::ioctl(raw, NBD_CLEAR_SOCK) };
-                        if rc != 0 {
-                            tracing::debug!(
-                                rc,
-                                errno = io::Error::last_os_error().raw_os_error(),
-                                device = %device_path.display(),
-                                "NBD_CLEAR_SOCK ioctl failed (typically harmless on disconnect)",
-                            );
-                        }
-                    }
-                    // OwnedFd's Drop closes the device file when
-                    // `nbd_fd` goes out of scope at end of closure.
-                    drop(nbd_fd);
-                    tracing::debug!(
-                        device = %device_path.display(),
-                        "NBD detached cleanup complete",
-                    );
-                })
-                .ok(); // best-effort; if spawn fails, the cleanup is lost (acceptable — process is likely on its way out)
-        }
+        let device_path = self.nbd_device.clone();
+        let index = self.index;
+        std::thread::Builder::new()
+            .name(format!("nbd-detach-{index}"))
+            .spawn(move || match nbd_netlink::disconnect_device(index) {
+                Ok(()) => tracing::debug!(
+                    device = %device_path.display(),
+                    "NBD netlink disconnect complete",
+                ),
+                Err(e) => tracing::warn!(
+                    device = %device_path.display(),
+                    error = %e,
+                    "NBD netlink disconnect failed during shutdown",
+                ),
+            })
+            .ok(); // best-effort; if spawn fails the device stays busy until startup recovery
     }
 }
 
 /// ADR 0017 Phase B: probe each device in `paths` for stale
 /// kernel-side bindings (a populated `/sys/block/nbdN/pid` pointing
 /// at a process that's no longer alive — the usual aftermath of an
-/// ungraceful host-agent exit). For each, open the device + issue
-/// NBD_DISCONNECT and NBD_CLEAR_SOCK to force the kernel to release.
-/// Returns `(probed, recovered, still_stuck)`.
+/// ungraceful host-agent exit). For each, issue a netlink
+/// `NBD_CMD_DISCONNECT` to make the kernel release it. Returns
+/// `(probed, recovered, still_stuck)`.
 ///
 /// Best-effort: a recovery that doesn't clear the pid file is
 /// logged with `tracing::warn!` so prod ops sees how many devices
 /// can't be recovered automatically (operator fallback: reboot the
 /// host). The pool-acquire path's `nbd_kernel_busy` probe will
 /// continue to skip still-stuck devices, so they're structurally
-/// invisible until the kernel releases (often "never" without a
-/// reboot).
+/// invisible until the kernel releases.
 ///
-/// Called once at host-agent startup from the NbdSlotAllocator's
-/// construction site, BEFORE any new sandboxes attach. Each call
-/// emits a one-line `recovered N/M stale NBD devices` summary so
-/// ops can monitor cleanup accumulation across restarts.
+/// MUST run only over slots that do NOT belong to surviving
+/// sandboxes — a survivor's device is alive-by-design across the
+/// restart (its FC keeps reading it; rehydrate RECONFIGUREs it).
+/// The pre-netlink version of this pass ran blind over every
+/// device at startup and actively disconnected the survivor's disk
+/// (prod 2026-06-11, /dev/nbd4 → guest rootfs EIO). The caller in
+/// `lib.rs` therefore runs it AFTER the survivor rehydrate pass,
+/// over the slot pool's still-free paths only.
 pub fn recover_stuck_nbd_devices(paths: &[std::path::PathBuf]) -> (usize, usize, usize) {
     let mut probed = 0;
     let mut recovered = 0;
@@ -385,50 +295,27 @@ fn recover_one_stuck_device(path: &std::path::Path) -> io::Result<NbdRecoveryOut
     tracing::warn!(
         device = %path.display(),
         bound_pid = %bound_pid,
-        "NBD recovery: device kernel-bound (possibly to a dead pid); attempting recovery via NBD_DISCONNECT + NBD_CLEAR_SOCK",
+        "NBD recovery: unclaimed device kernel-bound to a stale config; \
+         attempting recovery via netlink NBD_CMD_DISCONNECT",
     );
 
-    // 2. Open the device R/W to get a fd we can ioctl against.
-    let fd = OwnedFd::from(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?,
-    );
-    let raw = fd.as_raw_fd();
-
-    // 3. NBD_DISCONNECT signals the kernel to exit NBD_DO_IT.
-    let rc = unsafe { libc::ioctl(raw, NBD_DISCONNECT) };
-    if rc != 0 {
+    // 2. Netlink disconnect. Works without an open fd and without
+    //    the dead process's NBD_DO_IT thread — this is what the old
+    //    ioctl dance (NBD_DISCONNECT + NBD_CLEAR_SOCK on a fresh fd)
+    //    couldn't reliably do ("device STILL bound", prod
+    //    2026-06-11). Errors are folded into the re-probe below.
+    let index = nbd_netlink::device_index(path)?;
+    if let Err(e) = nbd_netlink::disconnect_device(index) {
         tracing::debug!(
             device = %path.display(),
-            errno = io::Error::last_os_error().raw_os_error(),
-            "NBD_DISCONNECT in recovery returned non-zero (often harmless: kernel was already disconnected)",
+            error = %e,
+            "netlink NBD_CMD_DISCONNECT in recovery errored; re-probing anyway",
         );
     }
 
-    // 4. NBD_CLEAR_SOCK clears the kernel's reference to whatever
-    //    socket the dead daemon registered. Load-bearing on devices
-    //    whose bound daemon died without disconnect: the kernel
-    //    holds onto the socket ref-count and won't release the
-    //    device until cleared.
-    let rc = unsafe { libc::ioctl(raw, NBD_CLEAR_SOCK) };
-    if rc != 0 {
-        tracing::debug!(
-            device = %path.display(),
-            errno = io::Error::last_os_error().raw_os_error(),
-            "NBD_CLEAR_SOCK in recovery returned non-zero",
-        );
-    }
-
-    // 5. Brief sleep so the kernel has a chance to release. Observed
-    //    100ms is sufficient on dev-vm; production may need more on
-    //    a heavily loaded host but this is a one-shot startup
-    //    operation so we don't iterate.
+    // 3. Brief sleep so the kernel has a chance to release, then
+    //    re-probe. Empty → recovered; non-empty → still stuck.
     std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // 6. Re-probe pid file. Empty → recovered; non-empty → still
-    //    stuck (reboot likely required).
     let final_pid = std::fs::read_to_string(&pid_path).unwrap_or_default();
     if final_pid.trim().is_empty() {
         tracing::info!(
@@ -442,7 +329,8 @@ fn recover_one_stuck_device(path: &std::path::Path) -> io::Result<NbdRecoveryOut
             device = %path.display(),
             prior_pid = %bound_pid,
             post_recovery_pid = %final_pid.trim(),
-            "NBD recovery: device STILL bound after NBD_DISCONNECT + NBD_CLEAR_SOCK; operator may need to reboot the host to recover this slot",
+            "NBD recovery: device STILL bound after netlink disconnect; \
+             operator may need to reboot the host to recover this slot",
         );
         Ok(NbdRecoveryOutcome::StillStuck)
     }
@@ -514,6 +402,24 @@ impl NbdSandboxState {
     pub fn device_path(&self) -> &Path {
         self.slot.path()
     }
+
+    /// Graceful-shutdown teardown that leaves the KERNEL side alive
+    /// for the successor host-agent generation (ADR 0044 K2). Without
+    /// this, process exit drops [`NbdHandle`] → netlink disconnect →
+    /// the survivor's disk is torn down by its own dying parent
+    /// ("Disconnected due to user request", prod 2026-06-12 canary)
+    /// and the successor's RECONFIGURE meets "not configured". The
+    /// serve task + scheduler are aborted (in-process resources); the
+    /// device config, with its parked-I/O dead_conn window, persists.
+    /// The slot lease is forgotten rather than released — the pool
+    /// dies with the process, and `NbdSlot::Drop` would
+    /// `tokio::spawn` during runtime teardown.
+    pub fn abandon_for_shutdown(self) {
+        drop(self.scheduler);
+        self.handle.abandon();
+        std::mem::forget(self.slot);
+        drop(self.backend);
+    }
 }
 
 /// One-call setup for a sandbox's NBD-backed rootfs:
@@ -542,9 +448,10 @@ pub async fn attach_manifest(
     slot_pool: &Arc<NbdSlotAllocator>,
     threshold_bytes: u64,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
+    let backend_id = disk_manifest_ref.manifest_id.to_string();
     let backend =
         ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?;
-    attach_backend(backend, slot_pool).await
+    attach_backend(backend, slot_pool, &backend_id).await
 }
 
 /// ADR 0045 C1: attach from manifest CONTENT delivered inline (a
@@ -557,6 +464,7 @@ pub async fn attach_manifest_content(
     slot_pool: &Arc<NbdSlotAllocator>,
     threshold_bytes: u64,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
+    let backend_id = disk_manifest_ref.manifest_id.to_string();
     let backend = ChunkedDiskBackend::from_manifest(
         disk_manifest_ref,
         manifest,
@@ -564,16 +472,47 @@ pub async fn attach_manifest_content(
         store,
         threshold_bytes,
     )?;
-    attach_backend(backend, slot_pool).await
+    attach_backend(backend, slot_pool, &backend_id).await
+}
+
+/// Survivor rehydrate (ADR 0044 K2): rebuild the data plane for a
+/// device the kernel ALREADY serves under a surviving FC. The slot
+/// must have been [`NbdSlotAllocator::claim`]ed for the survivor's
+/// existing `/dev/nbdN`; a fresh backend is built from the durable
+/// manifest and handed to the kernel via netlink
+/// `NBD_CMD_RECONFIGURE` — the kernel swaps the dead pod's socket
+/// for ours and releases any guest I/O parked under
+/// `dead_conn_timeout`. (The pre-netlink rehydrate acquired a FRESH
+/// slot here, serving a device nobody read while the survivor's
+/// real device stayed dead.)
+pub async fn reattach_manifest(
+    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
+    cache: engram_chunk_store::cache::ChunkCache,
+    store: Arc<engram_chunk_store::ChunkStore>,
+    slot: NbdSlot,
+    threshold_bytes: u64,
+) -> Result<NbdSandboxState, NbdRuntimeError> {
+    let backend_id = disk_manifest_ref.manifest_id.to_string();
+    let backend = Arc::new(
+        ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?,
+    );
+    let handle = reattach(backend.clone(), slot.path(), &backend_id).await?;
+    Ok(NbdSandboxState {
+        scheduler: None,
+        backend,
+        handle,
+        slot,
+    })
 }
 
 async fn attach_backend(
     backend: ChunkedDiskBackend,
     slot_pool: &Arc<NbdSlotAllocator>,
+    backend_id: &str,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
     let backend = Arc::new(backend);
     let slot = slot_pool.acquire().await;
-    let handle = spawn(backend.clone(), slot.path()).await?;
+    let handle = spawn(backend.clone(), slot.path(), backend_id).await?;
     Ok(NbdSandboxState {
         scheduler: None,
         backend,
@@ -593,6 +532,95 @@ async fn attach_backend(
 pub async fn spawn(
     backend: Arc<ChunkedDiskBackend>,
     nbd_device: &Path,
+    backend_id: &str,
+) -> Result<NbdHandle, NbdRuntimeError> {
+    serve_at(backend, nbd_device, backend_id, ConnectMode::Connect).await
+}
+
+/// Hand the kernel a NEW serve socket for a device it already has
+/// configured (netlink `NBD_CMD_RECONFIGURE`) — the survivor-
+/// rehydrate primitive. `backend_id` must match the identifier the
+/// original CONNECT registered (the kernel verifies it via
+/// `/sys/block/nbdN/backend`, so a slot-accounting bug can't splice
+/// our socket into someone else's device).
+///
+/// ADOPTION IS VERIFIED, NOT TRUSTED: the kernel's reconfigure
+/// handler converts `-ENOSPC` ("no dead connection slot to replace
+/// yet") into a clean ACK and quietly drops the socket — observed
+/// live when the predecessor's serve fd lingered in a child and the
+/// dead-marking only happened at the next request timeout. A
+/// dropped socket EOFs our serve loop within milliseconds (the
+/// kernel `sockfd_put`s its only reference), so after each attempt
+/// we wait briefly and check the serve task is still alive,
+/// retrying with a fresh socketpair until the kernel has actually
+/// marked the old connection dead. Budget covers a full 90s request
+/// timeout straggler.
+pub async fn reattach(
+    backend: Arc<ChunkedDiskBackend>,
+    nbd_device: &Path,
+    backend_id: &str,
+) -> Result<NbdHandle, NbdRuntimeError> {
+    let budget = std::time::Duration::from_secs(150);
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let handle = serve_at(
+            backend.clone(),
+            nbd_device,
+            backend_id,
+            ConnectMode::Reconfigure,
+        )
+        .await?;
+        // An adopted socket stays open (the kernel holds its dup);
+        // a rejected one EOFs the serve loop near-instantly.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if !handle
+            .serve_task
+            .as_ref()
+            .map(|t| t.is_finished())
+            .unwrap_or(true)
+        {
+            if attempt > 1 {
+                tracing::info!(
+                    device = %nbd_device.display(),
+                    attempt,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "NBD RECONFIGURE adopted after retries",
+                );
+            }
+            return Ok(handle);
+        }
+        // Not adopted. Drop WITHOUT the netlink disconnect (the
+        // device must stay configured for the next attempt — and
+        // for the parked guest I/O).
+        handle.abandon();
+        if started.elapsed() > budget {
+            return Err(NbdRuntimeError::Io(io::Error::other(format!(
+                "NBD RECONFIGURE not adopted within {budget:?} ({attempt} attempts): \
+                 the kernel reports success but closes the socket — predecessor's \
+                 connection never marked dead?"
+            ))));
+        }
+        tracing::debug!(
+            device = %nbd_device.display(),
+            attempt,
+            "NBD RECONFIGURE socket not adopted (kernel-swallowed ENOSPC); retrying",
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+enum ConnectMode {
+    Connect,
+    Reconfigure,
+}
+
+async fn serve_at(
+    backend: Arc<ChunkedDiskBackend>,
+    nbd_device: &Path,
+    backend_id: &str,
+    mode: ConnectMode,
 ) -> Result<NbdHandle, NbdRuntimeError> {
     let total_bytes = backend.total_bytes();
     if !total_bytes.is_multiple_of(NBD_BLOCK_SIZE) {
@@ -601,105 +629,53 @@ pub async fn spawn(
             block_size: NBD_BLOCK_SIZE,
         });
     }
+    let index = nbd_netlink::device_index(nbd_device)?;
 
-    // 1. Open the NBD device (O_RDWR). The kernel must already have
-    //    the nbd module loaded with enough slots (typically via
-    //    `modprobe nbd nbds_max=64`); the host-agent's Packer
-    //    manifest handles that.
-    let nbd_fd = OwnedFd::from(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(nbd_device)?,
-    );
-
-    // 2. socketpair(AF_UNIX, SOCK_STREAM). Both halves are SOCK_STREAM
+    // 1. socketpair(AF_UNIX, SOCK_STREAM). Both halves are SOCK_STREAM
     //    so reads block until enough bytes arrive (vs SOCK_DGRAM which
     //    would frame-truncate). One end goes to the kernel, the other
     //    stays in-process as a Tokio stream.
     let (kernel_side, server_side) = unix_socketpair()?;
 
-    // 3. Size the block device. The kernel rejects the SET_SOCK ioctl
-    //    if these haven't been called.
-    let block_count = total_bytes / NBD_BLOCK_SIZE;
-    ioctl_set(nbd_fd.as_raw_fd(), NBD_SET_BLKSIZE, NBD_BLOCK_SIZE)?;
-    ioctl_set(nbd_fd.as_raw_fd(), NBD_SET_SIZE_BLOCKS, block_count)?;
-    let flags = (NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_TRIM) as u64;
-    ioctl_set(nbd_fd.as_raw_fd(), NBD_SET_FLAGS, flags)?;
-
-    // 3b. Bound the kernel's per-request wait (see `nbd_kernel_timeout_secs`).
-    //     Without NBD_SET_TIMEOUT a daemon that never replies — a wedged
-    //     serve loop, a lock deadlock, the daemon dying — leaves guest
-    //     I/O (notably the device-open / partition-probe read at attach)
-    //     wedged in D-state indefinitely; with it the kernel times the
-    //     request out and returns EIO. Takes the timeout in seconds.
-    ioctl_set(
-        nbd_fd.as_raw_fd(),
-        NBD_SET_TIMEOUT,
-        nbd_kernel_timeout_secs(),
-    )?;
-
-    // 4. Hand the kernel its half of the socketpair. After this,
-    //    the kernel speaks NBD wire protocol over its end; we
-    //    serve from ours.
-    //
-    //    SAFETY: kernel_side is a valid OwnedFd we own; ioctl
-    //    NBD_SET_SOCK takes the fd value and the kernel duplicates
-    //    it internally. We drop our handle to kernel_side
-    //    immediately after — the kernel keeps it alive via its
-    //    internal reference.
-    ioctl_set(
-        nbd_fd.as_raw_fd(),
-        NBD_SET_SOCK,
-        kernel_side.as_raw_fd() as u64,
-    )?;
+    // 2. Configure (or re-arm) the device via netlink. The kernel
+    //    dups the socket fd, runs its own receive machinery (no
+    //    NBD_DO_IT thread), and parks guest I/O for
+    //    `dead_conn_timeout` whenever the connection dies — the
+    //    pod-roll survival contract. The genl round-trips are
+    //    blocking syscalls with a bounded recv timeout; run them off
+    //    the async workers.
+    let params_fd = kernel_side.as_raw_fd();
+    let backend_id_owned = backend_id.to_string();
+    let connect = tokio::task::spawn_blocking(move || {
+        let params = NbdNetlinkParams {
+            index,
+            sock_fd: params_fd,
+            timeout_secs: nbd_kernel_timeout_secs(),
+            dead_conn_timeout_secs: nbd_dead_conn_timeout_secs(),
+            backend_identifier: &backend_id_owned,
+        };
+        match mode {
+            ConnectMode::Connect => {
+                nbd_netlink::connect_device(&params, total_bytes, NBD_BLOCK_SIZE)
+            }
+            ConnectMode::Reconfigure => nbd_netlink::reconfigure_device(&params),
+        }
+    })
+    .await
+    .map_err(io::Error::other)?;
+    connect?;
+    // The kernel holds its own reference now.
     drop(kernel_side);
 
-    // 5. Spawn the kernel-blocked thread. `NBD_DO_IT` blocks until
-    //    NBD_DISCONNECT is issued; without this thread, the kernel
-    //    won't process I/O on the block device.
-    let nbd_fd_raw = nbd_fd.as_raw_fd();
-    let device_label = nbd_device.display().to_string();
-    let kernel_thread = std::thread::Builder::new()
-        .name(format!("engram-nbd-doit-{}", device_label))
-        .spawn(move || {
-            // SAFETY: nbd_fd_raw is alive for the duration of this
-            // thread because the parent NbdHandle owns the OwnedFd
-            // and Drop joins us before closing.
-            let rc = unsafe { libc::ioctl(nbd_fd_raw, NBD_DO_IT) };
-            if rc != 0 {
-                let errno = io::Error::last_os_error().raw_os_error();
-                tracing::warn!(rc, errno, "NBD_DO_IT exited unexpectedly");
-            }
-        })
-        .map_err(io::Error::other)?;
-
-    // 6. Spawn the tokio serve task on the server-side socket.
+    // 3. Spawn the tokio serve task on the server-side socket.
     let stream = TokioUnixStream::from_std(server_side)?;
     let serve_task = tokio::spawn(serve_loop(backend, stream));
 
     Ok(NbdHandle {
         nbd_device: nbd_device.to_path_buf(),
-        nbd_fd: Some(nbd_fd),
+        index,
         serve_task: Some(serve_task),
-        kernel_thread: Some(kernel_thread),
     })
-}
-
-/// Run an NBD ioctl that takes a u64 argument. The kernel reads
-/// the argument as a `unsigned long`, so we pass it as `u64` and
-/// `libc::ioctl` handles the platform-specific width.
-fn ioctl_set(fd: RawFd, cmd: libc::Ioctl, arg: u64) -> io::Result<()> {
-    // SAFETY: fd is an owned, valid kernel fd handed in by the
-    // caller. NBD ioctl numbers don't carry direction bits — the
-    // kernel reads `arg` as `unsigned long`, which is u64 on
-    // x86_64 / aarch64. Calling convention matches.
-    let rc = unsafe { libc::ioctl(fd, cmd, arg) };
-    if rc != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }
 
 /// `socketpair(AF_UNIX, SOCK_STREAM)` returning `(kernel_side,
@@ -709,7 +685,25 @@ fn unix_socketpair() -> io::Result<(OwnedFd, std::os::unix::net::UnixStream)> {
     // SAFETY: array sized for the AF_UNIX socketpair contract.
     // Kernel writes both fds; we wrap them in OwnedFd /
     // UnixStream immediately to take ownership.
-    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    //
+    // SOCK_CLOEXEC is LOAD-BEARING for the survivor contract: these
+    // fds are created with raw libc (no CLOEXEC by default), so
+    // every child spawned afterwards — Firecracker above all —
+    // inherited the server half. The child then kept the socket
+    // open past the host-agent's death, the kernel's recv worker
+    // never saw EOF, the dead nsock was only marked at the next
+    // 90s request timeout, and the successor's RECONFIGURE within
+    // that window met the kernel's silently-ACKed -ENOSPC ("no
+    // dead connection to replace") — prod canary 2026-06-12,
+    // "Receive control failed (result -32)" arriving ~90s late.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }

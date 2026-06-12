@@ -186,6 +186,113 @@ pub struct MigrationSourceInfo {
     pub disk_manifest_ref: super::manifest::ManifestRef,
     pub new_memory_chunk_hashes: Vec<[u8; 32]>,
     pub new_disk_chunk_hashes: Vec<[u8; 32]>,
+    /// ADR 0045 C2 (E2B fold): the source guest's hot set in fault
+    /// order — the destination pulls these FIRST. Best-effort rider
+    /// (empty when the source had no trace); serde-default keeps
+    /// mixed rolls safe.
+    #[serde(default)]
+    pub hot_chunks: Vec<[u8; 32]>,
+    /// ADR 0045 C2: this is a POST-COPY move. The destination restores
+    /// CONCURRENTLY with the source's capture: its uffd-handler dials
+    /// `peer_addr` with `peer_token`, parks until the source's SEAL,
+    /// and serves sealed (dirtied-since-checkpoint) faults from the
+    /// peer; `state.bin` is fetch-polled (it exists only post-pause).
+    /// `false`/absent ⇒ the C1 stop-and-copy shape (artifacts exist
+    /// before restore begins).
+    #[serde(default)]
+    pub post_copy: bool,
+    /// ADR 0045 C2: `host:port` of the source host-agent's page-server
+    /// listener (default port 9102).
+    #[serde(default)]
+    pub peer_addr: Option<String>,
+    /// ADR 0045 C2: the per-export secret the dest handler presents in
+    /// its `Hello` (delivered to the handler via env, never argv).
+    #[serde(default)]
+    pub peer_token: Option<String>,
+    /// ADR 0045 C2: the presetup-composed restore sidecar
+    /// (`manifest.json` content). C1 fetches the sidecar from the
+    /// export; post-copy can't (it must restore BEFORE the capture
+    /// exists), so the rider carries it. Empty for C1.
+    #[serde(default)]
+    pub sidecar_json: Vec<u8>,
+}
+
+/// ADR 0045 C2: what `migration_presetup` hands the coordinator — the
+/// pre-pause half of a post-copy capture. Everything the destination
+/// needs to BEGIN restoring before the source pauses: the export
+/// identity (pre-minted; the page server parks the dest handler's
+/// Hello until the capture registers it), the restore package sans
+/// `state.bin` (the sidecar + the inline v+1 session manifest are
+/// derivable from the chain pre-pause — post-copy never re-chunks at
+/// capture), and the hot set.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MigrationPresetupOut {
+    pub export_id: String,
+    pub peer_token: String,
+    /// The page-server port on the source (the coordinator pairs it
+    /// with the source's advertised host address).
+    pub peer_port: u16,
+    /// The capture-shape sidecar (`manifest.json` content) the dest
+    /// restores against.
+    pub sidecar_json: Vec<u8>,
+    /// The inline v+1 session memory manifest (fork lineage continues
+    /// on the dest; content == the chain's last checkpoint — sealed
+    /// chunks override via the peer at fault/drain time).
+    pub memory_manifest_json: Vec<u8>,
+    pub memory_manifest_ref: super::manifest::ManifestRef,
+    /// The disk manifest the dest NBD-attaches at prepare (the live
+    /// published view; the post-pause drain's final manifest arrives
+    /// with the capture and the dest REBASES before FC load).
+    pub disk_manifest_ref: Option<super::manifest::ManifestRef>,
+    #[serde(default)]
+    pub hot_chunks: Vec<[u8; 32]>,
+}
+
+/// ADR 0045 C2: what `migration_capture_postcopy` returns — the
+/// post-pause half. NOTHING bulky moves at capture (that is the
+/// point): the memory dirty map seals on the page server, the disk
+/// dirty/pending tiers seal on the export (raw bytes, never hashed),
+/// and `state.bin` becomes fetchable. The dest demand-faults both.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PostCopyCaptureOut {
+    /// Sealed (peer-authoritative) memory chunk count — observability.
+    pub sealed_chunks: u64,
+    pub total_chunks: u64,
+    /// Blackout decomposition (R6, all under the freeze; ADR 0045 C2
+    /// PR 10). The coordinator's `blackout_ms` is the wall across the
+    /// whole `migration_capture_postcopy` call; these break it into
+    /// the legs that actually cost — so an optimization (e.g. the
+    /// dest-side diff seed) targets the real hot leg instead of a
+    /// guess. `disk_drain_ms` is now only the host-cache fsync +
+    /// in-RAM seal (the re-chunk is gone — sealed blocks demand-fault
+    /// from the source like memory does).
+    pub pause_ms: u64,
+    pub disk_drain_ms: u64,
+    pub vmstate_ms: u64,
+    /// Pagemap scan wall time (blackout attribution, R6).
+    pub scan_ms: u64,
+    /// Sealed disk chunk count (dirty + pending tiers) — observability.
+    pub sealed_disk_chunks: u64,
+    pub paused_at_unix_ms: i64,
+}
+
+/// ADR 0045 C2: terminal drain outcome on the destination (consumed by
+/// the coordinator's finalize task via `migration_drain_wait`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum DrainOutcome {
+    /// Every sealed chunk is installed (or demoted + durably
+    /// fetchable). The source may be committed (destroyed).
+    Done {
+        pulled: u64,
+        alt_sourced: u64,
+        zero_chunks: u64,
+        ms: u64,
+    },
+    /// The peer died with sealed chunks uninstalled — no sound second
+    /// source exists. The dest VM has been PAUSED (poisoned) by the
+    /// host-agent; the coordinator must destroy it and rewind the
+    /// session (rung-1).
+    PeerLost { remaining: u64, detail: String },
 }
 
 /// ADR 0045 C1: what `migration_capture` hands the coordinator — the
@@ -203,6 +310,9 @@ pub struct MigrationCaptureOut {
     pub disk_manifest_ref: super::manifest::ManifestRef,
     pub new_memory_chunk_hashes: Vec<[u8; 32]>,
     pub new_disk_chunk_hashes: Vec<[u8; 32]>,
+    /// ADR 0045 C2 (E2B fold): see `MigrationSourceInfo::hot_chunks`.
+    #[serde(default)]
+    pub hot_chunks: Vec<[u8; 32]>,
     pub snapshot_id: super::ids::SnapshotId,
     pub paused_at_unix_ms: i64,
 }
@@ -213,6 +323,20 @@ pub enum MigrationItem {
     StateBin,
     Sidecar,
     Chunk([u8; 32]),
+    /// ADR 0045 C2: the post-pause drained coherent disk manifest
+    /// (inline JSON). The destination fetch-polls it alongside
+    /// `StateBin` and REBASES its NBD attach before FC load.
+    DiskManifest,
+    /// ADR 0045 C2 disk post-copy: the seal descriptor (inline JSON —
+    /// the source's published base manifest content + the sealed
+    /// chunk-index list). A NEW item kind (not `DiskManifest`) so an
+    /// old destination polling a new source fails LOUDLY (fetch error
+    /// → NeverLoaded → zero-loss abort) instead of resuming stale.
+    DiskSealInfo,
+    /// ADR 0045 C2 disk post-copy: one sealed disk chunk's raw bytes,
+    /// by chunk index — demand-fetched (and drained) by the dest's
+    /// NBD backend straight out of the frozen source's RAM.
+    DiskChunkAt(u64),
 }
 
 /// A frame of `migration_fetch`'s stream.

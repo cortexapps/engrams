@@ -59,6 +59,12 @@ service HostService {
   rpc MigrationFetch(MigrationFetchRequest) returns (stream MigrationFrame);
   rpc MigrationCommit(MigrationExportRef) returns (Empty);
   rpc MigrationAbort(MigrationExportRef) returns (Empty);
+  // ADR 0045 C2 post-copy: the pre-pause presetup (export identity +
+  // the restore package sans state.bin), the blackout capture
+  // (vmstate-only + pagemap seal), and the destination's drain await.
+  rpc MigrationPresetup(SandboxIdMessage) returns (MigrationPresetupResponse);
+  rpc MigrationCapturePostCopy(MigrationExportRef) returns (PostCopyCaptureResponse);
+  rpc MigrationDrainWait(SandboxIdMessage) returns (DrainOutcomeResponse);
   rpc Restore(RestoreRequest) returns (SandboxIdMessage);
   rpc GuestIp(SandboxIdMessage) returns (GuestIpResponse);
   // ADR 0045 Phase F: freeze / unfreeze a running microVM *in place* —
@@ -215,11 +221,61 @@ message MigrationCaptureResponse {
   // version-conflict retry dance (shared-template disk lineages).
   bytes memory_manifest_ref = 8;
   bytes disk_manifest_ref = 9;
+  // ADR 0045 C2 (E2B fold): the source guest's hot set in FAULT ORDER
+  // (the handler's working-set recorder, dumped per-jail). The
+  // destination pulls/prefaults these FIRST so the post-move re-fault
+  // storm hits warm NVMe. 32-byte raw hashes; empty when the source
+  // had no trace (best-effort rider, never load-bearing).
+  repeated bytes hot_chunks = 10;
 }
 
 message MigrationExportRef {
   bytes sandbox_id = 1;
   string export_id = 2;
+}
+
+// ADR 0045 C2: see MigrationPresetupOut in engram-core for field
+// semantics (this is a 1:1 wire mapping).
+message MigrationPresetupResponse {
+  string export_id = 1;
+  string peer_token = 2;
+  uint32 peer_port = 3;
+  bytes sidecar_json = 4;
+  bytes memory_manifest_json = 5;
+  bytes memory_manifest_ref = 6;   // bincode ManifestRef
+  bytes disk_manifest_ref = 7;     // bincode Option<ManifestRef> (empty = none)
+  repeated bytes hot_chunks = 8;
+}
+
+message PostCopyCaptureResponse {
+  uint64 sealed_chunks = 1;
+  uint64 total_chunks = 2;
+  uint64 scan_ms = 3;
+  // 4-6 were the pre-disk-post-copy drained-manifest fields
+  // (disk_manifest_json / disk_manifest_ref / new_disk_chunk_hashes):
+  // the capture no longer re-chunks disk under the freeze — sealed
+  // dirty blocks demand-fault from the source like memory does.
+  reserved 4, 5, 6;
+  int64 paused_at_unix_ms = 7;
+  // ADR 0045 C2 PR 10: blackout decomposition (all under the freeze).
+  uint64 pause_ms = 8;
+  uint64 disk_drain_ms = 9;
+  uint64 vmstate_ms = 10;
+  // Disk post-copy: how many disk chunks were sealed (dirty +
+  // pending tiers) for P2P demand-fetch.
+  uint64 sealed_disk_chunks = 11;
+}
+
+message DrainOutcomeResponse {
+  bool done = 1;
+  // done=true:
+  uint64 pulled = 2;
+  uint64 alt_sourced = 3;
+  uint64 zero_chunks = 4;
+  uint64 ms = 5;
+  // done=false (PeerLost):
+  uint64 remaining = 6;
+  string detail = 7;
 }
 
 message MigrationFetchRequest {
@@ -231,15 +287,29 @@ message MigrationFetchRequest {
 
 message MigrationItem {
   // Exactly one of:
-  //   kind = STATE_BIN | SIDECAR  (hash empty)
+  //   kind = STATE_BIN | SIDECAR  (hash + chunk_idx empty)
   //   kind = CHUNK                (hash = 32-byte chunk hash)
+  //   kind = DISK_CHUNK_AT        (chunk_idx = disk chunk index)
   enum Kind {
     CHUNK = 0;
     STATE_BIN = 1;
     SIDECAR = 2;
+    // ADR 0045 C2: the drained coherent disk manifest JSON.
+    DISK_MANIFEST = 3;
+    // ADR 0045 C2 disk post-copy: the seal descriptor JSON (base
+    // manifest content + sealed chunk indices). Intentionally a NEW
+    // kind (not DISK_MANIFEST) so an old destination polling a new
+    // source fails LOUDLY at the fetch (NeverLoaded → zero-loss
+    // abort-to-source) instead of resuming against a stale disk.
+    DISK_SEAL_INFO = 4;
+    // ADR 0045 C2 disk post-copy: one sealed disk chunk's RAW bytes,
+    // by chunk index — served from the frozen source's sealed
+    // dirty/pending tiers (RAM), never hashed or uploaded.
+    DISK_CHUNK_AT = 5;
   }
   Kind kind = 1;
   bytes hash = 2;
+  uint64 chunk_idx = 3;
 }
 
 message MigrationFrame {

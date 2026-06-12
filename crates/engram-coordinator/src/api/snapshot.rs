@@ -453,7 +453,7 @@ async fn resume_from_created(
             "session {id} is Created but has no bound host — cannot resume",
         )));
     }
-    let outcome = finish_resume_to_active(&state, &session, sandbox_id).await?;
+    let outcome = finish_resume_to_active(&state, &session, sandbox_id, true).await?;
     let note = match outcome {
         FinishResumeOutcome::Active => "resumed from Created (auto-evac completion)",
         FinishResumeOutcome::CreatedHarnessFailed => {
@@ -558,7 +558,7 @@ async fn resume_disk_only_cold_boot(
     // destroyed); clearing host_id disables `exclude_host` so a
     // single-host deployment can recover onto itself.
     let mut relocatable = session.clone();
-    relocatable.host_id = None;
+    let origin = relocatable.host_id.take();
 
     let receipt = evacuate_dead_source(
         &state.host_registry,
@@ -567,6 +567,11 @@ async fn resume_disk_only_cold_boot(
         None,
         Some(spec),
         None,
+        // ADR 0045 C2 (E2B fold, origin affinity): prefer the host the
+        // session last ran on — its NBD chunk cache (and base shm) are
+        // warm there. Soft tier-2: loses to capacity/draining, so this
+        // never strands the resume.
+        origin,
     )
     .await
     .map_err(|e| match &e {
@@ -597,7 +602,7 @@ async fn resume_disk_only_cold_boot(
 
     bind_session_routing(&state, id, receipt.new_sandbox_id).await;
     let refreshed = state.services.meta.get_session(id).await?;
-    let outcome = finish_resume_to_active(&state, &refreshed, receipt.new_sandbox_id).await?;
+    let outcome = finish_resume_to_active(&state, &refreshed, receipt.new_sandbox_id, true).await?;
     let note = match outcome {
         FinishResumeOutcome::Active => {
             "resumed via disk-only cold boot (fresh kernel on latest disk; in-RAM context lost)"
@@ -836,6 +841,11 @@ pub async fn finish_resume_to_active(
     state: &SharedState,
     session: &Session,
     new_sandbox_id: SandboxId,
+    // Emit the terminal StatusChanged here? The live-migration verb
+    // suppresses it and emits a single `evacuating -> active` itself —
+    // the `created -> active` hop is an internal FSM step there, not a
+    // user-meaningful state (the session can't take messages yet).
+    emit_status: bool,
 ) -> Result<FinishResumeOutcome, ApiError> {
     let id = session.id;
     // ADR 0016 §A.1.7: load the full bundle (manifest + SecretBundle
@@ -922,17 +932,19 @@ pub async fn finish_resume_to_active(
         .meta
         .transition_session(id, SessionState::Active)
         .await?;
-    let now = Utc::now();
-    state
-        .emit(
-            id,
-            SessionEvent::StatusChanged {
-                from: prev_for_active,
-                to: SessionState::Active,
-                at: now,
-            },
-        )
-        .await?;
+    if emit_status {
+        let now = Utc::now();
+        state
+            .emit(
+                id,
+                SessionEvent::StatusChanged {
+                    from: prev_for_active,
+                    to: SessionState::Active,
+                    at: now,
+                },
+            )
+            .await?;
+    }
     Ok(FinishResumeOutcome::Active)
 }
 
@@ -1185,7 +1197,7 @@ async fn resume_from_fc_snapshot(
     // freshly-bound host_id + sandbox_id (the caller might've raced
     // a concurrent writer between bind_resumed_session and now).
     let session_refreshed = state.services.meta.get_session(id).await?;
-    let outcome = finish_resume_to_active(&state, &session_refreshed, new_sandbox_id).await?;
+    let outcome = finish_resume_to_active(&state, &session_refreshed, new_sandbox_id, true).await?;
     match outcome {
         FinishResumeOutcome::CreatedHarnessFailed => Ok(SnapshotResponse {
             session_id: id,

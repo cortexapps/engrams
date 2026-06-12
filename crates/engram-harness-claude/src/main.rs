@@ -212,9 +212,18 @@ mod adapter {
         // Connection loop: dial → handshake → splice (forward host
         // commands / pump engine events) until the link drops, then
         // re-dial. The engine drives termination.
+        //
+        // ADR 0045 C1: SIGUSR1 = "drop the connection and re-dial NOW",
+        // sent by agentd's SpawnHarness-reattach arm right after a live
+        // move / snapshot restore. The restore rebuilds the vsock
+        // device, but this side's established connection never EOFs —
+        // the splice would block forever on a read the peer can no
+        // longer answer, and the new host would never see an attach.
+        let mut reconnect_nudge =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .expect("install SIGUSR1 handler");
         let mut consecutive_failures: u32 = 0;
-        const MAX_BACKOFF_SECS: u64 = 30;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+        const MAX_BACKOFF_SECS: u64 = 10;
         // `None` → the engine finished on its own; await it below for the
         // real exit code. `Some` → we're bailing for our own reason
         // (gave up reaching the host / host rejected attach) and must
@@ -229,36 +238,53 @@ mod adapter {
                 Some(s) => s,
                 None => {
                     // Couldn't reach the host at all — distinct from a
-                    // mid-session drop. Back off; give up only after a
-                    // run of failures-to-establish.
+                    // mid-session drop. Back off and KEEP TRYING,
+                    // forever. The harness is the session's only event
+                    // channel: a live move / snapshot restore rebuilds
+                    // the vsock device while the guest is CPU-starved
+                    // for tens of seconds, and the old give-up budget
+                    // (10 failures) expired exactly then — the harness
+                    // exited silently, the host kept a binding to a
+                    // corpse, and every later prompt 500'd ("sandbox
+                    // not found", prod canary 1f64052e). Dying never
+                    // helps: a genuinely-orphaned harness is reaped by
+                    // agentd's next SpawnHarness, and an idle retry at
+                    // the backoff cap costs nothing.
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    if consecutive_failures > MAX_CONSECUTIVE_FAILURES {
-                        tracing::error!(
-                            consecutive_failures,
-                            "giving up after repeated dial failures"
-                        );
-                        break Some(ExitCode::from(1));
-                    }
                     let backoff =
-                        std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(5));
+                        std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(4));
+                    if consecutive_failures.is_power_of_two() {
+                        tracing::warn!(
+                            consecutive_failures,
+                            backoff_secs = backoff,
+                            "host unreachable; retrying indefinitely"
+                        );
+                    }
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                     continue;
                 }
             };
-            match run_one_connection(stream, &cli, &cmd_tx, &mut evt_rx, &held, &reattach).await {
+            let outcome = tokio::select! {
+                outcome = run_one_connection(stream, &cli, &cmd_tx, &mut evt_rx, &held, &reattach) => outcome,
+                _ = reconnect_nudge.recv() => {
+                    tracing::info!(
+                        "SIGUSR1 reconnect nudge (live move / restore); \
+                         dropping the connection and re-dialing"
+                    );
+                    ConnOutcome::Dropped { reason: "SIGUSR1 reconnect nudge" }
+                }
+            };
+            match outcome {
                 ConnOutcome::EngineDone => break None,
                 ConnOutcome::Rejected => break Some(ExitCode::from(1)),
                 ConnOutcome::HandshakeFailed { reason } => {
+                    // Same indefinite-retry posture as the dial arm: a
+                    // handshake can fail transiently for as long as the
+                    // host side is mid-rebind (live move), and exiting
+                    // strands the session.
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    if consecutive_failures > MAX_CONSECUTIVE_FAILURES {
-                        tracing::error!(
-                            consecutive_failures,
-                            "giving up after repeated handshake failures"
-                        );
-                        break Some(ExitCode::from(1));
-                    }
                     let backoff =
-                        std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(5));
+                        std::cmp::min(MAX_BACKOFF_SECS, 1u64 << consecutive_failures.min(4));
                     tracing::warn!(
                         reason,
                         consecutive_failures,

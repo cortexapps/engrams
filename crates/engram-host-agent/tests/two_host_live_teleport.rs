@@ -52,6 +52,17 @@ fn build_host(
     blob_root: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
+    build_host_with_nbd(label, kernel, handler, blob_root, chunk_store, None)
+}
+
+fn build_host_with_nbd(
+    label: &str,
+    kernel: &Path,
+    handler: &Path,
+    blob_root: &Path,
+    chunk_store: &engram_chunk_store::ChunkStore,
+    nbd_device: Option<&Path>,
+) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
         .prefix(&format!("teleport-{label}-"))
         .tempdir()
@@ -68,13 +79,17 @@ fn build_host(
     let mut cache_cfg =
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
-    let pooled = Arc::new(
-        PooledBackend::new(inner)
-            .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
-            .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
-            .with_checkpoint_dir(work.path().join("checkpoints")),
-    );
-    (pooled, work)
+    let mut pooled = PooledBackend::new(inner)
+        .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
+        .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
+        .with_checkpoint_dir(work.path().join("checkpoints"));
+    if let Some(dev) = nbd_device {
+        pooled = pooled.with_nbd_pool(
+            engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(vec![dev.to_path_buf()])
+                .expect("nbd slot pool"),
+        );
+    }
+    (Arc::new(pooled), work)
 }
 
 async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
@@ -213,7 +228,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
-                    "echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
+                    "trap '' USR1; echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
                      echo $i > /dev/shm/harness-heartbeat; sleep 0.2; done"
                         .into(),
                 ],
@@ -258,6 +273,11 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         disk_manifest_ref: cap.disk_manifest_ref,
         new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
         new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
+        hot_chunks: vec![],
+        post_copy: false,
+        peer_addr: None,
+        peer_token: None,
+        sidecar_json: Vec::new(),
     });
 
     let t_restore = std::time::Instant::now();
@@ -293,7 +313,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
-                    "echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
+                    "trap '' USR1; echo $$ > /dev/shm/harness-pid; i=0; while :; do i=$((i+1)); \
                      echo $i > /dev/shm/harness-heartbeat; sleep 0.2; done"
                         .into(),
                 ],
@@ -369,6 +389,237 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .expect("commit on A");
     assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
     assert!(host_b.pooled.list().await.unwrap().contains(&moved));
+    host_b.pooled.destroy(moved).await.expect("destroy moved");
+    host_a.server.abort();
+    host_b.server.abort();
+}
+
+/// The NBD-rootfs arm (prod canaries 5fa742b7 / 4391e591): production
+/// sessions run on a CHUNKED-NBD rootfs, and both prod teleport
+/// canaries came out the other side with a corrupt disk — zeros /
+/// "Exec format error" on any UNCACHED read — while every memory-side
+/// probe passed. The sibling test above boots on a flat ext4 file
+/// (`rootfs_source`), so the migration's whole disk leg (pause-window
+/// drain, inline-manifest hand-off, dest NBD re-attach, drive
+/// re-point) had no real-VM coverage. Worse, on a single machine the
+/// frozen source's NBD device keeps serving correct bytes until
+/// commit, masking a wrong redirect — so this test COMMITS (source
+/// destroyed) BEFORE probing, then drops the guest page cache and
+/// re-reads through the destination's NBD. Byte-identical or bust.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + KVM + firecracker + Docker + two /dev/nbd devices"]
+async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
+    if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
+        return;
+    }
+    let Some((kernel, handler, agent)) = gate() else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            "engram_host_agent=debug,engram_chunk_store=debug,engram_sandbox_firecracker=info",
+        )
+        .with_test_writer()
+        .try_init();
+    // One real NBD device per host stack.
+    let nbd_a = PathBuf::from("/dev/nbd0");
+    let nbd_b = PathBuf::from("/dev/nbd1");
+    for dev in [&nbd_a, &nbd_b] {
+        if !dev.exists() {
+            eprintln!(
+                "SKIP: {} not present — run `sudo modprobe nbd nbds_max=4`",
+                dev.display()
+            );
+            return;
+        }
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dev)
+            .is_err()
+        {
+            eprintln!("SKIP: cannot open {} R/W", dev.display());
+            return;
+        }
+    }
+    std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
+
+    let shared = tempfile::tempdir().expect("shared dir");
+    let blob_root = shared.path().join("blob");
+    let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+        engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+
+    let src = tempfile::tempdir().expect("source dir");
+    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
+    std::fs::write(
+        src.path().join("engram.toml"),
+        "name = \"engram-teleport-nbd\"\n",
+    )
+    .unwrap();
+    let images = tempfile::tempdir().expect("images dir");
+    let baker = Builder::new(DockerCli::new(), chunk_store.clone());
+    let outcome = baker
+        .build(&BuildRequest {
+            source: src.path().to_path_buf(),
+            repo: "engram-teleport-nbd".into(),
+            tag: "warm-1".into(),
+            images_dir: images.path().to_path_buf(),
+            format: Format::Ext4,
+            agent_injection: Some(AgentInjection {
+                agent_binary: agent,
+                vsock_port: ENGRAM_AGENTD_PORT,
+                transport: engram_image_builder::Transport::Vsock,
+                init_script: None,
+            }),
+        })
+        .await
+        .expect("bake");
+    let rootfs_manifest = outcome
+        .disk_manifest
+        .expect("ext4 bake produces a chunked disk manifest");
+
+    let (pooled_a, _work_a) = build_host_with_nbd(
+        "nbd-a",
+        &kernel,
+        &handler,
+        &blob_root,
+        &chunk_store,
+        Some(&nbd_a),
+    );
+    let (pooled_b, _work_b) = build_host_with_nbd(
+        "nbd-b",
+        &kernel,
+        &handler,
+        &blob_root,
+        &chunk_store,
+        Some(&nbd_b),
+    );
+    let host_a = serve(pooled_a).await;
+    let host_b = serve(pooled_b).await;
+    let client_a = dial(host_a.addr).await;
+    let client_b = dial(host_b.addr).await;
+
+    // Create on A through the chunked-NBD rootfs path, exactly like a
+    // prod session (no flat ext4 file).
+    let spec = SandboxSpec {
+        image: "engram-teleport-nbd".into(),
+        rootfs_source: None,
+        image_uri: None,
+        rootfs_manifest: Some(rootfs_manifest),
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 256 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let vm = host_a.pooled.create(spec).await.expect("create on A");
+    let _ = exec(&host_a.pooled, vm, "true").await;
+    let ckpt = host_a
+        .pooled
+        .checkpoint_sandbox(vm)
+        .await
+        .expect("seed checkpoint on A");
+
+    // Pre-move disk truth: an existing rootfs binary AND a freshly
+    // written ROOTFS file (not /dev/shm — it must travel via the disk
+    // leg's pause-window drain).
+    let bin_hash_a = exec(&host_a.pooled, vm, "sha256sum /bin/ls | cut -d' ' -f1")
+        .await
+        .trim()
+        .to_string();
+    assert_eq!(bin_hash_a.len(), 64, "pre-move /bin/ls hash");
+    let probe_hash_a = exec(
+        &host_a.pooled,
+        vm,
+        "head -c 8388608 /dev/urandom > /rootfs-probe.bin && sync \
+         && sha256sum /rootfs-probe.bin | cut -d' ' -f1",
+    )
+    .await
+    .trim()
+    .to_string();
+    assert_eq!(probe_hash_a.len(), 64, "pre-move probe hash");
+
+    // ---- The move ----
+    let cap = client_a.migration_capture(vm).await.expect("capture on A");
+    assert!(
+        !cap.disk_manifest_json.is_empty(),
+        "an NBD-backed source must export its disk manifest"
+    );
+    let mut metadata = ckpt.clone();
+    metadata.id = cap.snapshot_id;
+    metadata.memory_manifest = Some(cap.memory_manifest_ref);
+    metadata.disk_manifest = Some(cap.disk_manifest_ref);
+    metadata.state_blob_key = None;
+    metadata.sidecar_blob_key = None;
+    metadata.migration_source = Some(MigrationSourceInfo {
+        export_id: cap.export_id.clone(),
+        source_addr: format!("http://{}", host_a.addr),
+        memory_manifest_json: cap.memory_manifest_json.clone(),
+        disk_manifest_json: cap.disk_manifest_json.clone(),
+        memory_manifest_ref: cap.memory_manifest_ref,
+        disk_manifest_ref: cap.disk_manifest_ref,
+        new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
+        new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
+        hot_chunks: vec![],
+        post_copy: false,
+        peer_addr: None,
+        peer_token: None,
+        sidecar_json: Vec::new(),
+    });
+    let moved = client_b.restore(metadata).await.expect("restore on B");
+    let row = host_b.pooled.snapshot_wait(moved).await.expect("catch-up");
+    assert_eq!(row.memory_manifest, Some(cap.memory_manifest_ref));
+
+    // COMMIT FIRST: the frozen source — whose NBD device on a
+    // one-machine test would happily keep serving the right bytes —
+    // is destroyed before any probe runs.
+    client_a
+        .migration_commit(vm, &cap.export_id)
+        .await
+        .expect("commit on A");
+    assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
+
+    // Post-move disk truth, THROUGH the destination's NBD: drop the
+    // guest page cache so nothing is served from the RAM that moved.
+    let dropped = exec(
+        &host_b.pooled,
+        moved,
+        "sync && echo 3 > /proc/sys/vm/drop_caches && echo dropped",
+    )
+    .await;
+    assert_eq!(dropped.trim(), "dropped", "page cache dropped on B");
+    let bin_hash_b = exec(&host_b.pooled, moved, "sha256sum /bin/ls | cut -d' ' -f1")
+        .await
+        .trim()
+        .to_string();
+    assert_eq!(
+        bin_hash_b, bin_hash_a,
+        "an uncached ROOTFS read on the destination must be \
+         byte-identical (prod symptom: zeros / Exec format error)"
+    );
+    let probe_hash_b = exec(
+        &host_b.pooled,
+        moved,
+        "sha256sum /rootfs-probe.bin | cut -d' ' -f1",
+    )
+    .await
+    .trim()
+    .to_string();
+    assert_eq!(
+        probe_hash_b, probe_hash_a,
+        "the session-written rootfs file must survive the move \
+         (travels via the pause-window disk drain)"
+    );
+
     host_b.pooled.destroy(moved).await.expect("destroy moved");
     host_a.server.abort();
     host_b.server.abort();
@@ -473,6 +724,11 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         disk_manifest_ref: cap.disk_manifest_ref,
         new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
         new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
+        hot_chunks: vec![],
+        post_copy: false,
+        peer_addr: None,
+        peer_token: None,
+        sidecar_json: Vec::new(),
     });
 
     let err = client_b.restore(metadata).await;

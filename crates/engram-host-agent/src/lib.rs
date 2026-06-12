@@ -26,11 +26,13 @@ pub mod bundles;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
+pub mod dirty_map;
 pub mod disk_daemon;
 pub mod egress;
 pub mod grpc_server;
 pub mod harness;
 pub mod host_client;
+pub mod migrate_peer;
 pub mod migration;
 pub use host_client::LocalHostClient;
 pub mod heartbeat;
@@ -229,10 +231,15 @@ impl HostAgent {
         // checkpoint), so the successor generation MUST re-adopt them or
         // they leak. Non-FC backends register no `fc_for_reattach` and
         // clean-slate (VZ/process don't survive a host-agent restart).
+        let mut reattached_roles: Vec<(SandboxId, migration::MigrationRole)> = Vec::new();
         if let Some(fc) = self.fc_for_reattach.as_ref() {
             match live_attach::reattach_pass(&self.cfg.work_dir, fc).await {
                 Ok(report) => {
                     tracing::info!("{}", report.summary());
+                    // ADR 0045 C2: sandboxes that were mid-post-copy when
+                    // the previous generation died; the fences re-arm
+                    // once the pooled backend exists below.
+                    reattached_roles = live_attach::scan_migration_roles(&self.cfg.work_dir);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -334,7 +341,9 @@ impl HostAgent {
                                     .ok(),
                                 None => None,
                             };
-                            let verdict = migration::ttl_verdict(session.is_some(), ownership);
+                            let state_served = pooled_for_ttl.migration_state_served(sandbox_id);
+                            let verdict =
+                                migration::ttl_verdict(session.is_some(), ownership, state_served);
                             tracing::warn!(
                                 %sandbox_id,
                                 ?session,
@@ -366,6 +375,85 @@ impl HostAgent {
                     }
                 });
             }
+            // ADR 0045 C2: re-arm post-copy fences for sandboxes that
+            // were mid-move across the host-agent restart. A DEST mid-
+            // drain is reaped immediately (its drain state died with
+            // the previous generation; the coordinator's PeerLost /
+            // lease machinery rewinds the session). A SOURCE is NEVER
+            // resumed — state may have shipped — so it runs the
+            // dumb-host ownership rule until the answer is `false`
+            // (destroy) — `true` keeps it paused (the scanner will
+            // rehome the session and flip the answer within a cycle).
+            for (sandbox_id, role) in reattached_roles {
+                match role {
+                    migration::MigrationRole::PostCopyDest => {
+                        tracing::warn!(%sandbox_id,
+                            "reattached post-copy DEST: reaping (drain state lost with the old generation)");
+                        let pooled_for_reap = pooled.clone();
+                        tokio::spawn(async move {
+                            use engram_core::traits::sandbox::SandboxBackend as _;
+                            pooled_for_reap.set_migration_role(sandbox_id, None).await;
+                            if let Err(e) = pooled_for_reap.destroy(sandbox_id).await {
+                                tracing::warn!(%sandbox_id, error = %e,
+                                    "reattached post-copy dest reap failed");
+                            }
+                        });
+                    }
+                    migration::MigrationRole::PostCopySource => {
+                        tracing::warn!(%sandbox_id,
+                            "reattached post-copy SOURCE: staying paused under the ownership rule (never self-resumes)");
+                        pooled.note_migration_role(sandbox_id, Some(role));
+                        let pooled_for_src = pooled.clone();
+                        let coord_for_src = coord_client::CoordClient::new(
+                            coord_url.clone(),
+                            self.cfg.coordinator_token.clone(),
+                        );
+                        let host_id_for_src = host_id;
+                        tokio::spawn(async move {
+                            use engram_core::traits::sandbox::SandboxBackend as _;
+                            let mut tick =
+                                tokio::time::interval(std::time::Duration::from_secs(30));
+                            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            loop {
+                                tick.tick().await;
+                                let Some(session_id) =
+                                    pooled_for_src.session_for_sandbox(sandbox_id)
+                                else {
+                                    // Binding rehydrates with registration;
+                                    // an unbound frozen source is
+                                    // unreclaimable — destroy.
+                                    tracing::warn!(%sandbox_id,
+                                        "reattached post-copy source has no session binding; destroying");
+                                    pooled_for_src.set_migration_role(sandbox_id, None).await;
+                                    let _ = pooled_for_src.destroy(sandbox_id).await;
+                                    return;
+                                };
+                                match coord_for_src
+                                    .sandbox_ownership(host_id_for_src, session_id, sandbox_id)
+                                    .await
+                                {
+                                    Ok(false) => {
+                                        tracing::info!(%sandbox_id,
+                                            "ownership moved on; destroying the frozen post-copy source");
+                                        pooled_for_src.set_migration_role(sandbox_id, None).await;
+                                        if let Err(e) = pooled_for_src.destroy(sandbox_id).await {
+                                            tracing::warn!(%sandbox_id, error = %e,
+                                                "frozen source destroy failed");
+                                        }
+                                        return;
+                                    }
+                                    Ok(true) => { /* stay paused; re-ask next tick */ }
+                                    Err(e) => {
+                                        tracing::debug!(%sandbox_id, error = %e,
+                                            "ownership check unreachable; staying paused");
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
             // ADR 0028 Fix A: the periodic checkpoint driver. No-ops
             // when ENGRAM_CHECKPOINT_INTERVAL_SECS=0, the backend has
             // no checkpoint dir, or the backend can't do diff
@@ -603,6 +691,21 @@ impl HostAgent {
                                         &resp.rehydrate_sandboxes,
                                     )
                                     .await;
+                                    // ADR 0044 K2: stale-binding sweep AFTER
+                                    // the survivors have claimed their slots
+                                    // — only still-free devices are probed,
+                                    // so a survivor's live (busy-by-design)
+                                    // device can never be disconnected by
+                                    // this pass. Replaces the old eager
+                                    // sweep at pool construction, which
+                                    // killed a survivor's disk in prod
+                                    // (2026-06-11, /dev/nbd4).
+                                    if let Some(nbd_pool) = pooled_for_rehydrate.nbd_pool() {
+                                        let unclaimed = nbd_pool.free_paths().await;
+                                        tokio::task::spawn_blocking(move || {
+                                            disk_daemon::recover_stuck_nbd_devices(&unclaimed);
+                                        });
+                                    }
                                 }
                                 #[cfg(not(target_os = "linux"))]
                                 {
@@ -641,6 +744,24 @@ impl HostAgent {
                 tokio::spawn(async move {
                     if let Err(e) = grpc_server::boot(addr, local_for_grpc, admin_for_grpc).await {
                         tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
+                    }
+                })
+            });
+
+            // ADR 0045 C2: the post-copy page server (TCP 9102). Auth is
+            // the per-export token, so the listener is inert until a C2
+            // capture registers an export. The handle rides on the pooled
+            // backend so the capture path can reach the registry.
+            let _migrate_peer_task = self.cfg.migrate_peer_listen_addr.map(|addr| {
+                let server = migrate_peer::PeerServer::new(
+                    addr.port(),
+                    self.chunk_cache.clone(),
+                    self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
+                );
+                pooled.set_migrate_peer_server(server.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = server.serve(addr).await {
+                        tracing::error!(addr = %addr, error = %e, "migrate-peer server terminated with error");
                     }
                 })
             });
@@ -861,6 +982,7 @@ impl HostAgent {
             // pod receives the POST. Idempotent across pods.
             let eviction_hub = harness_hub.clone();
             let eviction_coord = coord_client.clone();
+            let eviction_pooled = pooled.clone();
             let idle_soft_ttl = idle_evictor::idle_ttl_from_env();
             let idle_hard_ttl = idle_evictor::idle_hard_ttl_from_env();
             // ADR 0014 issue #4: disk-pressure floor. When free disk
@@ -914,7 +1036,15 @@ impl HostAgent {
                     }
                     // `idle_sandboxes` now skips sandboxes whose prior
                     // POST is still in flight (ADR 0016 §A.1.5a).
-                    let pairs = eviction_hub.idle_sandboxes(idle_soft_ttl, idle_hard_ttl);
+                    let mut pairs = eviction_hub.idle_sandboxes(idle_soft_ttl, idle_hard_ttl);
+                    // ADR 0045 C2: sandboxes mid-post-copy are never
+                    // idle-evict candidates — the frozen SOURCE is
+                    // maximally "quiet" and would be nominated every
+                    // tick; the DEST's durability isn't caught up yet.
+                    // The session lease blocks the pipeline anyway;
+                    // this keeps the nominations (and the lease-handoff
+                    // race window) out entirely.
+                    pairs.retain(|(_, sb)| eviction_pooled.migration_role(*sb).is_none());
                     if pairs.is_empty() {
                         continue;
                     }
@@ -1012,6 +1142,27 @@ impl HostAgent {
             // *controlled* node drain migrates active sessions off first
             // (the K3 operator / admin endpoints), so by the time SIGTERM
             // lands there is nothing left here to lose.
+            //
+            // ADR 0044 K2: the NBD data planes must be ABANDONED, not
+            // dropped — process unwind would otherwise run
+            // NbdHandle::Drop → netlink disconnect and tear down the
+            // survivors' disks on the way out (the 2026-06-12 canary:
+            // "Disconnected due to user request" at old-pod SIGTERM,
+            // then the successor's RECONFIGURE met "not configured").
+            // Abandon kills only in-process resources; the kernel
+            // config persists with guest I/O parked under
+            // dead_conn_timeout until the successor reconfigures.
+            #[cfg(target_os = "linux")]
+            {
+                let abandoned = pooled.abandon_nbd_data_planes_for_shutdown();
+                if abandoned > 0 {
+                    tracing::info!(
+                        abandoned,
+                        "SIGTERM: abandoned NBD data planes (kernel configs left \
+                         alive for the successor to RECONFIGURE)",
+                    );
+                }
+            }
             tracing::info!(
                 "SIGTERM: detaching running microVMs (left alive for the successor \
                  host-agent to reattach); not checkpointing"

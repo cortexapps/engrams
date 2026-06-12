@@ -25,13 +25,13 @@ use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
     BuildBaseSnapshotResponse, CowStateAllResponse, CowStateResponse, CreateSandboxRequest,
-    CreateSandboxResponse, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
-    InterruptHarnessRequest, ListSandboxesResponse, MigrationCaptureResponse, MigrationExportRef,
-    MigrationFetchRequest, MigrationFrame, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
-    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    CreateSandboxResponse, DrainOutcomeResponse, Empty, ExecExit, ExecFrame, ExecStartRequest,
+    GuestIpResponse, InterruptHarnessRequest, ListSandboxesResponse, MigrationCaptureResponse,
+    MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
+    PostCopyCaptureResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
+    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SnapshotBeginResponse, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -237,6 +237,7 @@ impl HostService for HostServiceImpl {
                 paused_at_unix_ms: out.paused_at_unix_ms,
                 memory_manifest_ref: encode_bincode(&out.memory_manifest_ref, "ManifestRef")?,
                 disk_manifest_ref: encode_bincode(&out.disk_manifest_ref, "ManifestRef")?,
+                hot_chunks: out.hot_chunks.into_iter().map(|h| h.to_vec()).collect(),
             }))
         }
         .instrument(span)
@@ -259,6 +260,15 @@ impl HostService for HostServiceImpl {
                 match Kind::try_from(item.kind) {
                     Ok(Kind::StateBin) => Ok(engram_core::types::snapshot::MigrationItem::StateBin),
                     Ok(Kind::Sidecar) => Ok(engram_core::types::snapshot::MigrationItem::Sidecar),
+                    Ok(Kind::DiskManifest) => {
+                        Ok(engram_core::types::snapshot::MigrationItem::DiskManifest)
+                    }
+                    Ok(Kind::DiskSealInfo) => {
+                        Ok(engram_core::types::snapshot::MigrationItem::DiskSealInfo)
+                    }
+                    Ok(Kind::DiskChunkAt) => Ok(
+                        engram_core::types::snapshot::MigrationItem::DiskChunkAt(item.chunk_idx),
+                    ),
                     Ok(Kind::Chunk) => {
                         let hash: [u8; 32] =
                             item.hash.as_slice().try_into().map_err(|_| {
@@ -313,6 +323,89 @@ impl HostService for HostServiceImpl {
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
+    }
+
+    async fn migration_presetup(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<MigrationPresetupResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let out = self
+            .inner
+            .migration_presetup(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(MigrationPresetupResponse {
+            export_id: out.export_id,
+            peer_token: out.peer_token,
+            peer_port: out.peer_port as u32,
+            sidecar_json: out.sidecar_json,
+            memory_manifest_json: out.memory_manifest_json,
+            memory_manifest_ref: encode_bincode(&out.memory_manifest_ref, "ManifestRef")?,
+            disk_manifest_ref: encode_bincode(&out.disk_manifest_ref, "Option<ManifestRef>")?,
+            hot_chunks: out.hot_chunks.into_iter().map(|h| h.to_vec()).collect(),
+        }))
+    }
+
+    async fn migration_capture_post_copy(
+        &self,
+        req: Request<MigrationExportRef>,
+    ) -> Result<Response<PostCopyCaptureResponse>, Status> {
+        let req = req.into_inner();
+        let id = decode_sandbox_id(&req.sandbox_id)?;
+        let out = self
+            .inner
+            .migration_capture_postcopy(id, &req.export_id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(PostCopyCaptureResponse {
+            sealed_chunks: out.sealed_chunks,
+            total_chunks: out.total_chunks,
+            scan_ms: out.scan_ms,
+            pause_ms: out.pause_ms,
+            disk_drain_ms: out.disk_drain_ms,
+            vmstate_ms: out.vmstate_ms,
+            sealed_disk_chunks: out.sealed_disk_chunks,
+            paused_at_unix_ms: out.paused_at_unix_ms,
+        }))
+    }
+
+    async fn migration_drain_wait(
+        &self,
+        req: Request<SandboxIdMessage>,
+    ) -> Result<Response<DrainOutcomeResponse>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        let out = self
+            .inner
+            .migration_drain_wait(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        use engram_core::types::snapshot::DrainOutcome;
+        Ok(Response::new(match out {
+            DrainOutcome::Done {
+                pulled,
+                alt_sourced,
+                zero_chunks,
+                ms,
+            } => DrainOutcomeResponse {
+                done: true,
+                pulled,
+                alt_sourced,
+                zero_chunks,
+                ms,
+                remaining: 0,
+                detail: String::new(),
+            },
+            DrainOutcome::PeerLost { remaining, detail } => DrainOutcomeResponse {
+                done: false,
+                pulled: 0,
+                alt_sourced: 0,
+                zero_chunks: 0,
+                ms: 0,
+                remaining,
+                detail,
+            },
+        }))
     }
 
     async fn commit_snapshot(

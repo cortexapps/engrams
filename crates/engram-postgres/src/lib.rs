@@ -814,6 +814,33 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    async fn rebind_session(
+        &self,
+        id: SessionId,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+    ) -> Result<(), MetaError> {
+        // ADR 0045 C2: ONE UPDATE — the ownership oracle
+        // (`session.sandbox_id == sandbox`) flips atomically with the
+        // host rebind (the post-copy `Committing` persist).
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions SET host_id = $2, sandbox_id = $3, updated_at = NOW() WHERE id = $1
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(host_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn assign_session_host(
         &self,
         id: SessionId,
@@ -2429,6 +2456,16 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
         // Idempotent: missing row = already released / never held.
         Ok(())
+    }
+
+    async fn session_lease_held(&self, session_id: SessionId) -> Result<bool, MetaError> {
+        let row: Option<(uuid::Uuid,)> =
+            sqlx::query_as("SELECT session_id FROM session_lease WHERE session_id = $1")
+                .bind(session_id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        Ok(row.is_some())
     }
 
     async fn touch_session_lease(

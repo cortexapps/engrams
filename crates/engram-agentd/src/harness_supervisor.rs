@@ -242,6 +242,33 @@ impl HarnessSupervisor {
                         pid = ?pid,
                         "harness still running (live move / mid-run resume); reattaching, not respawning",
                     );
+                    // ADR 0045 C1: nudge the live harness to re-dial the
+                    // host NOW. A snapshot restore rebuilds the vsock
+                    // device, but the harness's established connection
+                    // doesn't EOF — its read blocks forever, the
+                    // reconnect loop never wakes, and the destination
+                    // host never sees a harness attach (prompts 500
+                    // "sandbox not found" while exec works — prod
+                    // canaries 1f64052e / 51d51740). This SpawnHarness
+                    // is the one signal that fires exactly at restore
+                    // time, so deliver SIGUSR1 = "drop the connection
+                    // and re-dial" (handled in engram-harness-claude's
+                    // connection loop; harnesses without a handler are
+                    // respawned by the next SpawnHarness anyway).
+                    #[cfg(target_os = "linux")]
+                    if let Some(pid) = pid {
+                        if let Err(e) = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGUSR1,
+                        ) {
+                            tracing::warn!(
+                                pid,
+                                error = %e,
+                                "reconnect nudge (SIGUSR1) failed; harness must \
+                                 detect the dead connection on its own",
+                            );
+                        }
+                    }
                     guard.current_child = Some(prev);
                     return Ok(pid);
                 }

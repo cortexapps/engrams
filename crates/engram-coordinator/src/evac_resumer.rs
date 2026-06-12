@@ -251,6 +251,9 @@ async fn run_resume_pipeline(
         snapshot,
         cold_boot_spec,
         require_host,
+        // No origin preference: every scanner producer (drain, dead
+        // host, migration parachute) is moving AWAY from the source.
+        None,
     )
     .await
     {
@@ -354,7 +357,7 @@ async fn run_resume_pipeline(
     // Refresh the session row so finish_resume_to_active sees the
     // freshly-bound host_id + sandbox_id.
     let session_refreshed = state.services.meta.get_session(session_id).await?;
-    match finish_resume_to_active(state, &session_refreshed, receipt.new_sandbox_id).await {
+    match finish_resume_to_active(state, &session_refreshed, receipt.new_sandbox_id, true).await {
         Ok(FinishResumeOutcome::Active) => {
             tracing::info!(
                 %session_id,

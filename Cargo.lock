@@ -1207,6 +1207,7 @@ dependencies = [
  "engram-harness-noop",
  "engram-harness-proto",
  "engram-image-builder",
+ "engram-migrate-proto",
  "engram-oci",
  "engram-protocol",
  "engram-sandbox-firecracker",
@@ -1288,6 +1289,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-migrate-proto"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
  "workspace-hack",
 ]
 
@@ -1591,6 +1601,7 @@ dependencies = [
  "bytes",
  "engram-chunk-store",
  "engram-core",
+ "engram-migrate-proto",
  "engram-storage-gcs",
  "engram-storage-local",
  "engram-telemetry",
@@ -1598,6 +1609,7 @@ dependencies = [
  "sendfd",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -6236,7 +6248,9 @@ dependencies = [
  "percent-encoding",
  "phf_shared",
  "pkcs8",
+ "proc-macro2",
  "prost",
+ "quote",
  "rand 0.8.6",
  "rand_core 0.6.4",
  "regex",

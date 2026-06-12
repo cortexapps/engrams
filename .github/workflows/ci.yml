@@ -98,9 +98,14 @@ concurrency:
 
 # Default to read-only repo access. No job here writes to the repo
 # (no GH releases, no commit-back, no PR comments), so least
-# privilege.
+# privilege. `packages: read` is load-bearing: the test-firecracker
+# job oras-pulls the forked firecracker artifact from GHCR — without
+# it the pull is DENIED and every fork-gated FC test (the ADR 0045 R2
+# stock<->fork compat gate, the substrate suites, vmstate_only)
+# silently green-by-skips.
 permissions:
   contents: read
+  packages: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -722,6 +727,7 @@ jobs:
             --test diff_snapshot \
             --test file_restore_shared_rss \
             --test stock_fork_snapshot_compat \
+            --test vmstate_only_snapshot \
             --test substrate_kernel_capabilities \
             --test substrate_uffd_base \
             --run-ignored ignored-only \
@@ -735,6 +741,7 @@ jobs:
             --test checkpoint_chain \
             --test migration_source \
             --test two_host_live_teleport \
+            --test pagemap_scanner \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -765,7 +772,7 @@ jobs:
         id: nbd_setup
         run: |
           if sudo modprobe nbd nbds_max=4 2>/dev/null \
-             && sudo chmod 666 /dev/nbd0 2>/dev/null; then
+             && sudo chmod 666 /dev/nbd0 /dev/nbd1 2>/dev/null; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             ls -la /dev/nbd0
           else
@@ -781,6 +788,7 @@ jobs:
           cargo nextest run \
             -p engram-host-agent \
             --test nbd_chunked_disk \
+            --test nbd_netlink_reconfigure \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

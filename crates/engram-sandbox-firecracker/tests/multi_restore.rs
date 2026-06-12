@@ -1,26 +1,27 @@
-//! ADR 0014 M1.10: serial multi-restore correctness gate.
+//! ADR 0014 M1.10: serial multi-restore correctness gate, plus the
+//! concurrent same-snapshot regression for the vsock re-key.
 //!
 //! The warm-pool refill loop's steady-state shape: lease a slot,
 //! destroy it (consumed by a session), refill creates a new slot
-//! from the same template snapshot. This test exercises that
+//! from the same template snapshot. The serial test exercises that
 //! cycle by:
 //!
 //!   - Creating + snapshotting + destroying a source sandbox.
 //!   - Restoring N times in sequence from the same snapshot,
 //!     destroying each restored microVM before the next restore.
-//!   - Each restored microVM execs a unique sentinel and returns
-//!     cleanly — same payload as the source.
 //!
-//! ### Why this test is serial, not concurrent
+//! ### The concurrent test (vsock UDS re-key regression)
 //!
-//! N concurrent restores from the same snapshot collide on the
-//! source-sandbox-id-keyed vsock UDS path (FC's state.bin embeds
-//! it; two FCs can't bind the same Unix socket). ADR 0014 calls
-//! out per-FC mount-namespace + bind-mount as the unblocker for
-//! concurrent restores. Until that lands, warm pool ceiling
-//! stays at N=1 per host per template (see `CEILING_TARGET` in
-//! `engram-host-agent/src/warm_pool.rs`) and the refill cycle is
-//! the only multi-restore shape that matters.
+//! Historically N concurrent restores from one snapshot collided on
+//! the source-sandbox-id-keyed vsock UDS path (FC's state.bin embeds
+//! it; every descendant bound the SAME absolute path, and the last
+//! binder silently stole exec/harness traffic from live siblings —
+//! the 2026-06-11 cross-session misroute). Restores now pass the
+//! fork's `vsock_override` keyed to the new live sandbox id, so
+//! same-snapshot VMs coexist on one host. The concurrent test pins
+//! that: all N alive at once, each with its OWN id-keyed UDS bound
+//! by a live FC, and destroying one VM must not disturb a sibling's
+//! socket.
 //!
 //! Same gating as the other ignored FC integration tests
 //! (Linux + KVM + firecracker on PATH + fetched test artifacts).
@@ -134,5 +135,97 @@ async fn serial_restore_from_one_canonical_n_times() {
             !listed.contains(&id),
             "iter {i} destroyed sandbox must not appear in list()",
         );
+    }
+}
+
+/// Vsock UDS re-key regression: N same-snapshot restores ALIVE AT
+/// ONCE on one host, each owning its own id-keyed UDS. Pre-re-key
+/// this scenario was impossible (every descendant bound the source's
+/// path; the last binder stole its siblings' channels).
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
+async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
+    let env = match common::fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let local_rootfs = work.path().join("rootfs.ext4");
+    tokio::fs::copy(&env.rootfs, &local_rootfs)
+        .await
+        .expect("clone rootfs into tempdir");
+
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    cfg.net_pool = None;
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    let backend = FirecrackerBackend::new(work.path(), cfg);
+
+    let spec = SandboxSpec {
+        image: "concurrent-restore-source".into(),
+        rootfs_source: Some(local_rootfs.clone()),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 128 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+
+    let source_id = backend.create(spec).await.expect("create source");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    backend.destroy(source_id).await.expect("destroy source");
+    let source_vsock = work.path().join(format!("{source_id}.vsock"));
+
+    // All N restores live simultaneously.
+    let mut ids = Vec::new();
+    for i in 0..N {
+        let id = backend
+            .restore(metadata.clone())
+            .await
+            .unwrap_or_else(|e| panic!("concurrent restore {i}: {e}"));
+        ids.push(id);
+    }
+    let listed = backend.list().await.expect("list");
+    for id in &ids {
+        assert!(listed.contains(id), "{id} must be alive in list()");
+    }
+
+    // Each restored VM's FC must have bound its OWN id-keyed UDS —
+    // a real listener, not just a leftover file: connect() succeeds
+    // only against a live bind.
+    for id in &ids {
+        let own_uds = work.path().join(format!("{id}.vsock"));
+        tokio::net::UnixStream::connect(&own_uds)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("restored {id} must own a live vsock listener at {own_uds:?}: {e}")
+            });
+        assert_ne!(
+            own_uds, source_vsock,
+            "{id} must NOT be keyed to the source path",
+        );
+    }
+
+    // Destroying one sibling must not disturb another's socket (the
+    // old shared-path world failed exactly here: one teardown/unlink
+    // broke every descendant's channels).
+    let (victim, survivors) = ids.split_first().expect("at least one restore");
+    backend.destroy(*victim).await.expect("destroy victim");
+    for id in survivors {
+        let own_uds = work.path().join(format!("{id}.vsock"));
+        tokio::net::UnixStream::connect(&own_uds)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("survivor {id} lost its vsock listener after a sibling destroy: {e}")
+            });
+    }
+    for id in survivors {
+        backend.destroy(*id).await.expect("destroy survivor");
     }
 }

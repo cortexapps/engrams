@@ -37,6 +37,11 @@
 //!   `UFFDIO_COPY` / `UFFDIO_ZEROPAGE`.
 
 pub mod chunked;
+/// ADR 0045 C2: the post-copy peer channel — `PeerSession` (sync TCP
+/// client to the source host-agent's page server) + `ControlTx` (the
+/// one-way `--control-sock` reports). Portable (plain sockets); the
+/// fault-path consumer lives in the Linux-only `runtime`.
+pub mod peer;
 pub mod proto;
 pub mod working_set;
 
