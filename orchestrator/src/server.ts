@@ -19,6 +19,7 @@ import type { Hono } from "hono";
 import { getRequestListener } from "@hono/node-server";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import type { ConnectRouter } from "@connectrpc/connect";
+import type { NodeWebSocket } from "@hono/node-ws";
 
 export type RouteRegistrar = (router: ConnectRouter) => void;
 
@@ -29,8 +30,11 @@ export type RouteRegistrar = (router: ConnectRouter) => void;
  *   - routes everything else to the Hono app via getRequestListener
  *
  * Exported so tests can call buildServer(...) on an ephemeral port.
+ *
+ * @param nodeWs Optional @hono/node-ws handle. When provided, injectWebSocket
+ *   is called after server creation to wire the upgrade event handler.
  */
-export function buildServer(app: Hono, routes: RouteRegistrar = () => {}) {
+export function buildServer(app: Hono, routes: RouteRegistrar = () => {}, nodeWs?: NodeWebSocket) {
   // requestPathPrefix must match the "/rpc/" seam — handlers register at
   // prefix+requestPath, so a missing prefix causes every real RPC to 404.
   const connectHandler = connectNodeAdapter({ routes, requestPathPrefix: "/rpc" });
@@ -52,6 +56,11 @@ export function buildServer(app: Hono, routes: RouteRegistrar = () => {}) {
     // Everything else: delegate to Hono via getRequestListener.
     honoListener(req, res);
   });
+
+  // Wire WebSocket upgrade handler if @hono/node-ws is provided.
+  if (nodeWs) {
+    nodeWs.injectWebSocket(server);
+  }
 
   return server;
 }

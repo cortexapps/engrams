@@ -660,4 +660,96 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       );
     },
   );
+
+  // -------------------------------------------------------------------------
+  // 14a–14b. Shell WS (Task 21)
+  // -------------------------------------------------------------------------
+
+  test.skipIf(!SMOKE)(
+    "14a/14b anonymous shell WS → 401 (no upgrade)",
+    async () => {
+      const res = await fetch(`${BASE}/api/v1/sessions/any-id/shell`, {
+        headers: { Upgrade: "websocket", Connection: "Upgrade" },
+      });
+      expect(res.status).toBe(401);
+      console.log("Smoke 14a PASS: anonymous shell WS → 401");
+    },
+  );
+
+  test.skipIf(!SMOKE)(
+    "14b/14b shell WS member → terminal responds with 'hi'",
+    async () => {
+      // Create a task for a live session.
+      const imagesRes = await rpc("engram.app.v1.ImageService", "ListEnabledImages", {}, memberCookie);
+      expect(imagesRes.status).toBe(200);
+      const imagesBody = (await imagesRes.json()) as { images?: Array<{ imageUri?: string; harnessName?: string }> };
+      const noHarnessImage = (imagesBody.images ?? []).find((img) => !img.harnessName);
+      if (!noHarnessImage?.imageUri) {
+        console.log("Smoke 14b SKIP: no no-harness image available");
+        return;
+      }
+
+      const createRes = await rpc(
+        "engram.app.v1.TaskService",
+        "CreateTask",
+        { type: "chat", imageUri: noHarnessImage.imageUri, title: "Smoke shell task" },
+        memberCookie,
+      );
+      expect(createRes.status).toBe(200);
+      const createBody = (await createRes.json()) as {
+        task?: { id?: string; sessions?: Array<{ sessionId?: string }> };
+      };
+      const shellTaskId = createBody.task?.id;
+      const sessionId = createBody.task?.sessions?.[0]?.sessionId;
+      if (!shellTaskId || !sessionId) throw new Error("no task/session from CreateTask");
+
+      let foundHi = false;
+      const wsUrl = `${BASE.replace(/^http/, "ws")}/api/v1/sessions/${sessionId}/shell`;
+      const ac = new AbortController();
+      const abortTimer = setTimeout(() => ac.abort(), 15_000);
+
+      try {
+        // Bun native WebSocket with cookie header.
+        // Bun's WebSocket supports a third-arg options object with headers.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ws = new (WebSocket as any)(wsUrl, [], { headers: { Cookie: memberCookie } }) as WebSocket;
+        ws.binaryType = "arraybuffer";
+
+        await new Promise<void>((resolve, reject) => {
+          ws.onopen = () => {
+            ws.send(JSON.stringify({ AuthToken: "", columns: 80, rows: 24 }));
+            setTimeout(() => { ws.send("0echo hi\r"); }, 500);
+          };
+          ws.onmessage = (e) => {
+            let bytes: Uint8Array;
+            if (typeof e.data === "string") {
+              bytes = new TextEncoder().encode(e.data);
+            } else {
+              bytes = new Uint8Array(e.data as ArrayBuffer);
+            }
+            // Strip ttyd discriminator byte (0x30 = '0' = output)
+            const text = new TextDecoder().decode(bytes.subarray(1));
+            if (text.includes("hi")) {
+              foundHi = true;
+              clearTimeout(abortTimer);
+              ws.close();
+              resolve();
+            }
+          };
+          ws.onerror = (e) => reject(new Error(`WS error: ${String(e)}`));
+          ws.onclose = () => { if (!foundHi) resolve(); };
+          ac.signal.addEventListener("abort", () => { ws.close(); resolve(); });
+        });
+      } finally {
+        clearTimeout(abortTimer);
+        if (shellTaskId) {
+          await rpc("engram.app.v1.TaskService", "DeleteTask", { taskId: shellTaskId }, memberCookie);
+        }
+      }
+
+      expect(foundHi).toBe(true);
+      console.log("Smoke 14b PASS: shell WS → 'hi' received via ttyd echo");
+    },
+    30_000,
+  );
 });
