@@ -112,6 +112,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     refetchOnWindowFocus: false,
   });
 
+  // ADR 0039 §6: derive role/id for ability BEFORE any conditional returns so
+  // that useMemo is always called (Rules of Hooks — no hooks after early returns).
+  // When session is not yet resolved these are empty strings; the ability instance
+  // is only used in the value object that is created further down (after the
+  // guards), so the placeholder never escapes to a consumer.
+  const rawRole = (session?.user as { role?: string } | undefined)?.role ?? "user";
+  const ability = useMemo(
+    () => abilityFor({ id: session?.user.id ?? "", role: rawRole }),
+    // session?.user.id and rawRole are the only deps that affect the ability shape.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [session?.user.id, rawRole],
+  );
+
   // Boot screen — waiting for the session cookie round-trip.
   if (sessionPending) {
     return <BootScreen />;
@@ -141,7 +154,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // The admin plugin writes role as 'admin' | 'user'. We treat 'user' as 'member'
   // to match the Principal type (which uses 'member' | 'admin').
-  const rawRole = (session.user as { role?: string }).role ?? "user";
   const role = rawRole === "admin" ? "admin" : ("member" as const);
   const isAdmin = role === "admin";
 
@@ -156,15 +168,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // Role is set directly by the admin plugin (not via SCIM or IdP claim
     // in this deployment tier); leave role_source undefined (optional field).
   };
-
-  // ADR 0039 §6: build CASL ability from the resolved session.
-  // useMemo keeps the instance stable across re-renders unless id/role changes.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const ability = useMemo(
-    () => abilityFor({ id: session.user.id, role: rawRole }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [session.user.id, rawRole],
-  );
 
   const value: AuthState = {
     principal,
