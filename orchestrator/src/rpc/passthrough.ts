@@ -65,11 +65,31 @@ export type ResolveOwner = (sessionId: string) => Promise<string | null>;
 // ---------------------------------------------------------------------------
 
 /**
- * Copy all headers from a source Headers object into a destination.
+ * Headers that the gRPC upstream sends but that MUST NOT be forwarded to the
+ * browser-facing Connect response. The ConnectRouter sets content-type for the
+ * outbound protocol (application/json) and gRPC framing headers are not
+ * meaningful (and actively harmful) on a Connect response.
+ */
+const BLOCKED_RESPONSE_HEADERS = new Set([
+  "content-type",        // ConnectRouter owns this — forwarding application/grpc breaks browser parsing
+  "grpc-status",         // gRPC trailer, not a Connect response header
+  "grpc-message",        // gRPC trailer
+  "grpc-status-details-bin", // gRPC trailer
+  "transfer-encoding",   // hop-by-hop, must not be forwarded
+]);
+
+/**
+ * Copy headers from a source Headers object into a destination, excluding
+ * protocol-level headers that must not leak from the upstream gRPC response
+ * into the downstream Connect response.
  */
 function copyHeaders(src: Headers | undefined, dst: Headers): void {
   if (!src) return;
-  src.forEach((value, key) => dst.set(key, value));
+  src.forEach((value, key) => {
+    if (!BLOCKED_RESPONSE_HEADERS.has(key.toLowerCase())) {
+      dst.set(key, value);
+    }
+  });
 }
 
 /**

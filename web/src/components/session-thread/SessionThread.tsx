@@ -7,7 +7,11 @@ import {
 } from "@assistant-ui/react";
 import { Thread } from "@/components/assistant-ui/thread";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { sendPrompt, interruptSession } from "../../api";
+import { useMutation } from "@connectrpc/connect-query";
+import {
+  sendPrompt as sendPromptMethod,
+  interrupt as interruptMethod,
+} from "../../gen/engram/app/v1/session-SessionService_connectquery";
 import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
 import type { IndexedEvent, SessionState } from "../../types";
@@ -52,6 +56,15 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
     [events, sessionId, status],
   );
 
+  // ADR 0039 Task 24: sendPrompt + interrupt move to the connect-query
+  // useMutation so they flow via the gated passthrough (/rpc/…) rather than
+  // the legacy coordinator REST layer. The old fire-and-forget semantics are
+  // preserved: we await the mutation promise but don't optimistically mutate
+  // any query cache (the SSE stream is the source of truth for runs/events;
+  // there's no query to invalidate here).
+  const sendPromptMutation = useMutation(sendPromptMethod);
+  const interruptMutation = useMutation(interruptMethod);
+
   const runtime = useExternalStoreRuntime({
     messages,
     isRunning,
@@ -59,7 +72,7 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
     convertMessage: (m: ThreadMessageLike) => m,
     onNew: async (message) => {
       const text = appendText(message);
-      if (text) await sendPrompt(sessionId, text);
+      if (text) await sendPromptMutation.mutateAsync({ sessionId, text });
     },
     onCancel: async () => {
       // Nothing to interrupt once the session is idle/terminal (e.g. it was
@@ -69,7 +82,7 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
       // The run_interrupted event arrives over SSE and closes the run. A
       // 409 (no live sandbox) is still benign — the run may have just ended.
       try {
-        await interruptSession(sessionId);
+        await interruptMutation.mutateAsync({ sessionId });
       } catch (err) {
         console.warn("interrupt failed", err);
       }

@@ -23,6 +23,7 @@ import { createRouterTransport } from "@connectrpc/connect";
 import type { Transport } from "@connectrpc/connect";
 import { TaskService } from "./gen/engram/app/v1/task_pb";
 import { ImageService } from "./gen/engram/app/v1/image_pb";
+import { SessionService } from "./gen/engram/app/v1/session_pb";
 import { AuthContextProvider, type AuthState } from "./auth/AuthProvider";
 import type { Principal } from "./types";
 
@@ -41,9 +42,9 @@ const DEFAULT_PRINCIPAL: Principal = {
   can_sign_out: true,
 };
 
-/** ADR 0039 Task 23: default in-process transport that stubs both
- * TaskService and ImageService with empty/success responses. Tests that
- * exercise CreateTask should supply their own transport via the
+/** ADR 0039 Task 24: default in-process transport that stubs TaskService,
+ * ImageService, and SessionService with empty/success responses. Tests that
+ * exercise specific RPC behaviour should supply their own transport via the
  * `transport` option so they can control the response. */
 export const testTransport: Transport = createRouterTransport((router) => {
   router.service(TaskService, {
@@ -63,6 +64,29 @@ export const testTransport: Transport = createRouterTransport((router) => {
     listRegistries: () => ({ registries: [] }),
     addRegistry: () => ({ id: "", host: "", authKind: "", authPrincipal: undefined }),
     deleteRegistry: () => ({}),
+  });
+  // ADR 0039 Task 24: stub SessionService so components that call
+  // getSession / getCowState / listCheckpoints / sendPrompt / interrupt
+  // (including SessionThread's useMutation initialisation) don't error in tests.
+  router.service(SessionService, {
+    listSessions: () => ({ sessions: [] }),
+    createSession: () => ({
+      sessionId: "",
+      status: "",
+      imageVersion: "",
+      kind: "",
+    }),
+    getSession: () => ({ session: undefined }),
+    deleteSession: () => ({}),
+    sendPrompt: () => ({ sessionId: "", note: "" }),
+    interrupt: () => ({ sessionId: "", note: "" }),
+    getLog: () => ({ sessionId: "", kind: "", events: [] }),
+    snapshot: () => ({ sessionId: "", snapshotId: undefined, sizeBytes: undefined, note: "" }),
+    resume: () => ({ sessionId: "", snapshotId: undefined, sizeBytes: undefined, note: "" }),
+    evictLocal: () => ({}),
+    getCowState: () => ({ sessionId: "", state: undefined }),
+    listCheckpoints: () => ({ sessionId: "", checkpoints: [] }),
+    createArtifactFromPath: () => ({ artifactId: "", mediaType: "", sizeBytes: BigInt(0) }),
   });
 });
 
