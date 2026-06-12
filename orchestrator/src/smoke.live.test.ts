@@ -428,21 +428,42 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   test.skipIf(!SMOKE)(
     "11/13 GET SSE events with member cookie → ≥1 frame with id:",
     async () => {
-      // smokeTaskId was set in test 8; extract the session id from GetTask.
-      expect(smokeTaskId).toBeTruthy();
-
-      const getRes = await rpc(
-        "engram.app.v1.TaskService",
-        "GetTask",
-        { taskId: smokeTaskId },
+      // Test 10 DELETED smokeTaskId (and its session) — the SSE checks need a
+      // live session, so provision a fresh task here; test 12 cleans it up.
+      const imagesRes = await rpc(
+        "engram.app.v1.ImageService",
+        "ListEnabledImages",
+        {},
         memberCookie,
       );
-      expect(getRes.status).toBe(200);
-      const getBody = (await getRes.json()) as {
-        task?: { sessions?: Array<{ sessionId?: string }> };
+      expect(imagesRes.status).toBe(200);
+      const imagesBody = (await imagesRes.json()) as {
+        images?: Array<{ imageUri?: string; harnessName?: string }>;
       };
-      const sessionId = getBody.task?.sessions?.[0]?.sessionId;
+      const noHarnessImage = (imagesBody.images ?? []).find(
+        (img) => !img.harnessName,
+      );
+      expect(noHarnessImage?.imageUri).toBeTruthy();
+
+      const createRes = await rpc(
+        "engram.app.v1.TaskService",
+        "CreateTask",
+        {
+          type: "chat",
+          imageUri: noHarnessImage!.imageUri,
+          title: "Smoke SSE task",
+        },
+        memberCookie,
+      );
+      expect(createRes.status).toBe(200);
+      const createBody = (await createRes.json()) as {
+        task?: { id?: string; sessions?: Array<{ sessionId?: string }> };
+      };
+      const sseTaskId = createBody.task?.id;
+      const sessionId = createBody.task?.sessions?.[0]?.sessionId;
+      expect(sseTaskId).toBeTruthy();
       expect(sessionId).toBeTruthy();
+      (globalThis as Record<string, unknown>).__smokeSseTaskId__ = sseTaskId;
 
       // Fetch SSE stream; read until we have ≥1 data line with id:.
       const ac = new AbortController();
@@ -519,8 +540,11 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
         return;
       }
 
+      // 3s read window: an idle (fully-replayed) stream yields nothing — the
+      // abort is the expected exit. Keep it well under the test's own budget
+      // so the cleanup DeleteTask below still fits.
       const ac = new AbortController();
-      setTimeout(() => ac.abort(), 5_000);
+      setTimeout(() => ac.abort(), 3_000);
 
       let idAfterCursor: string | undefined;
 
@@ -573,7 +597,20 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
       console.log(
         `Smoke 12/13 PASS: reconnect with Last-Event-ID=${firstEventId} → next id=${idAfterCursor ?? "(none — stream empty)"} (no duplicate)`,
       );
+
+      // Cleanup: delete the task test 11 provisioned for the SSE checks.
+      const sseTaskId = g.__smokeSseTaskId__ as string | undefined;
+      if (sseTaskId) {
+        const delRes = await rpc(
+          "engram.app.v1.TaskService",
+          "DeleteTask",
+          { taskId: sseTaskId },
+          memberCookie,
+        );
+        expect(delRes.status).toBe(200);
+      }
     },
+    15_000, // 3s SSE read window + DeleteTask cleanup won't fit bun's 5s default
   );
 
   test.skipIf(!SMOKE)(
