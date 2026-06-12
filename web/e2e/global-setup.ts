@@ -144,9 +144,11 @@ export default async function globalSetup() {
     );
   }
   const imagesBody = (await imagesRes.json()) as {
-    images?: { imageUri: string; harnessName: string | null }[];
+    images?: { imageUri: string; harnessName?: string | null }[];
   };
-  if (!imagesBody.images?.some((i) => i.harnessName === null)) {
+  // Connect JSON omits unset optional fields (emitDefaults=false): a
+  // no-harness image has harnessName ABSENT, not null — loose check.
+  if (!imagesBody.images?.some((i) => i.harnessName == null)) {
     throw new Error("no NO-HARNESS image enabled — run `just integration-session` once");
   }
 
