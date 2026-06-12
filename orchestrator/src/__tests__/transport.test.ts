@@ -116,9 +116,11 @@ describe("bearerInterceptor (fake Connect/gRPC-Web upstream)", () => {
     const { makeTransport } = await import("../control-plane/transport.ts");
 
     // makeTransport always creates a grpcTransport (H2 required), so we can't
-    // point it at our HTTP/1.1 fake. Instead we verify the exported
-    // bearerInterceptor is the same interceptor that makeTransport uses by
-    // composing it manually with a gRPC-Web transport targeting the fake.
+    // point it at our HTTP/1.1 fake. makeTransport with no bearer override
+    // REUSES the exported bearerInterceptor (see transport.ts), so composing
+    // that same interceptor with a gRPC-Web transport against the fake
+    // exercises the identical header-attach path; the live smoke below covers
+    // makeTransport end-to-end over real gRPC/H2.
     const transport = createGrpcWebTransport({
       baseUrl: fakeServerUrl,
       httpVersion: "1.1",

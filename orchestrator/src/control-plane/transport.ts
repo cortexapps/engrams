@@ -31,13 +31,15 @@ export const bearerInterceptor: Interceptor = (next) => (req) => {
  * singleton's URL.
  */
 export function makeTransport(baseUrl: string, bearer?: string): Transport {
-  const interceptor: Interceptor = (next) => (req) => {
-    req.header.set(
-      "authorization",
-      `Bearer ${bearer ?? config.controlPlaneBearer}`,
-    );
-    return next(req);
-  };
+  // No override → reuse the exported bearerInterceptor (one definition of
+  // "attach the machine credential"); an override builds a scoped variant.
+  const interceptor: Interceptor =
+    bearer === undefined
+      ? bearerInterceptor
+      : (next) => (req) => {
+          req.header.set("authorization", `Bearer ${bearer}`);
+          return next(req);
+        };
 
   return createGrpcTransport({
     baseUrl,
