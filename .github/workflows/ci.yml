@@ -646,6 +646,16 @@ jobs:
           # `option_d_latency_bench` were also deleted with the
           # substrate subsystem; `restore_chain` came back (baked-in
           # variant) in the P1.6 e2e resurrection.
+          #
+          # Runs in PARALLEL (--test-threads=4 ≈ runner vCPUs): these are
+          # unprivileged tests (net_pool=None — no TAP), so the only
+          # host-global resource they share is the vsock CID space, which
+          # FirecrackerBackend now partitions per nextest slot
+          # (NEXTEST_TEST_GLOBAL_SLOT → CID base offset). Jail/work dirs
+          # are per-process temp dirs and the substrate shm base is
+          # PID-keyed, so nothing else collides. ~4x faster than the old
+          # serial run. The 128-256 MiB test VMs keep 4 concurrent slots
+          # well within the runner's RAM.
           cargo nextest run \
             -p engram-sandbox-firecracker \
             --test boot \
@@ -669,7 +679,7 @@ jobs:
             --test substrate_uffd_base \
             --run-ignored ignored-only \
             --no-fail-fast \
-            --test-threads=1
+            --test-threads=4
           # ADR 0028 Fix A: the checkpoint-chain pipeline test lives in
           # engram-host-agent (it exercises PooledBackend), same gating
           # as the FC tests above (KVM + Docker + musl agentd).

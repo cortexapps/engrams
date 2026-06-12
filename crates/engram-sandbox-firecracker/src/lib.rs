@@ -176,6 +176,47 @@ fn upload_uds_for(base_vsock_uds: &Path) -> PathBuf {
 /// (hypervisor / loopback / host); user-allocatable starts at 3.
 const FIRST_GUEST_CID: u32 = 3;
 
+/// vsock CIDs reserved per test slot (see [`test_resource_slot`]). A
+/// single test boots a small handful of VMs, so 4096 is generous
+/// headroom and keeps each slot's range far from its neighbours'.
+const CID_SLOT_STRIDE: u32 = 4096;
+
+/// Per-process isolation slot for HOST-GLOBAL sandbox resources — the
+/// vsock CID space and (when networking is on) the /30 IP pool. Both
+/// live outside any per-VM netns, so two `FirecrackerBackend`s in
+/// different processes that start their allocators at the same base
+/// collide on the host.
+///
+/// Production runs exactly one backend per host and never sets this, so
+/// the slot is 0 and every allocation is byte-for-byte unchanged. Under
+/// `cargo nextest`, each concurrently-running test gets its own process
+/// with a distinct `NEXTEST_TEST_GLOBAL_SLOT` in `[0, test-threads)`;
+/// reading it here lets the FC integration tests run in parallel (their
+/// jail/work dirs are already per-process temp dirs and their TAP/netns
+/// names are UUID-derived, so the CID — and the pool, for any future
+/// networked parallel test — are the only shared namespaces left).
+fn test_resource_slot() -> u32 {
+    std::env::var("NEXTEST_TEST_GLOBAL_SLOT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Shift the /30 pool into a per-slot /16 (`10.200.x` → `10.(200+slot).x`)
+/// so parallel test processes hand out disjoint guest IPs. Slot 0
+/// (production, and every serial test) is unchanged; the disabled-
+/// networking sentinel (`0.0.0.0`) is left alone. Only the second octet
+/// moves, and the test runner's thread count bounds `slot` well under
+/// the 55 slots available before the octet saturates.
+fn pool_for_slot(pool: std::net::Ipv4Addr, slot: u32) -> std::net::Ipv4Addr {
+    if slot == 0 || pool.is_unspecified() {
+        return pool;
+    }
+    let o = pool.octets();
+    let second = u32::from(o[1]).saturating_add(slot).min(255) as u8;
+    std::net::Ipv4Addr::new(o[0], second, 0, 0)
+}
+
 /// How long `destroy` waits for the guest to honour SendCtrlAltDel
 /// before escalating to SIGKILL. A healthy debian-slim/ubuntu rootfs
 /// halts within ~1s; 3s leaves room for the page-cache drain at
@@ -765,12 +806,20 @@ pub struct FirecrackerBackend {
 
 impl FirecrackerBackend {
     pub fn new(work_dir: impl Into<PathBuf>, config: FirecrackerConfig) -> Self {
+        // Per-process test-isolation slot (0 in production). Partitions
+        // the two host-global namespaces — vsock CID space + the /30 IP
+        // pool — so the FC integration suite can run in parallel under
+        // nextest without collisions. See `test_resource_slot`.
+        let slot = test_resource_slot();
         // Allocator over the configured pool; falls back to a
         // throwaway 0.0.0.0 pool when networking is disabled (the
         // allocator is created but never consulted in that mode).
-        let pool = config
-            .net_pool
-            .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
+        let pool = pool_for_slot(
+            config
+                .net_pool
+                .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
+            slot,
+        );
         let net_allocator = Arc::new(parking_lot::Mutex::new(net::NetworkAllocator::new(pool)));
         let work_dir: PathBuf = work_dir.into();
         // ADR 0007 Phase 5: default the UFFD handler's chunk cache
@@ -797,7 +846,7 @@ impl FirecrackerBackend {
             work_dir,
             config,
             sandboxes: Arc::new(DashMap::new()),
-            next_cid: AtomicU32::new(FIRST_GUEST_CID),
+            next_cid: AtomicU32::new(FIRST_GUEST_CID + slot * CID_SLOT_STRIDE),
             net_allocator,
             harness_sink: Arc::new(parking_lot::RwLock::new(None)),
             forge_sink: Arc::new(parking_lot::RwLock::new(None)),
