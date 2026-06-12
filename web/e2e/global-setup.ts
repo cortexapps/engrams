@@ -43,10 +43,11 @@ async function promoteE2eUserToAdmin(): Promise<void> {
   try {
     // Dynamic import avoids the ambient @types/node requirement across all files.
     const { execSync } = await import("child_process");
+    // Playwright runs with cwd=web/ — the compose file lives at the repo root.
     execSync(
       [
         "docker compose",
-        "-f deploy/docker-compose.dev.yml",
+        "-f ../deploy/docker-compose.dev.yml",
         "exec -T postgres",
         "psql -U engram -d engram_orchestrator",
         `-c "UPDATE \\"user\\" SET role='admin' WHERE email='${E2E_EMAIL}'"`,
