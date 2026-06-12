@@ -25,8 +25,9 @@ import type {
 } from "../../gen/engram/app/v1/image_pb";
 
 // Minimal proto-shaped enabled-image row for tests that need a row in the list.
-function makeProtoImage(imageUri: string): Partial<ProtoEnabledImageSummary> {
+function makeProtoImage(imageUri: string): ProtoEnabledImageSummary {
   return {
+    $typeName: "engram.app.v1.EnabledImageSummary",
     id: "row-1",
     imageUri,
     manifestDigest: "sha256:abc",
@@ -38,14 +39,17 @@ function makeProtoImage(imageUri: string): Partial<ProtoEnabledImageSummary> {
   };
 }
 
-function makeProtoJob(imageUri: string, state = "materializing"): Partial<ProtoEnableJob> {
+function makeProtoJob(imageUri: string, state = "materializing"): ProtoEnableJob {
   return {
+    $typeName: "engram.app.v1.EnableJob",
     id: "job-1",
     imageUri,
+    manifestDigest: undefined,
     state,
     chunksDone: 3,
     chunksTotal: 10,
-    error: "",
+    attempts: 0,
+    error: undefined,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -59,8 +63,8 @@ interface Captures {
 
 /** Build a transport that records image-mutation calls with controllable list state. */
 function installCapturingTransport(
-  initialImages: Partial<ProtoEnabledImageSummary>[] = [],
-  initialJobs: Partial<ProtoEnableJob>[] = [],
+  initialImages: ProtoEnabledImageSummary[] = [],
+  initialJobs: ProtoEnableJob[] = [],
 ): { transport: ReturnType<typeof createRouterTransport>; captures: Captures } {
   const captures: Captures = { enableCalls: [], disableCalls: [], refreshCalls: [] };
   const transport = createRouterTransport((router) => {
