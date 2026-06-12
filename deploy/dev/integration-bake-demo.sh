@@ -40,10 +40,10 @@ READY_DEADLINE_SECS="${READY_DEADLINE_SECS:-240}"
 # gRPC address and bearer token for the app surface (ADR 0039).
 export ENGRAM_APP_GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
 
-CLI_TOKEN_FLAG=()
-if [ -n "${ENGRAM_APP_TOKEN:-}" ]; then
-    CLI_TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
-fi
+# Fail-closed app surface (ADR 0039 Task 9): token always required;
+# default to the Tiltfile dev literal, override via env elsewhere.
+ENGRAM_APP_TOKEN="${ENGRAM_APP_TOKEN:-dev-app-grpc-token}"
+CLI_TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
 
 log() { echo "$@" >&2; }
 
@@ -90,7 +90,7 @@ log "    bake+push elapsed: $(echo "$T1 - $T0" | bc)s"
 log ""
 log "==> step 2/3: enable image (ADR 0036: async — polls to completion)"
 T0=$(date +%s.%N)
-./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" \
+./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} \
     image enable --uri "$IMAGE_URI" >&2
 T1=$(date +%s.%N)
 log "    enable elapsed: $(echo "$T1 - $T0" | bc)s"
@@ -102,7 +102,7 @@ log "==> step 3/3: poll hosts until this image's digest is ready"
 # image's manifest_digest (each bake produces a unique one) to
 # appear in some host's ready_image_digests, not just for the
 # count to be >= 1 — a prior run's image may already be ready.
-EXPECTED_DIGEST=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" --json image list \
+EXPECTED_DIGEST=$(./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} --json image list \
     | python3 -c "
 import sys,json
 rows = json.load(sys.stdin).get('images', [])
@@ -116,7 +116,7 @@ log "    waiting for digest: $EXPECTED_DIGEST"
 DEADLINE=$(( $(date +%s) + READY_DEADLINE_SECS ))
 T0=$(date +%s.%N)
 while :; do
-    READY=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" --json host list \
+    READY=$(./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} --json host list \
         | python3 -c "
 import sys,json
 rows = json.load(sys.stdin).get('hosts', [])

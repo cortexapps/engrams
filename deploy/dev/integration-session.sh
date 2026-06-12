@@ -28,13 +28,11 @@ PROMPT="${PROMPT:-}"
 # gRPC address and bearer token for the app surface (ADR 0039).
 # Set ENGRAM_APP_GRPC to override; default matches the Tiltfile.
 export ENGRAM_APP_GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
-# ENGRAM_APP_TOKEN is read by engram-cli from env; no default — dev
-# mode runs without token enforcement.
-
-CLI_TOKEN_FLAG=()
-if [ -n "${ENGRAM_APP_TOKEN:-}" ]; then
-    CLI_TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
-fi
+# The app-gRPC surface is FAIL-CLOSED (ADR 0039 Task 9) — a token is
+# always required. Default to the Tiltfile's dev literal so `just dev`
+# workflows stay zero-config; CI/other envs override via env.
+ENGRAM_APP_TOKEN="${ENGRAM_APP_TOKEN:-dev-app-grpc-token}"
+CLI_TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
 
 if ! curl -fsS "$COORD/healthz" >/dev/null 2>&1; then
     echo "ERROR: coord not reachable at $COORD" >&2
@@ -47,7 +45,7 @@ LOCAL_REGISTRY="localhost:5001"
 IMAGE_URI="$LOCAL_REGISTRY/integration-test/demo:warm-$SHORT"
 
 # Already enabled? Use the CLI to check via gRPC.
-already_enabled=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" --json image list 2>/dev/null \
+already_enabled=$(./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} --json image list 2>/dev/null \
     | python3 -c "
 import sys,json
 try:
@@ -105,7 +103,7 @@ else
     # Base snapshot is captured at enable time (ADR 0020), not at bake.
 
     echo "==> enabling image (ADR 0036: async — polls to completion)"
-    ./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" \
+    ./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} \
         image enable --uri "$IMAGE_URI"
 fi
 
@@ -113,7 +111,7 @@ fi
 # The session row carries the image URI, so we filter by image+status
 # and pick the first match. Best-effort: stale rows from prior runs are
 # possible if `just dev-down` didn't reap.
-existing_sid=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" --json session list 2>/dev/null \
+existing_sid=$(./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} --json session list 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -143,11 +141,11 @@ else
     else
         PROMPT_FLAG=()
     fi
-    SID=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" \
+    SID=$(./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} \
         session create \
         --image "$IMAGE_URI" \
-        "${MODE_FLAG[@]}" \
-        "${PROMPT_FLAG[@]}")
+        ${MODE_FLAG[@]+"${MODE_FLAG[@]}"} \
+        ${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"})
     echo "    session_id=$SID"
 fi
 

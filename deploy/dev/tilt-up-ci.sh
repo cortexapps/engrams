@@ -61,12 +61,12 @@ fi
 
 echo "==> waiting for host registration"
 for _ in $(seq 1 180); do
-    n=$("$CLI" "${TOKEN_FLAG[@]}" --grpc-addr "$GRPC" --json host list 2>/dev/null \
+    n=$("$CLI" ${TOKEN_FLAG[@]+"${TOKEN_FLAG[@]}"} --grpc-addr "$GRPC" --json host list 2>/dev/null \
         | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('hosts',[])))" 2>/dev/null || echo 0)
     [ "${n:-0}" -ge 1 ] && break
     sleep 1
 done
-n=$("$CLI" "${TOKEN_FLAG[@]}" --grpc-addr "$GRPC" --json host list 2>/dev/null \
+n=$("$CLI" ${TOKEN_FLAG[@]+"${TOKEN_FLAG[@]}"} --grpc-addr "$GRPC" --json host list 2>/dev/null \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('hosts',[])))" 2>/dev/null || echo 0)
 if [ "${n:-0}" -lt 1 ]; then
     echo "ERROR: no host-agent registered" >&2

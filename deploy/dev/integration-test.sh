@@ -23,10 +23,10 @@ COORD="http://127.0.0.1:8090"
 # gRPC address and bearer token for the app surface (ADR 0039).
 export ENGRAM_APP_GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
 
-CLI_TOKEN_FLAG=()
-if [ -n "${ENGRAM_APP_TOKEN:-}" ]; then
-    CLI_TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
-fi
+# Fail-closed app surface (ADR 0039 Task 9): token always required;
+# default to the Tiltfile dev literal, override via env elsewhere.
+ENGRAM_APP_TOKEN="${ENGRAM_APP_TOKEN:-dev-app-grpc-token}"
+CLI_TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
 
 dump_logs() {
     echo ""
@@ -46,7 +46,7 @@ echo ""
 echo "==> step 4/5: session create (cold-create with chunks already local)"
 T0=$(date +%s.%N)
 # mode=dev_vm: harness=none equivalent (no harness driven)
-SESS_ID=$(./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" \
+SESS_ID=$(./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} \
     session create \
     --image "$IMAGE_URI" \
     --dev-vm)
@@ -57,7 +57,7 @@ echo "    session_id: $SESS_ID"
 
 echo ""
 echo "==> step 5/5: cleanup — delete session $SESS_ID"
-./target/release/engram-cli "${CLI_TOKEN_FLAG[@]}" \
+./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} \
     session delete "$SESS_ID"
 echo "    session deleted"
 
