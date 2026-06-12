@@ -396,6 +396,60 @@ impl Driver {
             .to_string()
     }
 
+    /// The session's bound `host_id` (`None` while Idle / unbound).
+    /// Used by the teleport test to assert the session relocated.
+    async fn session_host_id(&self, sid: SessionId) -> Option<String> {
+        self.get_session(sid)
+            .await
+            .get("host_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// `GET /hosts` → the registered hosts' ids. The teleport test uses
+    /// this to discover a peer to relocate onto.
+    async fn list_host_ids(&self) -> Vec<String> {
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/hosts")
+            .send()
+            .await
+            .expect("GET /hosts");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "GET /hosts failed: {status} body={text}"
+        );
+        let body: Value = serde_json::from_str(&text).expect("decode ListHostsResponse");
+        body.get("hosts")
+            .and_then(Value::as_array)
+            .map(|hs| {
+                hs.iter()
+                    .filter_map(|h| h.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `POST /admin/sessions/:id/teleport` `{target_host_id}` — relocate
+    /// an Active session to a chosen host. Returns 202 (snapshot-rehome)
+    /// or 200 (live); either way the `evac_resumer` lands it on the
+    /// pinned host. Asserts only that the request was accepted; the
+    /// caller polls `wait_for_status(active)` + `session_host_id` for the
+    /// observable outcome.
+    async fn teleport(&self, sid: SessionId, target_host_id: &str) {
+        let path = format!("/api/v1/admin/sessions/{sid}/teleport");
+        let resp = self
+            .req(reqwest::Method::POST, &path)
+            .json(&serde_json::json!({ "target_host_id": target_host_id }))
+            .send()
+            .await
+            .expect("POST /admin/sessions/:id/teleport");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(status.is_success(), "teleport failed: {status} body={text}");
+    }
+
     /// Poll `GET /sessions/:id` until `status == want` or the deadline
     /// elapses. Returns true on match. Used to observe Active→Idle
     /// (eviction) and Idle/Evacuating→Active (resume / teleport
@@ -755,6 +809,19 @@ async fn e2e_claude_with_bogus_key_surfaces_anthropic_auth_error() {
 fn nbd_required() -> bool {
     matches!(
         std::env::var("ENGRAM_EXPECT_NBD").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Whether this environment is REQUIRED to have ≥2 hosts (the teleport
+/// scenario). Set `ENGRAM_EXPECT_TWO_HOSTS=1` on the CI lane that boots
+/// the two-host stack (`ENGRAM_INTEG_TWO_HOSTS=1`) so a single-host
+/// environment becomes a hard failure instead of a silent skip. Unset
+/// (default single-host lane, local runs) keeps the graceful-skip path,
+/// so the test is safe to land before the lane flips to two hosts.
+fn two_hosts_required() -> bool {
+    matches!(
+        std::env::var("ENGRAM_EXPECT_TWO_HOSTS").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
     )
 }
@@ -1571,6 +1638,112 @@ async fn e2e_evac_admin_endpoint_shape() {
     assert!(
         body.get("session_id").is_some(),
         "202 body must echo session_id; got {body:?}",
+    );
+
+    driver.delete(sid).await;
+}
+
+/// Full-stack 2-host teleport: relocate a live session to a chosen peer
+/// and prove its disk data crosses the move — the e2e the
+/// `e2e_evac_admin_endpoint_shape` doc calls out as "dev-vm only".
+/// Driven entirely through the public API.
+///
+/// Requires the two-host stack (`ENGRAM_INTEG_TWO_HOSTS=1`, which the CI
+/// lane sets alongside `ENGRAM_EXPECT_TWO_HOSTS=1`). On a single-host
+/// environment it skips with a `::warning::` — unless
+/// `ENGRAM_EXPECT_TWO_HOSTS` is set, where <2 hosts is a hard failure.
+/// This mirrors the `nbd_required()` gate so the test is safe to land
+/// before the lane flips to two hosts.
+///
+/// Flow: create on host A → write a UUID sentinel → `teleport` to host B
+/// → wait for Active → assert `host_id` is now B (the pinned target) →
+/// `cat` the sentinel back and assert byte-identical.
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image + a 2-host stack; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_two_host_teleport_preserves_sentinel() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+
+    let hosts = driver.list_host_ids().await;
+    if hosts.len() < 2 {
+        assert!(
+            !two_hosts_required(),
+            "ENGRAM_EXPECT_TWO_HOSTS is set but only {} host(s) registered — the \
+             two-host stack didn't come up (check ENGRAM_INTEG_TWO_HOSTS + the \
+             tilt-up-ci.sh >=2 host wait + NBD device split).",
+            hosts.len(),
+        );
+        eprintln!(
+            "::warning title=Teleport e2e skipped::only {} host registered; \
+             teleport needs >=2. Set ENGRAM_INTEG_TWO_HOSTS=1 on the lane to \
+             exercise this.",
+            hosts.len(),
+        );
+        return;
+    }
+
+    let sid = driver.create_session_none_harness(&image).await;
+    let src = driver
+        .session_host_id(sid)
+        .await
+        .expect("Active session must have a bound host_id");
+
+    let sentinel = uuid::Uuid::new_v4().to_string();
+    let write = driver
+        .exec(
+            sid,
+            &format!("printf '%s' {sentinel} > /var/tele-sentinel.txt && sync"),
+        )
+        .await;
+    assert_eq!(
+        write.exit_status,
+        Some(0),
+        "sentinel write should succeed; stderr=<{}>",
+        write.stderr,
+    );
+
+    // Pick a destination host that isn't the source, and teleport.
+    let dest = hosts
+        .iter()
+        .find(|h| **h != src)
+        .expect("a peer host distinct from the source");
+    driver.teleport(sid, dest).await;
+
+    // The evac_resumer drives Evacuating → Created → Active on the pinned
+    // host. Generous deadline: first restore on the peer may cold-fetch
+    // chunks. 180s mirrors the cold-create budget.
+    assert!(
+        driver
+            .wait_for_status(sid, "active", Duration::from_secs(180))
+            .await,
+        "session should be Active on the destination host after teleport; \
+         last status={}",
+        driver.session_status(sid).await,
+    );
+
+    // Landed on the pinned target, not the source.
+    let after = driver
+        .session_host_id(sid)
+        .await
+        .expect("resumed session must have a bound host_id");
+    assert_ne!(after, src, "session must leave the source host");
+    assert_eq!(
+        after, *dest,
+        "session must land on the pinned teleport target",
+    );
+
+    // Disk data crossed the move byte-identical.
+    let readback = driver.exec(sid, "cat /var/tele-sentinel.txt").await;
+    assert_eq!(
+        readback.exit_status,
+        Some(0),
+        "sentinel readback on the destination host should succeed; stderr=<{}>",
+        readback.stderr,
+    );
+    assert_eq!(
+        readback.stdout.trim(),
+        sentinel,
+        "disk data lost across the host teleport",
     );
 
     driver.delete(sid).await;

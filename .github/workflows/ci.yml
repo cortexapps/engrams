@@ -1403,6 +1403,11 @@ jobs:
           # in test-firecracker already does at the PooledBackend
           # layer.
           ENGRAM_EGRESS_PROXY_PORT: "14443"
+          # Two-host stack: brings up host-agent + host-agent-b (Tiltfile
+          # splits the /dev/nbd* devices + gives host-b a distinct proxy
+          # port). Required for e2e_two_host_teleport_preserves_sentinel;
+          # tilt-up-ci.sh waits for both to register.
+          ENGRAM_INTEG_TWO_HOSTS: "1"
         run: |
           # ADR 0025/0027: boot the OWNED guest kernel (6.1.102) the fetch
           # script provides + prod runs — it carries CONFIG_SQUASHFS_ZSTD=y so
@@ -1541,6 +1546,10 @@ jobs:
           # regression, not the old "no nbd.ko" environment gap, so the
           # Phase B chunked-disk tests fail loud instead of skipping.
           ENGRAM_EXPECT_NBD: "1"
+          # The bring-up sets ENGRAM_INTEG_TWO_HOSTS=1, so the teleport
+          # test must find >=2 hosts — make a single-host fleet a hard
+          # failure here (the test self-skips with a warning when unset).
+          ENGRAM_EXPECT_TWO_HOSTS: "1"
         run: |
           cargo nextest run \
               -p engram-coordinator \
