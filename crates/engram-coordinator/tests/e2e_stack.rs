@@ -342,6 +342,54 @@ impl Driver {
         None
     }
 
+    /// `GET /sessions/:id` → the full `Session` JSON. Black-box read:
+    /// the lifecycle tests observe `status` (snake_case `SessionState`
+    /// — "active" / "idle" / "evacuating") and `host_id` exactly as a
+    /// real client would, instead of probing internal diagnostics. A
+    /// pure read; it does not bump the session's activity clock, so
+    /// the idle-eviction test can poll it without keeping the session
+    /// warm.
+    async fn get_session(&self, sid: SessionId) -> Value {
+        let path = format!("/api/v1/sessions/{sid}");
+        let resp = self
+            .req(reqwest::Method::GET, &path)
+            .send()
+            .await
+            .expect("GET /sessions/:id");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "GET /sessions/:id failed: {status} body={text}"
+        );
+        serde_json::from_str(&text).expect("decode Session json")
+    }
+
+    /// The session's `status` string (snake_case `SessionState`).
+    async fn session_status(&self, sid: SessionId) -> String {
+        self.get_session(sid)
+            .await
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Poll `GET /sessions/:id` until `status == want` or the deadline
+    /// elapses. Returns true on match. Used to observe Active→Idle
+    /// (eviction) and Idle/Evacuating→Active (resume / teleport
+    /// rejoin) through the public API alone.
+    async fn wait_for_status(&self, sid: SessionId, want: &str, deadline: Duration) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < deadline {
+            if self.session_status(sid).await == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        false
+    }
+
     /// Stream session_events until the deadline, watching for an
     /// Anthropic auth-failure signal in either of the shapes
     /// documented on `AuthFailureSignal`.
@@ -1012,6 +1060,105 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
         post_advanced.is_some(),
         "post-resume disk_manifest_version never advanced past baseline {post_resume_baseline} in 90s — \
          the resumed sandbox isn't rejoined to chunked-disk tracking",
+    );
+
+    driver.delete(sid).await;
+}
+
+/// Lifecycle e2e: idle→active resume preserves BOTH disk and memory,
+/// proven the only way a user would see it — write through the API,
+/// run the snapshot→evict→resume cycle, read back through the API.
+///
+/// Unlike `e2e_resume_rejoins_chunked_disk_tracking` (which asserts on
+/// the internal `disk_manifest_version`), this is pure black-box: it
+/// never inspects cow-state or manifest internals. Two guarantees:
+///
+///   - **Disk data survives byte-identical.** A UUID sentinel written
+///     to `/var/sentinel.txt` is `cat`'d back after resume and must
+///     match. This is the user-facing "no data loss on resume" claim.
+///     It holds on any backend (NBD-attached OR materialize-to-file),
+///     so the test does NOT gate on NBD.
+///   - **The kernel was memory-restored, not rebooted.**
+///     `/proc/sys/kernel/random/boot_id` is minted once per kernel
+///     boot and lives only in kernel memory — the FC memory snapshot
+///     captures it, a cold reboot regenerates it. Asserting it's
+///     unchanged across the cycle proves resume is a true warm
+///     memory-restore, not a disk-only re-boot (which would silently
+///     drop any in-memory process state a real session depends on).
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_resume_preserves_disk_and_memory() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+
+    let sid = driver.create_session_none_harness(&image).await;
+
+    // Disk sentinel: a fresh UUID so stale state can't satisfy the
+    // readback. `/var` is the proven-writable anchor the other tests
+    // use. sync so it reaches the disk backend, not the guest cache.
+    let disk_sentinel = uuid::Uuid::new_v4().to_string();
+    let write = driver
+        .exec(
+            sid,
+            &format!("printf '%s' {disk_sentinel} > /var/sentinel.txt && sync"),
+        )
+        .await;
+    assert_eq!(
+        write.exit_status,
+        Some(0),
+        "sentinel write should succeed; stderr=<{}>",
+        write.stderr,
+    );
+
+    // Memory-continuity witness: the kernel's boot_id, captured BEFORE
+    // the snapshot. Survives a memory-restore; changes on a reboot.
+    let boot_id_before = driver
+        .exec(sid, "cat /proc/sys/kernel/random/boot_id")
+        .await;
+    assert_eq!(
+        boot_id_before.exit_status,
+        Some(0),
+        "reading boot_id should succeed; stderr=<{}>",
+        boot_id_before.stderr,
+    );
+    let boot_id_before = boot_id_before.stdout.trim().to_string();
+    assert!(!boot_id_before.is_empty(), "boot_id must be non-empty");
+
+    // The idle→active cycle prod exercises (minus the 30s idle wait):
+    // snapshot the running VM, drop the local sandbox, resume.
+    driver.snapshot(sid).await;
+    driver.evict_local(sid).await;
+    driver.resume(sid).await;
+    assert!(
+        driver
+            .wait_for_status(sid, "active", Duration::from_secs(30))
+            .await,
+        "session should be Active after resume",
+    );
+
+    // Disk survived byte-identical.
+    let readback = driver.exec(sid, "cat /var/sentinel.txt").await;
+    assert_eq!(
+        readback.exit_status,
+        Some(0),
+        "sentinel readback should succeed; stderr=<{}>",
+        readback.stderr,
+    );
+    assert_eq!(
+        readback.stdout.trim(),
+        disk_sentinel,
+        "disk data lost across resume: /var/sentinel.txt content changed",
+    );
+
+    // Kernel was memory-restored, not rebooted.
+    let boot_id_after = driver
+        .exec(sid, "cat /proc/sys/kernel/random/boot_id")
+        .await;
+    assert_eq!(
+        boot_id_after.stdout.trim(),
+        boot_id_before,
+        "boot_id changed across resume — the VM cold-rebooted instead of \
+         restoring from the memory snapshot (in-memory state would be lost)",
     );
 
     driver.delete(sid).await;
