@@ -17,6 +17,14 @@ export interface Config {
   controlPlaneBearer: string;
   /** TRUSTED_ORIGINS — comma-separated list; dev default: http://localhost:5173 */
   trustedOrigins: string[];
+  /**
+   * BETTER_AUTH_SECRET — signing/encryption key for better-auth cookies and
+   * tokens (Task 16). Optional here: better-auth falls back to a hard-coded
+   * dev literal when absent (logs a warning in dev, throws in production).
+   * Wire a dev literal through the Tiltfile so the value is deterministic
+   * without requiring a manual .env step.
+   */
+  betterAuthSecret: string | undefined;
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -43,6 +51,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     .map((s) => s.trim())
     .filter(Boolean);
 
+  // Optional: better-auth uses this for cookie signing / encryption.
+  // Falls back to a dev literal when absent (with a console warning);
+  // throws in production if unset. Wire through Tiltfile as a dev literal.
+  const betterAuthSecret = env["BETTER_AUTH_SECRET"] || undefined;
+
   if (missing.length > 0) {
     throw new Error(
       `Orchestrator: missing required environment variable(s): ${missing.join(", ")}`,
@@ -61,6 +74,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     controlPlaneGrpcUrl,
     controlPlaneBearer,
     trustedOrigins,
+    betterAuthSecret,
   };
 }
 

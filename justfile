@@ -373,6 +373,23 @@ smoke-create:
               "harness": {"kind":"none"} \
             }' | jq
 
+# Promote a user to admin role in the orchestrator DB (ADR 0039 Task 16).
+#
+# Nothing else ever makes a user admin — without this recipe every admin
+# surface in Phase 4 (Task 25) is untestable.
+#
+# Uses `docker compose exec` so it works even when psql is not on PATH.
+# The engram_orchestrator DB lives on the same postgres container as the
+# main DB (different database name, same cluster).
+#
+# Usage:
+#   just dev-admin                     # promotes dev@engram.local (default)
+#   just dev-admin email=alice@example.com
+dev-admin email='dev@engram.local':
+    docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
+        psql -U engram -d engram_orchestrator \
+        -c "UPDATE \"user\" SET role='admin' WHERE email='{{email}}'; SELECT email, role FROM \"user\" WHERE email='{{email}}';"
+
 # Smallest-possible dev session: empty workspace, no agent. Useful
 # for confirming the orthogonal axes in isolation — no git remote
 # to clone, no harness binary to attach, just a VM with a shell.

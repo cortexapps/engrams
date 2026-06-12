@@ -587,6 +587,11 @@ local_resource('orchestrator',
         'TRUSTED_ORIGINS': 'http://localhost:5173',
         'ORCHESTRATOR_PORT': '8787',
         'ORCHESTRATOR_DATABASE_URL': orchestrator_db_url,
+        # ADR 0039 Task 16: better-auth cookie-signing secret. A fixed dev
+        # literal is fine here — deterministic across restarts, never leaves
+        # loopback, never ships. Production must rotate this via .env or a
+        # secrets manager before Phase 4 deployment.
+        'BETTER_AUTH_SECRET': env_or('BETTER_AUTH_SECRET', 'dev-better-auth-secret-32bytes!!'),
     },
     resource_deps=['postgres', 'orchestrator-migrate'],
     readiness_probe=probe(

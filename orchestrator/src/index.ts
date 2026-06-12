@@ -2,11 +2,13 @@ import { Hono } from "hono";
 import { config } from "./config.ts";
 import { buildServer } from "./server.ts";
 import health from "./routes/health.ts";
+import authRoute from "./routes/auth.ts";
 
 const app = new Hono();
 
 // Mount routes.
 app.route("/", health);
+app.route("/", authRoute);
 
 // Default 404 for unmatched Hono paths.
 app.notFound((c) => c.json({ error: "not found" }, 404));
