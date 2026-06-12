@@ -354,7 +354,6 @@ mod tests {
     fn ephemeral_session(id: engram_core::SessionId) -> Session {
         Session {
             id,
-            user_id: None,
             status: SessionState::Active,
             host_id: Some(engram_core::HostId::new()),
             sandbox_id: None,

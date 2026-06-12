@@ -1843,7 +1843,6 @@ mod evicting_gate_tests {
     fn evicting_session(id: SessionId) -> Session {
         Session {
             id,
-            user_id: None,
             status: SessionState::Evicting,
             host_id: None,
             sandbox_id: Some(SandboxId::new()),

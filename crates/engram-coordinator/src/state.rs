@@ -1442,7 +1442,6 @@ pub(crate) mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: engram_core::types::SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1503,7 +1502,6 @@ pub(crate) mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: engram_core::types::SessionState::Active,
             host_id: None,
             sandbox_id,

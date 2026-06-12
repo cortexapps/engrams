@@ -43,12 +43,10 @@ pub mod verify;
 pub use bearer::ServiceBearer;
 pub use chain::VerifierChain;
 pub use config::{build_chain, AuthConfig, AuthMode, ForwardAuthConfig, OidcConfig};
-pub use cookie::CookieSession;
 pub use error::AuthError;
 pub use forward::ForwardAuthVerifier;
 pub use oidc::{OidcAuthenticator, OidcStart};
 pub use session::{hash_token, mint_session_token};
-pub use synthetic::SyntheticAdmin;
 pub use token::{open_user_token, seal_user_token};
 pub use verify::{IdentityVerifier, Verified, VerifiedEmail, VerifyInput};
 

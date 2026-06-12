@@ -169,7 +169,6 @@ async fn list_live_session_disk_manifest_ids_picks_up_live_writes() {
         .create_session(SessionSpec {
             image: "phase-c-helpers-test:warm-1".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");
@@ -250,7 +249,6 @@ async fn record_snapshot_bumps_chunk_generation() {
         .create_session(SessionSpec {
             image: "phase-c-snapshot-bump-test:warm-1".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");

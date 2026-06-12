@@ -52,7 +52,6 @@ async fn cross_replica_event_fan_out() {
         .create_session(SessionSpec {
             image: "ha-listener-test:warm-test".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");
@@ -198,7 +197,6 @@ async fn append_session_event_fires_pg_notify() {
         .create_session(SessionSpec {
             image: "ha-notify-test:warm-test".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create");

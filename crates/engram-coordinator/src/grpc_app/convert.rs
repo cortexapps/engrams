@@ -32,7 +32,6 @@ use engram_core::types::session::SessionMode;
 pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session {
     let engram_core::types::Session {
         id,
-        user_id: _, // ADR 0039 §2.1: attribution is off-contract; intentionally dropped.
         status,
         host_id,
         sandbox_id,
@@ -606,7 +605,6 @@ mod tests {
     fn populated_session() -> Session {
         Session {
             id: SessionId::new(),
-            user_id: Some("user-123".into()),
             status: SessionState::Active,
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),

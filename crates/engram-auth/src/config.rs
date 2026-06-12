@@ -1,17 +1,8 @@
-//! Auth configuration + the [`build_chain`] factory. The coordinator's CLI
-//! populates [`AuthConfig`]; this crate owns the shape so the chain assembly
-//! stays here (and the IdP-specific values — Rippling, GCP IAP — are pure
-//! config, never code).
-
-use std::sync::Arc;
-
-use engram_core::traits::{UserStore, WebSessionStore};
+//! Auth configuration + the [`build_chain`] factory.
 
 use crate::bearer::ServiceBearer;
 use crate::chain::VerifierChain;
-use crate::cookie::CookieSession;
 use crate::forward::ForwardAuthVerifier;
-use crate::synthetic::SyntheticAdmin;
 use crate::verify::IdentityVerifier;
 
 /// How the deployment authenticates humans.
@@ -114,23 +105,12 @@ impl Default for AuthConfig {
     }
 }
 
-/// Assemble the per-request verifier chain from config. Order (ADR 0031):
-/// cookie session → service bearer → forward-auth → synthetic admin. The
-/// OIDC authenticator is **not** in the chain — it's endpoint-driven
-/// (`/auth/login` + `/auth/callback`) and persists via the session cookie,
-/// which the cookie verifier then resolves.
-pub fn build_chain(
-    cfg: &AuthConfig,
-    users: Arc<dyn UserStore>,
-    web_sessions: Arc<dyn WebSessionStore>,
-) -> VerifierChain {
+/// Assemble the per-request verifier chain from config. ADR 0039 Task 31:
+/// only service-bearer remains (cookie/synthetic/OIDC removed; users table dropped).
+pub fn build_chain(cfg: &AuthConfig) -> VerifierChain {
     let mut verifiers: Vec<Box<dyn IdentityVerifier>> = Vec::new();
 
-    // 1. Cookie session (resolves OIDC-minted human sessions). Harmless in
-    //    forward-auth/none modes — it just misses when no cookie is present.
-    verifiers.push(Box::new(CookieSession::new(web_sessions)));
-
-    // 2. Service bearer (host-agent / CLI / machines), if configured.
+    // Service bearer (host-agent / CLI / machines), if configured.
     if !cfg.service_tokens.is_empty() {
         verifiers.push(Box::new(ServiceBearer::new(
             cfg.service_tokens.clone(),
@@ -138,28 +118,15 @@ pub fn build_chain(
         )));
     }
 
-    // 3. Forward-auth, if behind a trusted proxy.
+    // Forward-auth, if behind a trusted proxy. Note: VerifiedEmail resolution
+    // (JIT upsert) is a no-op now — the chain skips Email variants.
     if cfg.mode == AuthMode::ForwardAuth {
         if let Some(fa) = &cfg.forward_auth {
             verifiers.push(Box::new(ForwardAuthVerifier::new(fa.clone())));
         }
     }
 
-    // 4. Synthetic admin only when no SSO is configured.
-    if cfg.mode == AuthMode::None {
-        verifiers.push(Box::new(SyntheticAdmin::new(cfg.dev_default_email.clone())));
-    }
-
-    // The service-bearer and synthetic-admin identities resolve to real
-    // `users` rows via JIT; fold their emails into the admin allowlist so
-    // they're provisioned as admin (machine callers + the dev admin).
-    let mut admins = cfg.bootstrap_admins.clone();
-    admins.push(cfg.service_email.clone());
-    if cfg.mode == AuthMode::None {
-        admins.push(cfg.dev_default_email.clone());
-    }
-
-    VerifierChain::new(verifiers, users, admins)
+    VerifierChain::new(verifiers)
 }
 
 #[cfg(test)]

@@ -56,7 +56,6 @@ impl ReconcileMeta {
             id,
             Session {
                 id,
-                user_id: None,
                 status: SessionState::Active,
                 host_id: Some(host),
                 sandbox_id: Some(sandbox),

@@ -87,7 +87,6 @@ fn spec() -> SessionSpec {
     SessionSpec {
         image: "localhost:5001/placement-reservation:test".into(),
         mode: SessionMode::Agent,
-        user_id: None,
     }
 }
 

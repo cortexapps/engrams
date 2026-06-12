@@ -57,11 +57,10 @@ impl app::session_service_server::SessionService for AppSessionService {
         } else {
             std::collections::HashMap::new()
         };
-        // No calling user here (ADR §2.1): owner = None.
-        let body =
-            crate::api::sessions::create_session_core(&self.state, None, identity_env, api_req)
-                .await
-                .map_err(into_status)?;
+        // ADR 0039 Task 31: owner removed; identity_env carries harness secret env only.
+        let body = crate::api::sessions::create_session_core(&self.state, identity_env, api_req)
+            .await
+            .map_err(into_status)?;
         Ok(Response::new(app::CreateSessionResponse {
             session_id: body.session_id.to_string(),
             status: body.status.to_string(),

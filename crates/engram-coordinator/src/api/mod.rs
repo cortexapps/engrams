@@ -141,9 +141,6 @@ pub fn router(state: SharedState) -> Router {
             "/admin/sessions/:id/teleport",
             post(admin::teleport_session),
         )
-        // ADR 0045 Phase F: freeze / unfreeze a microVM in place.
-        .route("/admin/sessions/:id/pause", post(admin::pause_session))
-        .route("/admin/sessions/:id/resume", post(admin::resume_session))
         .route("/admin/hosts/:id/cordon", post(admin::cordon_host))
         .route("/admin/hosts/:id/uncordon", post(admin::uncordon_host))
         .route("/admin/hosts/:id/drain", post(admin::drain_host))
@@ -187,6 +184,10 @@ pub fn router(state: SharedState) -> Router {
     // NOT the human verifier chain — so the host-agent never needs a cookie
     // and a 401 here never tries to redirect a browser to /auth/login.
     let internal = Router::new()
+        // ADR 0045 Phase F: freeze / unfreeze a microVM in place (moved to
+        // internal bearer-auth router in ADR 0039 Task 31).
+        .route("/admin/sessions/:id/pause", post(admin::pause_session))
+        .route("/admin/sessions/:id/resume", post(admin::resume_session))
         .route("/hosts/register", post(host_http::register))
         .route("/hosts/:id/heartbeat", post(host_http::heartbeat))
         .route("/hosts/forge", post(forge::forge_forward))

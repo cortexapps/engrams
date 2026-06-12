@@ -57,7 +57,6 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     };
     Ok(Session {
         id: SessionId(id),
-        user_id: row.try_get("user_id").map_err(col_err)?,
         status: parse_session_state(&status)?,
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),

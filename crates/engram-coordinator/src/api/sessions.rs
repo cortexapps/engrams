@@ -313,35 +313,8 @@ pub(crate) async fn resolve_session_env(
         }
     }
 
-    // ADR 0031: re-apply the owner's git attribution + auto-injected Claude
-    // token on resume (the per-resume harness child is a fresh process, so it
-    // needs these in its env again). Keyed on the session's stored owner;
-    // best-effort — an unparseable/legacy user_id or missing auth runtime just
-    // skips it.
-    if let (Some(rt), Some(uid_str)) = (state.auth.as_ref(), session.user_id.as_ref()) {
-        if let Ok(uuid) = uid_str.parse::<uuid::Uuid>() {
-            match rt.users.get_user(engram_core::UserId(uuid)).await {
-                Ok(user) => {
-                    let principal = user.to_principal();
-                    // Git [user] attribution is human-initiated sessions only —
-                    // the service principal's service_email isn't a valid commit
-                    // author (GitHub rejects the squash-merge).
-                    if !principal.is_service(&rt.config.service_email) {
-                        env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-                        env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
-                    }
-                    let harness = bundle.as_ref().and_then(|b| b.manifest.harness.as_ref());
-                    inject_user_claude_token(state, &principal, harness, session.mode, &mut env)
-                        .await;
-                }
-                Err(e) => tracing::warn!(
-                    session_id = %session.id,
-                    error = %e,
-                    "resolve_session_env: owner lookup failed; resume env omits attribution + token",
-                ),
-            }
-        }
-    }
+    // ADR 0039 Task 31: user_id column and users table dropped;
+    // git attribution and per-user Claude token injection removed.
 
     (bundle, env)
 }
@@ -502,80 +475,26 @@ pub struct CreateSessionResponse {
 #[tracing::instrument(name = "session.create", skip_all)]
 pub async fn create_session(
     State(state): State<SharedState>,
-    crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
+    crate::api::principal::CurrentUser(_principal): crate::api::principal::CurrentUser,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    // The axum shim supplies, from its principal, exactly the
-    // attribution data the principal-free core takes as plain
-    // parameters: the owner id and the per-session identity env
-    // (git author + auto-injected Claude token). The gRPC path passes
-    // `None` / empty (ADR §2.1 — no calling user there).
-    let owner = Some(principal.user_id.to_string());
-    let identity_env = build_principal_identity_env(&state, &principal, &req).await;
-    let body = create_session_core(&state, owner, identity_env, req).await?;
+    // ADR 0039 Task 31: owner stamping and identity env removed (users table dropped).
+    let body = create_session_core(&state, HashMap::new(), req).await?;
     Ok((StatusCode::CREATED, Json(body)))
 }
 
-/// Build the per-session identity env the axum principal would stamp:
-/// git author (`ENGRAM_USER_EMAIL` / `ENGRAM_USER_NAME`, skipped for the
-/// service principal whose email isn't a valid commit author) plus the
-/// auto-injected saved Claude OAuth token for built-in `claude` agent
-/// sessions. Kept on the axum side so the core stays principal-free; the
-/// gRPC path supplies an empty map (Task 13's SecretService handles the
-/// token via `harness_secret_id` instead).
-async fn build_principal_identity_env(
-    state: &SharedState,
-    principal: &engram_core::types::user::Principal,
-    req: &CreateSessionRequest,
-) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-
-    // ADR 0031: attribute git commits to the initiating user. Skip the
-    // service principal: its service_email isn't a valid commit author.
-    if !state
-        .auth
-        .as_ref()
-        .is_some_and(|rt| principal.is_service(&rt.config.service_email))
-    {
-        env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-        env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
-    }
-
-    // ADR 0031: auto-inject the user's saved Claude Code OAuth token for
-    // built-in claude sessions. Best-effort — needs the image's harness
-    // manifest, which the core resolves; we resolve it here too so the
-    // axum behaviour is byte-identical. A missing/unopenable token is a
-    // no-op (the harness falls back to its own login path).
-    let image_uri: ImageRef = req.image.clone();
-    if let Ok(Some(enabled)) = state.services.meta.get_enabled_image(&image_uri).await {
-        if let Ok(manifest) = toml::from_str::<ImageManifest>(&enabled.manifest_toml) {
-            inject_user_claude_token(
-                state,
-                principal,
-                manifest.harness.as_ref(),
-                req.mode,
-                &mut env,
-            )
-            .await;
-        }
-    }
-    env
-}
-
 /// Transport-agnostic create core, with the metrics wrapper inside so
-/// gRPC creations are counted too (ADR 0039 Task 10). `owner` is the
-/// session's `user_id` (axum: the principal's id; gRPC: `None`).
-/// `identity_env` is the per-session git-author / Claude-token env the
-/// axum principal would have stamped (gRPC: empty). No principal, no
-/// authz — the caller is trusted (ADR §6).
+/// gRPC creations are counted too (ADR 0039 Task 10).
+/// `identity_env` carries per-session git-author / Claude-token env (now
+/// always empty from the axum shim; ADR 0039 Task 31 dropped user identity).
+/// No principal, no authz — the caller is trusted (ADR §6).
 pub(crate) async fn create_session_core(
     state: &SharedState,
-    owner: Option<String>,
     identity_env: HashMap<String, String>,
     req: CreateSessionRequest,
 ) -> Result<CreateSessionResponse, ApiError> {
     let start = std::time::Instant::now();
-    let result = create_session_compute(state, owner, identity_env, req).await;
+    let result = create_session_compute(state, identity_env, req).await;
     let elapsed = start.elapsed().as_secs_f64();
     let outcome = match &result {
         Ok(_) => "success",
@@ -609,7 +528,6 @@ pub(crate) async fn create_session_core(
 
 async fn create_session_compute(
     state: &SharedState,
-    owner: Option<String>,
     identity_env: HashMap<String, String>,
     req: CreateSessionRequest,
 ) -> Result<CreateSessionResponse, ApiError> {
@@ -698,10 +616,6 @@ async fn create_session_compute(
     let spec = SessionSpec {
         image: req.image.clone(),
         mode: req.mode,
-        // ADR 0031: owner is supplied by the caller — the axum shim
-        // passes the authenticated principal's id; the gRPC path passes
-        // `None` (no calling user, ADR §2.1).
-        user_id: owner.clone(),
     };
 
     // -------- 3. Mint a SessionId (no DB write yet) --------
@@ -1268,45 +1182,6 @@ async fn try_restore_base_snapshot(
     }
 }
 
-/// ADR 0031: inject the initiating user's saved Claude Code OAuth token into
-/// the session env, but only when the resolved harness is built-in Claude and
-/// the session drives it (agent mode). Best-effort — a missing or unopenable
-/// token is logged, never fatal, so the harness can still fall back to its own
-/// login path. Shared by the create and resume paths.
-async fn inject_user_claude_token(
-    state: &SharedState,
-    principal: &engram_core::types::user::Principal,
-    harness: Option<&engram_core::types::image::HarnessManifest>,
-    mode: SessionMode,
-    session_env: &mut std::collections::HashMap<String, String>,
-) {
-    let is_builtin_claude =
-        harness.and_then(|h| h.name.as_deref()) == Some("claude") && !mode.is_dev_vm();
-    if !is_builtin_claude {
-        return;
-    }
-    let Some(rt) = state.auth.as_ref() else {
-        return;
-    };
-    let kind = engram_core::types::user::UserToken::KIND_CLAUDE_OAUTH;
-    match rt.users.get_user_token(principal.user_id, kind).await {
-        Ok(Some(tok)) => {
-            match engram_auth::open_user_token(state.services.kek.as_ref(), &tok).await {
-                Ok(plain) => {
-                    session_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), plain);
-                }
-                Err(e) => {
-                    tracing::warn!(user_id = %principal.user_id, error = %e, "could not open saved Claude token")
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(user_id = %principal.user_id, error = %e, "could not load saved Claude token")
-        }
-    }
-}
-
 pub async fn get_session(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
@@ -1343,100 +1218,38 @@ pub struct ListSessionsResponse {
 
 #[derive(serde::Deserialize, Default)]
 pub struct ListSessionsParams {
-    /// `mine` (default) — the caller's own sessions. `all` — every session
-    /// (admin only); rows carry owner identity for attribution.
+    /// Retained for wire compatibility; scoping is now the orchestrator's job
+    /// (ADR 0039 Task 31). Will be removed in Task 32.
     #[serde(default)]
+    #[allow(dead_code)]
     pub scope: Option<String>,
 }
 
-/// `GET /sessions` — owner-scoped (ADR 0031). A member sees only their own
-/// sessions; an admin sees their own (`scope=mine`, default) or everyone's
-/// (`scope=all`). Returns only live rows — terminal states and
-/// `host_lost` are excluded (what `list_active_sessions` selects).
+/// `GET /sessions` — ADR 0039 Task 31: user_id column dropped; all sessions
+/// returned without owner scoping. The orchestrator owns authz and filtering.
 pub async fn list_sessions(
     State(state): State<SharedState>,
-    crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
-    axum::extract::Query(params): axum::extract::Query<ListSessionsParams>,
+    crate::api::principal::CurrentUser(_principal): crate::api::principal::CurrentUser,
+    axum::extract::Query(_params): axum::extract::Query<ListSessionsParams>,
 ) -> Result<Json<ListSessionsResponse>, ApiError> {
-    let show_all = match params.scope.as_deref().unwrap_or("mine") {
-        "all" => {
-            if !principal.is_admin() {
-                return Err(ApiError::Forbidden(
-                    "scope=all requires the admin role".into(),
-                ));
-            }
-            true
-        }
-        // "mine" or anything else → own sessions only.
-        _ => false,
-    };
-
-    // The core returns ALL live sessions, owner-annotated. The axum shim
-    // keeps today's principal scoping on its side: a member sees only
-    // their own rows, and — preserving the pre-extraction wire exactly —
-    // the `mine` view carries NO owner chips (owner is implicit: you).
+    // ADR 0039 Task 31: user_id column dropped; all sessions returned without owner scoping.
     let resp = list_sessions_core(&state).await?;
-    let sessions = if show_all {
-        resp.sessions
-    } else {
-        let mine = principal.user_id.to_string();
-        resp.sessions
-            .into_iter()
-            .filter(|item| item.session.user_id.as_deref() == Some(mine.as_str()))
-            .map(|item| SessionListItem {
-                session: item.session,
-                owner_email: None,
-                owner_name: None,
-            })
-            .collect()
-    };
-    Ok(Json(ListSessionsResponse { sessions }))
+    Ok(Json(resp))
 }
 
 /// Transport-agnostic core: returns ALL live sessions (the gRPC caller is
-/// a trusted service; filtering/authz is the orchestrator's job, ADR §6),
-/// each annotated with owner identity (one batch user lookup → map). The
-/// axum shim applies today's principal scoping before returning.
-///
-/// Behaviour-identical to the old `scope=all` arm of the handler — the
-/// `mine` arm just filters this set down. Owner annotation is computed
-/// unconditionally now (it was `scope=all`-only before); the cost is one
-/// `list_users` call, paid once per list, and the result is exactly what
-/// the admin view already showed.
+/// a trusted service; filtering/authz is the orchestrator's job, ADR §6).
+/// ADR 0039 Task 31: owner annotation removed (users table dropped).
 pub(crate) async fn list_sessions_core(
     state: &SharedState,
 ) -> Result<ListSessionsResponse, ApiError> {
     let all = state.services.meta.list_active_sessions().await?;
-
-    // Batch owner-identity lookup → map. Empty when there's no auth
-    // runtime (dev / tests), which falls through to unannotated rows —
-    // the same `None` the old `mine` arm produced.
-    let owners: HashMap<String, (Option<String>, String)> = match state.auth.as_ref() {
-        Some(rt) => rt
-            .users
-            .list_users()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|u| (u.id.to_string(), (u.display_name, u.email)))
-            .collect(),
-        None => HashMap::new(),
-    };
-
     let sessions = all
         .into_iter()
-        .map(|s| {
-            let (owner_name, owner_email) = s
-                .user_id
-                .as_ref()
-                .and_then(|uid| owners.get(uid))
-                .map(|(name, email)| (name.clone(), Some(email.clone())))
-                .unwrap_or((None, None));
-            SessionListItem {
-                session: s,
-                owner_email,
-                owner_name,
-            }
+        .map(|s| SessionListItem {
+            session: s,
+            owner_email: None,
+            owner_name: None,
         })
         .collect();
     Ok(ListSessionsResponse { sessions })

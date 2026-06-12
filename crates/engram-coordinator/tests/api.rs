@@ -78,7 +78,6 @@ impl MetadataStore for MockMetadataStore {
         let id = SessionId::new();
         let session = Session {
             id,
-            user_id: spec.user_id,
             status: SessionState::Pending,
             host_id: None,
             sandbox_id: None,
@@ -101,7 +100,6 @@ impl MetadataStore for MockMetadataStore {
     ) -> Result<(), MetaError> {
         let session = Session {
             id: session_id,
-            user_id: spec.user_id,
             status: SessionState::Created,
             host_id: Some(host_id),
             sandbox_id: Some(sandbox_id),
@@ -495,7 +493,6 @@ async fn build_forge_app() -> (axum::Router, SessionId, Arc<engram_git_dev::Stat
         .create_session(engram_core::types::session::SessionSpec {
             image: "cortexapps/engrams:warm-bootstrap".to_string(),
             mode: Default::default(),
-            user_id: None,
         })
         .await
         .expect("seed session");
@@ -1393,7 +1390,6 @@ async fn list_sessions_returns_live_rows_only() {
             .create_session(SessionSpec {
                 image: format!("{repo}:warm-bootstrap"),
                 mode: engram_core::types::session::SessionMode::Agent,
-                user_id: None,
             })
             .await
             .unwrap()
@@ -1448,7 +1444,6 @@ async fn list_sessions_serializes_full_session_record() {
             // harness is an image property. `mode = dev_vm` exercises
             // the non-default arm of the wire shape.
             mode: engram_core::types::session::SessionMode::DevVm,
-            user_id: Some("user-42".into()),
         })
         .await
         .unwrap();
@@ -1483,7 +1478,11 @@ async fn list_sessions_serializes_full_session_record() {
         "ADR 0021 P1.3 retired the per-session harness field"
     );
     assert_eq!(item["mode"], "dev_vm");
-    assert_eq!(item["user_id"], "user-42");
+    // ADR 0039 Task 31: user_id column dropped from sessions.
+    assert!(
+        item.get("user_id").is_none(),
+        "user_id must not appear in the wire shape after ADR 0039 Task 31"
+    );
     assert_eq!(item["status"], SessionState::Pending.as_str());
     assert!(item["created_at"].is_string());
     assert!(item["last_active_at"].is_string());
@@ -1496,7 +1495,6 @@ async fn delete_session_marks_completed_and_returns_204() {
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
@@ -1707,7 +1705,6 @@ async fn exec_stream_returns_409_when_no_live_sandbox() {
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
@@ -2028,7 +2025,6 @@ async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
@@ -2107,7 +2103,6 @@ async fn evict_local_409_when_session_not_active() {
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
@@ -2138,7 +2133,6 @@ async fn resume_410_gone_when_no_snapshot_exists() {
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
@@ -2219,7 +2213,6 @@ async fn exec_rejects_request_without_command_or_argv() {
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
@@ -2243,7 +2236,6 @@ async fn exec_rejects_empty_argv() {
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
@@ -2441,7 +2433,6 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
         .create_session(SessionSpec {
             image: "r:warm-bootstrap".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
@@ -3607,7 +3598,6 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
             session_id,
             Session {
                 id: session_id,
-                user_id: None,
                 status: SessionState::Active,
                 host_id: None,
                 sandbox_id: Some(sandbox_id),
@@ -3710,7 +3700,6 @@ async fn flush_now_returns_409_when_session_has_no_bound_sandbox() {
             session_id,
             Session {
                 id: session_id,
-                user_id: None,
                 status: SessionState::Idle,
                 host_id: None,
                 sandbox_id: None,
@@ -3746,7 +3735,6 @@ async fn flush_now_returns_idle_when_host_has_no_dirty_bytes() {
             session_id,
             Session {
                 id: session_id,
-                user_id: None,
                 status: SessionState::Active,
                 host_id: None,
                 sandbox_id: Some(sandbox_id),
@@ -3791,7 +3779,6 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
             session_id,
             Session {
                 id: session_id,
-                user_id: None,
                 status: SessionState::Active,
                 host_id: None,
                 sandbox_id: Some(sandbox_id),

@@ -991,15 +991,12 @@ async fn main() -> Result<(), CoordinatorError> {
 
     let forge = build_forge(&cli)?;
 
-    // ADR 0031: assemble the auth runtime. The Postgres store satisfies
-    // UserStore + WebSessionStore; `auth_tokens` becomes the service-bearer
-    // link in the chain. `None` mode → synthetic admin (dev/test).
+    // ADR 0039 Task 31: auth runtime no longer holds UserStore/WebSessionStore.
+    // Only the service-bearer (and optional forward-auth) remain in the chain.
     let auth = {
-        let users: Arc<dyn engram_core::traits::UserStore> = Arc::new(pg.clone());
-        let web_sessions: Arc<dyn engram_core::traits::WebSessionStore> = Arc::new(pg.clone());
         let mut auth_cfg = cfg.auth.clone();
         auth_cfg.service_tokens = cfg.auth_tokens.clone();
-        let chain = engram_auth::build_chain(&auth_cfg, users.clone(), web_sessions.clone());
+        let chain = engram_auth::build_chain(&auth_cfg);
         let oidc = auth_cfg
             .oidc
             .clone()
@@ -1008,8 +1005,6 @@ async fn main() -> Result<(), CoordinatorError> {
         Some(Arc::new(engram_coordinator::api::principal::AuthRuntime {
             chain,
             oidc,
-            users,
-            web_sessions,
             config: auth_cfg,
         }))
     };

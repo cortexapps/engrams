@@ -876,7 +876,6 @@ mod tests {
     fn make_session(host: HostId, sandbox: SandboxId, status: SessionState) -> Session {
         Session {
             id: SessionId::new(),
-            user_id: None,
             status,
             host_id: Some(host),
             sandbox_id: Some(sandbox),

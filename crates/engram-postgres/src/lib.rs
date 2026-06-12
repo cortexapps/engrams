@@ -227,14 +227,13 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, user_id, status, host_id,
+                (id, status, host_id,
                  image_uri, mode,
                  created_at, last_active_at)
-            VALUES ($1, $2, $3, NULL, $4, $5, $6, $6)
+            VALUES ($1, $2, NULL, $3, $4, $5, $5)
             "#,
         )
         .bind(id)
-        .bind(spec.user_id.as_deref())
         .bind(SessionState::Pending.as_str())
         .bind(&spec.image)
         .bind(mode_text)
@@ -259,10 +258,10 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, user_id, status, host_id, sandbox_id,
+                (id, status, host_id, sandbox_id,
                  image_uri, mode,
                  created_at, last_active_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
             ON CONFLICT (id) DO UPDATE SET
                 status         = EXCLUDED.status,
                 sandbox_id     = EXCLUDED.sandbox_id,
@@ -271,7 +270,6 @@ impl MetadataStore for PostgresStore {
             "#,
         )
         .bind(session_id.as_uuid())
-        .bind(spec.user_id.as_deref())
         .bind(SessionState::Created.as_str())
         .bind(host_id.as_uuid())
         .bind(sandbox_id.as_uuid())
@@ -361,13 +359,12 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, user_id, status, host_id, sandbox_id,
+                (id, status, host_id, sandbox_id,
                  image_uri, mode, mem_budget_mib, created_at, last_active_at)
-            VALUES ($1, $2, 'pending', $3, NULL, $4, $5, $6, $7, $7)
+            VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $6)
             "#,
         )
         .bind(session_id.as_uuid())
-        .bind(spec.user_id.as_deref())
         .bind(picked)
         .bind(&spec.image)
         .bind(spec.mode.as_str())
@@ -394,7 +391,7 @@ impl MetadataStore for PostgresStore {
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
+            SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
@@ -449,7 +446,7 @@ impl MetadataStore for PostgresStore {
         // (prod session 5cfb90b8, 2026-06-03).
         let rows = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
+            SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
@@ -676,7 +673,7 @@ impl MetadataStore for PostgresStore {
     async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
+            SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
@@ -729,7 +726,7 @@ impl MetadataStore for PostgresStore {
     async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
+            SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,

@@ -260,7 +260,6 @@ async fn seed_active_session(
         .create_session(SessionSpec {
             image: format!("ghcr.io/test/img:t-{}", uuid::Uuid::new_v4()),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create_session");

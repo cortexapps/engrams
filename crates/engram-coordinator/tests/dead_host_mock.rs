@@ -32,7 +32,6 @@ impl MetadataStore for MiniMeta {
             id,
             Session {
                 id,
-                user_id: spec.user_id,
                 status: SessionState::Pending,
                 host_id: None,
                 sandbox_id: None,
@@ -56,7 +55,6 @@ impl MetadataStore for MiniMeta {
             session_id,
             Session {
                 id: session_id,
-                user_id: spec.user_id,
                 status: SessionState::Created,
                 host_id: Some(host_id),
                 sandbox_id: Some(sandbox_id),
@@ -279,7 +277,6 @@ async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionState) -> Se
         .create_session(SessionSpec {
             image: "localhost:5001/demo:warm-test".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .unwrap();
