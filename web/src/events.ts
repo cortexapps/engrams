@@ -191,9 +191,11 @@ export interface OrchestratorSseEnvelope {
  *      ev.lastEventId — the envelope idx is authoritative and works in
  *      tests without a real EventSource).
  *   5. "lagged" kind → return null (caller invokes onLagged separately).
- *   6. idx === null (lagged sentinel) → return null.
- *   7. Unknown / ping kind that is not in the known SessionEventKind set
- *      → return null (transparent to consumers).
+ *   6. idx === null / non-numeric idx (contract-breaking envelope) →
+ *      return null.
+ *   7. Unknown event kinds are NOT filtered here — the EventSource layer
+ *      only dispatches kinds that have registered listeners, so a new
+ *      server kind is dropped there (same as the legacy wire).
  */
 export function parseOrchestratorFrame(frameData: string, kind: string): IndexedEvent | null {
   // Ping keepalives and lagged frames are not IndexedEvents.
@@ -207,7 +209,9 @@ export function parseOrchestratorFrame(frameData: string, kind: string): Indexed
   }
 
   // Lagged frames have idx === null; they're handled by the lagged listener.
-  if (envelope.idx === null) return null;
+  // Non-numeric idx = contract-breaking envelope — drop it (mirrors the old
+  // dispatch's Number.isFinite guard) while keeping idx 0 valid.
+  if (typeof envelope.idx !== "number" || !Number.isFinite(envelope.idx)) return null;
 
   let raw: Record<string, unknown>;
   try {
