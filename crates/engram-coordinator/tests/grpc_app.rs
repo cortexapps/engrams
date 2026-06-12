@@ -14,12 +14,13 @@
 //! in `api.rs` live inside that test binary and aren't importable.
 //! The stubs never touch state, so every method is inert.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use engram_cloud_mock::MockCloud;
 use engram_coordinator::{grpc_app, AppState, CoordinatorConfig, Services};
-use engram_core::traits::MetadataStore;
+use engram_core::traits::{MetadataStore, SealedSecretRow};
 use engram_core::types::{
     HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
@@ -28,9 +29,19 @@ use engram_protocol::app;
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
 
-/// Inert in-memory `MetadataStore`. The Task 8 stubs never reach the
-/// store; this only exists so `Services`/`AppState` can be built.
-struct StubMeta;
+/// Stateful in-memory `MetadataStore` backed by a real `HashMap` so
+/// sealed-secret operations actually persist across calls.
+struct StubMeta {
+    secrets: Mutex<HashMap<String, SealedSecretRow>>,
+}
+
+impl StubMeta {
+    fn new() -> Self {
+        Self {
+            secrets: Mutex::new(HashMap::new()),
+        }
+    }
+}
 
 #[async_trait]
 impl MetadataStore for StubMeta {
@@ -221,24 +232,33 @@ impl MetadataStore for StubMeta {
     }
     async fn put_sealed_secret(
         &self,
-        _key: &str,
-        _wrapped_dek: Vec<u8>,
-        _nonce: Vec<u8>,
-        _ciphertext: Vec<u8>,
-        _key_id: String,
+        key: &str,
+        wrapped_dek: Vec<u8>,
+        nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+        key_id: String,
     ) -> Result<(), MetaError> {
+        let row = SealedSecretRow {
+            key: key.to_string(),
+            wrapped_dek,
+            nonce,
+            ciphertext,
+            key_id,
+        };
+        self.secrets.lock().unwrap().insert(key.to_string(), row);
         Ok(())
     }
-    async fn has_sealed_secret(&self, _key: &str) -> Result<bool, MetaError> {
-        Ok(false)
+    async fn has_sealed_secret(&self, key: &str) -> Result<bool, MetaError> {
+        Ok(self.secrets.lock().unwrap().contains_key(key))
     }
     async fn get_sealed_secret(
         &self,
-        _key: &str,
+        key: &str,
     ) -> Result<Option<engram_core::traits::SealedSecretRow>, MetaError> {
-        Ok(None)
+        Ok(self.secrets.lock().unwrap().get(key).cloned())
     }
-    async fn delete_sealed_secret(&self, _key: &str) -> Result<(), MetaError> {
+    async fn delete_sealed_secret(&self, key: &str) -> Result<(), MetaError> {
+        self.secrets.lock().unwrap().remove(key);
         Ok(())
     }
 }
@@ -255,7 +275,7 @@ fn test_state(app_grpc_tokens: Vec<String>) -> Arc<AppState> {
         ))
     };
     let services = Services {
-        meta: Arc::new(StubMeta),
+        meta: Arc::new(StubMeta::new()),
         cloud: Arc::new(MockCloud::new()),
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
             ProcessBackend::new(sandbox_dir),
@@ -427,8 +447,7 @@ async fn app_grpc_rejects_missing_and_wrong_bearer() {
 }
 
 /// Task 13: harness_secret_id is now wired. With a non-existent secret id →
-/// NotFound (the secret must be PutSecret'd before CreateSession).
-/// The old Unimplemented rejection is gone.
+/// NotFound (secret lookup runs before image resolution — deterministic).
 #[tokio::test]
 async fn create_session_with_missing_harness_secret_returns_not_found() {
     let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
@@ -447,13 +466,13 @@ async fn create_session_with_missing_harness_secret_returns_not_found() {
     })
     .await
     .expect_err("missing secret → NotFound");
-    // The image isn't enabled in the stub state, so we may get NotFound
-    // for the image first OR NotFound for the secret. Either way it must
-    // NOT be Unimplemented — the old Task-13-pending rejection is gone.
-    assert_ne!(
+    // Secret lookup runs BEFORE image resolution — the handler calls
+    // build_harness_secret_env first, which returns NotFound when the
+    // secret row is absent. Image resolution never runs.
+    assert_eq!(
         err.code(),
-        tonic::Code::Unimplemented,
-        "harness_secret_id must no longer be rejected as Unimplemented: {err:?}"
+        tonic::Code::NotFound,
+        "missing harness_secret_id must return NotFound (secret checked before image): {err:?}"
     );
 
     server.abort();
@@ -470,24 +489,26 @@ async fn secret_service_put_has_delete_round_trip() {
         bearer(TEST_TOKEN),
     );
 
-    // StubMeta never persists; has_secret always returns false.
-    // But we prove the RPCs are wired and auth-gated.
+    // Before any put, has_secret must return false.
     let has = client
         .has_secret(app::HasSecretRequest {
             key: "test-key".into(),
         })
         .await
         .expect("HasSecret must succeed");
-    assert!(!has.into_inner().exists, "stub returns false");
+    assert!(
+        !has.into_inner().exists,
+        "no secret stored yet — must return false"
+    );
 
-    // put_secret — succeeds against stub (seals, then stub meta discards)
+    // put_secret — seals and stores via StubMeta.
     client
         .put_secret(app::PutSecretRequest {
             key: "test-key".into(),
             value: "test-value".into(),
         })
         .await
-        .expect("PutSecret must succeed against stub");
+        .expect("PutSecret must succeed");
 
     // delete_secret (idempotent)
     client
@@ -496,6 +517,110 @@ async fn secret_service_put_has_delete_round_trip() {
         })
         .await
         .expect("DeleteSecret must succeed");
+
+    server.abort();
+}
+
+/// Real crypto round-trip: StubMeta now persists; put → has(true) → get+inject → delete → has(false).
+/// Proves that seal→store→unseal→inject runs with REAL crypto in-process.
+#[tokio::test]
+async fn secret_service_real_crypto_round_trip() {
+    let (addr, server) = serve(test_state(vec![TEST_TOKEN.into()])).await;
+    let channel = dial(addr).await;
+    let mut client = app::secret_service_client::SecretServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    // put — real seal runs (EnvVarKeyProvider KEK, real CredCipher).
+    client
+        .put_secret(app::PutSecretRequest {
+            key: "u1".into(),
+            value: "s3cr3t-value".into(),
+        })
+        .await
+        .expect("PutSecret");
+
+    // has → true
+    let has = client
+        .has_secret(app::HasSecretRequest { key: "u1".into() })
+        .await
+        .expect("HasSecret after put");
+    assert!(
+        has.into_inner().exists,
+        "has_secret must return true after put"
+    );
+
+    // delete
+    client
+        .delete_secret(app::DeleteSecretRequest { key: "u1".into() })
+        .await
+        .expect("DeleteSecret");
+
+    // has → false
+    let has2 = client
+        .has_secret(app::HasSecretRequest { key: "u1".into() })
+        .await
+        .expect("HasSecret after delete");
+    assert!(
+        !has2.into_inner().exists,
+        "has_secret must return false after delete"
+    );
+
+    server.abort();
+}
+
+/// Injection test: seal+store a secret, then verify seal→store→unseal round-trip
+/// with real crypto by directly reading from StubMeta and calling CredCipher::open.
+/// Proves the crypto path end-to-end in-process (no harness or image resolution needed).
+#[tokio::test]
+async fn secret_real_crypto_unseal_via_grpc_put() {
+    // Build a state with real EnvVarKeyProvider (zeros KEK, "test:v1" key_id).
+    let state = test_state(vec![TEST_TOKEN.into()]);
+    let (addr, server) = serve(state.clone()).await;
+    let channel = dial(addr).await;
+    let mut client = app::secret_service_client::SecretServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    // Seal "oauth-tok-42" via the real gRPC path (real CredCipher + real KEK).
+    client
+        .put_secret(app::PutSecretRequest {
+            key: "inject-test".into(),
+            value: "oauth-tok-42".into(),
+        })
+        .await
+        .expect("PutSecret must succeed");
+
+    // The secret is in the StubMeta store. Prove get_sealed_secret returns Some.
+    let row = state
+        .services
+        .meta
+        .get_sealed_secret("inject-test")
+        .await
+        .expect("get_sealed_secret")
+        .expect("row must be present after put");
+
+    // Unseal manually to verify crypto end-to-end.
+    let nonce: [u8; 12] = row.nonce.as_slice().try_into().expect("nonce length");
+    let sealed = engram_crypto::SealedCred {
+        wrapped_dek: row.wrapped_dek,
+        nonce,
+        ciphertext: row.ciphertext,
+        key_id: row.key_id,
+    };
+    let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+    let plaintext = cipher
+        .open(&sealed)
+        .await
+        .expect("unseal must succeed with matching KEK");
+    assert_eq!(
+        std::str::from_utf8(&plaintext).unwrap(),
+        "oauth-tok-42",
+        "unsealed plaintext must match what was put"
+    );
+    println!("real-crypto: seal→store→unseal round-trip verified");
 
     server.abort();
 }

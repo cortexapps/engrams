@@ -298,14 +298,29 @@ pub(crate) async fn flush_now_core(
         .update_live_disk_manifest(session_id, sandbox_id, manifest_ref)
         .await?
     {
-        engram_core::traits::UpdateOutcome::Applied => Ok(FlushNowResult {
-            outcome: FlushNowOutcome::Applied,
-            manifest_version: Some(manifest_ref.version),
-        }),
-        engram_core::traits::UpdateOutcome::DroppedStale => Ok(FlushNowResult {
-            outcome: FlushNowOutcome::Stale,
-            manifest_version: None,
-        }),
+        engram_core::traits::UpdateOutcome::Applied => {
+            tracing::info!(
+                %session_id,
+                %sandbox_id,
+                manifest_version = manifest_ref.version,
+                "flush_now: applied — new manifest persisted",
+            );
+            Ok(FlushNowResult {
+                outcome: FlushNowOutcome::Applied,
+                manifest_version: Some(manifest_ref.version),
+            })
+        }
+        engram_core::traits::UpdateOutcome::DroppedStale => {
+            tracing::warn!(
+                %session_id,
+                %sandbox_id,
+                "flush_now: stale — sandbox_id drift between flush and publish; row not updated",
+            );
+            Ok(FlushNowResult {
+                outcome: FlushNowOutcome::Stale,
+                manifest_version: None,
+            })
+        }
     }
 }
 
@@ -424,14 +439,30 @@ pub async fn evacuate_session(
     Path(session_id): Path<SessionId>,
     Json(_req): Json<EvacuateSessionRequest>,
 ) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
-    tracing::info!(
-        %session_id,
-        "admin evacuate: session marked Evacuating; scanner will resume on peer",
-    );
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(evacuate_session_core(&state, session_id).await?),
-    ))
+    // Capture sandbox_id before the core evicts it (sandbox is destroyed
+    // by the pipeline; the registry entry is gone by the time we return).
+    let sandbox_id = state
+        .services
+        .meta
+        .get_session(session_id)
+        .await
+        .ok()
+        .and_then(|s| s.sandbox_id);
+    let resp = evacuate_session_core(&state, session_id).await?;
+    // Log AFTER the core succeeds so the message only appears when the
+    // evac pipeline has actually completed (pause+flush+snapshot+destroy).
+    match sandbox_id {
+        Some(sb) => tracing::info!(
+            %session_id,
+            sandbox_id = %sb,
+            "admin evacuate: session marked Evacuating; scanner will resume on peer",
+        ),
+        None => tracing::info!(
+            %session_id,
+            "admin evacuate: session marked Evacuating; scanner will resume on peer",
+        ),
+    }
+    Ok((StatusCode::ACCEPTED, Json(resp)))
 }
 
 /// Transport-agnostic core for ChunkGc.

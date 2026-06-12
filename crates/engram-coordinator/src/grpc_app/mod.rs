@@ -245,6 +245,13 @@ mod convention {
     //! This test counts, in the source, one auth check per `async fn` and
     //! fails loudly if they ever diverge.
     //!
+    //! A second test enumerates every `.rs` file under `src/grpc_app/` at
+    //! runtime and asserts each is either in `SOURCES` (scanned for auth)
+    //! or in `NON_RPC_HELPERS` (explicitly allowlisted non-RPC files). The
+    //! allowlisted files are additionally checked to contain no `_server::`
+    //! token — a service-impl token in a helper file defeats the point of
+    //! the allowlist.
+    //!
     //! ==========================================================
     //! IMPLEMENTERS, READ THIS — Tasks 10-13 rewrite all 43 stub
     //! bodies and WILL split the services into per-file modules.
@@ -266,6 +273,14 @@ mod convention {
         ("image.rs", include_str!("image.rs")),
         ("secret.rs", include_str!("secret.rs")),
     ];
+
+    /// Files under `src/grpc_app/` that are deliberately NOT listed in
+    /// `SOURCES` because they contain zero RPC `async fn`s. Every file
+    /// in the directory must be in `SOURCES` OR here — the `file_sweep`
+    /// test below enforces this. Files here are additionally checked to
+    /// contain no `_server::` token (a service-impl token in a helper
+    /// file would defeat the allowlist).
+    const NON_RPC_HELPERS: &[&str] = &["convert.rs", "auth.rs", "session_impl.rs"];
 
     /// The auth line that must open every RPC body. The trailing `;` is
     /// load-bearing: it distinguishes a real call site from the prose
@@ -303,6 +318,55 @@ mod convention {
                  NEW per-service file, also add it to the `SOURCES` list in this test \
                  (src/grpc_app/mod.rs, mod convention)."
             );
+        }
+    }
+
+    /// Every `.rs` file under `src/grpc_app/` must be accounted for:
+    /// either listed in `SOURCES` (scanned for auth) or in `NON_RPC_HELPERS`
+    /// (explicitly allowlisted). Files in `NON_RPC_HELPERS` must not contain
+    /// `_server::` — an RPC service impl hiding there would bypass the auth scan.
+    #[test]
+    fn file_sweep_every_grpc_app_file_is_accounted_for() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let grpc_app_dir = std::path::Path::new(manifest_dir).join("src/grpc_app");
+
+        let source_names: std::collections::HashSet<&str> =
+            SOURCES.iter().map(|(name, _)| *name).collect();
+        let helper_names: std::collections::HashSet<&str> =
+            NON_RPC_HELPERS.iter().copied().collect();
+
+        let entries = std::fs::read_dir(&grpc_app_dir)
+            .unwrap_or_else(|e| panic!("cannot read src/grpc_app/: {e}"));
+
+        for entry in entries {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("utf-8 filename");
+
+            assert!(
+                source_names.contains(file_name) || helper_names.contains(file_name),
+                "src/grpc_app/{file_name} is not accounted for: add it to SOURCES (if it \
+                 contains RPC `async fn`s) or NON_RPC_HELPERS (if it is a pure helper). \
+                 Unaccounted files are invisible to the auth-check scan."
+            );
+
+            // Allowlisted helpers must contain no service-impl token.
+            if helper_names.contains(file_name) {
+                let content = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("cannot read src/grpc_app/{file_name}: {e}"));
+                assert!(
+                    !content.contains("_server::"),
+                    "src/grpc_app/{file_name} is in NON_RPC_HELPERS but contains `_server::` — \
+                     a service impl token. Either move the impl to a file in SOURCES (and add \
+                     the auth check) or remove the service impl from the helper."
+                );
+            }
         }
     }
 }

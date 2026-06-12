@@ -1214,6 +1214,124 @@ async fn shell_relay_smoke() {
     println!("smoke(relay): all checks passed");
 }
 
+/// SecretService lifecycle smoke: put → has(true) → delete → has(false) via
+/// gRPC against the live stack. Proves migration 0061 end-to-end (the
+/// `sealed_secrets` table is present and the KEK unseals).
+///
+/// Env-gated + `#[ignore]` like the other smokes.
+#[tokio::test]
+#[ignore = "requires a running dev stack (just dev + just smoke-control-plane)"]
+async fn secret_lifecycle_smoke() {
+    let Some((addr, token)) = grpc_addr_and_token() else {
+        return;
+    };
+
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("valid gRPC endpoint")
+        .connect_timeout(std::time::Duration::from_secs(5));
+    let channel = endpoint
+        .connect()
+        .await
+        .expect("connect to coordinator app-gRPC");
+
+    let rpc_timeout = std::time::Duration::from_secs(10);
+    let mut client = app::secret_service_client::SecretServiceClient::with_interceptor(
+        channel,
+        bearer_interceptor(token),
+    );
+
+    // Use a timestamp-based key for uniqueness without needing uuid dep.
+    let key = format!(
+        "smoke-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    // 1. Put
+    let mut req = tonic::Request::new(app::PutSecretRequest {
+        key: key.clone(),
+        value: "smoke-secret-value".to_string(),
+    });
+    req.set_timeout(rpc_timeout);
+    client
+        .put_secret(req)
+        .await
+        .expect("PutSecret must succeed");
+    println!("secret_lifecycle_smoke: put {key:?}");
+
+    // 2. Has → true
+    let mut req = tonic::Request::new(app::HasSecretRequest { key: key.clone() });
+    req.set_timeout(rpc_timeout);
+    let has = client
+        .has_secret(req)
+        .await
+        .expect("HasSecret must succeed");
+    assert!(
+        has.into_inner().exists,
+        "HasSecret must return true after PutSecret"
+    );
+    println!("secret_lifecycle_smoke: has → true ✓");
+
+    // 3. Delete
+    let mut req = tonic::Request::new(app::DeleteSecretRequest { key: key.clone() });
+    req.set_timeout(rpc_timeout);
+    client
+        .delete_secret(req)
+        .await
+        .expect("DeleteSecret must succeed");
+    println!("secret_lifecycle_smoke: deleted");
+
+    // 4. Has → false
+    let mut req = tonic::Request::new(app::HasSecretRequest { key: key.clone() });
+    req.set_timeout(rpc_timeout);
+    let has2 = client
+        .has_secret(req)
+        .await
+        .expect("HasSecret must succeed");
+    assert!(
+        !has2.into_inner().exists,
+        "HasSecret must return false after DeleteSecret"
+    );
+    println!("secret_lifecycle_smoke: has → false ✓ — all checks passed");
+}
+
+/// Bearer-rejected probe: one Fleet RPC (ListHosts) with NO bearer token →
+/// Code::Unauthenticated. Verifies the live stack is fail-closed.
+///
+/// Env-gated + `#[ignore]` like the other smokes.
+#[tokio::test]
+#[ignore = "requires a running dev stack (just dev + just smoke-control-plane)"]
+async fn bearer_rejected_probe() {
+    let Some((addr, _token)) = grpc_addr_and_token() else {
+        return;
+    };
+
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("valid gRPC endpoint")
+        .connect_timeout(std::time::Duration::from_secs(5));
+    let channel = endpoint
+        .connect()
+        .await
+        .expect("connect to coordinator app-gRPC");
+
+    // No interceptor — no bearer header.
+    let mut client = app::fleet_service_client::FleetServiceClient::new(channel);
+    let mut req = tonic::Request::new(app::ListHostsRequest::default());
+    req.set_timeout(std::time::Duration::from_secs(5));
+    let err = client
+        .list_hosts(req)
+        .await
+        .expect_err("ListHosts with no bearer must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unauthenticated,
+        "live stack must reject unauthenticated FleetService calls: {err:?}"
+    );
+    println!("bearer_rejected_probe: ListHosts with no bearer → Unauthenticated ✓");
+}
+
 /// Human-readable frame variant name for diagnostic prints.
 fn frame_kind_name(f: &engram_protocol::app::relay_shell_response::Frame) -> &'static str {
     use engram_protocol::app::relay_shell_response::Frame;

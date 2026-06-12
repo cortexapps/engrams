@@ -790,7 +790,7 @@ pub trait MetadataStore: Send + Sync {
     // churn: reads report "absent", writes fail loudly. The one real
     // store (engram-postgres) overrides all four.
 
-    /// Seal `value` under the deployment KEK and upsert the row.
+    /// Store the sealed parts (caller seals via CredCipher) and upsert the row.
     /// `PutSecret seals + upserts` — no create/update distinction.
     async fn put_sealed_secret(
         &self,
