@@ -407,6 +407,13 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # bind. Same machine in dev, so loopback works for both.
         'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:' + grpc_port,
         'ENGRAM_GRPC_ADVERTISE_ADDR': 'http://127.0.0.1:' + grpc_port,
+        # ADR 0045 C2 post-copy page-server listener. Per-host port
+        # derived from the gRPC port: the binary default (9102) collides
+        # with host-agent-b's gRPC port in the two-host stack, so the
+        # coord's gRPC dial lands on the page-server protocol and every
+        # restore 503s. +20 keeps it clear of the 910x/911x grpc+metrics
+        # block for both hosts.
+        'ENGRAM_MIGRATE_PEER_LISTEN_ADDR': '0.0.0.0:' + str(int(grpc_port) + 20),
         'ENGRAM_COORDINATOR_ENDPOINT': 'http://127.0.0.1:8090',
         # Same GCS backend the coord uses, so chunks materialized
         # coord-side are reachable from the PooledBackend at runtime.
