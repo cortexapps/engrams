@@ -210,61 +210,10 @@ describe("SSE streaming regression (proves no full-response buffering)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// CRITICAL gRPC canary — skip when ENGRAM_SMOKE_GRPC is unset
+// gRPC live smoke — see src/__tests__/transport.test.ts (Task 17)
+//
+// The gRPC canary that previously lived here has been replaced by the
+// transport-level smoke test in transport.test.ts, which uses the real
+// `sessions` client from control-plane/client.ts instead of an ad-hoc
+// inline transport. Run with: ENGRAM_SMOKE_GRPC=1 bun test
 // ---------------------------------------------------------------------------
-
-const SMOKE_GRPC = process.env["ENGRAM_SMOKE_GRPC"] === "1";
-const BEARER = process.env["CONTROL_PLANE_BEARER"] ?? "dev-app-grpc-token";
-const GRPC_URL = process.env["CONTROL_PLANE_GRPC_URL"] ?? "http://127.0.0.1:50061";
-
-describe("gRPC canary (ENGRAM_SMOKE_GRPC=1 to enable)", () => {
-  test.skipIf(!SMOKE_GRPC)(
-    "SessionService.ListSessions returns without error (live coordinator)",
-    async () => {
-      // Dynamic import so the module isn't resolved when the test is skipped,
-      // avoiding import-time errors on machines without the coordinator up.
-      const { createGrpcTransport } = await import("@connectrpc/connect-node");
-      const { createClient } = await import("@connectrpc/connect");
-      const { SessionService } = await import(
-        "../gen/engram/app/v1/session_pb.ts"
-      );
-
-      const bearerInterceptor = () =>
-        (next: (req: unknown) => Promise<unknown>) =>
-        (req: { header: Headers }) => {
-          req.header.set("authorization", `Bearer ${BEARER}`);
-          return next(req);
-        };
-
-      const transport = createGrpcTransport({
-        baseUrl: GRPC_URL,
-        interceptors: [bearerInterceptor() as never],
-      });
-
-      const client = createClient(SessionService, transport);
-
-      let threw = false;
-      let errorMsg = "";
-      try {
-        const resp = await client.listSessions({});
-        // Any response (even empty list) is a success
-        expect(Array.isArray(resp.sessions)).toBe(true);
-        console.log(
-          `gRPC canary PASS: ListSessions returned ${resp.sessions.length} session(s)`,
-        );
-      } catch (err: unknown) {
-        threw = true;
-        errorMsg = err instanceof Error ? err.message : String(err);
-        console.error("gRPC canary BLOCKED:", errorMsg);
-      }
-
-      if (threw) {
-        // Force a descriptive failure rather than a silent pass
-        throw new Error(
-          `BLOCKED: gRPC canary failed — Bun node:http2 / Connect transport error: ${errorMsg}. ` +
-            `This changes the architecture; report to controller.`,
-        );
-      }
-    },
-  );
-});
