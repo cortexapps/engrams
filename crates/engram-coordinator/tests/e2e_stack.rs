@@ -290,6 +290,27 @@ impl Driver {
         assert!(status.is_success(), "resume failed: {status} body={text}");
     }
 
+    /// `POST /admin/sessions/:id/evict-idle` — the explicit admin
+    /// trigger for the idle-eviction primitive. Synchronous: the
+    /// session is `Idle` by the time this returns. Lets the test drive
+    /// Active→Idle through the real idle pipeline (pause → flush →
+    /// snapshot → destroy) without waiting out the idle TTL.
+    async fn evict_idle(&self, sid: SessionId) {
+        let path = format!("/api/v1/admin/sessions/{sid}/evict-idle");
+        let resp = self
+            .req(reqwest::Method::POST, &path)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("POST /admin/sessions/:id/evict-idle");
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "evict_idle failed: {status} body={text}"
+        );
+    }
+
     /// `GET /sessions/:id/cow-state`. ADR 0016 Phase A diagnostic.
     /// Returns `Some(json)` when the sandbox is NBD-tracked
     /// (Phase B's chunked-disk pipeline live), `None` when the
@@ -1159,6 +1180,76 @@ async fn e2e_resume_preserves_disk_and_memory() {
         boot_id_before,
         "boot_id changed across resume — the VM cold-rebooted instead of \
          restoring from the memory snapshot (in-memory state would be lost)",
+    );
+
+    driver.delete(sid).await;
+}
+
+/// Lifecycle e2e: active→idle eviction via the real idle pipeline, then
+/// resume with data intact — all through the public API.
+///
+/// `e2e_resume_preserves_disk_and_memory` drives Active→Idle with the
+/// manual `snapshot` + `evict-local` handlers; this one fires the
+/// `evict-idle` admin trigger, which runs the *same* primitive the
+/// host idle-detector and the coord backstop scanner drive on a
+/// timeout (`idle_evictor::evict_idle_session`). That's the deterministic
+/// stand-in for "the session went idle" — no global TTL lowering (which
+/// would race-evict the other serial tests' sessions).
+///
+/// Asserts the observable contract: the session reaches `idle`, is
+/// resumable, and the pre-eviction disk sentinel survives byte-identical.
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+async fn e2e_idle_evict_then_resume_preserves_data() {
+    let driver = Driver::from_env();
+    let image = Driver::image_uri();
+
+    let sid = driver.create_session_none_harness(&image).await;
+
+    let sentinel = uuid::Uuid::new_v4().to_string();
+    let write = driver
+        .exec(
+            sid,
+            &format!("printf '%s' {sentinel} > /var/idle-sentinel.txt && sync"),
+        )
+        .await;
+    assert_eq!(
+        write.exit_status,
+        Some(0),
+        "sentinel write should succeed; stderr=<{}>",
+        write.stderr,
+    );
+
+    // Fire the idle-eviction primitive. Synchronous → Idle on return,
+    // but assert the observable state transition through the API.
+    driver.evict_idle(sid).await;
+    assert!(
+        driver
+            .wait_for_status(sid, "idle", Duration::from_secs(30))
+            .await,
+        "session should be Idle after evict-idle; got {}",
+        driver.session_status(sid).await,
+    );
+
+    // Resumable, and the data written before eviction is intact.
+    driver.resume(sid).await;
+    assert!(
+        driver
+            .wait_for_status(sid, "active", Duration::from_secs(30))
+            .await,
+        "session should be Active after resume",
+    );
+    let readback = driver.exec(sid, "cat /var/idle-sentinel.txt").await;
+    assert_eq!(
+        readback.exit_status,
+        Some(0),
+        "sentinel readback should succeed; stderr=<{}>",
+        readback.stderr,
+    );
+    assert_eq!(
+        readback.stdout.trim(),
+        sentinel,
+        "disk data lost across idle-evict→resume",
     );
 
     driver.delete(sid).await;
