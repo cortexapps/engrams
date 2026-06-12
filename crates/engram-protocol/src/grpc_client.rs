@@ -321,11 +321,6 @@ impl GrpcHostClient {
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
-        let to32 = |v: Vec<u8>| -> Result<[u8; 32], SandboxError> {
-            v.as_slice()
-                .try_into()
-                .map_err(|_| SandboxError::Snapshot("chunk hash must be 32 bytes".into()))
-        };
         Ok(engram_core::types::snapshot::PostCopyCaptureOut {
             sealed_chunks: resp.sealed_chunks,
             total_chunks: resp.total_chunks,
@@ -333,13 +328,7 @@ impl GrpcHostClient {
             disk_drain_ms: resp.disk_drain_ms,
             vmstate_ms: resp.vmstate_ms,
             scan_ms: resp.scan_ms,
-            disk_manifest_json: resp.disk_manifest_json,
-            disk_manifest_ref: decode_bincode(&resp.disk_manifest_ref, "Option<ManifestRef>")?,
-            new_disk_chunk_hashes: resp
-                .new_disk_chunk_hashes
-                .into_iter()
-                .map(to32)
-                .collect::<Result<_, _>>()?,
+            sealed_disk_chunks: resp.sealed_disk_chunks,
             paused_at_unix_ms: resp.paused_at_unix_ms,
         })
     }
@@ -394,18 +383,32 @@ impl GrpcHostClient {
                 engram_core::types::snapshot::MigrationItem::StateBin => MigrationItem {
                     kind: Kind::StateBin as i32,
                     hash: Vec::new(),
+                    chunk_idx: 0,
                 },
                 engram_core::types::snapshot::MigrationItem::Sidecar => MigrationItem {
                     kind: Kind::Sidecar as i32,
                     hash: Vec::new(),
+                    chunk_idx: 0,
                 },
                 engram_core::types::snapshot::MigrationItem::Chunk(h) => MigrationItem {
                     kind: Kind::Chunk as i32,
                     hash: h.to_vec(),
+                    chunk_idx: 0,
                 },
                 engram_core::types::snapshot::MigrationItem::DiskManifest => MigrationItem {
                     kind: Kind::DiskManifest as i32,
                     hash: Vec::new(),
+                    chunk_idx: 0,
+                },
+                engram_core::types::snapshot::MigrationItem::DiskSealInfo => MigrationItem {
+                    kind: Kind::DiskSealInfo as i32,
+                    hash: Vec::new(),
+                    chunk_idx: 0,
+                },
+                engram_core::types::snapshot::MigrationItem::DiskChunkAt(idx) => MigrationItem {
+                    kind: Kind::DiskChunkAt as i32,
+                    hash: Vec::new(),
+                    chunk_idx: idx,
                 },
             })
             .collect();

@@ -502,6 +502,7 @@ pub async fn migrate_session_live(
         presetup_ms,
         sealed_chunks = capture.sealed_chunks,
         total_chunks = capture.total_chunks,
+        sealed_disk_chunks = capture.sealed_disk_chunks,
         // Blackout decomposition (source-measured, under the freeze):
         // pause + disk_drain + vmstate + scan ≈ the host-side blackout;
         // `blackout_ms` is the coordinator wall incl. the RPC round trip.
@@ -910,9 +911,7 @@ mod tests {
                     disk_drain_ms: 1,
                     vmstate_ms: 1,
                     scan_ms: 1,
-                    disk_manifest_json: Vec::new(),
-                    disk_manifest_ref: None,
-                    new_disk_chunk_hashes: vec![],
+                    sealed_disk_chunks: 0,
                     paused_at_unix_ms: 0,
                 })
             }
@@ -1108,9 +1107,7 @@ mod tests {
                     disk_drain_ms: 1,
                     vmstate_ms: 1,
                     scan_ms: 1,
-                    disk_manifest_json: Vec::new(),
-                    disk_manifest_ref: None,
-                    new_disk_chunk_hashes: vec![],
+                    sealed_disk_chunks: 0,
                     paused_at_unix_ms: 0,
                 })
             }

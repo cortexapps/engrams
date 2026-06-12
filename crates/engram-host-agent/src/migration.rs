@@ -76,6 +76,11 @@ pub struct MigrationExport {
     /// Drained-but-not-uploaded disk chunks, kept for the abort
     /// re-queue (`ChunkedDiskBackend::requeue_pending`).
     pub disk_pending: Option<crate::disk_daemon::PendingDiskFlush>,
+    /// ADR 0045 C2 disk post-copy: the sealed dirty/pending disk
+    /// tiers, raw bytes in RAM — served by index over
+    /// `MigrationFetch::DiskChunkAt`, re-queued into `dirty` on abort,
+    /// dropped on commit (the dest drained them).
+    pub disk_seal: Option<Arc<crate::disk_daemon::PostCopyDiskSeal>>,
     pub created_at: Instant,
     /// ADR 0045 C2: this export serves a post-copy move (the guest
     /// already resumed on the dest; this frozen source is a page
@@ -304,6 +309,7 @@ mod tests {
             snapshot_dir: "/tmp".into(),
             allowed_chunks: HashSet::new(),
             disk_pending: None,
+            disk_seal: None,
             created_at: Instant::now(),
             post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -324,6 +330,7 @@ mod tests {
             snapshot_dir: "/tmp".into(),
             allowed_chunks: HashSet::new(),
             disk_pending: None,
+            disk_seal: None,
             created_at: Instant::now(),
             post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

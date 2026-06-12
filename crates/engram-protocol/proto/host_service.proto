@@ -251,14 +251,19 @@ message PostCopyCaptureResponse {
   uint64 sealed_chunks = 1;
   uint64 total_chunks = 2;
   uint64 scan_ms = 3;
-  bytes disk_manifest_json = 4;
-  bytes disk_manifest_ref = 5;     // bincode Option<ManifestRef> (empty = none)
-  repeated bytes new_disk_chunk_hashes = 6;
+  // 4-6 were the pre-disk-post-copy drained-manifest fields
+  // (disk_manifest_json / disk_manifest_ref / new_disk_chunk_hashes):
+  // the capture no longer re-chunks disk under the freeze — sealed
+  // dirty blocks demand-fault from the source like memory does.
+  reserved 4, 5, 6;
   int64 paused_at_unix_ms = 7;
   // ADR 0045 C2 PR 10: blackout decomposition (all under the freeze).
   uint64 pause_ms = 8;
   uint64 disk_drain_ms = 9;
   uint64 vmstate_ms = 10;
+  // Disk post-copy: how many disk chunks were sealed (dirty +
+  // pending tiers) for P2P demand-fetch.
+  uint64 sealed_disk_chunks = 11;
 }
 
 message DrainOutcomeResponse {
@@ -282,17 +287,29 @@ message MigrationFetchRequest {
 
 message MigrationItem {
   // Exactly one of:
-  //   kind = STATE_BIN | SIDECAR  (hash empty)
+  //   kind = STATE_BIN | SIDECAR  (hash + chunk_idx empty)
   //   kind = CHUNK                (hash = 32-byte chunk hash)
+  //   kind = DISK_CHUNK_AT        (chunk_idx = disk chunk index)
   enum Kind {
     CHUNK = 0;
     STATE_BIN = 1;
     SIDECAR = 2;
     // ADR 0045 C2: the drained coherent disk manifest JSON.
     DISK_MANIFEST = 3;
+    // ADR 0045 C2 disk post-copy: the seal descriptor JSON (base
+    // manifest content + sealed chunk indices). Intentionally a NEW
+    // kind (not DISK_MANIFEST) so an old destination polling a new
+    // source fails LOUDLY at the fetch (NeverLoaded → zero-loss
+    // abort-to-source) instead of resuming against a stale disk.
+    DISK_SEAL_INFO = 4;
+    // ADR 0045 C2 disk post-copy: one sealed disk chunk's RAW bytes,
+    // by chunk index — served from the frozen source's sealed
+    // dirty/pending tiers (RAM), never hashed or uploaded.
+    DISK_CHUNK_AT = 5;
   }
   Kind kind = 1;
   bytes hash = 2;
+  uint64 chunk_idx = 3;
 }
 
 message MigrationFrame {

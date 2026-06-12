@@ -47,8 +47,8 @@ pub mod nbd_netlink;
 pub mod runtime;
 
 pub use backend::{
-    ChunkedDiskBackend, DiskBackendError, DiskFlushOutcome, PendingDiskFlush,
-    DEFAULT_DIRTY_THRESHOLD_BYTES,
+    ChunkedDiskBackend, DiskBackendError, DiskFlushOutcome, PendingDiskFlush, PostCopyDiskFetcher,
+    PostCopyDiskSeal, PostCopyDrainSubscription, DEFAULT_DIRTY_THRESHOLD_BYTES,
 };
 pub use flush_scheduler::{
     FlushScheduler, FlushSchedulerConfig, FlushSchedulerHandle, LiveManifestPublisher,

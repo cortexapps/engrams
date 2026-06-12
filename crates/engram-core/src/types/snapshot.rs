@@ -249,12 +249,13 @@ pub struct MigrationPresetupOut {
 }
 
 /// ADR 0045 C2: what `migration_capture_postcopy` returns — the
-/// post-pause half. No memory chunks move at capture (that is the
-/// point); the dirty map seals on the page server, `state.bin` becomes
-/// fetchable, and the drained coherent disk tail ships inline.
+/// post-pause half. NOTHING bulky moves at capture (that is the
+/// point): the memory dirty map seals on the page server, the disk
+/// dirty/pending tiers seal on the export (raw bytes, never hashed),
+/// and `state.bin` becomes fetchable. The dest demand-faults both.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PostCopyCaptureOut {
-    /// Sealed (peer-authoritative) chunk count — observability.
+    /// Sealed (peer-authoritative) memory chunk count — observability.
     pub sealed_chunks: u64,
     pub total_chunks: u64,
     /// Blackout decomposition (R6, all under the freeze; ADR 0045 C2
@@ -262,20 +263,16 @@ pub struct PostCopyCaptureOut {
     /// whole `migration_capture_postcopy` call; these break it into
     /// the legs that actually cost — so an optimization (e.g. the
     /// dest-side diff seed) targets the real hot leg instead of a
-    /// guess. `scan_ms` is consistently ~single-digit ms; the bulk is
-    /// `disk_drain_ms` (NBD fsync + local re-chunk) + `vmstate_ms`
-    /// (fork-v3 state.bin write).
+    /// guess. `disk_drain_ms` is now only the host-cache fsync +
+    /// in-RAM seal (the re-chunk is gone — sealed blocks demand-fault
+    /// from the source like memory does).
     pub pause_ms: u64,
     pub disk_drain_ms: u64,
     pub vmstate_ms: u64,
     /// Pagemap scan wall time (blackout attribution, R6).
     pub scan_ms: u64,
-    /// The drained coherent disk manifest (inline JSON + provisional
-    /// ref) the dest rebases to before FC load; `None` for
-    /// non-chunked-disk sandboxes.
-    pub disk_manifest_json: Vec<u8>,
-    pub disk_manifest_ref: Option<super::manifest::ManifestRef>,
-    pub new_disk_chunk_hashes: Vec<[u8; 32]>,
+    /// Sealed disk chunk count (dirty + pending tiers) — observability.
+    pub sealed_disk_chunks: u64,
     pub paused_at_unix_ms: i64,
 }
 
@@ -330,6 +327,16 @@ pub enum MigrationItem {
     /// (inline JSON). The destination fetch-polls it alongside
     /// `StateBin` and REBASES its NBD attach before FC load.
     DiskManifest,
+    /// ADR 0045 C2 disk post-copy: the seal descriptor (inline JSON —
+    /// the source's published base manifest content + the sealed
+    /// chunk-index list). A NEW item kind (not `DiskManifest`) so an
+    /// old destination polling a new source fails LOUDLY (fetch error
+    /// → NeverLoaded → zero-loss abort) instead of resuming stale.
+    DiskSealInfo,
+    /// ADR 0045 C2 disk post-copy: one sealed disk chunk's raw bytes,
+    /// by chunk index — demand-fetched (and drained) by the dest's
+    /// NBD backend straight out of the frozen source's RAM.
+    DiskChunkAt(u64),
 }
 
 /// A frame of `migration_fetch`'s stream.

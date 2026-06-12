@@ -263,6 +263,12 @@ impl HostService for HostServiceImpl {
                     Ok(Kind::DiskManifest) => {
                         Ok(engram_core::types::snapshot::MigrationItem::DiskManifest)
                     }
+                    Ok(Kind::DiskSealInfo) => {
+                        Ok(engram_core::types::snapshot::MigrationItem::DiskSealInfo)
+                    }
+                    Ok(Kind::DiskChunkAt) => Ok(
+                        engram_core::types::snapshot::MigrationItem::DiskChunkAt(item.chunk_idx),
+                    ),
                     Ok(Kind::Chunk) => {
                         let hash: [u8; 32] =
                             item.hash.as_slice().try_into().map_err(|_| {
@@ -359,13 +365,7 @@ impl HostService for HostServiceImpl {
             pause_ms: out.pause_ms,
             disk_drain_ms: out.disk_drain_ms,
             vmstate_ms: out.vmstate_ms,
-            disk_manifest_json: out.disk_manifest_json,
-            disk_manifest_ref: encode_bincode(&out.disk_manifest_ref, "Option<ManifestRef>")?,
-            new_disk_chunk_hashes: out
-                .new_disk_chunk_hashes
-                .into_iter()
-                .map(|h| h.to_vec())
-                .collect(),
+            sealed_disk_chunks: out.sealed_disk_chunks,
             paused_at_unix_ms: out.paused_at_unix_ms,
         }))
     }
