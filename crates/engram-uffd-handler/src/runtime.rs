@@ -1509,8 +1509,6 @@ mod tests {
         use engram_migrate_proto::{
             read_frame, write_frame, FromSource, SealBitmap, ToSource, PROTO_VERSION,
         };
-        use sha2::{Digest, Sha256};
-
         let page_size = 4096u64;
         let chunk_size = page_size;
         let n_chunks = 8usize;
@@ -1584,12 +1582,12 @@ mod tests {
                             1 => {
                                 let raw = vec![PEER_BYTE; chunk_size as usize];
                                 let (bytes, lz4) = engram_migrate_proto::compress_page(raw);
-                                let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+                                let hash = engram_migrate_proto::wire_hash(&bytes);
                                 FromSource::Page {
                                     req_id,
                                     chunk_offset,
                                     bytes,
-                                    sha256,
+                                    hash,
                                     lz4,
                                 }
                             }

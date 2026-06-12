@@ -34,7 +34,7 @@
 //!
 //! ## Soundness notes encoded in the message set
 //!
-//! - `Page.sha256` lets the dest verify peer bytes before `UFFDIO_COPY`;
+//! - `Page.hash` (blake3) lets the dest verify peer bytes before `UFFDIO_COPY`;
 //!   a mismatch is fatal (peer-authoritative content has no second
 //!   source).
 //! - `AltSource` demotes an over-approximated dirty chunk to class 2: the
@@ -65,7 +65,20 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// of the raw 512 KiB was ~1 ms of the per-fault constant on the
 /// no-SHA-NI fleet. Drain connections keep the demote (it saves wire
 /// and the drain is latency-insensitive).
-pub const PROTO_VERSION: u32 = 3;
+///
+/// v4: `Page.hash` is blake3 (was sha256) — measured 1.63 ms/serve in
+/// the encode leg, ~1.2 ms of it soft sha256 of the compressed wire
+/// bytes (no SHA-NI on the fleet); blake3 is cryptographic at
+/// ~1–2 GB/s in software. `AltSource.durable_sha256` STAYS sha256 —
+/// that is the chunk-store's content address, not wire integrity.
+pub const PROTO_VERSION: u32 = 4;
+
+/// Wire-integrity hash for `Page` payloads (v4: blake3 over the wire
+/// bytes — the SAME bytes shipped, compressed or raw). One helper so
+/// both endpoints can never disagree on the algorithm.
+pub fn wire_hash(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
 
 /// What a peer connection is FOR — the source's serve policy keys on
 /// it (see the v3 note on [`PROTO_VERSION`]).
@@ -208,8 +221,8 @@ pub enum FromSource {
     /// handler keeps the first and sanity-checks duplicates.
     Seal { bitmap: SealBitmap },
     /// Peer-authoritative chunk bytes read via `process_vm_readv` from
-    /// the paused source VM. `sha256` is computed over `bytes`; the
-    /// handler MUST verify before installing.
+    /// the paused source VM. `hash` is [`wire_hash`] over `bytes`
+    /// (as-shipped); the handler MUST verify before installing.
     Page {
         req_id: u64,
         chunk_offset: u64,
@@ -217,8 +230,9 @@ pub enum FromSource {
         /// `lz4`, raw otherwise (the source ships whichever is
         /// smaller — incompressible chunks go raw).
         bytes: Vec<u8>,
-        /// Over the WIRE bytes — verify BEFORE decompressing.
-        sha256: [u8; 32],
+        /// [`wire_hash`] over the WIRE bytes — verify BEFORE
+        /// decompressing.
+        hash: [u8; 32],
         lz4: bool,
     },
     /// The whole chunk is zero bytes — install via the zero path instead
@@ -404,7 +418,7 @@ mod tests {
             req_id: 1,
             chunk_offset: 0,
             bytes: vec![0xCD; 512 * 1024],
-            sha256: [0x11; 32],
+            hash: [0x11; 32],
             lz4: false,
         });
         // The v2 compression helpers: a compressible chunk round-trips

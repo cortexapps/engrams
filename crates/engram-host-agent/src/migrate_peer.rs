@@ -518,7 +518,7 @@ impl PeerServer {
                 // itself a win on this no-SHA-NI fleet).
                 let t_encode = std::time::Instant::now();
                 let (wire, lz4) = engram_migrate_proto::compress_page(bytes);
-                let sha256: [u8; 32] = Sha256::digest(&wire).into();
+                let hash = engram_migrate_proto::wire_hash(&wire);
                 export
                     .serve
                     .encode_us
@@ -527,7 +527,7 @@ impl PeerServer {
                     req_id,
                     chunk_offset,
                     bytes: wire,
-                    sha256,
+                    hash,
                     lz4,
                 }
             }

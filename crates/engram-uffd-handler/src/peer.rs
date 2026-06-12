@@ -35,7 +35,6 @@ use std::time::Duration;
 use engram_migrate_proto::{
     read_frame, write_frame, FromSource, HandlerControl, SealBitmap, ToSource, PROTO_VERSION,
 };
-use sha2::{Digest, Sha256};
 
 /// Reconnect policy: the source export outlives transient dials (its
 /// TTL is ~120 s of silence), but a dead source must surface fast —
@@ -396,7 +395,7 @@ pub fn decode_page(
             req_id,
             chunk_offset,
             bytes,
-            sha256,
+            hash,
             lz4,
         } => {
             if req_id != want_req || chunk_offset != want_offset {
@@ -406,8 +405,7 @@ pub fn decode_page(
                 )));
             }
             // Integrity covers the WIRE bytes; decompress only after.
-            let got: [u8; 32] = Sha256::digest(&bytes).into();
-            if got != sha256 {
+            if engram_migrate_proto::wire_hash(&bytes) != hash {
                 return Err(PeerError::ShaMismatch {
                     chunk_offset: want_offset,
                 });
@@ -591,12 +589,12 @@ mod tests {
         // Through the REAL compression path — the canned server
         // serves exactly what the prod source serves.
         let (bytes, lz4) = engram_migrate_proto::compress_page(vec![0xAB; CHUNK as usize]);
-        let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        let hash = engram_migrate_proto::wire_hash(&bytes);
         FromSource::Page {
             req_id,
             chunk_offset,
             bytes,
-            sha256,
+            hash,
             lz4,
         }
     }
@@ -642,7 +640,7 @@ mod tests {
                         req_id,
                         chunk_offset: o,
                         bytes,
-                        sha256: [0u8; 32],
+                        hash: [0u8; 32],
                         lz4: false,
                     }
                 }
