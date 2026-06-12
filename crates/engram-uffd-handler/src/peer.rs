@@ -142,6 +142,7 @@ fn dial(
     token: &str,
     expect_chunk_size: u64,
     expect_total_bytes: u64,
+    purpose: engram_migrate_proto::ConnPurpose,
 ) -> Result<(TcpStream, SealBitmap), PeerError> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
@@ -151,6 +152,7 @@ fn dial(
             version: PROTO_VERSION,
             export_id: export_id.to_string(),
             token: token.to_string(),
+            purpose,
         },
     )?;
     match read_frame::<_, FromSource>(&mut stream)? {
@@ -211,6 +213,7 @@ impl PeerSession {
             &token,
             expect_chunk_size,
             expect_total_bytes,
+            engram_migrate_proto::ConnPurpose::Fault,
         )?;
         tracing::info!(
             addr,
@@ -283,6 +286,7 @@ impl PeerSession {
             &self.token,
             self.chunk_size,
             self.expected_total,
+            engram_migrate_proto::ConnPurpose::Drain,
         )?;
         Ok(stream)
     }
@@ -306,6 +310,7 @@ impl PeerSession {
                     &self.token,
                     self.chunk_size,
                     self.expected_total,
+                    engram_migrate_proto::ConnPurpose::Fault,
                 ) {
                     Ok((fresh, _seal)) => *conn = fresh,
                     Err(e) => {

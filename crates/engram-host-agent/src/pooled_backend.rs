@@ -4086,6 +4086,7 @@ impl SandboxBackend for PooledBackend {
                 allowed_chunks: allowed,
                 chunk_size,
                 total_bytes,
+                serve: Default::default(),
                 drained: std::sync::atomic::AtomicBool::new(false),
             });
 

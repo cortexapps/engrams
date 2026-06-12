@@ -72,6 +72,9 @@ pub struct PeerExport {
     pub allowed_chunks: HashSet<ChunkHash>,
     pub chunk_size: u64,
     pub total_bytes: u64,
+    /// Per-leg serve attribution (logged at DrainDone): where the
+    /// per-request wall actually goes on this no-SHA-NI fleet.
+    pub serve: ServeStats,
     /// Set when the dest reports `DrainDone` — after this the source FC
     /// is no longer needed as a page source (commit may proceed).
     pub drained: AtomicBool,
@@ -87,6 +90,18 @@ pub enum ServedChunk {
     AltSource(ChunkHash),
     /// Peer-authoritative bytes (with their hash, for dest-side verify).
     Page(Vec<u8>, ChunkHash),
+}
+
+/// Cumulative per-leg serve timings (µs) + counts. All relaxed
+/// atomics — observability only.
+#[derive(Default)]
+pub struct ServeStats {
+    pub fault_serves: std::sync::atomic::AtomicU64,
+    pub drain_serves: std::sync::atomic::AtomicU64,
+    pub readv_us: std::sync::atomic::AtomicU64,
+    pub classify_us: std::sync::atomic::AtomicU64,
+    pub encode_us: std::sync::atomic::AtomicU64,
+    pub write_us: std::sync::atomic::AtomicU64,
 }
 
 /// Classify a chunk's live bytes against the durable manifest entry.
@@ -268,11 +283,12 @@ impl PeerServer {
         handle: tokio::runtime::Handle,
     ) -> std::io::Result<()> {
         let hello: ToSource = read_frame(&mut stream)?;
-        let export = match hello {
+        let (export, purpose) = match hello {
             ToSource::Hello {
                 version,
                 export_id,
                 token,
+                purpose,
             } => {
                 if version != PROTO_VERSION {
                     write_frame(
@@ -327,7 +343,7 @@ impl PeerServer {
                     )?;
                     return Ok(());
                 }
-                export
+                (export, purpose)
             }
             other => {
                 write_frame(
@@ -368,8 +384,13 @@ impl PeerServer {
                     req_id,
                     chunk_offset,
                 } => {
-                    let resp = self.serve_need_at(&export, req_id, chunk_offset);
+                    let resp = self.serve_need_at(&export, req_id, chunk_offset, purpose);
+                    let t_write = std::time::Instant::now();
                     write_frame(&mut stream, &resp)?;
+                    export
+                        .serve
+                        .write_us
+                        .fetch_add(t_write.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
                 ToSource::GetChunk { req_id, hash } => {
                     let resp = self.serve_get_chunk(&export, req_id, hash, &handle);
@@ -381,13 +402,20 @@ impl PeerServer {
                     zero_chunks,
                 } => {
                     export.drained.store(true, Ordering::SeqCst);
+                    let st = &export.serve;
                     tracing::info!(
                         export_id = %export.export_id,
                         sandbox_id = %export.sandbox_id,
                         pulled,
                         alt_sourced,
                         zero_chunks,
-                        "post-copy drain complete (dest-reported)"
+                        fault_serves = st.fault_serves.load(Ordering::Relaxed),
+                        drain_serves = st.drain_serves.load(Ordering::Relaxed),
+                        readv_us = st.readv_us.load(Ordering::Relaxed),
+                        classify_us = st.classify_us.load(Ordering::Relaxed),
+                        encode_us = st.encode_us.load(Ordering::Relaxed),
+                        write_us = st.write_us.load(Ordering::Relaxed),
+                        "post-copy drain complete (dest-reported; serve-leg attribution)"
                     );
                     return Ok(());
                 }
@@ -405,7 +433,14 @@ impl PeerServer {
         }
     }
 
-    fn serve_need_at(&self, export: &PeerExport, req_id: u64, chunk_offset: u64) -> FromSource {
+    fn serve_need_at(
+        &self,
+        export: &PeerExport,
+        req_id: u64,
+        chunk_offset: u64,
+        purpose: engram_migrate_proto::ConnPurpose,
+    ) -> FromSource {
+        use std::sync::atomic::Ordering::Relaxed;
         if !chunk_offset.is_multiple_of(export.chunk_size) || chunk_offset >= export.total_bytes {
             return FromSource::Error {
                 req_id: Some(req_id),
@@ -421,7 +456,14 @@ impl PeerServer {
                 message: format!("NeedAt for unsealed chunk {idx}"),
             };
         }
+        let latency_critical = matches!(purpose, engram_migrate_proto::ConnPurpose::Fault);
+        if latency_critical {
+            export.serve.fault_serves.fetch_add(1, Relaxed);
+        } else {
+            export.serve.drain_serves.fetch_add(1, Relaxed);
+        }
         let len = export.chunk_size.min(export.total_bytes - chunk_offset) as usize;
+        let t_readv = std::time::Instant::now();
         let bytes = match read_guest_range(export.fc_pid, &export.vmas, chunk_offset, len) {
             Ok(b) => b,
             Err(e) => {
@@ -431,8 +473,36 @@ impl PeerServer {
                 };
             }
         };
-        let durable = export.durable_at.get(idx as usize).and_then(|d| d.as_ref());
-        match classify_served_chunk(bytes, durable) {
+        export
+            .serve
+            .readv_us
+            .fetch_add(t_readv.elapsed().as_micros() as u64, Relaxed);
+
+        // v3: the AltSource classify (sha256 of the raw 512 KiB, ~1 ms
+        // on this no-SHA-NI fleet) runs ONLY for drain serves. On the
+        // fault path a demote is strictly WORSE than shipping the
+        // resident bytes — it converts one stalled-vCPU round trip
+        // into a dest-side cache/GCS fetch. The zero check stays on
+        // both paths (cheap scan, saves the whole payload).
+        let t_classify = std::time::Instant::now();
+        let classified = if latency_critical {
+            if bytes.iter().all(|b| *b == 0) {
+                ServedChunk::Zero
+            } else {
+                // The raw hash is unused on this arm — Page integrity
+                // is computed over the wire bytes below.
+                ServedChunk::Page(bytes, ChunkHash::from_bytes([0u8; 32]))
+            }
+        } else {
+            let durable = export.durable_at.get(idx as usize).and_then(|d| d.as_ref());
+            classify_served_chunk(bytes, durable)
+        };
+        export
+            .serve
+            .classify_us
+            .fetch_add(t_classify.elapsed().as_micros() as u64, Relaxed);
+
+        match classified {
             ServedChunk::Zero => FromSource::ZeroChunk {
                 req_id,
                 chunk_offset,
@@ -446,8 +516,13 @@ impl PeerServer {
                 // v2: ship the smaller of lz4/raw; integrity covers
                 // the wire bytes (and hashing the smaller payload is
                 // itself a win on this no-SHA-NI fleet).
+                let t_encode = std::time::Instant::now();
                 let (wire, lz4) = engram_migrate_proto::compress_page(bytes);
                 let sha256: [u8; 32] = Sha256::digest(&wire).into();
+                export
+                    .serve
+                    .encode_us
+                    .fetch_add(t_encode.elapsed().as_micros() as u64, Relaxed);
                 FromSource::Page {
                     req_id,
                     chunk_offset,
@@ -545,6 +620,7 @@ mod tests {
             allowed_chunks: HashSet::new(),
             chunk_size: 4096,
             total_bytes: 4 * 4096,
+            serve: Default::default(),
             drained: AtomicBool::new(false),
         }
     }
@@ -581,6 +657,7 @@ mod tests {
             version: PROTO_VERSION,
             export_id: export_id.into(),
             token: token.into(),
+            purpose: engram_migrate_proto::ConnPurpose::Fault,
         }
     }
 
@@ -615,6 +692,7 @@ mod tests {
                 version: PROTO_VERSION + 1,
                 export_id: "exp-1".into(),
                 token: "t".into(),
+                purpose: engram_migrate_proto::ConnPurpose::Fault,
             }],
             1,
         )

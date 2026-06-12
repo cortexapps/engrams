@@ -57,7 +57,27 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// smaller, and `sha256` covers the WIRE bytes. The measured per-fault
 /// cost on the no-SHA-NI fleet was ~6.7 ms, dominated by the 512 KiB
 /// transfer + double sha256 — compression cuts all three.
-pub const PROTO_VERSION: u32 = 2;
+///
+/// v3: `Hello.purpose` — connections identify as Fault or Drain. The
+/// source skips the AltSource classify hash on fault connections: a
+/// demote there ADDS a dest-side cache/GCS fetch (strictly worse
+/// latency than shipping the resident bytes), and the classify sha256
+/// of the raw 512 KiB was ~1 ms of the per-fault constant on the
+/// no-SHA-NI fleet. Drain connections keep the demote (it saves wire
+/// and the drain is latency-insensitive).
+pub const PROTO_VERSION: u32 = 3;
+
+/// What a peer connection is FOR — the source's serve policy keys on
+/// it (see the v3 note on [`PROTO_VERSION`]).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConnPurpose {
+    /// The handler's fault-loop connection: latency-critical, single
+    /// in-flight request, a stalled vCPU behind every frame.
+    Fault,
+    /// Background drain: throughput-oriented, pipelined, yields to
+    /// faults on the dest side.
+    Drain,
+}
 
 /// Default TCP port for the source host-agent's page-server listener.
 pub const DEFAULT_PEER_PORT: u16 = 9102;
@@ -150,6 +170,7 @@ pub enum ToSource {
         version: u32,
         export_id: String,
         token: String,
+        purpose: ConnPurpose,
     },
     /// Demand-fault or drain request for the sealed chunk containing
     /// `chunk_offset` (a chunk-aligned byte offset in the snapshot memory
@@ -345,6 +366,13 @@ mod tests {
             version: PROTO_VERSION,
             export_id: "ab12".into(),
             token: "secret".into(),
+            purpose: ConnPurpose::Fault,
+        });
+        round_trip(&ToSource::Hello {
+            version: PROTO_VERSION,
+            export_id: "ab12".into(),
+            token: "secret".into(),
+            purpose: ConnPurpose::Drain,
         });
         round_trip(&ToSource::NeedAt {
             req_id: 7,
