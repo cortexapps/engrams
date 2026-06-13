@@ -97,18 +97,26 @@ impl MigrationGateGuard {
     fn claim(source: Option<HostId>, dest: HostId, session: SessionId) -> Option<Self> {
         let mut claimed = Vec::new();
         for host in source.into_iter().chain([dest]) {
-            match MIGRATION_GATE.entry(host) {
+            // Compute the claim outcome and DROP the entry guard before
+            // any rollback `remove` — holding a shard lock across a
+            // `remove` of a host that hashes to the SAME shard
+            // self-deadlocks (DashMap shards are RwLocks; fewer shards
+            // on low-core CI made the collision a real hang).
+            let inserted = match MIGRATION_GATE.entry(host) {
                 dashmap::mapref::entry::Entry::Vacant(v) => {
                     v.insert(session);
-                    claimed.push(host);
+                    true
                 }
-                dashmap::mapref::entry::Entry::Occupied(_) => {
-                    // Roll back partial claims.
-                    for h in claimed {
-                        MIGRATION_GATE.remove(&h);
-                    }
-                    return None;
+                dashmap::mapref::entry::Entry::Occupied(_) => false,
+            };
+            if inserted {
+                claimed.push(host);
+            } else {
+                // Roll back partial claims — no entry guard held now.
+                for h in claimed {
+                    MIGRATION_GATE.remove(&h);
                 }
+                return None;
             }
         }
         Some(Self { hosts: claimed })
@@ -1295,6 +1303,34 @@ mod tests {
         // (No global-emptiness assert: the gate is a process-global and
         // sibling tests claim it concurrently; release is proven by the
         // successful re-claim above.)
+    }
+
+    /// Regression guard for the rollback-path shard deadlock: the
+    /// `Occupied` arm used to `remove` rolled-back claims while still
+    /// holding the current host's `entry()` shard lock, which hangs
+    /// when two hosts collide on a shard. Run the rollback sequence
+    /// enough times with fresh random ids that a same-shard collision
+    /// is near-certain — a reintroduced deadlock hangs the whole suite.
+    #[test]
+    fn claim_rollback_never_deadlocks_on_shard_collision() {
+        for _ in 0..5000 {
+            let dest = HostId::new();
+            let held = MigrationGateGuard::claim(None, dest, SessionId::new()).expect("hold dest");
+            // `claim(Some(src), dest, …)` claims src (vacant) then hits
+            // dest (occupied) → rolls back src while the dest entry
+            // guard is live. If src and dest share a shard, the old
+            // code deadlocked here.
+            let src = HostId::new();
+            assert!(
+                MigrationGateGuard::claim(Some(src), dest, SessionId::new()).is_none(),
+                "dest is held; the claim must fail and roll back src cleanly",
+            );
+            // src must be fully released by the rollback — re-claimable.
+            let reclaim = MigrationGateGuard::claim(Some(src), HostId::new(), SessionId::new())
+                .expect("rolled-back src is reusable");
+            drop(reclaim);
+            drop(held);
+        }
     }
 
     #[tokio::test]
