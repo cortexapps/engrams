@@ -1613,7 +1613,12 @@ jobs:
 
       - name: Run e2e_stack tests
         env:
-          ENGRAM_E2E_COORD_URL: http://127.0.0.1:8090
+          # ADR 0039 §1: the coord application surface is gRPC-only. The
+          # e2e_stack Driver drives SessionService + FleetService over the
+          # app-gRPC addr (the same surface `just smoke-control-plane`
+          # hits), with the Tiltfile dev bearer.
+          ENGRAM_E2E_GRPC: 127.0.0.1:50061
+          ENGRAM_E2E_GRPC_TOKEN: dev-app-grpc-token
           # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
           # points at the just-baked `demo-claude` image whose
           # manifest.toml carries the resolved Claude harness contract.
