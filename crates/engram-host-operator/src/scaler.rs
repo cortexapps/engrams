@@ -58,6 +58,15 @@ impl NodePoolScaler for NoopScaler {
         );
         Ok(())
     }
+
+    async fn remove_node(&self, node_pool: &str, node_name: &str) -> Result<(), BackendError> {
+        tracing::info!(
+            node_pool,
+            node_name,
+            "noop scaler: would remove node (no cloud actuator configured)"
+        );
+        Ok(())
+    }
 }
 
 /// Fleet-demand snapshot from `GET /api/admin/fleet/demand`.

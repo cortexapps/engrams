@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 const METADATA_BASE: &str = "http://metadata.google.internal/computeMetadata/v1";
 const CONTAINER_API: &str = "https://container.googleapis.com/v1";
+const COMPUTE_API: &str = "https://compute.googleapis.com/compute/v1";
 
 /// Resizes a GKE node pool via the Container API, self-identifying its
 /// project/cluster/location from the GKE metadata server.
@@ -34,6 +35,41 @@ pub struct GkeNodePoolScaler {
 #[derive(Deserialize)]
 struct TokenResp {
     access_token: String,
+}
+
+/// The slice of a GKE `nodePools.get` response we read: the managed
+/// instance groups backing the pool. (One per zone for a regional pool;
+/// one for a zonal pool.)
+#[derive(Deserialize)]
+struct NodePoolResp {
+    #[serde(default, rename = "instanceGroupUrls")]
+    instance_group_urls: Vec<String>,
+}
+
+/// Parse a GKE `instanceGroupUrls` entry into `(zone, igm_name)`. The URL
+/// is `.../projects/<proj>/zones/<zone>/instanceGroupManagers/<name>`
+/// (GKE's per-zone managed instance groups). Returns `None` on a shape we
+/// don't recognize, so the caller treats it as "not the owning group".
+fn parse_igm_url(url: &str) -> Option<(String, String)> {
+    let after_zone = url.split_once("/zones/")?.1; // "<zone>/instanceGroupManagers/<name>"
+    let (zone, rest) = after_zone.split_once('/')?;
+    let igm = rest.strip_prefix("instanceGroupManagers/")?;
+    if zone.is_empty() || igm.is_empty() {
+        return None;
+    }
+    Some((zone.to_string(), igm.to_string()))
+}
+
+/// Does the managed instance group `igm_name` own the node `node_name`?
+/// GKE names a node `gke-<cluster>-<pool>-<hash>-<suffix>` and its MIG
+/// `gke-<cluster>-<pool>-<hash>-grp`; stripping the MIG's `-grp` yields the
+/// node-name prefix (the `-` boundary avoids a hash being a prefix of a
+/// longer one).
+fn igm_owns_node(igm_name: &str, node_name: &str) -> bool {
+    match igm_name.strip_suffix("-grp") {
+        Some(prefix) => node_name.starts_with(&format!("{prefix}-")),
+        None => false,
+    }
 }
 
 impl GkeNodePoolScaler {
@@ -127,5 +163,145 @@ impl NodePoolScaler for GkeNodePoolScaler {
         // reconcile re-asserts the desired size idempotently.
         tracing::info!(node_pool, desired, "gke: setSize accepted");
         Ok(())
+    }
+
+    /// Remove ONE node via Compute `instanceGroupManagers.deleteInstances`,
+    /// which both terminates the instance AND decrements the MIG's
+    /// targetSize (so no replacement is created — the count-only `setSize`
+    /// can't do this without picking an arbitrary victim).
+    ///
+    /// Steps: `nodePools.get` → the pool's per-zone MIG URLs → match the one
+    /// whose name owns this node → `deleteInstances` on that MIG with
+    /// `skipInstancesOnValidationError: true` so a node already gone is a
+    /// no-op success (idempotent). No LRO polling — same posture as
+    /// `set_size`; the next reconcile re-observes the fleet.
+    async fn remove_node(&self, node_pool: &str, node_name: &str) -> Result<(), BackendError> {
+        let token = self.token().await?;
+        // 1. Fetch the pool's managed instance groups.
+        let np_url = format!(
+            "{CONTAINER_API}/projects/{}/locations/{}/clusters/{}/nodePools/{}",
+            self.project, self.location, self.cluster, node_pool
+        );
+        let resp = self
+            .http
+            .get(&np_url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BackendError::Protocol(format!(
+                "gke nodePools.get returned {status}: {body}"
+            )));
+        }
+        let np: NodePoolResp = resp
+            .json()
+            .await
+            .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+
+        // 2. Find the MIG that owns this node (by hash-prefix match).
+        let owner = np
+            .instance_group_urls
+            .iter()
+            .filter_map(|u| parse_igm_url(u))
+            .find(|(_, igm)| igm_owns_node(igm, node_name));
+        let Some((zone, igm)) = owner else {
+            // No MIG claims this node → it's already out of the pool. The
+            // wave driver may re-issue after a restart; treat as done.
+            tracing::info!(
+                node_pool,
+                node_name,
+                "gke: no instance group owns this node — already removed (idempotent)"
+            );
+            return Ok(());
+        };
+
+        // 3. deleteInstances — removes THIS instance and decrements targetSize.
+        let url = format!(
+            "{COMPUTE_API}/projects/{}/zones/{zone}/instanceGroupManagers/{igm}/deleteInstances",
+            self.project
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "instances": [format!("zones/{zone}/instances/{node_name}")],
+                "skipInstancesOnValidationError": true,
+            }))
+            .send()
+            .await
+            .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BackendError::Protocol(format!(
+                "gke deleteInstances returned {status}: {body}"
+            )));
+        }
+        tracing::info!(
+            node_pool,
+            node_name,
+            zone,
+            igm,
+            "gke: deleteInstances accepted"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_igm_url_extracts_zone_and_name() {
+        let url = "https://www.googleapis.com/compute/v1/projects/p/zones/us-west2-a/\
+                   instanceGroupManagers/gke-mycluster-kvm-abc123-grp";
+        assert_eq!(
+            parse_igm_url(url),
+            Some((
+                "us-west2-a".to_string(),
+                "gke-mycluster-kvm-abc123-grp".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_igm_url_rejects_unexpected_shapes() {
+        assert_eq!(parse_igm_url("https://example.com/no/zones/here"), None);
+        assert_eq!(parse_igm_url("garbage"), None);
+        // Has /zones/ but no instanceGroupManagers segment.
+        assert_eq!(
+            parse_igm_url("https://x/projects/p/zones/z/instances/i"),
+            None
+        );
+    }
+
+    #[test]
+    fn igm_owns_node_matches_on_the_hash_prefix() {
+        let igm = "gke-mycluster-kvm-abc123-grp";
+        // The node carries the MIG's prefix (minus -grp) + its own suffix.
+        assert!(igm_owns_node(igm, "gke-mycluster-kvm-abc123-x7p9"));
+        // A node from a different MIG (different hash) is NOT owned.
+        assert!(!igm_owns_node(igm, "gke-mycluster-kvm-def456-x7p9"));
+        // A different pool entirely.
+        assert!(!igm_owns_node(igm, "gke-mycluster-bigmem-abc123-x7p9"));
+        // A non-MIG name (no -grp suffix) owns nothing.
+        assert!(!igm_owns_node(
+            "gke-mycluster-kvm-abc123",
+            "gke-mycluster-kvm-abc123-x7p9"
+        ));
+    }
+
+    #[test]
+    fn igm_owns_node_requires_the_dash_boundary() {
+        // A hash that is a string-prefix of a longer hash must NOT match —
+        // the `-` boundary guards against `abc12` matching `abc123-...`.
+        let igm = "gke-c-p-abc12-grp";
+        assert!(!igm_owns_node(igm, "gke-c-p-abc123-x7p9"));
+        assert!(igm_owns_node(igm, "gke-c-p-abc12-x7p9"));
     }
 }
