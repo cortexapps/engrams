@@ -124,10 +124,11 @@ impl MetadataStore for MiniMeta {
     async fn touch_host_heartbeat(
         &self,
         _id: HostId,
-        _s: HostStatus,
-        _cap: engram_core::types::HostCapacity,
-        _util: engram_core::types::HostUtilization,
+        _hb: engram_core::types::host::HostHeartbeat,
     ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
         Ok(())
     }
     async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {

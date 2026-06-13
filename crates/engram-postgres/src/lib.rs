@@ -12,9 +12,8 @@ use chrono::{DateTime, Utc};
 use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore, UserStore, WebSessionStore};
 use engram_core::types::user::{Role, RoleSource, User, UserToken, WebSession};
 use engram_core::types::{
-    ArtifactRow, EnableJob, EnableJobState, EnabledImage, HostCapacity, HostRecord, HostStatus,
-    HostUtilization, PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec,
-    SessionState, SnapshotRecord,
+    ArtifactRow, EnableJob, EnableJobState, EnabledImage, HostRecord, HostStatus, PersistedEvent,
+    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId, UserId};
 use row::col_err;
@@ -304,7 +303,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, allocatable_mib
             FROM hosts
-            WHERE id = ANY($1) AND status IN ('ready','draining')
+            WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
             FOR UPDATE
             "#,
         )
@@ -380,6 +379,29 @@ impl MetadataStore for PostgresStore {
         Ok(Some(HostId(picked)))
     }
 
+    async fn per_host_reserved_mib(
+        &self,
+    ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
+        // Same predicate as `reserve_placement` / `fleet_free_mib` — the
+        // memory-reserving states, with crash-orphaned `pending` rows
+        // excluded.
+        let rows: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
+            r#"
+            SELECT host_id, COALESCE(SUM(mem_budget_mib), 0)::BIGINT
+            FROM sessions
+            WHERE host_id IS NOT NULL
+              AND status IN ('pending','created','guest_ready','active',
+                             'evacuating','evicting')
+              AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
+            GROUP BY host_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|(h, v)| (HostId(h), v)).collect())
+    }
+
     async fn delete_pending_session(&self, session_id: SessionId) -> Result<(), MetaError> {
         sqlx::query(
             "DELETE FROM sessions WHERE id = $1 AND status = 'pending' AND sandbox_id IS NULL",
@@ -427,7 +449,7 @@ impl MetadataStore for PostgresStore {
                   AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
                 GROUP BY host_id
             ) r ON r.host_id = h.id
-            WHERE h.status IN ('ready','draining')
+            WHERE h.status IN ('ready','draining') AND NOT h.cordoned
             "#,
         )
         .fetch_one(&self.pool)
@@ -1030,6 +1052,8 @@ impl MetadataStore for PostgresStore {
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
+                   ready_images, local_snapshots, current_bundles,
+                   cordoned, total_vcpus,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -1058,10 +1082,19 @@ impl MetadataStore for PostgresStore {
     async fn touch_host_heartbeat(
         &self,
         id: HostId,
-        status: HostStatus,
-        capacity: HostCapacity,
-        utilization: HostUtilization,
+        hb: engram_core::types::host::HostHeartbeat,
     ) -> Result<(), MetaError> {
+        // ADR 0047: the single per-heartbeat UPDATE — capacity +
+        // utilization + the scheduling state every replica reads
+        // (ready_images / local_snapshots / current_bundles /
+        // total_vcpus). `cordoned` is deliberately absent: it is
+        // coordinator-owned and only `set_host_cordoned` writes it.
+        let ready_images = serde_json::to_value(&hb.ready_images)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let local_snapshots = serde_json::to_value(&hb.local_snapshots)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let current_bundles = serde_json::to_value(&hb.current_bundles)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let n = sqlx::query(
             r#"UPDATE hosts
                   SET status = $2,
@@ -1074,25 +1107,49 @@ impl MetadataStore for PostgresStore {
                       util_mem_used_mib = $9,
                       util_cpu_pct = $10,
                       allocatable_mib = $11,
+                      ready_images = $12,
+                      local_snapshots = $13,
+                      current_bundles = $14,
+                      total_vcpus = $15,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
         )
         .bind(id.as_uuid())
-        .bind(status.as_str())
-        .bind(capacity.total_mib as i64)
-        .bind(capacity.used_mib as i64)
-        .bind(capacity.running_sandboxes as i32)
-        .bind(utilization.disk_total_mib as i64)
-        .bind(utilization.disk_used_mib as i64)
-        .bind(utilization.mem_total_mib as i64)
-        .bind(utilization.mem_used_mib as i64)
-        .bind(utilization.cpu_pct)
-        .bind(utilization.allocatable_mib as i64)
+        .bind(hb.status.as_str())
+        .bind(hb.capacity.total_mib as i64)
+        .bind(hb.capacity.used_mib as i64)
+        .bind(hb.capacity.running_sandboxes as i32)
+        .bind(hb.utilization.disk_total_mib as i64)
+        .bind(hb.utilization.disk_used_mib as i64)
+        .bind(hb.utilization.mem_total_mib as i64)
+        .bind(hb.utilization.mem_used_mib as i64)
+        .bind(hb.utilization.cpu_pct)
+        .bind(hb.utilization.allocatable_mib as i64)
+        .bind(ready_images)
+        .bind(local_snapshots)
+        .bind(current_bundles)
+        .bind(hb.total_vcpus as i32)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
         .rows_affected();
+        if n == 0 {
+            return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
+        // ADR 0047: the coordinator-owned cordon bit. Heartbeats never
+        // write this column, so the flip sticks until explicit uncordon.
+        let n = sqlx::query(r#"UPDATE hosts SET cordoned = $2, updated_at = NOW() WHERE id = $1"#)
+            .bind(id.as_uuid())
+            .bind(cordoned)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
         if n == 0 {
             return Err(MetaError::NotFound);
         }
@@ -1112,18 +1169,27 @@ impl MetadataStore for PostgresStore {
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
+                   ready_images, local_snapshots, current_bundles,
+                   cordoned, total_vcpus,
                    last_heartbeat_at, status, host_addr
               FROM hosts
              -- Only `ready` hosts are strike-out candidates. A `draining`
-             -- host is operator-managed: mid image-roll (where ADR 0044 K2
-             -- reattach keeps its VMs alive across the brief pod-swap
-             -- heartbeat gap) or mid node-removal (where its sessions are
-             -- already being evacuated). The operator owns its lifecycle, so
-             -- the dead-host detector must not race a roll and route the
-             -- reattaching sessions to Idle out from under the successor.
-             -- (ADR 0044 K3: image rolls reattach, not evacuate.)
+             -- host is host-reported operator territory (agent shutdown /
+             -- preStop), and a `cordoned` host is coordinator territory:
+             -- mid image-roll (where ADR 0044 K2 reattach keeps its VMs
+             -- alive across the brief pod-swap heartbeat gap) or mid
+             -- scale-down drain (ADR 0048). The detector must not race a
+             -- roll and route the reattaching sessions to Idle out from
+             -- under the successor — BUT a cordon must not shield a
+             -- genuinely-dead host forever (a wave victim that dies
+             -- mid-drain still needs its sessions rehomed), so cordoned
+             -- hosts are struck out at a 10× stale threshold (ADR 0047).
              WHERE status = 'ready'
-               AND last_heartbeat_at < NOW() - make_interval(secs => $1::bigint)
+               AND (
+                     (NOT cordoned
+                      AND last_heartbeat_at < NOW() - make_interval(secs => $1::bigint))
+                  OR last_heartbeat_at < NOW() - make_interval(secs => $1::bigint * 10)
+               )
             "#,
         )
         .bind(threshold_secs as i64)

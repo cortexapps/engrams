@@ -60,7 +60,26 @@ async fn rig() -> Option<TestRig> {
             return None;
         }
     };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
+    // ADR 0047: placement reads the GLOBAL hosts table now, so tests in
+    // this binary can no longer share a database — a sibling test's
+    // fresh host row would be a legal pick. Give each rig its own
+    // database, created off the configured URL. (Leaked test databases
+    // are fine: CI's Postgres is ephemeral, and local dev reuses names
+    // rarely enough to not matter.)
+    let admin = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect postgres (admin)");
+    let db_name = format!("engram_test_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
+        .execute(&admin)
+        .await
+        .expect("create per-test database");
+    let base = database_url
+        .rsplit_once('/')
+        .map(|(b, _)| b)
+        .expect("database url has a path");
+    let test_url = format!("{base}/{db_name}");
+    let store = engram_postgres::PostgresStore::connect(&test_url)
         .await
         .expect("connect postgres");
     store.migrate().await.expect("migrate");
@@ -210,6 +229,11 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
         host_addr: None,
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
     })
     .await
     .expect("upsert_host");
@@ -242,6 +266,11 @@ async fn seed_host_with(
         status,
         last_heartbeat_at,
         host_addr: None,
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
     })
     .await
     .expect("upsert_host");
@@ -588,22 +617,29 @@ async fn evac_attempts_primitives_round_trip() {
     );
 }
 
-/// HostRegistry::cordon flips `HostState.draining` such that
-/// `pick_for_session` skips the host. Pins the load-bearing user-
-/// visible promise of the cordon admin endpoint: cordoned hosts
-/// cannot be picked as evac targets.
+/// ADR 0047: the durable coordinator cordon. `set_host_cordoned` writes
+/// the PG bit; `placement::pick_for_session` (reading host rows) must
+/// skip the host — from ANY replica (a second registry over the same
+/// store sees the same cordon), and the cordon survives heartbeats
+/// (`touch_host_heartbeat` never writes the bit).
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn host_registry_cordon_excludes_host_from_pick_for_session() {
-    use engram_coordinator::host_registry::{HostRegistry, ScheduleContext};
+async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
+    use engram_coordinator::host_registry::HostRegistry;
+    use engram_coordinator::placement::{self, ScheduleContext};
     let Some(rig) = rig().await else { return };
     let meta = rig.meta.clone();
     let registry = Arc::new(HostRegistry::new(meta.clone()));
+    let replica_b = Arc::new(HostRegistry::new(meta.clone()));
 
     let cordoned = HostId::new();
     let healthy = HostId::new();
+    seed_ready_host(&meta, cordoned, "cordon-target").await;
+    seed_ready_host(&meta, healthy, "cordon-peer").await;
     registry.register(cordoned, FakeBackend::new());
     registry.register(healthy, FakeBackend::new());
+    replica_b.register(cordoned, FakeBackend::new());
+    replica_b.register(healthy, FakeBackend::new());
 
     // Both hosts available → either can be picked.
     let ctx = ScheduleContext {
@@ -615,51 +651,108 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
         exclude_host: None,
         prefer_host: None,
     };
-    let (first_pick, _) = registry.pick_for_session(&ctx).expect("pick succeeds");
+    let (first_pick, _) = placement::pick_for_session(meta.as_ref(), &registry, &ctx)
+        .await
+        .expect("pick succeeds");
     assert!(first_pick == cordoned || first_pick == healthy);
 
-    // Cordon `cordoned` — picker MUST avoid it.
-    assert!(registry.cordon(cordoned), "cordon a registered host");
-    for _ in 0..20 {
-        let (picked, _) = registry.pick_for_session(&ctx).expect("pick succeeds");
-        assert_eq!(
-            picked, healthy,
-            "cordoned host must never be picked (got {picked} after cordon)"
-        );
+    // Cordon — every replica's picker MUST avoid it.
+    meta.set_host_cordoned(cordoned, true)
+        .await
+        .expect("cordon a rowed host");
+    for reg in [&registry, &replica_b] {
+        for _ in 0..10 {
+            let (picked, _) = placement::pick_for_session(meta.as_ref(), reg, &ctx)
+                .await
+                .expect("pick succeeds");
+            assert_eq!(
+                picked, healthy,
+                "cordoned host must never be picked (got {picked} after cordon)"
+            );
+        }
     }
 
-    // Uncordon — the previously-cordoned host is now eligible. Use
-    // exclude_host to filter the other healthy host out, then verify
-    // the picker returns the (now-uncordoned) host. This avoids
-    // depending on DashMap's iteration order, which is stable but
-    // hash-dependent — the test would be flaky if we relied on it.
-    assert!(registry.uncordon(cordoned), "uncordon known host");
+    // A heartbeat must NOT clobber the cordon (the pre-0047 bug).
+    meta.touch_host_heartbeat(
+        cordoned,
+        engram_core::types::host::HostHeartbeat {
+            status: engram_core::types::HostStatus::Ready,
+            capacity: engram_core::types::HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 16_384,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: Default::default(),
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            total_vcpus: 8,
+        },
+    )
+    .await
+    .expect("heartbeat");
+    let (picked, _) = placement::pick_for_session(meta.as_ref(), &registry, &ctx)
+        .await
+        .expect("pick succeeds");
+    assert_eq!(picked, healthy, "heartbeat must not clear the cordon");
+
+    // Uncordon — the previously-cordoned host is eligible again. Use
+    // exclude_host to force the pick deterministically.
+    meta.set_host_cordoned(cordoned, false)
+        .await
+        .expect("uncordon");
     let exclude_healthy_ctx = ScheduleContext {
-        repo: "test/img",
-        image_version: "v1",
-        prefer_snapshot_id: None,
-        memory_mib: None,
-        required_image_digest: None,
         exclude_host: Some(healthy),
-        prefer_host: None,
+        ..ctx.clone()
     };
-    let (picked, _) = registry
-        .pick_for_session(&exclude_healthy_ctx)
+    let (picked, _) = placement::pick_for_session(meta.as_ref(), &registry, &exclude_healthy_ctx)
+        .await
         .expect("post-uncordon pick must succeed when healthy host is excluded");
     assert_eq!(
         picked, cordoned,
         "after uncordon, the picker must return the previously-cordoned host"
     );
 
-    // Unknown host id → false (admin endpoint maps to 404).
-    assert!(
-        !registry.cordon(HostId::new()),
-        "unknown host returns false"
-    );
-    assert!(
-        !registry.uncordon(HostId::new()),
-        "unknown host returns false"
-    );
+    // Unknown host id → NotFound (admin endpoint maps to 404).
+    assert!(matches!(
+        meta.set_host_cordoned(HostId::new(), true).await,
+        Err(engram_core::MetaError::NotFound)
+    ));
+}
+
+/// Seed a fresh-heartbeat `ready` host row so ADR 0047 placement (which
+/// reads PG) can schedule onto it.
+async fn seed_ready_host(
+    meta: &Arc<dyn engram_core::traits::MetadataStore>,
+    id: HostId,
+    hostname: &str,
+) {
+    use engram_core::types::host::HostRecord;
+    meta.upsert_host(HostRecord {
+        id,
+        hostname: hostname.into(),
+        cloud_metadata: Default::default(),
+        capacity: engram_core::types::HostCapacity {
+            total_gb: 0,
+            used_gb: 0,
+            total_mib: 16_384,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: Default::default(),
+        status: engram_core::types::HostStatus::Ready,
+        last_heartbeat_at: Utc::now(),
+        host_addr: None,
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
+    })
+    .await
+    .expect("seed host row");
 }
 
 /// ADR 0044 K3 amendment: the dead-host detector must NOT strike out a

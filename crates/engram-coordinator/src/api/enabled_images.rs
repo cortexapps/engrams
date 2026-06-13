@@ -652,13 +652,15 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // and ADR 0028's disk-only recovery boots the same shape.
     let spec = crate::api::sessions::cold_boot_spec(&row.image_uri, manifest, None);
 
-    let (host_id, host) = state.host_registry.pick_capture_host().ok_or_else(|| {
-        ApiError::Unavailable(
-            "no host is available to capture this image's base snapshot. \
-             Register a host and retry the enable."
-                .into(),
-        )
-    })?;
+    let (host_id, host) =
+        crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
+            .await
+            .map_err(|e| {
+                ApiError::Unavailable(format!(
+                    "no host is available to capture this image's base snapshot \
+                     ({e:?}). Register a host and retry the enable."
+                ))
+            })?;
 
     tracing::info!(
         image_uri = %row.image_uri,

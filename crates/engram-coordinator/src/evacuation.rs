@@ -31,7 +31,8 @@ use engram_core::types::session::{Session, SessionState};
 use engram_core::types::snapshot::{SnapshotMetadata, SnapshotRecord};
 use engram_core::{MetaError, SandboxError};
 
-use crate::host_registry::{HostRegistry, PickError, ScheduleContext};
+use crate::host_registry::HostRegistry;
+use crate::placement::{PickError, ScheduleContext};
 
 /// Errors specific to the evacuation primitive. Wraps the upstream
 /// `SandboxError` / `MetaError` so callers can distinguish which step
@@ -321,11 +322,13 @@ pub async fn evacuate_dead_source(
     // exact host (still excluding the source); a bad pin retries then
     // falls back to Idle rather than silently landing elsewhere.
     let (target_host, target_backend) = match require_host {
-        Some(host) => registry
-            .pick_specific_host(host, session.host_id)
-            .map_err(EvacError::NoTargetAvailable)?,
-        None => registry
-            .pick_for_session(&ctx)
+        Some(host) => {
+            crate::placement::pick_specific_host(meta.as_ref(), registry, host, session.host_id)
+                .await
+                .map_err(EvacError::NoTargetAvailable)?
+        }
+        None => crate::placement::pick_for_session(meta.as_ref(), registry, &ctx)
+            .await
             .map_err(EvacError::NoTargetAvailable)?,
     };
 
@@ -608,9 +611,40 @@ mod tests {
     struct FakeMeta {
         sessions: PlMutex<HashMap<SessionId, Session>>,
         sandbox_to_session: PlMutex<HashMap<SandboxId, (HostId, SessionState)>>,
+        /// ADR 0047: placement reads host rows — tests stage
+        /// schedulable hosts here via [`Self::add_ready_host`].
+        hosts: PlMutex<Vec<engram_core::types::host::HostRecord>>,
     }
 
     impl FakeMeta {
+        /// Stage a fresh-heartbeat `ready` host row so the PG-read
+        /// picker can schedule onto the registered backend.
+        fn add_ready_host(&self, id: HostId) {
+            self.hosts
+                .lock()
+                .push(engram_core::types::host::HostRecord {
+                    id,
+                    hostname: format!("fake-{id}"),
+                    cloud_metadata: Default::default(),
+                    capacity: engram_core::types::host::HostCapacity {
+                        total_gb: 0,
+                        used_gb: 0,
+                        total_mib: 16_384,
+                        used_mib: 0,
+                        running_sandboxes: 0,
+                    },
+                    utilization: Default::default(),
+                    status: engram_core::types::host::HostStatus::Ready,
+                    last_heartbeat_at: chrono::Utc::now(),
+                    host_addr: None,
+                    ready_images: Vec::new(),
+                    local_snapshots: Vec::new(),
+                    current_bundles: Vec::new(),
+                    cordoned: false,
+                    total_vcpus: 0,
+                });
+        }
+
         fn install_session(&self, sess: Session) {
             if let (Some(_), Some(sb)) = (sess.host_id, sess.sandbox_id) {
                 self.sandbox_to_session
@@ -704,7 +738,7 @@ mod tests {
         async fn list_active_hosts(
             &self,
         ) -> Result<Vec<engram_core::types::host::HostRecord>, MetaError> {
-            Ok(Vec::new())
+            Ok(self.hosts.lock().clone())
         }
         async fn set_host_status(
             &self,
@@ -716,10 +750,11 @@ mod tests {
         async fn touch_host_heartbeat(
             &self,
             _: HostId,
-            _: engram_core::types::host::HostStatus,
-            _: engram_core::types::host::HostCapacity,
-            _: engram_core::types::host::HostUtilization,
+            _: engram_core::types::host::HostHeartbeat,
         ) -> Result<(), MetaError> {
+            unreachable!()
+        }
+        async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
             unreachable!()
         }
         async fn list_stale_hosts(
@@ -907,10 +942,11 @@ mod tests {
     fn build_registry_with_target(
         meta: Arc<FakeMeta>,
     ) -> (Arc<HostRegistry>, HostId, Arc<FakeBackend>) {
-        let registry = Arc::new(HostRegistry::new(meta));
+        let registry = Arc::new(HostRegistry::new(meta.clone()));
         let target_host = HostId::new();
         let target_be = Arc::new(FakeBackend::default());
         registry.register(target_host, target_be.clone());
+        meta.add_ready_host(target_host);
         // pick_for_session's capacity fallback path requires a fresh
         // host with no draining flag — register() sets defaults that
         // suffice.
@@ -1045,6 +1081,8 @@ mod tests {
         let other_be = Arc::new(FakeBackend::default());
         registry.register(other, other_be.clone());
         registry.register(origin, origin_be.clone());
+        meta.add_ready_host(other);
+        meta.add_ready_host(origin);
         origin_be.set_restore_id(SandboxId::new());
         other_be.set_restore_id(SandboxId::new());
 

@@ -106,6 +106,19 @@ pub struct HostUtilization {
     pub cpu_pct: f32,
 }
 
+/// ADR 0047: a snapshot the host holds locally, as persisted in the
+/// `hosts.local_snapshots` JSONB column. Field-compatible with the
+/// heartbeat wire type (`engram_protocol::heartbeat::LocalSnapshotReport`)
+/// so the handler serializes the wire payload straight into the row.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostLocalSnapshot {
+    pub snapshot_id: super::ids::SnapshotId,
+    pub session_id: super::ids::SessionId,
+    pub size_bytes: u64,
+    pub replicated: bool,
+    pub last_accessed_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostRecord {
     pub id: HostId,
@@ -126,6 +139,48 @@ pub struct HostRecord {
     /// the coord's `GrpcHostPool` treats those as unreachable.
     #[serde(default)]
     pub host_addr: Option<String>,
+    /// ADR 0047: manifest digests of images this host has fully
+    /// prefetched (heartbeat-persisted; migration 0060). The placement
+    /// readiness gate reads these — from PG, so every coordinator
+    /// replica schedules from the same authority.
+    #[serde(default)]
+    pub ready_images: Vec<String>,
+    /// ADR 0047: snapshots the host holds locally (heartbeat-persisted).
+    /// Snapshot-affinity ranking reads the ids; the fleet view renders
+    /// the count.
+    #[serde(default)]
+    pub local_snapshots: Vec<HostLocalSnapshot>,
+    /// ADR 0035/0047: the host's current bundle bake stamp
+    /// (heartbeat-persisted). Operator visibility into fleet skew.
+    #[serde(default)]
+    pub current_bundles: Vec<super::sandbox::AuxBundleRef>,
+    /// ADR 0047: coordinator-owned cordon bit. Written only by the
+    /// admin cordon/uncordon endpoints (and the ADR 0048 wave driver);
+    /// heartbeats never touch it, so it can't be clobbered back to
+    /// schedulable mid-drain. Effective schedulability =
+    /// `status == Ready && !cordoned && fresh`.
+    #[serde(default)]
+    pub cordoned: bool,
+    /// ADR 0048: host core count from the heartbeat. The CPU packing
+    /// budget is `total_vcpus × overcommit`. 0 = not yet reported.
+    #[serde(default)]
+    pub total_vcpus: u32,
+}
+
+/// ADR 0047: everything a heartbeat persists, in one struct — the
+/// argument to `MetadataStore::touch_host_heartbeat`, which is the
+/// single per-heartbeat `hosts` UPDATE. `status` is the HOST-reported
+/// side (`draining` = the agent's own shutdown/preStop flag);
+/// `cordoned` deliberately has no field here.
+#[derive(Clone, Debug)]
+pub struct HostHeartbeat {
+    pub status: HostStatus,
+    pub capacity: HostCapacity,
+    pub utilization: HostUtilization,
+    pub ready_images: Vec<String>,
+    pub local_snapshots: Vec<HostLocalSnapshot>,
+    pub current_bundles: Vec<super::sandbox::AuxBundleRef>,
+    pub total_vcpus: u32,
 }
 
 /// Specification for provisioning a new host (autoscaling).

@@ -88,6 +88,17 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let cloud_metadata: HostMetadata =
         serde_json::from_value(cloud_meta).map_err(|e| MetaError::Serialization(e.to_string()))?;
     let host_addr: Option<String> = row.try_get("host_addr").map_err(col_err)?;
+    // ADR 0047: heartbeat-persisted scheduling state + the
+    // coordinator-owned cordon bit (migration 0060).
+    let ready_images: Vec<String> =
+        serde_json::from_value(row.try_get("ready_images").map_err(col_err)?)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let local_snapshots = serde_json::from_value(row.try_get("local_snapshots").map_err(col_err)?)
+        .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let current_bundles = serde_json::from_value(row.try_get("current_bundles").map_err(col_err)?)
+        .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let cordoned: bool = row.try_get("cordoned").map_err(col_err)?;
+    let total_vcpus: i32 = row.try_get("total_vcpus").map_err(col_err)?;
     Ok(HostRecord {
         id: HostId(id),
         hostname: row.try_get("hostname").map_err(col_err)?,
@@ -110,6 +121,11 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         status: parse_host_status(&status)?,
         last_heartbeat_at,
         host_addr,
+        ready_images,
+        local_snapshots,
+        current_bundles,
+        cordoned,
+        total_vcpus: total_vcpus.max(0) as u32,
     })
 }
 

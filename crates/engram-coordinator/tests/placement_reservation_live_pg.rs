@@ -66,16 +66,27 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
         host_addr: Some(format!("http://{hostname}:9101")),
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
     })
     .await
     .expect("upsert host");
     meta.touch_host_heartbeat(
         id,
-        HostStatus::Ready,
-        zero_capacity(),
-        HostUtilization {
-            allocatable_mib,
-            ..HostUtilization::default()
+        engram_core::types::host::HostHeartbeat {
+            status: HostStatus::Ready,
+            capacity: zero_capacity(),
+            utilization: HostUtilization {
+                allocatable_mib,
+                ..HostUtilization::default()
+            },
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            total_vcpus: 0,
         },
     )
     .await

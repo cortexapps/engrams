@@ -17,7 +17,6 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use engram_core::types::host::HostStatus;
 use engram_core::HostId;
 use serde::Serialize;
 
@@ -25,18 +24,12 @@ use crate::cow_state::{fetch_for_host, CowStateView};
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-/// `GET /api/hosts` — list all hosts the coordinator knows about,
-/// merging persisted Postgres rows with live in-memory scheduler
-/// state (capacity, local snapshots, draining).
+/// `GET /api/hosts` — list all hosts. ADR 0047: rendered from the
+/// Postgres rows alone (heartbeats persist the full scheduling state),
+/// so every coordinator replica serves the same view.
 pub async fn list(State(state): State<SharedState>) -> Result<Json<ListHostsResponse>, ApiError> {
     let rows = state.services.meta.list_active_hosts().await?;
-    let hosts = rows
-        .into_iter()
-        .map(|row| {
-            let live = state.host_registry.snapshot_state(row.id);
-            HostView::from_row_and_live(row, live)
-        })
-        .collect();
+    let hosts = rows.into_iter().map(HostView::from_row).collect();
     Ok(Json(ListHostsResponse { hosts }))
 }
 
@@ -50,8 +43,7 @@ pub async fn get(
         .into_iter()
         .find(|r| r.id == host_id)
         .ok_or_else(|| ApiError::NotFound("host not found".into()))?;
-    let live = state.host_registry.snapshot_state(host_id);
-    Ok(Json(HostView::from_row_and_live(row, live)))
+    Ok(Json(HostView::from_row(row)))
 }
 
 /// `GET /api/hosts/:id/cow-state`. ADR 0016 Phase A. Returns one
@@ -141,22 +133,15 @@ async fn enrichment_for_session(
     }
 }
 
-/// `POST /api/hosts/:id/drain`. Flips both the Postgres row and the
-/// in-memory scheduler view to Draining; new sessions won't be
-/// assigned to this host. In-flight sessions stay put.
+/// `POST /api/hosts/:id/drain`. ADR 0047: a durable coordinator-side
+/// cordon (`hosts.cordoned`) — heartbeats can't clobber it back to
+/// schedulable; placement reads the bit from PG on every pick. New
+/// sessions won't be assigned to this host; in-flight sessions stay.
 pub async fn drain(
     State(state): State<SharedState>,
     Path(host_id): Path<HostId>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .services
-        .meta
-        .set_host_status(host_id, HostStatus::Draining)
-        .await?;
-    if let Some(mut s) = state.host_registry.snapshot_state(host_id) {
-        s.draining = true;
-        state.host_registry.update_state(host_id, s);
-    }
+    state.services.meta.set_host_cordoned(host_id, true).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -170,13 +155,15 @@ pub struct HostView {
     pub id: HostId,
     pub hostname: String,
     pub status: &'static str,
+    /// ADR 0047: the coordinator-owned cordon bit — non-schedulable
+    /// regardless of the host-reported `status`.
+    pub cordoned: bool,
     pub capacity_total_mib: u64,
     pub capacity_used_mib: u64,
     pub running_sandboxes: u32,
     pub local_snapshots: usize,
-    /// ADR 0015 M5: count of images this host has fully
-    /// prefetched and is ready to serve. Live-only — reads as 0
-    /// on a coord replica that hasn't received a heartbeat yet.
+    /// ADR 0015 M5: count of images this host has fully prefetched
+    /// and is ready to serve (heartbeat-persisted; ADR 0047).
     pub ready_images: usize,
     /// ADR 0015 M5: manifest digests of the prefetched images.
     /// Exposed so callers (operators, integration tests) can
@@ -184,76 +171,43 @@ pub struct HostView {
     /// from the count. Sorted for deterministic output.
     pub ready_image_digests: Vec<String>,
     /// Observed disk/mem/cpu utilization from the latest heartbeat
-    /// (the fleet view's bars). Like capacity, these prefer the
-    /// persisted `hosts` row so they're consistent across coord
-    /// replicas; 0 until the host's first post-migration heartbeat.
+    /// (the fleet view's bars); 0 until the host's first
+    /// post-migration heartbeat.
     pub util_disk_total_mib: u64,
     pub util_disk_used_mib: u64,
     pub util_mem_total_mib: u64,
     pub util_mem_used_mib: u64,
     pub util_cpu_pct: f32,
+    /// ADR 0046/0047: host-measured allocatable RAM — what placement
+    /// budgets against.
+    pub allocatable_mib: u64,
+    /// ADR 0048: host core count from the heartbeat (0 = not reported).
+    pub total_vcpus: u32,
     pub last_heartbeat_at: DateTime<Utc>,
 }
 
 impl HostView {
-    fn from_row_and_live(
-        row: engram_core::types::HostRecord,
-        live: Option<crate::host_registry::HostState>,
-    ) -> Self {
-        // Capacity prefers the Postgres row (consistent across coord
-        // replicas — persisted on every heartbeat). If `live` is
-        // present *and* the row's MiB total is zero (pre-migration
-        // row, never had a fresh heartbeat write), fall back to the
-        // in-memory value so the operator isn't stuck staring at 0
-        // during a single-replica deploy or right after the
-        // migration runs.
-        //
-        // `local_snapshots` stays live-only — the count isn't
-        // persisted yet. It'll read as 0 on the heartbeat-non-owning
-        // pod, which matches the existing pre-MiB-fields behaviour.
-        let live = live.unwrap_or_default();
-        // Same row-vs-live preference as capacity: the row is written
-        // on every heartbeat and is replica-consistent; fall back to
-        // the in-memory value only for a pre-MiB-fields row that has
-        // never had a fresh heartbeat write.
-        let (capacity_total_mib, capacity_used_mib, running_sandboxes, util) =
-            if row.capacity.total_mib > 0 {
-                (
-                    row.capacity.total_mib,
-                    row.capacity.used_mib,
-                    row.capacity.running_sandboxes,
-                    row.utilization.clone(),
-                )
-            } else {
-                (
-                    live.capacity.total_mib,
-                    live.capacity.used_mib,
-                    live.capacity.running_sandboxes,
-                    live.utilization.clone(),
-                )
-            };
-        let ready_images = live.ready_images.len();
-        let mut ready_image_digests: Vec<String> = live
-            .ready_images
-            .iter()
-            .map(|d| d.as_str().to_string())
-            .collect();
+    fn from_row(row: engram_core::types::HostRecord) -> Self {
+        let mut ready_image_digests = row.ready_images.clone();
         ready_image_digests.sort();
         Self {
             id: row.id,
             hostname: row.hostname,
             status: row.status.as_str(),
-            capacity_total_mib,
-            capacity_used_mib,
-            running_sandboxes,
-            local_snapshots: live.local_snapshots.len(),
-            ready_images,
+            cordoned: row.cordoned,
+            capacity_total_mib: row.capacity.total_mib,
+            capacity_used_mib: row.capacity.used_mib,
+            running_sandboxes: row.capacity.running_sandboxes,
+            local_snapshots: row.local_snapshots.len(),
+            ready_images: ready_image_digests.len(),
             ready_image_digests,
-            util_disk_total_mib: util.disk_total_mib,
-            util_disk_used_mib: util.disk_used_mib,
-            util_mem_total_mib: util.mem_total_mib,
-            util_mem_used_mib: util.mem_used_mib,
-            util_cpu_pct: util.cpu_pct,
+            util_disk_total_mib: row.utilization.disk_total_mib,
+            util_disk_used_mib: row.utilization.disk_used_mib,
+            util_mem_total_mib: row.utilization.mem_total_mib,
+            util_mem_used_mib: row.utilization.mem_used_mib,
+            util_cpu_pct: row.utilization.cpu_pct,
+            allocatable_mib: row.utilization.allocatable_mib,
+            total_vcpus: row.total_vcpus,
             last_heartbeat_at: row.last_heartbeat_at,
         }
     }

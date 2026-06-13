@@ -54,6 +54,10 @@ struct MockMetadataStore {
     /// tests can assert the barrier ticked atomically with the
     /// session-row write.
     chunk_generation: std::sync::atomic::AtomicU64,
+    /// ADR 0047: placement reads host rows now — the fixture seeds the
+    /// test host here and `mark_host_ready_for` mutates its
+    /// `ready_images`.
+    hosts: Mutex<HashMap<HostId, HostRecord>>,
 }
 
 impl MockMetadataStore {
@@ -207,12 +211,15 @@ impl MetadataStore for MockMetadataStore {
             .load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    async fn upsert_host(&self, _host: HostRecord) -> Result<(), MetaError> {
+    async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
+        self.hosts.lock().insert(host.id, host);
         Ok(())
     }
 
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
-        Ok(Vec::new())
+        let mut rows: Vec<HostRecord> = self.hosts.lock().values().cloned().collect();
+        rows.sort_by_key(|h| h.id);
+        Ok(rows)
     }
 
     async fn set_host_status(&self, _id: HostId, _status: HostStatus) -> Result<(), MetaError> {
@@ -221,12 +228,19 @@ impl MetadataStore for MockMetadataStore {
 
     async fn touch_host_heartbeat(
         &self,
-        _id: HostId,
-        _status: HostStatus,
-        _cap: engram_core::types::HostCapacity,
-        _util: engram_core::types::HostUtilization,
+        _: HostId,
+        _: engram_core::types::host::HostHeartbeat,
     ) -> Result<(), MetaError> {
         Ok(())
+    }
+    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
+        match self.hosts.lock().get_mut(&id) {
+            Some(h) => {
+                h.cordoned = cordoned;
+                Ok(())
+            }
+            None => Err(MetaError::NotFound),
+        }
     }
 
     async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
@@ -695,7 +709,6 @@ struct TestFixture {
     /// `seed_enabled` calls. Production hosts populate this from
     /// the prefetch supervisor + heartbeat, but the in-test ProcessBackend
     /// has no chunks to prefetch — we just declare it ready.
-    host_registry: Arc<engram_coordinator::HostRegistry>,
     test_host_id: engram_core::HostId,
 }
 
@@ -746,15 +759,36 @@ impl TestFixture {
         let host_registry = Arc::new(engram_coordinator::HostRegistry::new(meta.clone()));
         let test_host_id = engram_core::HostId::new();
         host_registry.register(test_host_id, services.host.clone());
-        let state = Arc::new(AppState::new_with_registry(
-            cfg,
-            services,
-            host_registry.clone(),
-        ));
+        // ADR 0047: placement reads host rows — seed a fresh, ready,
+        // schedulable row for the test host.
+        meta.hosts.lock().insert(
+            test_host_id,
+            engram_core::types::host::HostRecord {
+                id: test_host_id,
+                hostname: "api-test-host".into(),
+                cloud_metadata: Default::default(),
+                capacity: engram_core::types::HostCapacity {
+                    total_gb: 0,
+                    used_gb: 0,
+                    total_mib: 16_384,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: Default::default(),
+                status: HostStatus::Ready,
+                last_heartbeat_at: chrono::Utc::now(),
+                host_addr: None,
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
+            },
+        );
+        let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
         let fx = Self {
             app: api::router(state),
             meta: meta.clone(),
-            host_registry,
             test_host_id,
         };
         // Seed baseline images for the repos most tests use against
@@ -786,13 +820,15 @@ impl TestFixture {
     }
 
     fn mark_host_ready_for(&self, digest: engram_protocol::heartbeat::ManifestDigest) {
-        let prior = self
-            .host_registry
-            .snapshot_state(self.test_host_id)
-            .unwrap_or_default();
-        let mut next = prior;
-        next.ready_images.insert(digest);
-        self.host_registry.update_state(self.test_host_id, next);
+        // ADR 0047: readiness lives on the host ROW now.
+        let mut hosts = self.meta.hosts.lock();
+        let row = hosts
+            .get_mut(&self.test_host_id)
+            .expect("fixture seeds the test host row");
+        let d = digest.as_str().to_string();
+        if !row.ready_images.contains(&d) {
+            row.ready_images.push(d);
+        }
     }
 }
 

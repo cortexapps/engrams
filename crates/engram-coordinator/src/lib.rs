@@ -30,6 +30,7 @@ pub mod idle_evictor;
 pub mod live_migration;
 pub mod metrics;
 pub mod pg_listener;
+pub mod placement;
 pub mod preemption_drain;
 pub mod reconcile;
 pub mod scheduler;

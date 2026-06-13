@@ -10,7 +10,7 @@ use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::host_registry::ScheduleContext;
+use crate::placement::ScheduleContext;
 use crate::state::{SessionEvent, SharedState};
 
 /// Default sandbox sizing for sessions created without explicit limits.
@@ -1182,7 +1182,10 @@ async fn try_restore_base_snapshot(
     // burst can't overcommit a host. The `pending` reservation row is finalized
     // by `create_session_created` (an upsert) after boot, or released below on
     // boot failure.
-    let candidates = state.host_registry.candidates_for(&ctx);
+    let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
+        .await
+        .map_err(engram_core::SandboxError::from)?
+        .hosts;
     let host_id = match state
         .services
         .meta
@@ -1192,7 +1195,7 @@ async fn try_restore_base_snapshot(
     {
         Some(h) => h,
         // No candidate has room — surfaces as the same 503 a pick miss does.
-        None => return Err(crate::host_registry::PickError::NoCapacity.into()),
+        None => return Err(crate::placement::PickError::NoCapacity.into()),
     };
     match state
         .host_registry

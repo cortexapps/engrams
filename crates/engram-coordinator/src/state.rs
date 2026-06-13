@@ -952,6 +952,32 @@ pub(crate) mod tests {
     >;
 
     impl MiniMeta {
+        /// ADR 0047: placement reads host rows now — tests stage a
+        /// schedulable (ready, fresh-heartbeat) host with this.
+        pub(crate) fn add_ready_host(&self, id: engram_core::HostId) {
+            self.hosts.lock().push(HostRecord {
+                id,
+                hostname: format!("test-{id}"),
+                cloud_metadata: Default::default(),
+                capacity: engram_core::types::HostCapacity {
+                    total_gb: 0,
+                    used_gb: 0,
+                    total_mib: 16_384,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: Default::default(),
+                status: HostStatus::Ready,
+                last_heartbeat_at: chrono::Utc::now(),
+                host_addr: None,
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
+            });
+        }
+
         pub(crate) fn new(session: Session) -> Self {
             Self {
                 session: PlMutex::new(session),
@@ -1056,7 +1082,13 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {
+        async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
+            let mut hosts = self.hosts.lock();
+            if let Some(existing) = hosts.iter_mut().find(|h| h.id == host.id) {
+                *existing = host;
+            } else {
+                hosts.push(host);
+            }
             Ok(())
         }
         async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
@@ -1067,12 +1099,31 @@ pub(crate) mod tests {
         }
         async fn touch_host_heartbeat(
             &self,
-            _: HostId,
-            _: HostStatus,
-            _: engram_core::types::HostCapacity,
-            _: engram_core::types::HostUtilization,
+            id: HostId,
+            hb: engram_core::types::host::HostHeartbeat,
         ) -> Result<(), MetaError> {
+            let mut hosts = self.hosts.lock();
+            if let Some(h) = hosts.iter_mut().find(|h| h.id == id) {
+                h.status = hb.status;
+                h.capacity = hb.capacity;
+                h.utilization = hb.utilization;
+                h.ready_images = hb.ready_images;
+                h.local_snapshots = hb.local_snapshots;
+                h.current_bundles = hb.current_bundles;
+                h.total_vcpus = hb.total_vcpus;
+                h.last_heartbeat_at = chrono::Utc::now();
+            }
             Ok(())
+        }
+        async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
+            let mut hosts = self.hosts.lock();
+            match hosts.iter_mut().find(|h| h.id == id) {
+                Some(h) => {
+                    h.cordoned = cordoned;
+                    Ok(())
+                }
+                None => Err(MetaError::NotFound),
+            }
         }
         async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
             Ok(Vec::new())

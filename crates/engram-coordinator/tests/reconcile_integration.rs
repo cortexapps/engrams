@@ -183,10 +183,11 @@ impl MetadataStore for ReconcileMeta {
     async fn touch_host_heartbeat(
         &self,
         _: HostId,
-        _: HostStatus,
-        _: engram_core::types::HostCapacity,
-        _: engram_core::types::HostUtilization,
+        _: engram_core::types::host::HostHeartbeat,
     ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
         Ok(())
     }
     async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {

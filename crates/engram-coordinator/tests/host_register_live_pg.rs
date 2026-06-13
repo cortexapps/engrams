@@ -54,6 +54,11 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
         host_addr: Some(addr.to_string()),
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
     }
 }
 

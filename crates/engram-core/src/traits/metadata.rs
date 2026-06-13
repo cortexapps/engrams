@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::error::MetaError;
 use crate::types::event::{ArtifactRow, PersistedEvent};
-use crate::types::host::{HostCapacity, HostRecord, HostStatus, HostUtilization};
+use crate::types::host::{HostHeartbeat, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::manifest::ManifestRef;
 use crate::types::registry::{
@@ -131,6 +131,17 @@ pub trait MetadataStore: Send + Sync {
     /// `pending`, sandbox-less row. Default impl (mocks) is a no-op.
     async fn delete_pending_session(&self, _session_id: SessionId) -> Result<(), MetaError> {
         Ok(())
+    }
+
+    /// ADR 0047: per-host reserved guest-RAM (Σ `mem_budget_mib` over the
+    /// memory-reserving session states) — the read-side twin of
+    /// `reserve_placement`'s aggregate, for the capacity-soft resume/evac
+    /// picker and the fleet view. Default impl (mocks): empty map (no
+    /// reservations).
+    async fn per_host_reserved_mib(
+        &self,
+    ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
+        Ok(std::collections::HashMap::new())
     }
 
     /// ADR 0009 reconcile pass: enumerate the `(session_id,
@@ -326,23 +337,27 @@ pub trait MetadataStore: Send + Sync {
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
     /// Record a heartbeat from `host_id`: bump `last_heartbeat_at` to
-    /// NOW(), set `status`, and persist `capacity` so cross-pod
-    /// `/api/hosts` reads stay consistent (the in-memory
-    /// `host_registry` only knows about hosts whose WS connects to
-    /// *this* coord pod, so the API view has to fall back to
-    /// Postgres for any host owned by a sibling). Distinct from
-    /// `set_host_status` because drain/dead transitions imply
-    /// nothing about liveness and must not refresh the dead-host
-    /// detector's timestamp. The WS dialer's heartbeat handler is
-    /// the only caller; in `--mode=all` the in-process timer calls
-    /// `upsert_host` instead.
-    async fn touch_host_heartbeat(
-        &self,
-        id: HostId,
-        status: HostStatus,
-        capacity: HostCapacity,
-        utilization: HostUtilization,
-    ) -> Result<(), MetaError>;
+    /// NOW(), set the host-reported `status`, and persist the full
+    /// [`HostHeartbeat`] payload — capacity, utilization, and (ADR
+    /// 0047) the scheduling state that used to live only in the
+    /// per-pod in-memory mirror: `ready_images`, `local_snapshots`,
+    /// `current_bundles`, `total_vcpus`. This is the single
+    /// per-heartbeat `hosts` UPDATE; every coordinator replica
+    /// schedules from these columns. Deliberately does NOT touch
+    /// `cordoned` (coordinator-owned; see `set_host_cordoned`).
+    /// Distinct from `set_host_status` because drain/dead transitions
+    /// imply nothing about liveness and must not refresh the
+    /// dead-host detector's timestamp.
+    async fn touch_host_heartbeat(&self, id: HostId, hb: HostHeartbeat) -> Result<(), MetaError>;
+
+    /// ADR 0047: flip the coordinator-owned `hosts.cordoned` bit.
+    /// Written only by the admin cordon/uncordon endpoints and the
+    /// ADR 0048 scale-down wave driver; heartbeats never touch it, so
+    /// a cordon survives until an explicit uncordon. Returns
+    /// `MetaError::NotFound` when no row exists — but succeeds for a
+    /// host that has a row yet no live connection (wave-cordon during
+    /// pod churn must stick).
+    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError>;
 
     /// List hosts whose `last_heartbeat_at` is older than `threshold_secs`
     /// AND whose status is `Ready`. The dead-host detector polls this every

@@ -29,7 +29,7 @@ use engram_core::{SandboxError, SandboxId, SessionId};
 use serde::Serialize;
 
 use crate::error::ApiError;
-use crate::host_registry::ScheduleContext;
+use crate::placement::ScheduleContext;
 use crate::state::{RecoveryCause, SessionEvent, SharedState};
 
 /// ADR 0039 follow-up #20: how long `ensure_active` will HOLD a
@@ -1127,10 +1127,13 @@ async fn resume_from_fc_snapshot(
         // host materializes any the receiving host is missing.
         aux_bundles: record.aux_bundles.clone(),
     };
-    let (host_id, new_sandbox_id) = match state
-        .host_registry
-        .restore_for_session(&ctx, restore_metadata)
-        .await
+    let (host_id, new_sandbox_id) = match crate::placement::restore_for_session(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        &ctx,
+        restore_metadata,
+    )
+    .await
     {
         Ok(v) => v,
         Err(SandboxError::Snapshot(msg)) => {

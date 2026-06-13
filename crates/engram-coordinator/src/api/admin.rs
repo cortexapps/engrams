@@ -547,15 +547,19 @@ pub async fn teleport_session(
     // session right now (unknown / draining / full / is the source) —
     // better than marking the session Evacuating and letting the scanner
     // retry-then-Idle against an impossible pin.
-    state
-        .host_registry
-        .pick_specific_host(req.target_host_id, session.host_id)
-        .map_err(|e| {
-            ApiError::Conflict(format!(
-                "target host {} can't take this session: {e:?}",
-                req.target_host_id,
-            ))
-        })?;
+    crate::placement::pick_specific_host(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        req.target_host_id,
+        session.host_id,
+    )
+    .await
+    .map_err(|e| {
+        ApiError::Conflict(format!(
+            "target host {} can't take this session: {e:?}",
+            req.target_host_id,
+        ))
+    })?;
 
     // ADR 0045 C1: behind ENGRAM_LIVE_TELEPORT=1, try the LIVE move
     // first — the eager dirty-set push (no GCS on the pause path, no
@@ -717,12 +721,13 @@ pub struct FleetDemandResponse {
     pub total_mib: u64,
 }
 
-/// `GET /api/admin/fleet/demand` — the K4 node-pool autoscaler's input. Host
-/// counts come from the in-memory registry; `free_mib` is the host-measured
-/// allocatable minus reserved session budgets (PG, ADR 0046) so the autoscaler
-/// scales on true demand rather than the phantom `total − used(=0)`.
+/// `GET /api/admin/fleet/demand` — the K4 node-pool autoscaler's input. ADR
+/// 0047: counts AND headroom both come from PG (the hosts rows + the reserved
+/// aggregate), so every coordinator replica reports identical demand.
 pub async fn fleet_demand(State(state): State<SharedState>) -> Json<FleetDemandResponse> {
-    let m = state.host_registry.fleet_metrics();
+    let m = crate::placement::fleet_snapshot(state.services.meta.as_ref())
+        .await
+        .unwrap_or_default();
     // On a transient query failure, fall back to total (treat as "no pressure";
     // scale-down hysteresis rides out a single tick).
     let free_mib = state
@@ -750,43 +755,32 @@ pub struct CordonResponse {
 }
 
 /// `POST /api/admin/hosts/:id/cordon` — mark a host non-schedulable.
-/// Flips `HostState.draining` so `pick_for_session` excludes it from
-/// new placements + evac targets. PG `hosts.status` is updated to
-/// `Draining` in the same call so a coord pod restart (or sibling
-/// pod) observes the cordon. No effect on already-bound sessions on
-/// this host — for that, the operator calls `/drain` (or evacs each
-/// session by hand).
+/// ADR 0047: writes the coordinator-owned `hosts.cordoned` bit, which
+/// heartbeats never touch — the cordon is DURABLE until an explicit
+/// uncordon, across coord restarts and replicas. A PG failure is a 500
+/// (durability is the point; there is no in-memory fallback to lie
+/// behind). Succeeds for a host that has a row but no live connection
+/// on this pod (a wave-cordon during pod churn must stick). No effect
+/// on already-bound sessions — for that, the operator calls `/drain`.
 pub async fn cordon_host(
     State(state): State<SharedState>,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<Json<CordonResponse>, ApiError> {
-    if !state.host_registry.cordon(host_id) {
-        return Err(ApiError::NotFound(format!("host {host_id} not registered")));
+    match state.services.meta.set_host_cordoned(host_id, true).await {
+        Ok(()) => {}
+        Err(engram_core::MetaError::NotFound) => {
+            return Err(ApiError::NotFound(format!("host {host_id} has no row")));
+        }
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "cordon: set_host_cordoned failed: {e}"
+            )));
+        }
     }
-    if let Err(e) = state
-        .services
-        .meta
-        .set_host_status(host_id, engram_core::types::HostStatus::Draining)
-        .await
-    {
-        // In-memory flag flipped; PG write failed. Log + return ok —
-        // the picker already filters this host out via the in-memory
-        // flag. The heartbeat handler on the next tick will rewrite
-        // hosts.status from whatever the host reports (typically
-        // Ready), which would clobber the cordon. To prevent that
-        // requires a PG-anchored cordon (follow-up); for v1 of the
-        // drain story we accept the eventual-consistency risk and
-        // log loudly.
-        tracing::warn!(
-            %host_id, error = %e,
-            "cordon: in-memory flipped but set_host_status(Draining) failed; \
-             a heartbeat may reset hosts.status to Ready before scanner action",
-        );
-    }
-    tracing::info!(%host_id, "admin cordon: host marked non-schedulable");
+    tracing::info!(%host_id, "admin cordon: host marked non-schedulable (durable)");
     Ok(Json(CordonResponse {
         host_id,
-        status: "draining",
+        status: "cordoned",
     }))
 }
 
@@ -796,20 +790,16 @@ pub async fn uncordon_host(
     State(state): State<SharedState>,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<Json<CordonResponse>, ApiError> {
-    if !state.host_registry.uncordon(host_id) {
-        return Err(ApiError::NotFound(format!("host {host_id} not registered")));
-    }
-    if let Err(e) = state
-        .services
-        .meta
-        .set_host_status(host_id, engram_core::types::HostStatus::Ready)
-        .await
-    {
-        tracing::warn!(
-            %host_id, error = %e,
-            "uncordon: in-memory flipped but set_host_status(Ready) failed; \
-             next heartbeat will reconcile",
-        );
+    match state.services.meta.set_host_cordoned(host_id, false).await {
+        Ok(()) => {}
+        Err(engram_core::MetaError::NotFound) => {
+            return Err(ApiError::NotFound(format!("host {host_id} has no row")));
+        }
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "uncordon: set_host_cordoned failed: {e}"
+            )));
+        }
     }
     tracing::info!(%host_id, "admin uncordon: host returned to scheduling");
     Ok(Json(CordonResponse {
@@ -847,19 +837,19 @@ pub async fn drain_host(
     State(state): State<SharedState>,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<(StatusCode, Json<DrainHostResponse>), ApiError> {
-    if !state.host_registry.cordon(host_id) {
-        return Err(ApiError::NotFound(format!("host {host_id} not registered")));
-    }
-    if let Err(e) = state
-        .services
-        .meta
-        .set_host_status(host_id, engram_core::types::HostStatus::Draining)
-        .await
-    {
-        tracing::warn!(
-            %host_id, error = %e,
-            "drain: cordon PG write failed; continuing — in-memory flag is set",
-        );
+    // ADR 0047: the durable cordon — heartbeats can't clobber it, every
+    // replica's picker reads it. A PG failure fails the drain (no
+    // in-memory fallback to half-drain behind).
+    match state.services.meta.set_host_cordoned(host_id, true).await {
+        Ok(()) => {}
+        Err(engram_core::MetaError::NotFound) => {
+            return Err(ApiError::NotFound(format!("host {host_id} has no row")));
+        }
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "drain: set_host_cordoned failed: {e}"
+            )));
+        }
     }
 
     // PG-authoritative list of sessions bound here. The in-memory
@@ -907,7 +897,7 @@ pub async fn drain_host(
                     Ok(session) => {
                         let (repo, tag) =
                             engram_core::types::session::split_image_ref(&session.image);
-                        let ctx = crate::host_registry::ScheduleContext {
+                        let ctx = crate::placement::ScheduleContext {
                             repo,
                             image_version: tag,
                             prefer_snapshot_id: None,
@@ -916,7 +906,14 @@ pub async fn drain_host(
                             exclude_host: Some(host_id),
                             prefer_host: None,
                         };
-                        st.host_registry.pick_for_session(&ctx).ok().map(|(h, _)| h)
+                        crate::placement::pick_for_session(
+                            st.services.meta.as_ref(),
+                            &st.host_registry,
+                            &ctx,
+                        )
+                        .await
+                        .ok()
+                        .map(|(h, _)| h)
                     }
                     Err(_) => None,
                 };

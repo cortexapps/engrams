@@ -157,10 +157,14 @@ pub async fn migrate_session_live(
 
     // The destination must be takeable and the source addressable
     // before we freeze anything.
-    let (_, dest_backend) = state
-        .host_registry
-        .pick_specific_host(target_host_id, session.host_id)
-        .map_err(|e| MigrateError::Fatal(format!("target host can't take the session: {e:?}")))?;
+    let (_, dest_backend) = crate::placement::pick_specific_host(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        target_host_id,
+        session.host_id,
+    )
+    .await
+    .map_err(|e| MigrateError::Fatal(format!("target host can't take the session: {e:?}")))?;
     let source_addr = source_host_addr(state, session.host_id)
         .await
         .ok_or_else(|| {
@@ -771,21 +775,9 @@ mod tests {
             target,
             Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(backend)),
         );
-        host_registry.update_state(
-            target,
-            crate::host_registry::HostState {
-                capacity: engram_protocol::heartbeat::HostCapacityReport {
-                    total_mib: 16_384,
-                    used_mib: 0,
-                    running_sandboxes: 0,
-                },
-                local_snapshots: Vec::new(),
-                draining: false,
-                ready_images: Default::default(),
-                current_bundles: Vec::new(),
-                utilization: Default::default(),
-            },
-        );
+        // ADR 0047: placement reads host rows — stage the target as a
+        // schedulable host in the mock store.
+        meta.add_ready_host(target);
         let services = Services {
             meta: meta.clone(),
             cloud: Arc::new(MockCloud::new()),
@@ -967,22 +959,6 @@ mod tests {
             target,
             Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(flaky.clone())),
         );
-        // Re-register resets the heartbeat state — restore capacity.
-        state.host_registry.update_state(
-            target,
-            crate::host_registry::HostState {
-                capacity: engram_protocol::heartbeat::HostCapacityReport {
-                    total_mib: 16_384,
-                    used_mib: 0,
-                    running_sandboxes: 0,
-                },
-                local_snapshots: Vec::new(),
-                draining: false,
-                ready_images: Default::default(),
-                current_bundles: Vec::new(),
-                utilization: Default::default(),
-            },
-        );
         // The SOURCE is resolved through services.host (the registry) by
         // sandbox owner — record the source sandbox's owner as the same
         // flaky backend (it serves capture + abort).
@@ -1007,6 +983,11 @@ mod tests {
                 status: engram_core::types::host::HostStatus::Ready,
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: Some("http://127.0.0.1:1".into()),
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
             });
         meta.snapshots
             .lock()
@@ -1169,22 +1150,6 @@ mod tests {
             target,
             Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(happy.clone())),
         );
-        // Re-register resets the heartbeat state — restore capacity.
-        state.host_registry.update_state(
-            target,
-            crate::host_registry::HostState {
-                capacity: engram_protocol::heartbeat::HostCapacityReport {
-                    total_mib: 16_384,
-                    used_mib: 0,
-                    running_sandboxes: 0,
-                },
-                local_snapshots: Vec::new(),
-                draining: false,
-                ready_images: Default::default(),
-                current_bundles: Vec::new(),
-                utilization: Default::default(),
-            },
-        );
         // The source resolves through the recorded sandbox owner (the
         // same fake backend serves both roles, as in the abort test).
         state
@@ -1207,6 +1172,11 @@ mod tests {
                 status: engram_core::types::host::HostStatus::Ready,
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: Some("http://127.0.0.1:1".into()),
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
             });
         meta.snapshots
             .lock()
