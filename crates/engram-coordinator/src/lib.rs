@@ -34,6 +34,7 @@ pub mod placement;
 pub mod preemption_drain;
 pub mod reconcile;
 pub mod scheduler;
+pub mod session_boot;
 pub mod snapshot_blob_gc;
 pub mod state;
 

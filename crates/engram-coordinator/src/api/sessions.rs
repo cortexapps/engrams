@@ -10,7 +10,6 @@ use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::placement::ScheduleContext;
 use crate::state::{SessionEvent, SharedState};
 
 /// Default sandbox sizing for sessions created without explicit limits.
@@ -791,13 +790,6 @@ async fn create_session_inner(
     // image manifest like any other dependency.
     let network = manifest.network.clone();
 
-    // Clone the env + network policy before they're moved into the
-    // VmSpec — the post-create proxy registration needs to look up
-    // placeholders by name and build the network allow-list. The
-    // borrow checker would otherwise rightly complain.
-    let spec_env_for_proxy = spec_env.clone();
-    let network_for_proxy = network.clone();
-
     // -------- 5. Schedule: restore from the image's base snapshot --------
     //
     // ADR 0020: every enabled image has a base snapshot — enable is
@@ -818,273 +810,101 @@ async fn create_session_inner(
             req.image
         ))
     })?;
-    // ADR 0027: must match the floor `capture_and_record_base_snapshot`
-    // applied — FC requires the restore `mem_size_mib` to equal the
-    // snapshot's. The shared helper guarantees they agree.
+
+    // -------- 5a. Reserve a host (ADR 0046 best-fit, ADR 0048 2D) --------
+    // Rank candidates from PG (affinity / readiness), then atomically
+    // pick + reserve in Postgres so a concurrent burst can't overcommit.
+    // The `pending` reservation row is finalized to `created` by
+    // `boot_on_reserved_host`, or released below on a not-started failure.
     let memory_mib = resolved_memory_mib(&manifest);
-    let vcpus = resolved_vcpus(&manifest);
-
-    let (host_id, sandbox_id) = try_restore_base_snapshot(
-        &state,
-        session_id,
-        base_snapshot_id,
-        &image_repo,
-        &image_tag,
-        memory_mib,
-        vcpus,
-        &spec,
-        // Per-session sandbox env (manifest env + resolved secrets +
-        // ENGRAM_SESSION_*). The shared base snapshot can't carry it, so
-        // it's injected into the restored sandbox (cold-create baked it
-        // into vm_spec.env).
-        spec_env,
-    )
-    .await
-    .map_err(|e| {
-        tracing::warn!(
-            image_uri = %req.image,
-            snapshot_id = %base_snapshot_id,
-            error = %e,
-            "base-snapshot restore failed at scheduling; returning 503, no row persisted",
-        );
-        match e {
-            engram_core::SandboxError::ImageNotReady(d) => ApiError::Unavailable(format!(
-                "image `{}` (digest {d}) is not ready on any host yet; retry shortly",
-                req.image
-            )),
-            other => ApiError::Unavailable(format!(
-                "no host could restore this session's base snapshot right now: {other}. \
-                 Retry shortly; capacity recovers as hosts register or sessions drain."
-            )),
-        }
-    })?;
-
-    // Atomic insert: row exists only once we have host_id + sandbox_id
-    // bound. If THIS step fails, the sandbox is already running and
-    // would orphan — tear it down before bubbling. Note the
-    // `services.host.destroy` is best-effort; a failure here leaves
-    // a sandbox running on the host until its owning host-agent's
-    // reconcile pass flips it.
-    if let Err(e) = state
-        .services
-        .meta
-        .create_session_created(session_id, spec, host_id, sandbox_id)
-        .await
-    {
-        tracing::error!(
-            session_id = %session_id,
-            sandbox_id = %sandbox_id,
-            host_id = %host_id,
-            error = %e,
-            "session row insert failed after sandbox create; tearing sandbox down",
-        );
-        if let Err(de) = state.services.host.destroy(sandbox_id).await {
-            tracing::error!(
-                session_id = %session_id,
-                sandbox_id = %sandbox_id,
-                error = %de,
-                "sandbox teardown after insert failure also failed — host reconcile will GC",
-            );
-        }
-        return Err(e.into());
-    }
-
-    // Now that the session row exists, the FK on session_secrets is
-    // satisfiable. Best-effort: a failure here just means resume
-    // re-prompts for credentials (the harness still gets them on the
-    // initial boot via vm_spec.env).
-    if let Some(overrides) = deferred_session_secrets {
-        if let Err(e) = persist_session_secrets(&state, session_id, &overrides).await {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "session secrets persistence failed; resume will lose secrets",
-            );
-        }
-    }
-
-    state.registry.bind(session_id, sandbox_id);
-    // ADR 0006: ship per-session egress policy to the host-agent
-    // that owns this sandbox. The host-agent applies it to its
-    // local proxy registry; the WS frame and any subsequent
-    // start_agent request are serialised on the same connection so
-    // the policy is live before the harness can make egress calls.
-    //
-    // Build the egress policy from the resolved guest IP. None when
-    // the backend has no guest IP for this sandbox (process backend,
-    // VZ in some configs) — fine; host-agents without a proxy
-    // ignore the policy field.
-    let egress_policy = if let Some(guest_ip_str) = state.services.host.guest_ip(sandbox_id).await {
-        if let Ok(guest_ip) = guest_ip_str.parse::<std::net::Ipv4Addr>() {
-            let mut secrets = Vec::new();
-            for (name, resolved) in &secret_bundle.secrets {
-                let Some(placeholder) = spec_env_for_proxy.get(name).cloned() else {
-                    continue;
-                };
-                secrets.push(engram_core::types::egress::EgressSecretEntry {
-                    placeholder,
-                    real_value: resolved.value.clone(),
-                    allow_hosts: resolved.schema.allow_hosts.clone(),
-                    allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
-                });
-            }
-            Some(engram_core::types::egress::SessionEgressPolicy {
-                session_id,
-                sandbox_id,
-                guest_ip,
-                network_allow_hosts: network_for_proxy.allow_hosts.clone(),
-                network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
-                secrets,
-                secret_mode: manifest.secret_mode,
-            })
-        } else {
-            None
-        }
-    } else {
-        None
+    let cpu_budget_vcpus = resolved_vcpus(&manifest);
+    let ctx = crate::placement::ScheduleContext {
+        repo: &image_repo,
+        image_version: &image_tag,
+        prefer_snapshot_id: Some(base_snapshot_id),
+        memory_mib: Some(memory_mib),
+        cpu_budget_vcpus: Some(cpu_budget_vcpus),
+        // Base-snapshot chunks lazy-materialize from BlobStorage; no host
+        // needs the image prefetched.
+        required_image_digest: None,
+        exclude_host: None,
+        prefer_host: None,
     };
-    // Bind the routing on the host that owns this sandbox *before*
-    // the agent has a chance to dial. `backend.create()` returns with
-    // the sandbox ready to accept exec but the agent (if any) NOT
-    // yet spawned. HostClient dispatches by sandbox_id so this routes
-    // to the right host (local in mode=all, WS in mode=coordinator).
-    state
-        .services
-        .host
-        .bind_session(session_id, sandbox_id)
-        .await;
-
-    // -------- 6. Start the agent --------
-    //
-    // ADR 0015 M1: every cold-create session goes through
-    // `start_agent`, including `harness: none`. Agentd's
-    // SpawnHarness handler treats empty argv as a readiness
-    // probe (no child spawned, no error), so the same call
-    // serves both cases — and as a side-effect "session is
-    // Active" now actually implies "agentd is reachable on
-    // vsock", which makes the early-eof race that the no-
-    // harness path used to produce structurally impossible.
-    let agent = agent_for_session.unwrap_or_else(|| engram_core::types::sandbox::AgentSpec {
-        argv: Vec::new(),
-        env: std::collections::HashMap::new(),
-        // dev_vm readiness probe: no harness ever spawns, but agentd still
-        // records this so the session's `/exec` and shell inherit it.
-        session_env,
-        // Host-agent fills `host_ca_pem` in from its local egress
-        // state (ADR 0021 P1.2). Coord leaves it None.
-        host_ca_pem: None,
-    });
-    let policy = egress_policy.unwrap_or_else(|| {
-        // No guest IP yet → synthesize an unspecified-IP policy.
-        // host-agents without a live proxy treat policy application
-        // as a no-op; the agent can refine on a later
-        // `apply_egress_policy` once the IP shows up.
-        engram_core::types::egress::SessionEgressPolicy {
-            session_id,
-            sandbox_id,
-            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-            network_allow_hosts: network_for_proxy.allow_hosts.clone(),
-            network_allow_host_patterns: network_for_proxy.allow_host_patterns.clone(),
-            secrets: Vec::new(),
-            secret_mode: manifest.secret_mode,
-        }
-    });
-    // ADR 0015 M2: emit the Pending→Created transition first so SSE
-    // subscribers see the lifecycle moment when the row materialized
-    // (the actual INSERT happened a few lines up). Pending is the
-    // API-caller's pre-insert view; we never persisted it, but the
-    // event log is the durable record of "request accepted, scheduler
-    // returned, row exists at Created."
-    let now_created = chrono::Utc::now();
-    state
-        .emit(
-            session_id,
-            SessionEvent::StatusChanged {
-                from: SessionState::Pending,
-                to: SessionState::Created,
-                at: now_created,
-            },
-        )
-        .await?;
-    if let Err(e) = state
-        .services
-        .host
-        .start_agent(sandbox_id, agent, policy)
+    let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
         .await
-    {
-        tracing::error!(
-            %session_id,
-            %sandbox_id,
-            %host_id,
-            error = %e,
-            "start_agent failed; marking session Failed",
-        );
-        let _ = state
-            .services
-            .meta
-            .transition_session(session_id, SessionState::Failed)
-            .await;
-        state.services.host.unbind_session(session_id).await;
-        return Err(e.into());
-    }
-    // ADR 0015 M2: start_agent returned OK, so agentd is reachable
-    // and the harness (if any) is running. Now and only now does
-    // `Active` actually hold its meaning. Transition + emit.
-    let prev_for_active = state
+        .map_err(engram_core::SandboxError::from)?;
+    let host_id = match state
         .services
         .meta
-        .transition_session(session_id, SessionState::Active)
-        .await?;
-    state
-        .emit(
+        .reserve_placement(
             session_id,
-            SessionEvent::StatusChanged {
-                from: prev_for_active,
-                to: SessionState::Active,
-                at: chrono::Utc::now(),
-            },
+            &spec,
+            memory_mib as i64,
+            cpu_budget_vcpus as i32,
+            &candidates.hosts,
+            candidates.affinity_len,
         )
-        .await?;
+        .await
+        .map_err(|e| ApiError::Internal(format!("reserve_placement: {e}")))?
+    {
+        Some(h) => h,
+        // No host fits. ADR 0048 C6 replaces this 503 with an enqueue +
+        // 201 queued; until the scanner lands, fail loud + retryable.
+        None => {
+            return Err(ApiError::Unavailable(
+                "no host has capacity for this session right now; retry shortly \
+                 (capacity recovers as hosts register, sessions drain, or the \
+                 fleet scales up)."
+                    .into(),
+            ));
+        }
+    };
 
-    // If the request carried an initial prompt, record it as a
-    // user-role message in the event log. The harness pulls the value
-    // out of `ENGRAM_INITIAL_PROMPT` and runs it without echoing it
-    // back through Claude's stream-json output, so subscribers
-    // (transcripts, dashboards) only see the assistant's reply
-    // otherwise. Mirror the per-prompt path in `prompt.rs`. Best-
-    // effort: a failed emit doesn't roll back session creation.
-    if let Some(text) = req.prompt.as_deref().filter(|s| !s.is_empty()) {
-        if let Err(e) = state
-            .emit(
+    // -------- 5b/6. Boot on the reserved host --------
+    let inputs = crate::session_boot::BootInputs {
+        session_id,
+        spec,
+        base_snapshot_id,
+        spec_env,
+        agent: agent_for_session,
+        session_env,
+        secret_bundle,
+        network,
+        secret_mode: manifest.secret_mode,
+        deferred_session_secrets,
+        prompt: req.prompt.clone().filter(|s| !s.is_empty()),
+    };
+    match crate::session_boot::boot_on_reserved_host(&state, inputs, host_id).await {
+        Ok(()) => Ok((
+            StatusCode::CREATED,
+            Json(CreateSessionResponse {
                 session_id,
-                SessionEvent::HarnessAgentMessage {
-                    run_id: String::new(),
-                    message_id: format!("user-{}", uuid::Uuid::new_v4()),
-                    role: engram_harness_proto::AgentRole::User,
-                    text: text.to_string(),
-                    at: chrono::Utc::now(),
-                },
-            )
-            .await
-        {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "emit initial prompt event failed",
-            );
+                status: SessionState::Active.as_str(),
+                image_version: image_tag,
+                // ADR 0020: every session is a base-snapshot restore now.
+                kind: "restored",
+            }),
+        )),
+        Err(crate::session_boot::BootError::NotStarted(e)) => {
+            // The sandbox never came up; release the reservation row so the
+            // host's free capacity is restored at once (reconcile would also
+            // reap it). No Failed transition — nothing usable ever existed.
+            if let Err(de) = state.services.meta.delete_pending_session(session_id).await {
+                tracing::warn!(%session_id, error = %de,
+                    "delete_pending_session after boot failure failed; reconcile will reap");
+            }
+            Err(e)
+        }
+        Err(crate::session_boot::BootError::Started(e)) => {
+            // The sandbox booted but a later step failed — fail the session.
+            let _ = state
+                .services
+                .meta
+                .transition_session(session_id, SessionState::Failed)
+                .await;
+            Err(e)
         }
     }
-
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateSessionResponse {
-            session_id,
-            status: SessionState::Active.as_str(),
-            image_version: image_tag,
-            // ADR 0020: every session is a base-snapshot restore now.
-            kind: "restored",
-        }),
-    ))
 }
 
 /// ADR 0020 P1: attempt to restore a session from the image's base
@@ -1109,132 +929,11 @@ async fn create_session_inner(
 /// Safe before any bake has published a canonical trace: a missing blob is
 /// treated as an empty working set and the host falls back to full-manifest
 /// prefetch (the prior, behaviour-preserving path).
-fn base_working_set_blob_key(
+pub(crate) fn base_working_set_blob_key(
     memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
 ) -> Option<String> {
     memory_manifest
         .map(|m| engram_chunk_store::working_set::TraceRef::canonical(m.manifest_id).storage_key())
-}
-
-// Cohesive base-restore + reserve-at-pick context; bundling into a struct would
-// just move the arg list. (ADR 0046 added session_id + spec for reservation.)
-#[allow(clippy::too_many_arguments)]
-async fn try_restore_base_snapshot(
-    state: &SharedState,
-    session_id: engram_core::SessionId,
-    snapshot_id: engram_core::types::SnapshotId,
-    image_repo: &str,
-    image_tag: &str,
-    memory_mib: u32,
-    cpu_budget_vcpus: u32,
-    spec: &engram_core::types::SessionSpec,
-    session_env: HashMap<String, String>,
-) -> Result<(engram_core::HostId, engram_core::SandboxId), engram_core::SandboxError> {
-    let record = state
-        .services
-        .meta
-        .get_snapshot(snapshot_id)
-        .await
-        .map_err(|e| {
-            engram_core::SandboxError::Snapshot(format!(
-                "get_snapshot {snapshot_id} for base restore: {e}"
-            ))
-        })?
-        .ok_or_else(|| {
-            engram_core::SandboxError::Snapshot(format!(
-                "enabled image references base snapshot {snapshot_id} but its snapshots row is gone"
-            ))
-        })?;
-    // The state.bin / sidecar.json blob keys are deterministic from the
-    // snapshot id (`snapshots/<id>/...`); the disk + memory chunked
-    // manifests come off the snapshots row. Together this is the full
-    // portable metadata the host's cross-host restore path consumes.
-    let metadata = engram_core::types::snapshot::SnapshotMetadata {
-        // ADR 0045 D4: fresh creates restore FROM the base snapshot, so
-        // canonical == session by construction; the host's fallback does
-        // exactly that.
-        base_memory_manifest: None,
-        migration_source: None,
-        id: snapshot_id,
-        size_bytes: record.size_bytes,
-        created_at: record.created_at,
-        image_version: record.image_version,
-        disk_manifest: record.disk_manifest,
-        memory_manifest: record.memory_manifest,
-        source_sandbox_id: None,
-        state_blob_key: Some(engram_chunk_store::snapshot_blob::state_blob_key(
-            snapshot_id,
-        )),
-        sidecar_blob_key: Some(engram_chunk_store::snapshot_blob::sidecar_blob_key(
-            snapshot_id,
-        )),
-        rootfs_blob_key: None,
-        // ADR 0039 (cache locality): narrow the host's memory-chunk prefetch
-        // to the base image's canonical working-set trace. See
-        // [`base_working_set_blob_key`].
-        working_set_blob_key: base_working_set_blob_key(record.memory_manifest),
-        // ADR 0035: the generations this base snapshot pins; the host
-        // materializes any it's missing and (fresh flavor) swaps to
-        // its current generation post-load.
-        aux_bundles: record.aux_bundles,
-    };
-    let ctx = ScheduleContext {
-        repo: image_repo,
-        image_version: image_tag,
-        prefer_snapshot_id: Some(snapshot_id),
-        memory_mib: Some(memory_mib),
-        cpu_budget_vcpus: Some(cpu_budget_vcpus),
-        // Base-snapshot chunks are pulled from BlobStorage on demand by
-        // the restore path; no host needs to have prefetched the image.
-        required_image_digest: None,
-        exclude_host: None,
-        prefer_host: None,
-    };
-    // ADR 0046: reserve at pick. Rank candidates in-memory (affinity /
-    // readiness), then atomically pick + reserve in Postgres so a concurrent
-    // burst can't overcommit a host. The `pending` reservation row is finalized
-    // by `create_session_created` (an upsert) after boot, or released below on
-    // boot failure.
-    let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
-        .await
-        .map_err(engram_core::SandboxError::from)?;
-    let host_id = match state
-        .services
-        .meta
-        .reserve_placement(
-            session_id,
-            spec,
-            memory_mib as i64,
-            cpu_budget_vcpus as i32,
-            &candidates.hosts,
-            candidates.affinity_len,
-        )
-        .await
-        .map_err(|e| engram_core::SandboxError::Snapshot(format!("reserve_placement: {e}")))?
-    {
-        Some(h) => h,
-        // No candidate has room — surfaces as the same 503 a pick miss does.
-        None => return Err(crate::placement::PickError::NoCapacity.into()),
-    };
-    match state
-        .host_registry
-        .restore_base_on_host(host_id, metadata, session_env)
-        .await
-    {
-        Ok(sandbox_id) => Ok((host_id, sandbox_id)),
-        Err(e) => {
-            // Boot failed — release the reservation (delete the pending row).
-            // Best-effort; the reconcile backstop reaps a stuck pending row.
-            if let Err(del) = state.services.meta.delete_pending_session(session_id).await {
-                tracing::warn!(
-                    %session_id,
-                    error = %del,
-                    "delete_pending_session after boot failure failed; reconcile will reap",
-                );
-            }
-            Err(e)
-        }
-    }
 }
 
 /// ADR 0031: inject the initiating user's saved Claude Code OAuth token into
