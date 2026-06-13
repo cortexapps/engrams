@@ -1,6 +1,6 @@
 # ADR 0048: fleet autoscaling — queue-aware scale-up, teleport-packed scale-down
 
-**Status:** Proposed (2026-06-12)
+**Status:** Accepted (2026-06-13) — OSS code shipped + CI-green (commit chain in "Shipped" below). The scale-UP path (queue + 2D packing) and the coordinator-side drain hardening are exercised by live-PG + FC CI. The scale-DOWN actuator (GKE `deleteInstances`) and the end-to-end consolidation wave are UNVALIDATED on real infra until the engrams-internal staged rollout (§6) — the grow-only invariant caps the blast radius until then.
 **Related:** ADR 0044 K4 (scale-up policy + GKE actuator, shipped inert), ADR 0045 Phase E (scale-down decision engine #138; this ADR ships its actuator and E2), ADR 0046 (placement reservation), ADR 0047 (stateless coordinator — the prerequisite this work forced), ADR 0022/0043/0045 (the density + teleport substrate this rides)
 
 ## Context
@@ -246,3 +246,37 @@ only consider ballooning if the knob proves insufficient.
 - Prod: the staged rollout above, closing with the 100-lingering-sessions
   consolidation rehearsal (blackout p99 ≈ 330 ms budget; a synthetic burst
   mid-wave aborts and returns cordoned capacity instantly).
+
+## Shipped (2026-06-13)
+
+OSS commit chain (all on `main`, each CI-green; ADR 0047 — the stateless
+coordinator this forced — landed first):
+
+- C2 `ce5b60fd` CPU budgets (manifest `resources.vcpus` → session reserve)
+- C3 `b701e591` best-fit 2D pack placement
+- C4/C5 `20392f13`/`93d1f1f7` `SessionState::Queued` FSM + boot-pipeline extract
+- C6/C7 `0a5d18b6` queue scanner + create/resume queueing + demand fields
+- C8/C9 `14026327` drain don't-strand guard + `DELETE /admin/hosts/:id` + 2D fleet view
+- C10 `d5d80153` `two_host_drain_wave` FC integration (passed on real KVM in CI)
+- O1/O2 `c551a4e1` `NodePoolScaler::remove_node` + GKE `deleteInstances`
+- O3/O4 `a31a1131` queue-aware 2D `desired_hosts` + grow-only `set_size` guard
+- O5/O6/O7 wave planner (`wave.rs`) + stateless executor (`autoscale.rs`) +
+  CRD/chart/values for the scale-down knobs
+
+**Deferred (named follow-ups, not blockers):**
+
+- *Operator Prometheus metrics.* The coordinator already exposes the headline
+  scale-up signals (`engram_sessions_queued{,_mib}`, `engram_queue_outcome_total`,
+  C6); the operator surfaces wave decisions via structured logs today. A
+  `metrics-exporter-prometheus` endpoint on the operator (desired/queued
+  gauges, wave started/aborted/drain-timeout counters) is the observability
+  follow-up — wire it when the prod dashboards land (rollout step 4+).
+- *Resume placement bypasses PG reservation* (pre-existing ADR 0046 gap; the
+  wave's `placement_preview` narrows it).
+
+**Prod gate (engrams-internal, §6):** the GKE `deleteInstances` path and the
+end-to-end consolidation wave are unvalidated until the staged rollout —
+coord `replicas: 2` → `scaler: gke` scale-up → one manual supervised wave
+(verify the IGM mapping + that `deleteInstances` decrements `targetSize`) →
+`idleOnly` soak → `aggressive`. The grow-only invariant caps blast radius
+throughout.
