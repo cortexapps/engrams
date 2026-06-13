@@ -438,7 +438,12 @@ impl MetadataStore for PostgresStore {
               -- A `pending` row older than 10 min is a crash-orphaned
               -- reservation (a boot never takes that long); don't let it leak
               -- into the reserved figure and false-reject the host.
-              AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
+              -- ADR 0048: gate on last_active_at, not created_at — a session
+              -- can sit `queued` for many minutes before `place_queued_session`
+              -- flips it to `pending` (bumping last_active_at), and an old
+              -- created_at would make that fresh reservation look crash-orphaned
+              -- and leak (overcommit). reserve_placement sets both to NOW().
+              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
             GROUP BY host_id
             "#,
         )
@@ -645,7 +650,12 @@ impl MetadataStore for PostgresStore {
             WHERE host_id IS NOT NULL
               AND status IN ('pending','created','guest_ready','active',
                              'evacuating','evicting')
-              AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
+              -- ADR 0048: gate on last_active_at, not created_at — a session
+              -- can sit `queued` for many minutes before `place_queued_session`
+              -- flips it to `pending` (bumping last_active_at), and an old
+              -- created_at would make that fresh reservation look crash-orphaned
+              -- and leak (overcommit). reserve_placement sets both to NOW().
+              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
             GROUP BY host_id
             "#,
         )
@@ -707,7 +717,12 @@ impl MetadataStore for PostgresStore {
                 WHERE host_id IS NOT NULL
                   AND status IN ('pending','created','guest_ready','active',
                                  'evacuating','evicting')
-                  AND (status <> 'pending' OR created_at > NOW() - INTERVAL '10 minutes')
+                  -- ADR 0048: gate on last_active_at, not created_at — a session
+              -- can sit `queued` for many minutes before `place_queued_session`
+              -- flips it to `pending` (bumping last_active_at), and an old
+              -- created_at would make that fresh reservation look crash-orphaned
+              -- and leak (overcommit). reserve_placement sets both to NOW().
+              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
                 GROUP BY host_id
             ) r ON r.host_id = h.id
             WHERE h.status IN ('ready','draining') AND NOT h.cordoned

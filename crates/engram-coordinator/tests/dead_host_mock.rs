@@ -299,6 +299,7 @@ fn legal_path_from_pending(target: SessionState) -> &'static [SessionState] {
     use SessionState::*;
     match target {
         Pending => &[],
+        Queued => &[Queued],
         Created => &[Created],
         GuestReady => &[Created, GuestReady],
         Active => &[Created, Active],

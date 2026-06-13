@@ -78,10 +78,17 @@ construction) owns the continuation:
   (`place_queued_session`), then the boot continuation runs on a bounded
   JoinSet; boot failure re-queues (the timeout clock keeps the original
   `queued_at`).
-- `queued_at + ENGRAM_QUEUE_TIMEOUT_SECS` (default 900 — node provision
-  ~2–3 min + image prefetch + margin) exceeded ⇒ create-origin →
-  `Failed` + a user-visible `queue_timeout` event; resume-origin → back to
-  `Idle` (durable; never Failed).
+- `queued_at + ENGRAM_QUEUE_TIMEOUT_SECS` (default **1800 = 30 min**)
+  exceeded ⇒ create-origin → `Failed` + a user-visible `queue_timeout`
+  event; resume-origin → back to `Idle` (durable; never Failed). The
+  timeout is deliberately generous: it is a backstop for the
+  *permanently-stuck* case (maxHosts hit, cloud quota/stockout), NOT a
+  budget for normal scale-up. A cold scale-up is node provision (~2–3 min)
+  + image prefetch (minutes for a cold image) + base-snapshot warm + the
+  occasional wait for a *peer* session to free room when at maxHosts —
+  comfortably under 30 min, with headroom. Operators who would rather wait
+  even longer than ever drop a request raise the knob; we prefer a long
+  queue to a 503.
 - FSM edges: `Pending→Queued`, `Idle→Queued`, `Queued→Pending` (placed),
   `Queued→Idle` (resume dequeue + resume timeout), `Queued→Failed`
   (create timeout / cancel). `reserves_host_memory(Queued) = false`.

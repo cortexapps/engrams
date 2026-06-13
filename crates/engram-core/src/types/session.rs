@@ -13,18 +13,25 @@ use super::ids::{HostId, SandboxId, SessionId};
 /// truth — call sites do not encode their own preconditions.
 ///
 /// Persistence: the column is `TEXT`; the wire form is the
-/// snake_case spelling of each variant. `Pending` is the only
-/// non-persisted state (it exists in the API caller's pre-insert
-/// view and as the `from` of the first `StatusChanged` event — no
-/// row in `sessions` ever has `status='pending'`).
+/// snake_case spelling of each variant. (`Pending` is persisted since
+/// ADR 0046 — a sandbox-less `pending` row is the placement
+/// reservation — and is also the `from` of the first `StatusChanged`
+/// event a freshly-created session emits.)
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
-    /// Request accepted; scheduler hasn't returned yet. In-memory /
-    /// events-only — no row in `sessions` is ever written with this
-    /// state. The `from` side of the first `StatusChanged` event a
-    /// freshly-created session emits.
+    /// Request accepted; a host has been reserved (ADR 0046 — a
+    /// sandbox-less `pending` row IS the reservation) but the sandbox
+    /// isn't bound yet. Also the `from` side of the first
+    /// `StatusChanged` event a freshly-created session emits.
     Pending,
+    /// ADR 0048: accepted but no host had capacity, so instead of a 503
+    /// the session waits in a FIFO queue (`host_id` NULL, `queued_at`
+    /// set). The queue scanner re-attempts placement each tick and
+    /// either drives it forward (`Queued → Pending` for a create,
+    /// `Queued → Idle` to resume) or fails it on timeout
+    /// (`Queued → Failed`). Holds no host memory reservation.
+    Queued,
     /// Sandbox is bound to a host (`host_id` + `sandbox_id` populated)
     /// but nothing further is proven. `start_agent` has not yet run;
     /// agentd may not be reachable; harness (if any) has not been
@@ -140,6 +147,7 @@ impl SessionState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Queued => "queued",
             Self::Created => "created",
             Self::GuestReady => "guest_ready",
             Self::Active => "active",
@@ -169,19 +177,26 @@ impl SessionState {
     /// startup `repopulate_routing` strands the session after a pod
     /// roll. Mock stores filter with this so they can't drift.
     pub fn is_live(&self) -> bool {
-        !self.is_terminal() && !matches!(self, Self::HostLost)
+        // `Queued` is excluded alongside `HostLost`: it has no sandbox
+        // binding to rehydrate (host_id NULL), and the queue scanner
+        // finds it via its own FIFO query, not `list_active_sessions`.
+        !self.is_terminal() && !matches!(self, Self::HostLost | Self::Queued)
     }
 
     /// Single source of truth for legal transitions. Per ADR 0015 M2
     /// + ADR 0018 commit 12 (Evacuating) + ADR 0034 (Evicting):
     ///
     /// ```text
-    /// Pending     -> Created | Failed
+    /// Pending     -> Created | Failed | Queued
+    /// Queued      -> Pending (placed create) | Idle (resume dequeue
+    ///                / resume-origin timeout) | Failed (create timeout
+    ///                / cancel)
     /// Created     -> GuestReady | Active | Failed | HostLost
     /// GuestReady  -> Active | Failed | HostLost
     /// Active      -> Idle | HostLost | Evacuating | Evicting | Failed
     ///              | Completed | Dead
-    /// Idle        -> Created (resume) | Dead | Completed
+    /// Idle        -> Created (resume) | Dead | Completed | Queued (resume
+    ///                hit no capacity, ADR 0048)
     /// HostLost    -> Created | Idle | Evacuating | Dead | Completed
     /// Evacuating  -> Created (scanner resumes on peer)
     ///              | Idle (scanner exhausted retries; user /resume)
@@ -208,14 +223,19 @@ impl SessionState {
         // comment block above). Every `from` state covered, including
         // the three terminal arms that always return false.
         match self {
-            Pending => matches!(target, Created | Failed),
+            Pending => matches!(target, Created | Failed | Queued),
+            // ADR 0048: a placed create flips Queued → Pending (re-enters
+            // the normal boot path); a resume dequeue or a resume-origin
+            // timeout goes Queued → Idle; a create-origin timeout / cancel
+            // goes Queued → Failed.
+            Queued => matches!(target, Pending | Idle | Failed),
             Created => matches!(target, GuestReady | Active | Failed | HostLost),
             GuestReady => matches!(target, Active | Failed | HostLost),
             Active => matches!(
                 target,
                 Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead
             ),
-            Idle => matches!(target, Created | Dead | Completed),
+            Idle => matches!(target, Created | Dead | Completed | Queued),
             HostLost => matches!(target, Created | Idle | Evacuating | Dead | Completed),
             Evacuating => matches!(target, Created | Idle | Dead | Completed),
             Evicting => matches!(target, Idle | HostLost | Dead | Completed),
@@ -234,7 +254,9 @@ impl SessionState {
         use SessionState::*;
         let target = match self {
             Active | Idle | HostLost | Evacuating | Evicting => Completed,
-            Pending | Created | GuestReady => Failed,
+            // Queued never ran → Failed, alongside the other never-usable
+            // early states.
+            Pending | Queued | Created | GuestReady => Failed,
             Failed | Completed | Dead => return None,
         };
         debug_assert!(
@@ -453,6 +475,7 @@ mod tests {
     fn session_state_as_str_matches_serde_form() {
         for s in [
             SessionState::Pending,
+            SessionState::Queued,
             SessionState::Created,
             SessionState::GuestReady,
             SessionState::Active,
@@ -481,6 +504,11 @@ mod tests {
         let allowed: &[(SessionState, SessionState)] = &[
             (Pending, Created),
             (Pending, Failed),
+            (Pending, Queued),
+            (Queued, Pending),
+            (Queued, Idle),
+            (Queued, Failed),
+            (Idle, Queued),
             (Created, GuestReady),
             (Created, Active),
             (Created, Failed),
@@ -513,8 +541,8 @@ mod tests {
             (Evicting, Completed),
         ];
         let all_states = [
-            Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting, Failed,
-            Completed, Dead,
+            Pending, Queued, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
+            Failed, Completed, Dead,
         ];
         for &from in &all_states {
             for &to in &all_states {
@@ -540,7 +568,7 @@ mod tests {
         for terminal in [Failed, Completed, Dead] {
             assert!(terminal.is_terminal());
             for target in [
-                Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
+                Pending, Queued, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
             ] {
                 assert_eq!(
                     terminal.try_transition_to(target),

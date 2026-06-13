@@ -263,6 +263,15 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         SessionState::Pending => Err(ApiError::Conflict(
             "session is pending — scheduling has not completed".into(),
         )),
+        // ADR 0048: accepted but waiting for fleet capacity. Retryable —
+        // the queue scanner drives it to Active (or Idle, then resume)
+        // once a host frees up / scales in; the client polls
+        // /sessions/:id/events for the flip, same as Pending.
+        SessionState::Queued => Err(ApiError::Conflict(
+            "session is queued — waiting for host capacity (the fleet is \
+             scaling up). It will resume automatically once placed."
+                .into(),
+        )),
         SessionState::HostLost => Err(ApiError::HostLost(
             "session's host went away; resume from a snapshot if one exists".into(),
         )),

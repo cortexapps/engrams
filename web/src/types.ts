@@ -15,6 +15,9 @@
  * `status_changed` event during create.
  *
  *   pending     — request accepted, scheduler not yet returned
+ *   queued      — accepted but no host had capacity; waiting FIFO for
+ *                 scale-up (ADR 0048). Resolves to created/active once
+ *                 placed, or failed on a long timeout.
  *   created     — sandbox bound; agentd not yet started
  *   guest_ready — agentd reachable; harness not yet running
  *   active      — agentd reachable AND harness running (or
@@ -36,6 +39,7 @@
  */
 export type SessionState =
   | "pending"
+  | "queued"
   | "created"
   | "guest_ready"
   | "active"

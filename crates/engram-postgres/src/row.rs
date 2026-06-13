@@ -412,6 +412,7 @@ pub(crate) fn parse_session_state_for_lib(s: &str) -> Result<SessionState, MetaE
 fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
     Ok(match s {
         "pending" => SessionState::Pending,
+        "queued" => SessionState::Queued,
         "created" => SessionState::Created,
         "guest_ready" => SessionState::GuestReady,
         "active" => SessionState::Active,
@@ -495,12 +496,14 @@ mod tests {
     fn session_state_parses_every_variant() {
         let variants = [
             ("pending", SessionState::Pending),
+            ("queued", SessionState::Queued),
             ("created", SessionState::Created),
             ("guest_ready", SessionState::GuestReady),
             ("active", SessionState::Active),
             ("idle", SessionState::Idle),
             ("host_lost", SessionState::HostLost),
             ("evacuating", SessionState::Evacuating),
+            ("evicting", SessionState::Evicting),
             ("completed", SessionState::Completed),
             ("failed", SessionState::Failed),
             ("dead", SessionState::Dead),

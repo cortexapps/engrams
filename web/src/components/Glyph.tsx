@@ -47,6 +47,7 @@ export function StatusGlyph({ status, beat = true }: GlyphProps) {
 function glyphFor(status: SessionState): string {
   switch (status) {
     case "pending":
+    case "queued":
       return "○";
     case "created":
     case "guest_ready":
@@ -75,6 +76,7 @@ function toneFor(status: SessionState): string {
       return "var(--ring)"; // racing green on paper, lime on the dark ground
     case "idle":
     case "pending":
+    case "queued":
     case "created":
     case "guest_ready":
     // Transitional suspend/relocate: faded like idle — on their way there
