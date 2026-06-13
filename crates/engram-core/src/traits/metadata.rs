@@ -125,6 +125,7 @@ pub trait MetadataStore: Send + Sync {
         _mem_budget_mib: i64,
         _cpu_budget_vcpus: i32,
         candidates: &[HostId],
+        _affinity_len: usize,
     ) -> Result<Option<HostId>, MetaError> {
         Ok(candidates.first().copied())
     }
@@ -192,14 +193,15 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// ADR 0047: per-host reserved guest-RAM (Σ `mem_budget_mib` over the
-    /// memory-reserving session states) — the read-side twin of
-    /// `reserve_placement`'s aggregate, for the capacity-soft resume/evac
-    /// picker and the fleet view. Default impl (mocks): empty map (no
-    /// reservations).
-    async fn per_host_reserved_mib(
+    /// ADR 0047/0048: per-host reserved budget (Σ `mem_budget_mib` AND
+    /// Σ `cpu_budget_vcpus` over the memory-reserving session states) —
+    /// the read-side twin of `reserve_placement`'s aggregate, for the
+    /// capacity-soft resume/evac picker and the fleet view. Default impl
+    /// (mocks): empty map (no reservations).
+    async fn per_host_reserved(
         &self,
-    ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
+    ) -> Result<std::collections::HashMap<HostId, crate::types::host::ReservedBudget>, MetaError>
+    {
         Ok(std::collections::HashMap::new())
     }
 

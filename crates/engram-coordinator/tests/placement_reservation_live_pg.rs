@@ -104,15 +104,17 @@ fn spec() -> SessionSpec {
 
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn burst_spreads_across_hosts_then_rejects_overflow() {
+async fn burst_packs_one_host_then_overflows_then_rejects() {
     let Some(meta) = connect().await else {
         return;
     };
     // Unique hostnames per run so repeats don't collide on upsert_host's
     // ON CONFLICT (hostname); reserve_placement is candidate-scoped
     // (`host_id = ANY($candidates)`), so this is robust under parallel tests
-    // sharing the DB. Two 16 GiB hosts, 4 GiB budgets: exactly 4 fit per host
-    // (the OOM incident shape, scaled down).
+    // sharing the DB. Two 16 GiB hosts, 4 GiB budgets: exactly 4 fit per host.
+    // ADR 0048: placement now PACKS (best-fit) — it fills one host before
+    // spilling to the next, so scale-down has a fully-idle host to shed — while
+    // still rejecting the overflow (admission control that stopped the OOM).
     let tag = SessionId::new();
     let host_a = seed_host(&meta, &format!("plc-a-{tag}"), 16384).await;
     let host_b = seed_host(&meta, &format!("plc-b-{tag}"), 16384).await;
@@ -122,7 +124,7 @@ async fn burst_spreads_across_hosts_then_rejects_overflow() {
     let mut placed = Vec::new();
     for _ in 0..8 {
         let picked = meta
-            .reserve_placement(SessionId::new(), &spec(), budget, 2, &candidates)
+            .reserve_placement(SessionId::new(), &spec(), budget, 2, &candidates, 0)
             .await
             .expect("reserve_placement ok");
         placed.push(picked);
@@ -131,17 +133,25 @@ async fn burst_spreads_across_hosts_then_rejects_overflow() {
         placed.iter().all(Option::is_some),
         "first 8 (4 per 16 GiB host) must all place; got {placed:?}"
     );
+    // Best-fit packs the tie-break-earlier host (host_a) completely before
+    // host_b takes any: the first four land on one host, the last four on the
+    // other — NOT interleaved.
+    let first_four: Vec<_> = placed[..4].iter().map(|h| h.unwrap()).collect();
+    assert!(
+        first_four.iter().all(|&h| h == first_four[0]),
+        "best-fit must PACK one host with the first 4, not spread: {placed:?}"
+    );
     let on_a = placed.iter().filter(|h| **h == Some(host_a)).count();
     let on_b = placed.iter().filter(|h| **h == Some(host_b)).count();
     assert_eq!(
         (on_a, on_b),
         (4, 4),
-        "a burst must SPREAD evenly across hosts, not stack onto one (the OOM)"
+        "both 16 GiB hosts end full (4 each) — packed, not stacked-past-capacity"
     );
 
     // 9th: both hosts at allocatable (4×4096 = 16384) → free 0 → reject.
     let ninth = meta
-        .reserve_placement(SessionId::new(), &spec(), budget, 2, &candidates)
+        .reserve_placement(SessionId::new(), &spec(), budget, 2, &candidates, 0)
         .await
         .expect("reserve_placement ok");
     assert_eq!(

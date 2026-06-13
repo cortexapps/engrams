@@ -301,6 +301,7 @@ pub async fn evacuate_dead_source(
         image_version: image_tag,
         prefer_snapshot_id: snapshot.as_ref().map(|s| s.id),
         memory_mib: None,
+        cpu_budget_vcpus: None,
         // Target-selection: image-cache-warm preference is a future
         // refinement (defer when we add zone tagging to HostState).
         // Today we accept any host that can take the work, but never

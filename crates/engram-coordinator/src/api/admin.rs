@@ -909,6 +909,7 @@ pub async fn drain_host(
                             image_version: tag,
                             prefer_snapshot_id: None,
                             memory_mib: None,
+                            cpu_budget_vcpus: None,
                             required_image_digest: None,
                             exclude_host: Some(host_id),
                             prefer_host: None,

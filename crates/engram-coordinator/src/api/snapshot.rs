@@ -1038,6 +1038,7 @@ async fn resume_from_fc_snapshot(
         image_version: image_tag,
         prefer_snapshot_id: Some(record.id),
         memory_mib: None,
+        cpu_budget_vcpus: None,
         // Restore from a snapshot reuses an existing in-memory image —
         // no chunked-rootfs prefetch needed on the resume path. Snapshot
         // affinity already constrains to a host that has the bytes.

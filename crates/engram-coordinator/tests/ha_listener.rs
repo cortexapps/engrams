@@ -337,6 +337,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
         image_version: "v",
         prefer_snapshot_id: None,
         memory_mib: None,
+        cpu_budget_vcpus: None,
         required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(
             digest.clone(),
         )),

@@ -183,6 +183,38 @@ pub struct HostHeartbeat {
     pub total_vcpus: u32,
 }
 
+/// ADR 0048: per-host reserved budget across BOTH placement dimensions —
+/// Σ over the memory-reserving session states of `mem_budget_mib` and
+/// `cpu_budget_vcpus`. The read-side twin of `reserve_placement`'s
+/// in-transaction aggregate, for the resume/evac picker and the fleet view.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReservedBudget {
+    pub mem_mib: i64,
+    pub vcpus: i64,
+}
+
+/// ADR 0048: the CPU overcommit factor. The host CPU budget is
+/// `total_vcpus × factor` — FC guests idle heavily and RAM is the hard
+/// constraint, so CPU is deliberately oversubscribed to keep packing
+/// from being CPU-bound far below the memory ceiling.
+/// `ENGRAM_CPU_OVERCOMMIT`, default 4.0; a non-positive / unparseable
+/// value falls back to the default.
+pub fn cpu_overcommit_factor() -> f64 {
+    std::env::var("ENGRAM_CPU_OVERCOMMIT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|f| *f > 0.0)
+        .unwrap_or(4.0)
+}
+
+/// ADR 0048: a host's schedulable vCPU budget — `total_vcpus × overcommit`.
+/// `0` when the host hasn't reported its core count yet (pre-0048
+/// host-agent), which the picker treats as "no CPU constraint" (the same
+/// soft posture as an unmeasured RAM allocatable).
+pub fn host_cpu_budget(total_vcpus: u32) -> i64 {
+    (total_vcpus as f64 * cpu_overcommit_factor()).floor() as i64
+}
+
 /// Specification for provisioning a new host (autoscaling).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostSpec {

@@ -647,6 +647,7 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
         image_version: "v1",
         prefer_snapshot_id: None,
         memory_mib: None,
+        cpu_budget_vcpus: None,
         required_image_digest: None,
         exclude_host: None,
         prefer_host: None,

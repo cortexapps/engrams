@@ -84,40 +84,78 @@ fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
 }
 
-/// ADR 0046: least-loaded-that-fits among `candidates` (ranked). `free = total
-/// − reserved − residency_floor`; ties break toward the earlier (affinity-
-/// preferred) candidate. `None` → no candidate has room → caller rejects (503).
-/// Pure (no I/O) so it's unit-tested without a database — it is the placement
-/// decision the OOM incident needed.
+/// ADR 0048: per-host placement inputs. `alloc_mib` is the host-measured
+/// RAM headroom (`<= 0` = unmeasured); `cpu_budget` is `total_vcpus ×
+/// overcommit` (`0` = host hasn't reported its core count → no CPU gate).
+#[derive(Clone, Copy, Debug, Default)]
+struct HostFit {
+    alloc_mib: i64,
+    reserved_mib: i64,
+    cpu_budget: i64,
+    reserved_vcpus: i64,
+}
+
+/// ADR 0046/0048: BEST-FIT, 2D placement among `candidates` (ranked, with the
+/// snapshot-affinity hosts forming the first `affinity_len`). Packs onto the
+/// host with the SMALLEST free RAM that still fits BOTH dimensions
+/// (`free_mib ≥ budget_mib AND free_vcpus ≥ budget_vcpus`) — best-fit so
+/// scale-down pressure surfaces instead of spreading. The affinity prefix is a
+/// real tier: a fitting affinity host wins over a tighter non-affinity host.
+/// Unmeasured-RAM hosts (dev / brand-new) are a last-resort fallback spanning
+/// both tiers. `None` → nothing fits → caller rejects / queues.
+///
+/// Pure (no I/O) so it's unit-tested without a database.
 fn choose_placement_host(
     candidates: &[uuid::Uuid],
-    allocatable_mib: &std::collections::HashMap<uuid::Uuid, i64>,
-    reserved_mib: &std::collections::HashMap<uuid::Uuid, i64>,
+    affinity_len: usize,
+    fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
     budget_mib: i64,
+    budget_vcpus: i64,
 ) -> Option<uuid::Uuid> {
-    let mut best_known: Option<(i64, uuid::Uuid)> = None;
-    let mut fallback_unknown: Option<uuid::Uuid> = None;
+    let split = affinity_len.min(candidates.len());
+    best_fit_measured(&candidates[..split], fit, budget_mib, budget_vcpus)
+        .or_else(|| best_fit_measured(&candidates[split..], fit, budget_mib, budget_vcpus))
+        // Last resort across BOTH tiers: a host with no allocatable
+        // measurement yet (don't gate on a bogus 0; let dev/new hosts work).
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|h| fit.get(h).is_some_and(|f| f.alloc_mib <= 0))
+                .copied()
+        })
+}
+
+/// Best-fit (smallest free RAM that fits both dims) among MEASURED hosts.
+fn best_fit_measured(
+    candidates: &[uuid::Uuid],
+    fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
+    budget_mib: i64,
+    budget_vcpus: i64,
+) -> Option<uuid::Uuid> {
+    let mut best: Option<(i64, uuid::Uuid)> = None; // (free_mib, host)
     for h in candidates {
-        let Some(&alloc) = allocatable_mib.get(h) else {
-            continue; // not ready/draining at lock time → skip
+        let Some(f) = fit.get(h) else {
+            continue; // not ready/draining at lock time
         };
-        if alloc <= 0 {
-            // No allocatable measurement yet (non-Linux dev backend, pre-0058,
-            // or a brand-new host) — don't gate on a bogus 0; keep as a
-            // last-resort fallback so dev/new hosts still take work.
-            fallback_unknown.get_or_insert(*h);
+        if f.alloc_mib <= 0 {
+            continue; // unmeasured — handled by the fallback tier
+        }
+        let free_mib = f.alloc_mib - f.reserved_mib;
+        if free_mib < budget_mib {
             continue;
         }
-        let free = alloc - reserved_mib.get(h).copied().unwrap_or(0);
-        if free < budget_mib {
+        // CPU dimension: only gate when the host reported a budget.
+        if f.cpu_budget > 0 && f.cpu_budget - f.reserved_vcpus < budget_vcpus {
             continue;
         }
-        match best_known {
-            Some((bf, _)) if bf >= free => {}
-            _ => best_known = Some((free, *h)),
+        // SMALLEST free that fits (best-fit); ties toward the earlier
+        // (higher-ranked) candidate.
+        match best {
+            Some((bf, _)) if bf <= free_mib => {}
+            _ => best = Some((free_mib, *h)),
         }
     }
-    best_known.map(|(_, h)| h).or(fallback_unknown)
+    best.map(|(_, h)| h)
 }
 
 // Kept beside `choose_placement_host` (the fn it exercises) rather than at the
@@ -125,7 +163,7 @@ fn choose_placement_host(
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod placement_tests {
-    use super::choose_placement_host;
+    use super::{choose_placement_host, HostFit};
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -133,65 +171,117 @@ mod placement_tests {
         (1..=n as u128).map(Uuid::from_u128).collect()
     }
 
+    /// Build a fit map from (alloc_mib, reserved_mib) pairs; CPU budget
+    /// left at 0 (= no CPU gate) unless a test overrides it.
+    fn ram_fit(entries: &[(Uuid, i64, i64)]) -> HashMap<Uuid, HostFit> {
+        entries
+            .iter()
+            .map(|&(id, alloc, reserved)| {
+                (
+                    id,
+                    HostFit {
+                        alloc_mib: alloc,
+                        reserved_mib: reserved,
+                        cpu_budget: 0,
+                        reserved_vcpus: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn picks_least_loaded_that_fits() {
+    fn best_fit_packs_onto_the_tightest_host_that_fits() {
+        // h0 has LESS free (4768) than h1 (32768); best-fit packs h0.
         let h = ids(2);
-        let total: HashMap<_, _> = [(h[0], 32768i64), (h[1], 32768)].into();
-        let reserved: HashMap<_, _> = [(h[0], 28000i64)].into(); // h0 nearly full
-        assert_eq!(
-            choose_placement_host(&h, &total, &reserved, 4096),
-            Some(h[1])
-        );
+        let fit = ram_fit(&[(h[0], 32768, 28000), (h[1], 32768, 0)]);
+        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0), Some(h[0]));
     }
 
     #[test]
     fn rejects_when_none_fit() {
         let h = ids(2);
-        let total: HashMap<_, _> = [(h[0], 8192i64), (h[1], 8192)].into();
-        let reserved: HashMap<_, _> = [(h[0], 6000i64), (h[1], 6000)].into();
-        assert_eq!(choose_placement_host(&h, &total, &reserved, 4096), None);
+        let fit = ram_fit(&[(h[0], 8192, 6000), (h[1], 8192, 6000)]);
+        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0), None);
+    }
+
+    #[test]
+    fn cpu_dimension_binds_before_ram() {
+        // Both hosts have ample RAM, but h0's CPU budget is exhausted
+        // (8 budget − 8 reserved = 0 free vCPU) so a 2-vCPU session must
+        // land on h1 despite h0 being the tighter RAM fit.
+        let h = ids(2);
+        let fit: HashMap<_, _> = [
+            (
+                h[0],
+                HostFit {
+                    alloc_mib: 32768,
+                    reserved_mib: 28000,
+                    cpu_budget: 8,
+                    reserved_vcpus: 8,
+                },
+            ),
+            (
+                h[1],
+                HostFit {
+                    alloc_mib: 32768,
+                    reserved_mib: 0,
+                    cpu_budget: 32,
+                    reserved_vcpus: 0,
+                },
+            ),
+        ]
+        .into();
+        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 2), Some(h[1]));
     }
 
     #[test]
     fn unknown_allocatable_is_a_fallback_not_a_gate() {
         let h = ids(2);
         // h0 unmeasured (0), h1 measured + fits → prefer the measured host.
-        let alloc: HashMap<_, _> = [(h[0], 0i64), (h[1], 32768)].into();
+        let fit = ram_fit(&[(h[0], 0, 0), (h[1], 32768, 0)]);
+        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0), Some(h[1]));
+        // only the unmeasured host (dev backend / brand-new) → fall back to it.
+        let only0 = ram_fit(&[(h[0], 0, 0)]);
         assert_eq!(
-            choose_placement_host(&h, &alloc, &HashMap::new(), 4096),
+            choose_placement_host(&h[..1], 0, &only0, 4096, 0),
+            Some(h[0])
+        );
+    }
+
+    #[test]
+    fn affinity_prefix_wins_over_a_tighter_non_affinity_host() {
+        // h0 is the affinity host (affinity_len=1) with MORE free RAM;
+        // best-fit would otherwise prefer the tighter h1, but the
+        // affinity tier is tried first and h0 fits.
+        let h = ids(2);
+        let fit = ram_fit(&[(h[0], 32768, 0), (h[1], 32768, 28000)]);
+        assert_eq!(choose_placement_host(&h, 1, &fit, 4096, 0), Some(h[0]));
+        // ...but if the affinity host can't fit, fall through to best-fit
+        // over the remainder.
+        let full_affinity = ram_fit(&[(h[0], 8192, 8000), (h[1], 32768, 28000)]);
+        assert_eq!(
+            choose_placement_host(&h, 1, &full_affinity, 4096, 0),
             Some(h[1])
         );
-        // only the unmeasured host (dev backend / brand-new) → fall back to it.
-        let only0: HashMap<_, _> = [(h[0], 0i64)].into();
-        assert_eq!(
-            choose_placement_host(&h[..1], &only0, &HashMap::new(), 4096),
-            Some(h[0])
-        );
     }
 
+    /// The scenario this whole ADR exists for: a burst of 4 GiB sessions
+    /// onto two ~16 GiB hosts now PACKS one host full before spilling to
+    /// the next (best-fit), instead of spreading — so scale-down has a
+    /// fully-idle host to shed.
     #[test]
-    fn tie_breaks_toward_earlier_candidate() {
+    fn burst_packs_one_host_then_overflows_to_next() {
         let h = ids(2);
-        let total: HashMap<_, _> = [(h[0], 32768i64), (h[1], 32768)].into();
-        assert_eq!(
-            choose_placement_host(&h, &total, &HashMap::new(), 4096),
-            Some(h[0])
-        );
-    }
-
-    /// The incident in miniature: a burst of 4 GiB sessions onto two ~16 GiB
-    /// hosts. With each reservation feeding the next pick (as the FOR UPDATE
-    /// txn makes real), placement spreads evenly and rejects the overflow
-    /// instead of stacking onto one host and OOM-ing it.
-    #[test]
-    fn burst_spreads_then_rejects_overflow() {
-        let h = ids(2);
-        let total: HashMap<_, _> = [(h[0], 16384i64), (h[1], 16384)].into();
         let mut reserved: HashMap<Uuid, i64> = HashMap::new();
         let budget = 4096;
         let mut picks = Vec::new();
         for _ in 0..10 {
-            match choose_placement_host(&h, &total, &reserved, budget) {
+            let fit = ram_fit(&[
+                (h[0], 16384, reserved.get(&h[0]).copied().unwrap_or(0)),
+                (h[1], 16384, reserved.get(&h[1]).copied().unwrap_or(0)),
+            ]);
+            match choose_placement_host(&h, 0, &fit, budget, 0) {
                 Some(p) => {
                     *reserved.entry(p).or_default() += budget;
                     picks.push(Some(p));
@@ -199,11 +289,11 @@ mod placement_tests {
                 None => picks.push(None),
             }
         }
-        let placed = picks.iter().filter(|p| p.is_some()).count();
+        let placed = picks.iter().flatten().count();
         assert_eq!(placed, 8, "16384/4096 = 4 per host = 8 total fit");
+        // h0 fills completely (4 sessions) before h1 takes any — packing.
         let on0 = picks.iter().flatten().filter(|&&p| p == h[0]).count();
-        let on1 = picks.iter().flatten().filter(|&&p| p == h[1]).count();
-        assert_eq!((on0, on1), (4, 4), "spread evenly, not stacked");
+        assert_eq!(on0, 4, "best-fit packs h0 full before spilling to h1");
     }
 }
 
@@ -290,6 +380,7 @@ impl MetadataStore for PostgresStore {
         mem_budget_mib: i64,
         cpu_budget_vcpus: i32,
         candidates: &[HostId],
+        affinity_len: usize,
     ) -> Result<Option<HostId>, MetaError> {
         if candidates.is_empty() {
             return Ok(None);
@@ -302,7 +393,7 @@ impl MetadataStore for PostgresStore {
         // insert below (sub-ms).
         let host_rows = sqlx::query(
             r#"
-            SELECT id, allocatable_mib
+            SELECT id, allocatable_mib, total_vcpus
             FROM hosts
             WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
             FOR UPDATE
@@ -312,23 +403,34 @@ impl MetadataStore for PostgresStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        // ADR 0046: allocatable_mib is the host-measured headroom for new
-        // sessions (MemAvailable + Σ guest-resident) — it already nets out the
-        // daemon / OS / chunk-cache / mlock'd residency baseline, so we subtract
-        // only session budgets from it. 0 = no measurement yet (dev/pre-0058).
-        let mut alloc: std::collections::HashMap<uuid::Uuid, i64> =
+        // ADR 0046/0048: build the 2D fit map. allocatable_mib is the
+        // host-measured RAM headroom (nets out daemon/OS/chunk-cache/mlock
+        // baseline; 0 = unmeasured). The CPU budget is total_vcpus × overcommit
+        // (0 = host hasn't reported its core count → no CPU gate).
+        let mut fit: std::collections::HashMap<uuid::Uuid, HostFit> =
             std::collections::HashMap::with_capacity(host_rows.len());
         for r in &host_rows {
             let id: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
-            let a: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
-            alloc.insert(id, a);
+            let alloc_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
+            let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
+            fit.insert(
+                id,
+                HostFit {
+                    alloc_mib,
+                    reserved_mib: 0,
+                    cpu_budget: engram_core::types::host::host_cpu_budget(total_vcpus.max(0) as u32),
+                    reserved_vcpus: 0,
+                },
+            );
         }
         // Reserved within the txn — sees the committed `pending` rows of placers
         // that locked these hosts before us. Status list is the SQL twin of
         // `SessionState::host_memory_reserving_states()`.
         let res_rows = sqlx::query(
             r#"
-            SELECT host_id, COALESCE(SUM(mem_budget_mib), 0)::BIGINT AS reserved_mib
+            SELECT host_id,
+                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT AS reserved_mib,
+                   COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
             FROM sessions
             WHERE host_id = ANY($1)
               AND status IN ('pending','created','guest_ready','active',
@@ -344,16 +446,24 @@ impl MetadataStore for PostgresStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
-        let mut reserved: std::collections::HashMap<uuid::Uuid, i64> =
-            std::collections::HashMap::with_capacity(res_rows.len());
         for r in &res_rows {
             let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
-            let v: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
-            reserved.insert(h, v);
+            let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
+            let cpu: i64 = sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?;
+            if let Some(f) = fit.get_mut(&h) {
+                f.reserved_mib = mem;
+                f.reserved_vcpus = cpu;
+            }
         }
-        // Least-loaded-that-fits among the (ranked) candidates — see
-        // `choose_placement_host` (unit-tested).
-        let Some(picked) = choose_placement_host(&cand, &alloc, &reserved, mem_budget_mib) else {
+        // Best-fit, 2D, affinity-prefix-first among the ranked candidates —
+        // see `choose_placement_host` (unit-tested).
+        let Some(picked) = choose_placement_host(
+            &cand,
+            affinity_len,
+            &fit,
+            mem_budget_mib,
+            cpu_budget_vcpus as i64,
+        ) else {
             tx.rollback().await.map_err(db_err)?;
             return Ok(None);
         };
@@ -517,15 +627,20 @@ impl MetadataStore for PostgresStore {
         Ok(flipped)
     }
 
-    async fn per_host_reserved_mib(
+    async fn per_host_reserved(
         &self,
-    ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
+    ) -> Result<
+        std::collections::HashMap<HostId, engram_core::types::host::ReservedBudget>,
+        MetaError,
+    > {
         // Same predicate as `reserve_placement` / `fleet_free_mib` — the
         // memory-reserving states, with crash-orphaned `pending` rows
-        // excluded.
-        let rows: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
+        // excluded — but summing BOTH budget dimensions (ADR 0048).
+        let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(
             r#"
-            SELECT host_id, COALESCE(SUM(mem_budget_mib), 0)::BIGINT
+            SELECT host_id,
+                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT,
+                   COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT
             FROM sessions
             WHERE host_id IS NOT NULL
               AND status IN ('pending','created','guest_ready','active',
@@ -537,7 +652,15 @@ impl MetadataStore for PostgresStore {
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(rows.into_iter().map(|(h, v)| (HostId(h), v)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(h, mem_mib, vcpus)| {
+                (
+                    HostId(h),
+                    engram_core::types::host::ReservedBudget { mem_mib, vcpus },
+                )
+            })
+            .collect())
     }
 
     async fn delete_pending_session(&self, session_id: SessionId) -> Result<(), MetaError> {

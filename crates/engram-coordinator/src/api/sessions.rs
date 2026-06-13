@@ -1183,6 +1183,7 @@ async fn try_restore_base_snapshot(
         image_version: image_tag,
         prefer_snapshot_id: Some(snapshot_id),
         memory_mib: Some(memory_mib),
+        cpu_budget_vcpus: Some(cpu_budget_vcpus),
         // Base-snapshot chunks are pulled from BlobStorage on demand by
         // the restore path; no host needs to have prefetched the image.
         required_image_digest: None,
@@ -1196,8 +1197,7 @@ async fn try_restore_base_snapshot(
     // boot failure.
     let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
         .await
-        .map_err(engram_core::SandboxError::from)?
-        .hosts;
+        .map_err(engram_core::SandboxError::from)?;
     let host_id = match state
         .services
         .meta
@@ -1206,7 +1206,8 @@ async fn try_restore_base_snapshot(
             spec,
             memory_mib as i64,
             cpu_budget_vcpus as i32,
-            &candidates,
+            &candidates.hosts,
+            candidates.affinity_len,
         )
         .await
         .map_err(|e| engram_core::SandboxError::Snapshot(format!("reserve_placement: {e}")))?

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use engram_core::traits::{HostClient, MetadataStore};
-use engram_core::types::host::{HostRecord, HostStatus};
+use engram_core::types::host::{HostRecord, HostStatus, ReservedBudget};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SnapshotId};
 use engram_protocol::heartbeat::ManifestDigest;
@@ -42,6 +42,10 @@ pub struct ScheduleContext<'a> {
     /// Memory hint for capacity ranking. `None` falls through to
     /// "any host with > 0 free capacity" rather than a strict fit.
     pub memory_mib: Option<u32>,
+    /// ADR 0048: vCPU budget for CPU-dimension ranking on the resume/evac
+    /// path. `None`/0 means "no CPU gate" (the create path commits CPU in
+    /// `reserve_placement`, not here).
+    pub cpu_budget_vcpus: Option<u32>,
     /// ADR 0015 M5: when set, restricts the candidate pool to hosts
     /// whose latest heartbeat reported this digest in `ready_images`.
     pub required_image_digest: Option<ManifestDigest>,
@@ -186,21 +190,23 @@ pub fn rank_hosts(
     }
 }
 
-/// Pure pick for the resume/evac path. Ranking tiers (unchanged from the
-/// pre-0047 in-memory picker):
+/// Pure pick for the resume/evac path. Ranking tiers:
 ///
 /// 1. snapshot-affinity (capacity-blind — the hot-tier hit is worth it),
-/// 2. `prefer_host` if it fits,
-/// 3. largest free RAM among hosts that fit `memory_mib`,
+/// 2. `prefer_host` if it fits both dimensions,
+/// 3. BEST-FIT: smallest free RAM among hosts that fit BOTH `memory_mib`
+///    and the CPU budget (ADR 0048 — pack, don't spread),
 /// 4. fallback: the first ranked candidate (hosts without an
 ///    allocatable measurement yet, or nothing fits — this path is
 ///    deliberately capacity-soft; only `reserve_placement` commits).
 ///
-/// "free" is `allocatable_mib − reserved` (ADR 0046's real headroom)
-/// rather than the old phantom `total − used(=0)`.
+/// "free RAM" is `allocatable_mib − reserved.mem_mib` (ADR 0046's real
+/// headroom); "free vCPU" is `total_vcpus × overcommit − reserved.vcpus`
+/// (ADR 0048; a host that hasn't reported its core count has budget 0 →
+/// no CPU gate, the soft posture).
 pub fn pick_from(
     hosts: &[HostRecord],
-    reserved_mib: &HashMap<HostId, i64>,
+    reserved: &HashMap<HostId, ReservedBudget>,
     ctx: &ScheduleContext<'_>,
     now: DateTime<Utc>,
     ttl: Duration,
@@ -216,31 +222,49 @@ pub fn pick_from(
     if ranked.affinity_len > 0 {
         return Ok(ranked.hosts[0]);
     }
-    let free_of = |id: HostId| -> Option<i64> {
+    let need_mib = ctx.memory_mib.unwrap_or(0) as i64;
+    let need_vcpus = ctx.cpu_budget_vcpus.unwrap_or(0) as i64;
+    // Free RAM for `id`: None ⇒ unmeasured (treated as "fits" softly).
+    let free_mib_of = |id: HostId| -> Option<i64> {
         let h = hosts.iter().find(|h| h.id == id)?;
         let alloc = h.utilization.allocatable_mib as i64;
         if alloc <= 0 {
-            return None; // no measurement yet — unknown, not zero
+            return None;
         }
-        Some(alloc - reserved_mib.get(&id).copied().unwrap_or(0))
+        Some(alloc - reserved.get(&id).map(|r| r.mem_mib).unwrap_or(0))
     };
-    let need = ctx.memory_mib.unwrap_or(0) as i64;
-    // 2. soft host-affinity, when it fits (unknown allocatable counts
+    // CPU fit for `id`: a host with budget 0 (unreported) doesn't gate.
+    let cpu_fits = |id: HostId| -> bool {
+        let Some(h) = hosts.iter().find(|h| h.id == id) else {
+            return false;
+        };
+        let budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
+        if budget <= 0 {
+            return true;
+        }
+        budget - reserved.get(&id).map(|r| r.vcpus).unwrap_or(0) >= need_vcpus
+    };
+    // 2. soft host-affinity, when it fits both dims (unknown RAM counts
     //    as fitting — same posture as `choose_placement_host`).
     if let Some(want) = ctx.prefer_host {
-        if ranked.hosts.contains(&want) && free_of(want).is_none_or(|f| f >= need) {
+        if ranked.hosts.contains(&want)
+            && free_mib_of(want).is_none_or(|f| f >= need_mib)
+            && cpu_fits(want)
+        {
             return Ok(want);
         }
     }
-    // 3. largest measured free that fits.
+    // 3. best-fit: SMALLEST measured free RAM that fits both dims.
     let mut best: Option<(i64, HostId)> = None;
     for &id in &ranked.hosts {
-        let Some(free) = free_of(id) else { continue };
-        if free < need {
+        let Some(free) = free_mib_of(id) else {
+            continue;
+        };
+        if free < need_mib || !cpu_fits(id) {
             continue;
         }
         match best {
-            Some((bf, _)) if bf >= free => {}
+            Some((bf, _)) if bf <= free => {}
             _ => best = Some((free, id)),
         }
     }
@@ -253,15 +277,15 @@ pub fn pick_from(
 
 async fn hosts_and_reserved(
     meta: &dyn MetadataStore,
-) -> Result<(Vec<HostRecord>, HashMap<HostId, i64>), PickError> {
+) -> Result<(Vec<HostRecord>, HashMap<HostId, ReservedBudget>), PickError> {
     let hosts = meta
         .list_active_hosts()
         .await
         .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
     let reserved = meta
-        .per_host_reserved_mib()
+        .per_host_reserved()
         .await
-        .map_err(|e| PickError::Internal(format!("per_host_reserved_mib: {e}")))?;
+        .map_err(|e| PickError::Internal(format!("per_host_reserved: {e}")))?;
     Ok((hosts, reserved))
 }
 
@@ -336,7 +360,8 @@ pub async fn pick_specific_host(
         return Err(PickError::NoCapacity);
     }
     let alloc = h.utilization.allocatable_mib as i64;
-    if alloc > 0 && alloc - reserved_of(&reserved, host_id) <= 0 {
+    let reserved_mib = reserved.get(&host_id).map(|r| r.mem_mib).unwrap_or(0);
+    if alloc > 0 && alloc - reserved_mib <= 0 {
         return Err(PickError::NoCapacity);
     }
     let backend = registry
@@ -344,10 +369,6 @@ pub async fn pick_specific_host(
         .await
         .map_err(|e| PickError::HostUnreachable(host_id, e.to_string()))?;
     Ok((host_id, backend))
-}
-
-fn reserved_of(reserved: &HashMap<HostId, i64>, id: HostId) -> i64 {
-    reserved.get(&id).copied().unwrap_or(0)
 }
 
 /// ADR 0020 P1: any schedulable host for a base-snapshot capture — NOT
@@ -459,10 +480,20 @@ mod tests {
             image_version: "v",
             prefer_snapshot_id: None,
             memory_mib: None,
+            cpu_budget_vcpus: None,
             required_image_digest: None,
             exclude_host: None,
             prefer_host: None,
         }
+    }
+
+    /// A reserved-budget map from (host, mem_mib) — vCPU left 0 unless a
+    /// test sets it explicitly.
+    fn mem_reserved(entries: &[(HostId, i64)]) -> HashMap<HostId, ReservedBudget> {
+        entries
+            .iter()
+            .map(|&(id, mem_mib)| (id, ReservedBudget { mem_mib, vcpus: 0 }))
+            .collect()
     }
 
     const TTL: Duration = Duration::from_secs(60);
@@ -519,14 +550,50 @@ mod tests {
     }
 
     #[test]
-    fn largest_measured_free_wins_and_reserved_counts() {
+    fn best_fit_packs_the_tightest_measured_host() {
+        // h1 has LESS free (4000) than h2 (32000); best-fit packs h1.
         let mut h1 = host(1);
         h1.utilization.allocatable_mib = 32_000;
         let mut h2 = host(2);
         h2.utilization.allocatable_mib = 32_000;
-        let reserved: HashMap<HostId, i64> = [(hid(1), 28_000i64)].into();
+        let reserved = mem_reserved(&[(hid(1), 28_000)]);
         let pick = pick_from(&[h1, h2], &reserved, &ctx(), Utc::now(), TTL).unwrap();
-        assert_eq!(pick, hid(2));
+        assert_eq!(pick, hid(1), "best-fit packs the tighter host");
+    }
+
+    #[test]
+    fn cpu_budget_excludes_a_host_with_no_free_vcpu() {
+        // h1 is the tighter RAM fit but its CPU budget is exhausted; a
+        // 2-vCPU session must land on h2.
+        let mut h1 = host(1);
+        h1.utilization.allocatable_mib = 32_000;
+        h1.total_vcpus = 8; // budget = 8 × overcommit(4) = 32
+        let mut h2 = host(2);
+        h2.utilization.allocatable_mib = 32_000;
+        h2.total_vcpus = 8;
+        let mut c = ctx();
+        c.memory_mib = Some(4_096);
+        c.cpu_budget_vcpus = Some(2);
+        // h1 reserved 32 vCPU (full); h2 reserved 0.
+        let reserved: HashMap<HostId, ReservedBudget> = [
+            (
+                hid(1),
+                ReservedBudget {
+                    mem_mib: 0,
+                    vcpus: 32,
+                },
+            ),
+            (
+                hid(2),
+                ReservedBudget {
+                    mem_mib: 0,
+                    vcpus: 0,
+                },
+            ),
+        ]
+        .into();
+        let pick = pick_from(&[h1, h2], &reserved, &c, Utc::now(), TTL).unwrap();
+        assert_eq!(pick, hid(2), "CPU-exhausted host is excluded");
     }
 
     #[test]
@@ -546,9 +613,9 @@ mod tests {
             TTL,
         )
         .unwrap();
-        assert_eq!(pick, hid(2), "prefer_host fits → wins over larger free");
+        assert_eq!(pick, hid(2), "prefer_host fits → wins over best-fit");
 
-        let reserved: HashMap<HostId, i64> = [(hid(2), 6_000i64)].into();
+        let reserved = mem_reserved(&[(hid(2), 6_000)]);
         let pick = pick_from(&[h1, h2], &reserved, &c, Utc::now(), TTL).unwrap();
         assert_eq!(pick, hid(1), "prefer_host full → falls through");
     }

@@ -168,8 +168,11 @@ rehearsal.
 ## Invariants / tradeoffs
 
 - **CPU overcommit 4.0 is a guess until calibrated**; `util_cpu_pct` on
-  packed hosts is the signal, and the knob is the response. RAM remains the
-  exact, hard constraint.
+  packed hosts is the signal, and the knob is the response. (4.0 matches
+  E2B's production default `R=4` — external validation that the ratio is
+  sane.) RAM remains the exact, hard constraint, reserved at the session's
+  *configured ceiling* (`mem_budget_mib`) — deliberately conservative; see
+  "Future work: memory density" for why and what to revisit.
 - **FIFO head-of-line blocking is deliberate** — fairness + a simple
   invariant (the operator scales to fit the head). A 32 GiB head blocks
   smaller queued sessions until capacity fits it.
@@ -186,6 +189,43 @@ rehearsal.
   blast radius at "MIG recreates a node", never "deletes a loaded node".
 - **Scale up fast, scale down slow** (ADR 0045's flapping risk): hysteresis
   on entry, one wave at a time, abort-on-queue.
+
+## Future work: memory density (measure on prod, then revisit)
+
+We reserve each session's **configured** RAM ceiling, not its measured
+resident footprint. That is provably OOM-safe but leaves density on the
+table: FC guest memory is demand-paged, so a 4 GiB-configured session that
+touches ~1.5 GiB carries ~2.5 GiB of phantom reservation, and ten of them on
+a host hide ~25 GiB the packer can't use. E2B captures exactly this gap —
+their placement gates on CPU alone (4× overcommit) and reserves **nothing**
+for memory, betting that demand-paged residency stays under host RAM. We
+don't take that bet today because memory's failure mode is a hard OOM cliff
+(ADR 0046), our base residency is `mlock`'d (unswappable by design), and dev
+builds touch and *keep* their working set with no active reclaim. (Disk swap
+is rejected outright — it trades the ~330 ms teleport latency we hold
+non-negotiable for unbounded fault latency and host-wide thrash; the queue is
+the correct back-pressure valve, not swap.)
+
+The lever to close the gap, gated on **prod measurement** of
+`Σ resident-RSS / Σ configured-budget` across real agent workloads:
+
+1. **A memory-overcommit ratio** symmetric to CPU's (`allocatable ×
+   mem_overcommit − Σ mem_budget`), default 1.0, raised toward ~1.2–1.5 once
+   the measured gap justifies it. Far more conservative than CPU's 4.0
+   because the failure is OOM, not slowdown — but it converts today's
+   hardcoded conservatism into a measured, reversible knob.
+2. **virtio-balloon + reserve-on-measured-working-set** — the true E2B-style
+   density: let guests return idle pages to the host and reserve against an
+   estimated working set rather than the configured ceiling. This is the
+   bigger structural bet: it interacts with snapshot/restore (FC balloon
+   caveats across resume) and with our `mlock`'d shared base, so it is its
+   own ADR, not a knob. Note we already have a density axis E2B lacks — the
+   shared, PSS-counted base — so the end state is *both*: shared clean base
+   (have it) **and** bounded overcommit on the per-session divergent set.
+
+Order of operations: ship strict-1.0 reservation now, instrument the
+configured-vs-resident ratio in prod, then introduce the overcommit knob, and
+only consider ballooning if the knob proves insufficient.
 
 ## Validation
 
