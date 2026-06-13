@@ -153,15 +153,22 @@ operator:
   # kvm nodes (default: schedule anywhere untainted).
   nodeSelector: {}
 
-  # ADR 0044 K4: node-pool autoscaling. The operator reads coordinator demand
-  # and sizes the host node pool to hold targetFreeMib of headroom (scale-up
-  # only in v1; drain-gated scale-down is a follow-up). The operator's default
-  # scaler is a noop that only LOGS the desired size — a GKE actuator is the
-  # follow-up, so enabling this today gives you the decision in logs, not a
-  # live resize.
+  # ADR 0044 K4 + ADR 0048: node-pool autoscaling. The operator reads
+  # coordinator demand and sizes the host node pool — scale-UP via set_size
+  # (2D + queue-aware, one-shot), scale-DOWN via the teleport-packed wave
+  # (drain the least-loaded nodes onto peers, then remove them). The default
+  # scaler (ENGRAM_NODE_POOL_SCALER unset) is a NOOP that only LOGS decisions;
+  # set it to "gke" (operator.scaler below) to actuate a real GKE pool.
   autoscaling:
     enabled: false
     nodePool: ""           # the cloud node pool the scaler resizes
     minHosts: 1            # set >= 1 (an empty fleet has no demand signal)
     maxHosts: 10
     targetFreeMib: 16384   # keep ~16 GiB of free guest-RAM headroom
+    # ADR 0048 scale-DOWN. off (default) = scale-up only. idleOnly sheds only
+    # fully-idle hosts; aggressive teleport-packs live sessions off the
+    # least-loaded hosts. The wave is bounded by the two caps below.
+    scaleDown: "off"
+    scaleDownHysteresisTicks: 3  # enter scale-down only after N agreeing ticks
+    maxShedPerWave: 1            # most victim nodes per wave
+    maxConcurrentDrains: 1       # most victims drained at once within a tick

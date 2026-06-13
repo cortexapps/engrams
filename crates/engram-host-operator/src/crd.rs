@@ -102,10 +102,29 @@ pub struct AutoscalingSpec {
     /// scale down slow). Pairs with the cold-node cost of re-adding a node.
     #[serde(default = "default_scale_down_hysteresis")]
     pub scale_down_hysteresis_ticks: u32,
+    /// ADR 0048: the most victim nodes a single scale-down WAVE may target.
+    /// Small waves are observable + bound the blast radius; the cost-optimal
+    /// target may be much lower, but we approach it a few nodes at a time.
+    #[serde(default = "default_max_shed_per_wave")]
+    pub max_shed_per_wave: u32,
+    /// ADR 0048: the most victims to DRAIN concurrently within one reconcile.
+    /// 1 is the safe default — the coordinator's R8 gate already serialises
+    /// per-host live migrations, so concurrent drains mostly help when many
+    /// victims are idle (nothing to teleport).
+    #[serde(default = "default_max_concurrent_drains")]
+    pub max_concurrent_drains: u32,
 }
 
 fn default_scale_down_hysteresis() -> u32 {
     3
+}
+
+fn default_max_shed_per_wave() -> u32 {
+    1
+}
+
+fn default_max_concurrent_drains() -> u32 {
+    1
 }
 
 /// Reported progress. v1 leaves this for `kubectl` visibility; the operator

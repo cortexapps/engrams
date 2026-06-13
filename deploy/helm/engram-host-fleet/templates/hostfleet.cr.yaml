@@ -19,13 +19,19 @@ spec:
   capacityFloor: {{ .Values.operator.capacityFloor }}
   drainTimeoutSeconds: {{ .Values.operator.drainTimeoutSeconds }}
   {{- if .Values.operator.autoscaling.enabled }}
-  # ADR 0044 K4: node-pool autoscaling. The operator sizes the pool to hold
-  # targetFreeMib of headroom (scale-up only in v1). With the default noop
-  # scaler it only logs the desired size; a GKE actuator is the follow-up.
+  # ADR 0044 K4 + ADR 0048: node-pool autoscaling. Scale-up sizes the pool to
+  # hold targetFreeMib of headroom (2D + queue-aware, one-shot); scale-down
+  # (off by default) teleport-packs live sessions off victim nodes, bounded by
+  # maxShedPerWave + maxConcurrentDrains. Only actuates with a real scaler
+  # (operator.scaler=gke); otherwise the noop scaler just logs decisions.
   autoscaling:
     nodePool: {{ required "operator.autoscaling.nodePool is required when autoscaling is enabled" .Values.operator.autoscaling.nodePool | quote }}
     minHosts: {{ .Values.operator.autoscaling.minHosts }}
     maxHosts: {{ .Values.operator.autoscaling.maxHosts }}
     targetFreeMib: {{ .Values.operator.autoscaling.targetFreeMib }}
+    scaleDown: {{ .Values.operator.autoscaling.scaleDown | default "off" | quote }}
+    scaleDownHysteresisTicks: {{ .Values.operator.autoscaling.scaleDownHysteresisTicks | default 3 }}
+    maxShedPerWave: {{ .Values.operator.autoscaling.maxShedPerWave | default 1 }}
+    maxConcurrentDrains: {{ .Values.operator.autoscaling.maxConcurrentDrains | default 1 }}
   {{- end }}
 {{- end }}

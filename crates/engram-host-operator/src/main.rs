@@ -6,11 +6,13 @@
 //! pod out from under a live microVM; this operator is the thing that *does*
 //! roll — after draining each node's coordinator host.
 
+mod autoscale;
 mod coord;
 mod crd;
 mod error;
 mod reconcile;
 mod scaler;
+mod wave;
 
 use std::sync::Arc;
 use std::time::Duration;

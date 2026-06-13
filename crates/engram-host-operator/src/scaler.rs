@@ -38,7 +38,7 @@ pub enum ScaleDownMode {
 }
 
 impl ScaleDownMode {
-    fn enabled(self) -> bool {
+    pub(crate) fn enabled(self) -> bool {
         !matches!(self, ScaleDownMode::Off)
     }
 }

@@ -22,6 +22,26 @@ pub struct HostStatus {
     pub running_sandboxes: u32,
 }
 
+/// One host's load + budget from `GET /api/hosts` (the `HostView` fields the
+/// scale-down wave planner needs). serde ignores the rest of the payload.
+/// ADR 0048: the budget fields are recent — `#[serde(default)]` keeps the
+/// operator tolerant of a pre-0048 coordinator (the wave just sees 0 free,
+/// which the 2D guard treats as "can't absorb", i.e. it won't shed — safe).
+#[derive(Clone, Debug, Deserialize)]
+pub struct HostLoad {
+    pub id: HostId,
+    pub cordoned: bool,
+    pub running_sandboxes: u32,
+    #[serde(default)]
+    pub reserved_mib: u64,
+    #[serde(default)]
+    pub free_mib: u64,
+    #[serde(default)]
+    pub reserved_vcpus: u64,
+    #[serde(default)]
+    pub free_vcpus: u64,
+}
+
 /// The coordinator API is versioned under this prefix — `api/mod.rs` nests the
 /// whole router at `/api/v1`. Centralised here (not at each call site) so a
 /// path typo can't silently 404; the `urls_are_v1_prefixed` test guards it.
@@ -88,13 +108,57 @@ impl CoordClient {
     /// (Evacuating = snapshot + warm-restore on a peer). Returns 202; the
     /// actual progress is observed via [`Self::host_status`].
     ///
-    /// **Reserved for the node-removal drain path** (ADR 0045 Phase E
-    /// scale-down actuation). Image rolls reattach and never drain
-    /// (`reconcile::roll_node`), so this currently has no caller.
-    #[allow(dead_code)]
+    /// The node-removal drain path (ADR 0045 Phase E / ADR 0048 scale-down).
+    /// Image rolls reattach and never drain (`reconcile::roll_node`); the
+    /// caller is the wave executor (`autoscale`).
     pub async fn drain(&self, host: HostId) -> Result<(), OperatorError> {
         self.post("drain", &format!("/admin/hosts/{host}/drain"))
             .await
+    }
+
+    /// `DELETE /api/v1/admin/hosts/:id` (ADR 0048) — deregister a drained host
+    /// immediately after `remove_node`, so its row doesn't linger to the
+    /// dead-host TTL. The coordinator 409s if any session is still bound, so
+    /// the wave only calls this after the drain gate reports 0 sandboxes.
+    pub async fn delete_host(&self, host: HostId) -> Result<(), OperatorError> {
+        let resp = self
+            .with_auth(self.http.delete(self.url(&format!("/admin/hosts/{host}"))))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OperatorError::Coord {
+                op: "delete_host",
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
+    /// `GET /api/v1/hosts` (ADR 0048) — every host's load + budget, for the
+    /// scale-down wave planner's victim selection + 2D capacity guard.
+    pub async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError> {
+        let resp = self
+            .with_auth(self.http.get(self.url("/hosts")))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OperatorError::Coord {
+                op: "list_hosts",
+                status: status.as_u16(),
+                body,
+            });
+        }
+        // `GET /api/hosts` → `{ "hosts": [ HostView, … ] }`.
+        #[derive(Deserialize)]
+        struct ListResp {
+            hosts: Vec<HostLoad>,
+        }
+        Ok(resp.json::<ListResp>().await?.hosts)
     }
 
     /// `GET /api/v1/hosts/:id` — the drain gate. `Ok(None)` means the host is
@@ -159,6 +223,11 @@ mod tests {
             "http://coord:8080/api/v1/admin/hosts/h1/drain"
         );
         assert_eq!(c.url("/hosts/h1"), "http://coord:8080/api/v1/hosts/h1");
+        assert_eq!(c.url("/hosts"), "http://coord:8080/api/v1/hosts");
+        assert_eq!(
+            c.url("/admin/hosts/h1"),
+            "http://coord:8080/api/v1/admin/hosts/h1"
+        );
         assert_eq!(
             c.url("/admin/fleet/demand"),
             "http://coord:8080/api/v1/admin/fleet/demand"
