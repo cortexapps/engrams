@@ -2433,23 +2433,15 @@ impl FirecrackerBackend {
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
 
-        // ADR 0048 (surfaced by the fleet load test): serialize concurrent
-        // restores FROM THE SAME BASE on this host across the
-        // shared-rootfs-symlink → load_snapshot window. Every VM descended
-        // from one base capture shares `source_rootfs_canonical` (the
-        // state.bin-embedded absolute rootfs path) — and unlike vsock, FC
-        // offers no load-time override to re-key it per sandbox. Two same-base
-        // restores otherwise (a) race the symlink install (TOCTOU `EEXIST` —
-        // the "/dev/nbdN: File exists" 503) and (b) can repoint the shared path
-        // between one VM's install and its load, so FC opens the WRONG device.
-        // The lock is held only across this restore (in UFFD mode — the prod
-        // base-restore path — `load_snapshot` returns immediately, so the hold
-        // is brief); different bases use different keys and stay concurrent.
-        // Per-host (process-local), which is exactly the collision's scope.
-        let _src_canon_guard = match manifest.source_rootfs_canonical.as_ref() {
-            Some(p) => Some(source_canonical_lock(p).lock_owned().await),
-            None => None,
-        };
+        // ADR 0048 (surfaced by the fleet load test): same-base concurrent
+        // restores share the FC-embedded `source_rootfs_canonical` rootfs path
+        // and collide on it. The fix — install that symlink + hold a
+        // per-source-path lock ONLY across `load_snapshot` (when FC opens the
+        // rootfs fd) — lives right before the load below, NOT here: holding it
+        // across all of `restore_in_jail` (netns + spawn + the cold chunk
+        // fetch) serialized a burst so hard the coordinator's restore RPC timed
+        // out. The load itself is ~5 ms in UFFD mode, so the tight window is
+        // nearly free.
 
         // ADR 0035 §3/§4: aux RO bundles.
         //
@@ -2805,6 +2797,42 @@ impl FirecrackerBackend {
         // bundle mounts at session bind so the guest's squashfs superblock
         // re-parses the swapped device. With no swap pending, keep the
         // single-call load-and-resume.
+        // ADR 0048 (load-test finding): install the SHARED, FC-embedded
+        // `source_rootfs_canonical` rootfs symlink pointing at OUR device, and
+        // hold a per-source-path lock ACROSS the load below so a concurrent
+        // same-base restore can't repoint it between our install and FC opening
+        // the rootfs fd (that repoint → FC opens the WRONG device; the racing
+        // install → "/dev/nbdN: File exists" 503). The per-NEW-sandbox
+        // `canonical` was already installed in leg 1 (unique, uncontended).
+        // Scoped to the load only: UFFD load returns in ~ms, so this serializes
+        // just the FD-open instant — the netns/spawn/cold chunk-fetch above all
+        // ran concurrently. Distinct bases use distinct paths and never contend.
+        let uniq_canonical = paths::rootfs_canonical(&self.work_dir, sandbox_id);
+        let _src_canon_guard = match (
+            manifest.source_rootfs_canonical.as_ref(),
+            manifest.spec.rootfs_source.as_ref(),
+        ) {
+            (Some(src), Some(target)) if src.as_path() != uniq_canonical.as_path() => {
+                let guard = source_canonical_lock(src).lock_owned().await;
+                if let Some(parent) = src.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        vm_err(format!(
+                            "create source rootfs canonical parent {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                paths::install_symlink(src, target).await.map_err(|e| {
+                    vm_err(format!(
+                        "restore source rootfs canonical symlink {} -> {}: {e}",
+                        src.display(),
+                        target.display()
+                    ))
+                })?;
+                Some(guard)
+            }
+            _ => None,
+        };
         let load_result: Result<(), SandboxError> = async {
             match &uffd_leg {
                 None => {
@@ -2924,6 +2952,9 @@ impl FirecrackerBackend {
             Ok(())
         }
         .await;
+        // FC has opened the rootfs fd (load returned); the shared path is free
+        // for the next same-base restore. Release before the post-load work.
+        drop(_src_canon_guard);
 
         let uffd_handler: Option<Child> = match load_result {
             Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
@@ -3226,27 +3257,13 @@ async fn restore_canonical_symlinks(
         // its canonical path on the manifest, recreate the file there
         // too (mkdir parent + symlink) so FC `load_snapshot` finds
         // the drive at the absolute path it expects.
-        if let Some(source_canonical) = manifest.source_rootfs_canonical.as_ref() {
-            if source_canonical != &canonical {
-                if let Some(parent) = source_canonical.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                        vm_err(format!(
-                            "create source rootfs canonical parent {}: {e}",
-                            parent.display()
-                        ))
-                    })?;
-                }
-                paths::install_symlink(source_canonical, rootfs_target)
-                    .await
-                    .map_err(|e| {
-                        vm_err(format!(
-                            "restore source rootfs canonical symlink {} -> {}: {e}",
-                            source_canonical.display(),
-                            rootfs_target.display()
-                        ))
-                    })?;
-            }
-        }
+        // NOTE: the SHARED `source_rootfs_canonical` symlink (the state.bin-
+        // embedded path, identical across every VM descended from one base) is
+        // installed by `restore_in_jail` under a per-source-path lock held only
+        // across `load_snapshot` — NOT here. Doing it here, off the lock, let
+        // same-base concurrent restores race it (TOCTOU `EEXIST` 503 + cross-VM
+        // repoint). This function only installs the per-NEW-sandbox `canonical`
+        // above, which is unique and never contended.
     }
     // Vsock: nothing to recreate. The load passes `vsock_override`
     // keyed to the NEW live sandbox id, so FC never binds the
