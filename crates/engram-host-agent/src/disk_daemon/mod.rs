@@ -58,7 +58,7 @@ pub use live_manifest_publisher::{
     CoordLiveManifestPublisher, LiveManifestPublisherHandle, SessionResolver,
 };
 pub use nbd::{NbdCommand, NbdReply, NbdRequest, NbdWireError, NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC};
-pub use slot::{NbdSlot, NbdSlotAllocator};
+pub use slot::{build_from_kernel as build_nbd_pool_from_kernel, NbdSlot, NbdSlotAllocator};
 
 #[cfg(target_os = "linux")]
 pub use runtime::{

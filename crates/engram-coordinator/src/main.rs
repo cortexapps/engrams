@@ -772,39 +772,15 @@ async fn main() -> Result<(), CoordinatorError> {
                     cli.local_path.join("chunk-cache"),
                 ),
             );
-            // ADR 0007 Phase 4: optional NBD daemon for chunked
-            // rootfs. `ENGRAM_NBD_DEVICES` is a comma-separated list
-            // of `/dev/nbdN` paths the host-agent allocates from when
-            // serving sessions whose image bundle carries a
-            // `disk_manifest`. Empty / unset → fall back to the
-            // materialize-to-file path (still correct, just slower
-            // cold start). Production Packer images load
-            // `modprobe nbd nbds_max=64` and populate this env var to
-            // match.
-            let nbd_pool = match std::env::var("ENGRAM_NBD_DEVICES") {
-                Ok(s) if !s.trim().is_empty() => {
-                    let paths: Vec<std::path::PathBuf> = s
-                        .split(',')
-                        .map(|p| p.trim())
-                        .filter(|p| !p.is_empty())
-                        .map(std::path::PathBuf::from)
-                        .collect();
-                    match engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(paths) {
-                        Ok(pool) => {
-                            tracing::info!(
-                                slots = pool.capacity(),
-                                "NBD daemon enabled; chunked rootfs serves /dev/nbdN",
-                            );
-                            Some(pool)
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "ENGRAM_NBD_DEVICES misconfigured; aborting");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                _ => None,
-            };
+            // ADR 0007 Phase 4 / ADR 0049: optional NBD daemon for
+            // chunked rootfs, with a warm-pool slot allocator that
+            // sizes itself from the kernel's `nbds_max` (the chart's
+            // `modprobe nbd nbds_max=<N>`), capped by
+            // `ENGRAM_NBD_MAX_SLOTS` and keeping `ENGRAM_NBD_WARM_SLOTS`
+            // slots warm. `None` (materialize-to-file fallback) when the
+            // nbd module isn't loaded or `ENGRAM_NBD_DISABLE` is set —
+            // still correct, just a slower cold start.
+            let nbd_pool = engram_host_agent::disk_daemon::build_nbd_pool_from_kernel();
 
             Arc::new({
                 let mut p = engram_host_agent::pooled_backend::PooledBackend::new(raw_backend)

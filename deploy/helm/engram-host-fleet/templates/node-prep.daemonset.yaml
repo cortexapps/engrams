@@ -37,8 +37,24 @@ spec:
           args:
             - |
               set -u
-              echo "[node-prep] modprobe nbd nbds_max={{ .Values.nbd.nbdsMax }}"
-              modprobe nbd nbds_max={{ .Values.nbd.nbdsMax }} 2>&1 || echo "[node-prep] nbd modprobe skipped (already loaded or unavailable)"
+              # ADR 0049: nbds_max only takes effect on a FRESH module
+              # load. If the module is already loaded with a different
+              # value (e.g. rolling 64 -> 4096), reload it — rmmod
+              # succeeds on a fresh/idle node and fails harmlessly while
+              # devices are in use (a reboot/drain then picks up the new
+              # value). A `0` disables NBD (skip the load entirely).
+              WANT_NBDS_MAX={{ .Values.nbd.nbdsMax }}
+              if [ "$WANT_NBDS_MAX" = "0" ]; then
+                echo "[node-prep] nbd disabled (nbdsMax=0); skipping modprobe"
+              else
+                CUR_NBDS_MAX=$(cat /sys/module/nbd/parameters/nbds_max 2>/dev/null || echo "")
+                if [ -n "$CUR_NBDS_MAX" ] && [ "$CUR_NBDS_MAX" != "$WANT_NBDS_MAX" ]; then
+                  echo "[node-prep] nbd loaded with nbds_max=$CUR_NBDS_MAX, want $WANT_NBDS_MAX; reloading"
+                  rmmod nbd 2>&1 || echo "[node-prep] rmmod nbd failed (devices in use); reboot/drain to change nbds_max"
+                fi
+                echo "[node-prep] modprobe nbd nbds_max=$WANT_NBDS_MAX"
+                modprobe nbd nbds_max=$WANT_NBDS_MAX 2>&1 || echo "[node-prep] nbd modprobe skipped (already loaded or unavailable)"
+              fi
               {{- range $k, $v := .Values.nodePrep.sysctls }}
               # {{ $k }} — non-namespaced sysctls (vm.*) take effect node-wide;
               # namespaced ones (net.*) only bind this pod's netns and are
