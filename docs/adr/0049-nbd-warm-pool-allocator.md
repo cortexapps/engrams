@@ -136,15 +136,47 @@ issues, each fixed in turn (the "fix one bottleneck, expose the next" cascade):
    template-only change (e.g. the propagation flag) is rolled by a graceful
    per-pod delete, not the operator.
 
-3. **Same-base concurrent-restore rootfs corruption (the lossless failure).**
-   `restore_with` reads `rootfs_source` from the per-base-snapshot
-   `snapshots/<base>/manifest.json`, which EVERY same-base restore patches with
-   its own `/dev/nbdN` (read-modify-write). A sibling's patch landing between a
-   restore's patch and its read made FC open the WRONG device → cross-session
-   rootfs corruption (`reread ''`) + "no live sandbox" reaps. The ADR 0048
-   `source_canonical_lock` serializes the symlink→load window but the wrong
-   device value was already baked in at the earlier read. Fixed by passing each
+3. **Sidecar device race (real, but secondary).** `restore_with` reads
+   `rootfs_source` from the per-base-snapshot `snapshots/<base>/manifest.json`,
+   which EVERY same-base restore patches with its own `/dev/nbdN`
+   (read-modify-write). A sibling's patch landing between a restore's patch and
+   its read could make FC open the WRONG device. Fixed by passing each
    restore's device DIRECTLY to FC via `restore_with_rootfs_override`
-   (`SandboxBackend` trait), authoritative over the shared sidecar — closing the
-   shared-file channel. The prod load test is the regression gate (a
-   PooledBackend-level concurrent real-FC repro isn't feasible in CI).
+   (`SandboxBackend` trait), authoritative over the shared sidecar. **This was a
+   genuine hardening but did NOT fix the load-test `lossless` failure** — the
+   re-run showed identical corruption, which led to (4).
+
+4. **Same-base concurrent-restore data corruption — the real `lossless`
+   failure.** A restored session's chunked-disk backend is keyed by
+   `disk_manifest_ref.manifest_id`, and on the FRESH-CREATE path that is
+   `bundle.disk_manifest` — the BASE IMAGE's id, identical for every same-base
+   session. The flush path only `next_version()`s that shared id (it never minted
+   a new one, unlike the *memory* path which does `ManifestRef::new()` per
+   capture). So N concurrent same-base sessions all wrote under one
+   `manifests/<base>/vN` chain: they raced the chunk-store version counter (the
+   ADR 0014 "version conflict; retry latest+1" band-aid, at 22-wide × 41 retries)
+   and `(manifest_id, version)` became AMBIGUOUS across sessions — session A's
+   `v_k` and B's `v_k` are different disks, indistinguishable to the resume/
+   recovery selector → cross-session reads (`reread ''`) + stale-drop reaps.
+   Confirmed live: 22 sandboxes → one `manifest_id=2502838e`, 41 conflicts, 18
+   stale-drops. **Fix:** lazily fork the disk manifest to a private per-session
+   `manifest_id` on the first flush of a fresh-base session (`BackendState::
+   fork_pending`, armed by `attach_manifest(.., fork_on_first_flush=true)` only on
+   the fresh-create path). The fork's chunk list still references the shared,
+   content-addressed base chunks (no byte duplication — density preserved); only
+   the manifest IDENTITY forks. Mirrors what memory already does
+   (`seed_checkpoint_chain`). Transparent to GC (pins by content hash) and the
+   coord columns (already per-row UUID); the resume selector's
+   `live.manifest_id == snapshot.manifest_id` assumption is *repaired*. Regression
+   tests: `backend::tests::fresh_same_base_backends_fork_to_distinct_private_ids`
+   + `unforked_backend_ticks_its_attached_id` (CI); prod load test is the e2e
+   gate.
+
+   *Residual (lazy fork):* a session idle-evicted with ZERO disk writes (its
+   snapshot `disk_manifest` is still the base) then resumed-and-written would
+   re-attach the base id and tick it — the fork only arms on the fresh-create
+   attach, not on resume-from-base. This is rare (a running guest almost always
+   writes *something* to its rootfs before idling) and strictly better than the
+   pre-fix state, but to close it fully the coordinator would pass a
+   "disk_manifest == image base" flag at resume so the host arms the fork there
+   too (or fork eagerly at attach, trading a manifest PUT per restore). Deferred.
