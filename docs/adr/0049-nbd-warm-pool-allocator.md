@@ -114,3 +114,37 @@ module load, so node-prep reloads the module when the live value differs
   `nbdsMax: 4096` — expect the wedge gone (queue drains, restores complete,
   lossless), host NBD-slot telemetry well below the cap. Flip to Accepted on a
   clean run.
+
+## Follow-ups — bottlenecks the throttle was hiding
+
+The 16-slot pool was *serializing* restores; removing it surfaced three latent
+issues, each fixed in turn (the "fix one bottleneck, expose the next" cascade):
+
+1. **UFFD substrate invisible on fresh nodes.** The host-agent's
+   `/var/lib/engram` volumeMount lacked `mountPropagation: HostToContainer`, so
+   node-prep's base-shm tmpfs (mounted in the host ns *after* the agent starts)
+   never propagated in — FC's shmem-only UFFD restore 503'd. Long-lived nodes
+   hid it via a restart-after-mount race; recreating nodes for `nbds_max=4096`
+   exposed it. Fixed by adding the propagation flag.
+
+2. **helm-deploy wedged the host-fleet release.** The DaemonSet is `OnDelete`
+   (operator owns the drain-gated roll), so `helm upgrade --wait` always timed
+   out → release `failed`; a cancelled run mid-wait left it stuck
+   `pending-upgrade` → next deploy aborts "another operation in progress". The
+   pipeline now self-heals (rollback) + drops `--wait` for that release. Note
+   the operator rolls host-agent pods on **image** change only — a chart/
+   template-only change (e.g. the propagation flag) is rolled by a graceful
+   per-pod delete, not the operator.
+
+3. **Same-base concurrent-restore rootfs corruption (the lossless failure).**
+   `restore_with` reads `rootfs_source` from the per-base-snapshot
+   `snapshots/<base>/manifest.json`, which EVERY same-base restore patches with
+   its own `/dev/nbdN` (read-modify-write). A sibling's patch landing between a
+   restore's patch and its read made FC open the WRONG device → cross-session
+   rootfs corruption (`reread ''`) + "no live sandbox" reaps. The ADR 0048
+   `source_canonical_lock` serializes the symlink→load window but the wrong
+   device value was already baked in at the earlier read. Fixed by passing each
+   restore's device DIRECTLY to FC via `restore_with_rootfs_override`
+   (`SandboxBackend` trait), authoritative over the shared sidecar — closing the
+   shared-file channel. The prod load test is the regression gate (a
+   PooledBackend-level concurrent real-FC repro isn't feasible in CI).

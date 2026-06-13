@@ -612,11 +612,25 @@ impl PooledBackend {
         }
         // ADR 0035 §3: fresh creates swap aux bundles to the host's
         // current generation inside the backend; resumes keep the pin.
-        let new_id = if fresh {
-            self.inner.restore_fresh(metadata).await?
-        } else {
-            self.inner.restore(metadata).await?
-        };
+        //
+        // ADR 0049 follow-up (same-base concurrent-restore corruption):
+        // pass THIS restore's NBD device to FC DIRECTLY rather than only
+        // through the shared base sidecar. The sidecar patch above is
+        // SHARED by every same-base restore (`snapshots/<base>/manifest.json`)
+        // and a sibling's patch landing between ours and FC's read made
+        // FC open the WRONG `/dev/nbdN` → cross-session rootfs corruption
+        // and "no live sandbox" reaps. The override is authoritative; the
+        // sidecar patch stays as a fallback for non-override callers.
+        #[cfg(target_os = "linux")]
+        let rootfs_override = pending_nbd_state
+            .as_ref()
+            .map(|n| n.device_path().to_path_buf());
+        #[cfg(not(target_os = "linux"))]
+        let rootfs_override: Option<std::path::PathBuf> = None;
+        let new_id = self
+            .inner
+            .restore_with_rootfs_override(metadata, fresh, rootfs_override)
+            .await?;
 
         // ADR 0016 Phase B commit 5: post-restore wiring. The new
         // sandbox_id is only known here; install it into

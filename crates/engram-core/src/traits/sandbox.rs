@@ -415,6 +415,33 @@ pub trait SandboxBackend: Send + Sync {
         self.restore(metadata).await
     }
 
+    /// ADR 0049 follow-up (same-base concurrent-restore corruption):
+    /// restore with an explicit per-restore rootfs device path. The
+    /// pooled backend acquires a unique `/dev/nbdN` per restore; passing
+    /// it here — instead of round-tripping it through the SHARED
+    /// base-snapshot sidecar (`snapshots/<base>/manifest.json`), which
+    /// concurrent same-base restores race read-modify-write — closes the
+    /// window where one restore reads a sibling's device out of the
+    /// clobbered sidecar and opens the WRONG rootfs (cross-session
+    /// corruption + the downstream "no live sandbox" reaps). `None` keeps
+    /// the sidecar's `spec.rootfs_source`. `fresh` selects the
+    /// resume/base-create flavor. Default ignores the override
+    /// (VZ/Process/mocks have no shared-sidecar device channel); the FC
+    /// backend overrides.
+    async fn restore_with_rootfs_override(
+        &self,
+        metadata: SnapshotMetadata,
+        fresh: bool,
+        rootfs_override: Option<std::path::PathBuf>,
+    ) -> Result<SandboxId, SandboxError> {
+        let _ = rootfs_override;
+        if fresh {
+            self.restore_fresh(metadata).await
+        } else {
+            self.restore(metadata).await
+        }
+    }
+
     /// ADR 0020 P1: block until the guest's agentd has dialled its
     /// ready port — i.e. the kernel booted, the rootfs mounted, and
     /// bootstrap/agentd reached `accept()`. This is the same wait
