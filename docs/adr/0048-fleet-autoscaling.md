@@ -1,6 +1,6 @@
 # ADR 0048: fleet autoscaling — queue-aware scale-up, teleport-packed scale-down
 
-**Status:** Accepted (2026-06-13). **The objective is aggressive autoscale-DOWN** — the fleet teleport-packs live sessions onto a handful of nodes and deletes the rest (the 100-nodes-×-1-session → a-few scenario). Queue-aware scale-UP is the necessary complement (the pack-down needs somewhere to grow back from, and a burst mid-wave must reclaim capacity instantly), not the point. OSS code is shipped + CI-green (commit chain in "Shipped" below); the GKE actuator runs against the real `kvm` node pool via the engrams-internal rollout (§6). That rollout is staged `idleOnly → aggressive` purely as a safe **enablement order** — `idleOnly` removes only empty nodes, validating the `deleteInstances` actuator with zero session disruption before `aggressive` moves live sessions — **not** a deprioritization of scale-down. The grow-only `set_size` invariant caps blast radius throughout.
+**Status:** Accepted + prod-enabled (2026-06-13). **The objective is aggressive autoscale-DOWN** — the fleet teleport-packs live sessions onto a handful of nodes and deletes the rest (the 100-nodes-×-1-session → a-few scenario). Queue-aware scale-UP is the necessary complement (the pack-down needs somewhere to grow back from, and a burst mid-wave must reclaim capacity instantly), not the point. OSS code shipped + CI-green; the GKE actuator is **live on the real `kvm` pool** with `scaleDown: aggressive` enabled (engrams-internal §6). The actuators are validated on real infra: a `setSize` grow (2→3, MIG targetSize 3, node joined) then an `idleOnly` shed of the empty node via `deleteInstances` — IGM hash-prefix mapping resolved, Workload-Identity auth + the corrected IAM worked, **MIG targetSize decremented 3→2 with no replacement**, host deregistered, zero session disruption. The live-teleport leg of `aggressive` is the ADR 0045 substrate (the `two_host_drain_wave` FC test packs N live microVMs A→B on real KVM). The grow-only `set_size` invariant caps blast radius throughout; a queue burst mid-wave aborts it and returns cordoned capacity instantly.
 **Related:** ADR 0044 K4 (scale-up policy + GKE actuator, shipped inert), ADR 0045 Phase E (scale-down decision engine #138; this ADR ships its actuator and E2), ADR 0046 (placement reservation), ADR 0047 (stateless coordinator — the prerequisite this work forced), ADR 0022/0043/0045 (the density + teleport substrate this rides)
 
 ## Context
@@ -274,11 +274,29 @@ coordinator this forced — landed first):
 - *Resume placement bypasses PG reservation* (pre-existing ADR 0046 gap; the
   wave's `placement_preview` narrows it).
 
-**Enablement (engrams-internal, §6) — the path to the objective:** coord
-`replicas: 2` (ADR 0047 statelessness validation) → `scaler: gke` scale-up →
-`scaleDown: idleOnly` (the safe first scale-down: empty nodes only, validates
-the `deleteInstances` actuator + IGM mapping + that it decrements `targetSize`
-with no replacement, zero disruption) → **`scaleDown: aggressive`** — the
-teleport-packed consolidation that is this ADR's reason to exist. The
+**Enablement (engrams-internal, §6) — DONE 2026-06-13:** coord `replicas: 2`
+(ADR 0047 statelessness validated — 2 pods, clean readiness) → `scaler: gke`
+scale-up (operator detected cluster identity + `setSize` accepted) →
+`scaleDown: idleOnly` (sheds an empty node via `deleteInstances`; IGM mapping
+resolved, `targetSize` decremented 3→2 with no replacement, zero disruption) →
+**`scaleDown: aggressive`** — the teleport-packed consolidation, now live. The
 grow-only invariant caps blast radius throughout; a burst mid-wave aborts the
 wave and returns cordoned capacity instantly.
+
+Two issues surfaced + fixed during the rollout:
+- **Operator IAM (I1):** GKE exposes no `container.nodePools.*` family — node
+  pools are sub-resources of the cluster. The custom role grants
+  `container.clusters.{get,update}` + `compute.instanceGroupManagers.{get,update}`
+  (verified via `list-testable-permissions`; `deleteInstances` needs only the
+  IGM `.update` — the MIG deletes on the caller's behalf).
+- **CRD drift:** Helm INSTALLS `crds/` once and never UPGRADES it, so
+  `autoscaling.scaleDown` (and the new `maxShedPerWave`/`maxConcurrentDrains`)
+  were silently pruned off the live CR by the apiserver — scale-down config had
+  no effect since K4. `helm-deploy.yml` now `kubectl apply`s the chart CRD
+  out-of-band every deploy.
+
+Remaining: a live in-prod consolidation of real sessions (the operator wave
+picking a LOADED victim → coord `drain_host` live-teleport → `deleteInstances`)
+is the composition of pieces validated separately (the prod actuator above +
+the `two_host_drain_wave` FC live-teleport on real KVM); it will confirm on the
+next real workload that grows the fleet past `minHosts` and then idles.
