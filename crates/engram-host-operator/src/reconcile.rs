@@ -134,7 +134,10 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
 
     // ADR 0044 K4: autoscale the node pool from coordinator demand. Best-
     // effort + independent of the roll — a coord hiccup shouldn't block rolls.
-    if let Err(e) = maybe_autoscale(spec, &ctx).await {
+    // Pass the PHYSICAL node count (one host-agent pod per node) so the
+    // grow-only `set_size` guard can tell "grow the pool" from "the cloud
+    // would delete a node".
+    if let Err(e) = maybe_autoscale(spec, &ctx, pods.len()).await {
         tracing::warn!(error = %e, "autoscale step failed; continuing");
     }
 
@@ -173,7 +176,11 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
 /// via a node-specific cloud call — is the follow-up actuator, ADR 0045 Phase
 /// E). This mirrors how K4 scale-up first shipped behind the logging
 /// `NoopScaler`.
-async fn maybe_autoscale(spec: &HostFleetSpec, ctx: &Ctx) -> Result<(), OperatorError> {
+async fn maybe_autoscale(
+    spec: &HostFleetSpec,
+    ctx: &Ctx,
+    physical_nodes: usize,
+) -> Result<(), OperatorError> {
     let Some(a) = &spec.autoscaling else {
         return Ok(());
     };
@@ -217,16 +224,36 @@ async fn maybe_autoscale(spec: &HostFleetSpec, ctx: &Ctx) -> Result<(), Operator
         return Ok(());
     }
 
-    // Scale-up or hold: actuate (idempotent) and clear any scale-down streak.
+    // Scale-up or hold: clear any scale-down streak.
     ctx.scaledown_ticks.store(0, Ordering::Relaxed);
-    tracing::info!(
-        node_pool = %a.node_pool,
-        current,
-        free_mib = demand.free_mib,
-        desired,
-        "autoscale: computed desired host count"
-    );
-    ctx.scaler.set_size(&a.node_pool, desired).await?;
+
+    // ADR 0048 grow-only invariant: `set_size` may only GROW the physical
+    // pool. `desired` is derived from `schedulable_hosts`, which dips below
+    // the physical node count whenever a host is cordoned (a failed roll, a
+    // wave in flight). Calling `set_size(desired)` with `desired ≤ physical`
+    // would tell the MIG to delete an arbitrary — possibly loaded — node.
+    // Shrinking is exclusively the wave executor's job (`remove_node`, which
+    // names the victim). So only actuate when we're truly growing.
+    if desired as usize > physical_nodes {
+        tracing::info!(
+            node_pool = %a.node_pool,
+            current,
+            physical_nodes,
+            free_mib = demand.free_mib,
+            desired,
+            "autoscale: growing host pool"
+        );
+        ctx.scaler.set_size(&a.node_pool, desired).await?;
+    } else {
+        tracing::debug!(
+            node_pool = %a.node_pool,
+            current,
+            physical_nodes,
+            desired,
+            "autoscale: desired ≤ physical node count — holding (set_size is grow-only; \
+             shrinking is the wave executor's remove_node path)"
+        );
+    }
     Ok(())
 }
 

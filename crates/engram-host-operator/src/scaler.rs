@@ -70,11 +70,32 @@ impl NodePoolScaler for NoopScaler {
 }
 
 /// Fleet-demand snapshot from `GET /api/admin/fleet/demand`.
-#[derive(Clone, Copy, Debug, Deserialize)]
+///
+/// ADR 0048 added the CPU budget dimension + the queue's aggregate demand.
+/// Every field the coordinator gained is `#[serde(default)]` so the operator
+/// tolerates polling a pre-0048 coordinator mid-rollout (the new fields read
+/// as 0 → no CPU pressure, no queue → identical to the K4 RAM-only behavior).
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct FleetDemand {
     pub schedulable_hosts: u32,
     pub free_mib: u64,
     pub total_mib: u64,
+    /// ADR 0048: the CPU budget dimension, in overcommit-vcpu units
+    /// (Σ `host_cpu_budget` = Σ `cores × overcommit` over schedulable hosts,
+    /// and the free remainder). 0 on hosts that haven't reported a core count.
+    #[serde(default)]
+    pub free_vcpus: u64,
+    #[serde(default)]
+    pub total_vcpus: u64,
+    /// ADR 0048: the queue's aggregate demand — sessions waiting on capacity,
+    /// and the RAM/CPU they'll consume. Scale-up must absorb this ON TOP of
+    /// the headroom target; ANY queued session hard-blocks scale-down.
+    #[serde(default)]
+    pub queued_sessions: u64,
+    #[serde(default)]
+    pub queued_mib: u64,
+    #[serde(default)]
+    pub queued_vcpus: u64,
 }
 
 /// Autoscaling policy inputs (from the HostFleet CR's `autoscaling`).
@@ -88,44 +109,77 @@ pub struct AutoscalePolicy {
     pub scale_down: ScaleDownMode,
 }
 
-/// Pure scaling policy (ADR 0044 K4 + ADR 0045 Phase E), unit-tested. Result
-/// is clamped to `[min_hosts, max_hosts]`.
+/// Pure scaling policy (ADR 0044 K4 + ADR 0045 Phase E + ADR 0048), unit-tested.
+/// Result is clamped to `[min_hosts, max_hosts]`.
 ///
-/// **Scale-up** grows the pool until free headroom ≥ `target_free_mib`.
+/// **Scale-up is 2D and queue-aware**, covered in ONE jump (so a 1000-session
+/// burst is a single `setSize`, not a slow ramp). The required host count is
+/// the **max** of the RAM-deficit and CPU-deficit host counts:
+/// - RAM deficit = `queued_mib + max(0, target_free_mib − free_mib)` — absorb
+///   the queue AND restore the headroom target after placing it.
+/// - CPU deficit = `max(0, queued_vcpus − free_vcpus)` — just enough overcommit
+///   budget to place the queue (there's no CPU headroom knob; RAM is the hard
+///   constraint, CPU a packing budget).
 ///
-/// **Scale-down** (ADR 0045 Phase E, gated by `policy.scale_down`) sheds **at
-/// most one host per call**, and only when a *whole host's worth* of slack
-/// remains afterward (`free_mib ≥ target_free_mib + per_host_mib`) — so the
-/// fleet never dips below its headroom target by shedding. One-at-a-time +
-/// the headroom guard keep it conservative; the reconcile loop adds hysteresis
-/// (act only after N consecutive agreeing ticks) on top. With `scale_down =
-/// Off` this is pure scale-up (the K4 behavior), never returning `< current`.
+/// Each deficit ÷ its average per-host capacity (`div_ceil`) → hosts; the max
+/// of the two is added to `current`.
+///
+/// **Scale-down** (gated by `policy.scale_down`) is **hard-blocked while ANY
+/// session is queued** — a non-empty queue means the fleet is capacity-starved,
+/// so shrinking is never right. When the queue is empty it returns the **full
+/// cost-optimal target** (shed every host whose removal still leaves
+/// `free_mib ≥ target_free_mib`); the wave executor bounds the actual shed per
+/// reconcile (`maxShedPerWave`) and the reconcile loop gates entry on
+/// hysteresis. With `scale_down = Off` this is pure scale-up (never `< current`).
 pub fn desired_hosts(demand: FleetDemand, policy: AutoscalePolicy) -> u32 {
     let max = policy.max_hosts.max(policy.min_hosts);
     let current = demand.schedulable_hosts;
 
-    // Empty fleet: nothing to measure per-host against — bootstrap to the
-    // floor (so set min_hosts ≥ 1 unless you really want scale-to-zero).
+    // Empty fleet: no per-host signal to size against — bootstrap to the floor
+    // (set min_hosts ≥ 1 unless you really want scale-to-zero). The next tick,
+    // with a live host's capacity signal, sizes up to any queued demand.
     if current == 0 {
         return policy.min_hosts.min(max);
     }
 
-    let per_host_mib = demand.total_mib / current as u64; // average host capacity
-    if per_host_mib == 0 {
-        return current.clamp(policy.min_hosts, max); // no capacity signal — hold
+    let per_host_mib = demand.total_mib / current as u64; // avg host RAM capacity
+    let per_host_vcpus = demand.total_vcpus / current as u64; // avg host CPU budget
+
+    // ---- Scale-UP: cover BOTH dimensions' deficits in one jump ----
+    let ram_deficit = demand.queued_mib + policy.target_free_mib.saturating_sub(demand.free_mib);
+    let cpu_deficit = demand.queued_vcpus.saturating_sub(demand.free_vcpus);
+    let ram_hosts = if per_host_mib > 0 {
+        ram_deficit.div_ceil(per_host_mib)
+    } else {
+        0
+    };
+    let cpu_hosts = if per_host_vcpus > 0 {
+        cpu_deficit.div_ceil(per_host_vcpus)
+    } else {
+        0
+    };
+    let add = ram_hosts.max(cpu_hosts);
+    if add > 0 {
+        return current
+            .saturating_add(add as u32)
+            .clamp(policy.min_hosts, max);
     }
 
-    if demand.free_mib < policy.target_free_mib {
-        // Under the headroom target — grow to cover the deficit.
-        let deficit = policy.target_free_mib - demand.free_mib;
-        let up = current.saturating_add(deficit.div_ceil(per_host_mib) as u32);
-        return up.clamp(policy.min_hosts, max);
-    }
-
-    // Headroom satisfied. Shed one host iff scale-down is enabled AND a full
-    // host of slack would still remain — otherwise hold.
-    if policy.scale_down.enabled() && demand.free_mib >= policy.target_free_mib + per_host_mib {
-        return current.saturating_sub(1).clamp(policy.min_hosts, max);
+    // ---- Scale-DOWN: only with an EMPTY queue + a RAM capacity signal ----
+    // A queued session means we're starved — never shrink under back-pressure.
+    if policy.scale_down.enabled()
+        && demand.queued_sessions == 0
+        && per_host_mib > 0
+        && demand.free_mib > policy.target_free_mib
+    {
+        // Cost-optimal: shed every host that still leaves the headroom target.
+        //   free − k·per_host ≥ target  ⇒  k ≤ (free − target) / per_host
+        let sheddable = (demand.free_mib - policy.target_free_mib) / per_host_mib;
+        if sheddable > 0 {
+            return current
+                .saturating_sub(sheddable as u32)
+                .clamp(policy.min_hosts, max);
+        }
     }
     current.clamp(policy.min_hosts, max)
 }
@@ -139,6 +193,7 @@ mod tests {
             schedulable_hosts: hosts,
             free_mib: free,
             total_mib: total,
+            ..Default::default()
         }
     }
     fn policy(min: u32, max: u32, target: u64) -> AutoscalePolicy {
@@ -249,17 +304,146 @@ mod tests {
     }
 
     #[test]
-    fn aggressive_and_idle_only_share_the_same_ram_policy() {
+    fn aggressive_and_idle_only_share_the_same_ram_target() {
         // The mode only changes *which host* the actuation drains; the RAM
-        // shed decision is identical. Both shed here.
-        let d = demand(4, 48_000, 64_000); // 16 GiB/host, 48 free, shed leaves 32 ≥ 16
+        // shed *target* is identical. ADR 0048: this is now the COST-OPTIMAL
+        // target, not one-at-a-time — 16 GiB/host, 48 free, target 16:
+        // shed k while 48 − 16k ≥ 16 → k ≤ 2 → target 2. The wave executor
+        // bounds the actual per-wave shed (maxShedPerWave).
+        let d = demand(4, 48_000, 64_000);
         assert_eq!(
             desired_hosts(d, policy_sd(1, 10, 16_000, ScaleDownMode::IdleOnly)),
-            3
+            2
         );
         assert_eq!(
             desired_hosts(d, policy_sd(1, 10, 16_000, ScaleDownMode::Aggressive)),
-            3
+            2
+        );
+    }
+
+    // ---- ADR 0048: 2D + queue-aware scale-up ----
+
+    /// A burst that queues a lot of RAM is covered in ONE jump (not a ramp).
+    #[test]
+    fn one_shot_burst_covers_the_whole_queue_in_one_jump() {
+        // 2 hosts, 16 GiB/host, free 0, target 0, queue wants 160 GiB.
+        // ram_deficit = 160_000 + 0 = 160_000 / 16_000 = 10 hosts → 12.
+        let d = FleetDemand {
+            schedulable_hosts: 2,
+            free_mib: 0,
+            total_mib: 32_000,
+            queued_mib: 160_000,
+            queued_sessions: 40,
+            ..Default::default()
+        };
+        assert_eq!(desired_hosts(d, policy(1, 100, 0)), 12);
+    }
+
+    /// CPU pressure can bind before RAM — the required hosts is the MAX of
+    /// the two dimensions' deficits.
+    #[test]
+    fn cpu_dimension_can_bind_before_ram() {
+        // 2 hosts. RAM: 16 GiB/host, free 32 GiB, target 0, no queued_mib →
+        // 0 RAM hosts. CPU: 16 budget-vcpu/host (32 total), free 0, queue
+        // wants 64 vcpu → ceil(64/16) = 4 CPU hosts. max(0,4) = 4 → 6.
+        let d = FleetDemand {
+            schedulable_hosts: 2,
+            free_mib: 32_000,
+            total_mib: 32_000,
+            total_vcpus: 32,
+            free_vcpus: 0,
+            queued_vcpus: 64,
+            queued_sessions: 32,
+            ..Default::default()
+        };
+        assert_eq!(desired_hosts(d, policy(1, 100, 0)), 6);
+    }
+
+    /// The headroom deficit and the queued demand COMPOSE on the RAM axis.
+    #[test]
+    fn ram_headroom_and_queue_deficits_compose() {
+        // 2 hosts, 16 GiB/host, free 4 GiB, target 16 GiB, queue wants 16 GiB.
+        // ram_deficit = 16_000 (queue) + (16_000 − 4_000) (headroom) = 28_000
+        // / 16_000 = ceil(1.75) = 2 → 4.
+        let d = FleetDemand {
+            schedulable_hosts: 2,
+            free_mib: 4_000,
+            total_mib: 32_000,
+            queued_mib: 16_000,
+            queued_sessions: 4,
+            ..Default::default()
+        };
+        assert_eq!(desired_hosts(d, policy(1, 100, 16_000)), 4);
+    }
+
+    /// A queue-driven scale-up still clamps to max_hosts.
+    #[test]
+    fn queue_driven_scale_up_clamps_to_max() {
+        let d = FleetDemand {
+            schedulable_hosts: 2,
+            free_mib: 0,
+            total_mib: 32_000,
+            queued_mib: 1_600_000,
+            queued_sessions: 400,
+            ..Default::default()
+        };
+        assert_eq!(desired_hosts(d, policy(1, 5, 0)), 5);
+    }
+
+    /// The `queued_sessions == 0` scale-down gate is DEFENSIVE: a queue with
+    /// real RAM/CPU demand already triggers scale-*up* (it can't reach the
+    /// scale-down branch). The gate guards the degenerate case — a session
+    /// queued with no measurable budget (e.g. blocked purely on
+    /// image-readiness, not capacity) — so huge RAM slack still can't shrink
+    /// the fleet while anything is waiting.
+    #[test]
+    fn any_queued_session_blocks_scale_down() {
+        // 5 hosts, 80 GiB free (cost-optimal would shed several), but one
+        // session is queued with zero measured demand → hold at 5.
+        let d = FleetDemand {
+            schedulable_hosts: 5,
+            free_mib: 80_000,
+            total_mib: 80_000,
+            queued_sessions: 1,
+            queued_mib: 0,
+            queued_vcpus: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            desired_hosts(d, policy_sd(1, 10, 16_000, ScaleDownMode::Aggressive)),
+            5
+        );
+    }
+
+    /// A queued session WITH real RAM demand triggers scale-up (it never
+    /// reaches the scale-down branch) — the complement to the gate test.
+    #[test]
+    fn queued_session_with_demand_triggers_scale_up_not_hold() {
+        // 5 hosts, 16 GiB/host, 80 GiB free, target 16 GiB, queue wants 2 GiB.
+        // ram_deficit = 2_000 + 0 = 2_000 → ceil(2000/16000) = 1 → grow to 6.
+        let d = FleetDemand {
+            schedulable_hosts: 5,
+            free_mib: 80_000,
+            total_mib: 80_000,
+            queued_sessions: 1,
+            queued_mib: 2_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            desired_hosts(d, policy_sd(1, 10, 16_000, ScaleDownMode::Aggressive)),
+            6
+        );
+    }
+
+    /// Cost-optimal scale-down sheds every host that keeps the headroom.
+    #[test]
+    fn scale_down_returns_the_full_cost_optimal_target() {
+        // 10 hosts, 16 GiB/host, 100 GiB free, target 16 GiB, empty queue.
+        // k while 100 − 16k ≥ 16 → k ≤ 5.25 → 5 → target 5.
+        let d = demand(10, 100_000, 160_000);
+        assert_eq!(
+            desired_hosts(d, policy_sd(1, 20, 16_000, ScaleDownMode::Aggressive)),
+            5
         );
     }
 }
