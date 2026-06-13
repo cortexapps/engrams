@@ -8,7 +8,7 @@ use crate::types::manifest::ManifestRef;
 use crate::types::registry::{
     EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
 };
-use crate::types::session::{Session, SessionSpec, SessionState};
+use crate::types::session::{QueuedDemand, QueuedSession, Session, SessionSpec, SessionState};
 use crate::types::snapshot::SnapshotRecord;
 
 /// ADR 0021 P1.8: outcome of [`MetadataStore::soft_delete_enabled_image`].
@@ -134,6 +134,79 @@ pub trait MetadataStore: Send + Sync {
     /// `pending`, sandbox-less row. Default impl (mocks) is a no-op.
     async fn delete_pending_session(&self, _session_id: SessionId) -> Result<(), MetaError> {
         Ok(())
+    }
+
+    // ---- ADR 0048: session queue ----
+
+    /// Insert a create that found no capacity as a `queued` row (host_id
+    /// NULL, the budgets the scanner will reserve with, `queued_at` =
+    /// NOW(), `queue_origin = 'create'`, the initial prompt). The queue
+    /// scanner re-attempts placement FIFO. Default impl (mocks) no-op.
+    async fn enqueue_session_create(
+        &self,
+        _id: SessionId,
+        _spec: &SessionSpec,
+        _mem_budget_mib: i64,
+        _cpu_budget_vcpus: i32,
+        _prompt: Option<&str>,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// Park an `Idle` session that hit no capacity on resume back in the
+    /// queue (`Idle → queued`, `queue_origin = 'resume'`). Default no-op.
+    async fn enqueue_session_resume(&self, _id: SessionId) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// Every `queued` session, oldest-first (FIFO). The scanner walks
+    /// this each tick. Default impl (mocks): empty.
+    async fn list_queued_sessions_fifo(&self) -> Result<Vec<QueuedSession>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically re-attempt placement for a `queued` session: pick a
+    /// host from `candidates` (same best-fit 2D logic as
+    /// `reserve_placement`) and, if one fits, flip the row
+    /// `queued → pending` with the host bound + `last_active_at` bumped,
+    /// returning the host. `None` = nothing fit (stay queued) or the row
+    /// already left `queued` (lost a race). Default impl (mocks): place
+    /// on the first candidate.
+    async fn place_queued_session(
+        &self,
+        _id: SessionId,
+        _mem_budget_mib: i64,
+        _cpu_budget_vcpus: i32,
+        candidates: &[HostId],
+        _affinity_len: usize,
+    ) -> Result<Option<HostId>, MetaError> {
+        Ok(candidates.first().copied())
+    }
+
+    /// Boot failed on a placed (`pending`) queued session — return it to
+    /// the queue (`pending → queued`), but ONLY while still `pending`
+    /// (a row that advanced to `created` is past requeue; the caller
+    /// fails it). Returns whether a row was requeued. Default: no-op false.
+    async fn requeue_session(&self, _id: SessionId) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
+    /// Crash recovery: `pending` rows with a `queue_origin` (i.e. placed
+    /// queued sessions) whose `last_active_at` is older than `older_than`
+    /// — a coord died mid-boot — flip back to `queued` for the scanner to
+    /// retry. Returns the count requeued. Default: 0.
+    async fn requeue_stale_pending(
+        &self,
+        _older_than: std::time::Duration,
+    ) -> Result<u64, MetaError> {
+        Ok(0)
+    }
+
+    /// The queue's demand (count, Σ mem_budget_mib, Σ cpu_budget_vcpus) —
+    /// the scale-up signal the operator reads via `/admin/fleet/demand`.
+    /// Default: zeros.
+    async fn queued_demand(&self) -> Result<QueuedDemand, MetaError> {
+        Ok(QueuedDemand::default())
     }
 
     /// ADR 0047 (was `state.teleport_targets`): pin / clear the

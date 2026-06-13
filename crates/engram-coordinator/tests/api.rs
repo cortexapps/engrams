@@ -2626,7 +2626,44 @@ async fn create_session_failure_returns_503_with_no_row() {
         default_image_version: "warm-bootstrap".into(),
         ..CoordinatorConfig::default()
     };
-    let app = api::router(Arc::new(AppState::new(cfg, services)));
+    // ADR 0047/0048: placement reads host rows + ADR 0048 queues on no
+    // capacity. Seed a schedulable host (and register the always-fail
+    // backend under its id) so the create REACHES the restore — exercising
+    // the boot-failure → 503 path this test is about, not the no-capacity
+    // → queued path.
+    let fail_host = engram_core::HostId::new();
+    let registry = Arc::new(engram_coordinator::HostRegistry::new(store.clone()));
+    registry.register(fail_host, services.host.clone());
+    store
+        .upsert_host(engram_core::types::host::HostRecord {
+            id: fail_host,
+            hostname: "always-fail".into(),
+            cloud_metadata: Default::default(),
+            capacity: engram_core::types::HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 16_384,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: engram_core::types::host::HostUtilization {
+                allocatable_mib: 16_384,
+                ..Default::default()
+            },
+            status: engram_core::types::host::HostStatus::Ready,
+            last_heartbeat_at: chrono::Utc::now(),
+            host_addr: None,
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            cordoned: false,
+            total_vcpus: 8,
+        })
+        .await
+        .unwrap();
+    let app = api::router(Arc::new(AppState::new_with_registry(
+        cfg, services, registry,
+    )));
 
     let resp = app
         .oneshot(json_request(

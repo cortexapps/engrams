@@ -551,281 +551,25 @@ async fn create_session_inner(
     crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    // -------- 0. Validate orthogonal axes --------
-    // ADR 0021 P1.3: `mode = DevVm + non-empty prompt` is meaningless
-    // — even if the image carries a baked harness, a DevVm session
-    // leaves it undriven, so there's nothing to receive the prompt.
-    // Reject explicitly so the dashboard / CLI surfaces the mistake.
-    if req.mode.is_dev_vm() && !req.prompt.as_deref().map(str::is_empty).unwrap_or(true) {
-        return Err(ApiError::BadRequest(
-            "`prompt` requires `mode = agent` — a dev-VM session has no agent to receive it".into(),
-        ));
-    }
+    // Resolve manifest / secrets / env / harness from the request.
+    let prepared = prepare_from_request(&state, &principal, &req).await?;
+    let crate::session_boot::PreparedBoot {
+        inputs,
+        memory_mib,
+        cpu_budget_vcpus,
+        image_repo,
+        image_tag,
+    } = prepared;
+    let session_id = inputs.session_id;
+    let base_snapshot_id = inputs.base_snapshot_id;
 
-    let image_uri: ImageRef = req.image.clone();
-    let (image_repo, image_tag) = {
-        let (r, t) = split_image_ref(&image_uri);
-        (r.to_string(), t.to_string())
-    };
-
-    // -------- 1. Look up the manifest from `enabled_images` --------
-    // The session's image must be enabled before sessions can
-    // reference it. The `enabled_images` row carries the
-    // manifest.toml fetched at enable time; session-create has zero
-    // network dependency on the manifest path.
-    let enabled = state
-        .services
-        .meta
-        .get_enabled_image(&image_uri)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "image `{image_uri}` is not enabled. \
-                 Operators enable images via POST /api/enabled-images \
-                 (or the dashboard's Settings → Images panel) before \
-                 sessions can reference them."
-            ))
-        })?;
-    let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
-        ApiError::Internal(format!(
-            "stored manifest for {image_uri} failed to parse: {e}"
-        ))
-    })?;
-
-    // ADR 0021 P1.5b retired the `harness_pack_uri` plumbing
-    // entirely — the harness travels in the rootfs now, so there's
-    // no registry URI to thread.
-    //
-    // Pre-flight gate: a session that asked for `mode = Agent` against
-    // a harness-less image is fine (it boots as if dev-VM), but we
-    // surface a 400 only when an image's `[harness]` block is
-    // malformed (`is_launchable() == false`). Manifests round-trip
-    // through `HarnessManifest::validate_source` at bake time, so
-    // this is defence-in-depth against drift.
-    if let Some(h) = manifest.harness.as_ref() {
-        if !h.is_launchable() && !req.mode.is_dev_vm() {
-            return Err(ApiError::Internal(format!(
-                "enabled image `{image_uri}` has a [harness] block that didn't resolve \
-                 (name/exec unset) — re-bake the image"
-            )));
-        }
-    }
-
-    // -------- 2. Resolve secrets --------
-    let secret_ctx = SecretContext {
-        repo: &image_repo,
-        image_tag: &image_tag,
-    };
-    if req.secrets.as_ref().map(|m| !m.is_empty()).unwrap_or(false)
-        && manifest.secret_mode != engram_core::types::image::SecretMode::Literal
-    {
-        return Err(ApiError::BadRequest(
-            "per-request `secrets` are only supported for `secret_mode = literal` images".into(),
-        ));
-    }
-    let secret_bundle: SecretBundle = state
-        .services
-        .secrets
-        .resolve(&secret_ctx, &manifest.secrets, req.secrets.as_ref())
-        .await
-        .map_err(|e| ApiError::Internal(format!("secret resolution: {e}")))?;
-
-    // ADR 0005: workspace comes from the bake image; the platform
-    // never clones a repo or materializes anything itself.
-    let spec = SessionSpec {
-        image: req.image.clone(),
-        mode: req.mode,
-        // ADR 0031: owner is the authenticated principal, server-stamped.
-        user_id: Some(principal.user_id.to_string()),
-    };
-
-    // -------- 3. Mint a SessionId (no DB write yet) --------
-    //
-    // The row is persisted in Phase 5, AFTER scheduling succeeds —
-    // so a scheduling failure (no capacity, image-not-found, host
-    // crash mid-create) returns 503 with no zombie row. Phase 4
-    // builds vm_spec / harness args using this id, which has to
-    // exist before the sandbox does because those args ride INTO
-    // the sandbox's env at create time.
-    //
-    // TODO(self-healing reconciler): when transient-capacity blips
-    // become a real pattern (warm pools, multi-region cold-start),
-    // flip this around: persist a Pending row with the full
-    // vm_spec captured, and have a background reconciler retry
-    // scheduling against later-arriving capacity. Today the
-    // session row carries `image + harness + user_id` only —
-    // not enough to reconstruct a vm_spec — so the v1 fix is
-    // "fail loud, let the user retry" rather than "queue and
-    // retry in the background". Schema work to capture the
-    // full spec is the gating change.
-    let session_id = SessionId::new();
-
-    // -------- 4. Build the anonymous SandboxSpec --------
-    // What every sandbox in this image pool gets. Session-specific
-    // env (ENGRAM_SESSION_ID etc.) is injected at exec / start_agent
-    // time so pooled sandboxes can serve any future session in the
-    // bucket.
-    let mut spec_env: HashMap<String, String> = manifest.env.clone();
-    apply_secrets_to_env(
-        &mut spec_env,
-        &secret_bundle,
-        manifest.secret_mode,
-        session_id,
-    );
-
-    // Per-request secrets that don't appear in the image manifest's
-    // schema (e.g. harness-supplied creds like CLAUDE_CODE_OAUTH_TOKEN
-    // — the demo image declares no `[secrets.*]` blocks) wouldn't
-    // otherwise reach the harness env: `SecretStore::resolve` only
-    // iterates the schema, so override values for unknown names get
-    // silently dropped. Fold them in here, overwriting any same-key
-    // value injected by the manifest's defaults / the secret store —
-    // the user explicitly typed a value into the dashboard for *this*
-    // session, that intent dominates. The broker-mode gate upstream
-    // (line ~204) guarantees overrides only show up under
-    // `SecretMode::Literal`, so passing them through verbatim is
-    // safe — the operator asserted the value, no proxy substitution
-    // contract is implied.
-    // Captured-but-deferred: the env injection is pure CPU and has to
-    // happen before vm_spec construction, but the DB persist depends
-    // on the session row existing (FK from session_secrets.session_id
-    // → sessions.id). Under the post-aa794b8 flow the row isn't
-    // written until *after* scheduling succeeds, so we defer the
-    // persist call to that point. See `deferred_session_secrets`
-    // below for where it actually fires.
-    let deferred_session_secrets: Option<HashMap<String, String>> =
-        if manifest.secret_mode == engram_core::types::image::SecretMode::Literal {
-            if let Some(overrides) = req.secrets.as_ref() {
-                for (name, value) in overrides {
-                    spec_env.insert(name.clone(), value.clone());
-                }
-                // Persist sealed under the deployment KEK so resume can
-                // rebuild the post-resume harness's launch env. Without
-                // this, an idle-then-active transition (auto-resume on
-                // the next prompt) respawns the harness child with no
-                // secret env — Claude prompts the user to log in again.
-                // Skipped when overrides is empty so we don't create
-                // empty rows.
-                if overrides.is_empty() {
-                    None
-                } else {
-                    Some(overrides.clone())
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-    // ADR 0021 P1.3: the harness identity (when any) comes from the
-    // image manifest, not the session request. Carry the resolved
-    // name through to the host-agent so the pooled_backend still
-    // pins its mount-root subdir name correctly (legacy substrate
-    // path; goes away with P1.5).
-    if let Some(h) = manifest.harness.as_ref() {
-        if let Some(name) = h.name.as_deref() {
-            spec_env.insert("ENGRAM_SESSION_HARNESS_NAME".into(), name.to_string());
-        }
-    }
-
-    // The durable session environment agentd holds at bind and applies as
-    // the base env for every process it spawns — harness, `/exec`, and the
-    // interactive shell. It's the image `[env]` + resolved secrets (already
-    // in spec_env) plus the session id. The forge broker token is
-    // deliberately NOT folded in: it's a short-lived per-request credential
-    // (re-minted so it survives a coord restart), so it rides each spawn's
-    // own env instead of the cached session env. See `AgentSpec::session_env`.
-    let mut session_env = spec_env.clone();
-    session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
-
-    // ADR 0031: attribute git commits inside the session to the initiating
-    // user. `render_gitconfig` writes these into `/etc/gitconfig [user]`. Skip
-    // the service principal: its service_email isn't a valid commit author, so
-    // injecting it makes GitHub reject the squash-merge.
-    if !state
-        .auth
-        .as_ref()
-        .is_some_and(|rt| principal.is_service(&rt.config.service_email))
-    {
-        session_env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-        session_env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
-    }
-
-    // ADR 0031: for built-in Claude sessions, auto-inject the user's saved
-    // Claude Code OAuth token — we never prompt per-session. Best-effort: a
-    // missing/unopenable token must not fail create (the harness then falls
-    // back to its own login path; the web gates create on a saved token).
-    inject_user_claude_token(
-        &state,
-        &principal,
-        manifest.harness.as_ref(),
-        req.mode,
-        &mut session_env,
-    )
-    .await;
-
-    let mut agent_for_session = resolve_harness(
-        &state,
-        manifest.harness.as_ref(),
-        req.mode,
-        session_id,
-        req.prompt.as_deref(),
-        session_env.clone(),
-        manifest.workdir.clone(),
-    )?;
-    // ADR 0023: mint the per-session forge broker token and hand it to the
-    // harness as a per-spawn extra (`AgentSpec::env`, layered on top of
-    // session_env). dev_vm sessions have no harness; their `/exec` path
-    // mints the token per request instead.
-    if let Some(agent) = agent_for_session.as_mut() {
-        inject_harness_env(&state, session_id, manifest.git.as_ref(), &mut agent.env).await;
-    }
-
-    // Network policy: image manifest's `[network]` block, verbatim.
-    // ADR 0005 retired the platform's git workspace (no clone URL to
-    // auto-allowlist anymore); agents that need GitHub egress
-    // declare `[network] allow_hosts = ["api.github.com"]` in their
-    // image manifest like any other dependency.
-    let network = manifest.network.clone();
-
-    // -------- 5. Schedule: restore from the image's base snapshot --------
-    //
-    // ADR 0020: every enabled image has a base snapshot — enable is
-    // transactional (an image can't be enabled without capturing one).
-    // So session create ALWAYS restores; there is no cold-boot path here.
-    // The single cold boot in the whole system is the capture itself
-    // (`build_base_snapshot`, run once per image at enable). No row
-    // exists yet; a restore failure returns 503 with Postgres untouched,
-    // so a retry can succeed once capacity recovers.
-    // The NOT NULL FK (migration 0038) guarantees a persisted enabled
-    // image carries a base snapshot; `Option` here is only the
-    // build-then-stamp artifact. `None` would mean a pre-0020 row the
-    // migration should have cleared — surface loudly, don't cold-boot.
-    let base_snapshot_id = enabled.base_snapshot_id.ok_or_else(|| {
-        ApiError::Internal(format!(
-            "enabled image `{}` has no base snapshot — re-enable it \
-             (POST /api/enabled-images) to capture one",
-            req.image
-        ))
-    })?;
-
-    // -------- 5a. Reserve a host (ADR 0046 best-fit, ADR 0048 2D) --------
-    // Rank candidates from PG (affinity / readiness), then atomically
-    // pick + reserve in Postgres so a concurrent burst can't overcommit.
-    // The `pending` reservation row is finalized to `created` by
-    // `boot_on_reserved_host`, or released below on a not-started failure.
-    let memory_mib = resolved_memory_mib(&manifest);
-    let cpu_budget_vcpus = resolved_vcpus(&manifest);
+    // -------- Reserve a host (ADR 0046 best-fit, ADR 0048 2D) --------
     let ctx = crate::placement::ScheduleContext {
         repo: &image_repo,
         image_version: &image_tag,
         prefer_snapshot_id: Some(base_snapshot_id),
         memory_mib: Some(memory_mib),
         cpu_budget_vcpus: Some(cpu_budget_vcpus),
-        // Base-snapshot chunks lazy-materialize from BlobStorage; no host
-        // needs the image prefetched.
         required_image_digest: None,
         exclude_host: None,
         prefer_host: None,
@@ -838,7 +582,7 @@ async fn create_session_inner(
         .meta
         .reserve_placement(
             session_id,
-            &spec,
+            &inputs.spec,
             memory_mib as i64,
             cpu_budget_vcpus as i32,
             &candidates.hosts,
@@ -848,32 +592,15 @@ async fn create_session_inner(
         .map_err(|e| ApiError::Internal(format!("reserve_placement: {e}")))?
     {
         Some(h) => h,
-        // No host fits. ADR 0048 C6 replaces this 503 with an enqueue +
-        // 201 queued; until the scanner lands, fail loud + retryable.
+        // ADR 0048: no host fits → QUEUE (FIFO) instead of 503. The queue
+        // scanner re-attempts placement as capacity frees / the fleet
+        // scales up, and drives the same boot path once a host fits.
         None => {
-            return Err(ApiError::Unavailable(
-                "no host has capacity for this session right now; retry shortly \
-                 (capacity recovers as hosts register, sessions drain, or the \
-                 fleet scales up)."
-                    .into(),
-            ));
+            return enqueue_create(&state, inputs, &image_tag).await;
         }
     };
 
-    // -------- 5b/6. Boot on the reserved host --------
-    let inputs = crate::session_boot::BootInputs {
-        session_id,
-        spec,
-        base_snapshot_id,
-        spec_env,
-        agent: agent_for_session,
-        session_env,
-        secret_bundle,
-        network,
-        secret_mode: manifest.secret_mode,
-        deferred_session_secrets,
-        prompt: req.prompt.clone().filter(|s| !s.is_empty()),
-    };
+    // -------- Boot on the reserved host --------
     match crate::session_boot::boot_on_reserved_host(&state, inputs, host_id).await {
         Ok(()) => Ok((
             StatusCode::CREATED,
@@ -907,6 +634,347 @@ async fn create_session_inner(
     }
 }
 
+/// ADR 0048: enqueue a create that found no capacity. INSERTs the row at
+/// `queued` (carrying the budgets + prompt the scanner reconstructs from),
+/// seals any per-request secret overrides now the FK is satisfiable, emits
+/// `Pending → Queued`, and returns 201 `{status:"queued"}`. The handler
+/// NEVER blocks — the `queue_scanner` owns the continuation.
+async fn enqueue_create(
+    state: &SharedState,
+    inputs: crate::session_boot::BootInputs,
+    image_tag: &str,
+) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
+    let session_id = inputs.session_id;
+    state
+        .services
+        .meta
+        .enqueue_session_create(
+            session_id,
+            &inputs.spec,
+            // The budgets the scanner will reserve with — same values create
+            // computed, so the queued demand signal is exact.
+            resolved_budget_mib(&inputs),
+            resolved_budget_vcpus(&inputs),
+            inputs.prompt.as_deref(),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("enqueue_session_create: {e}")))?;
+    // Seal per-request overrides now the row (FK target) exists.
+    if let Some(overrides) = inputs.deferred_session_secrets.as_ref() {
+        if let Err(e) = persist_session_secrets(state, session_id, overrides).await {
+            tracing::warn!(%session_id, error = %e,
+                "queued session secrets persist failed; resume/boot will lose overrides");
+        }
+    }
+    if let Err(e) = state
+        .emit(
+            session_id,
+            SessionEvent::StatusChanged {
+                from: SessionState::Pending,
+                to: SessionState::Queued,
+                at: chrono::Utc::now(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(%session_id, error = %e, "emit pending→queued failed; continuing");
+    }
+    tracing::info!(%session_id, "no capacity — session queued for placement (ADR 0048)");
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateSessionResponse {
+            session_id,
+            status: SessionState::Queued.as_str(),
+            image_version: image_tag.to_string(),
+            kind: "queued",
+        }),
+    ))
+}
+
+/// The session's memory budget, recovered from the env baked into
+/// `BootInputs` (it isn't stored separately — `resolved_memory_mib`
+/// is the source of truth, recomputed identically by the scanner).
+fn resolved_budget_mib(inputs: &crate::session_boot::BootInputs) -> i64 {
+    inputs.memory_mib as i64
+}
+fn resolved_budget_vcpus(inputs: &crate::session_boot::BootInputs) -> i32 {
+    inputs.cpu_budget_vcpus as i32
+}
+
+/// ADR 0048 C5/C6: resolve a session's manifest / secrets / env / harness
+/// from a live create request. Mints a fresh `SessionId`. Shares
+/// [`prepare_inner`] with the queue scanner's [`prepare_from_row`] so the
+/// two paths can't drift.
+pub(crate) async fn prepare_from_request(
+    state: &SharedState,
+    principal: &engram_core::types::user::Principal,
+    req: &CreateSessionRequest,
+) -> Result<crate::session_boot::PreparedBoot, ApiError> {
+    // Strict lookup: a create may only target a LIVE enabled image
+    // (a soft-deleted image still resumes idle sessions, but can't
+    // accept new ones).
+    let enabled = state
+        .services
+        .meta
+        .get_enabled_image(&req.image)
+        .await
+        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "image `{}` is not enabled. Operators enable images via \
+                 POST /api/enabled-images before sessions can reference them.",
+                req.image
+            ))
+        })?;
+    prepare_inner(
+        state,
+        Some(principal.user_id.to_string()),
+        Some(principal),
+        &req.image,
+        req.mode,
+        req.prompt.clone(),
+        req.secrets.clone(),
+        SessionId::new(),
+        enabled,
+    )
+    .await
+}
+
+/// ADR 0048 C6: resolve the same boot inputs from a durable `queued` row,
+/// so the queue scanner can boot a session no live request is holding.
+/// The owner principal is reconstructed from `session.user_id`; secret
+/// overrides come from the sealed `session_secrets` row; the prompt from
+/// `queue_prompt`. Tolerant image lookup (the image may have been
+/// soft-deleted while the session waited — the lineage is still pinned).
+pub(crate) async fn prepare_from_row(
+    state: &SharedState,
+    session: &Session,
+    prompt: Option<String>,
+) -> Result<crate::session_boot::PreparedBoot, ApiError> {
+    let principal = principal_for_session(state, session).await;
+    let overrides = load_session_secrets(state, session.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(session_id = %session.id, error = %e,
+            "prepare_from_row: secret overrides unavailable; continuing without them");
+            None
+        });
+    let enabled = state
+        .services
+        .meta
+        .get_enabled_image_any(&session.image)
+        .await
+        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "queued session `{}` image `{}` has no enabled_images row (lineage gone)",
+                session.id, session.image
+            ))
+        })?;
+    prepare_inner(
+        state,
+        session.user_id.clone(),
+        principal.as_ref(),
+        &session.image,
+        session.mode,
+        prompt,
+        overrides,
+        session.id,
+        enabled,
+    )
+    .await
+}
+
+/// Reconstruct the owning `Principal` from a session's stored `user_id`
+/// (mirrors `resolve_session_env`'s owner lookup). `None` when there's no
+/// auth runtime, the id is unparseable, or the user row is gone — callers
+/// then skip git attribution + the auto-injected Claude token, exactly as
+/// resume does.
+async fn principal_for_session(
+    state: &SharedState,
+    session: &Session,
+) -> Option<engram_core::types::user::Principal> {
+    let rt = state.auth.as_ref()?;
+    let uid = session.user_id.as_ref()?;
+    let uuid = uid.parse::<uuid::Uuid>().ok()?;
+    match rt.users.get_user(engram_core::UserId(uuid)).await {
+        Ok(user) => Some(user.to_principal()),
+        Err(e) => {
+            tracing::warn!(session_id = %session.id, error = %e,
+                "principal_for_session: owner lookup failed; boot omits attribution + token");
+            None
+        }
+    }
+}
+
+/// Shared resolution for both create entry points (ADR 0048 C5/C6). Mirrors
+/// the original create phases: harness-launchable gate → resolve secrets →
+/// build spec_env / session_env / agent / network → resolve the base
+/// snapshot + budgets. `user_id` stamps the row's owner; `principal` (when
+/// Some and non-service) drives git attribution + the Claude token.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_inner(
+    state: &SharedState,
+    user_id: Option<String>,
+    principal: Option<&engram_core::types::user::Principal>,
+    image_uri: &str,
+    mode: SessionMode,
+    prompt: Option<String>,
+    secret_overrides: Option<HashMap<String, String>>,
+    session_id: SessionId,
+    enabled: engram_core::types::EnabledImage,
+) -> Result<crate::session_boot::PreparedBoot, ApiError> {
+    // ADR 0021 P1.3: a dev-VM session leaves any baked harness undriven,
+    // so a prompt is meaningless — reject it explicitly.
+    if mode.is_dev_vm() && !prompt.as_deref().map(str::is_empty).unwrap_or(true) {
+        return Err(ApiError::BadRequest(
+            "`prompt` requires `mode = agent` — a dev-VM session has no agent to receive it".into(),
+        ));
+    }
+
+    let (image_repo, image_tag) = {
+        let (r, t) = split_image_ref(image_uri);
+        (r.to_string(), t.to_string())
+    };
+    let manifest: ImageManifest = toml::from_str(&enabled.manifest_toml).map_err(|e| {
+        ApiError::Internal(format!(
+            "stored manifest for {image_uri} failed to parse: {e}"
+        ))
+    })?;
+    if let Some(h) = manifest.harness.as_ref() {
+        if !h.is_launchable() && !mode.is_dev_vm() {
+            return Err(ApiError::Internal(format!(
+                "enabled image `{image_uri}` has a [harness] block that didn't resolve \
+                 (name/exec unset) — re-bake the image"
+            )));
+        }
+    }
+
+    // -------- Resolve secrets --------
+    let secret_ctx = SecretContext {
+        repo: &image_repo,
+        image_tag: &image_tag,
+    };
+    if secret_overrides
+        .as_ref()
+        .map(|m| !m.is_empty())
+        .unwrap_or(false)
+        && manifest.secret_mode != engram_core::types::image::SecretMode::Literal
+    {
+        return Err(ApiError::BadRequest(
+            "per-request `secrets` are only supported for `secret_mode = literal` images".into(),
+        ));
+    }
+    let secret_bundle: SecretBundle = state
+        .services
+        .secrets
+        .resolve(&secret_ctx, &manifest.secrets, secret_overrides.as_ref())
+        .await
+        .map_err(|e| ApiError::Internal(format!("secret resolution: {e}")))?;
+
+    let spec = SessionSpec {
+        image: image_uri.to_string(),
+        mode,
+        user_id,
+    };
+
+    // -------- Build the sandbox env --------
+    let mut spec_env: HashMap<String, String> = manifest.env.clone();
+    apply_secrets_to_env(
+        &mut spec_env,
+        &secret_bundle,
+        manifest.secret_mode,
+        session_id,
+    );
+
+    let deferred_session_secrets: Option<HashMap<String, String>> =
+        if manifest.secret_mode == engram_core::types::image::SecretMode::Literal {
+            if let Some(overrides) = secret_overrides.as_ref() {
+                for (name, value) in overrides {
+                    spec_env.insert(name.clone(), value.clone());
+                }
+                if overrides.is_empty() {
+                    None
+                } else {
+                    Some(overrides.clone())
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    if let Some(h) = manifest.harness.as_ref() {
+        if let Some(name) = h.name.as_deref() {
+            spec_env.insert("ENGRAM_SESSION_HARNESS_NAME".into(), name.to_string());
+        }
+    }
+
+    let mut session_env = spec_env.clone();
+    session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
+
+    // ADR 0031: git attribution + Claude token — only for a resolved,
+    // non-service principal (mirrors create + resume).
+    if let Some(p) = principal {
+        let is_service = state
+            .auth
+            .as_ref()
+            .is_some_and(|rt| p.is_service(&rt.config.service_email));
+        if !is_service {
+            session_env.insert("ENGRAM_USER_EMAIL".into(), p.email.clone());
+            session_env.insert("ENGRAM_USER_NAME".into(), p.git_name());
+        }
+        inject_user_claude_token(state, p, manifest.harness.as_ref(), mode, &mut session_env).await;
+    }
+
+    let mut agent = resolve_harness(
+        state,
+        manifest.harness.as_ref(),
+        mode,
+        session_id,
+        prompt.as_deref(),
+        session_env.clone(),
+        manifest.workdir.clone(),
+    )?;
+    if let Some(a) = agent.as_mut() {
+        inject_harness_env(state, session_id, manifest.git.as_ref(), &mut a.env).await;
+    }
+
+    let network = manifest.network.clone();
+
+    // -------- Base snapshot + budgets --------
+    let base_snapshot_id = enabled.base_snapshot_id.ok_or_else(|| {
+        ApiError::Internal(format!(
+            "enabled image `{image_uri}` has no base snapshot — re-enable it \
+             (POST /api/enabled-images) to capture one"
+        ))
+    })?;
+    let memory_mib = resolved_memory_mib(&manifest);
+    let cpu_budget_vcpus = resolved_vcpus(&manifest);
+
+    Ok(crate::session_boot::PreparedBoot {
+        inputs: crate::session_boot::BootInputs {
+            session_id,
+            spec,
+            base_snapshot_id,
+            spec_env,
+            agent,
+            session_env,
+            secret_bundle,
+            network,
+            secret_mode: manifest.secret_mode,
+            deferred_session_secrets,
+            prompt: prompt.filter(|s| !s.is_empty()),
+            memory_mib,
+            cpu_budget_vcpus,
+        },
+        memory_mib,
+        cpu_budget_vcpus,
+        image_repo,
+        image_tag,
+    })
+}
 /// ADR 0020 P1: attempt to restore a session from the image's base
 /// snapshot, late-binding the session harness. Builds the
 /// `SnapshotMetadata` from the base snapshot's `snapshots` row (the

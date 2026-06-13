@@ -723,14 +723,26 @@ pub struct FleetDemandResponse {
     /// the host-measured headroom (nets out the daemon/OS/chunk-cache/mlock
     /// baseline), the autoscaler's true demand signal.
     pub free_mib: u64,
-    /// Σ total_mib over schedulable hosts — lets the caller derive the
+    /// Σ allocatable_mib over schedulable hosts — lets the caller derive the
     /// average per-host capacity (how much one node adds).
     pub total_mib: u64,
+    /// ADR 0048: Σ spare vCPU (`Σ cpu_budget − reserved`) over schedulable
+    /// hosts, and the total CPU budget — the CPU dimension of scale-up.
+    pub free_vcpus: u64,
+    pub total_vcpus: u64,
+    /// ADR 0048: hosts cordoned for scale-down (operator visibility; the
+    /// wave driver also reads this to know its in-flight footprint).
+    pub cordoned_hosts: u32,
+    /// ADR 0048: the queue. `queued_*` is the demand the operator scales
+    /// UP to fit; scale-DOWN is hard-gated on `queued_sessions == 0`.
+    pub queued_sessions: u64,
+    pub queued_mib: u64,
+    pub queued_vcpus: u64,
 }
 
-/// `GET /api/admin/fleet/demand` — the K4 node-pool autoscaler's input. ADR
-/// 0047: counts AND headroom both come from PG (the hosts rows + the reserved
-/// aggregate), so every coordinator replica reports identical demand.
+/// `GET /api/admin/fleet/demand` — the autoscaler's input. ADR 0047/0048:
+/// counts, headroom (both dims), the cordoned footprint, AND the queue all
+/// come from PG, so every coordinator replica reports identical demand.
 pub async fn fleet_demand(State(state): State<SharedState>) -> Json<FleetDemandResponse> {
     let m = crate::placement::fleet_snapshot(state.services.meta.as_ref())
         .await
@@ -744,11 +756,23 @@ pub async fn fleet_demand(State(state): State<SharedState>) -> Json<FleetDemandR
         .await
         .map(|f| f.max(0) as u64)
         .unwrap_or(m.total_mib);
+    let queued = state
+        .services
+        .meta
+        .queued_demand()
+        .await
+        .unwrap_or_default();
     Json(FleetDemandResponse {
         ready_hosts: m.ready_hosts,
         schedulable_hosts: m.schedulable_hosts,
         free_mib,
         total_mib: m.total_mib,
+        free_vcpus: m.free_vcpus,
+        total_vcpus: m.total_vcpus,
+        cordoned_hosts: m.cordoned_hosts,
+        queued_sessions: queued.sessions,
+        queued_mib: queued.mem_mib,
+        queued_vcpus: queued.vcpus,
     })
 }
 

@@ -632,6 +632,236 @@ impl MetadataStore for PostgresStore {
         Ok(flipped)
     }
 
+    async fn enqueue_session_create(
+        &self,
+        id: SessionId,
+        spec: &SessionSpec,
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i32,
+        prompt: Option<&str>,
+    ) -> Result<(), MetaError> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO sessions
+                (id, user_id, status, host_id, sandbox_id, image_uri, mode,
+                 mem_budget_mib, cpu_budget_vcpus,
+                 queued_at, queue_origin, queue_prompt,
+                 created_at, last_active_at)
+            VALUES ($1, $2, 'queued', NULL, NULL, $3, $4, $5, $6, $7, 'create', $8, $7, $7)
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(spec.user_id.as_deref())
+        .bind(&spec.image)
+        .bind(spec.mode.as_str())
+        .bind(mem_budget_mib)
+        .bind(cpu_budget_vcpus)
+        .bind(now)
+        .bind(prompt)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn enqueue_session_resume(&self, id: SessionId) -> Result<(), MetaError> {
+        // Idle → queued (resume origin). Gated on `status='idle'` so a
+        // racing resume that already advanced the row is a clean no-op.
+        sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = 'queued', queued_at = NOW(), queue_origin = 'resume',
+                   last_active_at = NOW()
+             WHERE id = $1 AND status = 'idle'
+            "#,
+        )
+        .bind(id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn list_queued_sessions_fifo(
+        &self,
+    ) -> Result<Vec<engram_core::types::session::QueuedSession>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, status, host_id, sandbox_id, image_uri, mode,
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   COALESCE(mem_budget_mib, 0)::BIGINT AS mem_budget_mib,
+                   COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
+                   queue_origin, queue_prompt, queued_at
+            FROM sessions
+            WHERE status = 'queued'
+            ORDER BY queued_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::queued_session_from_row).collect()
+    }
+
+    async fn place_queued_session(
+        &self,
+        id: SessionId,
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i32,
+        candidates: &[HostId],
+        affinity_len: usize,
+    ) -> Result<Option<HostId>, MetaError> {
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Same FOR UPDATE serialization + 2D fit as `reserve_placement`.
+        let host_rows = sqlx::query(
+            r#"
+            SELECT id, allocatable_mib, total_vcpus
+            FROM hosts
+            WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
+            FOR UPDATE
+            "#,
+        )
+        .bind(&cand)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let mut fit: std::collections::HashMap<uuid::Uuid, HostFit> =
+            std::collections::HashMap::with_capacity(host_rows.len());
+        for r in &host_rows {
+            let hid: uuid::Uuid = sqlx::Row::try_get(r, "id").map_err(db_err)?;
+            let alloc_mib: i64 = sqlx::Row::try_get(r, "allocatable_mib").map_err(db_err)?;
+            let total_vcpus: i32 = sqlx::Row::try_get(r, "total_vcpus").map_err(db_err)?;
+            fit.insert(
+                hid,
+                HostFit {
+                    alloc_mib,
+                    reserved_mib: 0,
+                    cpu_budget: engram_core::types::host::host_cpu_budget(total_vcpus.max(0) as u32),
+                    reserved_vcpus: 0,
+                },
+            );
+        }
+        let res_rows = sqlx::query(
+            r#"
+            SELECT host_id,
+                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT AS reserved_mib,
+                   COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT AS reserved_vcpus
+            FROM sessions
+            WHERE host_id = ANY($1)
+              AND status IN ('pending','created','guest_ready','active',
+                             'evacuating','evicting')
+              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+            GROUP BY host_id
+            "#,
+        )
+        .bind(&cand)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        for r in &res_rows {
+            let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
+            let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
+            let cpu: i64 = sqlx::Row::try_get(r, "reserved_vcpus").map_err(db_err)?;
+            if let Some(f) = fit.get_mut(&h) {
+                f.reserved_mib = mem;
+                f.reserved_vcpus = cpu;
+            }
+        }
+        let Some(picked) = choose_placement_host(
+            &cand,
+            affinity_len,
+            &fit,
+            mem_budget_mib,
+            cpu_budget_vcpus as i64,
+        ) else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None);
+        };
+        // Flip queued → pending on the picked host. 0 rows = lost a race
+        // (already left `queued`); roll back, report no placement.
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = 'pending', host_id = $2, last_active_at = NOW()
+             WHERE id = $1 AND status = 'queued'
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(picked)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None);
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(HostId(picked)))
+    }
+
+    async fn requeue_session(&self, id: SessionId) -> Result<bool, MetaError> {
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = 'queued', host_id = NULL, last_active_at = NOW()
+             WHERE id = $1 AND status = 'pending'
+            "#,
+        )
+        .bind(id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn requeue_stale_pending(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<u64, MetaError> {
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = 'queued', host_id = NULL, last_active_at = NOW()
+             WHERE status = 'pending'
+               AND queue_origin IS NOT NULL
+               AND last_active_at < NOW() - make_interval(secs => $1::bigint)
+            "#,
+        )
+        .bind(older_than.as_secs() as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(n)
+    }
+
+    async fn queued_demand(&self) -> Result<engram_core::types::session::QueuedDemand, MetaError> {
+        let row: (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)::BIGINT,
+                   COALESCE(SUM(mem_budget_mib), 0)::BIGINT,
+                   COALESCE(SUM(cpu_budget_vcpus), 0)::BIGINT
+            FROM sessions WHERE status = 'queued'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(engram_core::types::session::QueuedDemand {
+            sessions: row.0.max(0) as u64,
+            mem_mib: row.1.max(0) as u64,
+            vcpus: row.2.max(0) as u64,
+        })
+    }
+
     async fn per_host_reserved(
         &self,
     ) -> Result<

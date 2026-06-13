@@ -111,6 +111,15 @@ pub struct FleetSnapshot {
     /// "what one node adds" figure the autoscaler's per-host average
     /// wants (it nets out the daemon/OS/residency baseline).
     pub total_mib: u64,
+    /// ADR 0048: Σ host CPU budget (`total_vcpus × overcommit`) over
+    /// schedulable hosts — the per-host-average CPU capacity a node adds.
+    pub total_vcpus: u64,
+    /// ADR 0048: Σ max(0, cpu_budget − reserved_vcpus) over schedulable
+    /// hosts — the spare vCPU the autoscaler scales the CPU dimension on.
+    pub free_vcpus: u64,
+    /// ADR 0047/0048: hosts cordoned off for scale-down — operator
+    /// visibility into how much of the fleet is mid-drain.
+    pub cordoned_hosts: u32,
 }
 
 /// Heartbeat-freshness horizon for placement (and the routing cache's
@@ -412,12 +421,17 @@ pub async fn restore_for_session(
     Ok((host_id, sandbox_id))
 }
 
-/// Fleet-wide autoscaling counts (ADR 0044 K4), from the hosts rows.
+/// Fleet-wide autoscaling counts (ADR 0044 K4 + ADR 0048 CPU dims),
+/// from the hosts rows + the per-host reserved aggregate.
 pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, PickError> {
     let hosts = meta
         .list_active_hosts()
         .await
         .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
+    let reserved = meta
+        .per_host_reserved()
+        .await
+        .map_err(|e| PickError::Internal(format!("per_host_reserved: {e}")))?;
     let now = Utc::now();
     let ttl = placement_ttl();
     let mut m = FleetSnapshot::default();
@@ -430,9 +444,16 @@ pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, P
             continue;
         }
         m.ready_hosts += 1;
+        if h.cordoned {
+            m.cordoned_hosts += 1;
+        }
         if host_is_schedulable(h, now, ttl) {
             m.schedulable_hosts += 1;
             m.total_mib += h.utilization.allocatable_mib;
+            let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
+            m.total_vcpus += cpu_budget as u64;
+            let reserved_vcpus = reserved.get(&h.id).map(|r| r.vcpus).unwrap_or(0);
+            m.free_vcpus += (cpu_budget - reserved_vcpus).max(0) as u64;
         }
     }
     Ok(m)

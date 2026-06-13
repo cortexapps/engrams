@@ -69,6 +69,28 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     })
 }
 
+pub(crate) fn queued_session_from_row(
+    row: &PgRow,
+) -> Result<engram_core::types::session::QueuedSession, MetaError> {
+    let session = session_from_row(row)?;
+    let origin_str: String = row.try_get("queue_origin").map_err(col_err)?;
+    let origin = engram_core::types::session::QueueOrigin::parse(&origin_str).ok_or_else(|| {
+        MetaError::Serialization(format!("queue_origin: unknown value {origin_str:?}"))
+    })?;
+    let prompt: Option<String> = row.try_get("queue_prompt").map_err(col_err)?;
+    let mem_budget_mib: i64 = row.try_get("mem_budget_mib").map_err(col_err)?;
+    let cpu_budget_vcpus: i32 = row.try_get("cpu_budget_vcpus").map_err(col_err)?;
+    let queued_at: DateTime<Utc> = row.try_get("queued_at").map_err(col_err)?;
+    Ok(engram_core::types::session::QueuedSession {
+        session,
+        origin,
+        prompt,
+        mem_budget_mib,
+        cpu_budget_vcpus,
+        queued_at,
+    })
+}
+
 pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let id: Uuid = row.try_get("id").map_err(col_err)?;
     let cloud_meta: serde_json::Value = row.try_get("cloud_metadata").map_err(col_err)?;

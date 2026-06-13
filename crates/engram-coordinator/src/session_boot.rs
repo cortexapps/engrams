@@ -61,6 +61,24 @@ pub(crate) struct BootInputs {
     pub deferred_session_secrets: Option<HashMap<String, String>>,
     /// An initial prompt to record as a user-role message once Active.
     pub prompt: Option<String>,
+    /// The session's resolved RAM budget (MiB) — carried so a queued
+    /// create can report its exact demand without re-resolving.
+    pub memory_mib: u32,
+    /// The session's resolved vCPU budget.
+    pub cpu_budget_vcpus: u32,
+}
+
+/// The product of resolving a session's manifest / secrets / env /
+/// harness — [`BootInputs`] plus the reserve-side figures the caller
+/// needs to place a host (and, for the create handler, the image tag for
+/// its response). Built by `sessions::prepare_from_request` (from a live
+/// request) or `sessions::prepare_from_row` (from a durable queued row).
+pub(crate) struct PreparedBoot {
+    pub inputs: BootInputs,
+    pub memory_mib: u32,
+    pub cpu_budget_vcpus: u32,
+    pub image_repo: String,
+    pub image_tag: String,
 }
 
 /// Why a boot failed, carrying the caller-facing error and — crucially —
@@ -99,6 +117,8 @@ pub(crate) async fn boot_on_reserved_host(
         secret_mode,
         deferred_session_secrets,
         prompt,
+        memory_mib: _,
+        cpu_budget_vcpus: _,
     } = inputs;
 
     // ---- restore the base snapshot on the reserved host ----

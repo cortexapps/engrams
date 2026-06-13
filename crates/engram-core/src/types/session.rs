@@ -326,6 +326,54 @@ pub type ImageRef = String;
 /// Returns `(uri, "")` if there's no `:tag` suffix (a digest-only
 /// reference uses `@sha256:...` syntax which we don't decompose
 /// here).
+/// ADR 0048: whether a queued session is waiting to boot a fresh create
+/// or to resume an idle session — they have different dequeue + timeout
+/// targets (`Queued → Pending` vs `Queued → Idle`; timeout → `Failed`
+/// vs back to `Idle`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueOrigin {
+    Create,
+    Resume,
+}
+
+impl QueueOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Resume => "resume",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "create" => Some(Self::Create),
+            "resume" => Some(Self::Resume),
+            _ => None,
+        }
+    }
+}
+
+/// ADR 0048: a row the queue scanner sees — the session plus its queue
+/// metadata (origin, the stashed create prompt, the budgets to reserve
+/// with, and when it was queued for FIFO + timeout).
+#[derive(Clone, Debug)]
+pub struct QueuedSession {
+    pub session: Session,
+    pub origin: QueueOrigin,
+    pub prompt: Option<String>,
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i32,
+    pub queued_at: DateTime<Utc>,
+}
+
+/// ADR 0048: the queue's aggregate demand — the autoscaler's scale-up
+/// signal (`/admin/fleet/demand`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueuedDemand {
+    pub sessions: u64,
+    pub mem_mib: u64,
+    pub vcpus: u64,
+}
+
 pub fn split_image_ref(uri: &str) -> (&str, &str) {
     // Find the LAST ':' AFTER the last '/' — protects against
     // splitting on the registry's port (e.g. `localhost:5001/...`).

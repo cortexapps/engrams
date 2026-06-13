@@ -362,7 +362,10 @@ async fn ensure_active_after_evicting_hold_for(
     }
 }
 
-async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
+pub(crate) async fn resume_session(
+    state: SharedState,
+    id: SessionId,
+) -> Result<SnapshotResponse, ApiError> {
     // Serialize resume against concurrent resume + eviction for this session.
     // Reuses the per-session `session_lease` lease (keyed on session_id).
     // Without it, two concurrent resumes — e.g. the prompt path's auto-resume
@@ -1058,6 +1061,48 @@ async fn resume_from_fc_snapshot(
         // host first, else wherever the session last ran.
         prefer_host: record.host_id.or(session.host_id),
     };
+
+    // ADR 0048 C7: if NO host can take this resume (the fleet is fully
+    // cordoned for a scale-down wave, or scaled to zero), QUEUE it
+    // (Idle → queued) instead of erroring. The queue scanner resumes it
+    // once capacity returns / the fleet scales up. Only triggers on an
+    // empty candidate set — a present-but-full fleet still soft-picks
+    // (the pre-existing ADR 0046 resume-isn't-reserved posture).
+    if matches!(session.status, SessionState::Idle) {
+        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
+            Ok(c) if c.hosts.is_empty() => {
+                state
+                    .services
+                    .meta
+                    .enqueue_session_resume(id)
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("enqueue_session_resume: {e}")))?;
+                let _ = state
+                    .emit(
+                        id,
+                        SessionEvent::StatusChanged {
+                            from: SessionState::Idle,
+                            to: SessionState::Queued,
+                            at: Utc::now(),
+                        },
+                    )
+                    .await;
+                tracing::info!(%id, "resume found no host capacity — queued (ADR 0048)");
+                return Ok(SnapshotResponse {
+                    session_id: id,
+                    snapshot_id: Some(record.id.to_string()),
+                    size_bytes: Some(record.size_bytes),
+                    note: "queued",
+                });
+            }
+            Ok(_) => {} // a candidate exists — proceed with the soft pick
+            Err(e) => {
+                // Read error: don't queue blindly, fall through to the
+                // restore attempt (which surfaces the real error).
+                tracing::warn!(%id, error = ?e, "resume: candidates_for failed; attempting restore");
+            }
+        }
+    }
     // ADR 0016 Phase B commit 6: pick the newer of
     // `session.live_disk_manifest` and `record.disk_manifest`.
     // Without this, the first resume after Phase B's continuous
