@@ -689,6 +689,7 @@ jobs:
             --test checkpoint_chain \
             --test migration_source \
             --test two_host_live_teleport \
+            --test two_host_drain_wave \
             --test pagemap_scanner \
             --run-ignored ignored-only \
             --no-fail-fast \
