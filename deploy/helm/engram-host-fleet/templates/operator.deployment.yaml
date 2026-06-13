@@ -10,6 +10,14 @@ metadata:
   name: {{ include "hostfleet.operator.fullname" . }}
   labels:
     {{- include "hostfleet.operator.labels" . | nindent 4 }}
+  {{- with .Values.operator.serviceAccount.annotations }}
+  # ADR 0048: Workload Identity binding for `scaler: gke` — the operator
+  # impersonates a GSA with nodePool/instanceGroupManager perms. This is the
+  # OPERATOR's GSA (NOT the host-agent's engram-fc-host); the coordinator
+  # keeps zero cloud creds.
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- with .Values.imagePullSecrets }}
 imagePullSecrets:
   {{- toYaml . | nindent 2 }}
