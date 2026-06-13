@@ -449,22 +449,13 @@ pub struct AppState {
     /// via the `ENGRAM_COORD_POD_ID` env var if local tests want
     /// a deterministic value.
     pub pod_id: Arc<String>,
-    /// ADR 0023: per-session credential-broker tokens (session →
-    /// expected bearer). Minted at session create and injected into the
-    /// guest as `ENGRAM_FORGE_TOKEN`; the in-session forge endpoints
-    /// authenticate the caller by matching against this, then resolve
-    /// the session's `GitForge`. Cleared at terminal. In-memory (one
-    /// `--mode=all` process); PG-backed is the multi-pod follow-on.
+    /// ADR 0023/0047: per-session credential-broker tokens (session →
+    /// expected bearer). PURE READ-THROUGH CACHE over the KEK-sealed
+    /// `session_broker_tokens` PG rows (the authority — minted
+    /// first-writer-wins, so the token is stable for the session's
+    /// lifetime on every replica). A miss loads + unseals from PG;
+    /// cleared at terminal alongside the row.
     pub git_broker_tokens: Arc<dashmap::DashMap<SessionId, String>>,
-    /// ADR 0045 Phase F (teleport): operator-pinned relocation targets
-    /// (session → destination host). Set by `POST .../sessions/:id/teleport`
-    /// before the session is marked `Evacuating`; the `evac_resumer`
-    /// scanner reads it to place on that exact host instead of the
-    /// capacity-ranked pick, and clears it once the session leaves
-    /// `Evacuating` (resolved or fell back to Idle). In-memory — the
-    /// coordinator is single-replica (ADR 0044); a coord restart loses
-    /// pending pins, which degrade to a standard any-peer move.
-    pub teleport_targets: Arc<dashmap::DashMap<SessionId, HostId>>,
     /// ADR 0023: the configured git forge authority (GitHub App, etc).
     /// Set on `main`'s run path via `run_with_registry_and_local`;
     /// `None` in tests and when `--git-forge` is unset (the forge
@@ -523,7 +514,6 @@ impl AppState {
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
             pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
-            teleport_targets: Arc::new(dashmap::DashMap::new()),
             forge: None,
             auth: None,
         }

@@ -861,32 +861,42 @@ pub async fn finish_resume_to_active(
     // HarnessSpec. The resume bundle already loaded the manifest;
     // a None bundle (manifest fetch failed above) means we skip the
     // agent re-attach, same as the dev-VM path.
-    let agent_opt = resume_bundle.as_ref().and_then(|b| {
-        // Same split as create: agentd holds the durable session env (image
-        // env + secrets + session id); the harness gets the forge broker
-        // token as a per-spawn extra — re-minted here so it's valid even
-        // after a coord restart dropped the in-memory token map.
-        let mut session_env = resume_base_env.clone();
-        session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
-        let mut agent = crate::api::sessions::resolve_harness(
-            state,
-            b.manifest.harness.as_ref(),
-            session.mode,
-            id,
-            None,
-            session_env,
-            b.manifest.workdir.clone(),
-        )
-        .ok()
-        .flatten()?;
-        crate::api::sessions::inject_harness_env(
-            state,
-            id,
-            b.manifest.git.as_ref(),
-            &mut agent.env,
-        );
-        Some(agent)
-    });
+    let agent_opt = match resume_bundle.as_ref() {
+        Some(b) => {
+            // Same split as create: agentd holds the durable session env
+            // (image env + secrets + session id); the harness gets the
+            // forge broker token as a per-spawn extra — loaded from the
+            // PG-sealed row (ADR 0047), so it's the same token across
+            // coord restarts and replicas.
+            let mut session_env = resume_base_env.clone();
+            session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
+            match crate::api::sessions::resolve_harness(
+                state,
+                b.manifest.harness.as_ref(),
+                session.mode,
+                id,
+                None,
+                session_env,
+                b.manifest.workdir.clone(),
+            )
+            .ok()
+            .flatten()
+            {
+                Some(mut agent) => {
+                    crate::api::sessions::inject_harness_env(
+                        state,
+                        id,
+                        b.manifest.git.as_ref(),
+                        &mut agent.env,
+                    )
+                    .await;
+                    Some(agent)
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
     let mut start_agent_failed = false;
     if let Some(agent) = agent_opt {
         // Rebuild the SessionEgressPolicy for the new sandbox.

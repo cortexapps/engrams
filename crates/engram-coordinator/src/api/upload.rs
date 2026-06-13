@@ -319,7 +319,9 @@ async fn authorized_untrusted_upload(
         state,
         header.session_id,
         &header.broker_token,
-    ) {
+    )
+    .await
+    {
         return UploadResponse::Error {
             message: "invalid or missing upload token".into(),
         };

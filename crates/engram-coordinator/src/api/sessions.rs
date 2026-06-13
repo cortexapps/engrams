@@ -772,7 +772,7 @@ async fn create_session_inner(
     // session_env). dev_vm sessions have no harness; their `/exec` path
     // mints the token per request instead.
     if let Some(agent) = agent_for_session.as_mut() {
-        inject_harness_env(&state, session_id, manifest.git.as_ref(), &mut agent.env);
+        inject_harness_env(&state, session_id, manifest.git.as_ref(), &mut agent.env).await;
     }
 
     // Network policy: image manifest's `[network]` block, verbatim.
@@ -1400,7 +1400,12 @@ pub async fn delete_session(
                 .await?;
             // ADR 0023: drop the session's credential-broker token so a
             // terminated session can no longer mint git credentials.
+            // ADR 0047: the PG row is the authority; the map is a cache.
             state.git_broker_tokens.remove(&id);
+            if let Err(e) = state.services.meta.delete_broker_token(id).await {
+                tracing::warn!(session_id = %id, error = %e,
+                    "delete_broker_token failed; ON DELETE CASCADE is the backstop");
+            }
         }
         Err(engram_core::MetaError::Conflict(msg)) => {
             tracing::info!(
@@ -1457,19 +1462,101 @@ pub async fn delete_session(
 /// `loopback_endpoint` (`http://127.0.0.1:<port>`) is returned for the
 /// HostTcp/ProcessBackend path so the in-guest helper can reach the
 /// coord on loopback; `None` on the vsock (Firecracker) path.
-pub(crate) fn get_or_mint_broker_token(state: &SharedState, session_id: SessionId) -> String {
-    match state.git_broker_tokens.get(&session_id) {
-        Some(existing) => existing.value().clone(),
-        None => {
-            let minted = format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            );
-            state.git_broker_tokens.insert(session_id, minted.clone());
-            minted
+pub(crate) async fn get_or_mint_broker_token(
+    state: &SharedState,
+    session_id: SessionId,
+) -> Option<String> {
+    // Fast path: this pod already unsealed it.
+    if let Some(existing) = state.git_broker_tokens.get(&session_id) {
+        return Some(existing.value().clone());
+    }
+    // Read-through: another replica (or a prior life of this pod)
+    // minted it — the PG row is the authority.
+    match load_broker_token(state, session_id).await {
+        Ok(Some(token)) => {
+            state.git_broker_tokens.insert(session_id, token.clone());
+            return Some(token);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e, "broker token read-through failed");
+            return None;
         }
     }
+    // Mint, seal, insert first-writer-wins; on a lost race read the
+    // winner's token so every replica injects the SAME value.
+    let minted = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+    let sealed = match cipher.seal(minted.as_bytes()).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e, "broker token seal failed");
+            return None;
+        }
+    };
+    let row = engram_core::types::registry::SessionBrokerToken {
+        session_id,
+        wrapped_dek: sealed.wrapped_dek,
+        nonce: sealed.nonce.to_vec(),
+        ciphertext: sealed.ciphertext,
+        key_id: sealed.key_id,
+    };
+    match state.services.meta.insert_broker_token(row).await {
+        Ok(true) => {
+            state.git_broker_tokens.insert(session_id, minted.clone());
+            Some(minted)
+        }
+        Ok(false) => match load_broker_token(state, session_id).await {
+            Ok(Some(token)) => {
+                state.git_broker_tokens.insert(session_id, token.clone());
+                Some(token)
+            }
+            Ok(None) | Err(_) => {
+                tracing::warn!(%session_id, "lost the mint race but the winner's row is unreadable");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e, "insert_broker_token failed");
+            None
+        }
+    }
+}
+
+/// Load + unseal the session's broker token from PG, if a row exists.
+pub(crate) async fn load_broker_token(
+    state: &SharedState,
+    session_id: SessionId,
+) -> Result<Option<String>, String> {
+    let Some(row) = state
+        .services
+        .meta
+        .get_broker_token(session_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let nonce: [u8; 12] = row
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| "broker token nonce is not 12 bytes".to_string())?;
+    let sealed = engram_crypto::SealedCred {
+        wrapped_dek: row.wrapped_dek,
+        nonce,
+        ciphertext: row.ciphertext,
+        key_id: row.key_id,
+    };
+    let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
+    let plain = cipher.open(&sealed).await.map_err(|e| e.to_string())?;
+    String::from_utf8(plain)
+        .map(Some)
+        .map_err(|_| "broker token is not utf-8".to_string())
 }
 
 fn loopback_endpoint(state: &SharedState) -> Option<String> {
@@ -1497,19 +1584,19 @@ fn loopback_endpoint(state: &SharedState) -> Option<String> {
 /// idle→resume hop until the next cold create — prod session
 /// 5cfb90b8); a single shared entry point makes that class of skew
 /// impossible. If you add an env here, both paths get it.
-pub(crate) fn inject_harness_env(
+pub(crate) async fn inject_harness_env(
     state: &SharedState,
     session_id: SessionId,
     git: Option<&engram_core::types::image::GitConfig>,
     env: &mut HashMap<String, String>,
 ) {
-    inject_forge_env(state, session_id, git, env);
+    inject_forge_env(state, session_id, git, env).await;
     // ADR 0026: artifact-upload token, injected for every image
     // (not git-gated) so the baked `engram-share` skill always works.
-    inject_upload_env(state, session_id, env);
+    inject_upload_env(state, session_id, env).await;
 }
 
-pub(crate) fn inject_forge_env(
+pub(crate) async fn inject_forge_env(
     state: &SharedState,
     session_id: SessionId,
     git: Option<&engram_core::types::image::GitConfig>,
@@ -1518,7 +1605,9 @@ pub(crate) fn inject_forge_env(
     let (Some(_forge), Some(git)) = (state.forge.as_ref(), git) else {
         return;
     };
-    let token = get_or_mint_broker_token(state, session_id);
+    let Some(token) = get_or_mint_broker_token(state, session_id).await else {
+        return;
+    };
     env.insert("ENGRAM_FORGE_TOKEN".into(), token);
     if let Some(owner) = git.owner.as_deref() {
         env.insert("ENGRAM_FORGE_OWNER".into(), owner.to_string());
@@ -1540,12 +1629,14 @@ pub(crate) fn inject_forge_env(
 /// broker token (a distinct env name, same secret value); the upload
 /// auth check (`session_auth::authorize_broker_token`) doesn't require a
 /// forge to be configured.
-pub(crate) fn inject_upload_env(
+pub(crate) async fn inject_upload_env(
     state: &SharedState,
     session_id: SessionId,
     env: &mut HashMap<String, String>,
 ) {
-    let token = get_or_mint_broker_token(state, session_id);
+    let Some(token) = get_or_mint_broker_token(state, session_id).await else {
+        return;
+    };
     env.insert("ENGRAM_UPLOAD_TOKEN".into(), token);
     if let Some(ep) = loopback_endpoint(state) {
         env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep);

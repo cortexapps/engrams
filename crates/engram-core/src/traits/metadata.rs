@@ -133,6 +133,45 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0047 (was `state.teleport_targets`): pin / clear the
+    /// operator-chosen teleport destination on the session row. The
+    /// evac scanner — on ANY replica — honors the pin as its required
+    /// placement. Default impls (mocks): no-op / no pin.
+    async fn set_teleport_target(
+        &self,
+        _id: SessionId,
+        _target: Option<HostId>,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn get_teleport_target(&self, _id: SessionId) -> Result<Option<HostId>, MetaError> {
+        Ok(None)
+    }
+
+    /// ADR 0047 (was `state.git_broker_tokens`): the KEK-sealed
+    /// per-session broker token. `insert_broker_token` is
+    /// first-writer-wins (`ON CONFLICT DO NOTHING`) and returns whether
+    /// THIS call inserted — a `false` means a sibling replica won the
+    /// mint race and the caller re-reads. Default impls (mocks):
+    /// insert always "wins", get finds nothing, delete no-ops — mock
+    /// flows ride the in-memory cache alone, which is exactly the
+    /// pre-0047 behavior.
+    async fn insert_broker_token(
+        &self,
+        _token: crate::types::registry::SessionBrokerToken,
+    ) -> Result<bool, MetaError> {
+        Ok(true)
+    }
+    async fn get_broker_token(
+        &self,
+        _id: SessionId,
+    ) -> Result<Option<crate::types::registry::SessionBrokerToken>, MetaError> {
+        Ok(None)
+    }
+    async fn delete_broker_token(&self, _id: SessionId) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     /// ADR 0047: per-host reserved guest-RAM (Σ `mem_budget_mib` over the
     /// memory-reserving session states) — the read-side twin of
     /// `reserve_placement`'s aggregate, for the capacity-soft resume/evac

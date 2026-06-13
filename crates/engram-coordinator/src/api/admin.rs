@@ -523,7 +523,7 @@ pub struct TeleportSessionRequest {
 ///
 /// Pre: Active session with a bound sandbox; `target_host_id` is a
 /// schedulable host that isn't the source. Post: 202; the session is
-/// marked `Evacuating` with the target pinned in `state.teleport_targets`,
+/// marked `Evacuating` with the target pinned on the session row,
 /// and the `evac_resumer` scanner resumes it on that exact host.
 pub async fn teleport_session(
     State(state): State<SharedState>,
@@ -601,12 +601,15 @@ pub async fn teleport_session(
         }
     }
 
-    // Pin the destination, then fire the same evac pipeline `evacuate`
-    // uses — the only difference is the scanner reads the pin and places
-    // on this exact host. Unwind the pin if the pipeline itself fails.
+    // Pin the destination (ADR 0047: durably, on the session row — the
+    // scanner on ANY replica honors it), then fire the same evac
+    // pipeline `evacuate` uses. Unwind the pin if the pipeline fails.
     state
-        .teleport_targets
-        .insert(session_id, req.target_host_id);
+        .services
+        .meta
+        .set_teleport_target(session_id, Some(req.target_host_id))
+        .await
+        .map_err(|e| ApiError::Internal(format!("teleport: pin target: {e}")))?;
     if let Err(e) = crate::idle_evictor::evict_session_to_state(
         &state,
         session_id,
@@ -615,7 +618,11 @@ pub async fn teleport_session(
     )
     .await
     {
-        state.teleport_targets.remove(&session_id);
+        let _ = state
+            .services
+            .meta
+            .set_teleport_target(session_id, None)
+            .await;
         return Err(ApiError::Internal(format!("teleport pipeline: {e}")));
     }
 

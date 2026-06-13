@@ -14,14 +14,32 @@ use engram_core::types::ids::SessionId;
 
 use crate::state::SharedState;
 
-/// Verify the per-session broker token in constant time against the
-/// in-memory map. Returns `true` iff the session has a token and it
-/// matches. Does NOT require `state.forge` — the forge seam layers its
-/// own forge-configured check on top of this.
-pub(crate) fn authorize_broker_token(state: &SharedState, session: SessionId, token: &str) -> bool {
-    match state.git_broker_tokens.get(&session) {
-        Some(expected) => constant_time_eq(token.as_bytes(), expected.value().as_bytes()),
-        None => false,
+/// Verify the per-session broker token in constant time. ADR 0047: the
+/// in-memory map is a read-through cache over the KEK-sealed PG row, so
+/// a guest request authorizes on ANY replica (the token may have been
+/// minted by a sibling pod, or by this pod's prior life). Returns
+/// `true` iff the session has a token and it matches. Does NOT require
+/// `state.forge` — the forge seam layers its own forge-configured check
+/// on top of this.
+pub(crate) async fn authorize_broker_token(
+    state: &SharedState,
+    session: SessionId,
+    token: &str,
+) -> bool {
+    if let Some(expected) = state.git_broker_tokens.get(&session) {
+        return constant_time_eq(token.as_bytes(), expected.value().as_bytes());
+    }
+    match crate::api::sessions::load_broker_token(state, session).await {
+        Ok(Some(expected)) => {
+            state.git_broker_tokens.insert(session, expected.clone());
+            constant_time_eq(token.as_bytes(), expected.as_bytes())
+        }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(session_id = %session, error = %e,
+                "broker token read-through failed during authorize; denying");
+            false
+        }
     }
 }
 

@@ -60,13 +60,13 @@ impl From<Denied> for ApiError {
 /// Verify the per-session broker token (constant-time) and return the
 /// configured forge. Layers the forge-configured check on top of the
 /// shared [`crate::api::session_auth::authorize_broker_token`].
-fn authorize(
+async fn authorize(
     state: &SharedState,
     session: SessionId,
     token: &str,
 ) -> Result<Arc<dyn GitForge>, Denied> {
     let forge = state.forge.clone().ok_or(Denied::NoForge)?;
-    if crate::api::session_auth::authorize_broker_token(state, session, token) {
+    if crate::api::session_auth::authorize_broker_token(state, session, token).await {
         Ok(forge)
     } else {
         Err(Denied::BadToken)
@@ -177,7 +177,7 @@ pub async fn git_credential(
 ) -> Result<Json<GitCredentialResponse>, ApiError> {
     let token =
         bearer(&headers).ok_or_else(|| ApiError::Unauthorized("missing forge token".into()))?;
-    let forge = authorize(&state, id, &token)?;
+    let forge = authorize(&state, id, &token).await?;
     let tok = op_fetch_credential(&forge, q.host, q.owner)
         .await
         .map_err(ApiError::Internal)?;
@@ -198,7 +198,7 @@ pub async fn create_pull_request(
 ) -> Result<Json<CreatePrResponse>, ApiError> {
     let token =
         bearer(&headers).ok_or_else(|| ApiError::Unauthorized("missing forge token".into()))?;
-    let forge = authorize(&state, id, &token)?;
+    let forge = authorize(&state, id, &token).await?;
     let spec = PullRequestSpec {
         head_branch: req.head_branch,
         base_branch: req.base_branch,
@@ -261,7 +261,7 @@ pub async fn handle_vsock_connection(state: SharedState, mut stream: HarnessByte
 }
 
 async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeResponse {
-    let forge = match authorize(state, req.session_id, &req.broker_token) {
+    let forge = match authorize(state, req.session_id, &req.broker_token).await {
         Ok(f) => f,
         Err(d) => {
             return ForgeResponse::Error {

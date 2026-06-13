@@ -329,7 +329,15 @@ pub async fn migrate_session_live(
         restore_task.abort();
         return Err(MigrateError::Fatal(format!("transition: {e}")));
     }
-    state.teleport_targets.insert(session_id, target_host_id);
+    if let Err(e) = state
+        .services
+        .meta
+        .set_teleport_target(session_id, Some(target_host_id))
+        .await
+    {
+        tracing::warn!(%session_id, error = %e,
+            "set_teleport_target failed; parachute would fall back to any-peer");
+    }
     // Observer-facing truth: the session leaves `active` as the
     // blackout begins.
     let _ = state
@@ -357,7 +365,11 @@ pub async fn migrate_session_live(
             // running VM is a benign FC error).
             restore_task.abort();
             let _ = source_backend.resume(sandbox_id).await;
-            state.teleport_targets.remove(&session_id);
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
             if walk_back_to_active(state, session_id).await {
                 return Err(MigrateError::AbortedToSource(format!(
                     "post-copy capture: {e}"
@@ -380,7 +392,11 @@ pub async fn migrate_session_live(
     let new_sandbox_id = match restore_task.await {
         Ok(Ok(id)) => id,
         Ok(Err(e)) => {
-            state.teleport_targets.remove(&session_id);
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
             // The load-gate marker proves the dest never ran the
             // shipped state — un-pausing the source is zero-loss
             // sound. Anything else is ambiguous: parachute.
@@ -404,7 +420,11 @@ pub async fn migrate_session_live(
             .await);
         }
         Err(join_err) => {
-            state.teleport_targets.remove(&session_id);
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
             return Err(parachute_or_kill(
                 state,
                 session_id,
@@ -449,7 +469,11 @@ pub async fn migrate_session_live(
     .await;
     if let Err(e) = rebind {
         let _ = dest_backend.destroy(new_sandbox_id).await;
-        state.teleport_targets.remove(&session_id);
+        let _ = state
+            .services
+            .meta
+            .set_teleport_target(session_id, None)
+            .await;
         return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
     }
     crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id).await;
@@ -483,7 +507,11 @@ pub async fn migrate_session_live(
         tracing::warn!(%session_id, error = %e,
             "post-copy migration: finish_resume_to_active failed; session left at Created");
     }
-    state.teleport_targets.remove(&session_id);
+    let _ = state
+        .services
+        .meta
+        .set_teleport_target(session_id, None)
+        .await;
 
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "presetup")
         .record(presetup_ms as f64 / 1000.0);

@@ -379,6 +379,90 @@ impl MetadataStore for PostgresStore {
         Ok(Some(HostId(picked)))
     }
 
+    async fn set_teleport_target(
+        &self,
+        id: SessionId,
+        target: Option<HostId>,
+    ) -> Result<(), MetaError> {
+        sqlx::query("UPDATE sessions SET teleport_target_host_id = $2 WHERE id = $1")
+            .bind(id.as_uuid())
+            .bind(target.map(|h| h.as_uuid()))
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_teleport_target(&self, id: SessionId) -> Result<Option<HostId>, MetaError> {
+        let row: Option<(Option<uuid::Uuid>,)> =
+            sqlx::query_as("SELECT teleport_target_host_id FROM sessions WHERE id = $1")
+                .bind(id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        Ok(row.and_then(|(t,)| t).map(HostId))
+    }
+
+    async fn insert_broker_token(
+        &self,
+        token: engram_core::types::registry::SessionBrokerToken,
+    ) -> Result<bool, MetaError> {
+        // First-writer-wins: a sibling replica racing the mint loses
+        // cleanly and re-reads the winner's row.
+        let n = sqlx::query(
+            r#"
+            INSERT INTO session_broker_tokens
+                (session_id, wrapped_dek, nonce, ciphertext, key_id)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (session_id) DO NOTHING
+            "#,
+        )
+        .bind(token.session_id.as_uuid())
+        .bind(&token.wrapped_dek)
+        .bind(&token.nonce)
+        .bind(&token.ciphertext)
+        .bind(&token.key_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(n == 1)
+    }
+
+    async fn get_broker_token(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<engram_core::types::registry::SessionBrokerToken>, MetaError> {
+        let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
+            r#"
+            SELECT wrapped_dek, nonce, ciphertext, key_id
+            FROM session_broker_tokens WHERE session_id = $1
+            "#,
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|(wrapped_dek, nonce, ciphertext, key_id)| {
+            engram_core::types::registry::SessionBrokerToken {
+                session_id: id,
+                wrapped_dek,
+                nonce,
+                ciphertext,
+                key_id,
+            }
+        }))
+    }
+
+    async fn delete_broker_token(&self, id: SessionId) -> Result<(), MetaError> {
+        sqlx::query("DELETE FROM session_broker_tokens WHERE session_id = $1")
+            .bind(id.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn per_host_reserved_mib(
         &self,
     ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {
