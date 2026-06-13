@@ -1,6 +1,6 @@
 # ADR 0048: fleet autoscaling — queue-aware scale-up, teleport-packed scale-down
 
-**Status:** Accepted (2026-06-13) — OSS code shipped + CI-green (commit chain in "Shipped" below). The scale-UP path (queue + 2D packing) and the coordinator-side drain hardening are exercised by live-PG + FC CI. The scale-DOWN actuator (GKE `deleteInstances`) and the end-to-end consolidation wave are UNVALIDATED on real infra until the engrams-internal staged rollout (§6) — the grow-only invariant caps the blast radius until then.
+**Status:** Accepted (2026-06-13). **The objective is aggressive autoscale-DOWN** — the fleet teleport-packs live sessions onto a handful of nodes and deletes the rest (the 100-nodes-×-1-session → a-few scenario). Queue-aware scale-UP is the necessary complement (the pack-down needs somewhere to grow back from, and a burst mid-wave must reclaim capacity instantly), not the point. OSS code is shipped + CI-green (commit chain in "Shipped" below); the GKE actuator runs against the real `kvm` node pool via the engrams-internal rollout (§6). That rollout is staged `idleOnly → aggressive` purely as a safe **enablement order** — `idleOnly` removes only empty nodes, validating the `deleteInstances` actuator with zero session disruption before `aggressive` moves live sessions — **not** a deprioritization of scale-down. The grow-only `set_size` invariant caps blast radius throughout.
 **Related:** ADR 0044 K4 (scale-up policy + GKE actuator, shipped inert), ADR 0045 Phase E (scale-down decision engine #138; this ADR ships its actuator and E2), ADR 0046 (placement reservation), ADR 0047 (stateless coordinator — the prerequisite this work forced), ADR 0022/0043/0045 (the density + teleport substrate this rides)
 
 ## Context
@@ -274,9 +274,11 @@ coordinator this forced — landed first):
 - *Resume placement bypasses PG reservation* (pre-existing ADR 0046 gap; the
   wave's `placement_preview` narrows it).
 
-**Prod gate (engrams-internal, §6):** the GKE `deleteInstances` path and the
-end-to-end consolidation wave are unvalidated until the staged rollout —
-coord `replicas: 2` → `scaler: gke` scale-up → one manual supervised wave
-(verify the IGM mapping + that `deleteInstances` decrements `targetSize`) →
-`idleOnly` soak → `aggressive`. The grow-only invariant caps blast radius
-throughout.
+**Enablement (engrams-internal, §6) — the path to the objective:** coord
+`replicas: 2` (ADR 0047 statelessness validation) → `scaler: gke` scale-up →
+`scaleDown: idleOnly` (the safe first scale-down: empty nodes only, validates
+the `deleteInstances` actuator + IGM mapping + that it decrements `targetSize`
+with no replacement, zero disruption) → **`scaleDown: aggressive`** — the
+teleport-packed consolidation that is this ADR's reason to exist. The
+grow-only invariant caps blast radius throughout; a burst mid-wave aborts the
+wave and returns cordoned capacity instantly.
