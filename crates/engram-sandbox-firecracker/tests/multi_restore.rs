@@ -229,3 +229,89 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
         backend.destroy(*id).await.expect("destroy survivor");
     }
 }
+
+/// How many restores to fire CONCURRENTLY (overlapping in flight) for the
+/// rootfs-symlink-collision regression. 4 reliably interleaves the
+/// install-symlink → load_snapshot windows.
+const OVERLAP_N: usize = 4;
+
+/// ADR 0048 (surfaced by the fleet load test): OVERLAPPING restores from one
+/// base — restore futures all IN FLIGHT AT ONCE, not awaited one-by-one like
+/// the serial siblings above. Every descendant shares the base's
+/// `source_rootfs_canonical` (FC's state.bin-embedded rootfs path; unlike
+/// vsock there's no load-time override to re-key it), so before the
+/// per-source-path serialization their `install_symlink` → `load_snapshot`
+/// windows raced: a TOCTOU `EEXIST` (the prod "…/<sb>.dev -> /dev/nbdN: File
+/// exists (os error 17)" 503) and, worse, one VM could repoint the shared path
+/// between a sibling's install and its load → FC opens the wrong device. All N
+/// concurrent restores must now succeed and coexist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
+async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
+    let env = match common::fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let local_rootfs = work.path().join("rootfs.ext4");
+    tokio::fs::copy(&env.rootfs, &local_rootfs)
+        .await
+        .expect("clone rootfs into tempdir");
+
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    cfg.net_pool = None;
+    cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/bin/bash".into();
+    let backend = std::sync::Arc::new(FirecrackerBackend::new(work.path(), cfg));
+
+    let spec = SandboxSpec {
+        image: "overlapping-restore-source".into(),
+        rootfs_source: Some(local_rootfs.clone()),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 128 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+
+    let source_id = backend.create(spec).await.expect("create source");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let metadata = backend.snapshot(source_id).await.expect("snapshot source");
+    backend.destroy(source_id).await.expect("destroy source");
+
+    // Fire all N restores concurrently — overlapping, so their canonical-symlink
+    // installs and loads interleave (the serial siblings above can't expose the
+    // race). Pre-fix some of these failed with "File exists".
+    let mut handles = Vec::new();
+    for i in 0..OVERLAP_N {
+        let b = backend.clone();
+        let md = metadata.clone();
+        handles.push(tokio::spawn(async move {
+            (i, SandboxBackend::restore(b.as_ref(), md).await)
+        }));
+    }
+    let mut ids = Vec::new();
+    for h in handles {
+        let (i, res) = h.await.expect("join restore task");
+        let id = res.unwrap_or_else(|e| panic!("overlapping restore {i} failed: {e}"));
+        ids.push(id);
+    }
+
+    // All N coexist (the serialization only orders the install→load window; it
+    // does not block any from completing).
+    let listed = backend.list().await.expect("list");
+    for id in &ids {
+        assert!(
+            listed.contains(id),
+            "{id} must be alive after an overlapping restore"
+        );
+    }
+    for id in ids {
+        backend.destroy(id).await.expect("destroy restored");
+    }
+}

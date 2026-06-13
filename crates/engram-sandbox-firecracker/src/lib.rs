@@ -2433,6 +2433,24 @@ impl FirecrackerBackend {
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
 
+        // ADR 0048 (surfaced by the fleet load test): serialize concurrent
+        // restores FROM THE SAME BASE on this host across the
+        // shared-rootfs-symlink → load_snapshot window. Every VM descended
+        // from one base capture shares `source_rootfs_canonical` (the
+        // state.bin-embedded absolute rootfs path) — and unlike vsock, FC
+        // offers no load-time override to re-key it per sandbox. Two same-base
+        // restores otherwise (a) race the symlink install (TOCTOU `EEXIST` —
+        // the "/dev/nbdN: File exists" 503) and (b) can repoint the shared path
+        // between one VM's install and its load, so FC opens the WRONG device.
+        // The lock is held only across this restore (in UFFD mode — the prod
+        // base-restore path — `load_snapshot` returns immediately, so the hold
+        // is brief); different bases use different keys and stay concurrent.
+        // Per-host (process-local), which is exactly the collision's scope.
+        let _src_canon_guard = match manifest.source_rootfs_canonical.as_ref() {
+            Some(p) => Some(source_canonical_lock(p).lock_owned().await),
+            None => None,
+        };
+
         // ADR 0035 §3/§4: aux RO bundles.
         //
         // The PINNED generation must be present regardless of flavor —
@@ -3157,6 +3175,20 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
 /// `swap_harness_drive` re-points the symlink at the session's real
 /// harness ext4 at warm-lease time, so the stub only needs to be
 /// openable as a block device by `load_snapshot`.
+/// ADR 0048: per-host lock keyed by a base snapshot's `source_rootfs_canonical`
+/// path. Restores that descend from the SAME base share this path (FC opens the
+/// rootfs at the state.bin-embedded absolute path, and there's no load-time
+/// rootfs override the way there is for vsock), so their
+/// `restore_canonical_symlinks` → `load_snapshot` windows must not interleave on
+/// one host. Distinct base paths (e.g. per-session resumes) get distinct keys
+/// and never contend. The map only ever grows by the number of distinct base
+/// paths a host serves (bounded by enabled images), so it isn't reaped.
+fn source_canonical_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> =
+        std::sync::LazyLock::new(DashMap::new);
+    LOCKS.entry(path.to_path_buf()).or_default().clone()
+}
+
 async fn restore_canonical_symlinks(
     work_dir: &Path,
     new_sandbox_id: SandboxId,
