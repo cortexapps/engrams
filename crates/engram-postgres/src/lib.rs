@@ -288,6 +288,7 @@ impl MetadataStore for PostgresStore {
         session_id: SessionId,
         spec: &SessionSpec,
         mem_budget_mib: i64,
+        cpu_budget_vcpus: i32,
         candidates: &[HostId],
     ) -> Result<Option<HostId>, MetaError> {
         if candidates.is_empty() {
@@ -361,8 +362,9 @@ impl MetadataStore for PostgresStore {
             r#"
             INSERT INTO sessions
                 (id, user_id, status, host_id, sandbox_id,
-                 image_uri, mode, mem_budget_mib, created_at, last_active_at)
-            VALUES ($1, $2, 'pending', $3, NULL, $4, $5, $6, $7, $7)
+                 image_uri, mode, mem_budget_mib, cpu_budget_vcpus,
+                 created_at, last_active_at)
+            VALUES ($1, $2, 'pending', $3, NULL, $4, $5, $6, $7, $8, $8)
             "#,
         )
         .bind(session_id.as_uuid())
@@ -371,6 +373,7 @@ impl MetadataStore for PostgresStore {
         .bind(&spec.image)
         .bind(spec.mode.as_str())
         .bind(mem_budget_mib)
+        .bind(cpu_budget_vcpus)
         .bind(now)
         .execute(&mut *tx)
         .await

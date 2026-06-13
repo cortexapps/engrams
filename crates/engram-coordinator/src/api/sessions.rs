@@ -43,6 +43,15 @@ pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) 
         })
 }
 
+/// ADR 0048: resolved guest vCPU count for an image. Enable-time
+/// validation (`enabled_images::validate_manifest`) guarantees the
+/// declaration is present for enabled images; `DEFAULT_VCPUS` is the
+/// defensive fallback for the test / non-enabled paths, mirroring
+/// `resolved_memory_mib`. This is the budget placement reserves.
+pub(crate) fn resolved_vcpus(manifest: &engram_core::types::ImageManifest) -> u32 {
+    manifest.resources.vcpus.unwrap_or(DEFAULT_VCPUS)
+}
+
 /// The system's cold-boot `SandboxSpec` shape — a fresh kernel boot
 /// (not a snapshot restore) with manifest-derived resources, env, and
 /// the ADR 0027 aux bundles (current generations: a fresh boot has no
@@ -61,7 +70,7 @@ pub(crate) fn cold_boot_spec(
 ) -> engram_core::types::sandbox::SandboxSpec {
     use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
 
-    let vcpus = manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS);
+    let vcpus = resolved_vcpus(manifest);
     let memory_mib = resolved_memory_mib(manifest);
     let disk_gib = manifest
         .resources
@@ -813,6 +822,7 @@ async fn create_session_inner(
     // applied — FC requires the restore `mem_size_mib` to equal the
     // snapshot's. The shared helper guarantees they agree.
     let memory_mib = resolved_memory_mib(&manifest);
+    let vcpus = resolved_vcpus(&manifest);
 
     let (host_id, sandbox_id) = try_restore_base_snapshot(
         &state,
@@ -821,6 +831,7 @@ async fn create_session_inner(
         &image_repo,
         &image_tag,
         memory_mib,
+        vcpus,
         &spec,
         // Per-session sandbox env (manifest env + resolved secrets +
         // ENGRAM_SESSION_*). The shared base snapshot can't carry it, so
@@ -1115,6 +1126,7 @@ async fn try_restore_base_snapshot(
     image_repo: &str,
     image_tag: &str,
     memory_mib: u32,
+    cpu_budget_vcpus: u32,
     spec: &engram_core::types::SessionSpec,
     session_env: HashMap<String, String>,
 ) -> Result<(engram_core::HostId, engram_core::SandboxId), engram_core::SandboxError> {
@@ -1189,7 +1201,13 @@ async fn try_restore_base_snapshot(
     let host_id = match state
         .services
         .meta
-        .reserve_placement(session_id, spec, memory_mib as i64, &candidates)
+        .reserve_placement(
+            session_id,
+            spec,
+            memory_mib as i64,
+            cpu_budget_vcpus as i32,
+            &candidates,
+        )
         .await
         .map_err(|e| engram_core::SandboxError::Snapshot(format!("reserve_placement: {e}")))?
     {

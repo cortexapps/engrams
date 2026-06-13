@@ -107,21 +107,23 @@ pub trait MetadataStore: Send + Sync {
         Ok(0)
     }
 
-    /// ADR 0046: atomically pick a host from `candidates` (ranked — the
-    /// in-memory affinity/readiness order) and reserve `mem_budget_mib` on it,
-    /// returning the chosen host, or `None` when no candidate has room
-    /// (`total − reserved − residency_floor ≥ mem_budget_mib`). The Postgres
-    /// impl runs under `SELECT … FROM hosts … FOR UPDATE` so concurrent placers
-    /// (any coordinator replica) serialize and a burst can't overcommit; it
-    /// inserts a `pending`, sandbox-less session row as the reservation — later
-    /// finalized by `create_session_created` (an upsert) after boot, or released
-    /// by `delete_pending_session` on boot failure. Default impl (mock stores)
-    /// just returns the first candidate, no capacity check or row insert.
+    /// ADR 0046/0048: atomically pick a host from `candidates` (ranked — the
+    /// affinity/readiness order) and reserve BOTH `mem_budget_mib` and
+    /// `cpu_budget_vcpus` on it, returning the chosen host, or `None` when no
+    /// candidate fits both dimensions (RAM: `allocatable − reserved`; CPU:
+    /// `total_vcpus × overcommit − reserved`). The Postgres impl runs under
+    /// `SELECT … FROM hosts … FOR UPDATE` so concurrent placers (any
+    /// coordinator replica) serialize and a burst can't overcommit; it inserts
+    /// a `pending`, sandbox-less session row as the reservation — later
+    /// finalized by `create_session_created` (an upsert) after boot, or
+    /// released by `delete_pending_session` on boot failure. Default impl (mock
+    /// stores) just returns the first candidate, no capacity check or row insert.
     async fn reserve_placement(
         &self,
         _session_id: SessionId,
         _spec: &SessionSpec,
         _mem_budget_mib: i64,
+        _cpu_budget_vcpus: i32,
         candidates: &[HostId],
     ) -> Result<Option<HostId>, MetaError> {
         Ok(candidates.first().copied())

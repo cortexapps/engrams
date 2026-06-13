@@ -122,7 +122,7 @@ async fn burst_spreads_across_hosts_then_rejects_overflow() {
     let mut placed = Vec::new();
     for _ in 0..8 {
         let picked = meta
-            .reserve_placement(SessionId::new(), &spec(), budget, &candidates)
+            .reserve_placement(SessionId::new(), &spec(), budget, 2, &candidates)
             .await
             .expect("reserve_placement ok");
         placed.push(picked);
@@ -141,7 +141,7 @@ async fn burst_spreads_across_hosts_then_rejects_overflow() {
 
     // 9th: both hosts at allocatable (4×4096 = 16384) → free 0 → reject.
     let ninth = meta
-        .reserve_placement(SessionId::new(), &spec(), budget, &candidates)
+        .reserve_placement(SessionId::new(), &spec(), budget, 2, &candidates)
         .await
         .expect("reserve_placement ok");
     assert_eq!(
