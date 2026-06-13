@@ -298,6 +298,44 @@ async fn hosts_and_reserved(
     Ok((hosts, reserved))
 }
 
+/// ADR 0048 C8 (drain don't-strand guard): is there a schedulable host
+/// (matching `ctx`, e.g. with `exclude_host` set to the drain victim)
+/// that fits BOTH budgets? A HARD 2D check — unlike `pick_from`'s
+/// capacity-soft fallback — so a drain doesn't start a move that would
+/// strand the session when the fleet is genuinely full. An unmeasured
+/// host (no allocatable / no reported vCPU) counts as fitting (same soft
+/// posture `reserve_placement` takes for brand-new / dev hosts).
+pub async fn placement_preview(
+    meta: &dyn MetadataStore,
+    ctx: &ScheduleContext<'_>,
+    mem_mib: i64,
+    cpu_vcpus: i64,
+) -> Result<bool, PickError> {
+    let (hosts, reserved) = hosts_and_reserved(meta).await?;
+    let ranked = rank_hosts(&hosts, ctx, Utc::now(), placement_ttl());
+    Ok(ranked.hosts.iter().any(|id| {
+        let Some(h) = hosts.iter().find(|h| h.id == *id) else {
+            return false;
+        };
+        let alloc = h.utilization.allocatable_mib as i64;
+        if alloc <= 0 {
+            return true; // unmeasured → soft fallback fits
+        }
+        let free_mib = alloc - reserved.get(id).map(|r| r.mem_mib).unwrap_or(0);
+        if free_mib < mem_mib {
+            return false;
+        }
+        let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
+        if cpu_budget > 0 {
+            let free_vcpus = cpu_budget - reserved.get(id).map(|r| r.vcpus).unwrap_or(0);
+            if free_vcpus < cpu_vcpus {
+                return false;
+            }
+        }
+        true
+    }))
+}
+
 /// ADR 0046: the ranked candidates for the create path's
 /// `reserve_placement` transaction.
 pub async fn candidates_for(

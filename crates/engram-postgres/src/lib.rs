@@ -1136,6 +1136,76 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    async fn list_active_assignments_with_budgets_on_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<engram_core::types::session::SandboxAssignment>, MetaError> {
+        let rows: Vec<(Uuid, Uuid, i64, i32)> = sqlx::query_as(
+            r#"
+            SELECT id, sandbox_id,
+                   COALESCE(mem_budget_mib, 0)::BIGINT,
+                   COALESCE(cpu_budget_vcpus, 0)
+            FROM sessions
+            WHERE host_id = $1 AND status = 'active' AND sandbox_id IS NOT NULL
+            "#,
+        )
+        .bind(host_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(s, sb, mem, cpu)| engram_core::types::session::SandboxAssignment {
+                    session_id: SessionId::from(s),
+                    sandbox_id: SandboxId::from(sb),
+                    mem_budget_mib: mem,
+                    cpu_budget_vcpus: cpu,
+                },
+            )
+            .collect())
+    }
+
+    async fn delete_host(
+        &self,
+        id: HostId,
+    ) -> Result<engram_core::types::session::DeleteHostOutcome, MetaError> {
+        use engram_core::types::session::DeleteHostOutcome;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Refuse while any session is still bound — deleting the row out
+        // from under a live session would orphan its routing.
+        let bound: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::BIGINT FROM sessions
+            WHERE host_id = $1
+              AND status IN ('pending','created','guest_ready','active',
+                             'evacuating','evicting')
+            "#,
+        )
+        .bind(id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if bound > 0 {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(DeleteHostOutcome::SessionsBound(bound as u64));
+        }
+        // Detach terminal/idle stragglers (defensive against an FK), then
+        // delete. 0 rows deleted = already gone → idempotent Deleted.
+        sqlx::query("UPDATE sessions SET host_id = NULL WHERE host_id = $1")
+            .bind(id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query("DELETE FROM hosts WHERE id = $1")
+            .bind(id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(DeleteHostOutcome::Deleted)
+    }
+
     async fn transition_session(
         &self,
         id: SessionId,

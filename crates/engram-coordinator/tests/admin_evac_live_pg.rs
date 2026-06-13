@@ -860,3 +860,170 @@ async fn missing_sandbox_strikes_are_consecutive_and_shared() {
         .expect("grace-1 tick");
     assert_eq!(flipped, vec![sid_b], "grace=1 is the no-grace mode");
 }
+
+/// ADR 0048 C9: `delete_host` is the operator's immediate-deregister
+/// primitive for the scale-down wave. It must REFUSE while any session
+/// is still bound (the operator finishes draining first — deleting the
+/// row out from under a live session orphans its routing), then succeed
+/// once the host is empty, and be idempotent if the row is already gone
+/// (the wave driver may re-issue it after a restart). This pins the
+/// SQL the `DELETE /api/admin/hosts/:id` handler maps onto.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn delete_host_refuses_bound_then_idempotent() {
+    use engram_core::types::session::DeleteHostOutcome;
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+
+    let host = HostId::new();
+    let sid = seed_active_session(&meta, host, SandboxId::new()).await;
+
+    // An Active session is bound → refuse with the bound count.
+    match meta.delete_host(host).await.expect("delete_host") {
+        DeleteHostOutcome::SessionsBound(n) => assert_eq!(n, 1, "one Active session bound"),
+        other => panic!("expected SessionsBound(1) while a session is Active, got {other:?}"),
+    }
+    // Row must survive the refusal.
+    assert!(
+        meta.list_active_hosts()
+            .await
+            .expect("list hosts")
+            .iter()
+            .any(|h| h.id == host),
+        "a refused delete must leave the host row intact"
+    );
+
+    // Move the session out of the bound set (Idle is not counted). Now
+    // the host is drainable.
+    meta.transition_session(sid, SessionState::Idle)
+        .await
+        .expect("Active → Idle");
+
+    match meta.delete_host(host).await.expect("delete_host") {
+        DeleteHostOutcome::Deleted => {}
+        other => panic!("expected Deleted once no session is bound, got {other:?}"),
+    }
+    assert!(
+        !meta
+            .list_active_hosts()
+            .await
+            .expect("list hosts")
+            .iter()
+            .any(|h| h.id == host),
+        "row must be gone after a successful delete"
+    );
+    // The Idle straggler was detached, not deleted.
+    let after = meta.get_session(sid).await.expect("get session");
+    assert_eq!(after.host_id, None, "delete_host detaches idle stragglers");
+
+    // Idempotent: deleting an already-gone row is a no-op success (the
+    // wave driver re-issues after a restart without a row to find).
+    match meta
+        .delete_host(host)
+        .await
+        .expect("delete_host (idempotent)")
+    {
+        DeleteHostOutcome::Deleted => {}
+        other => panic!("a second delete of a gone row must be Deleted, got {other:?}"),
+    }
+}
+
+/// ADR 0048 C8 (drain don't-strand guard): `placement_preview` is the
+/// HARD 2D fit check `drain_host` runs before starting ANY move. If the
+/// only survivor (the victim excluded) can't hold the session's budgets,
+/// it returns `false` so the drain surfaces a failure instead of parking
+/// an Active session Idle on a full fleet. A measured-but-too-small
+/// survivor → false; growing it (or its CPU budget) → true. An UNMEASURED
+/// survivor (allocatable 0) keeps the soft-fits posture → true.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
+    use engram_coordinator::placement::{self, ScheduleContext};
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+
+    let victim = HostId::new();
+    let survivor = HostId::new();
+    seed_ready_host(&meta, victim, "drain-victim").await;
+    seed_ready_host(&meta, survivor, "drain-survivor").await;
+
+    // Heartbeat the survivor as MEASURED with a small allocatable + a
+    // CPU budget. allocatable 4096 MiB; total_vcpus 4 ⇒ CPU budget
+    // 4 × overcommit (default 4.0) = 16 vCPU.
+    let heartbeat = |alloc_mib: u64, vcpus: u32| {
+        let meta = meta.clone();
+        async move {
+            meta.touch_host_heartbeat(
+                survivor,
+                engram_core::types::host::HostHeartbeat {
+                    status: engram_core::types::HostStatus::Ready,
+                    capacity: engram_core::types::HostCapacity {
+                        total_gb: 0,
+                        used_gb: 0,
+                        total_mib: 65_536,
+                        used_mib: 0,
+                        running_sandboxes: 0,
+                    },
+                    utilization: engram_core::types::host::HostUtilization {
+                        allocatable_mib: alloc_mib,
+                        ..Default::default()
+                    },
+                    ready_images: Vec::new(),
+                    local_snapshots: Vec::new(),
+                    current_bundles: Vec::new(),
+                    total_vcpus: vcpus,
+                },
+            )
+            .await
+            .expect("heartbeat survivor");
+        }
+    };
+    heartbeat(4_096, 4).await;
+
+    // The victim is excluded (it's draining); the survivor is the only
+    // candidate left.
+    let ctx = ScheduleContext {
+        repo: "test/img",
+        image_version: "v1",
+        prefer_snapshot_id: None,
+        memory_mib: Some(8_192),
+        cpu_budget_vcpus: Some(2),
+        required_image_digest: None,
+        exclude_host: Some(victim),
+        prefer_host: None,
+    };
+
+    // 8 GiB session, survivor has 4 GiB free → no fit → would strand.
+    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 2)
+        .await
+        .expect("placement_preview");
+    assert!(
+        !fits,
+        "a 8 GiB session must NOT fit a 4 GiB survivor — the guard blocks the drain"
+    );
+
+    // Grow the survivor's RAM → now it fits both dims.
+    heartbeat(16_384, 4).await;
+    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 2)
+        .await
+        .expect("placement_preview");
+    assert!(fits, "a 8 GiB session fits a 16 GiB survivor");
+
+    // CPU dimension binds independently: plenty of RAM, but a 32-vCPU
+    // ask against a 4-core × 4.0 = 16-vCPU budget → no fit.
+    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 32)
+        .await
+        .expect("placement_preview");
+    assert!(
+        !fits,
+        "CPU budget binds before RAM — a 32-vCPU ask exceeds the 16-vCPU host budget"
+    );
+
+    // An UNMEASURED survivor (allocatable 0, no reported cores) keeps the
+    // soft-fits posture reserve_placement takes for brand-new / dev hosts.
+    heartbeat(0, 0).await;
+    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 32)
+        .await
+        .expect("placement_preview");
+    assert!(fits, "an unmeasured survivor soft-fits any budget");
+}

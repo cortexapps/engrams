@@ -8,7 +8,10 @@ use crate::types::manifest::ManifestRef;
 use crate::types::registry::{
     EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
 };
-use crate::types::session::{QueuedDemand, QueuedSession, Session, SessionSpec, SessionState};
+use crate::types::session::{
+    DeleteHostOutcome, QueuedDemand, QueuedSession, SandboxAssignment, Session, SessionSpec,
+    SessionState,
+};
 use crate::types::snapshot::SnapshotRecord;
 
 /// ADR 0021 P1.8: outcome of [`MetadataStore::soft_delete_enabled_image`].
@@ -302,6 +305,42 @@ pub trait MetadataStore: Send + Sync {
                 _ => None,
             })
             .collect())
+    }
+
+    /// ADR 0048 C8: the Active assignments on `host_id` WITH their
+    /// reservation budgets, for the drain don't-strand guard (it must
+    /// pre-check that some survivor fits each session's budgets before
+    /// starting a move). Default impl scans `list_active_sessions` (mocks
+    /// carry no budgets → 0, which the guard treats as "no constraint").
+    async fn list_active_assignments_with_budgets_on_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<SandboxAssignment>, MetaError> {
+        let all = self.list_active_sessions().await?;
+        Ok(all
+            .into_iter()
+            .filter_map(|s| match (s.status, s.host_id, s.sandbox_id) {
+                (SessionState::Active, Some(h), Some(sb)) if h == host_id => {
+                    Some(SandboxAssignment {
+                        session_id: s.id,
+                        sandbox_id: sb,
+                        mem_budget_mib: 0,
+                        cpu_budget_vcpus: 0,
+                    })
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// ADR 0048: deregister a drained host immediately — its `hosts` row
+    /// is deleted so the operator's scale-down doesn't wait ~30-40s for
+    /// the dead-host detector. REFUSES (returns the bound count) if any
+    /// session is still bound (`pending`/`created`/`guest_ready`/`active`/
+    /// `evacuating`/`evicting`); idempotent (a missing row = `Ok(Deleted)`).
+    /// Default impl (mocks): `Deleted`.
+    async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
+        Ok(DeleteHostOutcome::Deleted)
     }
 
     /// ADR 0016 Phase B commit 7 — restart-time rehydration source.

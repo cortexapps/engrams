@@ -365,6 +365,26 @@ pub struct QueuedSession {
     pub queued_at: DateTime<Utc>,
 }
 
+/// ADR 0048 C8: an Active session bound to a host, with its reservation
+/// budgets — the drain don't-strand guard needs the budgets to ask
+/// "does some survivor fit this session?".
+#[derive(Clone, Copy, Debug)]
+pub struct SandboxAssignment {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i32,
+}
+
+/// ADR 0048: outcome of [`crate::traits::MetadataStore::delete_host`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteHostOutcome {
+    /// The host row was deleted (or was already gone — idempotent).
+    Deleted,
+    /// Refused: `n` sessions are still bound to the host.
+    SessionsBound(u64),
+}
+
 /// ADR 0048: the queue's aggregate demand — the autoscaler's scale-up
 /// signal (`/admin/fleet/demand`).
 #[derive(Clone, Copy, Debug, Default)]

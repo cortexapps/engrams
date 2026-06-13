@@ -29,7 +29,21 @@ use crate::state::SharedState;
 /// so every coordinator replica serves the same view.
 pub async fn list(State(state): State<SharedState>) -> Result<Json<ListHostsResponse>, ApiError> {
     let rows = state.services.meta.list_active_hosts().await?;
-    let hosts = rows.into_iter().map(HostView::from_row).collect();
+    // ADR 0048: the reserved aggregate (both budget dims) so the operator's
+    // wave planner reads each host's free RAM/vCPU + load for victim-picking.
+    let reserved = state
+        .services
+        .meta
+        .per_host_reserved()
+        .await
+        .unwrap_or_default();
+    let hosts = rows
+        .into_iter()
+        .map(|row| {
+            let r = reserved.get(&row.id).copied().unwrap_or_default();
+            HostView::from_row(row, r)
+        })
+        .collect();
     Ok(Json(ListHostsResponse { hosts }))
 }
 
@@ -43,7 +57,14 @@ pub async fn get(
         .into_iter()
         .find(|r| r.id == host_id)
         .ok_or_else(|| ApiError::NotFound("host not found".into()))?;
-    Ok(Json(HostView::from_row(row)))
+    let reserved = state
+        .services
+        .meta
+        .per_host_reserved()
+        .await
+        .unwrap_or_default();
+    let r = reserved.get(&host_id).copied().unwrap_or_default();
+    Ok(Json(HostView::from_row(row, r)))
 }
 
 /// `GET /api/hosts/:id/cow-state`. ADR 0016 Phase A. Returns one
@@ -181,15 +202,31 @@ pub struct HostView {
     /// ADR 0046/0047: host-measured allocatable RAM — what placement
     /// budgets against.
     pub allocatable_mib: u64,
-    /// ADR 0048: host core count from the heartbeat (0 = not reported).
+    /// ADR 0048: Σ reserved RAM (mem_budget_mib) and the resulting free
+    /// (allocatable − reserved) — the operator's wave planner reads these
+    /// for victim-picking + the 2D drain guard.
+    pub reserved_mib: u64,
+    pub free_mib: u64,
+    /// ADR 0048: host core count + budget (`total_vcpus × overcommit`),
+    /// Σ reserved vCPU, and the resulting free vCPU.
     pub total_vcpus: u32,
+    pub cpu_budget_vcpus: u64,
+    pub reserved_vcpus: u64,
+    pub free_vcpus: u64,
     pub last_heartbeat_at: DateTime<Utc>,
 }
 
 impl HostView {
-    fn from_row(row: engram_core::types::HostRecord) -> Self {
+    fn from_row(
+        row: engram_core::types::HostRecord,
+        reserved: engram_core::types::host::ReservedBudget,
+    ) -> Self {
         let mut ready_image_digests = row.ready_images.clone();
         ready_image_digests.sort();
+        let allocatable_mib = row.utilization.allocatable_mib;
+        let reserved_mib = reserved.mem_mib.max(0) as u64;
+        let cpu_budget = engram_core::types::host::host_cpu_budget(row.total_vcpus).max(0) as u64;
+        let reserved_vcpus = reserved.vcpus.max(0) as u64;
         Self {
             id: row.id,
             hostname: row.hostname,
@@ -206,8 +243,13 @@ impl HostView {
             util_mem_total_mib: row.utilization.mem_total_mib,
             util_mem_used_mib: row.utilization.mem_used_mib,
             util_cpu_pct: row.utilization.cpu_pct,
-            allocatable_mib: row.utilization.allocatable_mib,
+            allocatable_mib,
+            reserved_mib,
+            free_mib: allocatable_mib.saturating_sub(reserved_mib),
             total_vcpus: row.total_vcpus,
+            cpu_budget_vcpus: cpu_budget,
+            reserved_vcpus,
+            free_vcpus: cpu_budget.saturating_sub(reserved_vcpus),
             last_heartbeat_at: row.last_heartbeat_at,
         }
     }

@@ -883,14 +883,15 @@ pub async fn drain_host(
         }
     }
 
-    // PG-authoritative list of sessions bound here. The in-memory
+    // PG-authoritative list of sessions bound here (with budgets — ADR
+    // 0048 C8 needs them for the don't-strand guard). The in-memory
     // `sandboxes_on_host` map is faster but can lag (post-restart
     // rehydration window). For drain we use PG so a fresh coord pod
     // can complete a drain initiated against a sibling.
     let assignments = state
         .services
         .meta
-        .list_active_sandbox_assignments_on_host(host_id)
+        .list_active_assignments_with_budgets_on_host(host_id)
         .await
         .map_err(|e| ApiError::Internal(format!("drain: list sessions on host: {e}")))?;
 
@@ -918,37 +919,74 @@ pub async fn drain_host(
     // session Evacuating with the scanner armed — same end state as
     // the fallback, so it counts as evacuating.
     let mut tasks = tokio::task::JoinSet::new();
-    for (session_id, sandbox_id) in &assignments {
+    for a in &assignments {
         let st = state.clone();
-        let sid = *session_id;
-        let sb = *sandbox_id;
+        let sid = a.session_id;
+        let sb = a.sandbox_id;
+        let mem_budget = a.mem_budget_mib;
+        let cpu_budget = a.cpu_budget_vcpus;
         tasks.spawn(async move {
+            // ADR 0048 C8 don't-strand guard: before starting ANY move,
+            // confirm some SURVIVOR (a non-victim host) fits this session's
+            // budgets. If none does, do NOT begin the move — an Active
+            // session must never be parked Idle just because the fleet is
+            // full. Surface it as a failure so the operator aborts the wave.
+            let (repo, tag) = match st.services.meta.get_session(sid).await {
+                Ok(s) => {
+                    let (r, t) = engram_core::types::session::split_image_ref(&s.image);
+                    (r.to_string(), t.to_string())
+                }
+                Err(e) => return (sid, Err(format!("get_session: {e}"))),
+            };
+            let fit_ctx = crate::placement::ScheduleContext {
+                repo: &repo,
+                image_version: &tag,
+                prefer_snapshot_id: None,
+                memory_mib: Some(mem_budget.max(0) as u32),
+                cpu_budget_vcpus: Some(cpu_budget.max(0) as u32),
+                required_image_digest: None,
+                exclude_host: Some(host_id),
+                prefer_host: None,
+            };
+            match crate::placement::placement_preview(
+                st.services.meta.as_ref(),
+                &fit_ctx,
+                mem_budget,
+                cpu_budget as i64,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return (
+                        sid,
+                        Err("no surviving host has capacity for this session — \
+                             drain would strand it (scale up, then retry)"
+                            .to_string()),
+                    );
+                }
+                Err(e) => return (sid, Err(format!("placement_preview: {e:?}"))),
+            }
+
             if crate::live_migration::live_teleport_enabled() {
-                let target = match st.services.meta.get_session(sid).await {
-                    Ok(session) => {
-                        let (repo, tag) =
-                            engram_core::types::session::split_image_ref(&session.image);
-                        let ctx = crate::placement::ScheduleContext {
-                            repo,
-                            image_version: tag,
-                            prefer_snapshot_id: None,
-                            memory_mib: None,
-                            cpu_budget_vcpus: None,
-                            required_image_digest: None,
-                            exclude_host: Some(host_id),
-                            prefer_host: None,
-                        };
-                        crate::placement::pick_for_session(
-                            st.services.meta.as_ref(),
-                            &st.host_registry,
-                            &ctx,
-                        )
-                        .await
-                        .ok()
-                        .map(|(h, _)| h)
-                    }
-                    Err(_) => None,
+                let ctx = crate::placement::ScheduleContext {
+                    repo: &repo,
+                    image_version: &tag,
+                    prefer_snapshot_id: None,
+                    memory_mib: Some(mem_budget.max(0) as u32),
+                    cpu_budget_vcpus: Some(cpu_budget.max(0) as u32),
+                    required_image_digest: None,
+                    exclude_host: Some(host_id),
+                    prefer_host: None,
                 };
+                let target = crate::placement::pick_for_session(
+                    st.services.meta.as_ref(),
+                    &st.host_registry,
+                    &ctx,
+                )
+                .await
+                .ok()
+                .map(|(h, _)| h);
                 if let Some(target) = target {
                     match crate::live_migration::migrate_session_live(&st, sid, target).await {
                         Ok(()) => return (sid, Ok(())),
@@ -975,7 +1013,7 @@ pub async fn drain_host(
                 engram_core::types::SessionState::Evacuating,
             )
             .await;
-            (sid, outcome)
+            (sid, outcome.map_err(|e| e.to_string()))
         });
     }
 
@@ -985,10 +1023,10 @@ pub async fn drain_host(
         match join {
             Ok((sid, Ok(()))) => evacuating.push(sid),
             Ok((sid, Err(e))) => {
-                tracing::warn!(%sid, %host_id, error = %e, "drain: per-session evict failed");
+                tracing::warn!(%sid, %host_id, error = %e, "drain: per-session evict/guard failed");
                 failures.push(DrainFailure {
                     session_id: sid,
-                    error: e.to_string(),
+                    error: e,
                 });
             }
             Err(e) => {
@@ -1013,6 +1051,31 @@ pub async fn drain_host(
             failures,
         }),
     ))
+}
+
+/// `DELETE /api/admin/hosts/:id` (ADR 0048) — deregister a drained host
+/// immediately, so the operator's scale-down doesn't wait ~30-40s for the
+/// dead-host detector. 409 if any session is still bound (the operator
+/// must finish draining first); 200 + idempotent if the row is already
+/// gone. Also drops the in-memory registry entry + gRPC pool channel.
+pub async fn delete_host(
+    State(state): State<SharedState>,
+    Path(host_id): Path<engram_core::HostId>,
+) -> Result<StatusCode, ApiError> {
+    use engram_core::types::session::DeleteHostOutcome;
+    match state.services.meta.delete_host(host_id).await {
+        Ok(DeleteHostOutcome::Deleted) => {
+            // Drop the in-memory routing entry (best-effort; a sibling
+            // replica clears its own on the host_dead notify / TTL).
+            state.host_registry.unregister(host_id);
+            tracing::info!(%host_id, "admin: host deregistered (row deleted)");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(DeleteHostOutcome::SessionsBound(n)) => Err(ApiError::Conflict(format!(
+            "host {host_id} still has {n} bound session(s); drain it before deleting"
+        ))),
+        Err(e) => Err(ApiError::Internal(format!("delete_host: {e}"))),
+    }
 }
 
 // ---------------------------------------------------------------------

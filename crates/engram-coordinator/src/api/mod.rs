@@ -151,6 +151,12 @@ pub fn router(state: SharedState) -> Router {
         .route("/admin/hosts/:id/cordon", post(admin::cordon_host))
         .route("/admin/hosts/:id/uncordon", post(admin::uncordon_host))
         .route("/admin/hosts/:id/drain", post(admin::drain_host))
+        // ADR 0048: deregister a drained host (the wave driver calls this
+        // after remove_node so the row doesn't linger to the dead-host TTL).
+        .route(
+            "/admin/hosts/:id",
+            axum::routing::delete(admin::delete_host),
+        )
         // ADR 0044 K4: fleet-demand signal for the node-pool autoscaler.
         .route("/admin/fleet/demand", get(admin::fleet_demand))
         .route("/admin/chunk-gc/dry-run", post(admin::chunk_gc_dry_run))
