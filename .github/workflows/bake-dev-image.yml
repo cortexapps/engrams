@@ -75,13 +75,13 @@ jobs:
         # (ghcr.io/cortexapps/engrams/harness-claude:<ver>) and to PUSH the
         # produced image; oras reads the same config to pull cli-tools and
         # re-tag. One login covers all three.
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GH_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Pull golden cli-tools (engram-cli + engram-agentd)
         env:

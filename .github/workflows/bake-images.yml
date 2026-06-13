@@ -112,7 +112,7 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -121,7 +121,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Derive tags
         id: tags
@@ -142,7 +142,7 @@ jobs:
           { echo 'list<<EOF'; cat /tmp/tags.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
 
       - name: Build + push ${{ matrix.image }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/${{ matrix.image }}.Dockerfile
@@ -225,13 +225,13 @@ jobs:
           file dist/engram-host-agent dist/engram-uffd-handler
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish musl binaries to GHCR (oras)
         working-directory: dist
@@ -393,13 +393,13 @@ jobs:
           install -m0755 "$BIN" "$GITHUB_WORKSPACE/dist/firecracker"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish forked firecracker to GHCR (oras), keyed by fork SHA
         working-directory: dist
@@ -473,13 +473,13 @@ jobs:
           file dist/engram-cli dist/engram-agentd
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish cli-tools to GHCR (oras)
         working-directory: dist
@@ -536,13 +536,13 @@ jobs:
       # GHCR login first: node-assets-fetch.sh oras-pulls the bundle-*:main
       # artifacts below, and the buildx push needs it too.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       # ADR 0045 Phase B: pull the FORKED firecracker binary that build-firecracker
       # published, keyed by the submodule's gitlink SHA. We read that SHA straight
@@ -574,7 +574,7 @@ jobs:
           ENGRAM_FC_SRC: ${{ steps.fcfork.outputs.src }}
         run: bash docker/node-assets-fetch.sh node-assets-ctx
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Derive tags
         id: tags
@@ -593,7 +593,7 @@ jobs:
           { echo 'list<<EOF'; cat /tmp/na-tags.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
 
       - name: Build + push node-assets
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: node-assets-ctx
           file: docker/node-assets.Dockerfile
@@ -635,13 +635,13 @@ jobs:
           ls -l dist/
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish bundles to GHCR (oras)
         working-directory: dist
