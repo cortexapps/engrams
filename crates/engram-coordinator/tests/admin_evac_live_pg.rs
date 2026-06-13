@@ -803,3 +803,59 @@ async fn list_stale_hosts_excludes_draining_hosts() {
         "a fresh host is not stale"
     );
 }
+
+/// ADR 0047: `apply_missing_sandbox_strikes` semantics on the real SQL —
+/// the consecutive-reset behavior that per-pod counters corrupted under
+/// round-robin heartbeats. (Ports the pre-0047 in-memory `apply_strikes`
+/// unit tests onto the shared `sessions.missing_strikes` column.)
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn missing_sandbox_strikes_are_consecutive_and_shared() {
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+    let host = HostId::new();
+    let sb_a = SandboxId::new();
+    let sb_b = SandboxId::new();
+    let sid_a = seed_active_session(&meta, host, sb_a).await;
+    let sid_b = seed_active_session(&meta, host, sb_b).await;
+
+    // Two missing ticks for A (B present) — no flip yet.
+    for _ in 0..2 {
+        let flipped = meta
+            .apply_missing_sandbox_strikes(&[sid_b], &[sid_a], 3)
+            .await
+            .expect("strike tick");
+        assert!(flipped.is_empty(), "below grace must not flip");
+    }
+    // A re-appears: resets — the two prior strikes must not carry over.
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[sid_a, sid_b], &[], 3)
+        .await
+        .expect("reset tick");
+    assert!(flipped.is_empty());
+    // Three consecutive missing ticks now flip A exactly at grace —
+    // proving the reset took (2 stale + 1 would have flipped at tick 1).
+    for tick in 0..3 {
+        let flipped = meta
+            .apply_missing_sandbox_strikes(&[sid_b], &[sid_a], 3)
+            .await
+            .expect("strike tick");
+        if tick < 2 {
+            assert!(flipped.is_empty(), "tick {tick} must not flip");
+        } else {
+            assert_eq!(flipped, vec![sid_a], "third consecutive miss flips");
+        }
+    }
+    // The flip reset the counter: the next miss starts from scratch.
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[sid_b], &[sid_a], 3)
+        .await
+        .expect("post-flip tick");
+    assert!(flipped.is_empty(), "post-flip counter starts fresh");
+    // B was present throughout — untouched. grace=1 flips immediately.
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[], &[sid_b], 1)
+        .await
+        .expect("grace-1 tick");
+    assert_eq!(flipped, vec![sid_b], "grace=1 is the no-grace mode");
+}

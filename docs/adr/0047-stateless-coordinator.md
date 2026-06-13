@@ -1,6 +1,6 @@
 # ADR 0047: stateless coordinator — Postgres is the only authority
 
-**Status:** Proposed (2026-06-12)
+**Status:** Accepted (2026-06-12) — S2 (PG-authoritative placement + durable cordon, `69a3ad63`), S3+S4 (teleport pins + sealed broker tokens, `a9e5e6cb`), S5 (shared reconciler strikes) + S6 (replica audit + cross-replica tests) landed as one chain; prod multi-replica flip tracked in engrams-internal.
 **Related:** ADR 0012 (single-replica constraint — superseded by this), ADR 0015 M3 (routing cache + read-through), ADR 0044 (K8s host fleet), ADR 0046 (PG-backed placement reservation), ADR 0048 (fleet autoscaling — the consumer that forced this)
 
 ## Context
@@ -130,22 +130,44 @@ DashMap is deleted. Any replica's scanner now honors any replica's pin.
 
 ### 4. `git_broker_tokens` → `session_broker_tokens`
 
-Migration 0061 adds `session_broker_tokens(session_id UUID PRIMARY KEY,
-token_hash BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`.
-Mint (idempotent, on first injection) stores the SHA-256 of the token; the
-guest-facing `authorize_broker_token` compares hashes (constant-time on
-digests). The plaintext exists only in the guest env injection — consistent
-with the sealed-secrets posture; PG never holds a usable bearer token. Cleared
-on terminal transition. The DashMap is deleted. A guest request landing on any
-replica authorizes.
+Migration 0061 adds `session_broker_tokens` (session_id PK + the
+KEK-sealed envelope: wrapped_dek / nonce / ciphertext / key_id — the
+`session_secrets` shape). Hash-only storage was REJECTED during
+implementation: the token is re-injected into the guest env on every
+`/exec` and on resume, so a replica that can't recover the plaintext
+would mint a NEW token and invalidate every env a sibling already
+injected — replicas would flip the token under live shells per request.
+Instead the mint is first-writer-wins (`ON CONFLICT DO NOTHING`; a
+losing replica re-reads the winner), making the token STABLE for the
+session's lifetime on every replica, and the DashMap is demoted to a
+pure read-through cache over the sealed row (authorize + injection
+unseal on miss). Cleared on terminal transition, `ON DELETE CASCADE`
+as backstop.
 
-### 5. Reconciler strikes → PG
+### 5. Reconciler strikes → `sessions.missing_strikes`
 
-The per-host missing-sandbox strike counter moves to a PG-backed count (small
-table keyed by `(host_id, sandbox_id)` or an advisory-lock-serialized
-reconciler — decided by whichever is smaller against `reconcile/mod.rs`'s
-actual shape; the invariant is **N replicas must not multiply the strike
-rate**).
+The missing-sandbox strike counter moves onto the session row (migration
+0062, `MetadataStore::apply_missing_sandbox_strikes` — one transaction per
+heartbeat: reset the present, increment the missing, return + reset the
+ones that crossed `grace_ticks`). The per-pod counter wasn't just slower
+under N replicas — it was WRONG: a host's heartbeats round-robin across
+pods, so "present" resets land on one pod while strikes accumulate on
+another, and a healthy session could be flipped HostLost without ever
+being missing N CONSECUTIVE ticks. The shared column restores the
+consecutive semantics (pinned by the live-PG test
+`missing_sandbox_strikes_are_consecutive_and_shared`).
+
+### 6. Background-task replica audit (verified, no changes needed)
+
+- `enable_scanner` — lease-claimed jobs (`claim_enable_jobs`); a crashed
+  pod's claim expires and a peer resumes. ✓
+- `checkpoint_retention` — one idempotent DELETE; racing pods delete
+  zero rows. ✓
+- `idle_detect_backstop` — nominates via `transition_session` (FSM-legal;
+  the loser gets `Conflict`). ✓
+- `evac_resumer` / eviction scanner — `session_lease`-guarded. ✓
+- `dead_host` — PG advisory locks. ✓
+- `pg_listener` / SSE — per-pod delivery over PG-persisted events. ✓
 
 ## Consequences
 

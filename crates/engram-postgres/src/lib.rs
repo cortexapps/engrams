@@ -463,6 +463,57 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn apply_missing_sandbox_strikes(
+        &self,
+        present: &[SessionId],
+        missing: &[SessionId],
+        grace_ticks: i32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        if present.is_empty() && missing.is_empty() {
+            return Ok(Vec::new());
+        }
+        let present_ids: Vec<uuid::Uuid> = present.iter().map(|s| s.as_uuid()).collect();
+        let missing_ids: Vec<uuid::Uuid> = missing.iter().map(|s| s.as_uuid()).collect();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        if !present_ids.is_empty() {
+            sqlx::query(
+                "UPDATE sessions SET missing_strikes = 0
+                 WHERE id = ANY($1) AND missing_strikes <> 0",
+            )
+            .bind(&present_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        let mut flipped: Vec<SessionId> = Vec::new();
+        if !missing_ids.is_empty() {
+            let rows: Vec<(uuid::Uuid, i32)> = sqlx::query_as(
+                "UPDATE sessions SET missing_strikes = missing_strikes + 1
+                 WHERE id = ANY($1)
+                 RETURNING id, missing_strikes",
+            )
+            .bind(&missing_ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let crossed: Vec<uuid::Uuid> = rows
+                .into_iter()
+                .filter(|(_, s)| *s >= grace_ticks)
+                .map(|(id, _)| id)
+                .collect();
+            if !crossed.is_empty() {
+                sqlx::query("UPDATE sessions SET missing_strikes = 0 WHERE id = ANY($1)")
+                    .bind(&crossed)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            }
+            flipped = crossed.into_iter().map(SessionId).collect();
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(flipped)
+    }
+
     async fn per_host_reserved_mib(
         &self,
     ) -> Result<std::collections::HashMap<HostId, i64>, MetaError> {

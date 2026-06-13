@@ -172,6 +172,24 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0047 (replica-safe reconciler): apply one heartbeat's
+    /// missing-sandbox strike accounting on the session rows. Sessions
+    /// whose sandbox WAS in the heartbeat get their counter reset;
+    /// missing ones increment; ids that reach `grace_ticks` are
+    /// returned (their counters reset in the same transaction) and the
+    /// caller flips them. The shared column restores the "missing N
+    /// CONSECUTIVE heartbeats" semantics that per-pod counters corrupt
+    /// when a host's heartbeats round-robin across replicas. Default
+    /// impl (mocks): never flips; reconcile-exercising mocks override.
+    async fn apply_missing_sandbox_strikes(
+        &self,
+        _present: &[SessionId],
+        _missing: &[SessionId],
+        _grace_ticks: i32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// ADR 0047: per-host reserved guest-RAM (Σ `mem_budget_mib` over the
     /// memory-reserving session states) — the read-side twin of
     /// `reserve_placement`'s aggregate, for the capacity-soft resume/evac

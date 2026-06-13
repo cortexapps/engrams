@@ -242,3 +242,206 @@ async fn append_session_event_fires_pg_notify() {
         .expect("session row is present after the NOTIFY arrived");
     assert_eq!(row.id, session_id);
 }
+
+/// ADR 0047: the stateless-coordinator contract, end to end against one
+/// shared Postgres — what one replica writes (heartbeat scheduling
+/// state, a durable cordon, a teleport pin, a sealed broker token), any
+/// other replica reads on its next decision. Two `PostgresStore`s stand
+/// in for two coord pods; a unique image digest isolates the candidate
+/// pool from any other host rows in the shared test database.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn cross_replica_scheduling_pins_and_tokens() {
+    use engram_coordinator::host_registry::HostRegistry;
+    use engram_coordinator::placement::{self, ScheduleContext};
+    use engram_core::types::host::{HostCapacity, HostHeartbeat, HostRecord, HostStatus};
+    use engram_core::HostId;
+
+    let Ok(database_url) = std::env::var("ENGRAM_TEST_DATABASE_URL") else {
+        return;
+    };
+    let store_a = engram_postgres::PostgresStore::connect(&database_url)
+        .await
+        .expect("connect A");
+    store_a.migrate().await.expect("migrate");
+    let store_b = engram_postgres::PostgresStore::connect(&database_url)
+        .await
+        .expect("connect B");
+    let meta_a: Arc<dyn MetadataStore> = Arc::new(store_a);
+    let meta_b: Arc<dyn MetadataStore> = Arc::new(store_b);
+
+    // --- 1. heartbeat through A ⇒ schedulable from B -----------------
+    let digest = format!("sha256:adr47-{}", uuid::Uuid::new_v4().simple());
+    let h1 = HostId::new();
+    let h2 = HostId::new();
+    for (host, name) in [(h1, "ha-h1"), (h2, "ha-h2")] {
+        meta_a
+            .upsert_host(HostRecord {
+                id: host,
+                hostname: name.into(),
+                cloud_metadata: Default::default(),
+                capacity: HostCapacity {
+                    total_gb: 0,
+                    used_gb: 0,
+                    total_mib: 16_384,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: Default::default(),
+                status: HostStatus::Ready,
+                last_heartbeat_at: chrono::Utc::now(),
+                host_addr: None,
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
+            })
+            .await
+            .expect("seed host");
+        meta_a
+            .touch_host_heartbeat(
+                host,
+                HostHeartbeat {
+                    status: HostStatus::Ready,
+                    capacity: HostCapacity {
+                        total_gb: 0,
+                        used_gb: 0,
+                        total_mib: 16_384,
+                        used_mib: 0,
+                        running_sandboxes: 0,
+                    },
+                    utilization: Default::default(),
+                    ready_images: vec![digest.clone()],
+                    local_snapshots: Vec::new(),
+                    current_bundles: Vec::new(),
+                    total_vcpus: 8,
+                },
+            )
+            .await
+            .expect("heartbeat through A");
+    }
+    // Replica B has its own registry with its own backends — the
+    // scheduling DECISION comes from the shared rows.
+    let registry_b = Arc::new(HostRegistry::new(meta_b.clone()));
+    let work = tempfile::tempdir().expect("dir").keep();
+    let raw: Arc<dyn engram_core::traits::SandboxBackend> =
+        Arc::new(engram_sandbox_process::ProcessBackend::new(work));
+    let backend: Arc<dyn engram_core::traits::HostClient> =
+        Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(raw));
+    registry_b.register(h1, backend.clone());
+    registry_b.register(h2, backend.clone());
+
+    let ctx = ScheduleContext {
+        repo: "r",
+        image_version: "v",
+        prefer_snapshot_id: None,
+        memory_mib: None,
+        required_image_digest: Some(engram_protocol::heartbeat::ManifestDigest::new(
+            digest.clone(),
+        )),
+        exclude_host: None,
+        prefer_host: None,
+    };
+    let (picked, _) = placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx)
+        .await
+        .expect("B schedules onto a host whose heartbeats landed on A");
+    assert!(picked == h1 || picked == h2);
+
+    // --- 2. cordon via A ⇒ B's picker excludes it ---------------------
+    meta_a.set_host_cordoned(h1, true).await.expect("cordon");
+    for _ in 0..10 {
+        let (picked, _) = placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx)
+            .await
+            .expect("pick");
+        assert_eq!(picked, h2, "A's cordon must bind B's picker");
+    }
+
+    // --- 3. teleport pin via A ⇒ visible (and clearable) from B ------
+    let session_id = meta_a
+        .create_session(SessionSpec {
+            image: "ha-adr47:test".into(),
+            mode: engram_core::types::session::SessionMode::Agent,
+            user_id: None,
+        })
+        .await
+        .expect("create session");
+    meta_a
+        .set_teleport_target(session_id, Some(h2))
+        .await
+        .expect("pin via A");
+    assert_eq!(
+        meta_b
+            .get_teleport_target(session_id)
+            .await
+            .expect("get via B"),
+        Some(h2),
+        "B's scanner must honor A's pin"
+    );
+    meta_b
+        .set_teleport_target(session_id, None)
+        .await
+        .expect("clear via B");
+    assert_eq!(
+        meta_a.get_teleport_target(session_id).await.expect("get"),
+        None
+    );
+
+    // --- 4. broker token sealed via A ⇒ unsealed + equal on B --------
+    let kek_a = engram_crypto::EnvVarKeyProvider::from_bytes([7u8; 32], "test:v1");
+    let kek_b = engram_crypto::EnvVarKeyProvider::from_bytes([7u8; 32], "test:v1");
+    let token = format!("tok-{}", uuid::Uuid::new_v4().simple());
+    let sealed = engram_crypto::CredCipher::new(&kek_a)
+        .seal(token.as_bytes())
+        .await
+        .expect("seal");
+    let inserted = meta_a
+        .insert_broker_token(engram_core::types::registry::SessionBrokerToken {
+            session_id,
+            wrapped_dek: sealed.wrapped_dek.clone(),
+            nonce: sealed.nonce.to_vec(),
+            ciphertext: sealed.ciphertext.clone(),
+            key_id: sealed.key_id.clone(),
+        })
+        .await
+        .expect("insert");
+    assert!(inserted, "first writer wins");
+    // A losing replica's re-insert is a clean no-op…
+    let second = meta_b
+        .insert_broker_token(engram_core::types::registry::SessionBrokerToken {
+            session_id,
+            wrapped_dek: vec![1],
+            nonce: vec![0; 12],
+            ciphertext: vec![2],
+            key_id: "loser".into(),
+        })
+        .await
+        .expect("racing insert");
+    assert!(!second, "ON CONFLICT DO NOTHING — the loser re-reads");
+    // …and B unseals the winner's token to the same plaintext.
+    let row = meta_b
+        .get_broker_token(session_id)
+        .await
+        .expect("get via B")
+        .expect("row exists");
+    let nonce: [u8; 12] = row.nonce.as_slice().try_into().expect("12-byte nonce");
+    let opened = engram_crypto::CredCipher::new(&kek_b)
+        .open(&engram_crypto::SealedCred {
+            wrapped_dek: row.wrapped_dek,
+            nonce,
+            ciphertext: row.ciphertext,
+            key_id: row.key_id,
+        })
+        .await
+        .expect("open via B");
+    assert_eq!(String::from_utf8(opened).unwrap(), token);
+    meta_b
+        .delete_broker_token(session_id)
+        .await
+        .expect("delete");
+    assert!(meta_a
+        .get_broker_token(session_id)
+        .await
+        .expect("get after delete")
+        .is_none());
+}
