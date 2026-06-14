@@ -335,42 +335,70 @@ impl HostAgent {
                         for (sandbox_id, session, export_id) in
                             pooled_for_ttl.expired_migration_exports()
                         {
-                            let ownership = match session {
-                                Some(session_id) => coord_for_ttl
-                                    .sandbox_ownership(host_id_for_ttl, session_id, sandbox_id)
-                                    .await
-                                    .ok(),
-                                None => None,
-                            };
-                            let state_served = pooled_for_ttl.migration_state_served(sandbox_id);
-                            let verdict =
-                                migration::ttl_verdict(session.is_some(), ownership, state_served);
-                            tracing::warn!(
-                                %sandbox_id,
-                                ?session,
-                                ?verdict,
-                                "migration export exceeded TTL with no commit/abort",
-                            );
-                            use engram_core::traits::sandbox::SandboxBackend as _;
-                            match verdict {
-                                migration::TtlVerdict::AbortInPlace => {
-                                    if let Err(e) =
-                                        pooled_for_ttl.migration_abort(sandbox_id, &export_id).await
-                                    {
-                                        tracing::warn!(%sandbox_id, error = %e,
-                                            "export TTL abort failed");
-                                    }
-                                }
-                                migration::TtlVerdict::Destroy => {
-                                    if let Err(e) = pooled_for_ttl
-                                        .migration_commit(sandbox_id, &export_id)
+                            // Panic containment for the TTL safety net: a
+                            // panic anywhere in a single export's verdict
+                            // execution must NOT propagate and abort this
+                            // spawned task — that would silently kill the
+                            // dumb-host sweep for the rest of the process
+                            // lifetime, leaking every later abandoned
+                            // export. Wrap each per-export iteration in
+                            // `catch_unwind` so one poisoned export is
+                            // logged at error! and the loop keeps ticking.
+                            use futures::future::FutureExt as _;
+                            let pooled_iter = pooled_for_ttl.clone();
+                            let coord_iter = &coord_for_ttl;
+                            let export_id_iter = export_id.clone();
+                            let outcome = std::panic::AssertUnwindSafe(async move {
+                                let ownership = match session {
+                                    Some(session_id) => coord_iter
+                                        .sandbox_ownership(host_id_for_ttl, session_id, sandbox_id)
                                         .await
-                                    {
-                                        tracing::warn!(%sandbox_id, error = %e,
-                                            "export TTL destroy failed");
+                                        .ok(),
+                                    None => None,
+                                };
+                                let state_served = pooled_iter.migration_state_served(sandbox_id);
+                                let verdict = migration::ttl_verdict(
+                                    session.is_some(),
+                                    ownership,
+                                    state_served,
+                                );
+                                tracing::warn!(
+                                    %sandbox_id,
+                                    ?session,
+                                    ?verdict,
+                                    "migration export exceeded TTL with no commit/abort",
+                                );
+                                use engram_core::traits::sandbox::SandboxBackend as _;
+                                match verdict {
+                                    migration::TtlVerdict::AbortInPlace => {
+                                        if let Err(e) = pooled_iter
+                                            .migration_abort(sandbox_id, &export_id_iter)
+                                            .await
+                                        {
+                                            tracing::warn!(%sandbox_id, error = %e,
+                                                "export TTL abort failed");
+                                        }
                                     }
+                                    migration::TtlVerdict::Destroy => {
+                                        if let Err(e) = pooled_iter
+                                            .migration_commit(sandbox_id, &export_id_iter)
+                                            .await
+                                        {
+                                            tracing::warn!(%sandbox_id, error = %e,
+                                                "export TTL destroy failed");
+                                        }
+                                    }
+                                    migration::TtlVerdict::StayPaused => {}
                                 }
-                                migration::TtlVerdict::StayPaused => {}
+                            })
+                            .catch_unwind()
+                            .await;
+                            if outcome.is_err() {
+                                tracing::error!(
+                                    %sandbox_id,
+                                    "migration TTL sweep iteration panicked; \
+                                     contained — sweep continues",
+                                );
                             }
                         }
                     }
