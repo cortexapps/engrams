@@ -307,6 +307,16 @@ pub struct Runtime {
     peer: Option<std::sync::Arc<crate::peer::PeerSession>>,
     /// One-way progress/failure reports to the host-agent (peer mode).
     control: Option<std::sync::Arc<crate::peer::ControlTx>>,
+    /// ADR 0045 C2: latched once the background drain has pulled every
+    /// sealed chunk (DrainDone). After this, the destination holds all
+    /// sealed content locally and no longer needs the source — the
+    /// fault path must NOT dial the peer (the source's export may already
+    /// be torn down by `migration_commit`). A fault that finds its chunk
+    /// installed simply wakes; a (vanishingly unlikely) still-uninstalled
+    /// sealed chunk after a successful drain falls through to `resolve()`
+    /// rather than fatally escalating PeerLost on a healthy, fully-drained
+    /// destination (issue #227 scenario (a)).
+    drain_done: std::sync::atomic::AtomicBool,
     /// ADR 0045 C2 (E2B fold): one-shot trace dump when the recorder
     /// window closes — the migration capture reads the per-jail trace
     /// file LIVE, so waiting for handler exit (the publish channel) is
@@ -383,6 +393,7 @@ impl Runtime {
             zeropage_ok: std::sync::atomic::AtomicBool::new(true),
             peer: None,
             control: None,
+            drain_done: std::sync::atomic::AtomicBool::new(false),
             window_dump_done: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -1124,42 +1135,75 @@ impl Runtime {
                     self.wake_page(page_aligned, page_size)?;
                     return Ok(());
                 }
-                match peer.need_at(chunk_byte_offset) {
-                    Ok(crate::peer::PeerPage::Bytes(bytes)) => {
-                        let installed =
-                            self.install_chunk_at(chunk_byte_offset, bytes.into(), true)?;
-                        if !installed {
-                            self.wake_page(page_aligned, page_size)?;
+                // ADR 0045 C2 / issue #227 (a): once the drain has pulled
+                // every sealed chunk, the source's export may be torn down
+                // (migration_commit) and dialing it would park up to 120 s
+                // then fatally escalate a HEALTHY, fully-drained dest. After
+                // DrainDone the chunk is installed (handled above) or — only
+                // under a genuine drain bug — still missing, in which case we
+                // fall through to resolve() rather than rewinding the VM.
+                if self.is_drain_done() {
+                    tracing::warn!(
+                        chunk_idx,
+                        "sealed fault after DrainDone with chunk uninstalled; \
+                         not dialing torn-down peer, falling through to resolve()"
+                    );
+                } else {
+                    match peer.need_at(chunk_byte_offset) {
+                        Ok(crate::peer::PeerPage::Bytes(bytes)) => {
+                            let installed =
+                                self.install_chunk_at(chunk_byte_offset, bytes.into(), true)?;
+                            if !installed {
+                                self.wake_page(page_aligned, page_size)?;
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
-                    }
-                    Ok(crate::peer::PeerPage::Zero) => {
-                        // Private zero install — NEVER the shared base
-                        // (sealed content is divergence by definition).
-                        let installed = if self.base_shm.is_some() {
-                            self.install_zero_substrate(chunk_byte_offset, true)?
-                        } else {
-                            self.install_zero_at(chunk_byte_offset, true)?
-                        };
-                        if !installed {
-                            self.wake_page(page_aligned, page_size)?;
+                        Ok(crate::peer::PeerPage::Zero) => {
+                            // Private zero install — NEVER the shared base
+                            // (sealed content is divergence by definition).
+                            let installed = if self.base_shm.is_some() {
+                                self.install_zero_substrate(chunk_byte_offset, true)?
+                            } else {
+                                self.install_zero_at(chunk_byte_offset, true)?
+                            };
+                            if !installed {
+                                self.wake_page(page_aligned, page_size)?;
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
-                    }
-                    Ok(crate::peer::PeerPage::AltSource(_durable)) => {
-                        // Over-approximation demote: the source proved this
-                        // chunk equals the durable manifest entry, so the
-                        // normal resolve() arms below serve it (class 2).
-                    }
-                    Err(e) => {
-                        peer.mark_lost();
-                        if let Some(control) = self.control.as_ref() {
-                            control.report(engram_migrate_proto::HandlerControl::PeerLost {
-                                remaining: self.sealed_uninstalled_count(peer),
-                                detail: e.to_string(),
-                            });
+                        Ok(crate::peer::PeerPage::AltSource(_durable)) => {
+                            // Over-approximation demote: the source proved this
+                            // chunk equals the durable manifest entry, so the
+                            // normal resolve() arms below serve it (class 2).
                         }
-                        return Err(HandlerError::PeerLost(e.to_string()));
+                        Err(e) => {
+                            // Issue #227 (a): before fatally escalating, re-check
+                            // whether the chunk landed meanwhile — the drain or a
+                            // sibling fault may have installed it while THIS fault
+                            // sat parked mid-redial (a multi-second window), or the
+                            // drain may have just finished and torn down the export
+                            // out from under us. If it's installed now, the peer
+                            // was never actually needed: wake and return Ok rather
+                            // than rewinding a healthy destination.
+                            if self.chunk_installed(chunk_idx) {
+                                tracing::info!(
+                                    chunk_idx,
+                                    error = %e,
+                                    "sealed fault errored but chunk landed via drain/sibling; \
+                                     waking instead of escalating PeerLost"
+                                );
+                                self.wake_page(page_aligned, page_size)?;
+                                return Ok(());
+                            }
+                            peer.mark_lost();
+                            if let Some(control) = self.control.as_ref() {
+                                control.report(engram_migrate_proto::HandlerControl::PeerLost {
+                                    remaining: self.sealed_uninstalled_count(peer),
+                                    detail: e.to_string(),
+                                });
+                            }
+                            return Err(HandlerError::PeerLost(e.to_string()));
+                        }
                     }
                 }
             }
@@ -1255,6 +1299,18 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    /// Latch the drain-complete flag (DrainDone). Once set, the fault
+    /// path stops dialing the peer (see `drain_done` field doc).
+    fn mark_drain_done(&self) {
+        self.drain_done
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True once the background drain has reported DrainDone.
+    fn is_drain_done(&self) -> bool {
+        self.drain_done.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// How many sealed chunks remain uninstalled (PeerLost reporting).
     fn sealed_uninstalled_count(&self, peer: &crate::peer::PeerSession) -> u64 {
         let installed = self.installed.lock().expect("installed bitmap poisoned");
@@ -1287,6 +1343,10 @@ impl Runtime {
         use crate::peer::{DrainStats, PeerPage};
 
         const PIPELINE_DEPTH: usize = 8;
+        // Per-request (retryable, `Error{req_id: Some}`) drain failures get
+        // a bounded same-conn retry before the drain gives up (issue #227 b).
+        const DRAIN_REQUEST_RETRIES: u32 = 3;
+        const DRAIN_REQUEST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
         let chunk_size = self.backend.chunk_size();
         let seal = peer.seal();
@@ -1328,6 +1388,14 @@ impl Runtime {
 
         let mut in_flight: std::collections::VecDeque<(u64, u64)> = Default::default(); // (req_id, offset)
         let mut iter = todo.into_iter();
+        // Issue #227 (b): offsets the source answered with a per-request
+        // error (`Error{req_id: Some}`, e.g. a transient process_vm_readv
+        // EAGAIN/ENOMEM). Re-queued for a bounded re-request through the
+        // SAME pipeline (preserving strict request/response FIFO order on
+        // the wire — never a side-band read) rather than rewinding the
+        // whole drain. `attempts[offset]` bounds the retries.
+        let mut retry: std::collections::VecDeque<u64> = Default::default();
+        let mut attempts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         let mut processed = 0usize;
         loop {
             // Fill the pipeline — but YIELD to guest faults. A fault
@@ -1342,7 +1410,15 @@ impl Runtime {
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
             while in_flight.len() < PIPELINE_DEPTH {
-                let Some(offset) = iter.next() else { break };
+                // Drain re-queued (per-request-failed) offsets first, then
+                // the fresh todo list.
+                let offset = match retry.pop_front() {
+                    Some(o) => o,
+                    None => match iter.next() {
+                        Some(o) => o,
+                        None => break,
+                    },
+                };
                 if self.chunk_installed((offset / chunk_size) as usize) {
                     processed += 1;
                     continue;
@@ -1363,8 +1439,33 @@ impl Runtime {
             };
             let resp = engram_migrate_proto::read_frame(&mut conn)
                 .map_err(|e| HandlerError::PeerLost(format!("drain read: {e}")))?;
-            let page = crate::peer::decode_page(resp, req_id, offset)
-                .map_err(|e| HandlerError::PeerLost(format!("drain decode: {e}")))?;
+            // Issue #227 (b): a per-request server error (`Error{req_id:
+            // Some}`) is NOT migration-fatal — the conn keeps serving. Bound-
+            // retry THAT chunk via the re-queue (FIFO-safe) instead of
+            // rewinding. Connection-fatal errors (`Error{None}`/IO/sha/
+            // geometry) still escalate to PeerLost.
+            let page = match crate::peer::decode_page(resp, req_id, offset) {
+                Ok(page) => page,
+                Err(crate::peer::PeerError::RequestFailed(msg)) => {
+                    let n = attempts.entry(offset).or_insert(0);
+                    *n += 1;
+                    if *n > DRAIN_REQUEST_RETRIES {
+                        return Err(HandlerError::PeerLost(format!(
+                            "drain per-request retries exhausted at offset {offset:#x}: {msg}"
+                        )));
+                    }
+                    tracing::warn!(
+                        offset,
+                        attempt = *n,
+                        error = %msg,
+                        "drain per-request error; re-queuing for retry"
+                    );
+                    std::thread::sleep(DRAIN_REQUEST_BACKOFF);
+                    retry.push_back(offset);
+                    continue;
+                }
+                Err(e) => return Err(HandlerError::PeerLost(format!("drain decode: {e}"))),
+            };
             match page {
                 PeerPage::Bytes(bytes) => {
                     self.install_chunk_at(offset, bytes.into(), false)?;
@@ -1546,6 +1647,13 @@ pub fn run_listener(
                     let started = std::time::Instant::now();
                     match rt.drain_from_peer(&peer, prefault_trace.as_ref()) {
                         Ok(stats) => {
+                            // Issue #227 (a): latch drain-complete BEFORE
+                            // reporting DrainDone. The host-agent acts on
+                            // DrainDone by committing the migration (which
+                            // tears the source export down), so the fault
+                            // path must already know not to dial the peer by
+                            // the time that frame is observed.
+                            rt.mark_drain_done();
                             let (faults, fault_us, fault_max_us) = peer.fault_stats();
                             tracing::info!(
                                 pulled = stats.pulled,
@@ -2006,6 +2114,426 @@ mod tests {
                 "chunk {i}: expected {want:#x}"
             );
         }
+        unsafe { libc::munmap(ptr, len) };
+    }
+
+    /// Regression for issue #227 (b) at the DRAIN level: the source
+    /// answers one sealed chunk with `Error { req_id: Some }` (a transient
+    /// per-request readv failure) before serving it normally. The drain
+    /// must re-request THAT chunk (bounded, FIFO-safe re-queue) and
+    /// complete — NOT escalate the whole migration to PeerLost.
+    ///
+    /// Pre-fix the drain's `decode_page` error → `HandlerError::PeerLost`
+    /// arm collapsed every `Error` into a fatal rewind, so a single
+    /// transient readv EAGAIN/ENOMEM on the source rewound the whole VM.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn drain_retries_per_request_error_and_does_not_rewind() {
+        use engram_migrate_proto::{
+            read_frame, write_frame, FromSource, SealBitmap, ToSource, PROTO_VERSION,
+        };
+        let page_size = 4096u64;
+        let chunk_size = page_size;
+        let n_chunks = 4usize;
+        let total = chunk_size * n_chunks as u64;
+        const PEER_BYTE: u8 = 0xC7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob);
+        let mut entries = Vec::new();
+        for i in 0..n_chunks {
+            let tag = (i as u8).wrapping_add(1);
+            let hash = store
+                .put_chunk(&vec![tag; chunk_size as usize])
+                .await
+                .unwrap();
+            entries.push(ChunkRef {
+                offset: i as u64 * chunk_size,
+                hash,
+            });
+        }
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes: total,
+            chunks: entries,
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend = Arc::new(
+            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+        );
+
+        // Fake source seals chunk 2 and fails its FIRST NeedAt with a
+        // per-request error, then serves it as Page bytes on the retry.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sealed_idx = 2u64;
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                std::thread::spawn(move || {
+                    let Ok(ToSource::Hello { .. }) = read_frame::<_, ToSource>(&mut s) else {
+                        return;
+                    };
+                    write_frame(
+                        &mut s,
+                        &FromSource::HelloAck {
+                            version: PROTO_VERSION,
+                            chunk_size,
+                            total_bytes: total,
+                        },
+                    )
+                    .unwrap();
+                    let mut bitmap = SealBitmap::new(chunk_size, n_chunks as u64);
+                    bitmap.set(sealed_idx);
+                    write_frame(&mut s, &FromSource::Seal { bitmap }).unwrap();
+                    let mut failed_once = false;
+                    while let Ok(ToSource::NeedAt {
+                        req_id,
+                        chunk_offset,
+                    }) = read_frame::<_, ToSource>(&mut s)
+                    {
+                        let resp = if chunk_offset / chunk_size == sealed_idx && !failed_once {
+                            failed_once = true;
+                            // Per-request failure: conn stays alive.
+                            FromSource::Error {
+                                req_id: Some(req_id),
+                                message: "transient readv EAGAIN".into(),
+                            }
+                        } else {
+                            let raw = vec![PEER_BYTE; chunk_size as usize];
+                            let (bytes, lz4) = engram_migrate_proto::compress_page(raw);
+                            let hash = engram_migrate_proto::wire_hash(&bytes);
+                            FromSource::Page {
+                                req_id,
+                                chunk_offset,
+                                bytes,
+                                hash,
+                                lz4,
+                            }
+                        };
+                        if write_frame(&mut s, &resp).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let len = total as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(true)
+            .create()
+        {
+            Ok(u) => u,
+            Err(e) => {
+                unsafe { libc::munmap(ptr, len) };
+                eprintln!("SKIP: cannot create userfaultfd ({e})");
+                return;
+            }
+        };
+        uffd.register(ptr, len).expect("register region with uffd");
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: ptr as u64,
+            size: len,
+            offset: 0,
+            page_size: page_size as usize,
+        }];
+        let session = tokio::task::spawn_blocking(move || {
+            crate::peer::PeerSession::connect(
+                addr.to_string(),
+                "exp".into(),
+                "tok".into(),
+                chunk_size,
+                total,
+            )
+        })
+        .await
+        .unwrap()
+        .expect("peer connect");
+        let session = Arc::new(session);
+
+        let mut rt = Runtime::new(
+            mappings,
+            uffd,
+            backend,
+            tokio::runtime::Handle::current(),
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+        rt.set_peer(Arc::clone(&session), None);
+        let rt = Arc::new(rt);
+
+        let rt_drain = Arc::clone(&rt);
+        let sess = Arc::clone(&session);
+        let stats = std::thread::spawn(move || rt_drain.drain_from_peer(&sess, None))
+            .join()
+            .unwrap()
+            .expect("drain must SUCCEED through the per-request error, not rewind");
+        assert_eq!(stats.pulled, 1, "the sealed chunk was pulled after retry");
+        assert!(
+            !session.is_lost(),
+            "a per-request drain error must not latch the peer lost"
+        );
+        // The sealed chunk holds the PEER's bytes (installed via the retry).
+        let view = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        let start = sealed_idx as usize * chunk_size as usize;
+        assert!(
+            view[start..start + chunk_size as usize]
+                .iter()
+                .all(|b| *b == PEER_BYTE),
+            "sealed chunk must carry the peer bytes after the retry"
+        );
+        unsafe { libc::munmap(ptr, len) };
+    }
+
+    /// Regression for issue #227 (a): once the drain has reported
+    /// DrainDone, the source's export may be torn down by
+    /// `migration_commit`. A late sealed fault must NOT dial the
+    /// (now-gone) peer, park, and fatally escalate PeerLost on a healthy,
+    /// fully-drained destination — it must fall through to `resolve()`.
+    ///
+    /// We model the worst case: `drain_done` latched while a sealed chunk
+    /// is (under a hypothetical drain bug) still uninstalled, AND the
+    /// source listener is gone. Pre-fix `serve_pagefault` would call
+    /// `peer.need_at`, fail to connect, exhaust reconnects, and return
+    /// `HandlerError::PeerLost`. Post-fix it skips the peer entirely and
+    /// resolves the chunk from the durable manifest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn sealed_fault_after_drain_done_does_not_dial_torn_down_peer() {
+        use engram_migrate_proto::{
+            read_frame, write_frame, FromSource, SealBitmap, ToSource, PROTO_VERSION,
+        };
+        let page_size = 4096u64;
+        let chunk_size = page_size;
+        let n_chunks = 4usize;
+        let total = chunk_size * n_chunks as u64;
+        let sealed_idx = 2u64;
+
+        // Manifest carries content for every chunk (the durable view the
+        // post-DrainDone fallthrough resolves from).
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob);
+        let mut entries = Vec::new();
+        for i in 0..n_chunks {
+            let tag = (i as u8).wrapping_add(1);
+            let hash = store
+                .put_chunk(&vec![tag; chunk_size as usize])
+                .await
+                .unwrap();
+            entries.push(ChunkRef {
+                offset: i as u64 * chunk_size,
+                hash,
+            });
+        }
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes: total,
+            chunks: entries,
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend = Arc::new(
+            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+        );
+
+        // Source: completes the handshake (so `connect` succeeds), then we
+        // SHUT IT DOWN to model the export being torn down post-commit.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let accept = std::thread::spawn(move || {
+            // The peer dials a Fault conn (`connect` below). Complete the
+            // handshake on the first conn that delivers a `Hello`, then park
+            // on `stop_rx` until the body tears us down.
+            //
+            // Bound EVERY blocking operation so this thread can never park
+            // forever — the body's `accept.join()` would otherwise hang to
+            // the 180 s nextest TIMEOUT (the original failure mode this test
+            // tripped on Blacksmith runners, where the previous
+            // `continue`-on-bad-read looped straight back into a blocking
+            // `accept()` that never returns once the lone dial is consumed).
+            // We give the listener an accept deadline and each accepted
+            // socket a read timeout; a hiccup or a spurious connect makes us
+            // give up (close the listener) so `connect` fails fast and the
+            // join always returns, rather than wedging CI.
+            listener
+                .set_nonblocking(true)
+                .expect("listener nonblocking mode");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let mut s = match listener.accept() {
+                    Ok((s, _)) => s,
+                    // No pending connection yet: nap briefly and re-poll the
+                    // deadline rather than blocking on `accept()` forever.
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                // Hand the conn back to blocking mode (with a read deadline)
+                // for the length-prefixed frame reads.
+                s.set_nonblocking(false).expect("conn blocking mode");
+                s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("accepted-conn read timeout");
+                // Not a Hello (or read timed out / closed): drop this conn and
+                // wait for the real dial instead of re-blocking indefinitely.
+                let Ok(ToSource::Hello { .. }) = read_frame::<_, ToSource>(&mut s) else {
+                    continue;
+                };
+                write_frame(
+                    &mut s,
+                    &FromSource::HelloAck {
+                        version: PROTO_VERSION,
+                        chunk_size,
+                        total_bytes: total,
+                    },
+                )
+                .unwrap();
+                let mut bitmap = SealBitmap::new(chunk_size, n_chunks as u64);
+                bitmap.set(sealed_idx);
+                write_frame(&mut s, &FromSource::Seal { bitmap }).unwrap();
+                // Hold the seal conn open until told to stop; never serve a
+                // NeedAt (the drain isn't run in this test).
+                let _ = stop_rx.recv();
+                return;
+            }
+        });
+
+        let len = total as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(true)
+            .create()
+        {
+            Ok(u) => u,
+            Err(e) => {
+                unsafe { libc::munmap(ptr, len) };
+                let _ = stop_tx.send(());
+                let _ = accept.join();
+                eprintln!("SKIP: cannot create userfaultfd ({e})");
+                return;
+            }
+        };
+        uffd.register(ptr, len).expect("register region with uffd");
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: ptr as u64,
+            size: len,
+            offset: 0,
+            page_size: page_size as usize,
+        }];
+        let session = tokio::task::spawn_blocking(move || {
+            crate::peer::PeerSession::connect(
+                addr.to_string(),
+                "exp".into(),
+                "tok".into(),
+                chunk_size,
+                total,
+            )
+        })
+        .await
+        .unwrap()
+        .expect("peer connect");
+        let session = Arc::new(session);
+
+        let mut rt = Runtime::new(
+            mappings,
+            uffd,
+            backend,
+            tokio::runtime::Handle::current(),
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+        rt.set_peer(Arc::clone(&session), None);
+        let rt = Arc::new(rt);
+
+        // Drain reported complete (latched), and the source export is now
+        // gone — exactly the post-commit window.
+        rt.mark_drain_done();
+        let _ = stop_tx.send(());
+        let _ = accept.join();
+        // Sanity: the sealed chunk is genuinely still uninstalled here.
+        assert!(!rt.chunk_installed(sealed_idx as usize));
+
+        // The sealed fault must resolve WITHOUT dialing the dead peer and
+        // WITHOUT escalating PeerLost. `serve_pagefault` may `block_on` the
+        // async chunk fetch, so run it on a plain thread (off the tokio
+        // workers) and JOIN it directly — exactly like the other
+        // `serve_pagefault` tests in this module. We deliberately do NOT
+        // wrap it in a `recv_timeout` bound: an in-test timeout that fires
+        // would unwind the body and LEAK the still-running fault thread,
+        // which keeps the nextest per-test process alive until the 180 s
+        // slow-timeout — i.e. it converts a slow path into a permanent CI
+        // wedge (the original failure mode of this test). The post-fix gate
+        // resolves locally and returns promptly; if it ever genuinely hung,
+        // nextest's own per-test slow-timeout is the correct backstop and
+        // would attribute the hang to this test directly.
+        let base = ptr as u64;
+        let rt_f = Arc::clone(&rt);
+        let outcome = std::thread::spawn(move || {
+            rt_f.serve_pagefault(base + sealed_idx * chunk_size)
+                .map_err(|e| e.to_string())
+        })
+        .join()
+        .expect("fault worker panicked");
+        assert!(
+            outcome.is_ok(),
+            "post-DrainDone sealed fault must resolve via the manifest, not PeerLost: {outcome:?}"
+        );
+        // Resolved from the durable manifest (tag = idx+1), and the peer
+        // was never marked lost (no false PeerLost).
+        let view = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        let start = sealed_idx as usize * chunk_size as usize;
+        let want = (sealed_idx as u8).wrapping_add(1);
+        assert!(
+            view[start..start + chunk_size as usize]
+                .iter()
+                .all(|b| *b == want),
+            "sealed chunk must be resolved from the durable manifest after DrainDone"
+        );
+        assert!(
+            !session.is_lost(),
+            "a fully-drained destination must not be declared PeerLost"
+        );
         unsafe { libc::munmap(ptr, len) };
     }
 

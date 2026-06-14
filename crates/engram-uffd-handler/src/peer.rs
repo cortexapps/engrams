@@ -47,8 +47,18 @@ const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 #[derive(Debug)]
 pub enum PeerError {
     Io(std::io::Error),
-    /// The server answered `Error` (protocol misuse or serving failure).
+    /// The server answered `Error { req_id: None }` — a connection-fatal
+    /// failure (bad hello, version skew, unknown export). Terminal: the
+    /// connection cannot serve any request, so the caller latches `lost`.
     Server(String),
+    /// The server answered `Error { req_id: Some }` — that *single*
+    /// request failed (e.g. a transient `process_vm_readv` EAGAIN/ENOMEM
+    /// under host memory pressure) but the connection stays alive and the
+    /// next frame is served normally. Per the wire contract
+    /// (`engram-migrate-proto` lib.rs: `Some` ⇒ "that request failed"),
+    /// this is RETRYABLE — `need_at` redials/retries within
+    /// `RECONNECT_ATTEMPTS` instead of declaring the peer lost.
+    RequestFailed(String),
     /// `Page` bytes didn't hash to the carried sha256 — corrupt or
     /// hostile peer; never installable.
     ShaMismatch {
@@ -66,6 +76,7 @@ impl std::fmt::Display for PeerError {
         match self {
             Self::Io(e) => write!(f, "peer io: {e}"),
             Self::Server(m) => write!(f, "peer server error: {m}"),
+            Self::RequestFailed(m) => write!(f, "peer request failed (retryable): {m}"),
             Self::ShaMismatch { chunk_offset } => {
                 write!(f, "peer page sha mismatch at offset {chunk_offset:#x}")
             }
@@ -321,16 +332,31 @@ impl PeerSession {
             }
             match request_chunk(&mut conn, &self.next_req, chunk_offset) {
                 Ok(page) => return Ok(page),
-                // Terminal classifications never retry.
+                // Terminal classifications never retry: corrupt content, a
+                // connection-fatal server error (`Error{req_id: None}`),
+                // or geometry skew are all unrecoverable on any conn.
                 Err(e @ PeerError::ShaMismatch { .. })
                 | Err(e @ PeerError::Server(_))
                 | Err(e @ PeerError::GeometryMismatch(_)) => {
                     self.mark_lost();
                     return Err(e);
                 }
-                Err(e) => {
-                    tracing::warn!(attempt, error = %e, "peer request failed; will redial");
+                // Per-request failures (`Error{req_id: Some}`) and
+                // connection-level IO are RETRYABLE: the wire contract
+                // says `Some` means only THIS request failed and the conn
+                // keeps serving. Redial+retry within RECONNECT_ATTEMPTS
+                // rather than rewinding the whole migration on one
+                // transient readv EAGAIN/ENOMEM. Only exhaustion (below)
+                // latches the peer lost.
+                Err(e @ PeerError::RequestFailed(_)) | Err(e @ PeerError::Io(_)) => {
+                    tracing::warn!(attempt, error = %e, "peer request failed; will retry");
                     last_err = Some(e);
+                }
+                Err(e @ PeerError::Lost(_)) => {
+                    // Should not surface from request_chunk, but treat as
+                    // terminal if it ever does.
+                    self.mark_lost();
+                    return Err(e);
                 }
             }
         }
@@ -423,7 +449,17 @@ pub fn decode_page(
             durable_sha256,
             ..
         } if req_id == want_req => Ok(PeerPage::AltSource(durable_sha256)),
-        FromSource::Error { message, .. } => Err(PeerError::Server(message)),
+        // Honor the wire contract: `req_id: Some` ⇒ THAT request failed
+        // (the conn keeps serving — retryable); `req_id: None` ⇒
+        // connection-fatal (terminal).
+        FromSource::Error {
+            req_id: Some(_),
+            message,
+        } => Err(PeerError::RequestFailed(message)),
+        FromSource::Error {
+            req_id: None,
+            message,
+        } => Err(PeerError::Server(message)),
         other => Err(PeerError::Server(format!("unexpected response: {other:?}"))),
     }
 }
@@ -712,6 +748,106 @@ mod tests {
         assert!(sess.is_lost());
         // Subsequent requests refuse immediately.
         assert!(matches!(sess.need_at(0), Err(PeerError::Lost(_))));
+    }
+
+    /// Regression for issue #227 (b): a per-request server error
+    /// (`Error { req_id: Some }`) means "THAT request failed" per the wire
+    /// contract — the connection keeps serving. `need_at` must classify it
+    /// as `RequestFailed` and RETRY (not `mark_lost` + terminal), so one
+    /// transient `process_vm_readv` EAGAIN/ENOMEM on the source never
+    /// rewinds the whole migration.
+    ///
+    /// Pre-fix `decode_page` collapsed every `Error` into `PeerError::Server`
+    /// and `need_at` mapped `Server(_)` unconditionally to `mark_lost()` +
+    /// terminal, so this would have returned `Err` with the session latched
+    /// lost.
+    #[test]
+    fn need_at_retries_per_request_error_then_succeeds() {
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let calls_for_src = std::sync::Arc::clone(&calls);
+        let addr = fake_source(vec![0], move |req_id, chunk_offset| {
+            // First NeedAt ever → per-request failure (req_id: Some);
+            // every later one → a real page. Mirrors the source's
+            // transient-readv reply that keeps the conn alive.
+            if calls_for_src.fetch_add(1, Ordering::SeqCst) == 0 {
+                FromSource::Error {
+                    req_id: Some(req_id),
+                    message: "transient readv EAGAIN".into(),
+                }
+            } else {
+                page_resp(req_id, chunk_offset)
+            }
+        });
+        let sess = PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL)
+            .expect("connect");
+        match sess
+            .need_at(0)
+            .expect("retried per-request error must succeed")
+        {
+            PeerPage::Bytes(b) => assert!(b.iter().all(|x| *x == 0xAB)),
+            other => panic!("expected Bytes after retry, got {other:?}"),
+        }
+        // The peer must NOT be latched lost: the migration is unaffected.
+        assert!(
+            !sess.is_lost(),
+            "per-request error must not mark the peer lost"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "expected a retry round-trip"
+        );
+    }
+
+    /// Regression for issue #227 (b), terminal half: a connection-fatal
+    /// server error (`Error { req_id: None }`) IS terminal — it latches the
+    /// peer lost and never retries. This is the discriminant that must stay
+    /// fatal so a genuinely-broken conn still surfaces PeerLost promptly.
+    #[test]
+    fn need_at_connection_fatal_error_is_terminal() {
+        let addr = fake_source(vec![0], |_req_id, _chunk_offset| FromSource::Error {
+            req_id: None,
+            message: "unknown export".into(),
+        });
+        let sess = PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL)
+            .expect("connect");
+        let err = sess
+            .need_at(0)
+            .expect_err("connection-fatal error must be terminal");
+        assert!(matches!(err, PeerError::Server(_)), "{err}");
+        assert!(
+            sess.is_lost(),
+            "connection-fatal error must latch the peer lost"
+        );
+    }
+
+    /// `decode_page` honors the wire contract directly: `Some` ⇒
+    /// `RequestFailed` (retryable), `None` ⇒ `Server` (terminal).
+    #[test]
+    fn decode_page_distinguishes_request_scoped_from_fatal() {
+        let req_scoped = decode_page(
+            FromSource::Error {
+                req_id: Some(7),
+                message: "readv".into(),
+            },
+            7,
+            0,
+        );
+        assert!(
+            matches!(req_scoped, Err(PeerError::RequestFailed(_))),
+            "req_id: Some must decode as RequestFailed, got {req_scoped:?}"
+        );
+        let fatal = decode_page(
+            FromSource::Error {
+                req_id: None,
+                message: "bad hello".into(),
+            },
+            7,
+            0,
+        );
+        assert!(
+            matches!(fatal, Err(PeerError::Server(_))),
+            "req_id: None must decode as Server, got {fatal:?}"
+        );
     }
 
     #[test]
