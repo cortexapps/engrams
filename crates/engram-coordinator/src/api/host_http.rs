@@ -241,6 +241,13 @@ pub async fn register(
 
 // ---- POST /api/hosts/:id/heartbeat ----
 
+/// Serde default for `HeartbeatRequest::running_sandboxes_known`
+/// (issue #215): a heartbeat that omits the field (pre-fix host-agent
+/// mid-roll) is assumed to carry a valid `backend.list()` result.
+fn default_running_sandboxes_known() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 pub struct HeartbeatRequest {
     /// Wire mirror of `engram_protocol::heartbeat::Heartbeat` minus
@@ -251,6 +258,15 @@ pub struct HeartbeatRequest {
     pub local_snapshots: Vec<LocalSnapshotReport>,
     #[serde(default)]
     pub running_sandboxes: Vec<SandboxId>,
+    /// Issue #215: `false` iff the host's `backend.list()` failed this
+    /// tick — `running_sandboxes` is then meaningless and the ADR 0009
+    /// reconcile MUST be skipped (an empty list there is "no info", not
+    /// "no sandboxes", and would strike every active session on the
+    /// host). `#[serde(default = ...)]` to `true` so a pre-fix
+    /// host-agent mid-roll (which omits the field) is treated as
+    /// carrying a valid list — same behaviour as before the fix.
+    #[serde(default = "default_running_sandboxes_known")]
+    pub running_sandboxes_known: bool,
     #[serde(default)]
     pub draining: bool,
     /// ADR 0013: host's gRPC advertise address. Carried on every
@@ -367,16 +383,29 @@ pub async fn heartbeat(
     // ADR 0009 §1-§3: reconcile first, so subsequent state updates
     // reflect the post-flip view. Same dispatch as the WS
     // supervisor loop (`api/hosts.rs:266-284`).
-    let flipped = state
-        .reconciler
-        .reconcile_host(&state, host_id, &hb.running_sandboxes)
-        .await;
-    if !flipped.is_empty() {
-        tracing::info!(
+    //
+    // Issue #215: skip reconcile when the host couldn't enumerate its
+    // sandboxes this tick (`running_sandboxes_known == false`). The
+    // empty `running_sandboxes` it sends is "no information", not "no
+    // sandboxes running"; reconciling against it would strike every
+    // active session on the host on a single host-side `list()` blip.
+    if !hb.running_sandboxes_known {
+        tracing::warn!(
             host_id = %host_id,
-            count = flipped.len(),
-            "heartbeat reconcile flipped missing-sandbox sessions",
+            "heartbeat: host reported running_sandboxes_known=false (backend.list() failed); skipping reconcile this tick",
         );
+    } else {
+        let flipped = state
+            .reconciler
+            .reconcile_host(&state, host_id, &hb.running_sandboxes)
+            .await;
+        if !flipped.is_empty() {
+            tracing::info!(
+                host_id = %host_id,
+                count = flipped.len(),
+                "heartbeat reconcile flipped missing-sandbox sessions",
+            );
+        }
     }
 
     // Bump the routing cache's freshness stamp for this host (ADR
@@ -953,6 +982,38 @@ mod tests {
                 idle_since: None,
             }],
         }
+    }
+
+    /// Issue #215: a heartbeat that OMITS `running_sandboxes_known`
+    /// (pre-fix host-agent mid-roll) must deserialize to `true` so the
+    /// coord keeps reconciling against its list — same behaviour as
+    /// before the fix. A heartbeat that explicitly sends `false`
+    /// (post-fix host that hit a `backend.list()` error) parses as
+    /// `false` so the handler skips reconcile for that tick.
+    #[test]
+    fn running_sandboxes_known_defaults_true_but_honors_false() {
+        // Omitted → true (interop with pre-fix host-agents).
+        let omitted: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 0 },
+            "running_sandboxes": [],
+        }))
+        .expect("deserialize heartbeat without the flag");
+        assert!(
+            omitted.running_sandboxes_known,
+            "a heartbeat omitting the flag must be treated as carrying a valid list"
+        );
+
+        // Explicit false → false (host's list() errored this tick).
+        let errored: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 0 },
+            "running_sandboxes": [],
+            "running_sandboxes_known": false,
+        }))
+        .expect("deserialize heartbeat with the flag");
+        assert!(
+            !errored.running_sandboxes_known,
+            "an explicit false must be honored so the coord skips reconcile this tick"
+        );
     }
 
     /// ADR 0034 happy path: the handler flips Active → Evicting,

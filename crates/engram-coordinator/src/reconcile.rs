@@ -381,15 +381,22 @@ pub fn spawn_in_proc(state: SharedState, tick: Duration) -> JoinHandle<()> {
                 let Some(backend) = state.host_registry.backend_of(host_id) else {
                     continue;
                 };
+                // Issue #215: a `backend.list()` error is "no
+                // information", NOT "no sandboxes running". Feeding an
+                // empty set into `reconcile_host` would strike EVERY
+                // active session on this host that tick — a single RPC
+                // hiccup eats a grace tick from all of them. An RPC
+                // failure is not evidence the sandboxes are gone, so we
+                // skip this host's tick entirely and recover next tick.
                 let running = match backend.list().await {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(
                             host_id = %host_id,
                             error = %e,
-                            "in-proc reconcile: backend.list() failed; reporting empty (strike grace absorbs)"
+                            "in-proc reconcile: backend.list() failed; skipping tick (no info — not striking)"
                         );
-                        Vec::new()
+                        continue;
                     }
                 };
                 let flipped = state
