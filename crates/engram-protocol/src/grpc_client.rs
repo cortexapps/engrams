@@ -1312,14 +1312,12 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
         // error would have produced. A `failed_precondition` WITHOUT the
         // marker (none is emitted host-side today, but be defensive)
         // falls through to the generic mapping.
-        Code::FailedPrecondition => {
-            match crate::wire::parse_wire_skew_message(status.message()) {
-                Some((host, coord)) => SandboxError::WireSkew { host, coord },
-                None => {
-                    SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into())
-                }
+        Code::FailedPrecondition => match crate::wire::parse_wire_skew_message(status.message()) {
+            Some((host, coord)) => SandboxError::WireSkew { host, coord },
+            None => {
+                SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into())
             }
-        }
+        },
         _ => SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into()),
     }
 }
@@ -1381,7 +1379,9 @@ mod grpc_err_tests {
     fn unmarked_failed_precondition_falls_through_to_vm() {
         // A `failed_precondition` WITHOUT the skew marker isn't a version
         // mismatch — it must not be misread as `WireSkew`.
-        let err = grpc_to_sandbox_err(tonic::Status::failed_precondition("some other precondition"));
+        let err = grpc_to_sandbox_err(tonic::Status::failed_precondition(
+            "some other precondition",
+        ));
         assert!(matches!(err, SandboxError::Vm(_)));
     }
 }

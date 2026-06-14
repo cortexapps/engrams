@@ -2523,15 +2523,19 @@ mod evicting_gate_tests {
         );
 
         // The residual sandbox MUST have been destroyed before the fresh
-        // restore was attempted.
-        {
+        // restore was attempted. Snapshot the guarded state into owned
+        // values and drop the guard before the awaits below — a
+        // (parking_lot) `MutexGuard` held across an `.await` is a deadlock
+        // hazard (`clippy::await_holding_lock`).
+        let (saw_residual, destroyed_snapshot) = {
             let destroyed = destroyed.lock();
-            assert!(
-                destroyed.contains(&residual),
-                "resume_from_idle must destroy the residual sandbox {residual} before \
-                 restoring fresh; destroyed = {destroyed:?}",
-            );
-        }
+            (destroyed.contains(&residual), destroyed.clone())
+        };
+        assert!(
+            saw_residual,
+            "resume_from_idle must destroy the residual sandbox {residual} before \
+             restoring fresh; destroyed = {destroyed_snapshot:?}",
+        );
 
         // And the binding MUST have been cleared so nothing routes to the
         // torn-down sandbox (and so a fresh restore doesn't overwrite a

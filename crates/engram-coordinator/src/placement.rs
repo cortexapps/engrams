@@ -761,7 +761,11 @@ mod tests {
             TTL,
         )
         .unwrap();
-        assert_eq!(pick, hid(3), "session must be placed on the version-matched host");
+        assert_eq!(
+            pick,
+            hid(3),
+            "session must be placed on the version-matched host"
+        );
 
         // A fleet of ONLY skewed hosts yields NoCapacity (the scheduler
         // drains them), not a placement onto a host that would 400.
