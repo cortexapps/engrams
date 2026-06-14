@@ -1532,7 +1532,7 @@ impl FirecrackerBackend {
         &self,
         jail_dir: &Path,
         netns_name: Option<&str>,
-    ) -> Result<(PathBuf, Child), SandboxError> {
+    ) -> Result<(PathBuf, Child, SpawnKillGuard), SandboxError> {
         // jail_dir is created by the caller (create_in_jail / restore_in_jail)
         // before we're invoked — single owner for dir creation (ADR 0020 P3),
         // so the UFFD-handler leg can't race a create_dir_all buried here.
@@ -1570,8 +1570,9 @@ impl FirecrackerBackend {
         };
         // ADR 0044 K2: NO `kill_on_drop` — a live FC must survive the
         // host-agent process exiting (detach + reattach). The
-        // create-window backstop is the explicit `SpawnKillGuard` the
-        // caller arms; steady-state teardown is `destroy()` via pid.
+        // create-window backstop is the explicit `SpawnKillGuard` armed
+        // BELOW the instant `.spawn()` succeeds; steady-state teardown is
+        // `destroy()` via pid.
         let mut child = cmd
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_clone))
@@ -1585,6 +1586,18 @@ impl FirecrackerBackend {
                 ))
             })?;
 
+        // Issue #197: arm the SIGKILL backstop HERE, before `wait_for_socket`,
+        // not in the caller after a multi-second await. Without kill_on_drop a
+        // restore future cancelled inside that wait (e.g. a post-copy
+        // `restore_task.abort()` while leg 2 parks on the peer sock) would
+        // otherwise drop this live Child unguarded and orphan FC. The caller
+        // holds the returned guard through the rest of setup and `disarm()`s it
+        // at the commit point.
+        let guard = child
+            .id()
+            .map(SpawnKillGuard::new)
+            .ok_or_else(|| vm_err("firecracker child has no pid right after spawn"))?;
+
         // Race the socket appearing against the process exiting. If
         // firecracker dies during startup, surface that with the log.
         if let Err(e) = wait_for_socket(&socket, Duration::from_secs(5), &mut child).await {
@@ -1595,7 +1608,7 @@ impl FirecrackerBackend {
             )));
         }
 
-        Ok((socket, child))
+        Ok((socket, child, guard))
     }
 
     /// Spawn `engram-uffd-handler` in ADR 0020 chunk-native mode and
@@ -1649,7 +1662,7 @@ impl FirecrackerBackend {
         // post-seal — so this spawn waits on the CONTROL sock, and the
         // load gate (not this fn) waits on the UDS.
         peer: Option<&MigrationPeerSpec>,
-    ) -> Result<Child, SandboxError> {
+    ) -> Result<(Child, SpawnKillGuard), SandboxError> {
         // ADR 0014 M1.14: when the caller wires `working_set_trace_output`,
         // it's the bake's profile pass — destroy removes jail_dir
         // immediately after, sweeping the handler's log with it. Park
@@ -1773,7 +1786,7 @@ impl FirecrackerBackend {
         // ADR 0044 K2: no `kill_on_drop` (see spawn_firecracker) — the
         // uffd handler must also survive a host-agent restart so the
         // successor can reattach it. Create-window cleanup is the
-        // caller's `SpawnKillGuard`; teardown is `destroy()` via pid.
+        // `SpawnKillGuard` armed BELOW; teardown is `destroy()` via pid.
         let mut child = cmd
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_clone))
@@ -1785,6 +1798,15 @@ impl FirecrackerBackend {
                     self.config.uffd_handler_bin.display()
                 ))
             })?;
+
+        // Issue #197: arm the SIGKILL backstop HERE, right after spawn —
+        // a peer-mode handler parks in the `wait_for_socket` below until the
+        // SOURCE seals, which is exactly when a post-copy abort drops this
+        // future. Caller holds the guard through setup and `disarm()`s at commit.
+        let guard = child
+            .id()
+            .map(SpawnKillGuard::new)
+            .ok_or_else(|| vm_err("uffd handler child has no pid right after spawn"))?;
 
         // Peer mode binds the FC-facing UDS only after the source's
         // SEAL arrives (which is what makes \"FC can load\" imply
@@ -1803,7 +1825,7 @@ impl FirecrackerBackend {
                 spawn_gate.display()
             )));
         }
-        Ok(child)
+        Ok((child, guard))
     }
 
     /// Run the create lifecycle inside a per-sandbox jail dir. Split out
@@ -1922,15 +1944,12 @@ impl FirecrackerBackend {
         // on root (per-VM /30 via `net::provision`). ADR 0014 M1.16
         // only puts warm restores in their own netns; cold path
         // stays simpler.
-        let (socket, child) = self.spawn_firecracker(jail_dir, None).await?;
-        // ADR 0044 K2: arm the create-window SIGKILL backstop now that FC
-        // is spawned without kill_on_drop. Every `?` from here to the
-        // `sandboxes.insert` below reaps the half-spawned FC; we
+        // ADR 0044 K2 / issue #197: `spawn_firecracker` arms the create-window
+        // SIGKILL backstop internally (FC has no kill_on_drop), so it's live
+        // across its own `wait_for_socket` and across everything below. Every
+        // `?` from here to the `sandboxes.insert` reaps the half-spawned FC; we
         // `disarm()` it immediately before committing the live sandbox.
-        let mut fc_guard = child
-            .id()
-            .map(SpawnKillGuard::new)
-            .ok_or_else(|| vm_err("firecracker child has no pid right after spawn"))?;
+        let (socket, child, mut fc_guard) = self.spawn_firecracker(jail_dir, None).await?;
 
         // Configure + start. Any failure here drops the Child (no kill —
         // kill_on_drop is gone) and fires `fc_guard`, which SIGKILLs FC;
@@ -2605,27 +2624,25 @@ impl FirecrackerBackend {
                 tracing::info_span!("fc.reserve_netns"),
             )
             .await?;
+            // Issue #197: arm the drop-based netns teardown the instant the
+            // netns is provisioned, so ANY subsequent cancel/early-return
+            // (FC spawn failing, the symlink step, a cancellation of the
+            // whole restore future inside the join below) reclaims the
+            // netns + veth + SNAT slot. Replaces the per-`Err`-arm
+            // `teardown_netns` calls this leg used to carry.
             let netns_name = netns_setup.as_ref().map(|s| s.netns_name.clone());
-            let (socket, mut child) = match tracing::Instrument::instrument(
+            let netns_guard = NetnsGuard::new(netns_setup, Arc::clone(&self.net_allocator));
+            let (socket, child, fc_guard) = tracing::Instrument::instrument(
                 self.spawn_firecracker(jail_dir, netns_name.as_deref()),
                 tracing::info_span!("fc.spawn_process"),
             )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    if let Some(setup) = netns_setup.as_ref() {
-                        net::teardown_netns(setup, &self.net_allocator).await;
-                    }
-                    return Err(e);
-                }
-            };
+            .await?;
             // ADR 0014: `state.bin` embeds the canonical rootfs path keyed by
             // the SOURCE sandbox_id; recreate the source-id-keyed symlink
             // pointing at the host-local backing before `load_snapshot` opens
-            // it. On failure SIGKILL the just-spawned FC (kill_on_drop is gone
-            // — ADR 0044 K2) + tear the netns down before propagating.
-            if let Err(e) = tracing::Instrument::instrument(
+            // it. On failure `fc_guard` (SIGKILL FC) and `netns_guard` (tear
+            // the netns down) fire on drop — no manual cleanup needed.
+            tracing::Instrument::instrument(
                 restore_canonical_symlinks(
                     &self.work_dir,
                     sandbox_id,
@@ -2634,21 +2651,16 @@ impl FirecrackerBackend {
                 ),
                 tracing::info_span!("fc.restore_symlinks"),
             )
-            .await
-            {
-                let _ = child.kill().await;
-                if let Some(setup) = netns_setup.as_ref() {
-                    net::teardown_netns(setup, &self.net_allocator).await;
-                }
-                return Err(e);
-            }
-            Ok::<_, SandboxError>((netns_setup, socket, child))
+            .await?;
+            Ok::<_, SandboxError>((netns_guard, socket, child, fc_guard))
         };
 
         // Leg 2 — spawn the UFFD page-fault handler (Uffd mode) so it's
         // listening before `load_snapshot` connects; File mode has none.
-        // spawn_uffd_handler sets kill_on_drop, so dropping the Child on a
-        // cleanup path SIGKILLs it. Returns (handler, the UDS the gate dials).
+        // Issue #197: `spawn_uffd_handler` arms a `SpawnKillGuard` internally
+        // (no kill_on_drop — ADR 0044 K2), so a cancellation while it parks
+        // on the peer control sock SIGKILLs the handler on drop. Returns
+        // (handler, the UDS the gate dials, the guard).
         let leg_uffd = async {
             match restore_mode {
                 RestoreMode::File => Ok::<_, SandboxError>(None),
@@ -2702,7 +2714,7 @@ impl FirecrackerBackend {
                     // the local trace.
                     let prefault_host = manifest.trace_host_hint.map(|hid| hid.as_uuid());
                     let publish_host = self.config.host_id.map(|hid| hid.as_uuid());
-                    let handler = self
+                    let (handler, uffd_guard) = self
                         .spawn_uffd_handler(
                             &uffd_uds,
                             canonical_ref,
@@ -2714,50 +2726,38 @@ impl FirecrackerBackend {
                             peer_spec.as_ref(),
                         )
                         .await?;
-                    Ok(Some((handler, uffd_uds)))
+                    Ok(Some((handler, uffd_uds, uffd_guard)))
                 }
             }
         };
 
         let (setup_res, uffd_res) = tokio::join!(leg_setup, leg_uffd);
 
-        // Reconcile: each leg self-cleaned its own partial state, so on a
-        // failure we only undo the OTHER leg, then return the first error.
-        let (netns_setup, socket, child, uffd_leg) = match (setup_res, uffd_res) {
-            (Ok((netns, socket, child)), Ok(uffd)) => (netns, socket, child, uffd),
-            (Err(e), Ok(uffd)) => {
-                // Setup failed (self-cleaned). SIGKILL the handler leg 2
-                // spawned (kill_on_drop is gone — ADR 0044 K2).
-                if let Some((mut handler, _uds)) = uffd {
-                    let _ = handler.kill().await;
-                }
-                return Err(e);
+        // Reconcile. Issue #197: every per-leg resource now rides a Drop
+        // guard (FC + uffd on `SpawnKillGuard`, the netns on `NetnsGuard`),
+        // so on ANY failure we just `return Err` — dropping the OTHER leg's
+        // success tuple fires its guards and self-cleans. No manual
+        // kill/teardown reconciliation (and no window where one leg's
+        // resources are live but unguarded).
+        let (netns_guard, socket, child, mut fc_guard, uffd_leg) = match (setup_res, uffd_res) {
+            (Ok((netns_guard, socket, child, fc_guard)), Ok(uffd)) => {
+                (netns_guard, socket, child, fc_guard, uffd)
             }
-            (Ok((netns, _socket, mut child)), Err(e)) => {
-                // UFFD leg failed. Tear down leg 1's netns + SIGKILL the FC.
-                let _ = child.kill().await;
-                if let Some(setup) = netns.as_ref() {
-                    net::teardown_netns(setup, &self.net_allocator).await;
-                }
-                return Err(e);
-            }
-            // Both failed; each self-cleaned. Surface the setup error.
-            (Err(e), Err(_)) => return Err(e),
+            // On either-or-both failure, the surviving Ok tuple drops here,
+            // running its guards. Surface the setup error first when present.
+            (Err(e), _) => return Err(e),
+            (Ok(_), Err(e)) => return Err(e),
         };
 
-        // ADR 0044 K2: arm create-window SIGKILL backstops for the restored
-        // FC and (Uffd mode) the page-fault handler — neither carries
-        // kill_on_drop, so every `?` from here through `load_snapshot` and
-        // the listener spawns reaps them. Disarmed just before the
-        // `sandboxes.insert` once the VM is resumed and committed.
-        let mut fc_guard = child
-            .id()
-            .map(SpawnKillGuard::new)
-            .ok_or_else(|| vm_err("restored firecracker child has no pid right after spawn"))?;
-        let mut uffd_guard = uffd_leg
-            .as_ref()
-            .and_then(|(handler, _uds)| handler.id())
-            .map(SpawnKillGuard::new);
+        // The guards armed inside the legs stay live from here through
+        // `load_snapshot` and the listener spawns — every `?` below reaps FC,
+        // the uffd handler, and the netns. They're disarmed just before the
+        // `sandboxes.insert` once the VM is resumed and committed (ADR 0044
+        // K2: a committed VM is decoupled from this host-agent's lifecycle).
+        let (uffd_leg, mut uffd_guard) = match uffd_leg {
+            Some((handler, uds, guard)) => (Some((handler, uds)), Some(guard)),
+            None => (None, None),
+        };
 
         // Legacy/test path: no netns means we still might need the
         // old host-root TAP setup (when `manifest.net.is_some` but
@@ -2966,16 +2966,11 @@ impl FirecrackerBackend {
         let uffd_handler: Option<Child> = match load_result {
             Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
             Err(e) => {
-                // Snapshot load failed: tear down the network state before
-                // propagating. The FC child + uffd handler are SIGKILLed by
-                // their `SpawnKillGuard`s firing on this early return, then
-                // reaped when `child`/`uffd_leg` drop (ADR 0044 K2).
-                if let Some(setup) = net_setup.as_ref() {
-                    net::teardown(setup, &self.net_allocator).await;
-                }
-                if let Some(setup) = netns_setup.as_ref() {
-                    net::teardown_netns(setup, &self.net_allocator).await;
-                }
+                // Snapshot load failed. Issue #197: the still-armed
+                // `fc_guard` / `uffd_guard` SIGKILL FC + the handler, and
+                // `netns_guard` tears down the per-VM netns + frees the SNAT
+                // slot — all on this early-return drop (ADR 0044 K2). No
+                // manual cleanup needed.
                 return Err(e);
             }
         };
@@ -3059,11 +3054,14 @@ impl FirecrackerBackend {
         // VM is resumed, listeners are up, and (below) its manifest is
         // written: the restored sandbox is committed. Defuse the
         // create-window backstops so the VM is fully decoupled from this
-        // host-agent's lifecycle (ADR 0044 K2 detach).
+        // host-agent's lifecycle (ADR 0044 K2 detach). Issue #197: the netns
+        // guard hands its `NetnsSetup` over to the live sandbox here — past
+        // this point `destroy()` owns netns teardown, not the guard.
         fc_guard.disarm();
         if let Some(g) = uffd_guard.as_mut() {
             g.disarm();
         }
+        let netns_setup = netns_guard.into_committed();
         // ADR 0044 K2: persist the manifest so the successor host-agent
         // can reattach this still-live restored VM — recording the per-VM
         // netns (warm restores) and the uffd handler pid (Uffd mode).
@@ -3338,6 +3336,77 @@ impl Drop for SpawnKillGuard {
                 );
             }
         }
+    }
+}
+
+/// Issue #197: drop-based per-VM netns cleanup, mirroring [`SpawnKillGuard`]
+/// for the network half of a restore. ADR 0014 M1.16 provisions a per-VM
+/// netns (veth pair, in-netns TAP, SNAT iptables rule, allocator `/30` slot)
+/// BEFORE FC spawns, but it was only ever torn down in explicit `Err` arms
+/// — never on `Drop`. A restore future cancelled in the spawn/load window
+/// (the post-copy `restore_task.abort()` is the deterministic case), or the
+/// post-load listener early-returns, would skip every one of those arms and
+/// leak the netns + veth + SNAT rule + allocator slot.
+///
+/// Constructed right after `reserve_restored_netns` succeeds and held
+/// through the rest of restore; `disarm()`ed at the commit point where the
+/// `NetnsSetup` moves into the live sandbox (whose `destroy()` then owns
+/// teardown). If dropped while armed it runs `net::teardown_netns` —
+/// `Drop` can't `.await`, so (following the detached-task idiom this crate
+/// already uses for async-from-Drop cleanup) it spawns the teardown on a
+/// runtime handle captured at construction.
+struct NetnsGuard {
+    /// `None` when networking is disabled / the snapshot has no `net`
+    /// record — then the guard is inert (nothing was provisioned).
+    setup: Option<net::NetnsSetup>,
+    allocator: Arc<parking_lot::Mutex<net::NetworkAllocator>>,
+    handle: tokio::runtime::Handle,
+    armed: bool,
+}
+
+impl NetnsGuard {
+    fn new(
+        setup: Option<net::NetnsSetup>,
+        allocator: Arc<parking_lot::Mutex<net::NetworkAllocator>>,
+    ) -> Self {
+        Self {
+            setup,
+            allocator,
+            handle: tokio::runtime::Handle::current(),
+            armed: true,
+        }
+    }
+
+    /// Defuse and yield the owned `NetnsSetup` at the commit point — the
+    /// live sandbox (and its `destroy()`) now owns teardown. Consuming
+    /// `self` here makes it impossible to keep an armed guard alive past
+    /// commit by accident.
+    fn into_committed(mut self) -> Option<net::NetnsSetup> {
+        self.armed = false;
+        self.setup.take()
+    }
+}
+
+impl Drop for NetnsGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(setup) = self.setup.take() else {
+            return; // nothing was provisioned
+        };
+        let allocator = Arc::clone(&self.allocator);
+        // `teardown_netns` is async (shells `ip netns delete` + frees the
+        // allocator slot under the same lock other restores contend on), so
+        // we can't block here. Detach it on the captured runtime handle —
+        // same pattern as the cancel-safe `destroy()` teardown.
+        self.handle.spawn(async move {
+            net::teardown_netns(&setup, &allocator).await;
+            tracing::debug!(
+                netns = %setup.netns_name,
+                "NetnsGuard: tore down per-VM netns on cancelled/failed restore"
+            );
+        });
     }
 }
 
@@ -5833,5 +5902,150 @@ mod tests {
         // reaped inside `kill_fc`'s `Child::kill().await`, so no zombie is
         // left. Tidy up the stub socket dir.
         let _ = std::fs::remove_dir_all(&sock_dir);
+    }
+
+    /// Issue #197: the `SpawnKillGuard` is now armed INSIDE the spawn
+    /// helpers (right after `.spawn()`), so it covers the helper's own
+    /// `wait_for_socket` await AND everything the caller does before the
+    /// commit point — closing the window where a restore future cancelled
+    /// between `spawn()` and the (previously caller-side, post-`join!`)
+    /// guard arming orphaned the FC/uffd process.
+    ///
+    /// We can't drive a real FC spawn in a unit test, but we CAN assert the
+    /// invariant the fix relies on: a guard constructed exactly the way the
+    /// helpers now construct it — `child.id().map(SpawnKillGuard::new)` the
+    /// instant after spawn — SIGKILLs the (kill_on_drop=false, mirroring ADR
+    /// 0044 K2) process when dropped without `disarm()`, and leaves it alone
+    /// when disarmed. Pre-fix the guard didn't exist during that window at
+    /// all, so a dropped future killed nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_kill_guard_armed_at_spawn_reaps_on_cancel_window_drop() {
+        use std::time::Duration;
+
+        // Stand-in for FC/uffd: long-lived, kill_on_drop OFF (prod shape).
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("120").kill_on_drop(false);
+        let child = cmd.spawn().expect("spawn sleep stand-in");
+        let pid = child.id().expect("child has a pid");
+        assert!(pid_alive(pid), "stand-in alive right after spawn");
+
+        // Arm the guard the way the spawn helpers do now.
+        let guard = child.id().map(SpawnKillGuard::new).expect("pid present");
+
+        // Model the cancellation window: the enclosing future is dropped
+        // (here, scope exit) while the guard is still armed. The Child is
+        // also dropped — with kill_on_drop OFF it would NOT reap the process,
+        // so the guard is the only thing that can.
+        drop(child);
+        drop(guard);
+
+        let mut reaped = false;
+        for _ in 0..50 {
+            if !pid_alive(pid) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "armed SpawnKillGuard must SIGKILL the half-spawned process on drop"
+        );
+
+        // Disarm variant: a committed VM's guard is defused and the process
+        // survives the drop (only `destroy()`/an explicit kill reaps it).
+        let child2 = cmd.spawn().expect("spawn second sleep stand-in");
+        let pid2 = child2.id().expect("child2 has a pid");
+        let mut guard2 = child2.id().map(SpawnKillGuard::new).expect("pid present");
+        guard2.disarm();
+        drop(guard2);
+        // Give a (would-be) SIGKILL time to land if disarm were ineffective.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            pid_alive(pid2),
+            "disarmed SpawnKillGuard must leave the committed process running"
+        );
+        // Clean up the survivor.
+        unsafe {
+            libc::kill(pid2 as i32, libc::SIGKILL);
+        }
+    }
+
+    /// Issue #197 companion leak: per-VM netns teardown was `Err`-arm-only,
+    /// never drop-based, so a cancelled/early-returned restore leaked the
+    /// netns + veth + SNAT iptables rule + the allocator's `/30` slot. The
+    /// new `NetnsGuard` makes teardown drop-based.
+    ///
+    /// Linux-only because the allocator-free + `ip netns delete` body of
+    /// `net::teardown_netns` is `cfg(target_os = "linux")` — the observable
+    /// behavior (the SNAT slot returning to the pool) only exists there.
+    /// Runs in CI's `tests (linux)` workspace nextest pass (not `#[ignore]`,
+    /// no KVM). We use a bogus netns name so `ip netns delete` best-effort
+    /// no-ops; the allocator free runs regardless.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn netns_guard_drop_frees_snat_slot_on_cancel() {
+        use std::net::Ipv4Addr;
+        use std::time::Duration;
+
+        let allocator = Arc::new(parking_lot::Mutex::new(net::NetworkAllocator::new(
+            Ipv4Addr::new(10, 200, 0, 0),
+        )));
+        // Allocate a real SNAT slot, as `provision_netns` would.
+        let snat_cidr = allocator.lock().alloc().expect("alloc snat slot");
+        let baseline = allocator.lock().live_count();
+        assert!(
+            baseline >= 2,
+            "slot 0 (reserved) + our snat slot are in use"
+        );
+
+        let setup = net::NetnsSetup {
+            netns_name: format!("eng197-test-{}", std::process::id()),
+            veth_host: "eng197h".into(),
+            veth_ns: "eng197n".into(),
+            tap_name: "tap0".into(),
+            vm_cidr: net::VmCidr::new(Ipv4Addr::new(10, 200, 0, 0)),
+            snat_cidr,
+        };
+
+        // Armed guard dropped (the cancellation/early-return case) must run
+        // teardown on its detached task and free the SNAT slot.
+        {
+            let _guard = NetnsGuard::new(Some(setup.clone()), Arc::clone(&allocator));
+        } // drop here
+
+        let mut freed = false;
+        for _ in 0..100 {
+            if allocator.lock().live_count() < baseline {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            freed,
+            "armed NetnsGuard drop must free the SNAT slot (live_count {} >= baseline {})",
+            allocator.lock().live_count(),
+            baseline,
+        );
+
+        // Committed path: `into_committed()` disarms and the slot stays in
+        // use — the live sandbox's `destroy()` now owns teardown.
+        let snat2 = allocator.lock().alloc().expect("alloc second snat slot");
+        let baseline2 = allocator.lock().live_count();
+        let setup2 = net::NetnsSetup {
+            snat_cidr: snat2,
+            ..setup
+        };
+        let guard = NetnsGuard::new(Some(setup2), Arc::clone(&allocator));
+        let committed = guard.into_committed();
+        assert!(committed.is_some(), "into_committed yields the setup");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            allocator.lock().live_count(),
+            baseline2,
+            "disarmed (committed) NetnsGuard must NOT free the slot"
+        );
     }
 }
