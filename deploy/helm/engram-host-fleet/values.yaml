@@ -80,6 +80,26 @@ firecracker:
   # disable (then a pod restart kills the node's VMs).
   vmCgroupParent: /sys/fs/cgroup/engram-vms
 
+egress:
+  # ADR 0006 + issue #240: the per-session egress proxy is MANDATORY.
+  # Every host-agent binds it (TCP/443 SNI allow-listing + DNS
+  # filtering); a host that can't stand it up refuses to start. There
+  # is no "off" — `port` exists only to dodge a bind collision. The
+  # K8s migration (ADR 0044 K5) dropped these env vars when the GCE MIG
+  # was retired, silently leaving prod with unfiltered guest egress;
+  # this section re-wires them.
+  port: 8443
+  # Where the CA material loads from. Production: gcp-secret-manager
+  # (Workload Identity on the host-agent ServiceAccount). The two
+  # secret paths below point at the existing TF-managed secrets
+  # (module.engrams.egress_ca_cert_secret_name / ..._key_secret_name).
+  caSource: gcp-secret-manager
+  # Fully-qualified Secret Manager resource paths
+  # (projects/<p>/secrets/<name>/versions/latest). REQUIRED when
+  # caSource == gcp-secret-manager.
+  caGcpCertSecret: ""
+  caGcpKeySecret: ""
+
 storage:
   # Local NVMe for the chunk cache + per-sandbox work dir.
   workDirHostPath: /var/lib/engram

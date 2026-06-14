@@ -8131,6 +8131,181 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────
+    // ADR 0045 C2 teleport: egress policy + DNS interception must be
+    // re-established on the destination host before a teleported
+    // session resumes (issue #240). The destination host-agent learns
+    // the per-session policy via `notify_session_policy`; after that
+    // call the local filtering proxy MUST resolve the guest IP to the
+    // session's allow-list. If it doesn't, a teleported guest runs
+    // unfiltered on the destination — exactly the regression #240
+    // closes.
+    // ──────────────────────────────────────────────────────────────
+    mod teleport_egress_policy_tests {
+        use super::*;
+        use engram_core::types::egress::SessionEgressPolicy;
+        use engram_core::types::image::SecretMode;
+        use std::net::Ipv4Addr;
+
+        /// Minimal inner backend — teleport policy re-application only
+        /// touches PooledBackend's own `notify_session_policy` override
+        /// (it registers against the wired egress proxy); the inner is
+        /// never called.
+        struct NoopInner;
+        #[async_trait]
+        impl SandboxBackend for NoopInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                PathBuf::new()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+        }
+
+        /// Spawn a real `HostEgress` on an ephemeral loopback port with
+        /// a self-generated local-disk CA. This is the same proxy the
+        /// production host-agent stands up; we only need its registry.
+        async fn spawn_test_egress() -> (HostEgress, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source: Arc<dyn engram_egress_proxy::CaSource> = Arc::new(
+                engram_egress_proxy::LocalDiskCaSource::new(dir.path().join("egress-ca")),
+            );
+            // Port 0 ⇒ OS-assigned ephemeral port (no fixed-port
+            // collisions when the suite runs in parallel).
+            let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let egress = HostEgress::spawn(source, bind).await.expect("spawn egress");
+            (egress, dir)
+        }
+
+        fn policy_for(
+            session_id: SessionId,
+            sandbox_id: SandboxId,
+            guest_ip: Ipv4Addr,
+            allow: &[&str],
+        ) -> SessionEgressPolicy {
+            SessionEgressPolicy {
+                session_id,
+                sandbox_id,
+                guest_ip,
+                network_allow_hosts: allow.iter().map(|s| s.to_string()).collect(),
+                network_allow_host_patterns: Vec::new(),
+                secrets: Vec::new(),
+                secret_mode: SecretMode::Literal,
+            }
+        }
+
+        /// The destination host-agent, on receiving the teleported
+        /// session's policy, MUST register it with the local proxy so
+        /// the guest IP resolves to the allow-list. Pre-#240 prod ran
+        /// with the proxy globally disabled, so this path was a no-op
+        /// ("no local egress proxy, binding recorded for Phase B
+        /// publisher only") and a teleported guest had unfiltered
+        /// egress. This test pins the now-mandatory behavior.
+        #[tokio::test]
+        async fn teleport_dest_reestablishes_egress_filter_before_resume() {
+            let (egress, _dir) = spawn_test_egress().await;
+            let registry = egress.registry.clone();
+
+            let pooled = PooledBackend::new(Arc::new(NoopInner) as Arc<dyn SandboxBackend>)
+                .with_egress(Arc::new(egress));
+
+            let session_id = SessionId::new();
+            let sandbox_id = SandboxId::new();
+            let guest_ip = Ipv4Addr::new(10, 200, 0, 2);
+
+            // Before the dest applies policy, the proxy knows nothing
+            // about this guest IP — a connection would be refused.
+            assert!(
+                registry.lookup(guest_ip).is_none(),
+                "pre-condition: dest proxy must not know the teleported guest yet",
+            );
+
+            // The dest receives the teleported session's egress policy
+            // (the same call the coordinator makes on the destination
+            // before finishing the resume).
+            pooled
+                .notify_session_policy(policy_for(
+                    session_id,
+                    sandbox_id,
+                    guest_ip,
+                    &["api.anthropic.com"],
+                ))
+                .await
+                .expect("dest must accept and apply the teleported egress policy");
+
+            // The filter is now LIVE on the destination: the guest IP
+            // resolves to a session whose allow-list permits ONLY the
+            // policy's host and refuses everything else (incl. a DNS-
+            // exfil target). DNS interception keys off the same
+            // `network_allow` HostList the resolver consults, so this
+            // also proves DNS filtering is in force for the guest.
+            let state = registry
+                .lookup(guest_ip)
+                .expect("dest proxy must resolve the teleported guest IP after policy apply");
+            assert_eq!(state.session_id, session_id);
+            assert!(
+                state.network_allow.matches("api.anthropic.com"),
+                "allow-listed host must be permitted post-teleport",
+            );
+            assert!(
+                !state.network_allow.matches("evil.example.com"),
+                "non-allow-listed host (exfil target) must be refused post-teleport",
+            );
+        }
+
+        /// Idempotent re-application: a teleport may re-issue the
+        /// policy (e.g. parachute fallback re-homes the session). The
+        /// dest must update cleanly, never leaving a stale unfiltered
+        /// binding or two conflicting entries for the same IP.
+        #[tokio::test]
+        async fn teleport_dest_policy_reapply_is_idempotent() {
+            let (egress, _dir) = spawn_test_egress().await;
+            let registry = egress.registry.clone();
+            let pooled = PooledBackend::new(Arc::new(NoopInner) as Arc<dyn SandboxBackend>)
+                .with_egress(Arc::new(egress));
+
+            let session_id = SessionId::new();
+            let sandbox_id = SandboxId::new();
+            let guest_ip = Ipv4Addr::new(10, 200, 0, 2);
+
+            pooled
+                .notify_session_policy(policy_for(session_id, sandbox_id, guest_ip, &["a.example"]))
+                .await
+                .unwrap();
+            // Re-home: same IP, tighter allow-list.
+            pooled
+                .notify_session_policy(policy_for(session_id, sandbox_id, guest_ip, &["b.example"]))
+                .await
+                .unwrap();
+
+            let state = registry.lookup(guest_ip).expect("guest resolves");
+            assert!(state.network_allow.matches("b.example"));
+            assert!(
+                !state.network_allow.matches("a.example"),
+                "re-applied policy must replace the prior allow-list, not union it",
+            );
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
     // ADR 0014 issue #1/#2: commit + abort snapshot lifecycle tests.
     // ──────────────────────────────────────────────────────────────
 

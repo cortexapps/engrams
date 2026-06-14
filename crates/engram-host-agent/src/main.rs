@@ -111,17 +111,20 @@ struct Cli {
     vz_kernel_path: Option<PathBuf>,
 
     /// TCP port the local egress proxy binds. iptables PREROUTING
-    /// REDIRECT on this host sends guest tcp/443 here. `0` (default)
-    /// disables egress filtering entirely: no proxy is spawned, no
-    /// REDIRECT rules are installed, and guests reach the network
-    /// directly. ADR 0006.
-    #[arg(long, env = "ENGRAM_EGRESS_PROXY_PORT", default_value_t = 0)]
+    /// REDIRECT on this host sends guest tcp/443 here. The egress
+    /// proxy is **mandatory** — it is the only path a guest reaches
+    /// the network (TCP/443 SNI allow-listing + DNS filtering, ADR
+    /// 0006), and a host that cannot stand it up refuses to serve
+    /// sessions. This flag exists only to avoid a bind collision when
+    /// something else on the host already holds the default port;
+    /// there is **no `0 = off` sentinel** — the proxy cannot be
+    /// disabled. ADR 0006 / issue #240.
+    #[arg(long, env = "ENGRAM_EGRESS_PROXY_PORT", default_value_t = 8443)]
     egress_proxy_port: u16,
 
     /// Where the host-agent loads the deployment-wide egress-proxy
-    /// CA from. Ignored when `--egress-proxy-port=0`. Production
-    /// uses `gcp-secret-manager` with Workload Identity; dev uses
-    /// `local-disk` (auto-generates on first boot).
+    /// CA from. Production uses `gcp-secret-manager` with Workload
+    /// Identity; dev uses `local-disk` (auto-generates on first boot).
     #[arg(
         long,
         env = "ENGRAM_EGRESS_CA_SOURCE",
@@ -296,15 +299,14 @@ async fn main() -> Result<(), HostAgentError> {
             fc_cfg.guest_otel_endpoint = std::env::var("ENGRAM_GUEST_OTEL_ENDPOINT")
                 .ok()
                 .filter(|s| !s.trim().is_empty());
-            // When the egress proxy is enabled, plumb the matching
-            // TCP/443 port into the FC config so iptables installs
-            // the REDIRECT rule (and the matching default-deny on
-            // FORWARD). `egress_dns_port` stays at the default 5353
-            // — operators don't need to override unless something
-            // else on the host already binds that port.
-            if cli.egress_proxy_port > 0 {
-                fc_cfg.egress_proxy_port = Some(cli.egress_proxy_port);
-            }
+            // The egress proxy is mandatory (issue #240): always
+            // plumb the matching TCP/443 port into the FC config so
+            // iptables installs the REDIRECT rule (and the matching
+            // default-deny on FORWARD + udp/tcp 53 DNS REDIRECT).
+            // `egress_dns_port` stays at the default 5353 — operators
+            // don't need to override unless something else on the host
+            // already binds that port. There is no unfiltered path.
+            fc_cfg.egress_proxy_port = Some(cli.egress_proxy_port);
             // ADR 0014 follow-up: pin CPUID to a Cascade Lake baseline
             // so warm snapshots stay portable across the bake-host CPU
             // (AMD on Blacksmith runners) vs the prod-host CPU (Intel
@@ -500,18 +502,15 @@ async fn main() -> Result<(), HostAgentError> {
     if let Some(pool) = engram_host_agent::disk_daemon::build_nbd_pool_from_kernel() {
         agent = agent.with_nbd_pool(pool);
     }
-    if cli.egress_proxy_port > 0 {
-        match build_host_egress(&cli).await {
-            Ok(egress) => agent = agent.with_egress(Arc::new(egress)),
-            Err(e) => {
-                tracing::error!(error = %e, "egress proxy spawn failed; aborting");
-                return Err(HostAgentError::Config(format!("egress: {e}")));
-            }
+    // The egress proxy is mandatory (issue #240). A host that cannot
+    // stand it up (CA unloadable, port unbindable) must NOT serve a
+    // session — there is no "unfiltered access" fallback. Fail closed.
+    match build_host_egress(&cli).await {
+        Ok(egress) => agent = agent.with_egress(Arc::new(egress)),
+        Err(e) => {
+            tracing::error!(error = %e, "egress proxy spawn failed; aborting (egress filtering is mandatory)");
+            return Err(HostAgentError::Config(format!("egress: {e}")));
         }
-    } else {
-        tracing::info!(
-            "egress proxy disabled (--egress-proxy-port=0); guests have unfiltered network access"
-        );
     }
     agent.run().await
 }
