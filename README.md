@@ -350,6 +350,52 @@ After relaunching the terminal, `just check` and `cargo nextest`
 runs complete in ~30s instead of hanging indefinitely. See
 [nextest's own docs](https://nexte.st/docs/installation/macos/#how-to-add-your-terminal-to-developer-tools).
 
+### Linux checks on macOS (cross-compile)
+
+A large part of the codebase — the Firecracker backend, `engram-uffd-handler`,
+and the `engram-host-agent` disk/netlink paths — is `cfg(target_os = "linux")`.
+On macOS, `just check` / `cargo clippy` compile the host (`*-apple-darwin`)
+target, so they **silently skip all of that code**: a clippy warning or even a
+type error in a Linux-gated module won't show up. To lint/typecheck it locally,
+cross-compile to `aarch64-unknown-linux-musl` — the native arch of an
+Apple-Silicon Mac, so it builds at full speed (no x86 emulation), and
+`target_os = "linux"` is true so every gated module is compiled:
+
+```bash
+# With Nix (recommended) — the flake wires the musl cross toolchain, pins the
+# host compiler to clang, and supplies the kernel UAPI headers. Nothing else:
+nix develop -c cargo clippy --target aarch64-unknown-linux-musl \
+  -p engram-host-agent --all-targets -- -D warnings
+```
+
+Without Nix you need three things on top of the macOS Quick-start deps:
+
+```bash
+# 1. the target's std (already listed in rust-toolchain.toml, so rustup adds it):
+rustup target add aarch64-unknown-linux-musl
+# 2. the musl cross compiler/linker (already in the Quick start):
+#    brew install FiloSottile/musl-cross/musl-cross --with-aarch64
+# 3. the Linux kernel UAPI headers — the musl-cross sysroot ships libc but NOT
+#    <linux/userfaultfd.h> &c., which bindgen (userfaultfd-sys) needs. Extract
+#    them once via Docker (already a project dep):
+UAPI="$HOME/.local/share/engram-linux-uapi"
+docker run --rm --platform linux/arm64 -v "$UAPI:/out" debian:bookworm bash -c '
+  apt-get update -qq && apt-get install -y -qq linux-libc-dev &&
+  cp -a /usr/include/linux /usr/include/asm-generic /out/ &&
+  cp -a /usr/include/aarch64-linux-gnu/asm /out/'
+
+# then, for each check (the two env vars point bindgen's clang AND the cc crate
+# at the headers the musl sysroot lacks):
+BINDGEN_EXTRA_CLANG_ARGS="-I$UAPI" CFLAGS_aarch64_unknown_linux_musl="-I$UAPI" \
+  cargo clippy --target aarch64-unknown-linux-musl \
+  -p engram-host-agent --all-targets -- -D warnings
+```
+
+This only **typechecks and lints** the Linux code — it does not run it.
+The Firecracker / uffd integration tests need a real Linux + KVM host: run
+them on the dev VM or let CI's `tests (linux)` / `tests (firecracker)` jobs
+cover them.
+
 ## Sessions are bake-image sandboxes with chunked-immutable durability
 
 A session is one bounded unit of agent work. It's two things on the wire: an `image` (the OCI URI of a baked rootfs) and an optional `harness` (which agent process to attach). The bake image's `/workspace` is the workspace; the platform doesn't run any git operations itself.

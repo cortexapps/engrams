@@ -146,6 +146,33 @@
               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$X86_CC"
               export CC_aarch64_unknown_linux_musl="$ARM64_CC"
               export CC_x86_64_unknown_linux_musl="$X86_CC"
+              # The nix cross stdenvs above export a GENERIC `CC`/`CXX`
+              # (one of the musl gccs). cc-rs falls back to that generic
+              # CC for HOST (apple-darwin) build-dependency C — e.g. ring's
+              # curve25519.c built for a proc-macro — and pairs it with
+              # macOS flags (`-arch arm64 -mmacosx-version-min`), so a musl
+              # gcc gets `-arch arm64` and the build dies. Pin the host
+              # target's compiler back to the nix clang wrapper so host C
+              # builds use clang while only the *-linux-musl targets use the
+              # cross gccs. Without this, `cargo {check,clippy} --target
+              # aarch64-unknown-linux-musl` (the local Linux cross-check)
+              # fails on ring; `just bake-demo` happened to dodge it by not
+              # pulling a host-built ring.
+              export CC_aarch64_apple_darwin="$(command -v cc)"
+              export CXX_aarch64_apple_darwin="$(command -v c++)"
+              export CC_x86_64_apple_darwin="$(command -v cc)"
+              export CXX_x86_64_apple_darwin="$(command -v c++)"
+              # The musl cross sysroots ship libc but NOT the Linux kernel
+              # UAPI headers, so a kernel-header bindgen crate (userfaultfd-sys,
+              # and the C `cc` step) can't find <linux/userfaultfd.h> when you
+              # cross-check the Linux-gated crates from macOS. Point clang
+              # (bindgen) and the `cc` crate at the cross targets' kernel
+              # headers. This is what makes `cargo {check,clippy} --target
+              # aarch64-unknown-linux-musl` work in `nix develop` for
+              # engram-{host-agent,uffd-handler,sandbox-firecracker}.
+              export BINDGEN_EXTRA_CLANG_ARGS="''${BINDGEN_EXTRA_CLANG_ARGS:+$BINDGEN_EXTRA_CLANG_ARGS }-I${pkgs.pkgsCross.aarch64-multiplatform-musl.linuxHeaders}/include"
+              export CFLAGS_aarch64_unknown_linux_musl="-I${pkgs.pkgsCross.aarch64-multiplatform-musl.linuxHeaders}/include"
+              export CFLAGS_x86_64_unknown_linux_musl="-I${pkgs.pkgsCross.musl64.linuxHeaders}/include"
             fi
           '';
         };
