@@ -454,6 +454,32 @@ jobs:
       - name: pnpm test (vitest)
         run: pnpm test
 
+  # ADR 0051 Task 14: the orchestration tier (Bun/Hono). install + tsc
+  # --noEmit + bun test (the .live smoke test self-skips without a live
+  # coordinator). Inert until the tier is wired to traffic.
+  orchestrator:
+    name: orchestrator (bun)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: orchestrator
+    env:
+      # Required by loadConfig(); tests override per-test via process.env
+      # assignments, but the module-level `config` singleton reads this at
+      # import time. A dummy value is fine for CI unit tests.
+      CONTROL_PLANE_BEARER: ci-test-token
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: bun install
+        run: bun install --frozen-lockfile
+      - name: bun typecheck
+        run: bun run typecheck
+      - name: bun test
+        run: bun test
+
   # ADR 0051 §7: buf owns crates/engram-protocol/proto. Lint gates style
   # (legacy host_service.proto carries scoped exceptions in buf.yaml;
   # everything new must be clean under full STANDARD); breaking gates wire
