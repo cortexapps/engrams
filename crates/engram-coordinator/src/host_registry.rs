@@ -743,6 +743,11 @@ impl HostClient for HostRegistry {
         backend.release_shell(sandbox_id).await
     }
 
+    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.renew_shell(sandbox_id).await
+    }
+
     async fn proxy_shell(
         &self,
         sandbox_id: SandboxId,

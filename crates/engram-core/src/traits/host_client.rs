@@ -299,6 +299,23 @@ pub trait HostClient: Send + Sync {
     /// caller can't poison the count.
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
 
+    /// Issue #219: refresh the keep-alive stamp on an existing shell
+    /// pin. The coord shell bridge calls this periodically (piggybacking
+    /// its WS keepalive) so the host can distinguish a live shell from
+    /// one whose coord-side bridge task died without sending
+    /// `release_shell` (rolling deploy, crash, dropped WS). The host's
+    /// eviction tick reaps pins not renewed within its stale window,
+    /// closing the "pinned forever" leak. A no-op if no pin exists for
+    /// the sandbox — renewal must never resurrect a released pin.
+    ///
+    /// Default impl is a no-op so backends that don't own a hub (mocks,
+    /// remote impls in tests) need no change; the in-proc
+    /// `LocalHostClient` and the gRPC client override it.
+    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let _ = sandbox_id;
+        Ok(())
+    }
+
     /// ADR 0014 issue #6: open a bidi shell tunnel to the in-guest
     /// `ttyd` for `sandbox_id`. The returned [`ShellTunnel`] is a
     /// pair of mpsc channels:

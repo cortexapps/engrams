@@ -84,7 +84,43 @@ pub async fn shell(
                 }
             };
 
-            if let Err(e) = bridge_browser_to_tunnel(socket, tunnel).await {
+            // Issue #219: renew the host-side pin on a fixed interval
+            // while the bridge is live. The `release_shell` below is the
+            // happy-path teardown, but if THIS task dies without running
+            // it — the coord pod is killed mid-session (rolling deploy),
+            // the future is dropped, the WS is severed — the host would
+            // otherwise keep the sandbox pinned against idle eviction
+            // forever. The renewer is part of this same task, so its
+            // ticks stop the instant the bridge does; the host reaps any
+            // pin it stops hearing about within its stale window.
+            let renew_host = host.clone();
+            let mut renew_tick =
+                tokio::time::interval(engram_host_agent::harness::SHELL_PIN_RENEW_INTERVAL);
+            renew_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; skip it (acquire_shell just
+            // stamped the pin) so we don't issue a redundant RPC.
+            renew_tick.tick().await;
+            let renewer = async {
+                loop {
+                    renew_tick.tick().await;
+                    if let Err(e) = renew_host.renew_shell(sandbox_id).await {
+                        tracing::warn!(
+                            session_id = %id,
+                            error = %e,
+                            "renew_shell failed; pin may be reaped early if this persists",
+                        );
+                    }
+                }
+            };
+
+            let bridge_result = tokio::select! {
+                r = bridge_browser_to_tunnel(socket, tunnel) => r,
+                // The renewer loops forever; it only resolves if the
+                // process is shutting down. In practice the bridge arm
+                // always wins. `never` keeps the select exhaustive.
+                _ = renewer => Ok(()),
+            };
+            if let Err(e) = bridge_result {
                 tracing::warn!(
                     session_id = %id,
                     error = %e,
@@ -95,7 +131,8 @@ pub async fn shell(
                 tracing::warn!(
                     session_id = %id,
                     error = %e,
-                    "release_shell failed; the hub's pin count may drift",
+                    "release_shell failed; the hub's pin count may drift \
+                     (the host-side stale sweep is the backstop — issue #219)",
                 );
             }
         })

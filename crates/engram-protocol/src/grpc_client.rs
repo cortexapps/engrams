@@ -705,6 +705,19 @@ impl GrpcHostClient {
         Ok(())
     }
 
+    /// Issue #219: refresh a live shell pin's keep-alive stamp.
+    pub async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let req = SandboxIdMessage {
+            uuid: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .renew_shell(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
     /// ADR 0016 Phase A: per-sandbox COW diagnostic snapshot. Empty
     /// `state_bincode` on the wire encodes `None` (host has no
     /// chunk-tracked view of this sandbox) so coord can distinguish
@@ -1211,6 +1224,10 @@ impl HostClient for GrpcHostClient {
 
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Self::release_shell(self, sandbox_id).await
+    }
+
+    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Self::renew_shell(self, sandbox_id).await
     }
 
     async fn proxy_shell(

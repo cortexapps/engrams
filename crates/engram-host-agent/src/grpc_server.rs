@@ -656,6 +656,15 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
+    async fn renew_shell(&self, req: Request<SandboxIdMessage>) -> Result<Response<Empty>, Status> {
+        let id = decode_sandbox_id(&req.into_inner().uuid)?;
+        self.inner
+            .renew_shell(id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
     async fn reap_materialize_dir(
         &self,
         req: Request<ReapMaterializeDirRequest>,

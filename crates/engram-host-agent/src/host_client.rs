@@ -76,6 +76,14 @@ impl HostClient for LocalHostClient {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+        // Issue #219: drop any lingering shell pin for this sandbox.
+        // The pin's release is normally driven by the coord WS bridge,
+        // but once the sandbox is gone that bridge can never deliver
+        // its `ReleaseShell` — leaving the entry to leak forever. Clear
+        // it here (the only host-side layer that both runs on the
+        // production destroy path and holds the hub) so the map can't
+        // accumulate stale entries over the host's lifetime.
+        self.harness_hub.clear_shell(id);
         self.sandbox.destroy(id).await
     }
 
@@ -247,6 +255,11 @@ impl HostClient for LocalHostClient {
 
     async fn release_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.harness_hub.release_shell(sandbox_id);
+        Ok(())
+    }
+
+    async fn renew_shell(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.harness_hub.renew_shell(sandbox_id);
         Ok(())
     }
 

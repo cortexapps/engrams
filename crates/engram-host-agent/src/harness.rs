@@ -39,6 +39,23 @@ use tokio::sync::{mpsc, oneshot};
 /// proceeds without the durability guarantee.
 pub const CHECKPOINT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a `shell_attached` pin may go un-renewed before the host's
+/// eviction tick reaps it (issue #219). The coord shell bridge renews
+/// the pin every [`SHELL_PIN_RENEW_INTERVAL`] while the WS is live, so
+/// a healthy session refreshes the stamp ~5× before this fires. A pin
+/// older than this means the renewer is gone (coord pod died mid-
+/// session, or the bridge task was torn down without a `ReleaseShell`)
+/// and the sandbox must fall back under the normal idle TTLs. Chosen
+/// well above the renew interval so transient renew failures or coord
+/// GC pauses don't prematurely un-pin a session a human is using.
+pub const SHELL_PIN_STALE_AGE: Duration = Duration::from_secs(300);
+
+/// How often the coord shell bridge renews a live `shell_attached`
+/// pin (issue #219). Piggybacks the WS keepalive cadence. Must stay
+/// comfortably below [`SHELL_PIN_STALE_AGE`] so a few dropped renewals
+/// don't trip the host-side stale sweep.
+pub const SHELL_PIN_RENEW_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How long `send_prompt` waits for the harness connection to appear
 /// before giving up with `NotAttached`. Covers the post-resume window
 /// where ensure_active has returned but the in-VM bootstrap+harness
@@ -121,7 +138,20 @@ struct HubInner {
     /// release the keep-alive. While the count is > 0 for a sandbox,
     /// `idle_sandboxes` skips it — the human is actively poking at
     /// the box and we don't snapshot-and-evict under their feet.
-    shell_attached: Mutex<HashMap<SandboxId, u32>>,
+    ///
+    /// Each entry is `(count, last_renewed)`. The pin is acquired and
+    /// released by two independent coord→host RPCs from the same axum
+    /// task that bridges the WS (`api/shell.rs`). If the coord pod dies
+    /// mid-session (rolling deploy) or the `ReleaseShell` RPC fails,
+    /// that task never sends the release and the count would otherwise
+    /// stay ≥ 1 forever — permanently exempting the sandbox from idle
+    /// eviction, hard-TTL backstop included (issue #219). To bound the
+    /// drift, the coord bridge renews the pin on its WS keepalive
+    /// interval (`renew_shell` stamps `last_renewed`), and the host's
+    /// eviction tick reaps entries not renewed within
+    /// [`SHELL_PIN_STALE_AGE`] (`sweep_stale_shells`) — exactly mirroring
+    /// the `eviction_inflight` hardening below.
+    shell_attached: Mutex<HashMap<SandboxId, (u32, Instant)>>,
     /// ADR 0016 §A.1.5a: per-sandbox "an idle-eviction POST for this
     /// sandbox is currently in flight on coord". Marked just before
     /// the host's eviction-task POSTs candidates; cleared when the
@@ -206,12 +236,25 @@ impl HarnessHub {
     /// (e.g. a second tab) doesn't release the keep-alive when the
     /// first disconnects.
     pub fn acquire_shell(&self, sandbox_id: SandboxId) {
-        *self
-            .inner
-            .shell_attached
-            .lock()
-            .entry(sandbox_id)
-            .or_insert(0) += 1;
+        let mut map = self.inner.shell_attached.lock();
+        let slot = map.entry(sandbox_id).or_insert((0, Instant::now()));
+        slot.0 += 1;
+        // (Re)stamp on every acquire so a fresh client always resets
+        // the stale clock — a second tab opening must not inherit a
+        // near-expired stamp from the first.
+        slot.1 = Instant::now();
+    }
+
+    /// Refresh the stale clock on an existing shell pin (issue #219).
+    /// Called by the coord shell bridge on its WS-keepalive interval so
+    /// the host's `sweep_stale_shells` can distinguish a live session
+    /// from one whose renewer (the coord bridge task) has died. A no-op
+    /// if the sandbox has no pin — renewal must never resurrect a pin
+    /// that `release_shell`/`clear_shell` already cleared.
+    pub fn renew_shell(&self, sandbox_id: SandboxId) {
+        if let Some(slot) = self.inner.shell_attached.lock().get_mut(&sandbox_id) {
+            slot.1 = Instant::now();
+        }
     }
 
     /// Decrement the shell-attached count for `sandbox_id`. The
@@ -219,12 +262,21 @@ impl HarnessHub {
     /// the count hits zero.
     pub fn release_shell(&self, sandbox_id: SandboxId) {
         let mut map = self.inner.shell_attached.lock();
-        if let Some(count) = map.get_mut(&sandbox_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+        if let Some(slot) = map.get_mut(&sandbox_id) {
+            slot.0 = slot.0.saturating_sub(1);
+            if slot.0 == 0 {
                 map.remove(&sandbox_id);
             }
         }
+    }
+
+    /// Drop the shell pin for `sandbox_id` outright, ignoring the
+    /// refcount (issue #219). Called from the destroy path: once the
+    /// sandbox is gone the pin is meaningless, and leaving it behind
+    /// leaks an entry forever (the WS bridge for a destroyed sandbox
+    /// can never deliver its `ReleaseShell`). Idempotent.
+    pub fn clear_shell(&self, sandbox_id: SandboxId) {
+        self.inner.shell_attached.lock().remove(&sandbox_id);
     }
 
     /// Tell the hub that an upcoming harness connection identifying
@@ -549,6 +601,31 @@ impl HarnessHub {
         let mut removed = Vec::new();
         guard.retain(|sandbox_id, marked_at| {
             if now.duration_since(*marked_at) >= max_age {
+                removed.push(*sandbox_id);
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    /// Issue #219: reap shell pins not renewed within `max_age` and
+    /// return the sandbox_ids removed. Direct analogue of
+    /// `sweep_stale_evictions` for the `shell_attached` map. A live
+    /// coord shell bridge renews its pin every
+    /// [`SHELL_PIN_RENEW_INTERVAL`]; a pin older than `max_age`
+    /// (typically [`SHELL_PIN_STALE_AGE`]) means the renewer is gone —
+    /// coord pod died mid-session, or the bridge task was torn down
+    /// without sending `ReleaseShell` — so the sandbox must fall back
+    /// under the normal idle TTLs instead of staying pinned forever.
+    /// Called from the host's eviction tick.
+    pub fn sweep_stale_shells(&self, max_age: Duration) -> Vec<SandboxId> {
+        let mut guard = self.inner.shell_attached.lock();
+        let now = Instant::now();
+        let mut removed = Vec::new();
+        guard.retain(|sandbox_id, (_count, last_renewed)| {
+            if now.duration_since(*last_renewed) >= max_age {
                 removed.push(*sandbox_id);
                 false
             } else {
@@ -1578,6 +1655,157 @@ mod tests {
             !hub.inner.eviction_inflight.lock().contains_key(&sb),
             "clear must remove the entry",
         );
+    }
+
+    // Issue #219 — shell-pin keep-alive leak hardening --------------
+
+    /// Core regression for issue #219: a shell pin whose coord-side
+    /// renewer has died (no `release_shell`, no `renew_shell`) must be
+    /// reaped by the host's stale sweep so the sandbox falls back under
+    /// idle eviction — including the hard-TTL backstop. Without the fix,
+    /// `shell_attached` had no timestamp and no sweep, so the pin (and
+    /// the unconditional `continue` in `idle_sandboxes`) stuck forever.
+    #[tokio::test]
+    async fn stale_shell_pin_is_reaped_and_sandbox_becomes_evictable() {
+        let hub = HarnessHub::new(noop_sink());
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+        let _ack = drive_harness(harness_side, session_id, |_r, _w| async {}).await;
+
+        // Push the sandbox past the soft TTL so it WOULD be a candidate.
+        hub.inner
+            .last_idle_at
+            .lock()
+            .insert(sandbox_id, Utc::now() - chrono::Duration::seconds(120));
+
+        // Open a shell: the pin now suppresses eviction.
+        hub.acquire_shell(sandbox_id);
+        let pinned = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
+        assert!(
+            pinned.is_empty(),
+            "an attached shell must suppress idle eviction; got {pinned:?}",
+        );
+
+        // Simulate the coord bridge dying: the pin stops being renewed.
+        // Backdate the stamp past the stale window (the count stays ≥1 —
+        // this is exactly the leaked state the bug produced).
+        {
+            let mut guard = hub.inner.shell_attached.lock();
+            let entry = guard.get_mut(&sandbox_id).expect("pin present");
+            entry.1 = Instant::now()
+                .checked_sub(SHELL_PIN_STALE_AGE + Duration::from_secs(60))
+                .unwrap_or_else(Instant::now);
+            assert!(entry.0 >= 1, "count must stay non-zero — the leak");
+        }
+
+        // The eviction tick's sweep reaps the un-renewed pin.
+        let reaped = hub.sweep_stale_shells(SHELL_PIN_STALE_AGE);
+        assert_eq!(reaped, vec![sandbox_id], "stale pin must be reaped");
+
+        // Sandbox is once again an idle-eviction candidate.
+        let after = hub.idle_sandboxes(Duration::from_secs(30), Duration::from_secs(1800));
+        assert_eq!(
+            after.len(),
+            1,
+            "after the stale sweep the sandbox must be evictable again; got {after:?}",
+        );
+        assert_eq!(after[0].1, sandbox_id);
+    }
+
+    /// A pin renewed within the window is NOT reaped — a live shell
+    /// session keeps its sandbox pinned across many sweep ticks.
+    #[test]
+    fn renewed_shell_pin_survives_the_sweep() {
+        let hub = HarnessHub::new(noop_sink());
+        let sandbox_id = SandboxId::new();
+        hub.acquire_shell(sandbox_id);
+
+        // Backdate near the edge, then renew — the renew must reset the
+        // clock so the immediately-following sweep keeps it.
+        {
+            let mut guard = hub.inner.shell_attached.lock();
+            let entry = guard.get_mut(&sandbox_id).unwrap();
+            entry.1 = Instant::now()
+                .checked_sub(SHELL_PIN_STALE_AGE + Duration::from_secs(10))
+                .unwrap_or_else(Instant::now);
+        }
+        hub.renew_shell(sandbox_id);
+
+        let reaped = hub.sweep_stale_shells(SHELL_PIN_STALE_AGE);
+        assert!(
+            reaped.is_empty(),
+            "a freshly-renewed pin must survive the sweep; reaped {reaped:?}",
+        );
+        assert!(
+            hub.inner.shell_attached.lock().contains_key(&sandbox_id),
+            "renewed pin must remain",
+        );
+    }
+
+    /// `renew_shell` must never resurrect a pin that was already
+    /// released/cleared — otherwise a late renewal RPC from a dying
+    /// bridge could re-pin a sandbox the host just freed.
+    #[test]
+    fn renew_shell_does_not_resurrect_a_released_pin() {
+        let hub = HarnessHub::new(noop_sink());
+        let sandbox_id = SandboxId::new();
+        hub.acquire_shell(sandbox_id);
+        hub.release_shell(sandbox_id);
+        assert!(
+            !hub.inner.shell_attached.lock().contains_key(&sandbox_id),
+            "release must clear the entry at count 0",
+        );
+        hub.renew_shell(sandbox_id);
+        assert!(
+            !hub.inner.shell_attached.lock().contains_key(&sandbox_id),
+            "renew on a missing pin must be a no-op, not a resurrection",
+        );
+    }
+
+    /// Multi-tab refcount semantics are preserved across the new
+    /// `(count, Instant)` representation: two acquires need two releases
+    /// before the pin clears.
+    #[test]
+    fn shell_pin_refcount_survives_the_instant_pairing() {
+        let hub = HarnessHub::new(noop_sink());
+        let sandbox_id = SandboxId::new();
+        hub.acquire_shell(sandbox_id);
+        hub.acquire_shell(sandbox_id);
+        assert_eq!(
+            hub.inner.shell_attached.lock().get(&sandbox_id).unwrap().0,
+            2,
+            "two tabs → count 2",
+        );
+        hub.release_shell(sandbox_id);
+        assert!(
+            hub.inner.shell_attached.lock().contains_key(&sandbox_id),
+            "first release must NOT clear while a second tab is open",
+        );
+        hub.release_shell(sandbox_id);
+        assert!(
+            !hub.inner.shell_attached.lock().contains_key(&sandbox_id),
+            "second release clears the pin",
+        );
+    }
+
+    /// `clear_shell` (the destroy-path cleanup) empties the pin
+    /// regardless of refcount — once the sandbox is gone the pin is
+    /// meaningless and must not leak.
+    #[test]
+    fn clear_shell_empties_pin_regardless_of_count() {
+        let hub = HarnessHub::new(noop_sink());
+        let sandbox_id = SandboxId::new();
+        hub.acquire_shell(sandbox_id);
+        hub.acquire_shell(sandbox_id);
+        hub.clear_shell(sandbox_id);
+        assert!(
+            !hub.inner.shell_attached.lock().contains_key(&sandbox_id),
+            "destroy-time clear must empty the map even with count > 1",
+        );
+        // Idempotent on an already-clear entry.
+        hub.clear_shell(sandbox_id);
     }
 
     /// Regression for issue #217: ABBA lock-order inversion between
