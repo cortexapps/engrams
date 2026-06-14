@@ -1652,6 +1652,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2 0.6.4",
  "tempfile",
  "tokio",
  "tracing",

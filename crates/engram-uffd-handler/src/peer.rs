@@ -42,6 +42,29 @@ use engram_migrate_proto::{
 const RECONNECT_ATTEMPTS: u32 = 3;
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
+/// Page-channel socket deadlines. A silently-dead source (power loss /
+/// partition with no FIN/RST) leaves the framing `read_exact` with no
+/// unacked data to fail on, so a blocking read would hang forever — and
+/// `need_at`/`drain` only ever surface `PeerLost` on an `Err` return.
+/// These bound that wait so an `io::ErrorKind::WouldBlock`/`TimedOut`
+/// arrives, converts to `PeerError::Io` (retryable), and the bounded
+/// redial loop escalates to `Lost` within seconds instead of wedging a
+/// vCPU (and teardown) on a dead peer. The 5 s read budget comfortably
+/// exceeds the source's worst-case `process_vm_readv` service: it serves
+/// from the PAUSED guest's resident RAM (no disk, no network), and the
+/// drain's hot-first ordering keeps any single chunk's serve sub-ms.
+const PEER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// TCP keepalive so a dropped path with no in-flight data still surfaces
+/// (the read/write timeouts only fire while a request is outstanding;
+/// keepalive catches an idle fault conn between faults). Idle 10 s, then
+/// probe every 5 s, 3 probes → the kernel drops the conn within ~25 s of
+/// silence even when no read is pending, which `read_frame` then sees as
+/// a connection error.
+const PEER_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+const PEER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const PEER_KEEPALIVE_RETRIES: u32 = 3;
+
 /// Errors on the peer channel. `ShaMismatch` and exhausted reconnects
 /// are terminal: the caller latches `lost` and reports `PeerLost`.
 #[derive(Debug)]
@@ -144,6 +167,25 @@ pub struct PeerSession {
     epoch: std::time::Instant,
 }
 
+/// Bound the page channel against a silently-dead source: read/write
+/// deadlines so the framing `read_exact`/`write_all` can never block
+/// forever, plus TCP keepalive so an idle conn between faults still
+/// surfaces a dropped path. Applied to EVERY dialed conn — the fault
+/// conn (`connect` + the `need_at` redial) and the drain conn
+/// (`open_extra_conn`) — since all route through `dial`.
+fn apply_peer_sockopts(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(PEER_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(PEER_WRITE_TIMEOUT))?;
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(PEER_KEEPALIVE_IDLE)
+        .with_interval(PEER_KEEPALIVE_INTERVAL)
+        .with_retries(PEER_KEEPALIVE_RETRIES);
+    // SockRef borrows the fd without taking ownership; the TcpStream
+    // stays the owner.
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
+    Ok(())
+}
+
 /// Dial + `Hello` + `HelloAck` + `Seal` on a fresh connection,
 /// validating geometry against the session manifest's view.
 fn dial(
@@ -156,6 +198,7 @@ fn dial(
 ) -> Result<(TcpStream, SealBitmap), PeerError> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
+    apply_peer_sockopts(&stream)?;
     write_frame(
         &mut stream,
         &ToSource::Hello {
@@ -281,6 +324,18 @@ impl PeerSession {
 
     pub fn is_lost(&self) -> bool {
         self.lost.load(Ordering::SeqCst)
+    }
+
+    /// Test-only: the read/write deadlines actually set on the live
+    /// fault connection (proves `apply_peer_sockopts` ran on the dialed
+    /// stream, not just on a discarded local).
+    #[cfg(test)]
+    fn fault_conn_timeouts(&self) -> (Option<Duration>, Option<Duration>) {
+        let conn = self.fault_conn.lock().expect("fault conn poisoned");
+        (
+            conn.read_timeout().expect("read_timeout"),
+            conn.write_timeout().expect("write_timeout"),
+        )
     }
 
     pub fn mark_lost(&self) {
@@ -847,6 +902,94 @@ mod tests {
         assert!(
             matches!(fatal, Err(PeerError::Server(_))),
             "req_id: None must decode as Server, got {fatal:?}"
+        );
+    }
+
+    /// Regression for issue #226 (a): every dialed page-channel conn
+    /// must carry read/write deadlines + keepalive so a silently-dead
+    /// source can't wedge a blocking `read_frame` forever. Pre-fix
+    /// `dial` set only `set_nodelay`, leaving `read_timeout`/
+    /// `write_timeout` as `None`.
+    #[test]
+    fn dialed_fault_conn_has_read_write_timeouts() {
+        let addr = fake_source(vec![0], page_resp);
+        let sess = PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL)
+            .expect("connect");
+        let (read_to, write_to) = sess.fault_conn_timeouts();
+        assert_eq!(
+            read_to,
+            Some(PEER_READ_TIMEOUT),
+            "fault conn must carry a read deadline (#226)"
+        );
+        assert_eq!(
+            write_to,
+            Some(PEER_WRITE_TIMEOUT),
+            "fault conn must carry a write deadline (#226)"
+        );
+    }
+
+    /// Regression for issue #226 (a), the failure it actually prevents:
+    /// a source that completes the handshake then goes SILENT (no FIN/
+    /// RST — power loss / partition) must NOT wedge `need_at` forever.
+    /// The read timeout fires, classifies `Io` (retryable), the bounded
+    /// redial loop runs, and the session latches `Lost` — surfacing
+    /// `PeerLost` to the caller instead of a permanently-parked vCPU.
+    ///
+    /// Pre-fix (`read_frame`'s `read_exact` on a conn with no read
+    /// timeout) this test would hang indefinitely rather than returning.
+    #[test]
+    fn silent_source_after_handshake_surfaces_lost_not_hang() {
+        // A source that handshakes (Hello/Ack/Seal) on every connection
+        // but NEVER answers a NeedAt — and holds the socket open so
+        // there is no EOF/RST to fail on. This is the no-unacked-data
+        // black hole the issue describes; only a read timeout can break
+        // it. Each redial gets the same silent treatment.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let Ok(ToSource::Hello { .. }) = read_frame::<_, ToSource>(&mut s) else {
+                    continue;
+                };
+                write_frame(
+                    &mut s,
+                    &FromSource::HelloAck {
+                        version: PROTO_VERSION,
+                        chunk_size: CHUNK,
+                        total_bytes: TOTAL,
+                    },
+                )
+                .unwrap();
+                let mut bitmap = SealBitmap::new(CHUNK, TOTAL / CHUNK);
+                bitmap.set(0);
+                write_frame(&mut s, &FromSource::Seal { bitmap }).unwrap();
+                // Go silent: never read the NeedAt, never reply, never
+                // close. Keep the stream alive so the dest sees no FIN.
+                held.push(s);
+            }
+        });
+
+        let sess = PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL)
+            .expect("connect");
+        let start = std::time::Instant::now();
+        let err = sess
+            .need_at(0)
+            .expect_err("a silent source must surface an error, not hang");
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, PeerError::Lost(_)),
+            "silent source must latch Lost, got {err}"
+        );
+        assert!(sess.is_lost(), "session must be latched lost");
+        // It must have RETURNED (the whole point) and within the bounded
+        // read-timeout * redial budget — generously capped to absorb CI
+        // scheduling jitter while still proving it isn't an unbounded
+        // hang.
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "need_at took {elapsed:?} — read timeout/redial budget not bounding the wait"
         );
     }
 
