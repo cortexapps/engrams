@@ -1271,7 +1271,30 @@ pub async fn delete_session(
     // routing rebuild even if it kept the column set, but tidy
     // anyway so an audit query "what sandboxes does the coordinator
     // think exist" matches reality.
-    let _ = state.services.meta.assign_session_sandbox(id, None).await;
+    //
+    // Issue #211: guard the clear on the EXACT sandbox we read +
+    // destroyed (`bound_sandbox`). The row is terminal, so a competing
+    // rebind onto it can't happen anymore — but a stale read elsewhere
+    // shouldn't be able to null a column that something else legitimately
+    // re-populated either. `Some(bound_sandbox)` means "only clear if the
+    // row still points at the sandbox I destroyed"; a `Conflict` (the
+    // binding already moved on) is benign here, so it's logged not failed.
+    if let Some(sandbox_id) = bound_sandbox {
+        if let Err(e) = state
+            .services
+            .meta
+            .assign_session_sandbox_guarded(id, None, Some(Some(sandbox_id)), &[])
+            .await
+        {
+            tracing::debug!(
+                session_id = %id,
+                sandbox_id = %sandbox_id,
+                error = %e,
+                "delete_session: guarded sandbox clear was a no-op (binding already \
+                 changed) — leaving it for the new owner",
+            );
+        }
+    }
     state.services.host.unbind_session(id).await;
     Ok(StatusCode::NO_CONTENT)
 }

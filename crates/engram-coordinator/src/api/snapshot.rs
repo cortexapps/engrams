@@ -25,7 +25,7 @@ use engram_core::traits::storage::BlobStorage;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{Session, SessionState};
-use engram_core::{SandboxError, SandboxId, SessionId};
+use engram_core::{MetaError, SandboxError, SandboxId, SessionId};
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -1378,18 +1378,64 @@ async fn bind_resumed_session(
     // write here would leave every replica unable to dispatch `/exec`
     // to the resumed sandbox. Fail the resume rather than limp on an
     // in-memory fallback that no longer exists.
-    state
+    //
+    // Issue #211: this used to be two blind `WHERE id = $1` UPDATEs. A
+    // `DELETE /sessions/:id` (terminate) racing the in-flight restore
+    // can flip the row `Idle → Completed` and clear `sandbox_id`; the
+    // blind binds would then succeed onto the *terminal* row, the
+    // ownership oracle would answer `owned = true`, and the host's
+    // stale-sandbox reap — the backstop for every orphan path — never
+    // fires. Permanent leak. Guard the bind on the row still being the
+    // `Idle`, unbound row we dispatched on (resume_from_idle cleared any
+    // residual sandbox to NULL above). One atomic CAS rebind so host +
+    // sandbox flip together.
+    match state
         .services
         .meta
-        .assign_session_host(id, Some(host_id))
+        .rebind_session_guarded(id, host_id, sandbox_id, Some(None), &[SessionState::Idle])
         .await
-        .map_err(|e| ApiError::Internal(format!("assign_session_host on resume: {e}")))?;
-    state
-        .services
-        .meta
-        .assign_session_sandbox(id, Some(sandbox_id))
-        .await
-        .map_err(|e| ApiError::Internal(format!("assign_session_sandbox on resume: {e}")))?;
+    {
+        Ok(()) => {}
+        Err(MetaError::Conflict(msg)) => {
+            // The row went terminal (or a competitor bound it) while we
+            // were restoring. Destroy the VM we just created so it does
+            // NOT become an orphan, then fail the resume cleanly.
+            tracing::warn!(
+                session_id = %id,
+                sandbox_id = %sandbox_id,
+                conflict = %msg,
+                "bind_resumed_session: row no longer the Idle/unbound row we \
+                 dispatched on (terminate/competing-resume race) — destroying \
+                 the freshly restored sandbox to avoid an orphan",
+            );
+            if let Err(e) = state.services.host.destroy(sandbox_id).await {
+                tracing::warn!(
+                    session_id = %id,
+                    sandbox_id = %sandbox_id,
+                    error = %e,
+                    "bind_resumed_session: destroy of unbound sandbox failed; \
+                     host reconcile will GC it",
+                );
+            }
+            return Err(ApiError::Conflict(format!(
+                "resume aborted: session changed underneath the restore ({msg})"
+            )));
+        }
+        Err(e) => {
+            // A real persistence failure. The sandbox is bound to no row;
+            // destroy it before surfacing so it can't leak.
+            if let Err(de) = state.services.host.destroy(sandbox_id).await {
+                tracing::warn!(
+                    session_id = %id,
+                    sandbox_id = %sandbox_id,
+                    error = %de,
+                    "bind_resumed_session: destroy after bind failure failed; \
+                     host reconcile will GC it",
+                );
+            }
+            return Err(ApiError::Internal(format!("rebind_session on resume: {e}")));
+        }
+    }
     bind_session_routing(state, id, sandbox_id).await;
     Ok(())
 }

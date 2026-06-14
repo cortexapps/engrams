@@ -78,6 +78,24 @@ impl PostgresStore {
             .await
             .map_err(|e| MetaError::Migration(e.to_string()))
     }
+
+    /// Issue #211: disambiguate a 0-row guarded UPDATE. If the row exists
+    /// at all, the guard (status / expected-sandbox CAS) rejected the
+    /// write — a `Conflict`. Otherwise the id is genuinely unknown —
+    /// `NotFound`. Mirrors the shape `transition_session` uses.
+    async fn conflict_or_not_found(&self, id: SessionId) -> MetaError {
+        match sqlx::query_scalar::<_, i64>("SELECT 1::bigint FROM sessions WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(_)) => MetaError::Conflict(format!(
+                "guarded session write rejected for {id}: state/sandbox precondition not met"
+            )),
+            Ok(None) => MetaError::NotFound,
+            Err(e) => db_err(e),
+        }
+    }
 }
 
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
@@ -1553,6 +1571,176 @@ impl MetadataStore for PostgresStore {
         };
         if n == 0 {
             return Err(MetaError::NotFound);
+        }
+        Ok(())
+    }
+
+    // ---- Issue #211: guarded CAS overrides ----
+    //
+    // The three writers above are blind `WHERE id = $1` UPDATEs. These
+    // overrides condition the same write on the row's current
+    // `sandbox_id` and `status`, so a racing actor can't bind a live
+    // sandbox onto a row that concurrently went terminal (defeating the
+    // orphan reap), and reconcile can't null a freshly-landed rebind.
+    //
+    // `0 rows` is disambiguated into `Conflict` (row exists but the guard
+    // rejected it) vs `NotFound` (no such id) with a cheap follow-up
+    // existence probe — the same shape `transition_session` uses.
+
+    async fn assign_session_sandbox_guarded(
+        &self,
+        id: SessionId,
+        sandbox_id: Option<SandboxId>,
+        expected_current: Option<Option<SandboxId>>,
+        allowed_states: &[SessionState],
+    ) -> Result<(), MetaError> {
+        // The `None` clear path additionally tears down the live disk
+        // manifest + bumps chunk_generation; reuse the existing blind
+        // setter inside a guarded TX rather than duplicating that logic.
+        let states: Vec<String> = allowed_states
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        let expected_uuid = expected_current.map(|o| o.map(|s| s.as_uuid()));
+
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Lock + verify the row under the guard. SELECT ... FOR UPDATE so
+        // a concurrent terminate/transition serializes behind us.
+        let row: Option<(Option<uuid::Uuid>, String)> =
+            sqlx::query_as("SELECT sandbox_id, status FROM sessions WHERE id = $1 FOR UPDATE")
+                .bind(id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let Some((cur_sandbox, status)) = row else {
+            tx.rollback().await.map_err(db_err)?;
+            return Err(MetaError::NotFound);
+        };
+        if let Some(expected) = expected_uuid {
+            if cur_sandbox != expected {
+                tx.rollback().await.map_err(db_err)?;
+                return Err(MetaError::Conflict(format!(
+                    "assign_session_sandbox CAS: sandbox_id is {cur_sandbox:?}, expected {expected:?}"
+                )));
+            }
+        }
+        if !states.is_empty() && !states.contains(&status) {
+            tx.rollback().await.map_err(db_err)?;
+            return Err(MetaError::Conflict(format!(
+                "assign_session_sandbox CAS: status is {status}, not in {states:?}"
+            )));
+        }
+        if sandbox_id.is_some() {
+            sqlx::query("UPDATE sessions SET sandbox_id = $2, updated_at = NOW() WHERE id = $1")
+                .bind(id.as_uuid())
+                .bind(sandbox_id.map(|s| s.as_uuid()))
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        } else {
+            let n = sqlx::query(
+                "UPDATE sessions
+                    SET sandbox_id                 = NULL,
+                        live_disk_manifest_id      = NULL,
+                        live_disk_manifest_version = NULL,
+                        live_disk_manifest_at      = NULL,
+                        updated_at                 = NOW()
+                  WHERE id = $1",
+            )
+            .bind(id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            if n > 0 {
+                sqlx::query(
+                    "UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE",
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn assign_session_host_guarded(
+        &self,
+        id: SessionId,
+        host_id: Option<HostId>,
+        expected_current: Option<Option<SandboxId>>,
+        allowed_states: &[SessionState],
+    ) -> Result<(), MetaError> {
+        let states: Vec<String> = allowed_states
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        let expected_uuid = expected_current.map(|o| o.map(|s| s.as_uuid()));
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions SET host_id = $2, updated_at = NOW()
+            WHERE id = $1
+              AND ($3::text[] IS NULL OR status = ANY($3))
+              AND ($4::boolean IS FALSE OR sandbox_id IS NOT DISTINCT FROM $5)
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(host_id.map(|h| h.as_uuid()))
+        .bind(if states.is_empty() {
+            None
+        } else {
+            Some(states)
+        })
+        .bind(expected_uuid.is_some())
+        .bind(expected_uuid.flatten())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Err(self.conflict_or_not_found(id).await);
+        }
+        Ok(())
+    }
+
+    async fn rebind_session_guarded(
+        &self,
+        id: SessionId,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+        expected_current: Option<Option<SandboxId>>,
+        allowed_states: &[SessionState],
+    ) -> Result<(), MetaError> {
+        let states: Vec<String> = allowed_states
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        let expected_uuid = expected_current.map(|o| o.map(|s| s.as_uuid()));
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions SET host_id = $2, sandbox_id = $3, updated_at = NOW()
+            WHERE id = $1
+              AND ($4::text[] IS NULL OR status = ANY($4))
+              AND ($5::boolean IS FALSE OR sandbox_id IS NOT DISTINCT FROM $6)
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(host_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .bind(if states.is_empty() {
+            None
+        } else {
+            Some(states)
+        })
+        .bind(expected_uuid.is_some())
+        .bind(expected_uuid.flatten())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Err(self.conflict_or_not_found(id).await);
         }
         Ok(())
     }

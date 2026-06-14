@@ -339,6 +339,7 @@ jobs:
             --test placement_reservation_live_pg \
             --test host_register_live_pg \
             --test queue_scanner_live_pg \
+            --test binding_cas_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
