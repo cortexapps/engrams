@@ -45,6 +45,8 @@ use engram_migrate_proto::{
     read_frame, write_frame, FromSource, SealBitmap, ToSource, PROTO_VERSION,
 };
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Notify, Semaphore};
 
 use crate::dirty_map::GuestVma;
 
@@ -199,6 +201,17 @@ pub fn read_guest_range(
     ))
 }
 
+/// Max concurrently-parked unknown-export Hellos. A parked Hello now
+/// holds NO blocking-pool thread per issue #226 part b — just one async
+/// task plus a semaphore permit — but the bound still caps fan-out so a
+/// retry storm of bogus export ids can't pin the page server's accept
+/// path or memory. R8 caps in-flight migrations at one per host, so
+/// legitimate parked conns are a handful: the fault dial plus a few
+/// drain dials, and 16 is ample headroom. Beyond the bound the server
+/// rejects immediately with the existing connection-fatal `Error` frame
+/// rather than queueing.
+const MAX_PARKED_HELLOS: usize = 16;
+
 /// The page server: one per host-agent, holding the live exports.
 pub struct PeerServer {
     /// The port the listener binds (presetup advertises it to the
@@ -208,6 +221,13 @@ pub struct PeerServer {
     /// registration (export-TTL scale in production; tests shrink it).
     park_budget: std::time::Duration,
     exports: DashMap<String, Arc<PeerExport>>,
+    /// Notified on every [`PeerServer::register`] so parked Hellos wake
+    /// the instant their export lands instead of poll-sleeping a
+    /// blocking thread (issue #226 (b)).
+    registered: Notify,
+    /// Bounds concurrently-parked unknown-export Hellos
+    /// ([`MAX_PARKED_HELLOS`]).
+    park_slots: Semaphore,
     /// `GetChunk` backing. `None` ⇒ `GetChunk` answers `Error` (the dest
     /// falls back to GCS) — hosts without chunk machinery can't be
     /// migration sources anyway.
@@ -231,6 +251,8 @@ impl PeerServer {
             port,
             park_budget,
             exports: DashMap::new(),
+            registered: Notify::new(),
+            park_slots: Semaphore::new(MAX_PARKED_HELLOS),
             cache,
             store,
         })
@@ -248,6 +270,11 @@ impl PeerServer {
     pub fn register(&self, export: PeerExport) {
         self.exports
             .insert(export.export_id.clone(), Arc::new(export));
+        // Wake every parked Hello so the one waiting on THIS export id
+        // resolves immediately (the others re-check and re-park). A
+        // sub-ms wakeup keeps the post-copy blackout honest — no 10 ms
+        // poll latency, no pinned thread (issue #226 (b)).
+        self.registered.notify_waiters();
     }
 
     /// Remove an export at commit/abort. Idempotent.
@@ -269,116 +296,220 @@ impl PeerServer {
 
     /// Serve connections off an already-bound listener (tests bind their
     /// own ephemeral port to dodge the pick-then-bind race).
+    ///
+    /// Each connection's `Hello` is read and its export resolved
+    /// ASYNCHRONOUSLY — an unknown-export Hello parks on a `tokio` task
+    /// (no blocking-pool thread; issue #226 (b)) until the export
+    /// registers or the park budget elapses. Only AFTER the export is
+    /// resolved do we hand off to `spawn_blocking` for the sync request
+    /// loop. All conn tasks live in a [`tokio::task::JoinSet`] owned by
+    /// this future, so dropping/aborting `serve_on` aborts every
+    /// in-flight handler — including parked waiters (shutdown
+    /// cancellation, per the issue's acceptance criteria).
     pub async fn serve_on(
         self: Arc<Self>,
         listener: tokio::net::TcpListener,
     ) -> std::io::Result<()> {
+        let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
+            // Reap finished handlers so the set doesn't grow unbounded.
+            while conns.try_join_next().is_some() {}
             let (stream, peer) = listener.accept().await?;
             let server = self.clone();
-            let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
-                let std_stream = match stream.into_std() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "peer conn into_std failed");
-                        return;
-                    }
-                };
-                // The codec is sync; undo tokio's nonblocking mode.
-                if let Err(e) = std_stream.set_nonblocking(false) {
-                    tracing::warn!(error = %e, "peer conn set_nonblocking failed");
-                    return;
-                }
-                let _ = std_stream.set_nodelay(true);
-                if let Err(e) = server.handle_conn(std_stream, handle) {
+            conns.spawn(async move {
+                if let Err(e) = server.handle_conn(stream, peer).await {
                     tracing::debug!(%peer, error = %e, "peer conn ended with error");
                 }
             });
         }
     }
 
-    /// One connection: Hello → HelloAck → Seal push → request loop.
-    fn handle_conn(
-        &self,
-        mut stream: std::net::TcpStream,
-        handle: tokio::runtime::Handle,
+    /// One connection: async Hello-read + export-resolve (parking
+    /// without a blocking thread), then the sync request loop on
+    /// `spawn_blocking`.
+    async fn handle_conn(
+        self: Arc<Self>,
+        mut stream: tokio::net::TcpStream,
+        peer: SocketAddr,
     ) -> std::io::Result<()> {
-        let hello: ToSource = read_frame(&mut stream)?;
-        let (export, purpose) = match hello {
-            ToSource::Hello {
-                version,
-                export_id,
-                token,
-                purpose,
-            } => {
-                if version != PROTO_VERSION {
-                    write_frame(
-                        &mut stream,
-                        &FromSource::Error {
-                            req_id: None,
-                            message: format!(
-                                "proto version mismatch: got {version}, want {PROTO_VERSION}"
-                            ),
-                        },
-                    )?;
-                    return Ok(());
-                }
-                // ADR 0045 C2: PARK an unknown export instead of
-                // rejecting — the destination handler is spawned (and
-                // dials) BEFORE the source pauses; its export appears
-                // only when the capture registers it. Poll-park up to
-                // the export-TTL scale; sub-ms wakeup once the seal
-                // lands keeps the blackout honest. Bounded + VPC-
-                // internal + one-migration-per-host (R8), so the
-                // parked-conn surface is tiny. (Found by prod-probing
-                // the Hello path: the reject made every first-attempt
-                // C2 move fail by construction.)
-                let park_budget = self.park_budget;
-                let parked_at = std::time::Instant::now();
-                let export = loop {
-                    if let Some(export) = self.get(&export_id) {
-                        break export;
-                    }
-                    if parked_at.elapsed() > park_budget {
-                        write_frame(
-                            &mut stream,
-                            &FromSource::Error {
-                                req_id: None,
-                                message: "unknown export (park budget exhausted)".into(),
-                            },
-                        )?;
-                        return Ok(());
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                };
-                // Hash-then-compare: constant-time without a new dep.
-                let got = Sha256::digest(token.as_bytes());
-                let want = Sha256::digest(export.token.as_bytes());
-                if got != want {
-                    write_frame(
-                        &mut stream,
-                        &FromSource::Error {
-                            req_id: None,
-                            message: "bad token".into(),
-                        },
-                    )?;
-                    return Ok(());
-                }
-                (export, purpose)
-            }
-            other => {
-                write_frame(
-                    &mut stream,
-                    &FromSource::Error {
-                        req_id: None,
-                        message: format!("expected Hello first, got {other:?}"),
-                    },
-                )?;
+        let _ = stream.set_nodelay(true);
+        // Read the Hello async so an unknown-export park holds no
+        // blocking-pool thread. Same wire framing as the sync codec.
+        let hello: ToSource = match read_frame_async(&mut stream).await {
+            Ok(h) => h,
+            // Dest hung up before/at Hello — nothing to serve.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let (export, purpose) = match self.resolve_export(&mut stream, hello).await? {
+            Some(resolved) => resolved,
+            // resolve_export already wrote the connection-fatal Error
+            // frame (version skew / bad token / unknown export / not a
+            // Hello / park-budget exhausted / parked-conn limit).
+            None => return Ok(()),
+        };
+
+        // Export resolved: the rest of the conversation is the sync
+        // codec on a blocking thread (symmetric with the dest client).
+        let std_stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%peer, error = %e, "peer conn into_std failed");
                 return Ok(());
             }
         };
+        // The codec is sync; undo tokio's nonblocking mode.
+        if let Err(e) = std_stream.set_nonblocking(false) {
+            tracing::warn!(%peer, error = %e, "peer conn set_nonblocking failed");
+            return Ok(());
+        }
+        let handle = tokio::runtime::Handle::current();
+        let server = Arc::clone(&self);
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = server.serve_resolved_conn(&std_stream, &export, purpose, &handle) {
+                tracing::debug!(%peer, error = %e, "peer conn request loop ended with error");
+            }
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("peer conn join: {e}")))
+    }
 
+    /// Validate the `Hello` and resolve its export — PARKING an unknown
+    /// export (ADR 0045 C2) on an async task, not a blocking thread
+    /// (issue #226 (b)). Returns `Some((export, purpose))` on success;
+    /// on any connection-fatal condition it writes the `Error` frame
+    /// and returns `None`.
+    ///
+    /// The destination handler is spawned (and dials) BEFORE the source
+    /// pauses; its export appears only when the capture registers it —
+    /// so the park is load-bearing (rejecting made every first-attempt
+    /// C2 move fail by construction; found prod-probing the Hello path).
+    async fn resolve_export(
+        &self,
+        stream: &mut tokio::net::TcpStream,
+        hello: ToSource,
+    ) -> std::io::Result<Option<(Arc<PeerExport>, engram_migrate_proto::ConnPurpose)>> {
+        let ToSource::Hello {
+            version,
+            export_id,
+            token,
+            purpose,
+        } = hello
+        else {
+            write_frame_async(
+                stream,
+                &FromSource::Error {
+                    req_id: None,
+                    message: format!("expected Hello first, got {hello:?}"),
+                },
+            )
+            .await?;
+            return Ok(None);
+        };
+        if version != PROTO_VERSION {
+            write_frame_async(
+                stream,
+                &FromSource::Error {
+                    req_id: None,
+                    message: format!("proto version mismatch: got {version}, want {PROTO_VERSION}"),
+                },
+            )
+            .await?;
+            return Ok(None);
+        }
+
+        let export = match self.park_for_export(&export_id).await {
+            Some(export) => export,
+            None => {
+                write_frame_async(
+                    stream,
+                    &FromSource::Error {
+                        req_id: None,
+                        message: "unknown export (park budget exhausted)".into(),
+                    },
+                )
+                .await?;
+                return Ok(None);
+            }
+        };
+        // Hash-then-compare: constant-time without a new dep.
+        let got = Sha256::digest(token.as_bytes());
+        let want = Sha256::digest(export.token.as_bytes());
+        if got != want {
+            write_frame_async(
+                stream,
+                &FromSource::Error {
+                    req_id: None,
+                    message: "bad token".into(),
+                },
+            )
+            .await?;
+            return Ok(None);
+        }
+        Ok(Some((export, purpose)))
+    }
+
+    /// Await the export's registration up to `park_budget`, holding only
+    /// an async task + a bounded park slot (NOT a blocking thread). The
+    /// `notify_waiters` subscription is taken BEFORE the `get` re-check
+    /// so a `register` racing between them can't be missed. Returns
+    /// `None` on park-budget exhaustion OR when the parked-conn limit is
+    /// saturated.
+    async fn park_for_export(&self, export_id: &str) -> Option<Arc<PeerExport>> {
+        // Fast path: already registered — no permit, no waiting.
+        if let Some(export) = self.get(export_id) {
+            return Some(export);
+        }
+        // Bound concurrently-parked Hellos. Beyond the cap, reject now
+        // rather than queue (a bogus-export retry storm can't pin the
+        // accept path or memory).
+        let _permit = match self.park_slots.try_acquire() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    export_id,
+                    limit = MAX_PARKED_HELLOS,
+                    "parked-Hello limit reached; rejecting"
+                );
+                return None;
+            }
+        };
+        let deadline = tokio::time::Instant::now() + self.park_budget;
+        loop {
+            // Register as a waiter BEFORE re-checking `get`, so a
+            // `register()` (which calls `notify_waiters`) landing between
+            // the check and the await can't be lost. `Notify::notified()`
+            // only enrolls on first poll; `enable()` enrolls eagerly,
+            // which is the documented lost-wakeup-safe pattern.
+            let woken = self.registered.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if let Some(export) = self.get(export_id) {
+                return Some(export);
+            }
+            match tokio::time::timeout_at(deadline, woken).await {
+                Ok(()) => {
+                    if let Some(export) = self.get(export_id) {
+                        return Some(export);
+                    }
+                    // Spurious wake for a different export id — re-park.
+                }
+                Err(_) => return None, // park budget exhausted
+            }
+        }
+    }
+
+    /// The sync side of a connection once its export is resolved:
+    /// HelloAck → Seal push → request loop. Runs on a `spawn_blocking`
+    /// thread with the proto's sync codec.
+    fn serve_resolved_conn(
+        &self,
+        stream: &std::net::TcpStream,
+        export: &Arc<PeerExport>,
+        purpose: engram_migrate_proto::ConnPurpose,
+        handle: &tokio::runtime::Handle,
+    ) -> std::io::Result<()> {
+        let mut stream = stream;
         write_frame(
             &mut stream,
             &FromSource::HelloAck {
@@ -409,7 +540,7 @@ impl PeerServer {
                     // Issue #216 Gap 2: stamp the shared TTL clock so an
                     // active TCP-only drain keeps the registry export alive.
                     export.touch();
-                    let resp = self.serve_need_at(&export, req_id, chunk_offset, purpose);
+                    let resp = self.serve_need_at(export, req_id, chunk_offset, purpose);
                     let t_write = std::time::Instant::now();
                     write_frame(&mut stream, &resp)?;
                     export
@@ -422,7 +553,7 @@ impl PeerServer {
                     // NeedAt) — a drain that falls back to GetChunk for
                     // every page must also count as activity.
                     export.touch();
-                    let resp = self.serve_get_chunk(&export, req_id, hash, &handle);
+                    let resp = self.serve_get_chunk(export, req_id, hash, handle);
                     write_frame(&mut stream, &resp)?;
                 }
                 ToSource::DrainDone {
@@ -598,6 +729,64 @@ impl PeerServer {
             },
         }
     }
+}
+
+/// Read one length-prefixed frame asynchronously — the SAME wire format
+/// as the proto's sync `read_frame` (4-byte big-endian length + bincode
+/// body, bounded by `MAX_FRAME_BYTES`). The page channel's codec is sync
+/// by design (the dest client must stay tokio-free), but the SOURCE
+/// reads only the opening `Hello` async so an unknown-export park can
+/// run on a tokio task instead of pinning a blocking-pool thread (issue
+/// #226 (b)); everything after the export resolves uses the sync codec.
+async fn read_frame_async<R, T>(r: &mut R) -> std::io::Result<T>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > engram_migrate_proto::MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "frame length {len} exceeds MAX_FRAME_BYTES ({})",
+                engram_migrate_proto::MAX_FRAME_BYTES
+            ),
+        ));
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    bincode::deserialize(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}")))
+}
+
+/// Write one length-prefixed frame asynchronously (mirror of
+/// [`read_frame_async`]). Used only for the connection-fatal `Error`
+/// replies on the async resolve path; the rest of the conversation is
+/// the sync codec.
+async fn write_frame_async<W, T>(w: &mut W, msg: &T) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
+    let body = bincode::serialize(msg).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bincode: {e}"))
+    })?;
+    if body.len() > engram_migrate_proto::MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "encoded frame {} exceeds MAX_FRAME_BYTES ({})",
+                body.len(),
+                engram_migrate_proto::MAX_FRAME_BYTES
+            ),
+        ));
+    }
+    w.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    w.write_all(&body).await?;
+    w.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -917,5 +1106,144 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// Helper: dial the server, send `Hello`, return the connected
+    /// stream WITHOUT reading the reply (so unknown-export dials stay
+    /// parked on the server). Caller keeps the stream alive.
+    fn dial_and_hello(addr: SocketAddr, export_id: &str, token: &str) -> std::net::TcpStream {
+        let mut s = std::net::TcpStream::connect(addr).expect("dial");
+        write_frame(&mut s, &hello(export_id, token)).expect("hello");
+        s.flush().unwrap();
+        s
+    }
+
+    /// Regression for issue #226 (b): a flood of parked unknown-export
+    /// Hellos must NOT pin blocking-pool threads, so a real export's
+    /// connection still completes its handshake promptly even when the
+    /// blocking pool is tiny. Pre-fix every parked Hello sat in a
+    /// `spawn_blocking` 10 ms poll-sleep loop, so with a single blocking
+    /// thread the known-export dial below would be starved for the full
+    /// park budget and the handshake would time out.
+    ///
+    /// Built on a runtime with `max_blocking_threads(1)`: the post-fix
+    /// park runs on async tasks (zero blocking threads), so the one
+    /// blocking thread stays free for the resolved conn's sync request
+    /// loop (`serve_resolved_conn`). Pre-fix, the 16 parked Hellos would
+    /// each grab a blocking thread and the server could never get one to
+    /// serve the real export — the handshake below would time out.
+    ///
+    /// NB: the client handshake runs on a DEDICATED OS thread, NOT the
+    /// tokio blocking pool, so it doesn't itself compete for the single
+    /// blocking thread the server needs (that would deadlock the test
+    /// regardless of the fix).
+    #[test]
+    fn parked_hellos_do_not_starve_blocking_pool() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Long park budget: pre-fix, parked conns would hold the lone
+            // blocking thread for this whole window.
+            let server = PeerServer::new_with_park_budget(
+                9102,
+                None,
+                None,
+                std::time::Duration::from_secs(30),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let serve = tokio::spawn(server.clone().serve_on(listener));
+
+            // Flood the parked-conn cap with unknown-export Hellos. They
+            // must all park WITHOUT consuming the (single) blocking
+            // thread.
+            let mut parked = Vec::new();
+            for i in 0..MAX_PARKED_HELLOS {
+                parked.push(dial_and_hello(addr, &format!("absent-{i}"), "t"));
+            }
+            // Give the server a moment to accept + park them all.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // Now register a real export and dial it on a dedicated OS
+            // thread. Its handshake must complete quickly — the blocking
+            // thread is free because the parked Hellos hold none.
+            server.register(test_export("t"));
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let client = std::thread::spawn(move || {
+                let mut s = dial_and_hello(addr, "exp-1", "t");
+                s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let ack: FromSource = read_frame(&mut s).expect("ack");
+                let seal: FromSource = read_frame(&mut s).expect("seal");
+                let _ = done_tx.send((ack, seal));
+            });
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+                .await
+                .expect("real export handshake starved by parked Hellos (#226 b)")
+                .expect("client thread dropped without sending");
+            assert!(
+                matches!(got.0, FromSource::HelloAck { .. }),
+                "expected HelloAck, got {:?}",
+                got.0
+            );
+            assert!(matches!(got.1, FromSource::Seal { .. }));
+            client.join().unwrap();
+
+            // Shutdown cancellation: aborting serve_on drops its JoinSet,
+            // which aborts every parked waiter promptly (no lingering
+            // tasks holding park slots).
+            serve.abort();
+            let _ = serve.await;
+            drop(parked);
+        });
+    }
+
+    /// Regression for issue #226 (b), the bound: beyond
+    /// `MAX_PARKED_HELLOS` concurrently-parked unknown-export Hellos, the
+    /// server rejects further dials immediately with the connection-fatal
+    /// `Error` frame rather than parking (and pinning) without limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parked_hello_limit_rejects_beyond_cap() {
+        // Park budget long enough that the first wave stays parked while
+        // we probe the cap.
+        let server =
+            PeerServer::new_with_park_budget(9102, None, None, std::time::Duration::from_secs(30));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = tokio::spawn(server.clone().serve_on(listener));
+
+        // Saturate the parked-conn cap.
+        let mut parked = Vec::new();
+        for i in 0..MAX_PARKED_HELLOS {
+            parked.push(dial_and_hello(addr, &format!("absent-{i}"), "t"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // One more parked dial must be rejected promptly with the
+        // unknown-export Error frame (it couldn't acquire a park slot).
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let mut s = dial_and_hello(addr, "absent-overflow", "t");
+                s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                read_frame::<_, FromSource>(&mut s).expect("error frame")
+            }),
+        )
+        .await
+        .expect("over-cap dial neither parked-forever nor rejected")
+        .unwrap();
+        assert!(
+            matches!(&got, FromSource::Error { req_id: None, message } if message.contains("unknown export")),
+            "over-cap dial must be rejected with the connection-fatal Error frame, got {got:?}"
+        );
+
+        serve.abort();
+        let _ = serve.await;
+        drop(parked);
     }
 }

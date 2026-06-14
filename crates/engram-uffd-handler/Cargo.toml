@@ -49,6 +49,10 @@ sendfd = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# `all` feature unlocks TcpKeepalive::with_interval/with_retries
+# (TCP_KEEPINTVL/TCP_KEEPCNT) on the page channel; with_time is
+# unconditional. See peer.rs `apply_peer_sockopts`.
+socket2 = { workspace = true, features = ["all"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
