@@ -54,6 +54,61 @@ fn nbd_state_none() -> NbdStateSlot {}
 /// save and load paths use the same fleet-tuned fan-out.
 const MEMORY_PREFETCH_CONCURRENCY: usize = 32;
 
+/// The cloneable post-phase result future stored per sandbox by
+/// `snapshot_begin` / `migration_finish_restore` and consumed by
+/// `snapshot_wait`.
+///
+/// ADR 0045 D5 originally stored a raw `JoinHandle` here and the
+/// `snapshot_wait` consumer removed the entry BEFORE awaiting it —
+/// so a single cancelled/timed-out wait (tonic drops the server-side
+/// handler future on a coordinator deadline or pod restart) lost the
+/// only reader, leaving a fully-uploaded snapshot permanently
+/// unretrievable and wedging eviction finalize (issue #221).
+///
+/// The fix: store a [`futures::future::Shared`] of the result so the
+/// wait is idempotent and retryable, and tolerant of two concurrent
+/// waiters (the coordinator's RPCs are at-least-once). The entry is
+/// removed only on *successful* consumption (or by supersession /
+/// destroy), not on a cancelled await. The spawned task's
+/// [`AbortHandle`](tokio::task::AbortHandle) rides alongside so
+/// supersession and destroy can still abort the backing upload.
+///
+/// `SnapshotMetadata` is `Clone` but `SandboxError` is not, so the
+/// error is wrapped in `Arc` to satisfy `Shared`'s `Clone` bound.
+type SharedSnapshotResult = futures::future::Shared<
+    futures::future::BoxFuture<'static, Result<SnapshotMetadata, Arc<SandboxError>>>,
+>;
+
+/// A retryable post-phase result plus the abort handle for its
+/// backing task. See [`SharedSnapshotResult`].
+struct SnapshotWait {
+    shared: SharedSnapshotResult,
+    abort: tokio::task::AbortHandle,
+}
+
+impl SnapshotWait {
+    /// Wrap a spawned post-phase `JoinHandle` into a cloneable,
+    /// retryable wait.
+    fn from_handle(
+        handle: tokio::task::JoinHandle<Result<SnapshotMetadata, SandboxError>>,
+    ) -> Self {
+        use futures::future::FutureExt as _;
+        let abort = handle.abort_handle();
+        let shared = (async move {
+            match handle.await {
+                Ok(Ok(meta)) => Ok(meta),
+                Ok(Err(e)) => Err(Arc::new(e)),
+                Err(join_err) => Err(Arc::new(SandboxError::Snapshot(format!(
+                    "snapshot upload task: {join_err}"
+                )))),
+            }
+        })
+        .boxed()
+        .shared();
+        Self { shared, abort }
+    }
+}
+
 /// Return the cached image's legacy `rootfs.ext4` path or a
 /// typed error when neither it nor a bundle is present.
 ///
@@ -513,10 +568,16 @@ pub struct PooledBackend {
     /// chain advances are not).
     capture_locks: Arc<DashMap<SandboxId, Arc<tokio::sync::Mutex<()>>>>,
     /// ADR 0045 D5: per-sandbox background upload tasks spawned by
-    /// `snapshot_begin`, awaited by `snapshot_wait`. Single-consumer:
-    /// the coordinator's finalize task is the only waiter.
-    snapshot_waits:
-        Arc<DashMap<SandboxId, tokio::task::JoinHandle<Result<SnapshotMetadata, SandboxError>>>>,
+    /// `snapshot_begin` / `migration_finish_restore`, awaited by
+    /// `snapshot_wait`.
+    ///
+    /// Issue #221: the result is stored as a cloneable, retryable
+    /// [`SharedSnapshotResult`] (not a raw `JoinHandle`). The
+    /// coordinator's finalize RPC is at-least-once — deadlines fire and
+    /// pods restart mid-call — so the wait must tolerate a cancelled
+    /// await and a retry, and two concurrent waiters. The entry is
+    /// removed only on successful consumption / supersession / destroy.
+    snapshot_waits: Arc<DashMap<SandboxId, SnapshotWait>>,
     /// ADR 0045 C1: open live-migration exports (frozen sandboxes
     /// serving a move). See `crate::migration`.
     migrations: Arc<crate::migration::MigrationRegistry>,
@@ -1972,8 +2033,11 @@ impl PooledBackend {
             );
             Ok(row_template)
         });
-        if let Some(prior) = self.snapshot_waits.insert(id, handle) {
-            prior.abort();
+        if let Some(prior) = self
+            .snapshot_waits
+            .insert(id, SnapshotWait::from_handle(handle))
+        {
+            prior.abort.abort();
         }
         Ok(())
     }
@@ -3927,25 +3991,62 @@ impl SandboxBackend for PooledBackend {
             let _capture_guard = capture_guard;
             finisher.finish(id, cap).await
         });
-        if let Some(prior) = self.snapshot_waits.insert(id, handle) {
+        if let Some(prior) = self
+            .snapshot_waits
+            .insert(id, SnapshotWait::from_handle(handle))
+        {
             // A prior begin whose wait never came (coordinator died).
-            // Don't await it (it may still be uploading) — just drop the
-            // handle; its artifacts are covered by the inflight tracking
-            // + abort-prior path on the next snapshot.
-            prior.abort();
+            // Don't await it (it may still be uploading) — just abort the
+            // backing task; its artifacts are covered by the inflight
+            // tracking + abort-prior path on the next snapshot.
+            prior.abort.abort();
             tracing::warn!(sandbox_id = %id, "snapshot_begin superseded an unconsumed prior wait");
         }
         Ok(snapshot_id)
     }
 
-    /// ADR 0045 D5: await the background post phase. Single-consumer.
+    /// ADR 0045 D5: await the background post phase.
+    ///
+    /// Issue #221: idempotent + retryable. We CLONE the stored shared
+    /// future and await the clone — we do NOT remove the map entry up
+    /// front. A coordinator's finalize RPC is at-least-once: a deadline
+    /// or pod restart drops the server-side handler future mid-await,
+    /// and a raw-`JoinHandle` map (the old shape) would lose the only
+    /// reader of a fully-uploaded snapshot and wedge finalize forever.
+    /// With the shared future, a retried wait re-resolves to the same
+    /// result, and two concurrent replicas both observe it. The entry
+    /// is removed only after a *successful* consumption; an error is
+    /// left in place so a retry can re-observe it (and supersession /
+    /// destroy do the cleanup on the failure path).
     async fn snapshot_wait(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        let (_, handle) = self.snapshot_waits.remove(&id).ok_or_else(|| {
-            SandboxError::Snapshot(format!("no snapshot_begin in flight for sandbox {id}"))
-        })?;
-        handle
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("snapshot upload task: {e}")))?
+        let shared = self
+            .snapshot_waits
+            .get(&id)
+            .map(|w| w.shared.clone())
+            .ok_or_else(|| {
+                SandboxError::Snapshot(format!("no snapshot_begin in flight for sandbox {id}"))
+            })?;
+        // Await the CLONE — if this future is dropped (cancelled wait),
+        // the entry and the underlying task are untouched, so a retry
+        // re-clones and re-awaits.
+        match shared.await {
+            Ok(meta) => {
+                // Consumed successfully — drop the slot so it doesn't
+                // leak. A concurrent waiter that already cloned the
+                // shared future still resolves from its own clone.
+                self.snapshot_waits.remove(&id);
+                Ok(meta)
+            }
+            // The post phase genuinely failed. Leave the entry in place
+            // so a retry re-observes the error rather than a misleading
+            // "no snapshot_begin in flight"; destroy / supersession
+            // reclaims the slot. Unwrap the shared `Arc<SandboxError>`
+            // back into an owned error for the caller.
+            Err(e) => Err(match Arc::try_unwrap(e) {
+                Ok(owned) => owned,
+                Err(shared_err) => SandboxError::Snapshot(format!("{shared_err}")),
+            }),
+        }
     }
 
     /// ADR 0045 C2: the pre-pause presetup. Mints the export identity
@@ -5169,6 +5270,16 @@ impl SandboxBackend for PooledBackend {
         // image), so there's nothing on disk to remove here.
         let _ = self.checkpoint_chains.remove(&id);
         let _ = self.capture_locks.remove(&id);
+        // Issue #221: reclaim any unconsumed `snapshot_wait` slot. The
+        // entry is now kept-until-consumed (so a cancelled coordinator
+        // wait can retry), which means the coordinator's give-up path —
+        // `abort_inflight_snapshot` + `destroy` — must clean it up here
+        // or it leaks for the lifetime of the host. Abort the backing
+        // upload task too (the sandbox is gone; the artifacts, if any,
+        // are covered by the durable checkpoint record).
+        if let Some((_, wait)) = self.snapshot_waits.remove(&id) {
+            wait.abort.abort();
+        }
         result
     }
 
@@ -7840,5 +7951,215 @@ mod tests {
         }
         // After the guard drops the shard is free again.
         assert!(matches!(map.try_get_mut(&id), TryResult::Present(_)));
+    }
+
+    // ---- Issue #221: snapshot_wait must be idempotent / retryable ----
+
+    /// Minimal in-process `PooledBackend` for the `snapshot_wait`
+    /// lifecycle tests — no chunk store / NBD wired (we drive
+    /// `snapshot_waits` directly, bypassing the Linux-gated capture
+    /// pipeline so the contract under test runs on every platform).
+    fn lifecycle_backend() -> PooledBackend {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        // keep `tmp` alive for the backend's lifetime
+        std::mem::forget(tmp);
+        PooledBackend::new(inner)
+    }
+
+    /// A `SnapshotMetadata` carrying a recognizable id for assertions.
+    fn fake_metadata() -> SnapshotMetadata {
+        SnapshotMetadata {
+            id: engram_core::types::SnapshotId::new(),
+            size_bytes: 4242,
+            created_at: chrono::Utc::now(),
+            image_version: "test-image:v1".into(),
+            disk_manifest: None,
+            memory_manifest: None,
+            base_memory_manifest: None,
+            migration_source: None,
+            source_sandbox_id: None,
+            state_blob_key: None,
+            sidecar_blob_key: None,
+            rootfs_blob_key: None,
+            working_set_blob_key: None,
+            aux_bundles: Vec::new(),
+        }
+    }
+
+    /// Stand-in for `snapshot_begin`'s producer: spawn a delayed
+    /// "upload" task and stash it as a retryable `SnapshotWait`, exactly
+    /// as the real producer sites do. `delay` models the tens-of-seconds
+    /// upload that outlives the coordinator's RPC deadline.
+    fn begin_delayed_upload(
+        pooled: &PooledBackend,
+        id: SandboxId,
+        meta: SnapshotMetadata,
+        delay: std::time::Duration,
+    ) {
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            Ok::<_, SandboxError>(meta)
+        });
+        pooled
+            .snapshot_waits
+            .insert(id, SnapshotWait::from_handle(handle));
+    }
+
+    /// THE regression for #221: a `snapshot_wait` whose await is dropped
+    /// (the coordinator's gRPC deadline fires / its pod restarts
+    /// mid-call) must NOT strip the result. A retry after the upload
+    /// completes must still return the metadata.
+    ///
+    /// Before the fix `snapshot_wait` removed the map entry up front, so
+    /// the dropped await orphaned the in-flight upload and the retry hit
+    /// the permanent "no snapshot_begin in flight" error.
+    #[tokio::test]
+    async fn snapshot_wait_survives_a_cancelled_wait_and_a_retry_returns_metadata() {
+        let pooled = lifecycle_backend();
+        let id = SandboxId::new();
+        let meta = fake_metadata();
+        let want = meta.id;
+        // Upload outlives the (very short) "deadline" below.
+        begin_delayed_upload(&pooled, id, meta, std::time::Duration::from_millis(150));
+
+        // First wait under a short timeout — simulates tonic dropping
+        // the server-side handler future. The future is dropped here.
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            pooled.snapshot_wait(id),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the first wait must time out (be cancelled)"
+        );
+
+        // The slot must still be present after the cancellation.
+        assert!(
+            pooled.snapshot_waits.contains_key(&id),
+            "cancelled wait must NOT remove the slot (issue #221 root cause)",
+        );
+
+        // Retry — the upload has since completed; we must get the
+        // metadata back, not "no snapshot_begin in flight".
+        let got = pooled
+            .snapshot_wait(id)
+            .await
+            .expect("retry after a cancelled wait must return the metadata");
+        assert_eq!(got.id, want);
+
+        // A successful consume reclaims the slot.
+        assert!(
+            !pooled.snapshot_waits.contains_key(&id),
+            "successful consumption must remove the slot",
+        );
+    }
+
+    /// At-least-once: two concurrent waiters (e.g. two coordinator
+    /// replicas) must both resolve to the same metadata.
+    #[tokio::test]
+    async fn snapshot_wait_two_concurrent_waiters_both_resolve() {
+        let pooled = Arc::new(lifecycle_backend());
+        let id = SandboxId::new();
+        let meta = fake_metadata();
+        let want = meta.id;
+        begin_delayed_upload(&pooled, id, meta, std::time::Duration::from_millis(30));
+
+        let a = {
+            let p = pooled.clone();
+            tokio::spawn(async move { p.snapshot_wait(id).await })
+        };
+        let b = {
+            let p = pooled.clone();
+            tokio::spawn(async move { p.snapshot_wait(id).await })
+        };
+        let (ra, rb) = tokio::join!(a, b);
+        assert_eq!(ra.unwrap().unwrap().id, want);
+        assert_eq!(rb.unwrap().unwrap().id, want);
+        assert!(
+            !pooled.snapshot_waits.contains_key(&id),
+            "slot reclaimed once consumed",
+        );
+    }
+
+    /// Lifecycle: a fresh `SnapshotWait` insert supersedes an
+    /// unconsumed prior and aborts its backing task (the existing
+    /// abort-prior contract preserved across the type change).
+    #[tokio::test]
+    async fn snapshot_wait_supersession_aborts_the_prior() {
+        let pooled = lifecycle_backend();
+        let id = SandboxId::new();
+
+        // A prior wait that would never finish on its own. We watch a
+        // sentinel future racing the long sleep so we can prove the
+        // abort actually fired (the abort is asynchronous — `abort()`
+        // signals, the runtime cancels on the next poll).
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let never = tokio::spawn(async move {
+            // tx drops (sending Err to rx) the instant this task is
+            // cancelled OR completes — but the 1h sleep means only
+            // cancellation can drop it within the test.
+            let _drop_signals_cancellation = tx;
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok::<_, SandboxError>(fake_metadata())
+        });
+        let prior = SnapshotWait::from_handle(never);
+        pooled.snapshot_waits.insert(id, prior);
+
+        // Supersede with a fast one (mirrors snapshot_begin's insert +
+        // abort-prior path).
+        let meta = fake_metadata();
+        let want = meta.id;
+        if let Some(p) = pooled.snapshot_waits.insert(
+            id,
+            SnapshotWait::from_handle(tokio::spawn(async move { Ok::<_, SandboxError>(meta) })),
+        ) {
+            p.abort.abort();
+        }
+        // The prior task is cancelled: its `tx` is dropped, so the rx
+        // resolves to a `RecvError` rather than hanging on the 1h sleep.
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        assert!(
+            matches!(cancelled, Ok(Err(_))),
+            "prior task must be aborted on supersession (got {cancelled:?})",
+        );
+
+        // The current (superseding) wait still resolves.
+        let got = pooled.snapshot_wait(id).await.unwrap();
+        assert_eq!(got.id, want);
+    }
+
+    /// Lifecycle: `destroy` reclaims an unconsumed slot (the
+    /// coordinator's give-up path) and aborts the backing upload — no
+    /// leak. Without the destroy cleanup the kept-until-consumed slot
+    /// would leak for the host's lifetime.
+    #[tokio::test]
+    async fn destroy_reclaims_unconsumed_snapshot_wait_slot() {
+        let pooled = lifecycle_backend();
+        let id = SandboxId::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let never = tokio::spawn(async move {
+            let _drop_signals_cancellation = tx;
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Ok::<_, SandboxError>(fake_metadata())
+        });
+        let wait = SnapshotWait::from_handle(never);
+        pooled.snapshot_waits.insert(id, wait);
+
+        // ProcessBackend has no such sandbox; destroy's inner result is
+        // irrelevant to the slot-cleanup contract under test.
+        let _ = pooled.destroy(id).await;
+
+        assert!(
+            !pooled.snapshot_waits.contains_key(&id),
+            "destroy must remove the snapshot_wait slot (issue #221 leak guard)",
+        );
+        // The backing upload task is cancelled by destroy.
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        assert!(
+            matches!(cancelled, Ok(Err(_))),
+            "destroy must abort the backing upload task (got {cancelled:?})",
+        );
     }
 }
