@@ -527,23 +527,38 @@ impl MetadataStore for PostgresStore {
         id: SessionId,
         target: Option<HostId>,
     ) -> Result<(), MetaError> {
-        sqlx::query("UPDATE sessions SET teleport_target_host_id = $2 WHERE id = $1")
-            .bind(id.as_uuid())
-            .bind(target.map(|h| h.as_uuid()))
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
+        // Issue #214: stamp `teleport_target_set_at` whenever a pin is
+        // set (NOW()), and clear it when the pin is cleared (Some→non-NULL,
+        // None→NULL), so the two columns are always consistent. The scanner
+        // ages out a stale pin off this timestamp.
+        sqlx::query(
+            "UPDATE sessions \
+             SET teleport_target_host_id = $2, \
+                 teleport_target_set_at = CASE WHEN $2 IS NULL THEN NULL ELSE NOW() END \
+             WHERE id = $1",
+        )
+        .bind(id.as_uuid())
+        .bind(target.map(|h| h.as_uuid()))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
-    async fn get_teleport_target(&self, id: SessionId) -> Result<Option<HostId>, MetaError> {
-        let row: Option<(Option<uuid::Uuid>,)> =
-            sqlx::query_as("SELECT teleport_target_host_id FROM sessions WHERE id = $1")
-                .bind(id.as_uuid())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
-        Ok(row.and_then(|(t,)| t).map(HostId))
+    async fn get_teleport_target(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<(HostId, Option<chrono::DateTime<chrono::Utc>>)>, MetaError> {
+        let row: Option<(Option<uuid::Uuid>, Option<chrono::DateTime<chrono::Utc>>)> =
+            sqlx::query_as(
+                "SELECT teleport_target_host_id, teleport_target_set_at \
+                 FROM sessions WHERE id = $1",
+            )
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|(t, set_at)| t.map(|u| (HostId(u), set_at))))
     }
 
     async fn insert_broker_token(

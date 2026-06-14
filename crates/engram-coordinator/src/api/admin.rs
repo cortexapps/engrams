@@ -633,7 +633,7 @@ pub async fn teleport_session(
         .set_teleport_target(session_id, Some(req.target_host_id))
         .await
         .map_err(|e| ApiError::Internal(format!("teleport: pin target: {e}")))?;
-    if let Err(e) = crate::idle_evictor::evict_session_to_state(
+    match crate::idle_evictor::evict_session_to_state(
         &state,
         session_id,
         sandbox_id,
@@ -641,12 +641,41 @@ pub async fn teleport_session(
     )
     .await
     {
-        let _ = state
-            .services
-            .meta
-            .set_teleport_target(session_id, None)
-            .await;
-        return Err(ApiError::Internal(format!("teleport pipeline: {e}")));
+        Ok(crate::idle_evictor::EvictOutcome::Evacuated) => {}
+        // Issue #214: the pipeline no-op'd (a guard fired — a concurrent
+        // idle-eviction held the lease, the session was no longer
+        // evictable, or the sandbox was already unbound). The session is
+        // NOT entering Evacuating, so no evac-resumer pass will ever
+        // consume the pin we just set. Returning 202 here would leak that
+        // pin: it would survive indefinitely and strictly hijack the
+        // session's NEXT (unrelated) evacuation onto `req.target_host_id`,
+        // possibly full/draining/gone by then. Remove the pin and tell the
+        // operator the move didn't start (409, retryable) — don't pretend.
+        Ok(crate::idle_evictor::EvictOutcome::Skipped { reason }) => {
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
+            tracing::warn!(
+                %session_id,
+                %sandbox_id,
+                target_host = %req.target_host_id,
+                reason,
+                "admin teleport: eviction pipeline skipped; pin removed, returning 409",
+            );
+            return Err(ApiError::Conflict(format!(
+                "teleport did not start: {reason}",
+            )));
+        }
+        Err(e) => {
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
+            return Err(ApiError::Internal(format!("teleport pipeline: {e}")));
+        }
     }
 
     tracing::info!(
@@ -1053,7 +1082,13 @@ pub async fn drain_host(
                     engram_core::types::SessionState::Evacuating,
                 )
                 .await;
-                (sid, outcome.map_err(|e| e.to_string()))
+                // A `Skipped` here (a concurrent eviction won the lease, the
+                // session was already relocated, etc.) is not a drain failure:
+                // the session is being / has been moved off this host by the
+                // other actor. Drain doesn't pin a destination, so unlike
+                // teleport (issue #214) there is no stale pin to unwind — fold
+                // both Ok arms to success. Errors still surface as failures.
+                (sid, outcome.map(|_| ()).map_err(|e| e.to_string()))
             });
         }
 

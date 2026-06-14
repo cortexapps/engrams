@@ -32,6 +32,31 @@ use engram_core::{SandboxId, SessionId};
 
 use crate::state::{SessionEvent, SharedState};
 
+/// Tri-state result of [`evict_session_to_state`] / [`evict_idle_session`].
+///
+/// Issue #214: the pipeline has three legitimate "no-op" arms that
+/// return without evacuating (lease already held, K5 status guard,
+/// registry guard). Before this enum they all collapsed to `Ok(())`,
+/// indistinguishable from a genuine evacuation. The `teleport_session`
+/// handler pinned the destination on the session row, ran the pipeline,
+/// and returned 202 "evacuating" on any `Ok(())` — so a skip left the
+/// pin set while the session NEVER entered `Evacuating`. No evac-resumer
+/// pass consumed the pin; it then strictly hijacked the session's *next*
+/// (unrelated) evacuation onto a possibly-full/gone host.
+///
+/// Returning the outcome lets callers distinguish the two: teleport
+/// removes the pin and returns 409 Conflict on `Skipped`, instead of
+/// pretending the move is in flight.
+#[derive(Debug, Clone)]
+pub enum EvictOutcome {
+    /// The pipeline ran: the session was (or is being, for the D5
+    /// background-finalize fast path) suspended to the target state.
+    Evacuated,
+    /// A re-entry / liveness guard fired; the session was NOT evacuated
+    /// by this call. The reason is operator-facing (surfaced in a 409).
+    Skipped { reason: &'static str },
+}
+
 /// Run the suspend pipeline for one sandbox. Pure function over
 /// `SharedState`; the loop above is just the driver. Multi-host
 /// production refactors the driver onto each host-agent and keeps
@@ -45,7 +70,7 @@ pub async fn evict_idle_session(
     state: &SharedState,
     session_id: SessionId,
     sandbox_id: SandboxId,
-) -> Result<(), EvictError> {
+) -> Result<EvictOutcome, EvictError> {
     evict_session_to_state(state, session_id, sandbox_id, SessionState::Idle).await
 }
 
@@ -72,7 +97,7 @@ pub async fn evict_session_to_state(
     session_id: SessionId,
     sandbox_id: SandboxId,
     target_state: SessionState,
-) -> Result<(), EvictError> {
+) -> Result<EvictOutcome, EvictError> {
     // The pipeline only knows about Idle and Evacuating as legal
     // targets. Both share the "Active → captured-snapshot → suspended"
     // semantic; any other target would skip half the steps and break
@@ -100,7 +125,9 @@ pub async fn evict_session_to_state(
                 sandbox_id = %sandbox_id,
                 "idle eviction skipped: pipeline already in flight (session_lease row held)",
             );
-            return Ok(());
+            return Ok(EvictOutcome::Skipped {
+                reason: "eviction pipeline already in flight (session lease held)",
+            });
         }
         Err(e) => {
             // Lease store unavailable. Honest failure mode: bail out
@@ -131,7 +158,9 @@ pub async fn evict_session_to_state(
                 state = s.status.as_str(),
                 "evict skipped: session no longer evictable (a concurrent eviction won the lease first)",
             );
-            return Ok(());
+            return Ok(EvictOutcome::Skipped {
+                reason: "session no longer evictable (a concurrent eviction won the lease first)",
+            });
         }
         Ok(_) => {}
         Err(e) => {
@@ -164,7 +193,9 @@ pub async fn evict_session_to_state(
             sandbox_id = %sandbox_id,
             "idle eviction skipped: sandbox no longer bound",
         );
-        return Ok(());
+        return Ok(EvictOutcome::Skipped {
+            reason: "sandbox no longer bound (already evicted or relocated)",
+        });
     }
 
     // Step 1: take a snapshot. ADR 0007 Phase 6: backend owns its
@@ -193,14 +224,9 @@ pub async fn evict_session_to_state(
     if target_state == SessionState::Idle {
         match state.services.host.snapshot_begin(sandbox_id).await {
             Ok(snapshot_id) => {
-                return finish_eviction_background(
-                    state,
-                    session_id,
-                    sandbox_id,
-                    snapshot_id,
-                    _guard,
-                )
-                .await;
+                finish_eviction_background(state, session_id, sandbox_id, snapshot_id, _guard)
+                    .await?;
+                return Ok(EvictOutcome::Evacuated);
             }
             Err(engram_core::SandboxError::InvalidSpec(reason)) => {
                 tracing::debug!(
@@ -399,7 +425,7 @@ pub async fn evict_session_to_state(
         "idle eviction pipeline completed",
     );
 
-    Ok(())
+    Ok(EvictOutcome::Evacuated)
 }
 
 /// ADR 0045 D5: the fast-path tail of an idle eviction. The capture has
@@ -2648,6 +2674,224 @@ mod tests {
         // Session stays Active (no eviction happened).
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Active);
+    }
+
+    /// Issue #214: a `Skipped` outcome from `evict_session_to_state` must
+    /// be distinguishable from a real evacuation. Here a peer's session
+    /// lease is pre-held, so the lease guard fires the first skip arm.
+    #[tokio::test]
+    async fn evict_session_to_state_reports_skipped_when_lease_held() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:skip".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let state = build_state_with_session(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // A peer pod holds the lease → the pipeline must report Skipped,
+        // not Evacuated.
+        state
+            .services
+            .meta
+            .try_acquire_session_lease(session_id, Some(sandbox_id), "peer-pod")
+            .await
+            .unwrap();
+
+        let outcome =
+            evict_session_to_state(&state, session_id, sandbox_id, SessionState::Evacuating)
+                .await
+                .expect("a guarded skip is not an error");
+        assert!(
+            matches!(outcome, EvictOutcome::Skipped { .. }),
+            "lease-held pipeline must report Skipped, got {outcome:?}",
+        );
+        // The session was untouched.
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.status, SessionState::Active);
+    }
+
+    /// Issue #214 acceptance (the core regression): a teleport whose
+    /// eviction pipeline no-ops (here: a concurrent idle-eviction holds
+    /// the session lease) must return 409 Conflict AND leave the teleport
+    /// pin empty — never 202 with a leaked pin that hijacks the session's
+    /// next evacuation. Before the fix the handler returned 202 and the
+    /// pin survived.
+    #[tokio::test]
+    async fn teleport_skip_returns_conflict_and_clears_pin() {
+        use crate::api::admin::{teleport_session, TeleportSessionRequest};
+        use axum::extract::{Path, State};
+        use axum::Json;
+
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:teleport".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // Register a schedulable teleport target in BOTH the registry
+        // (so pick_specific_host's backend_for resolves) and MiniMeta's
+        // host rows (so it's seen as Ready). The session's host_id is
+        // None, so the target is never excluded as "the source".
+        let target = engram_core::HostId::new();
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(
+            sandbox_root.path().join("target-sandboxes"),
+        ));
+        state.host_registry.register(
+            target,
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(backend)),
+        );
+        meta.add_ready_host(target);
+
+        // A peer pod holds the session lease → the eviction pipeline will
+        // hit its lease-guard skip arm.
+        state
+            .services
+            .meta
+            .try_acquire_session_lease(session_id, Some(sandbox_id), "concurrent-idle-evict")
+            .await
+            .unwrap();
+
+        let result = teleport_session(
+            State(state.clone()),
+            Path(session_id),
+            Json(TeleportSessionRequest {
+                target_host_id: target,
+            }),
+        )
+        .await;
+        match result {
+            Err(crate::error::ApiError::Conflict(_)) => {}
+            Ok((status, _)) => {
+                panic!("a no-op'd teleport must NOT succeed; got status {status}")
+            }
+            Err(other) => panic!("expected 409 Conflict, got {other:?}"),
+        }
+
+        // The crux of #214: the pin must be empty — otherwise it leaks and
+        // strictly hijacks the session's next evacuation.
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_teleport_target(session_id)
+                .await
+                .unwrap(),
+            None,
+            "a no-op'd teleport must leave teleport_target empty (no leaked pin)",
+        );
+        // Session untouched (still Active, lease guard short-circuited).
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(after.status, SessionState::Active);
+    }
+
+    /// Issue #214 acceptance (happy path unchanged): a teleport whose
+    /// pipeline actually evacuates returns 202 and marks the session
+    /// Evacuating with the pin SET — the pin is the scanner's required
+    /// placement, consumed exactly once when the evac-resumer resolves the
+    /// session (not by the handler). This is the inverse of the skip case
+    /// and guards against the fix over-eagerly clearing a live pin.
+    #[tokio::test]
+    async fn teleport_success_keeps_pin_for_the_scanner() {
+        use crate::api::admin::{teleport_session, TeleportSessionRequest};
+        use axum::extract::{Path, State};
+        use axum::Json;
+
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:teleport-ok".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let target = engram_core::HostId::new();
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ProcessBackend::new(
+            sandbox_root.path().join("target-sandboxes"),
+        ));
+        state.host_registry.register(
+            target,
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(backend)),
+        );
+        meta.add_ready_host(target);
+
+        // No lease held → the pipeline runs to completion (Active →
+        // Evacuating).
+        let (status, _body) = teleport_session(
+            State(state.clone()),
+            Path(session_id),
+            Json(TeleportSessionRequest {
+                target_host_id: target,
+            }),
+        )
+        .await
+        .expect("a real teleport must return 202");
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Evacuating,
+            "a successful teleport marks the session Evacuating",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_teleport_target(session_id)
+                .await
+                .unwrap()
+                .map(|(h, _)| h),
+            Some(target),
+            "a live teleport pin must persist for the evac scanner to consume",
+        );
     }
 
     // ─── ADR 0034: eviction scanner tests ─────────────────────────

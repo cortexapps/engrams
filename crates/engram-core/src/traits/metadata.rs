@@ -215,7 +215,10 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0047 (was `state.teleport_targets`): pin / clear the
     /// operator-chosen teleport destination on the session row. The
     /// evac scanner — on ANY replica — honors the pin as its required
-    /// placement. Default impls (mocks): no-op / no pin.
+    /// placement. Setting a pin stamps `teleport_target_set_at = NOW()`
+    /// (issue #214) so the scanner can age out a stale leaked pin;
+    /// clearing (`None`) clears the stamp too. Default impls (mocks):
+    /// no-op / no pin.
     async fn set_teleport_target(
         &self,
         _id: SessionId,
@@ -223,7 +226,16 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn get_teleport_target(&self, _id: SessionId) -> Result<Option<HostId>, MetaError> {
+    /// Read the operator-pinned teleport destination and the instant it
+    /// was set, if any. Issue #214: the `set_at` lets the evac scanner
+    /// ignore + clear a pin older than a TTL — degrading any future pin
+    /// leak to default placement instead of a strict hijack. A `None`
+    /// timestamp (pin set before the 0065 migration) is treated as
+    /// not-aged by the scanner. Default impls (mocks): no pin.
+    async fn get_teleport_target(
+        &self,
+        _id: SessionId,
+    ) -> Result<Option<(HostId, Option<chrono::DateTime<chrono::Utc>>)>, MetaError> {
         Ok(None)
     }
 
