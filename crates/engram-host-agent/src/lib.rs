@@ -46,6 +46,7 @@ pub mod pooled_backend;
 pub mod proxy_shell;
 pub mod resource;
 pub mod snapshot;
+pub mod teardown_reconcile;
 pub mod trace_scope;
 pub mod util;
 
@@ -375,6 +376,89 @@ impl HostAgent {
                     }
                 });
             }
+
+            // ADR 0050 E: host-local teardown reconcile. The coordinator
+            // drives every destroy as a best-effort RPC; when that RPC
+            // fails (transient gRPC) the FC leaks, and nothing reaps it
+            // (ADR 0009 reconcile only sweeps session→sandbox-missing).
+            // This generalizes the migration source-ownership rule
+            // (ADR 0045 C1) to ALL sandboxes: each tick, for every
+            // non-migration sandbox, ask the coord whether its session
+            // still owns it; once the answer has been "no" for
+            // ORPHAN_STRIKES consecutive ticks (debounce vs an in-flight
+            // create's not-yet-published binding + a transient coord
+            // outage), destroy it LOCALLY — a destroy that can't be
+            // defeated by the same coord→host gRPC flakiness that leaked
+            // it. `sandbox_ownership` reads `sessions.sandbox_id` (PG,
+            // ADR 0047's sole authority), so a terminal/idle/rebound
+            // session reliably answers "not owned".
+            {
+                let pooled_for_reap = pooled.clone();
+                let coord_for_reap = coord_client::CoordClient::new(
+                    coord_url.clone(),
+                    self.cfg.coordinator_token.clone(),
+                );
+                let host_id_for_reap = host_id;
+                tokio::spawn(async move {
+                    use crate::teardown_reconcile::{
+                        orphan_strike, ORPHAN_STRIKES, RECONCILE_INTERVAL,
+                    };
+                    use engram_core::traits::sandbox::SandboxBackend as _;
+                    let mut strikes: std::collections::HashMap<SandboxId, u32> =
+                        std::collections::HashMap::new();
+                    let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let sandboxes = match pooled_for_reap.list().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(error = %e,
+                                    "teardown reconcile: list() failed; skipping tick");
+                                continue;
+                            }
+                        };
+                        let live: std::collections::HashSet<SandboxId> =
+                            sandboxes.iter().copied().collect();
+                        strikes.retain(|id, _| live.contains(id));
+                        for sandbox_id in sandboxes {
+                            // Migration sandboxes run their own ownership rules.
+                            if pooled_for_reap.migration_role(sandbox_id).is_some() {
+                                strikes.remove(&sandbox_id);
+                                continue;
+                            }
+                            let session = pooled_for_reap.session_for_sandbox(sandbox_id);
+                            let orphan = match session {
+                                Some(sid) => match coord_for_reap
+                                    .sandbox_ownership(host_id_for_reap, sid, sandbox_id)
+                                    .await
+                                {
+                                    Ok(owned) => !owned,
+                                    // Coord unreachable → assume still owned; never
+                                    // reap on a transient control-plane blip.
+                                    Err(_) => false,
+                                },
+                                // No session binding. Past the debounce this is an
+                                // unreclaimable orphan; a fresh create publishes its
+                                // binding within a tick, so the strike count protects
+                                // it.
+                                None => true,
+                            };
+                            if orphan_strike(&mut strikes, sandbox_id, orphan, ORPHAN_STRIKES) {
+                                tracing::warn!(%sandbox_id, ?session,
+                                    "teardown reconcile: sandbox no longer owned by its session; destroying locally");
+                                if let Err(e) = pooled_for_reap.destroy(sandbox_id).await {
+                                    tracing::warn!(%sandbox_id, error = %e,
+                                        "teardown reconcile: local destroy failed; retrying next tick");
+                                } else {
+                                    strikes.remove(&sandbox_id);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
             // ADR 0045 C2: re-arm post-copy fences for sandboxes that
             // were mid-move across the host-agent restart. A DEST mid-
             // drain is reaped immediately (its drain state died with
@@ -829,6 +913,50 @@ impl HostAgent {
                     current_bundles.clone(),
                 )
             });
+
+            // ADR 0050 D: gRPC readiness gate. Heartbeating is what makes
+            // this host schedulable + routable, so don't start until our
+            // own gRPC server is actually accepting connections — else the
+            // coord can register us and dispatch a restore/exec before the
+            // server is up, which the lazy-dialing pool surfaces as a
+            // transient `Unavailable` (the load test's fresh-host 500s and
+            // truncated streams). A successful TCP connect to the listen
+            // port proves the listener is bound + backlogging.
+            if let Some(addr) = self.cfg.grpc_listen_addr {
+                let probe_addr = if addr.ip().is_unspecified() {
+                    match addr.ip() {
+                        std::net::IpAddr::V4(_) => std::net::SocketAddr::new(
+                            std::net::Ipv4Addr::LOCALHOST.into(),
+                            addr.port(),
+                        ),
+                        std::net::IpAddr::V6(_) => std::net::SocketAddr::new(
+                            std::net::Ipv6Addr::LOCALHOST.into(),
+                            addr.port(),
+                        ),
+                    }
+                } else {
+                    addr
+                };
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    match tokio::net::TcpStream::connect(probe_addr).await {
+                        Ok(_) => {
+                            tracing::info!(%addr,
+                                "gRPC server accepting; host ready to heartbeat");
+                            break;
+                        }
+                        Err(_) if tokio::time::Instant::now() < deadline => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            tracing::error!(%addr, error = %e,
+                                "gRPC server still not accepting after 30s; \
+                                 heartbeating anyway to avoid stranding the host");
+                            break;
+                        }
+                    }
+                }
+            }
 
             // ADR 0013: HTTP heartbeat loop. Posts
             // {capacity, local_snapshots, running_sandboxes,
