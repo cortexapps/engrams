@@ -1921,8 +1921,22 @@ impl MetadataStore for PostgresStore {
         let current_bundles = serde_json::to_value(&hb.current_bundles)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let n = sqlx::query(
+            // Issue #230: `dead` is terminal w.r.t. heartbeats — see
+            // `HostStatus::can_transition_to`. The dead-host sweep
+            // (`mark_host_dead_and_orphan_sessions`) marks a partitioned
+            // host `dead` and UNBINDS its sessions (host_id/sandbox_id
+            // NULLed). Without this guard the host's very next heartbeat
+            // blindly wrote `status = $2` (ready/draining from the agent's
+            // self-report), resurrecting the row to schedulable while its
+            // former sessions sit unbound — a zombie host taking new
+            // placements. The CASE pins `dead` so a `dead` row returns to
+            // `ready` ONLY via an explicit re-register (`upsert_host`,
+            // which conflicts on `(id)` and sets `status = EXCLUDED.status`
+            // = ready). `ready`↔`draining` stay heartbeat-overridable:
+            // `draining` is the agent's own preStop flag and a host that
+            // finished/aborted its drain legitimately reports ready again.
             r#"UPDATE hosts
-                  SET status = $2,
+                  SET status = CASE WHEN status = 'dead' THEN 'dead' ELSE $2 END,
                       capacity_total_mib = $3,
                       capacity_used_mib = $4,
                       running_sandboxes_count = $5,
