@@ -193,6 +193,12 @@ pub async fn exec(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_status = None;
+    // ADR 0050 B: a clean exec ends with an `Exit` event. If the stream
+    // ends WITHOUT one, the host connection dropped mid-exec — we have a
+    // truncated stdout, not a completed command. Track this so we 502
+    // instead of returning a 200 with partial output (which the caller
+    // would read as a successful-but-empty run).
+    let mut saw_exit = false;
     while let Some(ev) = events.next().await {
         match ev {
             ExecEvent::Stdout(b) => {
@@ -223,6 +229,7 @@ pub async fn exec(
             }
             ExecEvent::Exit(code) => {
                 exit_status = code;
+                saw_exit = true;
                 break;
             }
         }
@@ -232,6 +239,33 @@ pub async fn exec(
         wall_ms: started_at.elapsed().as_millis() as u64,
         ..ExecRusage::default()
     };
+
+    // ADR 0050 B: stream ended without an `Exit` — the host connection
+    // dropped mid-exec. Surface it as a truncated-stream error rather
+    // than a 200 with whatever partial stdout arrived. The command's
+    // side effects (if any) are indeterminate; the caller decides
+    // whether to retry (exec is not assumed idempotent).
+    if !saw_exit {
+        state
+            .emit(
+                id,
+                SessionEvent::ExecCompleted {
+                    exec_id: exec_id.clone(),
+                    exit_status: None,
+                    rusage,
+                    at: Utc::now(),
+                },
+            )
+            .await?;
+        return Err(ApiError::BadGateway(format!(
+            "exec stream truncated after {} bytes stdout / {} bytes stderr — \
+             the host connection dropped before the command's exit status; \
+             the command may or may not have completed",
+            stdout.len(),
+            stderr.len(),
+        )));
+    }
+
     state
         .emit(
             id,

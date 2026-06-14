@@ -42,6 +42,13 @@ pub enum ApiError {
     /// 429 — a per-session rate/quota limit was hit. ADR 0026: an
     /// artifact upload over the session's count/total-bytes quota.
     TooManyRequests(String),
+    /// 502 — an upstream (a host-agent over gRPC) returned an
+    /// unusable response. ADR 0050 B: an exec stream that ended
+    /// without an `Exit` event — the host connection dropped mid-exec,
+    /// so the partial stdout is NOT a completed command. Distinct from
+    /// `Unavailable` (503, "couldn't reach it, retry") and `Internal`
+    /// (the coord itself is broken).
+    BadGateway(String),
     Internal(String),
 }
 
@@ -64,6 +71,7 @@ impl ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -81,6 +89,7 @@ impl ApiError {
             Self::Forbidden(_) => "forbidden",
             Self::PayloadTooLarge(_) => "payload_too_large",
             Self::TooManyRequests(_) => "too_many_requests",
+            Self::BadGateway(_) => "bad_gateway",
             Self::Internal(_) => "internal",
         }
     }
@@ -98,6 +107,7 @@ impl ApiError {
             | Self::Forbidden(m)
             | Self::PayloadTooLarge(m)
             | Self::TooManyRequests(m)
+            | Self::BadGateway(m)
             | Self::Internal(m) => m,
         }
     }
@@ -151,6 +161,11 @@ impl From<SandboxError> for ApiError {
                  Resume from a snapshot or fork the session."
                     .into(),
             ),
+            // ADR 0050 C: transient — the host couldn't be reached but
+            // isn't gone. Retryable (503), not a 500.
+            SandboxError::Unavailable(msg) => Self::Unavailable(format!(
+                "host temporarily unavailable: {msg}. Retry shortly."
+            )),
             other => Self::Internal(other.to_string()),
         }
     }
@@ -232,5 +247,23 @@ mod tests {
             let api: ApiError = e.into();
             assert_eq!(api.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
+    }
+
+    #[test]
+    fn sandbox_unavailable_maps_to_retryable_503() {
+        // ADR 0050 C: a transient host-unreachable must be a retryable
+        // 503, NOT a 500 (which the client treats as a hard failure).
+        let api: ApiError = SandboxError::Unavailable("tcp connect error".into()).into();
+        assert_eq!(api.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api.slug(), "unavailable");
+    }
+
+    #[test]
+    fn bad_gateway_maps_to_502() {
+        // ADR 0050 B: a truncated exec stream is a 502 (the upstream host
+        // gave an unusable response), distinct from 503 (couldn't reach it).
+        let api = ApiError::BadGateway("exec stream truncated".into());
+        assert_eq!(api.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(api.slug(), "bad_gateway");
     }
 }

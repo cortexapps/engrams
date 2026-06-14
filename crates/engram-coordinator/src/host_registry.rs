@@ -525,8 +525,30 @@ impl HostClient for HostRegistry {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        let (_, backend) = self.resolve_owner(id).await?;
-        backend.exec_stream(id, cmd).await
+        // ADR 0050 C: the gRPC pool dials lazily and defers per-RPC
+        // retry to the call site. A freshly-scaled host's first call
+        // can come back `Unavailable` (connect not yet established);
+        // retry a bounded number of times, re-resolving the owner each
+        // attempt (the binding may have moved), before surfacing the
+        // transient error as a retryable 503. Only the stream-ESTABLISH
+        // call is retried here; a mid-stream drop surfaces downstream as
+        // a truncated-stream 502 (ADR 0050 B) — exec is not idempotent.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (_, backend) = self.resolve_owner(id).await?;
+            match backend.exec_stream(id, cmd.clone()).await {
+                Err(SandboxError::Unavailable(msg)) if attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(
+                        sandbox_id = %id, attempt, error = %msg,
+                        "exec_stream transient Unavailable; retrying",
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                other => return other,
+            }
+        }
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
@@ -608,8 +630,31 @@ impl HostClient for HostRegistry {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(id).await?;
-        let result = backend.destroy(id).await;
+        // ADR 0050 E: retry transient `Unavailable` so a gRPC blip during
+        // teardown doesn't leak the FC on the happy path (the host-local
+        // teardown reconcile is the floor, but retrying here destroys it
+        // immediately when the host is reachable). Re-resolve the owner
+        // each attempt; a `HostLost` resolve means the host — and its FC —
+        // are already gone, so there's nothing to retry.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0;
+        let result = loop {
+            attempt += 1;
+            let backend = match self.resolve_owner(id).await {
+                Ok((_, b)) => b,
+                Err(e) => break Err(e),
+            };
+            match backend.destroy(id).await {
+                Err(SandboxError::Unavailable(msg)) if attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(
+                        sandbox_id = %id, attempt, error = %msg,
+                        "destroy transient Unavailable; retrying",
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                other => break other,
+            }
+        };
         // Drop the ownership row regardless — even if destroy errors,
         // the id is no longer routable to anything sensible. A future
         // call against the same id will fail with NotFound, which is

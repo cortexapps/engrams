@@ -1257,9 +1257,36 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
         // coordinator's "unsupported -> composed snapshot()" fallback
         // fires uniformly for old binaries and non-FC backends alike.
         Code::Unimplemented => SandboxError::InvalidSpec(status.message().to_string()),
-        // Unavailable = host disconnected mid-call / channel evicted.
-        // Surfacing as `Vm` rather than a dedicated variant matches
-        // the WS path's `ConnectionError::Closed` mapping.
+        // ADR 0050 C: Unavailable = lazy connect failed / host
+        // disconnected mid-call / channel evicted — TRANSIENT. Map to
+        // the retryable `Unavailable` variant so the exec/destroy call
+        // sites can retry (the pool defers per-RPC retry to them), and
+        // the API surfaces a 503, not a 500.
+        Code::Unavailable => SandboxError::Unavailable(status.message().to_string()),
         _ => SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into()),
+    }
+}
+
+#[cfg(test)]
+mod grpc_err_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_maps_to_retryable_variant_not_vm() {
+        // ADR 0050 C: tonic `Unavailable` (lazy connect failed / channel
+        // evicted) must surface as the retryable `Unavailable` variant so
+        // the exec/destroy call sites retry it — NOT collapse into `Vm`
+        // (a real VM error the caller would 500 on).
+        let err = grpc_to_sandbox_err(tonic::Status::unavailable("tcp connect error"));
+        match err {
+            SandboxError::Unavailable(msg) => assert!(msg.contains("tcp connect error")),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_vm_error_still_maps_to_vm() {
+        let err = grpc_to_sandbox_err(tonic::Status::internal("firecracker panicked"));
+        assert!(matches!(err, SandboxError::Vm(_)));
     }
 }
