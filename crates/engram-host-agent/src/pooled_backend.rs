@@ -840,35 +840,77 @@ impl PooledBackend {
         }
         // ADR 0035 §3: fresh creates swap aux bundles to the host's
         // current generation inside the backend; resumes keep the pin.
+        //
+        // Issue #223 — CANCELLATION SAFETY. On the NBD-attach path the
+        // sidecar was already patched to `/dev/nbdN` (above, in
+        // `prepare_resume_nbd_attach`), so the FC `inner.restore`/`restore_fresh`
+        // below boots reading that device. The `NbdSandboxState` (daemon +
+        // slot lease) only enters `nbd_sandboxes` AFTER the restore returns.
+        // If the gRPC handler future is dropped (client deadline, coordinator
+        // pod restart) in the window between the restore and the insert, the
+        // local `pending_nbd_state` drops mid-flight UNDER THE LIVE FC:
+        // `NbdHandle::Drop` netlink-disconnects the device the just-restored
+        // guest is reading (guest parks under `dead_conn_timeout`, VM orphaned
+        // — its id never delivered to anyone), and `NbdSlot::Drop` returns the
+        // path to the pool. The disconnect clears the busy probe, so a
+        // different session's `create` can CONNECT its own backend onto the
+        // device the orphan FC still holds open → cross-session disk I/O
+        // (prod canaries 5fa742b7/4391e591). `orphan_reap` is eventual and can
+        // lose the race.
+        //
+        // Fix (mirrors the coordinator detach in #210 / the FC `ResumeOnDrop`
+        // family): run the restore + the map insert inside a `tokio::spawn`ed
+        // task that MOVES `pending_nbd_state` into itself, so the state always
+        // lands in `nbd_sandboxes` regardless of the request's fate — then
+        // normal `destroy()` teardown owns it (kill FC first, THEN disconnect).
+        // The handler awaits the JoinHandle only to observe the result for the
+        // connected client; a disconnect drops that await, not the work. The
+        // non-NBD path (macOS, no-NBD hosts) has nothing to lose on a dropped
+        // drop chain, so it stays inline.
+        #[cfg(target_os = "linux")]
+        if let Some(mut state) = pending_nbd_state {
+            let inner = self.inner.clone();
+            let nbd_sandboxes = self.nbd_sandboxes.clone();
+            let publisher = self.live_manifest_publisher.clone();
+            let flush_config = self.flush_config.clone();
+            let join = tokio::spawn(async move {
+                let new_id = if fresh {
+                    inner.restore_fresh(metadata).await?
+                } else {
+                    inner.restore(metadata).await?
+                };
+                // ADR 0016 Phase B commit 5: post-restore wiring. The new
+                // sandbox_id is only known here; install it into
+                // `nbd_sandboxes` together with the FlushScheduler so the
+                // resumed sandbox is first-class in the COW diagnostic and
+                // in the continuous-flush pipeline. Field-ordered Drop
+                // ensures scheduler-cancel → NBD-disconnect → slot-release
+                // on subsequent destroy.
+                state.install_flush_scheduler(new_id, publisher, flush_config);
+                // ADR 0019: open the resume operation window — restore-time disk
+                // reads (load_snapshot + the resumed guest's working set) attach
+                // `chunk.fetch` spans to this trace. Covers idle→resume AND
+                // evac-dest; the coord parent trace distinguishes them. Closed by
+                // `start_agent` (finish_resume_to_active calls it). Memory page-in
+                // is the UFFD side, on the spawn-TRACEPARENT path.
+                state.backend.operation_scope().begin("resume");
+                nbd_sandboxes.insert(new_id, state);
+                Ok::<SandboxId, SandboxError>(new_id)
+            });
+            // A JoinError here means the spawned task panicked; the FC restore
+            // either never completed or panicked mid-flight — surface it as a
+            // VM error (the task did NOT insert, so there is no orphan to own).
+            // A cancelled HANDLER future drops THIS await, not the task.
+            return join
+                .await
+                .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?;
+        }
+
         let new_id = if fresh {
             self.inner.restore_fresh(metadata).await?
         } else {
             self.inner.restore(metadata).await?
         };
-
-        // ADR 0016 Phase B commit 5: post-restore wiring. The new
-        // sandbox_id is only known here; install it into
-        // `nbd_sandboxes` together with the FlushScheduler so the
-        // resumed sandbox is first-class in the COW diagnostic and
-        // in the continuous-flush pipeline. Field-ordered Drop
-        // ensures scheduler-cancel → NBD-disconnect → slot-release
-        // on subsequent destroy.
-        #[cfg(target_os = "linux")]
-        if let Some(mut state) = pending_nbd_state {
-            state.install_flush_scheduler(
-                new_id,
-                self.live_manifest_publisher.clone(),
-                self.flush_config.clone(),
-            );
-            // ADR 0019: open the resume operation window — restore-time disk
-            // reads (load_snapshot + the resumed guest's working set) attach
-            // `chunk.fetch` spans to this trace. Covers idle→resume AND
-            // evac-dest; the coord parent trace distinguishes them. Closed by
-            // `start_agent` (finish_resume_to_active calls it). Memory page-in
-            // is the UFFD side, on the spawn-TRACEPARENT path.
-            state.backend.operation_scope().begin("resume");
-            self.nbd_sandboxes.insert(new_id, state);
-        }
         Ok(new_id)
     }
 
@@ -2205,6 +2247,17 @@ impl PooledBackend {
     /// itself to still-free slots (ADR 0044 K2).
     pub fn nbd_pool(&self) -> Option<Arc<crate::disk_daemon::NbdSlotAllocator>> {
         self.nbd_pool.clone()
+    }
+
+    /// Test-only: whether `id` currently has a live NBD data plane in
+    /// `nbd_sandboxes`. Used by the issue-#223 cancellation regression
+    /// test to assert the daemon landed in the map (and was therefore
+    /// retained, owned by normal `destroy()` teardown) even when the
+    /// `restore` handler future was dropped mid-flight.
+    #[cfg(target_os = "linux")]
+    #[doc(hidden)]
+    pub fn __test_nbd_sandbox_registered(&self, id: SandboxId) -> bool {
+        self.nbd_sandboxes.contains_key(&id)
     }
 
     /// ADR 0044 K2 graceful shutdown: abandon every live NBD data
@@ -3889,7 +3942,6 @@ impl SandboxBackend for PooledBackend {
             // here because that backend has finer-grained insight
             // into the sub-steps of the FC `PUT` calls if we want
             // to drill in later.
-            let sandbox_id = self.inner.create(spec).await?;
             // Stash any spawned NBD daemon under the freshly-assigned
             // sandbox id. `destroy()` removes the entry (Drop tears
             // down the daemon + returns the slot); `snapshot()` reads
@@ -3903,21 +3955,45 @@ impl SandboxBackend for PooledBackend {
             // same path without re-spawn machinery). Field-ordered
             // Drop on `NbdSandboxState` guarantees scheduler-cancel →
             // NBD-disconnect → slot-release.
+            //
+            // Issue #223 — CANCELLATION SAFETY (same hazard as the restore
+            // path): the rootfs sidecar was patched to `/dev/nbdN` before
+            // `inner.create`, so the booted FC reads that device, but the
+            // `NbdSandboxState` only enters `nbd_sandboxes` AFTER create
+            // returns. A handler future dropped between `inner.create` and the
+            // insert drops `pending_nbd_state` under the live FC — disconnect
+            // under the running guest + slot freed for cross-session reuse.
+            // Run create + the insert inside a `tokio::spawn`ed task that MOVES
+            // the NBD state in, so the daemon always lands in the map and
+            // normal `destroy()` teardown owns it regardless of the request's
+            // fate. The non-NBD path stays inline (no drop chain to lose).
             #[cfg(target_os = "linux")]
-            if let Some(mut state) = pending_nbd_state {
-                state.install_flush_scheduler(
-                    sandbox_id,
-                    self.live_manifest_publisher.clone(),
-                    self.flush_config.clone(),
-                );
-                // ADR 0019: open the cold-boot operation window. The guest's
-                // rootfs/substrate ext4-mount page-ins (served by this NBD
-                // backend) now attach `chunk.fetch` spans to the cold-boot
-                // trace until `start_agent` ends the window at agent_ready.
-                state.backend.operation_scope().begin("cold_boot");
-                self.nbd_sandboxes.insert(sandbox_id, state);
-            }
-            Ok(sandbox_id)
+            let create_result: Result<SandboxId, SandboxError> = if let Some(mut state) =
+                pending_nbd_state
+            {
+                let inner = self.inner.clone();
+                let nbd_sandboxes = self.nbd_sandboxes.clone();
+                let publisher = self.live_manifest_publisher.clone();
+                let flush_config = self.flush_config.clone();
+                let join = tokio::spawn(async move {
+                    let sandbox_id = inner.create(spec).await?;
+                    state.install_flush_scheduler(sandbox_id, publisher, flush_config);
+                    // ADR 0019: open the cold-boot operation window. The guest's
+                    // rootfs/substrate ext4-mount page-ins (served by this NBD
+                    // backend) now attach `chunk.fetch` spans to the cold-boot
+                    // trace until `start_agent` ends the window at agent_ready.
+                    state.backend.operation_scope().begin("cold_boot");
+                    nbd_sandboxes.insert(sandbox_id, state);
+                    Ok::<SandboxId, SandboxError>(sandbox_id)
+                });
+                join.await
+                    .map_err(|e| SandboxError::Vm(format!("create task panicked: {e}").into()))?
+            } else {
+                self.inner.create(spec).await
+            };
+            #[cfg(not(target_os = "linux"))]
+            let create_result: Result<SandboxId, SandboxError> = self.inner.create(spec).await;
+            create_result
         }
         .await;
 

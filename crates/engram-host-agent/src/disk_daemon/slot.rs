@@ -83,10 +83,78 @@ fn slot_path(slot: u32) -> PathBuf {
     PathBuf::from(format!("/dev/nbd{slot}"))
 }
 
+/// `true` if any process still holds `/dev/nbdN` open — i.e.
+/// `/sys/block/nbdN/holders/` is non-empty OR opening the device with
+/// `O_EXCL` fails `EBUSY`. The holders dir lists block-layer holders
+/// (a stacked device); the `O_EXCL` probe catches a plain `open()` from
+/// a process (a Firecracker guest reading the rootfs is exactly this)
+/// because the kernel refuses an `O_EXCL` open of a block device that
+/// another opener already has open.
+///
+/// Issue #223 — DEFENSE IN DEPTH. After a cancellation-window
+/// disconnect under a live FC, `NbdHandle::Drop` netlink-disconnects
+/// the device: the kernel clears `/sys/block/nbdN/pid` and zeros
+/// `size`, so the `pid`+`size` free-check below PASSES even though the
+/// orphan FC still holds the device fd open. The next claimant would
+/// then CONNECT its own backend onto a device the orphan reads/writes —
+/// cross-session disk I/O. The open-count check detects exactly that
+/// residual open fd, so a device an orphan still holds is never
+/// warmed/handed out (it becomes claimable again only once the orphan's
+/// `destroy()` closes its fd).
+#[cfg(target_os = "linux")]
+fn device_has_open_holder(slot: u32) -> bool {
+    // 1. Block-layer holders (stacked devices). Non-empty dir = held.
+    let holders_present = std::fs::read_dir(format!("/sys/block/nbd{slot}/holders"))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    // 2. Plain process opener (the FC guest case). An `O_EXCL` open of a
+    //    block device fails `EBUSY` when another opener already holds it.
+    //    A successful open means no one else has it; close immediately.
+    use std::os::unix::fs::OpenOptionsExt;
+    let o_excl = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_EXCL)
+        .open(format!("/dev/nbd{slot}"));
+    let o_excl_errno = match &o_excl {
+        Ok(_f) => None,
+        Err(e) => e.raw_os_error(),
+    };
+    interpret_open_holder(holders_present, o_excl_errno)
+}
+
+/// Pure decision for [`device_has_open_holder`] (issue #223), split out
+/// so the policy is unit-testable without a real block device. A device
+/// is considered held if a block-layer holder is present, or the
+/// `O_EXCL` open returned `EBUSY` (another opener has it). `o_excl_errno`
+/// is `None` on a successful exclusive open (definitively unheld), or
+/// `Some(errno)` on failure — only `EBUSY` is a positive "held" signal;
+/// any other error (e.g. `ENOENT` on a sparse universe, `EACCES`) is not,
+/// so the pid/size signals decide.
+#[cfg(any(target_os = "linux", test))]
+fn interpret_open_holder(holders_present: bool, o_excl_errno: Option<i32>) -> bool {
+    if holders_present {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        o_excl_errno == Some(libc::EBUSY)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Off-Linux this helper is reached only from the unit test, which
+        // passes the linux EBUSY code (16) explicitly.
+        o_excl_errno == Some(16)
+    }
+}
+
 /// Kernel-truth free-check: a device is free iff `/sys/block/nbdN/pid`
-/// is absent AND `/sys/block/nbdN/size` reads `0`. The pid file is the
-/// kernel's "bound to an NBD thread" signal; size catches a device
-/// whose binding is mid-teardown (pid cleared, size not yet zeroed).
+/// is absent AND `/sys/block/nbdN/size` reads `0` AND no process still
+/// holds `/dev/nbdN` open (issue #223). The pid file is the kernel's
+/// "bound to an NBD thread" signal; size catches a device whose binding
+/// is mid-teardown (pid cleared, size not yet zeroed); the open-holder
+/// check catches an orphan FC still reading a device whose NBD binding
+/// was already disconnected (the cancellation-window cross-session
+/// hazard).
 ///
 /// On non-Linux (macOS dev) `/sys` doesn't exist, so the real probe is
 /// never used there — production builds the pool only when the kernel
@@ -97,13 +165,18 @@ fn device_is_free(slot: u32) -> bool {
         if Path::new(&format!("/sys/block/nbd{slot}/pid")).exists() {
             return false;
         }
-        match std::fs::read_to_string(format!("/sys/block/nbd{slot}/size")) {
+        let size_zero = match std::fs::read_to_string(format!("/sys/block/nbd{slot}/size")) {
             Ok(s) => s.trim() == "0",
             // Size unreadable → be conservative, treat as not free so
             // the populator skips and re-checks rather than handing out
             // a device in an unknown state.
             Err(_) => false,
-        }
+        };
+        // Even a fully-disconnected device (pid cleared, size 0) is NOT
+        // free while an orphan FC still holds its fd open — handing it
+        // out would let a different session CONNECT a backend the orphan
+        // keeps reading. See `device_has_open_holder` (issue #223).
+        size_zero && !device_has_open_holder(slot)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -778,6 +851,77 @@ mod tests {
         assert!(
             !free.contains(&held.path().to_path_buf()),
             "held slot leaked into free_paths"
+        );
+    }
+
+    /// Issue #223 — the open-holder decision used by `device_is_free`.
+    /// After a cancellation-window disconnect under a live FC, the
+    /// device's NBD binding is torn down (pid cleared, size 0) but the
+    /// orphan FC still holds its fd open. `device_is_free` must treat
+    /// THAT as not-free so a different session can never CONNECT onto a
+    /// device the orphan still reads. The decision keys on EITHER a
+    /// block-layer holder OR an `O_EXCL`-open `EBUSY`.
+    #[test]
+    fn open_holder_blocks_a_disconnected_but_still_open_device() {
+        // EBUSY on the O_EXCL open (libc::EBUSY == 16): another opener
+        // (the orphan FC) holds the device → held, must NOT be handed out.
+        assert!(
+            interpret_open_holder(false, Some(16)),
+            "an O_EXCL EBUSY (device still open by an orphan FC) must read as HELD"
+        );
+        // A block-layer holder present → held regardless of the O_EXCL probe.
+        assert!(
+            interpret_open_holder(true, None),
+            "a non-empty holders/ dir must read as HELD"
+        );
+        // Clean: no holder, exclusive open succeeded → free to hand out.
+        assert!(
+            !interpret_open_holder(false, None),
+            "no holder + a successful O_EXCL open must read as FREE"
+        );
+        // A non-EBUSY open error (e.g. ENOENT=2 on a sparse universe,
+        // EACCES=13) is NOT a positive held signal — the pid/size checks
+        // decide, so this helper reports not-held.
+        assert!(
+            !interpret_open_holder(false, Some(2)),
+            "ENOENT must not be misread as held"
+        );
+        assert!(
+            !interpret_open_holder(false, Some(13)),
+            "EACCES must not be misread as held"
+        );
+    }
+
+    /// Issue #223 — allocator-level consequence: a device an orphan FC
+    /// still holds open (the injected free-check reports it busy even
+    /// though its NBD binding was disconnected) is never warmed or
+    /// handed out, and rejoins the pool only once the holder clears.
+    #[tokio::test]
+    async fn held_device_is_never_handed_out_until_holder_clears() {
+        // Slot 0 modeled as "disconnected NBD binding but orphan FC still
+        // holds the fd open" — the free-check (which in prod is
+        // `device_is_free`, here injected) reports it busy.
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::from([0u32])));
+        let pool = test_pool(2, 2, busy.clone());
+        // Only slot 1 is free; warm tops out at 1, slot 0 never warms.
+        wait_warm(&pool, 1).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(pool.warm_count().await, 1);
+        let a = pool.acquire().await;
+        assert_eq!(
+            a.path(),
+            Path::new("/dev/nbd1"),
+            "the held device (nbd0) must not be handed out"
+        );
+        // Orphan FC's destroy() finally closes the fd → free-check clears.
+        busy.lock().unwrap().remove(&0);
+        // The populator now re-warms slot 0; acquire it.
+        wait_warm(&pool, 1).await;
+        let b = pool.acquire().await;
+        assert_eq!(
+            b.path(),
+            Path::new("/dev/nbd0"),
+            "once the holder clears, the device rejoins the pool"
         );
     }
 }
