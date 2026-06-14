@@ -136,41 +136,51 @@ issues, each fixed in turn (the "fix one bottleneck, expose the next" cascade):
    template-only change (e.g. the propagation flag) is rolled by a graceful
    per-pod delete, not the operator.
 
-3. **Sidecar device race (real, but secondary).** `restore_with` reads
-   `rootfs_source` from the per-base-snapshot `snapshots/<base>/manifest.json`,
-   which EVERY same-base restore patches with its own `/dev/nbdN`
-   (read-modify-write). A sibling's patch landing between a restore's patch and
-   its read could make FC open the WRONG device. Fixed by passing each
-   restore's device DIRECTLY to FC via `restore_with_rootfs_override`
-   (`SandboxBackend` trait), authoritative over the shared sidecar. **This was a
-   genuine hardening but did NOT fix the load-test `lossless` failure** — the
-   re-run showed identical corruption, which led to (4).
+3. **Sidecar device race (REVERTED — chasing a phantom).** `restore_with`
+   reads `rootfs_source` from the per-base-snapshot `snapshots/<base>/manifest.json`,
+   which every same-base restore patches with its own `/dev/nbdN`. A sibling's
+   patch landing between a restore's patch and its read could *in theory* make
+   FC open the wrong device. I added a `restore_with_rootfs_override` to pass the
+   device directly — but it never fixed anything observable, because the
+   "corruption" it was chasing **did not exist** (see the IMPORTANT note below).
+   Reverted (commit `97ea3e8f`); no proven impact, kept the diff honest.
 
-4. **Same-base concurrent-restore data corruption — the real `lossless`
-   failure.** A restored session's chunked-disk backend is keyed by
+4. **Per-session disk-manifest fork (KEPT — fixes a latent durability hazard,
+   NOT corruption).** A restored session's chunked-disk backend is keyed by
    `disk_manifest_ref.manifest_id`, and on the FRESH-CREATE path that is
    `bundle.disk_manifest` — the BASE IMAGE's id, identical for every same-base
-   session. The flush path only `next_version()`s that shared id (it never minted
-   a new one, unlike the *memory* path which does `ManifestRef::new()` per
-   capture). So N concurrent same-base sessions all wrote under one
-   `manifests/<base>/vN` chain: they raced the chunk-store version counter (the
-   ADR 0014 "version conflict; retry latest+1" band-aid, at 22-wide × 41 retries)
-   and `(manifest_id, version)` became AMBIGUOUS across sessions — session A's
-   `v_k` and B's `v_k` are different disks, indistinguishable to the resume/
-   recovery selector → cross-session reads (`reread ''`) + stale-drop reaps.
-   Confirmed live: 22 sandboxes → one `manifest_id=2502838e`, 41 conflicts, 18
-   stale-drops. **Fix:** lazily fork the disk manifest to a private per-session
-   `manifest_id` on the first flush of a fresh-base session (`BackendState::
-   fork_pending`, armed by `attach_manifest(.., fork_on_first_flush=true)` only on
-   the fresh-create path). The fork's chunk list still references the shared,
-   content-addressed base chunks (no byte duplication — density preserved); only
-   the manifest IDENTITY forks. Mirrors what memory already does
-   (`seed_checkpoint_chain`). Transparent to GC (pins by content hash) and the
-   coord columns (already per-row UUID); the resume selector's
+   session. The flush path only `next_version()`s that shared id (unlike *memory*,
+   which mints `ManifestRef::new()` per capture). So N concurrent same-base
+   sessions wrote under one `manifests/<base>/vN` chain. Two real, *latent*
+   problems (neither was the load-test failure): (a) they raced the chunk-store
+   version counter — the ADR 0014 "version conflict; retry latest+1" band-aid,
+   live-measured at 22-wide × 41 retries, capped at 32 and wasteful; and (b)
+   `(manifest_id, version)` was AMBIGUOUS across sessions — `(shared_id, v5)`
+   holds one session's content, so an eviction/cold-recovery reading session A's
+   `(shared_id, v5)` could restore session B's disk. **Fix:** lazily fork the disk
+   manifest to a private per-session `manifest_id` on the first flush of a
+   fresh-base session (`BackendState::fork_pending`, armed by
+   `attach_manifest(.., fork_on_first_flush=true)` only on the fresh-create path).
+   The fork's chunk list still references the shared, content-addressed base
+   chunks (**no byte duplication — density preserved**; and it's *faster* under
+   burst — no version contention); only the manifest IDENTITY forks. Mirrors
+   `seed_checkpoint_chain`. Transparent to GC (pins by content hash) and the coord
+   columns (already per-row UUID); the resume selector's
    `live.manifest_id == snapshot.manifest_id` assumption is *repaired*. Regression
    tests: `backend::tests::fresh_same_base_backends_fork_to_distinct_private_ids`
-   + `unforked_backend_ticks_its_attached_id` (CI); prod load test is the e2e
-   gate.
+   + `unforked_backend_ticks_its_attached_id` (CI).
+
+   **IMPORTANT — there was no data corruption.** The load test's "lossless"
+   failures (`reread ''`) were a TEST-HARNESS MISDIAGNOSIS: `sha256sum … 2>/dev/null`
+   run against a sandbox that was *gone* (409 "no live sandbox") emits empty
+   output, which the test scored as data loss. A dual-substrate probe (write the
+   same bytes to a rootfs-disk path AND a `/dev/shm` tmpfs path, hash both, and
+   report the reread EXEC status) showed **0 genuine data loss** — every failure
+   was the reread *exec* failing on a vanished sandbox. The disk and memory
+   substrates were sound throughout; (4) is a real but latent durability fix, not
+   the cause of the observed failures. The actual issues the test surfaced are a
+   `reserve_placement` PG deadlock (`FOR UPDATE` without `ORDER BY id`) and
+   sandboxes vanishing mid-session under burst — both availability, not integrity.
 
    *Residual (lazy fork):* a session idle-evicted with ZERO disk writes (its
    snapshot `disk_manifest` is still the base) then resumed-and-written would
