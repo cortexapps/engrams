@@ -729,6 +729,15 @@ pub(crate) enum LeaseTouch {
     TransientError(engram_core::MetaError),
 }
 
+/// Outcome of a lease `touch_checked`. `Lost` is authoritative (the row
+/// is gone or owned by someone else — give up ownership); a
+/// `TransientError` is a PG-transport blip the caller may retry through.
+pub(crate) enum LeaseTouch {
+    Held,
+    Lost,
+    TransientError(engram_core::MetaError),
+}
+
 impl Drop for SessionLeaseGuard {
     fn drop(&mut self) {
         // Drop is sync; release runs as a detached tokio task. Best-
