@@ -617,6 +617,99 @@ async fn evac_attempts_primitives_round_trip() {
     );
 }
 
+/// Issue #215 (live-PG): the actual `sessions.missing_strikes` SQL must
+/// reset on a sandbox re-key. Accrue `grace_ticks - 1` strikes against
+/// SB1 via `apply_missing_sandbox_strikes`, then rebind to SB2 via the
+/// production binding writers and assert the column is back at 0 — so a
+/// single subsequent missing tick does NOT cross the threshold. Before
+/// the fix, `assign_session_sandbox` / `rebind_session` left the column
+/// untouched and the very next missing tick flipped a healthy session.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn missing_strikes_reset_on_sandbox_rekey() {
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+    let grace = engram_coordinator::reconcile::DEFAULT_GRACE_TICKS as i32;
+
+    let host_a = HostId::new();
+    let sb1 = SandboxId::new();
+    let session_id = seed_active_session(&meta, host_a, sb1).await;
+
+    // Accrue grace-1 strikes against the current binding (SB1 missing
+    // for grace-1 consecutive ticks). None of these cross the
+    // threshold, so nothing flips.
+    for _ in 0..(grace - 1) {
+        let flipped = meta
+            .apply_missing_sandbox_strikes(&[], &[session_id], grace)
+            .await
+            .expect("apply_missing_sandbox_strikes");
+        assert!(flipped.is_empty(), "below threshold → no flip");
+    }
+
+    // --- Path 1: assign_session_sandbox(Some) rebind resets strikes.
+    let sb2 = SandboxId::new();
+    meta.assign_session_sandbox(session_id, Some(sb2))
+        .await
+        .expect("rebind to SB2");
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[], &[session_id], grace)
+        .await
+        .expect("apply after rebind");
+    assert!(
+        flipped.is_empty(),
+        "the first missing tick after a sandbox re-key must be strike 1 of a fresh window, \
+         not the grace-th — stale strikes leaked across the rebind"
+    );
+
+    // --- Path 2: rebind_session (host+sandbox in one UPDATE) resets too.
+    // Re-accrue up to grace-1 (we're at 1 from the tick above; bump to grace-1).
+    for _ in 0..(grace - 2) {
+        let flipped = meta
+            .apply_missing_sandbox_strikes(&[], &[session_id], grace)
+            .await
+            .expect("re-accrue");
+        assert!(flipped.is_empty());
+    }
+    let host_b = HostId::new();
+    ensure_host_row(&meta, host_b, "rekey-dest").await;
+    let sb3 = SandboxId::new();
+    meta.rebind_session(session_id, host_b, sb3)
+        .await
+        .expect("rebind_session to SB3 on host B");
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[], &[session_id], grace)
+        .await
+        .expect("apply after rebind_session");
+    assert!(
+        flipped.is_empty(),
+        "rebind_session must also reset the strike streak"
+    );
+
+    // --- Path 3: unbind (assign_session_sandbox(None)) clears strikes.
+    // Re-accrue to grace-1, unbind, rebind, then a single miss must not flip.
+    for _ in 0..(grace - 2) {
+        meta.apply_missing_sandbox_strikes(&[], &[session_id], grace)
+            .await
+            .expect("re-accrue before unbind");
+    }
+    meta.assign_session_sandbox(session_id, None)
+        .await
+        .expect("unbind");
+    // Rebind to a fresh sandbox so the row is bound again for the tick.
+    let sb4 = SandboxId::new();
+    meta.assign_session_sandbox(session_id, Some(sb4))
+        .await
+        .expect("rebind after unbind");
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[], &[session_id], grace)
+        .await
+        .expect("apply after unbind+rebind");
+    assert!(
+        flipped.is_empty(),
+        "unbind must clear the strike streak so the next binding gets a fresh window"
+    );
+}
+
 /// ADR 0047: the durable coordinator cordon. `set_host_cordoned` writes
 /// the PG bit; `placement::pick_for_session` (reading host rows) must
 /// skip the host — from ANY replica (a second registry over the same

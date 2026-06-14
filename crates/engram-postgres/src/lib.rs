@@ -1473,9 +1473,14 @@ impl MetadataStore for PostgresStore {
         // ADR 0045 C2: ONE UPDATE — the ownership oracle
         // (`session.sandbox_id == sandbox`) flips atomically with the
         // host rebind (the post-copy `Committing` persist).
+        //
+        // Issue #215: reset `missing_strikes = 0` — this re-keys the
+        // session onto a fresh sandbox (and host), so any in-flight
+        // reconcile strike streak against the old sandbox is no longer
+        // consecutive and must not bleed into the new binding's grace.
         let n = sqlx::query(
             r#"
-            UPDATE sessions SET host_id = $2, sandbox_id = $3, updated_at = NOW() WHERE id = $1
+            UPDATE sessions SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = NOW() WHERE id = $1
             "#,
         )
         .bind(id.as_uuid())
@@ -1541,14 +1546,30 @@ impl MetadataStore for PostgresStore {
         // scheduler flush of the new sandbox populates the columns;
         // any leftover value from a prior binding is overwritten by
         // that publish (or the sandbox_id guard drops it as stale).
+        //
+        // Issue #215: BOTH branches reset `missing_strikes = 0`. The
+        // reconcile strike counter (`apply_missing_sandbox_strikes`)
+        // means "N CONSECUTIVE heartbeats in which THIS session's
+        // bound sandbox was missing from its host's running set". A
+        // rebind points the row at a brand-new sandbox and an unbind
+        // detaches it entirely — either way the previous streak is no
+        // longer consecutive against the current binding, so carrying
+        // it forward would collapse the 3-tick grace for a freshly
+        // resumed/migrated session (one transient under-report on the
+        // new host is strike 3, dismantling a healthy VM). The strike
+        // column is keyed by session id alone, so re-keying the
+        // sandbox must explicitly clear it here.
         let n = if sandbox_id.is_some() {
-            sqlx::query("UPDATE sessions SET sandbox_id = $2, updated_at = NOW() WHERE id = $1")
-                .bind(id.as_uuid())
-                .bind(sandbox_id.map(|s| s.as_uuid()))
-                .execute(&self.pool)
-                .await
-                .map_err(db_err)?
-                .rows_affected()
+            sqlx::query(
+                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(id.as_uuid())
+            .bind(sandbox_id.map(|s| s.as_uuid()))
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
         } else {
             // Single TX: clear sandbox + live manifest, AND bump
             // chunk_generation in the same step so Phase C's mid-
@@ -1557,6 +1578,7 @@ impl MetadataStore for PostgresStore {
             let n = sqlx::query(
                 "UPDATE sessions
                     SET sandbox_id                 = NULL,
+                        missing_strikes            = 0,
                         live_disk_manifest_id      = NULL,
                         live_disk_manifest_version = NULL,
                         live_disk_manifest_at      = NULL,
@@ -1645,17 +1667,24 @@ impl MetadataStore for PostgresStore {
                 "assign_session_sandbox CAS: status is {status}, not in {states:?}"
             )));
         }
+        // Issue #215: clear `missing_strikes` on both bind and unbind —
+        // see the comment in `assign_session_sandbox`. A re-key / unbind
+        // breaks the reconcile strike streak's consecutiveness.
         if sandbox_id.is_some() {
-            sqlx::query("UPDATE sessions SET sandbox_id = $2, updated_at = NOW() WHERE id = $1")
-                .bind(id.as_uuid())
-                .bind(sandbox_id.map(|s| s.as_uuid()))
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+            sqlx::query(
+                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = NOW() \
+                 WHERE id = $1",
+            )
+            .bind(id.as_uuid())
+            .bind(sandbox_id.map(|s| s.as_uuid()))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         } else {
             let n = sqlx::query(
                 "UPDATE sessions
                     SET sandbox_id                 = NULL,
+                        missing_strikes            = 0,
                         live_disk_manifest_id      = NULL,
                         live_disk_manifest_version = NULL,
                         live_disk_manifest_at      = NULL,
@@ -1732,9 +1761,11 @@ impl MetadataStore for PostgresStore {
             .map(|s| s.as_str().to_string())
             .collect();
         let expected_uuid = expected_current.map(|o| o.map(|s| s.as_uuid()));
+        // Issue #215: re-keying onto a fresh sandbox clears the stale
+        // reconcile strike streak (see `assign_session_sandbox`).
         let n = sqlx::query(
             r#"
-            UPDATE sessions SET host_id = $2, sandbox_id = $3, updated_at = NOW()
+            UPDATE sessions SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = NOW()
             WHERE id = $1
               AND ($4::text[] IS NULL OR status = ANY($4))
               AND ($5::boolean IS FALSE OR sandbox_id IS NOT DISTINCT FROM $6)

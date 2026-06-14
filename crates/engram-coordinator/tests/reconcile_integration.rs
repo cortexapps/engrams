@@ -73,6 +73,13 @@ impl ReconcileMeta {
         id
     }
 
+    /// Directly seed an in-flight strike streak on a session row, as
+    /// if earlier missing heartbeats (or `backend.list()` blips) had
+    /// already accrued against its *previous* binding. Issue #215.
+    fn seed_strikes(&self, session: SessionId, strikes: i32) {
+        self.strikes.lock().insert(session, strikes);
+    }
+
     fn seed_recoverable_snapshot(&self, session: SessionId, recoverable: bool) {
         let snap = SnapshotRecord {
             id: SnapshotId::new(),
@@ -172,6 +179,12 @@ impl MetadataStore for ReconcileMeta {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
         s.sandbox_id = sandbox_id;
+        drop(g);
+        // Issue #215: mirror the PG store — binding or unbinding a
+        // sandbox resets the reconcile strike streak, since a re-key /
+        // unbind breaks the "N CONSECUTIVE missing heartbeats against
+        // THIS binding" invariant the counter encodes.
+        self.strikes.lock().remove(&id);
         Ok(())
     }
     async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {
@@ -537,6 +550,86 @@ async fn re_appearing_sandbox_within_grace_does_not_flip() {
         .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
         .await;
     assert_eq!(flipped, vec![session], "flip on the (n+1)th total miss");
+}
+
+/// Issue #215 regression: stale strikes accumulated against a session's
+/// OLD sandbox must NOT count against a brand-new sandbox after a re-key
+/// (evac/resume/migration). The strike counter encodes "N CONSECUTIVE
+/// heartbeats THIS binding's sandbox was missing"; rebinding to a fresh
+/// sandbox breaks consecutiveness, so the new binding is owed a full
+/// `grace_ticks` window. Before the fix, `assign_session_sandbox` left
+/// the counter untouched, so a freshly-resumed session carrying 2 stale
+/// strikes was dismantled on its first transient under-report (strike 3
+/// of a contract-promised 3-tick grace collapsed to 1).
+#[tokio::test]
+async fn stale_strikes_do_not_carry_across_sandbox_rekey() {
+    let meta = Arc::new(ReconcileMeta::default());
+    let host_registry =
+        HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
+    let events = Arc::new(SessionEventBus::new(64));
+    let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
+
+    // Session S was Active on host A, sandbox SB1, and accrued
+    // `grace_ticks - 1` strikes there (a flaky agent / a couple of
+    // `list()` blips) — one short of a flip.
+    let host_a = HostId::new();
+    let sb1 = SandboxId::new();
+    let session = meta.seed_active(host_a, sb1);
+    meta.seed_strikes(session, (DEFAULT_GRACE_TICKS - 1) as i32);
+    // It has a recoverable snapshot, so a wrongful flip would land it
+    // in Idle (in-RAM work lost) rather than Dead — but the point is
+    // it must NOT flip at all here.
+    meta.seed_recoverable_snapshot(session, true);
+
+    // S is drained off A and resumed on host B against a fresh sandbox
+    // SB2 (evac/migration). This is the re-key: the binding writer
+    // must reset the strike streak.
+    let host_b = HostId::new();
+    let sb2 = SandboxId::new();
+    meta.assign_session_host(session, Some(host_b))
+        .await
+        .unwrap();
+    meta.assign_session_sandbox(session, Some(sb2))
+        .await
+        .unwrap();
+
+    // First transient under-report on B (e.g. a heartbeat sampled
+    // during B's rehydration window). PRE-FIX this is strike 3 → flip.
+    // POST-FIX it is strike 1 of a fresh window → no flip.
+    let flipped = reconciler
+        .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host_b, &[])
+        .await;
+    assert!(
+        flipped.is_empty(),
+        "a single missing tick after a sandbox re-key must NOT flip a freshly-resumed session; \
+         stale strikes from the old sandbox leaked into the new binding's grace window"
+    );
+    assert_eq!(
+        meta.status(session),
+        SessionState::Active,
+        "the just-resumed session must stay Active through its first post-rebind blip"
+    );
+
+    // It still takes a FULL fresh grace window against SB2 to flip —
+    // proving the reset, not merely a one-off skip.
+    for _ in 0..(DEFAULT_GRACE_TICKS - 2) {
+        let flipped = reconciler
+            .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host_b, &[])
+            .await;
+        assert!(
+            flipped.is_empty(),
+            "fresh grace window not yet exhausted against the new sandbox"
+        );
+    }
+    // The `grace_ticks`-th consecutive miss against SB2 finally flips.
+    let flipped = reconciler
+        .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host_b, &[])
+        .await;
+    assert_eq!(
+        flipped,
+        vec![session],
+        "flip only after a full fresh grace window of misses against the new sandbox"
+    );
 }
 
 /// Sessions that are already in a terminal state (Dead) must not be

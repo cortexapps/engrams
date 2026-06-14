@@ -34,6 +34,9 @@ pub fn build_heartbeat(
         },
         local_snapshots: Vec::new(),
         running_sandboxes,
+        // In-process path: the caller already resolved the list
+        // successfully, so the set is authoritative.
+        running_sandboxes_known: true,
         draining,
         ready_images: Vec::new(),
         checkpoints: Vec::new(),

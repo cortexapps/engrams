@@ -1046,14 +1046,24 @@ impl HostAgent {
                 let mut util_probe = crate::util::UtilizationProbe::new();
                 loop {
                     tick.tick().await;
-                    let running_sandboxes = match pooled_for_heartbeat.list().await {
-                        Ok(ids) => ids,
+                    // Issue #215: a `list()` error is "no information",
+                    // not "no sandboxes running". Reporting empty would
+                    // make the coord's ADR 0009 reconcile strike every
+                    // active session on this host that tick. Carry an
+                    // explicit `running_sandboxes_known = false` so the
+                    // coord skips reconcile for this heartbeat instead of
+                    // mistaking the empty set for a real running set.
+                    let (running_sandboxes, running_sandboxes_known) = match pooled_for_heartbeat
+                        .list()
+                        .await
+                    {
+                        Ok(ids) => (ids, true),
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "backend.list() failed; reporting empty running_sandboxes",
+                                "backend.list() failed; heartbeat carries running_sandboxes_known=false (coord skips reconcile)",
                             );
-                            Vec::new()
+                            (Vec::new(), false)
                         }
                     };
                     let running_count = running_sandboxes.len() as u32;
@@ -1109,6 +1119,7 @@ impl HostAgent {
                         },
                         local_snapshots: Vec::new(),
                         running_sandboxes,
+                        running_sandboxes_known,
                         draining: false,
                         host_addr: host_addr_for_heartbeat.clone(),
                         ready_images: readiness_for_heartbeat.snapshot(),

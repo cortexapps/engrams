@@ -2,6 +2,13 @@ use chrono::{DateTime, Utc};
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
 use serde::{Deserialize, Serialize};
 
+/// Serde default for `running_sandboxes_known` (issue #215): a
+/// heartbeat that omits the field (pre-fix host-agent mid-roll) is
+/// assumed to carry a valid `backend.list()` result.
+fn default_true() -> bool {
+    true
+}
+
 /// Heartbeat message: host -> coordinator, every ~5s. Reports
 /// current capacity, the snapshots held locally, the set of
 /// sandbox_ids the host currently has live in its `SandboxBackend`,
@@ -23,10 +30,24 @@ pub struct Heartbeat {
     pub local_snapshots: Vec<LocalSnapshotReport>,
     /// Sandbox IDs currently live on this host (per `backend.list()`).
     /// Empty on hosts that haven't enabled reconciliation yet (Phase 1
-    /// observation window) or where the backend returned an error.
-    /// ~12 B per id × ~50 sandboxes ≈ 600 B per heartbeat — trivial.
-    /// Ordered for deterministic test fixtures; the coord doesn't care.
+    /// observation window). ~12 B per id × ~50 sandboxes ≈ 600 B per
+    /// heartbeat — trivial. Ordered for deterministic test fixtures;
+    /// the coord doesn't care.
+    ///
+    /// Issue #215: when `running_sandboxes_known` is `false` this field
+    /// is meaningless (`backend.list()` errored this tick) and the
+    /// coord MUST NOT run the ADR 0009 reconcile against it — an empty
+    /// list there is "no information", not "no sandboxes", and feeding
+    /// it through would strike every active session on the host.
     pub running_sandboxes: Vec<SandboxId>,
+    /// Issue #215: `false` iff `backend.list()` failed this tick, so
+    /// `running_sandboxes` carries no usable signal. `#[serde(default
+    /// = ...)]` to `true` for mixed-version interop — a pre-fix
+    /// host-agent that omits the field is assumed to have a valid list
+    /// (its old behaviour of reporting empty-on-error is the bug being
+    /// fixed, but it's no worse than before for the rollout window).
+    #[serde(default = "default_true")]
+    pub running_sandboxes_known: bool,
     pub draining: bool,
     /// ADR 0015 M5: manifest digests of every image this host has
     /// fully prefetched to local NVMe. The scheduler's
@@ -198,6 +219,7 @@ mod tests {
                 last_accessed_at: Utc::now(),
             }],
             running_sandboxes: vec![SandboxId::new(), SandboxId::new()],
+            running_sandboxes_known: true,
             draining: false,
             ready_images: Vec::new(),
             checkpoints: Vec::new(),

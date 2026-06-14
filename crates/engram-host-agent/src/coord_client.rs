@@ -464,6 +464,12 @@ pub struct HeartbeatRequest {
     pub local_snapshots: Vec<LocalSnapshotReport>,
     #[serde(default)]
     pub running_sandboxes: Vec<SandboxId>,
+    /// Issue #215: `false` iff `backend.list()` failed this tick, so
+    /// `running_sandboxes` carries no usable signal and the coord must
+    /// skip its ADR 0009 reconcile rather than strike every session.
+    /// (Serialize-only struct; the coord's mirror supplies the
+    /// deserialize-side default for mixed-version interop.)
+    pub running_sandboxes_known: bool,
     #[serde(default)]
     pub draining: bool,
     /// ADR 0013: gRPC advertise URL the host registered with. Sent on
@@ -667,6 +673,7 @@ mod tests {
             capacity: HostCapacityReport::default(),
             local_snapshots: vec![],
             running_sandboxes: vec![],
+            running_sandboxes_known: true,
             draining: false,
             host_addr: None,
             ready_images: vec![],
