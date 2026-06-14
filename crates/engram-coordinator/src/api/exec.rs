@@ -424,7 +424,16 @@ pub async fn exec_stream(
         yield Ok(sse);
     };
 
-    Ok(Sse::new(sse_stream).keep_alive(
+    // ADR 0050 B: end the live tail when the coordinator begins graceful
+    // shutdown so a long-running streamed exec doesn't block hyper's
+    // drain (tokio-rs/axum#2673). The client resumes from the PG log via
+    // Last-Event-ID against a healthy replica (each frame above carries
+    // its idx).
+    let mut shutdown_rx = state.subscribe_shutdown();
+    let shutdown = async move {
+        let _ = shutdown_rx.wait_for(|shutting_down| *shutting_down).await;
+    };
+    Ok(Sse::new(sse_stream.take_until(shutdown)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),

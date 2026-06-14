@@ -74,7 +74,17 @@ pub async fn events(
         .await?;
     let replay_high_water = replayed.last().map(|e| e.idx).unwrap_or(since);
 
-    let stream = build_event_stream(replayed, live_rx, replay_high_water);
+    // ADR 0050 B: end the stream when the coordinator begins graceful
+    // shutdown so this long-lived SSE connection doesn't block hyper's
+    // drain (tokio-rs/axum#2673). The browser EventSource auto-reconnects
+    // to a healthy replica and resumes from the PG log via Last-Event-ID,
+    // so the close is lossless. Fires immediately if shutdown is already
+    // underway (don't open a new stream on a draining pod).
+    let mut shutdown_rx = state.subscribe_shutdown();
+    let shutdown = async move {
+        let _ = shutdown_rx.wait_for(|shutting_down| *shutting_down).await;
+    };
+    let stream = build_event_stream(replayed, live_rx, replay_high_water).take_until(shutdown);
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))

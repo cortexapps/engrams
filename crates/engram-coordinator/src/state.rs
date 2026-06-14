@@ -431,6 +431,16 @@ pub struct AppState {
     /// `Services`) for the same reason as `forge` — the many test `Services`
     /// literals don't need touching.
     pub auth: Option<Arc<crate::api::principal::AuthRuntime>>,
+    /// ADR 0050 B: graceful-shutdown fanout. Flipped to `true` once
+    /// `run`'s SIGTERM/ctrl-c handler fires, BEFORE axum starts draining
+    /// connections. Long-lived response handlers (SSE `/events`,
+    /// `/exec/stream`) subscribe and end their streams on the flip so
+    /// they don't block hyper's graceful shutdown indefinitely
+    /// (tokio-rs/axum#2673) — the client reconnects to a healthy replica
+    /// and resumes from the PG-backed log via `Last-Event-ID`. The
+    /// receiver-less `watch::Sender` is kept alive here; handlers call
+    /// `subscribe_shutdown()` for a fresh receiver.
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl AppState {
@@ -475,7 +485,22 @@ impl AppState {
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
             forge: None,
             auth: None,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
         }
+    }
+
+    /// A fresh receiver on the graceful-shutdown signal (ADR 0050 B).
+    /// Resolves `true` once shutdown begins (immediately if already
+    /// shutting down). Long-lived handlers `take_until` it.
+    pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    /// Signal graceful shutdown: wakes every [`subscribe_shutdown`]
+    /// receiver so SSE/stream handlers end. Called by `run`'s signal
+    /// handler before axum drains. Idempotent.
+    pub fn trigger_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 
     /// Where to write per-session snapshot directories on local disk.
