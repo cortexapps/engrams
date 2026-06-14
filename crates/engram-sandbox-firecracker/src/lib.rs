@@ -928,6 +928,38 @@ impl FirecrackerBackend {
         &self.work_dir
     }
 
+    /// Issue #198: the teardown callback handed to every
+    /// `spawn_process_supervisor`. When a supervisor wins the prune race
+    /// (its watched FC or uffd pid died and it removed the map entry), it
+    /// invokes this with the removed `LiveSandbox` so the SAME
+    /// kill/free/cleanup sequence `destroy()` runs executes against the
+    /// surviving sibling + host state — instead of dropping `LiveSandbox`
+    /// silently (which, post-ADR-0044-K2 `kill_on_drop` removal, leaks a
+    /// wedged VM, its allocator /30, TAP/netns, and `sandbox.json`).
+    ///
+    /// Captures owned clones of the allocator + config so the returned
+    /// closure is `'static` and can move into the detached supervisor
+    /// task. `destroy_teardown` is the shared, double-teardown-tolerant
+    /// helper also used by `destroy()`.
+    fn supervisor_teardown_fn(
+        &self,
+    ) -> impl FnOnce(SandboxId, LiveSandbox) -> futures_util::future::BoxFuture<'static, ()>
+           + Send
+           + 'static {
+        let net_allocator = self.net_allocator.clone();
+        let vm_cgroup_parent = self.config.vm_cgroup_parent.clone();
+        let work_dir = self.work_dir.clone();
+        move |id, live| {
+            Box::pin(destroy_teardown(
+                id,
+                live,
+                net_allocator,
+                vm_cgroup_parent,
+                work_dir,
+            ))
+        }
+    }
+
     /// ADR 0007 Phase 6: per-snapshot staging dir, owned by the
     /// backend. Snapshots live under `<work_dir>/snapshots/<id>/`
     /// rather than the per-sandbox jail dir, so a snapshot
@@ -1309,9 +1341,21 @@ impl FirecrackerBackend {
 
         // §4 supervisor on the reattached FC pid, and the uffd handler pid
         // when one was verified still-live above.
-        spawn_process_supervisor(self.sandboxes.clone(), id, fc.process.pid, "firecracker");
+        spawn_process_supervisor(
+            self.sandboxes.clone(),
+            id,
+            fc.process.pid,
+            "firecracker",
+            self.supervisor_teardown_fn(),
+        );
         if let Some(pid) = uffd_pid {
-            spawn_process_supervisor(self.sandboxes.clone(), id, pid, "uffd-handler");
+            spawn_process_supervisor(
+                self.sandboxes.clone(),
+                id,
+                pid,
+                "uffd-handler",
+                self.supervisor_teardown_fn(),
+            );
         }
 
         // ADR 0044 K2: re-bind the host-side vsock listeners. The in-guest
@@ -2196,7 +2240,13 @@ impl FirecrackerBackend {
             },
         );
         if let Some(pid) = fc_pid {
-            spawn_process_supervisor(self.sandboxes.clone(), sandbox_id, pid, "firecracker");
+            spawn_process_supervisor(
+                self.sandboxes.clone(),
+                sandbox_id,
+                pid,
+                "firecracker",
+                self.supervisor_teardown_fn(),
+            );
         } else {
             tracing::warn!(
                 %sandbox_id,
@@ -3106,10 +3156,22 @@ impl FirecrackerBackend {
             },
         );
         if let Some(pid) = fc_pid {
-            spawn_process_supervisor(self.sandboxes.clone(), sandbox_id, pid, "firecracker");
+            spawn_process_supervisor(
+                self.sandboxes.clone(),
+                sandbox_id,
+                pid,
+                "firecracker",
+                self.supervisor_teardown_fn(),
+            );
         }
         if let Some(pid) = uffd_pid {
-            spawn_process_supervisor(self.sandboxes.clone(), sandbox_id, pid, "uffd-handler");
+            spawn_process_supervisor(
+                self.sandboxes.clone(),
+                sandbox_id,
+                pid,
+                "uffd-handler",
+                self.supervisor_teardown_fn(),
+            );
         }
         tracing::info!(
             %sandbox_id,
@@ -3647,6 +3709,30 @@ async fn read_smaps_rollup_pss_rss(pid: u32) -> Option<(u64, u64)> {
 /// then catches the absence on the next heartbeat tick and flips the
 /// owning session per the §3 policy.
 ///
+/// Issue #198: a bare map-remove is NOT enough. A Uffd-mode sandbox is
+/// watched by TWO supervisors over the SAME `sandbox_id` — one on
+/// `fc_pid`, one on `uffd_pid`. When only ONE of the pair dies (e.g. the
+/// uffd handler is OOM-killed — it's a prime OOM target since it holds
+/// page caches), the surviving sibling keeps running: FC then
+/// page-faults forever on any non-resident page (a dead handler can't
+/// service the userfaultfd), or a surviving handler blocks in
+/// `read_event()` after FC's mm is gone. Merely dropping the removed
+/// `LiveSandbox` kills nothing (ADR 0044 K2 removed `kill_on_drop`), and
+/// because the map entry is now gone, a later `destroy()` hits its
+/// idempotent early-return and reports success — leaving a wedged
+/// RAM-holding VM, a leaked allocator /30 + SNAT slot (→ `NetReserveFailed`
+/// on future restores of the same snapshot), and a `sandbox.json` that
+/// reattach re-adopts as live across a host-agent restart.
+///
+/// So when the prune actually removes the entry we hand the removed
+/// value to `on_prune`, which runs the SAME full teardown `destroy()`
+/// uses (`destroy_teardown`): SIGKILL the surviving sibling, free
+/// net/netns + the allocator slot, drop the cgroup, unlink the canonical
+/// symlinks + jail dir (incl. `sandbox.json`). The helper is
+/// double-teardown tolerant (ESRCH, already-deleted netns are ignored)
+/// because the supervisor races `destroy()` by design — only one of them
+/// wins the `remove`, and only the winner runs teardown.
+///
 /// Polling vs `child.wait()`: `wait()` requires `&mut Child`, which
 /// can't be shared with the existing destroy path. Polling is simpler
 /// and has acceptable latency (1s detection + 15s reconcile grace =
@@ -3663,12 +3749,17 @@ async fn read_smaps_rollup_pss_rss(pid: u32) -> Option<(u64, u64)> {
 /// load negligible: with N sandboxes the per-second syscall rate is
 /// N × 1. For a fully-loaded 50-sandbox host that's 50 syscalls/sec
 /// — invisible against the FC API + vsock I/O.
-fn spawn_process_supervisor<V: Send + Sync + 'static>(
+fn spawn_process_supervisor<V, F, Fut>(
     sandboxes: Arc<DashMap<SandboxId, V>>,
     sandbox_id: SandboxId,
     pid: u32,
     role: &'static str,
-) {
+    on_prune: F,
+) where
+    V: Send + Sync + 'static,
+    F: FnOnce(SandboxId, V) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -3707,13 +3798,21 @@ fn spawn_process_supervisor<V: Send + Sync + 'static>(
             // manual kill, etc.) — destroy() would have removed
             // the entry already, so this is the "supervisor wins
             // the race" path.
-            if sandboxes.remove(&sandbox_id).is_some() {
+            if let Some((_, live)) = sandboxes.remove(&sandbox_id) {
                 tracing::warn!(
                     %sandbox_id,
                     %pid,
                     role,
-                    "host-side VM supervisor (ADR 0009 §4) pruned unexpectedly-dead sandbox"
+                    "host-side VM supervisor (ADR 0009 §4) pruned unexpectedly-dead sandbox; \
+                     running full teardown to reap the surviving sibling + free host state (issue #198)"
                 );
+                // Issue #198: this is the ONLY owner of the removed
+                // `LiveSandbox` now — run the same kill/free/cleanup
+                // `destroy()` runs so the surviving sibling (FC when the
+                // handler died; the handler when FC died), its net/netns
+                // + allocator slot, cgroup, and jail dir (incl.
+                // `sandbox.json`) are all reaped instead of leaked.
+                on_prune(sandbox_id, live).await;
             } else {
                 tracing::debug!(
                     %sandbox_id,
@@ -5553,7 +5652,7 @@ mod tests {
             .expect("spawn sleep");
         let pid = child.id().expect("child has pid");
 
-        spawn_process_supervisor(sandboxes.clone(), id, pid, "test-sleep");
+        spawn_process_supervisor(sandboxes.clone(), id, pid, "test-sleep", |_id, ()| async {});
 
         // Initial: supervisor sees the pid alive, doesn't prune.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -5594,7 +5693,7 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id().expect("child has pid");
-        spawn_process_supervisor(sandboxes.clone(), id, pid, "test-sleep");
+        spawn_process_supervisor(sandboxes.clone(), id, pid, "test-sleep", |_id, ()| async {});
 
         child.kill().await.expect("kill child");
         let _ = child.wait().await;
@@ -5604,6 +5703,101 @@ mod tests {
         // weird state).
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!sandboxes.contains_key(&id));
+    }
+
+    /// Issue #198 regression: when a supervisor wins the prune race it
+    /// must hand the removed value to its teardown callback so the
+    /// surviving sibling process + host state get reaped — NOT drop the
+    /// value silently. Before the fix the prune was a bare
+    /// `sandboxes.remove(..)` with no callback at all, so the removed
+    /// `LiveSandbox` (owning the still-live FC `Child`) was dropped and,
+    /// post-ADR-0044-K2, killed nothing → wedged VM + leaked /30 +
+    /// re-adopted `sandbox.json`.
+    ///
+    /// Mirrors the real Uffd-mode topology: TWO supervisors over the
+    /// SAME id (one per pid). When one pid dies, exactly ONE of them
+    /// wins `remove` and runs teardown; the other observes the entry
+    /// already gone and is a no-op. We assert teardown fires exactly
+    /// once and receives the value we inserted.
+    #[tokio::test]
+    async fn supervisor_prune_runs_teardown_on_removed_value() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Value carries a sentinel so we can prove teardown got THE
+        // removed value, not a default/empty stand-in.
+        let sandboxes: Arc<DashMap<SandboxId, u64>> = Arc::new(DashMap::new());
+        let id = SandboxId::new();
+        let sentinel: u64 = 0xDEAD_BEEF;
+        sandboxes.insert(id, sentinel);
+
+        let teardown_calls = Arc::new(AtomicUsize::new(0));
+        let seen_value = Arc::new(parking_lot::Mutex::new(None::<u64>));
+
+        // A "fc-like" and a "uffd-like" supervisor over the same id,
+        // each watching a distinct real child pid — matching the two
+        // supervisors a Uffd-mode sandbox gets.
+        let mut child_a = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn sleep A");
+        let mut child_b = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn sleep B");
+        let pid_a = child_a.id().expect("child A has pid");
+        let pid_b = child_b.id().expect("child B has pid");
+
+        let mk_cb = || {
+            let calls = teardown_calls.clone();
+            let seen = seen_value.clone();
+            move |_id: SandboxId, removed: u64| {
+                let calls = calls.clone();
+                let seen = seen.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    *seen.lock() = Some(removed);
+                }
+            }
+        };
+
+        spawn_process_supervisor(sandboxes.clone(), id, pid_a, "fc-like", mk_cb());
+        spawn_process_supervisor(sandboxes.clone(), id, pid_b, "uffd-like", mk_cb());
+
+        // Kill BOTH children so BOTH supervisors observe ESRCH and race
+        // to `remove`. The fix must ensure exactly one teardown runs.
+        child_a.kill().await.expect("kill A");
+        let _ = child_a.wait().await;
+        child_b.kill().await.expect("kill B");
+        let _ = child_b.wait().await;
+
+        // Wait for the prune + teardown to land (1s poll + reap +
+        // callback). Generous deadline to stay non-flaky in CI.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !sandboxes.contains_key(&id) && teardown_calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            !sandboxes.contains_key(&id),
+            "entry must be pruned from the map"
+        );
+        // Exactly one teardown: the race winner removed the entry and
+        // ran teardown; the loser saw `None` and was a no-op. A second
+        // teardown would mean a double-free of host state.
+        assert_eq!(
+            teardown_calls.load(Ordering::SeqCst),
+            1,
+            "teardown must run exactly once (race winner only), not zero (old silent-drop bug) \
+             and not twice (double-free)"
+        );
+        assert_eq!(
+            *seen_value.lock(),
+            Some(sentinel),
+            "teardown must receive the exact LiveSandbox value that was removed",
+        );
     }
 
     // ---- cpu_template_from_env ------------------------------------------
