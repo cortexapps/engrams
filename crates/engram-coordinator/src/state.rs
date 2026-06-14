@@ -896,9 +896,19 @@ pub(crate) mod tests {
         /// require_host). Issue #209 tests assert this is cleared on
         /// every verb exit path — the default no-op trait impl would make
         /// such an assertion vacuous, so the mock tracks it for real.
-        pub(crate) teleport_targets:
-            PlMutex<std::collections::HashMap<SessionId, engram_core::HostId>>,
+        /// Issue #214: tracks the set-at timestamp alongside the pin so
+        /// the aged-pin scanner test can backdate one deterministically.
+        pub(crate) teleport_targets: PlMutex<TeleportPinMap>,
     }
+
+    /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
+    /// `teleport_targets` field. `session_id → (target_host, set_at?)` —
+    /// `set_at` is `None` only for a pin staged before issue #214's
+    /// migration (the scanner treats such a pin as not-aged).
+    pub(crate) type TeleportPinMap = std::collections::HashMap<
+        SessionId,
+        (engram_core::HostId, Option<chrono::DateTime<chrono::Utc>>),
+    >;
 
     /// Alias so the `clippy::type_complexity` lint stays happy on
     /// MiniMeta's leases field. Mirrors `session_lease`'s
@@ -1035,7 +1045,7 @@ pub(crate) mod tests {
             let mut t = self.teleport_targets.lock();
             match target {
                 Some(h) => {
-                    t.insert(id, h);
+                    t.insert(id, (h, Some(chrono::Utc::now())));
                 }
                 None => {
                     t.remove(&id);
@@ -1046,7 +1056,7 @@ pub(crate) mod tests {
         async fn get_teleport_target(
             &self,
             id: engram_core::SessionId,
-        ) -> Result<Option<HostId>, MetaError> {
+        ) -> Result<Option<(HostId, Option<chrono::DateTime<chrono::Utc>>)>, MetaError> {
             Ok(self.teleport_targets.lock().get(&id).copied())
         }
         async fn assign_session_sandbox(

@@ -63,6 +63,27 @@ use crate::api::snapshot::{bind_session_routing, finish_resume_to_active, Finish
 use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
 use crate::state::{SessionEvent, SharedState};
 
+/// Issue #214: max age of an operator teleport pin before the evac
+/// scanner treats it as a leak and ignores + clears it. A pin is meant
+/// to be consumed within one scanner tick (~seconds) of being set; one
+/// that survives 15 minutes can only have leaked from a path that set it
+/// without driving the session through `Evacuating`. Defense in depth
+/// behind the core teleport_session fix — degrades any future leak to
+/// default placement instead of a strict hijack.
+const TELEPORT_PIN_TTL: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Issue #214: is a teleport pin stamped at `set_at` old enough (as of
+/// `now`) to be treated as a leak? A `None` stamp (pin set before the
+/// 0065 migration) is never aged out — we keep honoring legacy pins.
+fn teleport_pin_aged(
+    set_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    set_at
+        .map(|t| now.signed_duration_since(t) > TELEPORT_PIN_TTL)
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Debug)]
 pub struct EvacResumerConfig {
     /// How often to sweep for Evacuating sessions. The scanner picks
@@ -277,8 +298,38 @@ async fn run_resume_pipeline(
     // ADR 0045 Phase F: an operator-pinned teleport destination, if any.
     // Honored strictly (a bad pin retries then falls back to Idle, never
     // silently lands elsewhere); cleared below once the session resolves.
+    //
+    // Issue #214 defense in depth: a pin is supposed to be consumed within
+    // seconds of being set (teleport marks the session Evacuating, the next
+    // scanner tick resolves it). A pin still present long after it was set
+    // is a LEAK — some path set it without the session ever entering
+    // Evacuating (the core fix closes the known teleport no-op path; this
+    // backstops any future one). Strictly honoring a stale pin would hijack
+    // this evacuation onto a possibly full/gone host, then burn the budget
+    // to a forced-Idle strand. Instead: ignore + clear + warn on an aged
+    // pin so this evacuation degrades to default capacity-ranked placement.
     let require_host = match state.services.meta.get_teleport_target(session_id).await {
-        Ok(t) => t,
+        Ok(Some((host, set_at))) => {
+            if teleport_pin_aged(set_at, Utc::now()) {
+                tracing::warn!(
+                    %session_id,
+                    stale_target = %host,
+                    set_at = ?set_at,
+                    ttl_secs = TELEPORT_PIN_TTL.num_seconds(),
+                    "evac-resumer: teleport pin older than TTL — treating as a leaked pin; \
+                     ignoring + clearing it, falling back to default placement (issue #214)",
+                );
+                let _ = state
+                    .services
+                    .meta
+                    .set_teleport_target(session_id, None)
+                    .await;
+                None
+            } else {
+                Some(host)
+            }
+        }
+        Ok(None) => None,
         Err(e) => {
             tracing::warn!(%session_id, error = %e,
                 "get_teleport_target failed; treating as unpinned");
@@ -584,6 +635,89 @@ mod tests {
             SessionState::Idle,
             "disk-only session with no enabled image must land at Idle \
              (re-enable image + /resume recovers), not burn the budget",
+        );
+    }
+
+    /// Issue #214: the aged-pin predicate. A fresh stamp is honored; one
+    /// past the TTL is a leak; a `None` stamp (legacy pin) is always
+    /// honored so the rollout doesn't drop in-flight pins.
+    #[test]
+    fn teleport_pin_aged_respects_ttl() {
+        let now = Utc::now();
+        assert!(
+            !teleport_pin_aged(Some(now), now),
+            "a just-set pin is not aged",
+        );
+        assert!(
+            !teleport_pin_aged(
+                Some(now - (TELEPORT_PIN_TTL - chrono::Duration::seconds(1))),
+                now
+            ),
+            "a pin just inside the TTL is honored",
+        );
+        assert!(
+            teleport_pin_aged(
+                Some(now - (TELEPORT_PIN_TTL + chrono::Duration::seconds(1))),
+                now
+            ),
+            "a pin past the TTL is treated as a leak",
+        );
+        assert!(
+            !teleport_pin_aged(None, now),
+            "a NULL stamp (pre-0065 legacy pin) is never aged out",
+        );
+    }
+
+    /// Issue #214 acceptance: a teleport pin older than the TTL is a leak.
+    /// The evac scanner must IGNORE it (not strictly pin this evacuation
+    /// onto the stale target) and CLEAR it (so it can't hijack a future
+    /// evacuation either). We observe the clear directly; the "ignore" is
+    /// implied because a structurally-recoverable session with a honored
+    /// pin to an unknown host would burn its budget, whereas this session
+    /// resolves on attempt 1 (structural fail-fast) with the pin gone.
+    #[tokio::test]
+    async fn aged_teleport_pin_is_ignored_and_cleared() {
+        let session = evacuating_session(None);
+        let session_id = session.id;
+        let (state, meta) = build_state(session.clone());
+
+        // Plant an aged pin straight into the mirror: a real leak from
+        // some path that set the pin >TTL ago without the session ever
+        // resolving off Evacuating. The set-at is backdated past the TTL.
+        let stale_target = engram_core::HostId::new();
+        meta.teleport_targets.lock().insert(
+            session_id,
+            (
+                stale_target,
+                Some(Utc::now() - (TELEPORT_PIN_TTL + chrono::Duration::minutes(1))),
+            ),
+        );
+
+        // No recoverable state → the pipeline fails fast to Dead, but the
+        // aged-pin check runs first (before evacuate_dead_source).
+        advance_one(&EvacResumerConfig::default(), &state, session, 0)
+            .await
+            .expect("advance_one swallows structural failures");
+
+        assert_eq!(
+            meta.get_teleport_target(session_id).await.unwrap(),
+            None,
+            "an aged (leaked) teleport pin must be cleared, not left to hijack \
+             a future evacuation",
+        );
+    }
+
+    /// Inverse of the above: a FRESH pin must NOT be cleared by the
+    /// aged-pin guard — it is consumed normally by the resolution path.
+    /// (Here the session fails structurally, so the pin is cleared by the
+    /// terminal-fail arm rather than the aged-pin arm; the point is the
+    /// aged-pin arm doesn't fire and warn on a healthy pin.) We assert the
+    /// predicate path: a freshly-stamped pin is observed as require_host.
+    #[test]
+    fn fresh_teleport_pin_is_not_aged() {
+        assert!(
+            !teleport_pin_aged(Some(Utc::now()), Utc::now()),
+            "a freshly-set teleport pin must be honored, never aged out",
         );
     }
 }

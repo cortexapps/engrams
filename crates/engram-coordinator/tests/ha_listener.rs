@@ -375,7 +375,8 @@ async fn cross_replica_scheduling_pins_and_tokens() {
         meta_b
             .get_teleport_target(session_id)
             .await
-            .expect("get via B"),
+            .expect("get via B")
+            .map(|(h, _set_at)| h),
         Some(h2),
         "B's scanner must honor A's pin"
     );
