@@ -67,16 +67,19 @@ export function makeEventsRoute(deps?: EventsDeps): Hono {
     await guardFn(c, "read");
 
     return streamSSE(c, async (stream) => {
-      // 2. Compute replay cursor: max(?since, Last-Event-ID), NaN-guarded.
-      //    Negative values (e.g. ?since=-1 from web/src/sse.ts) are treated
-      //    as "from start" — BigInt(-1) is not useful as a cursor.
-      const nums = [
-        c.req.query("since"),
-        c.req.header("last-event-id"),
-      ]
-        .map(Number)
-        .filter((n) => Number.isFinite(n) && n >= 0);
-      const since = nums.length ? BigInt(Math.max(...nums)) : undefined;
+      // 2. Compute replay cursor: max(?since, Last-Event-ID).
+      //    Parse as BigInt DIRECTLY from the string — the coordinator `idx`
+      //    is int64, so a `Number(...)` round-trip would silently lose
+      //    precision past 2^53 and resolve a reconnect to the wrong idx
+      //    (replayed/skipped events). Only non-negative integer strings
+      //    qualify; negatives (`?since=-1` "from start"), floats, and
+      //    non-numeric drop out → `undefined` ≡ from the start of the log.
+      const cursors = [c.req.query("since"), c.req.header("last-event-id")]
+        .filter((v): v is string => typeof v === "string" && /^\d+$/.test(v))
+        .map((v) => BigInt(v));
+      const since = cursors.length
+        ? cursors.reduce((a, b) => (b > a ? b : a))
+        : undefined;
 
       // 3. Open upstream server-stream. Pass the browser's AbortSignal so
       //    a client disconnect triggers RST on the upstream gRPC stream.
