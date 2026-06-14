@@ -213,26 +213,20 @@ mark fs_mounts_done
 # vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so
 # we do it here. Backend-aware by the guest's OWN address: VZ guests
 # get 192.168.64.x from Apple's DHCP and the NAT gateway
-# (192.168.64.1) answers DNS, so it goes first with 1.1.1.1 as
-# fallback. FC guests live in the 10.200/16 netns pool where
-# NOTHING answers on 192.168.64.1 — listing it first cost every
-# uncached lookup a ~5s first-nameserver timeout (and pushed
-# A+AAAA lookups past client budgets entirely; prod-found
-# 2026-06-12), so FC writes 1.1.1.1 only (the host's FORWARD
-# chain explicitly ACCEPTs VM→1.1.1.1:53). timeout:2/attempts:2
-# bounds the residual worst case on either backend. Skip if
+# (192.168.64.1) answers DNS, so it goes first (VZ dev has no egress
+# proxy). FC guests live in the 10.200/16 netns pool behind the
+# MANDATORY egress proxy (issue #240): the host iptables REDIRECTs
+# guest {udp,tcp}/53 to the filtering DNS proxy regardless of the
+# destination IP, and that proxy NXDOMAINs anything outside
+# `manifest.network.allow_hosts`. So FC points at its own gateway
+# (10.200.0.1, where the REDIRECT lives) — NOT a public resolver.
+# Writing `1.1.1.1` here used to be a DNS-tunnel exfiltration hatch
+# (a malicious harness encodes data into subdomains of an attacker-
+# controlled name); it's gone. Listing a dead 192.168.64.1 first on
+# FC cost every uncached lookup a ~5s first-nameserver timeout
+# (prod-found 2026-06-12), so FC writes the single gateway entry.
+# timeout:2/attempts:2 bounds the residual worst case. Skip if
 # /etc/resolv.conf already exists (operator override).
-#
-# FIXME(dns-exfil): the egress proxy enforces `manifest.network.
-# allow_hosts` for outbound *connections*, but DNS itself goes
-# straight to 1.1.1.1. A malicious harness can encode data into
-# subdomains of an attacker-controlled name and exfiltrate via DNS
-# queries even when the proxy blocks every TCP connection. Fix:
-# host the egress proxy on udp/53 as well, iptables-REDIRECT
-# guest→udp/53 there, and have it answer only for names in
-# `allow_hosts` (NXDOMAIN otherwise). For FC, that lets us also
-# drop the `ACCEPT VM→1.1.1.1 udp/53` rule. Until that lands, the
-# DNS path is an unfiltered side channel.
 mkdir -p /etc
 if [ ! -s /etc/resolv.conf ]; then
     # Shell-pure VZ detection (no ip/grep dependency — the shim only
@@ -249,9 +243,11 @@ if [ ! -s /etc/resolv.conf ]; then
         done < /proc/net/fib_trie
     fi
     if [ -n "$vz_nat" ]; then
-        printf 'nameserver 192.168.64.1\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n' > /etc/resolv.conf
+        printf 'nameserver 192.168.64.1\noptions timeout:2 attempts:2\n' > /etc/resolv.conf
     else
-        printf 'nameserver 1.1.1.1\noptions timeout:2 attempts:2\n' > /etc/resolv.conf
+        # FC: the gateway is where the host's DNS REDIRECT sends
+        # :53 to the filtering proxy. No public-resolver fallback.
+        printf 'nameserver 10.200.0.1\noptions timeout:2 attempts:2\n' > /etc/resolv.conf
     fi
 fi
 # /etc/hosts: a slim rootfs (debian-slim etc.) ships an empty one, so
@@ -1298,4 +1294,37 @@ async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// issue #240: the FC branch of the init shim's resolv.conf writer
+    /// must NOT hand the guest a public recursive resolver. With the
+    /// mandatory egress proxy, the host REDIRECTs guest :53 to the
+    /// filtering DNS proxy; the guest is pointed at its gateway
+    /// (10.200.0.1) where that REDIRECT lives, and a public-resolver
+    /// nameserver would be a DNS-tunnel exfiltration hatch. Before the
+    /// fix the shim wrote `nameserver 1.1.1.1` for FC; this guards the
+    /// regression.
+    #[test]
+    fn init_shim_fc_resolv_conf_has_no_public_resolver() {
+        // The FC (non-VZ) branch is the `else` that writes a single
+        // gateway nameserver. It must point at the netns gateway and
+        // carry no public resolver.
+        assert!(
+            DEFAULT_INIT_SHIM.contains("nameserver 10.200.0.1"),
+            "FC guest must resolve via its gateway (where the host DNS REDIRECT lives)",
+        );
+        assert!(
+            !DEFAULT_INIT_SHIM.contains("nameserver 1.1.1.1"),
+            "init shim must not write a public resolver (1.1.1.1) — DNS-exfil hatch (#240)",
+        );
+        // The stale FIXME(dns-exfil) is resolved and should be gone.
+        assert!(
+            !DEFAULT_INIT_SHIM.contains("FIXME(dns-exfil)"),
+            "the DNS-exfil FIXME is fixed; the stale marker should be removed",
+        );
+    }
 }

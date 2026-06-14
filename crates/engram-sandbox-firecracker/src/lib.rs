@@ -321,16 +321,17 @@ pub struct FirecrackerConfig {
     /// TCP port the host-side egress proxy listens on. When `Some`,
     /// `host_startup` REDIRECTs VM→tcp/443 to this port and applies
     /// a default-deny on FORWARD so the proxy is the only egress
-    /// path. When `None` (test/dev), VMs get open egress with the
-    /// standard hard-isolation drops.
+    /// path. In production this is ALWAYS `Some` — the egress proxy
+    /// is mandatory (issue #240). `None` is test/dev only and still
+    /// gets a FORWARD default-deny (no public-resolver hatch).
     pub egress_proxy_port: Option<u16>,
     /// UDP+TCP port the filtering DNS proxy listens on. Iptables
     /// REDIRECTs guest `{udp,tcp}/53` to this port so the proxy can
     /// enforce `manifest.network.allow_hosts` on resolution. Default
     /// 5353 (avoids systemd-resolved's 127.0.0.53:53 bind on hosts
-    /// that run it). Ignored when `egress_proxy_port` is `None` —
-    /// no-proxy mode keeps the legacy unconditional ACCEPT to
-    /// 1.1.1.1:53.
+    /// that run it). Ignored when `egress_proxy_port` is `None`
+    /// (test/dev only; that lane now applies a plain FORWARD
+    /// default-deny with no public-resolver ACCEPT — issue #240).
     pub egress_dns_port: Option<u16>,
     /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
     /// the FC sidecar JSON at snapshot time (so cross-host restore

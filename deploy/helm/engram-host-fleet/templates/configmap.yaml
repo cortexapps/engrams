@@ -50,3 +50,23 @@ data:
   {{- with .Values.storage.chunkCacheBudgetBytes }}
   ENGRAM_CHUNK_CACHE_BUDGET_BYTES: {{ . | quote }}
   {{- end }}
+  # ADR 0006 + issue #240: the egress proxy is MANDATORY. host-agent
+  # always binds it and FAILS TO START if it can't (CA unloadable /
+  # port unbindable). The K8s migration (ADR 0044 K5) dropped these
+  # when the GCE MIG was retired, leaving prod hosts with the binary
+  # default and unfiltered guest egress. `ENGRAM_EGRESS_PROXY_PORT`
+  # exists only to avoid a bind collision — there is no "0 = off".
+  ENGRAM_EGRESS_PROXY_PORT: {{ .Values.egress.port | default 8443 | quote }}
+  ENGRAM_EGRESS_CA_SOURCE: {{ .Values.egress.caSource | quote }}
+  {{- if eq .Values.egress.caSource "gcp-secret-manager" }}
+  {{- if not .Values.egress.caGcpCertSecret }}
+  {{- fail "egress.caGcpCertSecret is required when egress.caSource == gcp-secret-manager (issue #240)" }}
+  {{- end }}
+  {{- if not .Values.egress.caGcpKeySecret }}
+  {{- fail "egress.caGcpKeySecret is required when egress.caSource == gcp-secret-manager (issue #240)" }}
+  {{- end }}
+  # Secret Manager RESOURCE PATHS (not the secret values) — the
+  # host-agent's Workload Identity SA reads them at boot.
+  ENGRAM_EGRESS_CA_GCP_CERT_SECRET: {{ .Values.egress.caGcpCertSecret | quote }}
+  ENGRAM_EGRESS_CA_GCP_KEY_SECRET: {{ .Values.egress.caGcpKeySecret | quote }}
+  {{- end }}

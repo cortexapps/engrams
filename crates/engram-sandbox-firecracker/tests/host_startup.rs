@@ -103,16 +103,27 @@ async fn host_startup_no_proxy_is_idempotent_and_lacks_redirect() {
         dump.contains("engram-host-input"),
         "missing host-INPUT drop"
     );
-    assert!(dump.contains("engram-dns"), "missing DNS allow");
     assert!(dump.contains("engram-masq"), "missing MASQUERADE");
-    // No proxy mode → no REDIRECT, no default-deny.
+    // issue #240: the no-proxy lane closed the DNS-exfil hatch. There is
+    // no longer a public-resolver ACCEPT (the legacy `engram-dns` rule),
+    // and instead the lane applies the default-deny so no guest is ever
+    // left with an unfiltered egress route.
+    assert!(
+        !dump.contains("engram-dns"),
+        "no-proxy lane must not install a public-resolver DNS allow (DNS-exfil hatch closed)",
+    );
+    assert!(
+        dump.contains("engram-default-deny"),
+        "no-proxy lane must still close egress with the default-deny FORWARD DROP",
+    );
+    // No proxy mode → no REDIRECT (those belong to proxy mode only).
     assert!(
         !dump.contains("engram-proxy-redirect"),
         "REDIRECT should be absent under no-proxy mode",
     );
     assert!(
-        !dump.contains("engram-default-deny"),
-        "default-deny should be absent under no-proxy mode",
+        !dump.contains("engram-dns-redirect"),
+        "DNS REDIRECT should be absent under no-proxy mode",
     );
 
     cleanup();

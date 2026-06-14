@@ -88,8 +88,11 @@ pub struct HostAgent {
     pub cfg: HostAgentConfig,
     pub sandbox: Arc<dyn SandboxBackend>,
     pub cloud: Arc<dyn CloudBackend>,
-    /// ADR 0006: local egress proxy. `None` keeps egress unfiltered
-    /// (dev / explicit opt-out via `--egress-proxy-port=0`).
+    /// ADR 0006: local egress proxy. The production host-agent binary
+    /// ALWAYS attaches one (issue #240 made it mandatory — a host that
+    /// can't stand up the proxy refuses to start). `None` is reachable
+    /// only from in-process test harnesses and the non-FC dev backends
+    /// (VZ/Process), which carry no internet-facing guest network.
     pub egress: Option<Arc<egress::HostEgress>>,
     /// ADR 0007: chunk store + per-host materialization root. `None`
     /// keeps the legacy OCI-pulled `rootfs.ext4` path active (chunked

@@ -257,10 +257,12 @@ pub fn tap_name_for(sandbox_id: SandboxId) -> String {
 ///
 /// `proxy_port`: when Some, REDIRECT VM→tcp/443 to that port (the
 /// proxy runs on `127.0.0.1:port` per the coord wiring) AND apply a
-/// final FORWARD DROP so the proxy is the only egress path. When
-/// None (test/dev mode), VM egress to the public internet is
-/// allowed under the standard MASQUERADE; only host-LAN and
-/// inter-VM traffic is dropped.
+/// final FORWARD DROP so the proxy is the only egress path. In
+/// production this is ALWAYS Some — the egress proxy is mandatory
+/// (issue #240) and host-agent refuses to start without it. `None`
+/// is reachable only from in-process tests / non-FC dev backends; it
+/// still applies the final FORWARD DROP (no public-resolver ACCEPT),
+/// so no code path leaves a guest with an unfiltered DNS route.
 ///
 /// `dns_port`: when proxy mode is on, where the filtering DNS proxy
 /// is bound. Iptables REDIRECTs guest `{udp,tcp}/53` to this port
@@ -411,19 +413,19 @@ pub fn host_startup_lines(proxy_port: Option<u16>, dns_port: Option<u16>) -> Vec
              -m comment --comment engram-default-deny",
         ));
     } else {
-        // 4d. NO-PROXY mode: allow DNS to a public resolver
-        //     unconditionally (operator opted out of egress
-        //     filtering altogether, and DNS still has to work for
-        //     anything in the VM to function). The host-LAN drops
-        //     above already filtered private subnets, and
-        //     MASQUERADE makes return traffic find the right VM.
+        // 4d. NO-PROXY mode is reachable ONLY from in-process tests and
+        //     the non-FC dev backends that provision no guest network
+        //     (issue #240 removed the production opt-out: the egress
+        //     proxy is mandatory and host-agent fails to start without
+        //     it). There is deliberately NO public-resolver ACCEPT here
+        //     — an earlier `ACCEPT VM→1.1.1.1:53` was a DNS-tunnel
+        //     exfiltration channel. Apply the same default-deny so no
+        //     code path leaves a guest with an unfiltered route to a
+        //     public resolver. If a test genuinely needs egress, it
+        //     runs the real proxy with a permissive `allow_hosts`.
         out.push(format!(
-            "-A FORWARD -s {pool} -p udp --dport 53 -d {PUBLIC_DNS} \
-             -j ACCEPT -m comment --comment engram-dns",
-        ));
-        out.push(format!(
-            "-A FORWARD -s {pool} -p tcp --dport 53 -d {PUBLIC_DNS} \
-             -j ACCEPT -m comment --comment engram-dns",
+            "-A FORWARD -s {pool} -j DROP \
+             -m comment --comment engram-default-deny",
         ));
     }
 
@@ -441,8 +443,6 @@ pub fn host_startup_lines(proxy_port: Option<u16>, dns_port: Option<u16>) -> Vec
 /// `--fc-net-cidr 10.201.0.0/16` if they're already using
 /// `10.200.0.0/16` for something else.
 pub const ENGRAM_POOL_CIDR: &str = "10.200.0.0/16";
-
-const PUBLIC_DNS: &str = "1.1.1.1";
 
 /// Default port the filtering DNS proxy binds on. 5353 not 53 so
 /// the host's systemd-resolved (bound on 127.0.0.53:53) can keep
@@ -1491,19 +1491,26 @@ mod tests {
     }
 
     #[test]
-    fn host_startup_no_proxy_drops_lan_but_allows_internet() {
+    fn host_startup_no_proxy_default_denies_and_has_no_public_resolver() {
+        // issue #240: the no-proxy lane is test/dev only, and even it
+        // must never leave a guest with an unfiltered route. It keeps
+        // the hard-isolation drops AND applies the final FORWARD
+        // default-deny with NO public-resolver ACCEPT.
         let lines = host_startup_lines(None, None).join("\n");
         // Inter-VM block.
         assert!(lines.contains("-s 10.200.0.0/16 -d 10.200.0.0/16 -j DROP"));
         // Host-LAN drops.
         assert!(lines.contains("-d 10.0.0.0/8 -j DROP"));
         assert!(lines.contains("-d 192.168.0.0/16 -j DROP"));
-        // DNS allow.
-        assert!(lines.contains("--dport 53 -d 1.1.1.1"));
-        // No proxy redirect.
+        // No public-resolver ACCEPT — that was the DNS-exfil channel.
+        assert!(
+            !lines.contains("-d 1.1.1.1"),
+            "no code path may ACCEPT egress to a public resolver (DNS-exfil hatch closed)",
+        );
+        // No proxy redirect (no proxy_port supplied).
         assert!(!lines.contains("REDIRECT"));
-        // No final default-deny — internet egress is open.
-        assert!(!lines.contains("engram-default-deny"));
+        // Final default-deny present — egress is closed in every lane.
+        assert!(lines.contains("engram-default-deny"));
         // MASQUERADE present so return traffic reaches the VM.
         assert!(lines.contains("MASQUERADE"));
     }
@@ -1578,14 +1585,24 @@ mod tests {
     }
 
     #[test]
-    fn host_startup_no_proxy_keeps_dns_to_public_resolver() {
-        // The operator opted out of filtering altogether; we keep
-        // the legacy "DNS allowed to 1.1.1.1" path so the VM can
-        // resolve at all. The DNS-exfil hole is exactly the price
-        // of `--egress-proxy-port=0`.
+    fn host_startup_no_proxy_has_no_public_resolver_hatch() {
+        // issue #240 regression guard: the no-proxy lane (test/dev
+        // only — production always supplies a proxy_port) must NOT
+        // emit the legacy "DNS allowed to 1.1.1.1" ACCEPT. That rule
+        // was an open recursive resolver = a DNS-tunnel exfiltration
+        // channel. With egress now mandatory, this lane drops the
+        // hatch entirely. Before the fix this assertion fails (the
+        // rule was present); after, it passes.
         let lines = host_startup_lines(None, None).join("\n");
-        assert!(lines.contains("--dport 53 -d 1.1.1.1"));
+        assert!(
+            !lines.contains("--dport 53 -d 1.1.1.1"),
+            "no-proxy lane must not ACCEPT VM->1.1.1.1:53 (DNS-exfil hatch); \
+             egress is mandatory and the public-resolver path is gone",
+        );
+        // It also doesn't install REDIRECTs (those belong to proxy mode).
         assert!(!lines.contains("engram-dns-redirect"));
+        // But it DOES close egress with the default-deny.
+        assert!(lines.contains("engram-default-deny"));
     }
 
     #[test]
