@@ -766,6 +766,19 @@ impl HostAgent {
             // our host_addr column. Mandatory — the coord-side
             // GrpcHostPool can't dispatch to us until host_addr
             // lands. Background loop with exponential backoff.
+            //
+            // Issue #224: capture this task's JoinHandle so the SIGTERM
+            // path can ABORT it. It is the largest insert-after-sweep
+            // source: it awaits `rehydrate_survivors` (a multi-second
+            // pool-claim + GCS manifest fetch + netlink RECONFIGURE per
+            // survivor) AFTER registration succeeds, and an unaborted
+            // rehydrate can `nbd_sandboxes.insert` a survivor's live
+            // data plane after `abandon_nbd_data_planes_for_shutdown`
+            // already swept the (then-absent) entry. The terminal
+            // `abandoning` flag in PooledBackend is the correctness
+            // backstop, but aborting the task removes the race window
+            // entirely for the common case.
+            let mut registration_task: Option<tokio::task::JoinHandle<()>> = None;
             if let Some(advertise_addr) = self.cfg.grpc_advertise_addr.clone() {
                 // hostname: prefer the env-supplied value (set by
                 // the deployment / systemd unit on production
@@ -786,7 +799,7 @@ impl HostAgent {
                 };
                 let cc = coord_client.clone();
                 let pooled_for_rehydrate = pooled.clone();
-                tokio::spawn(async move {
+                registration_task = Some(tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_millis(500);
                     let cap = std::time::Duration::from_secs(30);
                     loop {
@@ -863,7 +876,7 @@ impl HostAgent {
                             }
                         }
                     }
-                });
+                }));
             }
 
             // ADR 0013: boot the gRPC HostService server. The
@@ -1324,6 +1337,21 @@ impl HostAgent {
             heartbeat_task.abort();
             eviction_task.abort();
             if let Some(t) = grpc_task {
+                t.abort();
+            }
+            // Issue #224: abort the registration/rehydrate task BEFORE
+            // the abandon sweep below. It is the largest insert-after-
+            // sweep source — its `rehydrate_survivors` await window can
+            // `nbd_sandboxes.insert` a survivor's live data plane after
+            // the sweep, which `NbdHandle::Drop` would then netlink-
+            // disconnect at process exit (the very "Disconnected due to
+            // user request → successor's RECONFIGURE meets 'not
+            // configured'" failure the K2 fix shipped to eliminate).
+            // The terminal `abandoning` flag set inside the sweep is the
+            // correctness backstop for the in-flight-gRPC and
+            // already-past-abort-point cases; this abort removes the
+            // common-case window outright.
+            if let Some(t) = registration_task.take() {
                 t.abort();
             }
 

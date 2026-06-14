@@ -242,9 +242,44 @@ impl Drop for NbdSlot {
         // Fire-and-forget release: clears the reserved bit so the
         // populator can re-validate and re-warm the slot. Spawned so
         // Drop never blocks on the lock.
-        tokio::spawn(async move {
-            allocator.release(slot).await;
-        });
+        //
+        // Issue #224: `tokio::spawn` PANICS when no runtime is current.
+        // During SIGTERM teardown the abandon path forgets the slot
+        // (`NbdSandboxState::abandon_for_shutdown`), but a straggler
+        // `NbdSandboxState` dropped the NORMAL way after `run()` returns
+        // — once the runtime has begun dropping — would hit this Drop
+        // with no current runtime: the panic-in-Drop aborts the whole
+        // process (`SIGABRT`) instead of the clean exit the K2 contract
+        // needs. Guard with `Handle::try_current()`: spawn onto the
+        // runtime when one is live (the steady-state destroy path), else
+        // run the release on a detached std thread (block_on a tiny
+        // current-thread runtime). If the pool is dying with the process
+        // the release is a no-op-in-effect, but the thread fallback is
+        // panic-free either way.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    allocator.release(slot).await;
+                });
+            }
+            Err(_) => {
+                // No current runtime (process teardown). Don't panic;
+                // release on a detached thread with its own minimal
+                // runtime so the reserved bit still clears if we're
+                // somehow not actually exiting.
+                std::thread::Builder::new()
+                    .name(format!("nbd-slot-release-{slot}"))
+                    .spawn(move || {
+                        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            rt.block_on(allocator.release(slot));
+                        }
+                    })
+                    .ok();
+            }
+        }
     }
 }
 

@@ -747,6 +747,7 @@ jobs:
             --test nbd_chunked_disk \
             --test nbd_netlink_reconfigure \
             --test nbd_restore_cancel \
+            --test nbd_shutdown_abandon_race \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
