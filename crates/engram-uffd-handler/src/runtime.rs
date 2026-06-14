@@ -296,7 +296,26 @@ impl Runtime {
         // x86 and 16 KiB on aarch64; per-region the kernel guarantees
         // this is consistent.
         let page_size = mappings.first().map(|m| m.page_size as u64).unwrap_or(4096);
-        let chunk_count = backend.total_bytes().div_ceil(backend.chunk_size()) as usize;
+        let chunk_size = backend.chunk_size();
+        let chunk_count = backend.total_bytes().div_ceil(chunk_size) as usize;
+
+        // A chunk that straddles a region boundary must install across
+        // both regions (`install_spanning`). Misaligned boundaries are
+        // expected on FC x86 (the BIOS hole at 640 KiB is not 512 KiB-
+        // chunk-aligned), so this is a visibility breadcrumb, not an
+        // error — but it's the precise condition the spanning install
+        // exists to handle, so flag it if a future layout introduces one.
+        for w in mappings.windows(2) {
+            let boundary = w[0].offset + w[0].size as u64;
+            if !boundary.is_multiple_of(chunk_size) {
+                tracing::debug!(
+                    boundary,
+                    chunk_size,
+                    "region boundary is not chunk-aligned; chunks spanning it \
+                     install across regions via install_spanning"
+                );
+            }
+        }
         let vcpu_count = u32::try_from(mappings.len()).unwrap_or(u32::MAX);
         let recorder = Arc::new(Mutex::new(WorkingSetRecorder::new(
             vcpu_count,
@@ -544,11 +563,129 @@ impl Runtime {
         Ok(())
     }
 
+    /// Atomically claim the per-chunk `installed` bit for `chunk_idx`.
+    /// Returns `true` if WE claimed it (caller must install), `false`
+    /// if a prior install already owns it (caller short-circuits to a
+    /// wake). The bit is set under the lock so concurrent prefault /
+    /// fault / drain installs serialise to exactly one install per
+    /// chunk. On a subsequent install failure the caller MUST call
+    /// `release_chunk` so the chunk stays retryable.
+    fn claim_chunk(&self, chunk_idx: usize) -> bool {
+        let mut installed = self.installed.lock().expect("installed bitmap poisoned");
+        match installed.get_mut(chunk_idx) {
+            Some(slot) if *slot => false,
+            Some(slot) => {
+                *slot = true;
+                true
+            }
+            // Out-of-range index: treat as "claimed" so the caller
+            // proceeds and the subsequent locate_offset surfaces the
+            // real out-of-bounds error rather than silently looping.
+            None => true,
+        }
+    }
+
+    /// Roll back a `claim_chunk` after a failed install so the chunk
+    /// can be re-claimed and retried (closes the bit-set-before-install
+    /// permanent-loss window).
+    fn release_chunk(&self, chunk_idx: usize) {
+        let mut installed = self.installed.lock().expect("installed bitmap poisoned");
+        if let Some(slot) = installed.get_mut(chunk_idx) {
+            *slot = false;
+        }
+    }
+
+    /// Smallest mapped file offset `>= from` across all regions, or
+    /// `None` if no region covers any offset at or after `from`. Used
+    /// to skip inter-region file gaps when walking a chunk that the
+    /// mappings don't cover contiguously.
+    fn next_mapped_offset(&self, from: u64) -> Option<u64> {
+        self.mappings
+            .iter()
+            .filter_map(|m| {
+                let end = m.offset + m.size as u64;
+                if from < end {
+                    Some(m.offset.max(from))
+                } else {
+                    None
+                }
+            })
+            .min()
+    }
+
+    /// Install a chunk's worth of bytes over the file-offset range
+    /// `[byte_offset, byte_offset + total_len)`, walking *every* region
+    /// the range touches.
+    ///
+    /// A chunk can straddle an FC memory-region boundary (FC x86 splits
+    /// guest RAM around the BIOS hole at 640 KiB, which is not aligned
+    /// to the 512 KiB memory chunk size). A single `locate_offset` only
+    /// finds the region containing the chunk *start*, so clamping to
+    /// that region's tail leaves the spillover into the next region(s)
+    /// permanently uninstalled — and since the per-chunk `installed` bit
+    /// would be set, no later fault ever repairs it (the fault path
+    /// rounds down to the same chunk start, short-circuits on the bit,
+    /// and `wake_page`s a still-missing page → fault/wake livelock).
+    ///
+    /// For each region segment this resolves `(host_va, room_to_eom)`
+    /// via `locate_offset` and calls `install_seg(host_va, seg_len)` —
+    /// the caller supplies the actual ioctl (COPY / ZEROPAGE / CONTINUE)
+    /// and the source-byte slicing keyed off the in-chunk offset
+    /// (passed as `chunk_pos`). File ranges genuinely absent from the
+    /// mappings (inter-region gaps) are skipped.
+    ///
+    /// The caller is responsible for setting the per-chunk `installed`
+    /// bit only *after* this returns `Ok`, so a mid-walk error leaves
+    /// the bit clear and the chunk retryable.
+    fn install_spanning<F>(
+        &self,
+        byte_offset: u64,
+        total_len: u64,
+        mut install_seg: F,
+    ) -> Result<(), HandlerError>
+    where
+        // (host_va, segment_len, chunk_pos) -> Result<(), _>
+        // `chunk_pos` is the offset of this segment from `byte_offset`
+        // (i.e. where in the chunk's source buffer the bytes start).
+        F: FnMut(u64, usize, usize) -> Result<(), HandlerError>,
+    {
+        let end = byte_offset + total_len;
+        let mut cursor = byte_offset;
+        while cursor < end {
+            let Some((_m, host_va, room_to_eom)) = locate_offset(&self.mappings, cursor) else {
+                // `cursor` falls in an inter-region gap (a file range no
+                // mapping covers). Skip ahead to the next mapped offset
+                // still inside this chunk; if there is none, we're done.
+                match self.next_mapped_offset(cursor) {
+                    Some(next) if next < end => {
+                        cursor = next;
+                        continue;
+                    }
+                    _ => break,
+                }
+            };
+            let remaining = end - cursor;
+            let seg_len = std::cmp::min(remaining, room_to_eom) as usize;
+            debug_assert!(
+                seg_len.is_multiple_of(self.page_size as usize),
+                "segment install length must be page-aligned"
+            );
+            let chunk_pos = (cursor - byte_offset) as usize;
+            install_seg(host_va, seg_len, chunk_pos)?;
+            cursor += seg_len as u64;
+        }
+        Ok(())
+    }
+
     /// Install `bytes` (a full chunk) at the given session byte
     /// offset, copying into the guest's UFFD-registered region via
-    /// one `UFFDIO_COPY`. `wake` controls whether vCPUs blocked on
+    /// `UFFDIO_COPY`. `wake` controls whether vCPUs blocked on
     /// pages in this range are woken (`true` during the fault loop,
     /// `false` during prefault when no vCPU is blocked yet).
+    ///
+    /// Walks every region the chunk touches (see `install_spanning`):
+    /// a chunk straddling an FC region boundary is installed in full,
+    /// not clamped to the first region.
     ///
     /// Returns `Ok(true)` if we installed; `Ok(false)` if the chunk
     /// was already installed (idempotent path).
@@ -561,44 +698,37 @@ impl Runtime {
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
 
-        // First, the cheap idempotency check — avoid syscalls and
-        // EEXIST round-trips entirely if a prior install already
-        // covered this chunk.
-        {
-            let mut installed = self.installed.lock().expect("installed bitmap poisoned");
-            if let Some(slot) = installed.get_mut(chunk_idx) {
-                if *slot {
-                    return Ok(false);
-                }
-                *slot = true;
+        // Cheap idempotency claim — avoid syscalls and EEXIST round-
+        // trips entirely if a prior install already covered this chunk.
+        if !self.claim_chunk(chunk_idx) {
+            return Ok(false);
+        }
+
+        // The chunk's bytes occupy file offsets
+        // [byte_offset, byte_offset + total_len). Walk every region the
+        // range touches so a boundary-spanning chunk installs in FULL,
+        // copying the matching slice of `bytes` into each segment.
+        let total_len = std::cmp::min(chunk_size, bytes.len() as u64);
+        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, pos| {
+            // SAFETY: `bytes[pos..pos+seg_len]` is in bounds
+            // (`install_spanning` never advances past `total_len`, which
+            // is clamped to `bytes.len()`). `host_va` is a guest-visible
+            // address in a UFFD-registered region we hold copy access
+            // to. UFFDIO_COPY installs the PTE + wakes per page atomically.
+            unsafe {
+                self.uffd.copy(
+                    bytes[pos..pos + seg_len].as_ptr() as *const _,
+                    host_va as *mut std::ffi::c_void,
+                    seg_len,
+                    wake,
+                )?;
             }
+            Ok(())
+        });
+        if result.is_err() {
+            self.release_chunk(chunk_idx);
         }
-
-        let (_m, host_va, room_to_eom) = locate_offset(&self.mappings, byte_offset)
-            .ok_or(HandlerError::AddressOutsideRegions(byte_offset))?;
-
-        // Install the smaller of (chunk_size, remaining mapping size,
-        // bytes.len()). Cross-region chunks are unusual but tolerated
-        // by clamping to the current region's tail; the next
-        // (mis-aligned) region's fault will install its own chunk.
-        let install_len =
-            std::cmp::min(std::cmp::min(chunk_size, room_to_eom), bytes.len() as u64) as usize;
-        debug_assert!(install_len.is_multiple_of(self.page_size as usize));
-
-        // SAFETY: `bytes.as_ptr()` is valid for `install_len` bytes
-        // (we just clamped). `host_va` is a guest-visible address
-        // in a UFFD-registered region we own a copy access to via
-        // the kernel. UFFDIO_COPY semantics handle the page table
-        // entry install + wake atomically per page.
-        unsafe {
-            self.uffd.copy(
-                bytes.as_ptr() as *const _,
-                host_va as *mut std::ffi::c_void,
-                install_len,
-                wake,
-            )?;
-        }
-        Ok(true)
+        result.map(|()| true)
     }
 
     /// Install a zero-filled chunk: `UFFDIO_ZEROPAGE` over the
@@ -610,30 +740,32 @@ impl Runtime {
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
 
-        {
-            let mut installed = self.installed.lock().expect("installed bitmap poisoned");
-            if let Some(slot) = installed.get_mut(chunk_idx) {
-                if *slot {
-                    return Ok(false);
-                }
-                *slot = true;
+        if !self.claim_chunk(chunk_idx) {
+            return Ok(false);
+        }
+
+        // Zero the chunk's whole [byte_offset, +total_len) range,
+        // walking every region it spans (clamped to the manifest's
+        // total so the final partial chunk doesn't overrun).
+        let total_len = std::cmp::min(
+            chunk_size,
+            self.backend.total_bytes().saturating_sub(byte_offset),
+        );
+        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, _pos| {
+            // SAFETY: `host_va` is a guest-visible address in a UFFD-
+            // registered region we hold zeropage access to. ZEROPAGE
+            // installs zero pages over the range + wakes blocked vCPUs
+            // atomically per page when `wake`.
+            unsafe {
+                self.uffd
+                    .zeropage(host_va as *mut std::ffi::c_void, seg_len, wake)?;
             }
+            Ok(())
+        });
+        if result.is_err() {
+            self.release_chunk(chunk_idx);
         }
-
-        let (_m, host_va, room_to_eom) = locate_offset(&self.mappings, byte_offset)
-            .ok_or(HandlerError::AddressOutsideRegions(byte_offset))?;
-        let install_len = std::cmp::min(chunk_size, room_to_eom) as usize;
-        debug_assert!(install_len.is_multiple_of(self.page_size as usize));
-
-        // SAFETY: `host_va` is a guest-visible address in a UFFD-
-        // registered region we hold copy/zeropage access to. ZEROPAGE
-        // installs zero pages over the range + wakes blocked vCPUs
-        // atomically per page when `wake`.
-        unsafe {
-            self.uffd
-                .zeropage(host_va as *mut std::ffi::c_void, install_len, wake)?;
-        }
-        Ok(true)
+        result.map(|()| true)
     }
 
     /// ADR 0045 substrate (v2b): install a canonical chunk by ensuring the
@@ -651,58 +783,63 @@ impl Runtime {
     ) -> Result<bool, HandlerError> {
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
-        {
-            let mut installed = self.installed.lock().expect("installed bitmap poisoned");
-            if let Some(slot) = installed.get_mut(chunk_idx) {
-                if *slot {
-                    return Ok(false);
-                }
-                *slot = true;
-            }
+        if !self.claim_chunk(chunk_idx) {
+            return Ok(false);
         }
 
-        let (_m, host_va, room_to_eom) = locate_offset(&self.mappings, byte_offset)
-            .ok_or(HandlerError::AddressOutsideRegions(byte_offset))?;
         let populate_len = std::cmp::min(
             chunk_size,
             self.backend.total_bytes().saturating_sub(byte_offset),
         );
+        // Ensure the base shm holds this chunk's bytes (file-offset
+        // keyed — independent of the region layout) before we map them.
+        // On failure release the claim so the chunk stays retryable.
         if !base.is_populated(byte_offset, populate_len) {
-            let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
-            base.write_chunk(byte_offset, &bytes)
-                .map_err(HandlerError::BaseShm)?;
-        }
-
-        let install_len =
-            std::cmp::min(std::cmp::min(chunk_size, room_to_eom), populate_len) as usize;
-        debug_assert!(install_len.is_multiple_of(self.page_size as usize));
-        // CONTINUE the whole range in one ioctl; the kernel may map a prefix
-        // and return EAGAIN-with-progress (surfaced by the crate as
-        // Ok(mapped < len)) — loop the remainder. EEXIST means a racing
-        // prefault/fault already mapped a page; treat as installed.
-        let mut done: u64 = 0;
-        while (done as usize) < install_len {
-            let start = host_va + done;
-            let len = install_len as u64 - done;
-            // (`Uffd::continue` is a safe wrapper — the range lies inside a
-            // UFFD-registered region whose backing pages we just ensured
-            // are present in the base file's page cache.)
-            match self
-                .uffd
-                .r#continue(start as *mut std::ffi::c_void, len as usize, wake)
-            {
-                Ok(0) => break, // defensive: no progress
-                Ok(mapped) => done += mapped,
-                Err(userfaultfd::Error::SystemError(e)) if e as i32 == libc::EEXIST => {
-                    // Page(s) already mapped (racing fault). The kernel
-                    // stops at the first conflict without reporting
-                    // progress; skip one page and keep going.
-                    done += self.page_size;
+            let bytes = match self.handle.block_on(self.backend.fetch_chunk(hash)) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.release_chunk(chunk_idx);
+                    return Err(e.into());
                 }
-                Err(e) => return Err(HandlerError::Uffd(e)),
+            };
+            if let Err(e) = base.write_chunk(byte_offset, &bytes) {
+                self.release_chunk(chunk_idx);
+                return Err(HandlerError::BaseShm(e));
             }
         }
-        Ok(true)
+
+        // CONTINUE each region segment the chunk spans. Per segment the
+        // kernel may map a prefix and return progress (looped) and may
+        // EEXIST on a page a racing fault already mapped.
+        let result = self.install_spanning(byte_offset, populate_len, |host_va, seg_len, _pos| {
+            let mut done: u64 = 0;
+            while (done as usize) < seg_len {
+                let start = host_va + done;
+                let len = seg_len as u64 - done;
+                // (`Uffd::continue` is a safe wrapper — the range lies inside a
+                // UFFD-registered region whose backing pages we just ensured
+                // are present in the base file's page cache.)
+                match self
+                    .uffd
+                    .r#continue(start as *mut std::ffi::c_void, len as usize, wake)
+                {
+                    Ok(0) => break, // defensive: no progress
+                    Ok(mapped) => done += mapped,
+                    Err(userfaultfd::Error::SystemError(e)) if e as i32 == libc::EEXIST => {
+                        // Page(s) already mapped (racing fault). The kernel
+                        // stops at the first conflict without reporting
+                        // progress; skip one page and keep going.
+                        done += self.page_size;
+                    }
+                    Err(e) => return Err(HandlerError::Uffd(e)),
+                }
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.release_chunk(chunk_idx);
+        }
+        result.map(|()| true)
     }
 
     /// ADR 0045 substrate (v2b): zero canonical chunks. Try
@@ -711,52 +848,57 @@ impl Runtime {
     /// mappings, in which case fall back to a private COPY of a zeroed
     /// buffer (correct, costs one private page per touched page).
     fn install_zero_substrate(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
+        use std::sync::atomic::Ordering;
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
-        {
-            let mut installed = self.installed.lock().expect("installed bitmap poisoned");
-            if let Some(slot) = installed.get_mut(chunk_idx) {
-                if *slot {
-                    return Ok(false);
-                }
-                *slot = true;
-            }
+        if !self.claim_chunk(chunk_idx) {
+            return Ok(false);
         }
-        let (_m, host_va, room_to_eom) = locate_offset(&self.mappings, byte_offset)
-            .ok_or(HandlerError::AddressOutsideRegions(byte_offset))?;
-        let install_len = std::cmp::min(chunk_size, room_to_eom) as usize;
 
-        use std::sync::atomic::Ordering;
-        if self.zeropage_ok.load(Ordering::Relaxed) {
-            // SAFETY: range is inside a registered region (as above).
-            match unsafe {
-                self.uffd
-                    .zeropage(host_va as *mut std::ffi::c_void, install_len, wake)
-            } {
-                Ok(_) => return Ok(true),
-                Err(userfaultfd::Error::ZeropageFailed(errno))
-                    if errno as i32 == libc::EINVAL || errno as i32 == libc::EOPNOTSUPP =>
-                {
-                    self.zeropage_ok.store(false, Ordering::Relaxed);
-                    tracing::info!(
-                        "UFFDIO_ZEROPAGE unsupported on the substrate mapping;                          falling back to COPY-of-zeros"
-                    );
+        // Walk every region the chunk spans (clamped to the manifest's
+        // total). Per segment try ZEROPAGE; on a kernel that rejects it
+        // for this MAP_PRIVATE file mapping, fall back to a COPY of a
+        // zeroed buffer for that segment and every later one.
+        let total_len = std::cmp::min(
+            chunk_size,
+            self.backend.total_bytes().saturating_sub(byte_offset),
+        );
+        let result = self.install_spanning(byte_offset, total_len, |host_va, seg_len, _pos| {
+            if self.zeropage_ok.load(Ordering::Relaxed) {
+                // SAFETY: range is inside a registered region.
+                match unsafe {
+                    self.uffd
+                        .zeropage(host_va as *mut std::ffi::c_void, seg_len, wake)
+                } {
+                    Ok(_) => return Ok(()),
+                    Err(userfaultfd::Error::ZeropageFailed(errno))
+                        if errno as i32 == libc::EINVAL || errno as i32 == libc::EOPNOTSUPP =>
+                    {
+                        self.zeropage_ok.store(false, Ordering::Relaxed);
+                        tracing::info!(
+                            "UFFDIO_ZEROPAGE unsupported on the substrate mapping;                          falling back to COPY-of-zeros"
+                        );
+                    }
+                    Err(e) => return Err(HandlerError::Uffd(e)),
                 }
-                Err(e) => return Err(HandlerError::Uffd(e)),
             }
+            let zeros = bytes::Bytes::from(vec![0u8; seg_len]);
+            // SAFETY: zeroed buffer of seg_len; same contract as
+            // install_chunk_at's copy.
+            unsafe {
+                self.uffd.copy(
+                    zeros.as_ptr() as *const _,
+                    host_va as *mut std::ffi::c_void,
+                    seg_len,
+                    wake,
+                )?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.release_chunk(chunk_idx);
         }
-        let zeros = bytes::Bytes::from(vec![0u8; install_len]);
-        // SAFETY: zeroed buffer of install_len; same contract as
-        // install_chunk_at's copy.
-        unsafe {
-            self.uffd.copy(
-                zeros.as_ptr() as *const _,
-                host_va as *mut std::ffi::c_void,
-                install_len,
-                wake,
-            )?;
-        }
-        Ok(true)
+        result.map(|()| true)
     }
 
     /// Run forever, draining events from the UFFD and serving each
@@ -1715,5 +1857,188 @@ mod tests {
             );
         }
         unsafe { libc::munmap(ptr, len) };
+    }
+
+    /// Regression for the cross-region partial-install livelock
+    /// (issue #205). FC splits guest RAM into multiple mappings whose
+    /// VAs are non-contiguous (the BIOS hole) while the *file* offsets
+    /// stay contiguous. A memory chunk straddling a region boundary
+    /// used to be `UFFDIO_COPY`'d only up to the first region's tail,
+    /// yet marked fully installed — so the spillover into the next
+    /// region was never installed by any path and a fault there spun
+    /// forever (bit set → wake a still-missing page → refault).
+    ///
+    /// Layout mirrors `proto::deserializes_multiple_regions`: region A
+    /// holds file [0, BOUNDARY) at one VA; region B holds the rest at a
+    /// DIFFERENT VA (a gap between them). With a chunk size larger than
+    /// BOUNDARY, chunk 0 spans the boundary. We exercise every install
+    /// path (copy / zero / drain) and assert BOTH segments land and a
+    /// fault on the region-B tail makes progress (no livelock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn boundary_spanning_chunk_installs_across_both_regions() {
+        let page_size = 4096u64;
+        // 2 pages/chunk; the region boundary lands mid-chunk-0 (1 page in).
+        let chunk_size = 2 * page_size; // 8192
+        let boundary = page_size; // region A = file [0, 4096)
+        let total = 3 * page_size; // 12288: chunk0 [0,8192) spans, chunk1 [8192,12288) partial
+        let region_b_size = total - boundary; // 8192
+
+        // Plant content: chunk i = byte (i+1) repeated, into a local store.
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob);
+        let n_chunks = total.div_ceil(chunk_size) as usize; // 2
+        let mut entries = Vec::with_capacity(n_chunks);
+        for i in 0..n_chunks {
+            let off = i as u64 * chunk_size;
+            let this_len = std::cmp::min(chunk_size, total - off) as usize;
+            let tag = (i as u8).wrapping_add(1);
+            let hash = store.put_chunk(&vec![tag; this_len]).await.unwrap();
+            entries.push(ChunkRef { offset: off, hash });
+        }
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes: total,
+            chunks: entries,
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend = Arc::new(
+            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+        );
+
+        // Two SEPARATE mmaps → naturally non-contiguous VAs (the gap),
+        // contiguous file offsets via the `offset` field. This is the
+        // production layout the single-region tests never reproduced.
+        let map = |sz: usize| -> *mut std::ffi::c_void {
+            unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    sz,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            }
+        };
+        let ptr_a = map(boundary as usize);
+        let ptr_b = map(region_b_size as usize);
+        assert_ne!(ptr_a, libc::MAP_FAILED, "mmap A failed");
+        assert_ne!(ptr_b, libc::MAP_FAILED, "mmap B failed");
+
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(true)
+            .create()
+        {
+            Ok(u) => u,
+            Err(e) => {
+                unsafe { libc::munmap(ptr_a, boundary as usize) };
+                unsafe { libc::munmap(ptr_b, region_b_size as usize) };
+                eprintln!(
+                    "SKIP: cannot create userfaultfd ({e}); kernel forbids unprivileged uffd"
+                );
+                return;
+            }
+        };
+        uffd.register(ptr_a, boundary as usize)
+            .expect("register region A");
+        uffd.register(ptr_b, region_b_size as usize)
+            .expect("register region B");
+
+        let mappings = vec![
+            GuestRegionUffdMapping {
+                base_host_virt_addr: ptr_a as u64,
+                size: boundary as usize,
+                offset: 0,
+                page_size: page_size as usize,
+            },
+            GuestRegionUffdMapping {
+                base_host_virt_addr: ptr_b as u64,
+                size: region_b_size as usize,
+                offset: boundary, // file offsets stay contiguous
+                page_size: page_size as usize,
+            },
+        ];
+        let rt = Arc::new(
+            Runtime::new(
+                mappings,
+                uffd,
+                backend,
+                tokio::runtime::Handle::current(),
+                Duration::ZERO,
+                None,
+            )
+            .unwrap(),
+        );
+
+        // Fault on region A (file offset 0) → the fault loop resolves
+        // chunk 0 and installs it. chunk 0's file range [0, 8192) spans
+        // the boundary @ 4096. block_on inside serve_pagefault → run it
+        // on a plain thread, exactly like the handler's blocking loop.
+        let rt_i = Arc::clone(&rt);
+        let ptr_a_addr = ptr_a as u64;
+        std::thread::spawn(move || {
+            rt_i.serve_pagefault(ptr_a_addr)
+                .expect("install chunk 0 via fault on region A");
+        })
+        .join()
+        .unwrap();
+
+        // Region A (file [0,4096)) AND region B's first page (file
+        // [4096,8192)) must both hold chunk-0's content (tag 1). Before
+        // the fix, region B's segment was never installed.
+        let view_a = unsafe { std::slice::from_raw_parts(ptr_a as *const u8, boundary as usize) };
+        assert!(
+            view_a.iter().all(|b| *b == 1),
+            "region A segment of chunk 0 must be installed"
+        );
+        let view_b =
+            unsafe { std::slice::from_raw_parts(ptr_b as *const u8, region_b_size as usize) };
+        assert!(
+            view_b[0..page_size as usize].iter().all(|b| *b == 1),
+            "region B segment of chunk 0 must be installed (was the livelock bug)"
+        );
+
+        // A fault on the region-B tail of chunk 0 (file offset 4096)
+        // must make progress: chunk already installed → wake, NOT spin
+        // on a missing page. (The page is present now, so wake returns
+        // cleanly; pre-fix the page was missing and the vCPU would
+        // refault forever.) Then serve the partial chunk 1, which lives
+        // entirely in region B at file [8192,12288) → VA ptr_b +
+        // (8192-4096): the "fault rounds to chunk start in region B" path.
+        // Both off the tokio workers (serve_pagefault may block_on).
+        let rt_f = Arc::clone(&rt);
+        let ptr_b_addr = ptr_b as u64;
+        let tail_off = chunk_size - boundary;
+        std::thread::spawn(move || {
+            rt_f.serve_pagefault(ptr_b_addr)
+                .expect("fault on region-B tail must make progress");
+            rt_f.serve_pagefault(ptr_b_addr + tail_off)
+                .expect("serve chunk 1");
+        })
+        .join()
+        .unwrap();
+        assert!(
+            view_b[(chunk_size - boundary) as usize..]
+                .iter()
+                .all(|b| *b == 2),
+            "chunk 1 (region-B-only) content"
+        );
+
+        assert!(
+            rt.installed.lock().unwrap().iter().all(|b| *b),
+            "every chunk installed"
+        );
+
+        unsafe { libc::munmap(ptr_a, boundary as usize) };
+        unsafe { libc::munmap(ptr_b, region_b_size as usize) };
     }
 }
