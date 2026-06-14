@@ -601,8 +601,61 @@ async fn create_session_inner(
     };
 
     // -------- Boot on the reserved host --------
-    match crate::session_boot::boot_on_reserved_host(&state, inputs, host_id).await {
-        Ok(()) => Ok((
+    //
+    // Issue #210: DETACH the boot pipeline from the cancellable request
+    // future. `boot_on_reserved_host` makes a LIVE sandbox in
+    // `restore_base_on_host` (session_boot.rs) and only later records it via
+    // `create_session_created`; the compensating `host.destroy` runs solely
+    // on the row-insert `Err` arm, never on a dropped future. Awaited INLINE,
+    // a client disconnect between the restore and the insert (a slow restore,
+    // up to a 240s deadline) drops the future: a running sandbox is left with
+    // no recorded binding AND the disposition below — which releases the
+    // `pending` reservation / fails the session — never runs, so the reserved
+    // capacity stays pinned too.
+    //
+    // Mirror the resume lane (and ADR 0034 / the #208 teleport detachment):
+    // run the boot AND its full disposition in a `tokio::spawn`ed task so the
+    // sandbox is always recorded or torn down and the reservation is always
+    // released, regardless of the request's fate. The handler awaits the
+    // JoinHandle only to shape the connected client's response.
+    let st = state.clone();
+    let boot_handle = tokio::spawn(async move {
+        match crate::session_boot::boot_on_reserved_host(&st, inputs, host_id).await {
+            Ok(()) => Ok(()),
+            Err(crate::session_boot::BootError::NotStarted(e)) => {
+                // The sandbox never came up (or was torn down on the insert
+                // failure); release the reservation row so the host's free
+                // capacity is restored at once (reconcile would also reap it).
+                // No Failed transition — nothing usable ever existed.
+                if let Err(de) = st.services.meta.delete_pending_session(session_id).await {
+                    tracing::warn!(%session_id, error = %de,
+                        "delete_pending_session after boot failure failed; reconcile will reap");
+                }
+                Err(e)
+            }
+            Err(crate::session_boot::BootError::Started(e)) => {
+                // The sandbox booted but a later step failed — fail the
+                // session (the sandbox was already unbound by the boot pipeline).
+                let _ = st
+                    .services
+                    .meta
+                    .transition_session(session_id, SessionState::Failed)
+                    .await;
+                Err(e)
+            }
+        }
+    });
+
+    let boot_result = boot_handle.await.map_err(|join_err| {
+        // The boot task panicked: it did NOT run its disposition, so the
+        // pending reservation may still be pinned. The placement reconcile /
+        // stale-pending guard (10 min) reclaims it; surface a 500 so the
+        // client doesn't believe the session is live.
+        ApiError::Internal(format!("session boot task panicked: {join_err}"))
+    })?;
+
+    boot_result.map(|()| {
+        (
             StatusCode::CREATED,
             Json(CreateSessionResponse {
                 session_id,
@@ -611,27 +664,8 @@ async fn create_session_inner(
                 // ADR 0020: every session is a base-snapshot restore now.
                 kind: "restored",
             }),
-        )),
-        Err(crate::session_boot::BootError::NotStarted(e)) => {
-            // The sandbox never came up; release the reservation row so the
-            // host's free capacity is restored at once (reconcile would also
-            // reap it). No Failed transition — nothing usable ever existed.
-            if let Err(de) = state.services.meta.delete_pending_session(session_id).await {
-                tracing::warn!(%session_id, error = %de,
-                    "delete_pending_session after boot failure failed; reconcile will reap");
-            }
-            Err(e)
-        }
-        Err(crate::session_boot::BootError::Started(e)) => {
-            // The sandbox booted but a later step failed — fail the session.
-            let _ = state
-                .services
-                .meta
-                .transition_session(session_id, SessionState::Failed)
-                .await;
-            Err(e)
-        }
-    }
+        )
+    })
 }
 
 /// ADR 0048: enqueue a create that found no capacity. INSERTs the row at
