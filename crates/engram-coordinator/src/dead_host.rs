@@ -151,11 +151,30 @@ async fn run_once(
         "dead-host detector found stale candidates"
     );
     for host in candidates {
-        if let Err(e) = evict_host(pool, state, host.id).await {
+        let host_addr = host.host_addr.clone();
+        if let Err(e) = evict_host(pool, state, host.id, host_addr).await {
             tracing::warn!(host_id = %host.id, error = %e, "evict failed; another replica may have it");
         }
     }
     Ok(())
+}
+
+/// Defense-in-depth liveness probe for the dead-host detector (issue
+/// #231). The detector keys on `last_heartbeat_at`, which the heartbeat
+/// handler advances best-effort-no-more. But the failure mode that
+/// orphans a *healthy* host is cross-pod: pod A's pool saturates and
+/// stops persisting host H's `last_heartbeat_at` (H now also gets 5xx
+/// and backs off, but the row is already stale), while pod B's detector
+/// — healthy PG — sees the stale row and is about to mark H dead and
+/// orphan its sessions. Before doing that, B dials H directly: if H
+/// answers a `Ping`, the row is stale but the host is alive, so we skip
+/// the eviction and warn. Converts silent data loss into an alert.
+///
+/// Returns `true` only when the host *answered* the probe. An
+/// unreachable host (the genuine dead-host case), or no client to
+/// probe with, returns `false` so eviction proceeds as before.
+async fn host_responds(client: &Arc<dyn engram_core::traits::HostClient>) -> bool {
+    client.ping().await.is_ok()
 }
 
 /// The dead-host detector's stage-2 routing decision (ADR 0045 Phase
@@ -177,6 +196,7 @@ async fn evict_host(
     pool: &PgPool,
     state: &SharedState,
     host_id: HostId,
+    host_addr: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let meta = &state.services.meta;
     let host_registry = &state.host_registry;
@@ -215,6 +235,52 @@ async fn evict_host(
             .execute(&mut *conn)
             .await?;
         return Ok(());
+    }
+
+    // Defense-in-depth (issue #231): the row says stale, but is the host
+    // actually gone? Dial it directly with a cheap `Ping` before we
+    // orphan its sessions. The asymmetric-PG-failure mode — one coord
+    // pod's pool saturates and stops advancing H's `last_heartbeat_at`
+    // while THIS pod's detector is healthy — staled a *live* host's row;
+    // marking it dead here would orphan every session on a host that's
+    // up and loaded. If the host answers, skip the eviction and warn so
+    // an operator catches the heartbeat-persistence fault instead of a
+    // fleet section flapping mid-run.
+    //
+    // We probe via the in-memory pool entry when present, otherwise we
+    // warm a fresh dial from the candidate's persisted `host_addr` (the
+    // cross-pod case: this pod never saw H register, so its registry is
+    // empty for H). No `host_addr` (pre-0013 row) ⇒ unprobeable ⇒ fall
+    // through to eviction, exactly as before this guard existed.
+    let probe_client: Option<Arc<dyn engram_core::traits::HostClient>> = match state
+        .services
+        .host_pool
+        .get(host_id)
+    {
+        Ok(c) => Some(Arc::new(c)),
+        Err(_) => match host_addr {
+            Some(addr) => match state.services.host_pool.get_or_warm(host_id, addr).await {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; treating as unreachable");
+                    None
+                }
+            },
+            None => None,
+        },
+    };
+    if let Some(client) = probe_client {
+        if host_responds(&client).await {
+            tracing::warn!(
+                host_id = %host_id,
+                "stale row but live host — host answered Ping while last_heartbeat_at is stale; SKIPPING eviction. Check heartbeat persistence (coord PG pool saturation?) — see engram_heartbeat_persist_failures_total (issue #231)",
+            );
+            sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+                .bind(&lock_key)
+                .execute(&mut *conn)
+                .await?;
+            return Ok(());
+        }
     }
 
     let affected = meta.mark_host_dead_and_orphan_sessions(host_id).await?;
@@ -345,5 +411,116 @@ mod tests {
         for (snap, manifest) in [(true, true), (true, false), (false, true), (false, false)] {
             assert_ne!(recovery_target(snap, manifest), SessionState::Evacuating);
         }
+    }
+
+    // Issue #231: defense-in-depth probe. The detector keys on the
+    // stale `last_heartbeat_at` row, but before orphaning a host's
+    // sessions it dials the host directly. A host that ANSWERS the
+    // probe is alive (the row went stale because some coord pod's PG
+    // pool saturated and stopped advancing it) → eviction must be
+    // skipped. A host that does NOT answer is the genuine dead-host
+    // case → eviction proceeds. `host_responds` is the seam that
+    // decides which; these tests pin both arms.
+    use engram_core::traits::HostClient;
+    use engram_core::types::egress::SessionEgressPolicy;
+    use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+    use engram_core::types::snapshot::SnapshotMetadata;
+    use engram_core::{SandboxError, SandboxId, SessionId};
+
+    /// Minimal `HostClient` whose `list()` (and thus the default
+    /// `ping()`) returns alive/unreachable on demand. Every other
+    /// method is unreachable in this test — the probe only calls
+    /// `ping()`.
+    struct ProbeHost {
+        alive: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl HostClient for ProbeHost {
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            if self.alive {
+                Ok(Vec::new())
+            } else {
+                Err(SandboxError::Unavailable("host down".into()))
+            }
+        }
+        async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            unimplemented!()
+        }
+        async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
+            unimplemented!()
+        }
+        async fn exec_stream(
+            &self,
+            _id: SandboxId,
+            _cmd: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            unimplemented!()
+        }
+        async fn snapshot(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            unimplemented!()
+        }
+        async fn restore(&self, _metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            unimplemented!()
+        }
+        async fn start_agent(
+            &self,
+            _id: SandboxId,
+            _agent: AgentSpec,
+            _policy: SessionEgressPolicy,
+        ) -> Result<(), SandboxError> {
+            unimplemented!()
+        }
+        async fn apply_egress_policy(
+            &self,
+            _policy: SessionEgressPolicy,
+        ) -> Result<(), SandboxError> {
+            unimplemented!()
+        }
+        async fn guest_ip(&self, _id: SandboxId) -> Option<String> {
+            unimplemented!()
+        }
+        async fn bind_session(&self, _session_id: SessionId, _sandbox_id: SandboxId) {
+            unimplemented!()
+        }
+        async fn unbind_session(&self, _session_id: SessionId) {
+            unimplemented!()
+        }
+        async fn send_prompt(
+            &self,
+            _sandbox_id: SandboxId,
+            _text: String,
+        ) -> Result<(), SandboxError> {
+            unimplemented!()
+        }
+        async fn acquire_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+            unimplemented!()
+        }
+        async fn release_shell(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn host_responds_skips_eviction_for_a_live_but_stale_host() {
+        // The host answers the Ping → it's alive; the stale row is a
+        // heartbeat-persistence artifact, NOT a dead host. evict_host
+        // uses this to skip the orphaning.
+        let live: Arc<dyn HostClient> = Arc::new(ProbeHost { alive: true });
+        assert!(
+            host_responds(&live).await,
+            "a host that answers the probe must be treated as live (skip eviction)",
+        );
+    }
+
+    #[tokio::test]
+    async fn host_does_not_respond_when_unreachable() {
+        // The genuine dead-host case: the probe fails → eviction
+        // proceeds as before.
+        let dead: Arc<dyn HostClient> = Arc::new(ProbeHost { alive: false });
+        assert!(
+            !host_responds(&dead).await,
+            "an unreachable host must not be treated as live (eviction proceeds)",
+        );
     }
 }

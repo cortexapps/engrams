@@ -1071,6 +1071,16 @@ impl HostClient for GrpcHostClient {
         self.list_sandboxes().await
     }
 
+    async fn ping(&self) -> Result<(), SandboxError> {
+        // Override the trait default (which round-trips `list()`) with
+        // the dedicated no-op `Ping` RPC — cheapest possible liveness
+        // probe for the dead-host detector's defense-in-depth check
+        // (issue #231).
+        GrpcHostClient::ping(self)
+            .await
+            .map_err(|s| SandboxError::Unavailable(format!("ping: {s}")))
+    }
+
     async fn exec_stream(
         &self,
         id: SandboxId,

@@ -38,6 +38,20 @@ pub trait HostClient: Send + Sync {
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError>;
 
+    /// Cheap liveness probe. Returns `Ok(())` if the host answers an
+    /// RPC, `Err` if it's unreachable. Used by the dead-host detector
+    /// as a defense-in-depth check before evicting a host that merely
+    /// *looks* stale in Postgres (issue #231: an asymmetric PG failure
+    /// — one coord pod's pool saturated while a sibling's detector is
+    /// healthy — can stale a host's `last_heartbeat_at` row while the
+    /// host is alive and serving). The default reuses `list()`, which
+    /// every transport already implements and which the heartbeat
+    /// reconcile path already round-trips; the gRPC transport overrides
+    /// it with the no-op `Ping` RPC.
+    async fn ping(&self) -> Result<(), SandboxError> {
+        self.list().await.map(|_| ())
+    }
+
     async fn exec_stream(
         &self,
         id: SandboxId,
