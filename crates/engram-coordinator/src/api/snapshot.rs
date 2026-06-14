@@ -2415,6 +2415,7 @@ mod evicting_gate_tests {
         }
     }
 
+
     fn idle_session_with_residual_sandbox(
         id: SessionId,
         host: engram_core::HostId,
