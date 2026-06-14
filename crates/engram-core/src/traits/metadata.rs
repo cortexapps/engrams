@@ -1110,7 +1110,12 @@ pub trait MetadataStore: Send + Sync {
     //     row already exists (another caller is mid-pipeline).
     //   - `release_session_lease` is idempotent — extra calls
     //     against an already-deleted row are Ok(()). Used by the
-    //     RAII guard's drop path.
+    //     RAII guard's drop path. Scoped to the holder (`locked_by`):
+    //     it deletes ONLY the row this holder owns, so a holder that
+    //     was reaped (its row aged past the sweep threshold) and
+    //     re-acquired by someone else can't blind-delete the new
+    //     holder's lease on its own (late) Drop. Mirrors
+    //     `touch_session_lease`'s `AND locked_by = $2` scoping.
     //   - `sweep_stale_session_leases` deletes rows older than
     //     `max_age` and returns them for warn-logging. Backs the
     //     coord-side stale-lease reaper.
@@ -1137,9 +1142,19 @@ pub trait MetadataStore: Send + Sync {
         Ok(true)
     }
 
-    /// Idempotent. Drop-safe.
-    async fn release_session_lease(&self, _session_id: SessionId) -> Result<(), MetaError> {
-        Ok(())
+    /// Idempotent. Drop-safe. Scoped to the holder: deletes only the row
+    /// owned by `locked_by`, so a reaped-then-re-acquired lease can't be
+    /// blind-deleted out from under the new holder by the old holder's
+    /// late Drop (the fleet's primary serializer must not fail open after
+    /// a >180s hold). Returns whether a row was deleted — `false` means
+    /// the lease was already gone (reaped or stolen); the caller should
+    /// `warn!` for forensics.
+    async fn release_session_lease(
+        &self,
+        _session_id: SessionId,
+        _locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        Ok(true)
     }
 
     /// Peek: is the per-session lease currently held (an eviction /

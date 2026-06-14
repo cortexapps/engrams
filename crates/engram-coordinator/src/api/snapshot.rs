@@ -431,7 +431,17 @@ pub(crate) async fn resume_session(
     let st = state.clone();
     let handle = tokio::spawn(async move {
         // Hold the lease for the WHOLE pipeline by moving it in here.
-        let _lease = lease;
+        let lease = lease;
+        // Issue #212: the resume pipeline is a straight-line sequence of
+        // multi-second host RPCs (restore deadline 240s) with no touch loop
+        // of its own — unlike the eviction/migration finalize loops, it
+        // never refreshed the lease. A resume that crossed the 180s reap
+        // window was deleted out from under itself; another holder then
+        // re-acquired and drove the same session concurrently (#212's
+        // double-driver). Refresh `locked_at` every 60s for the pipeline's
+        // lifetime so a healthy holder is never reaped. The heartbeat is
+        // dropped (aborted) when `lease` drops at task exit.
+        let _heartbeat = lease.spawn_heartbeat(std::time::Duration::from_secs(60));
         let session = st.services.meta.get_session(id).await?;
 
         // ADR 0007: single-tier dispatcher.

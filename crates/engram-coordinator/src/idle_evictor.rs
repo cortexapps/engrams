@@ -653,6 +653,71 @@ impl SessionLeaseGuard {
             Err(e) => LeaseTouch::TransientError(e),
         }
     }
+
+    /// Issue #212: spawn a background task that refreshes this lease's
+    /// `locked_at` every `interval` for as long as the returned
+    /// `LeaseHeartbeat` is alive. Use this for holders whose pipeline is a
+    /// straight-line sequence of multi-second host RPCs that don't already
+    /// have a `select!`/touch loop of their own — chiefly the resume
+    /// pipeline (`api::snapshot`), whose restore RPC deadline (240s)
+    /// exceeds the 180s reap window. Without it the resume guard is reaped
+    /// mid-pipeline, another holder re-acquires, and the original guard's
+    /// (now holder-scoped) release no-ops while two pipelines briefly race
+    /// the session — the heartbeat prevents the reap in the first place.
+    ///
+    /// A `LeaseTouch::Lost` from the heartbeat is logged but does NOT abort
+    /// the pipeline here: the holder-scoped release + the binding-write CAS
+    /// guards are the authoritative safety net, and the heartbeat is a
+    /// reap-avoidance optimisation, not a control-flow signal. Dropping the
+    /// handle aborts the loop (RAII, tied to the guard's scope).
+    pub(crate) fn spawn_heartbeat(&self, interval: std::time::Duration) -> LeaseHeartbeat {
+        let meta = self.meta.clone();
+        let session_id = self.session_id;
+        let locked_by = self.locked_by.clone();
+        let handle = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                match meta.touch_session_lease(session_id, &locked_by).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(
+                            %session_id,
+                            %locked_by,
+                            "lease heartbeat: touch affected 0 rows — lease reaped or \
+                             stolen; holder-scoped release/CAS guards remain authoritative",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %session_id,
+                            %locked_by,
+                            error = %e,
+                            "lease heartbeat: touch transport error — will retry next tick",
+                        );
+                    }
+                }
+            }
+        });
+        LeaseHeartbeat { handle }
+    }
+}
+
+/// RAII handle for a lease heartbeat task (see
+/// [`SessionLeaseGuard::spawn_heartbeat`]). Dropping it aborts the touch
+/// loop, so the heartbeat is scoped to whatever owns this handle —
+/// typically held alongside the moved `SessionLeaseGuard` inside the
+/// resume pipeline task.
+pub(crate) struct LeaseHeartbeat {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 /// Outcome of a lease `touch_checked`. `Lost` is authoritative (the row
@@ -672,13 +737,30 @@ impl Drop for SessionLeaseGuard {
         // cleans it up at the next 180s tick.
         let meta = self.meta.clone();
         let session_id = self.session_id;
+        let locked_by = self.locked_by.clone();
         tokio::spawn(async move {
-            if let Err(e) = meta.release_session_lease(session_id).await {
-                tracing::warn!(
-                    %session_id,
-                    error = %e,
-                    "session lease release failed; stale-lease reaper will retry",
-                );
+            match meta.release_session_lease(session_id, &locked_by).await {
+                Ok(true) => {}
+                // 0-row delete: this holder no longer owned the row. It was
+                // reaped (held >180s without a touch) and possibly already
+                // re-acquired by another holder. The scoped DELETE protected
+                // the new holder from a blind delete; warn for forensics.
+                Ok(false) => {
+                    tracing::warn!(
+                        %session_id,
+                        %locked_by,
+                        "session lease release affected 0 rows — lease was reaped \
+                         or stolen before Drop; another holder may now own it",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %session_id,
+                        %locked_by,
+                        error = %e,
+                        "session lease release failed; stale-lease reaper will retry",
+                    );
+                }
             }
         });
     }
@@ -2169,7 +2251,7 @@ mod tests {
         state
             .services
             .meta
-            .release_session_lease(session_id)
+            .release_session_lease(session_id, "peer-pod-fixture")
             .await
             .unwrap();
 
