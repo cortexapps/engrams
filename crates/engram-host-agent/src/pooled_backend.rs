@@ -187,12 +187,160 @@ impl crate::disk_daemon::PostCopyDiskFetcher for GrpcPostCopyDiskFetcher {
 /// ADR 0045 C2: a minted-but-not-yet-captured post-copy export. The
 /// capture (Linux-only) consumes it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone)]
 struct PendingPresetup {
     export_id: String,
     peer_token: String,
     /// The chain ref the presetup advertised as the session manifest
     /// (the capture validates the chain hasn't moved underneath).
     chain_ref: engram_core::types::manifest::ManifestRef,
+}
+
+/// Issue #202: the unwind guard for a migration / snapshot capture's
+/// "point of no return" window — between the guest `pause` and the
+/// moment the export (or the snapshot finisher) takes ownership of the
+/// drained state.
+///
+/// Inside that window the capture has frozen the guest, raised the
+/// disk `migration_fence` (so background `flush()` no-ops), and DRAINED
+/// the dirty disk buffer out into a local `PendingDiskFlush` (or a
+/// post-copy seal). If a fallible `?` await returns `Err`, OR tonic
+/// drops the handler future on a coordinator deadline / disconnect, no
+/// error arm runs — so without a Drop-based guard the guest stays
+/// paused forever, the fence stays raised (silent disk-RPO collapse),
+/// and the drained chunks are lost from every future published manifest
+/// (a silent disk rollback for the next restore). See the issue for the
+/// three independently-confirmed code paths.
+///
+/// `Drop` performs the SAME recovery `migration_abort` does
+/// (`requeue_pending` + `requeue_postcopy_seal` + `set_migration_fence
+/// (false)` + best-effort `resume`), plus it re-inserts the consumed
+/// post-copy presetup so a coordinator retry can succeed. Because the
+/// dirty re-queue + resume are async, `Drop` spawns a task. `defuse` is
+/// called once ownership transfers (export registered / capture handed
+/// to the finisher), making the success path a zero-behavior-change
+/// no-op.
+struct CaptureUnwind {
+    inner: Arc<dyn SandboxBackend>,
+    id: SandboxId,
+    /// The disk backend to unfence + requeue against. The disk types are
+    /// cross-platform (`disk_daemon::backend`), so these fields are too —
+    /// only the capture call sites that POPULATE them are Linux-gated.
+    /// `None` when the sandbox has no NBD disk (non-Linux, memory-only).
+    disk_backend: Option<Arc<crate::disk_daemon::ChunkedDiskBackend>>,
+    /// Whether the fence was raised by the capture (so Drop knows to
+    /// lower it). Tracked separately from `disk_backend` because the
+    /// ordinary-snapshot path drains WITHOUT fencing.
+    fenced: bool,
+    /// Drained-but-unowned dirty chunks to re-queue on unwind.
+    disk_pending: Option<crate::disk_daemon::PendingDiskFlush>,
+    /// Post-copy seal to re-queue on unwind (C2 only).
+    disk_seal: Option<Arc<crate::disk_daemon::PostCopyDiskSeal>>,
+    /// The presetup consumed by `migration_capture_postcopy`, restored
+    /// on unwind so the coordinator's retry finds a matching presetup
+    /// instead of failing "no matching presetup" (C2 only).
+    #[allow(clippy::type_complexity)]
+    presetup_restore: Option<(
+        SandboxId,
+        PendingPresetup,
+        Arc<DashMap<SandboxId, PendingPresetup>>,
+    )>,
+    defused: bool,
+}
+
+impl CaptureUnwind {
+    /// Arm a guard that, on unwind, resumes the guest. Disk fields are
+    /// attached separately so the caller can move drained state into the
+    /// guard as it produces it.
+    fn new(inner: Arc<dyn SandboxBackend>, id: SandboxId) -> Self {
+        Self {
+            inner,
+            id,
+            disk_backend: None,
+            fenced: false,
+            disk_pending: None,
+            disk_seal: None,
+            presetup_restore: None,
+            defused: true,
+        }
+    }
+
+    /// Mark the guard armed (the pause has happened; from here Drop must
+    /// run the unwind unless `defuse` is called).
+    fn arm(&mut self) {
+        self.defused = false;
+    }
+
+    /// Ownership transferred (export registered / capture handed to the
+    /// finisher). Drop becomes a no-op.
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for CaptureUnwind {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        let inner = self.inner.clone();
+        let id = self.id;
+        let disk_backend = self.disk_backend.take();
+        let fenced = self.fenced;
+        let disk_pending = self.disk_pending.take();
+        let disk_seal = self.disk_seal.take();
+        if let Some((pid, presetup, map)) = self.presetup_restore.take() {
+            // Restore the consumed presetup so a coordinator retry finds
+            // a match — unless a NEWER presetup already landed (last-
+            // write-wins, matching `migration_presetup`'s own policy).
+            map.entry(pid).or_insert(presetup);
+        }
+        tracing::warn!(
+            sandbox_id = %id,
+            "capture unwind: capture failed or was cancelled after pause+fence+drain; \
+             requeueing drained disk state, clearing the migration fence, resuming the guest",
+        );
+        // The dirty re-queue + resume are async; Drop can't await, so
+        // hand the SAME recovery `migration_abort` runs to a task. Drop
+        // can run outside a runtime (process shutdown, sync test); fall
+        // back to a synchronous fence clear so a fenced backend never
+        // stays wedged even then.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            if let Some(backend) = &disk_backend {
+                if fenced {
+                    backend.set_migration_fence(false);
+                }
+            }
+            tracing::warn!(
+                sandbox_id = %id,
+                "capture unwind: no tokio runtime in Drop; cleared fence synchronously, \
+                 could not requeue/resume (best-effort)",
+            );
+            return;
+        };
+        handle.spawn(async move {
+            if let Some(backend) = disk_backend {
+                if let Some(pending) = disk_pending {
+                    backend.requeue_pending(pending).await;
+                }
+                if let Some(sealed) = disk_seal.as_deref() {
+                    backend.requeue_postcopy_seal(sealed).await;
+                }
+                if fenced {
+                    backend.set_migration_fence(false);
+                }
+            }
+            if let Err(e) = inner.resume(id).await {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "capture unwind: best-effort resume failed (guest may stay paused until destroy)",
+                );
+            } else {
+                tracing::info!(sandbox_id = %id, "capture unwind: guest resumed in place");
+            }
+        });
+    }
 }
 
 /// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
@@ -939,6 +1087,19 @@ impl PooledBackend {
             .await
             .map_err(|e| SandboxError::Snapshot(format!("pre-flush pause: {e}")))?;
 
+        // Issue #202: arm the unwind guard the instant the guest is
+        // paused. Unlike the migration paths this path raises no fence,
+        // and `inner.snapshot` below resumes the guest on success — but
+        // if `inner.snapshot` returns `Err` (FC `PUT /snapshot/create`
+        // can hang 60 s then fail) or the handler future is cancelled
+        // here, the guest stays paused and the drained dirty buffer is
+        // lost. The guard owns the drained `PendingDiskFlush` and rides
+        // inside the returned `SnapshotCapture` until the finisher's
+        // `flush_upload` takes it over (covering the cancellation gap in
+        // `snapshot_begin` between this return and the finisher spawn).
+        let mut unwind = CaptureUnwind::new(self.inner.clone(), id);
+        unwind.arm();
+
         // ADR 0038 B3: under the pause, only DRAIN the dirty buffer
         // (+ hash + stash in the backend's pending tier) — the
         // multi-second GCS upload is deferred to `flush_upload` after
@@ -947,7 +1108,7 @@ impl PooledBackend {
         // still captures disk-at-the-pause-instant (ADR 0018 §12m); the
         // memory capture below is paired with it.
         #[cfg(target_os = "linux")]
-        let nbd_pending_flush = {
+        {
             // INVARIANT (see `nbd_sandboxes`): clone the Arc + copy the
             // device path out of the guard, then drop it BEFORE any
             // `.await` — a held guard across the drain/upload below
@@ -993,11 +1154,15 @@ impl PooledBackend {
                     .flush_local()
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
-                Some(pending)
-            } else {
-                None
+                // Issue #202: the dirty buffer now lives only in
+                // `pending` — move it into the guard so any error/cancel
+                // before the finisher takes over re-queues it (and
+                // resumes the guest). `fenced` stays false: this path
+                // never raises the migration fence.
+                unwind.disk_backend = Some(backend);
+                unwind.disk_pending = Some(pending);
             }
-        };
+        }
 
         // ADR 0007 Phase 6: backend owns its staging dir; we look
         // it up via snapshot_path_for after the inner call so we
@@ -1026,6 +1191,11 @@ impl PooledBackend {
         .record(create_start.elapsed().as_secs_f64());
         let metadata = create_res?;
         let dest = self.inner.snapshot_path_for(metadata.id);
+        // `create_res` was Ok ⟹ `inner.snapshot`/`snapshot_diff` brought
+        // the guest back running. The guard rides into `SnapshotCapture`
+        // (still armed) so the cancellation gap in `snapshot_begin` and
+        // any failure before the finisher consumes it stays covered; the
+        // finisher takes the pending out of the guard and defuses it.
         Ok((
             capture_guard,
             SnapshotCapture {
@@ -1033,8 +1203,7 @@ impl PooledBackend {
                 dest,
                 chain_prev,
                 paused_at,
-                #[cfg(target_os = "linux")]
-                nbd_pending_flush,
+                unwind,
             },
         ))
     }
@@ -3007,8 +3176,11 @@ pub(crate) struct SnapshotCapture {
         engram_chunk_store::Manifest,
     )>,
     paused_at: chrono::DateTime<chrono::Utc>,
-    #[cfg(target_os = "linux")]
-    nbd_pending_flush: Option<crate::disk_daemon::PendingDiskFlush>,
+    /// Issue #202: the armed capture-unwind guard. Owns the drained
+    /// `PendingDiskFlush` (Linux) and resumes the guest if this capture
+    /// is dropped before the finisher takes it over. The finisher
+    /// extracts the pending and defuses it.
+    unwind: CaptureUnwind,
 }
 
 /// ADR 0045 D5: see [`PooledBackend::finisher`]. Owns Arc-clones of the
@@ -3060,8 +3232,16 @@ impl SnapshotFinisher {
         let dest = cap.dest;
         let chain_prev = cap.chain_prev;
         let paused_at = cap.paused_at;
+        // Issue #202: the finisher now owns the capture. The guest is
+        // running (inner.snapshot resumed it) and `flush_upload` below
+        // owns the drained chunks' re-queue on its own error path, so
+        // take the pending out of the guard and defuse it — from here
+        // the guard's resume/requeue must NOT fire.
+        let mut unwind = cap.unwind;
         #[cfg(target_os = "linux")]
-        let nbd_pending_flush = cap.nbd_pending_flush;
+        let nbd_pending_flush = unwind.disk_pending.take();
+        unwind.defuse();
+        drop(unwind);
         let mut metadata = metadata;
         let post = async {
             // ADR 0038 B3: the guest has resumed (inner.snapshot above
@@ -3911,6 +4091,11 @@ impl SandboxBackend for PooledBackend {
                     "no matching presetup for this capture (export id skew?)".into(),
                 ));
             };
+            // Issue #202: keep a copy of the consumed presetup so an
+            // unwind can re-insert it — otherwise a coordinator retry
+            // hits "no matching presetup" and the dest parks until its
+            // 120 s budget burns out.
+            let presetup_restore = pending.clone();
             let Some((chain_ref, chain_manifest)) = self
                 .checkpoint_chains
                 .get(&id)
@@ -3953,6 +4138,16 @@ impl SandboxBackend for PooledBackend {
                 .map_err(|e| SandboxError::Snapshot(format!("post-copy pause: {e}")))?;
             let pause_ms = t_pause.elapsed().as_millis() as u64;
 
+            // Issue #202: arm the unwind guard the instant the guest is
+            // paused. Any error/cancel before the export is registered
+            // must resume the guest, clear the fence, re-queue the
+            // (later-taken) seal, AND restore the consumed presetup. The
+            // old `FenceGuard` only lowered the fence — it left the guest
+            // frozen, dropped the seal, and consumed the presetup.
+            let mut unwind = CaptureUnwind::new(self.inner.clone(), id);
+            unwind.arm();
+            unwind.presetup_restore = Some((id, presetup_restore, self.pending_presetups.clone()));
+
             // Blackout leg 2: disk COHERENCE (disk post-copy). Fence
             // flush publishes, push the host's block-device page cache
             // down into the daemon (the presetup's pre-pause fsync
@@ -3962,32 +4157,22 @@ impl SandboxBackend for PooledBackend {
             // is stable): it DRAINS the dirty buffer, so nothing
             // fallible may sit between the drain and the export
             // taking ownership (a dropped seal = the guest's disk
-            // writes silently gone on the abort-resume). The fence
-            // guard releases on every pre-export error arm — a fenced
+            // writes silently gone on the abort-resume). The unwind
+            // guard (issue #202) re-queues the seal, clears the fence,
+            // resumes the guest, and restores the presetup on every
+            // pre-export error arm AND on wire cancellation — a fenced
             // backend whose capture failed would otherwise no-op
             // flushes forever (silent durability stall).
             let disk_entry = self
                 .nbd_sandboxes
                 .get(&id)
                 .map(|e| (e.backend.clone(), e.device_path().to_path_buf()));
-            struct FenceGuard(Option<std::sync::Arc<crate::disk_daemon::ChunkedDiskBackend>>);
-            impl FenceGuard {
-                fn defuse(&mut self) {
-                    self.0 = None;
-                }
-            }
-            impl Drop for FenceGuard {
-                fn drop(&mut self) {
-                    if let Some(b) = self.0.take() {
-                        b.set_migration_fence(false);
-                    }
-                }
-            }
             let t_disk = std::time::Instant::now();
-            let mut fence_guard = FenceGuard(None);
             if let Some((backend, dev)) = &disk_entry {
                 backend.set_migration_fence(true);
-                fence_guard.0 = Some(backend.clone());
+                // Issue #202: record the fence on the unwind guard.
+                unwind.disk_backend = Some(backend.clone());
+                unwind.fenced = true;
                 let dev = dev.clone();
                 tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                     let f = std::fs::OpenOptions::new()
@@ -4077,6 +4262,13 @@ impl SandboxBackend for PooledBackend {
                 )
             };
             let sealed_disk_chunks = disk_seal.as_ref().map(|s| s.len()).unwrap_or(0) as u64;
+            // Issue #202: the seal has DRAINED the dirty buffer — from
+            // here the bytes live only in `disk_seal`. Move a reference
+            // into the unwind guard so any error/cancel re-queues them
+            // (the seal is Arc-shared; the export gets its own clone).
+            // This subsumes the per-arm `requeue_postcopy_seal` calls
+            // below AND covers the wire-cancellation case they couldn't.
+            unwind.disk_seal = disk_seal.clone();
             // The seal descriptor rides the export for the dest's
             // fetch poller (base manifest content + sealed indices).
             // A NEW filename on purpose: an OLD destination still
@@ -4089,12 +4281,9 @@ impl SandboxBackend for PooledBackend {
                     .map_err(|e| SandboxError::Snapshot(format!("write disk seal info: {e}"))),
                 Err(e) => Err(SandboxError::Snapshot(format!("disk seal info: {e}"))),
             };
-            if let Err(e) = descriptor_written {
-                if let (Some((backend, _)), Some(sealed)) = (&disk_entry, &disk_seal) {
-                    backend.requeue_postcopy_seal(sealed).await;
-                }
-                return Err(e);
-            }
+            // On error the unwind guard re-queues the seal, clears the fence,
+            // resumes the guest, and restores the presetup.
+            descriptor_written?;
             disk_drain_ms += t_seal.elapsed().as_millis() as u64;
 
             // Register BOTH exports under the same identity, then the
@@ -4104,7 +4293,6 @@ impl SandboxBackend for PooledBackend {
             let state_served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let last_activity =
                 std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-            let disk_seal_for_requeue = disk_seal.clone();
             let inserted = self.migrations.insert(crate::migration::MigrationExport {
                 export_id: export_id.to_string(),
                 sandbox_id: id,
@@ -4119,14 +4307,15 @@ impl SandboxBackend for PooledBackend {
                 capture_guard,
             });
             if !inserted {
-                if let (Some((backend, _)), Some(sealed)) = (&disk_entry, &disk_seal_for_requeue) {
-                    backend.requeue_postcopy_seal(sealed).await;
-                }
+                // The unwind guard re-queues the seal (Arc clone),
+                // clears the fence, resumes, and restores the presetup.
                 return Err(SandboxError::AlreadyExists);
             }
-            // The export owns the fence now (abort unfences; commit
-            // destroys the sandbox).
-            fence_guard.defuse();
+            // Issue #202: the export now owns the fence + seal and the
+            // dest is about to load — defuse the guard (abort unfences;
+            // commit destroys the sandbox). After this point the
+            // presetup must NOT be restored (the move is committing).
+            unwind.defuse();
             self.set_migration_role(id, Some(crate::migration::MigrationRole::PostCopySource))
                 .await;
             peer.register(crate::migrate_peer::PeerExport {
@@ -4325,6 +4514,16 @@ impl SandboxBackend for PooledBackend {
             .await
             .map_err(|e| SandboxError::Snapshot(format!("migration pause: {e}")))?;
 
+        // Issue #202: arm the unwind guard the instant the guest is
+        // paused. From here every error/cancel until the export is
+        // registered must resume the guest, clear the fence, and requeue
+        // the drained dirty buffer — otherwise the session is bricked
+        // (frozen + fence stuck + acked writes silently lost). The guard
+        // owns the drained `disk_pending` through the window; we hand it
+        // to the export only after the registry insert succeeds.
+        let mut unwind = CaptureUnwind::new(self.inner.clone(), id);
+        unwind.arm();
+
         // Disk: drain under the pause, land the pending tier in the
         // LOCAL cache, fence further flush publishes.
         // INVARIANT (see `nbd_sandboxes`): clone the Arc + copy the
@@ -4338,61 +4537,70 @@ impl SandboxBackend for PooledBackend {
             .get(&id)
             .map(|entry| (entry.backend.clone(), entry.device_path().to_path_buf()));
         #[cfg(target_os = "linux")]
-        let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) =
-            if let Some((backend, dev)) = backend_dev {
-                backend.set_migration_fence(true);
-                // Push the HOST's block-device page cache down to the
-                // daemon before draining. FC's virtio-blk writes to
-                // /dev/nbdN through the kernel page cache (drive
-                // cache_type default = Unsafe: guest FLUSH does not
-                // propagate), so without this fsync the drain captures
-                // only what background writeback happened to push —
-                // an ACTIVE guest's recent writes were still in the
-                // host cache and the export shipped a chunk with
-                // zeros/stale bytes where they belonged (the two-host
-                // NBD e2e probe; idle evictions dodge it because a
-                // quiescent session ages past the writeback interval).
-                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                    let f = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&dev)?;
-                    f.sync_all()
-                })
+        let (disk_manifest_json, disk_ref, disk_hashes) = if let Some((backend, dev)) = backend_dev
+        {
+            backend.set_migration_fence(true);
+            // Issue #202: the fence is now raised — record it on the
+            // guard so an unwind clears it (else `flush()` no-ops for
+            // the sandbox's lifetime).
+            unwind.disk_backend = Some(backend.clone());
+            unwind.fenced = true;
+            // Push the HOST's block-device page cache down to the
+            // daemon before draining. FC's virtio-blk writes to
+            // /dev/nbdN through the kernel page cache (drive
+            // cache_type default = Unsafe: guest FLUSH does not
+            // propagate), so without this fsync the drain captures
+            // only what background writeback happened to push —
+            // an ACTIVE guest's recent writes were still in the
+            // host cache and the export shipped a chunk with
+            // zeros/stale bytes where they belonged (the two-host
+            // NBD e2e probe; idle evictions dodge it because a
+            // quiescent session ages past the writeback interval).
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&dev)?;
+                f.sync_all()
+            })
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
+            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
+            backend.wait_idle().await;
+            let pending = backend
+                .flush_local()
                 .await
-                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
-                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
-                backend.wait_idle().await;
-                let pending = backend
-                    .flush_local()
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("migration disk drain: {e}")))?;
-                let (m, hashes) = backend
-                    .flush_to_local_cache(&pending)
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("migration disk cache: {e}")))?;
-                let dref = backend.manifest_ref().await.next_version();
-                (
-                    serde_json::to_vec(&m)
-                        .map_err(|e| SandboxError::Snapshot(format!("disk manifest json: {e}")))?,
-                    dref,
-                    hashes,
-                    Some(pending),
-                )
-            } else {
-                (
-                    Vec::new(),
-                    engram_core::types::manifest::ManifestRef::new(),
-                    Vec::new(),
-                    None,
-                )
-            };
+                .map_err(|e| SandboxError::Snapshot(format!("migration disk drain: {e}")))?;
+            // Issue #202: the dirty buffer is now drained OUT of the
+            // backend and lives only in `pending`. Move it into the
+            // guard immediately so any subsequent error/cancel
+            // requeues it (instead of dropping it on the floor). The
+            // success path takes it back out before the export insert.
+            unwind.disk_pending = Some(pending);
+            let pending = unwind.disk_pending.as_ref().expect("just set");
+            let (m, hashes) = backend
+                .flush_to_local_cache(pending)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("migration disk cache: {e}")))?;
+            let dref = backend.manifest_ref().await.next_version();
+            (
+                serde_json::to_vec(&m)
+                    .map_err(|e| SandboxError::Snapshot(format!("disk manifest json: {e}")))?,
+                dref,
+                hashes,
+            )
+        } else {
+            (
+                Vec::new(),
+                engram_core::types::manifest::ManifestRef::new(),
+                Vec::new(),
+            )
+        };
         #[cfg(not(target_os = "linux"))]
-        let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) = (
+        let (disk_manifest_json, disk_ref, disk_hashes) = (
             Vec::new(),
             engram_core::types::manifest::ManifestRef::new(),
             Vec::<engram_chunk_store::manifest::ChunkHash>::new(),
-            None,
         );
 
         // FC diff capture. `snapshot_diff` resumes the guest on
@@ -4439,6 +4647,12 @@ impl SandboxBackend for PooledBackend {
             mem_hashes.iter().copied().collect();
         allowed.extend(mem_manifest.chunks.iter().map(|c| c.hash));
         allowed.extend(disk_hashes.iter().copied());
+        // Issue #202: hand the drained `disk_pending` from the guard to
+        // the export, which now owns it (abort re-queues it; commit drops
+        // it once the dest has drained). The guard's remaining job is the
+        // resume + unfence on the (now narrow) insert-failure arm. (On
+        // non-Linux the field was never populated, so this is `None`.)
+        let disk_pending = unwind.disk_pending.take();
         let inserted = self.migrations.insert(crate::migration::MigrationExport {
             export_id: export_id.clone(),
             sandbox_id: id,
@@ -4456,8 +4670,15 @@ impl SandboxBackend for PooledBackend {
             capture_guard,
         });
         if !inserted {
+            // The early `validate_open` + the held `capture_guard` make
+            // this arm effectively unreachable, but keep the guard armed
+            // so its Drop still resumes the guest + clears the fence.
             return Err(SandboxError::AlreadyExists);
         }
+        // Issue #202: the export now owns the drained disk state, the
+        // fence, and the frozen guest (abort/commit drive them from
+        // here). Defuse the guard — the capture succeeded.
+        unwind.defuse();
         tracing::info!(
             sandbox_id = %id,
             export_id = %export_id,
@@ -5835,6 +6056,208 @@ mod tests {
             panic!("no chain must signal fallback");
         };
         assert!(matches!(err, SandboxError::InvalidSpec(_)));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Issue #202: the capture unwind guard. A migration/snapshot
+    // capture that errors or is cancelled AFTER pause + fence + drain
+    // must NOT leave the guest paused, the fence stuck, or the drained
+    // disk chunks lost. The guard's `Drop` runs the same recovery
+    // `migration_abort` does. A successful capture defuses it (no-op).
+    // ──────────────────────────────────────────────────────────────
+
+    /// Inner backend double that records `resume` calls so the test can
+    /// assert the unwind guard un-pauses the guest.
+    struct ResumeSpy {
+        resumes: std::sync::Arc<parking_lot::Mutex<Vec<SandboxId>>>,
+    }
+    #[async_trait]
+    impl SandboxBackend for ResumeSpy {
+        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+            PathBuf::new()
+        }
+        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(Vec::new())
+        }
+        async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.resumes.lock().push(id);
+            Ok(())
+        }
+    }
+
+    /// Build a `ChunkedDiskBackend` over a 4-chunk sparse base with one
+    /// dirty chunk written, plus its store. Mirrors the disk_daemon
+    /// `build_backend` test helper.
+    async fn unwind_test_disk_backend() -> (
+        std::sync::Arc<crate::disk_daemon::ChunkedDiskBackend>,
+        std::sync::Arc<engram_chunk_store::ChunkStore>,
+        tempfile::TempDir,
+    ) {
+        use engram_chunk_store::manifest::{ChunkSize, ManifestKind, ManifestRef};
+        use engram_chunk_store::{ChunkCache, ChunkStore, Manifest};
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(dir.path().to_path_buf()),
+        );
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let mut cfg = engram_chunk_store::cache::ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let manifest = Manifest {
+            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes: chunk_size * 4,
+            chunks: Vec::new(),
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let backend = Arc::new(
+            crate::disk_daemon::ChunkedDiskBackend::new(
+                manifest_ref,
+                &manifest,
+                cache,
+                store.clone(),
+                u64::MAX,
+            )
+            .unwrap(),
+        );
+        // One acked write → one dirty chunk.
+        backend
+            .write(0, &vec![0x42; chunk_size as usize])
+            .await
+            .unwrap();
+        (backend, store, dir)
+    }
+
+    /// THE regression: an armed-but-not-defused guard (an error or a
+    /// cancelled capture) must resume the guest, clear the fence, and
+    /// re-queue the drained chunk so it lands in the next published
+    /// manifest. Without the fix the guest stays paused forever, the
+    /// fence no-ops every future flush, and the drained chunk is gone.
+    #[tokio::test]
+    async fn capture_unwind_on_drop_resumes_unfences_and_requeues() {
+        let (backend, store, _dir) = unwind_test_disk_backend().await;
+        let resumes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let inner: Arc<dyn SandboxBackend> = Arc::new(ResumeSpy {
+            resumes: resumes.clone(),
+        });
+        let id = SandboxId::new();
+
+        // Simulate a migration capture up to the "point of no return":
+        // fence raised, dirty buffer drained out into `pending`.
+        backend.set_migration_fence(true);
+        let pending = backend.flush_local().await.unwrap();
+        // A fenced flush no-ops (the bug's consequence #2 surface).
+        assert_eq!(
+            backend.flush().await.unwrap().chunks_flushed,
+            0,
+            "fence raised: flush must no-op",
+        );
+
+        // Arm the guard with the drained state — then DROP it without
+        // defusing, exactly as an `Err`/cancel between pause and the
+        // export insert would.
+        {
+            let mut guard = CaptureUnwind::new(inner.clone(), id);
+            guard.arm();
+            guard.disk_backend = Some(backend.clone());
+            guard.fenced = true;
+            guard.disk_pending = Some(pending);
+            // guard dropped here (never defused)
+        }
+        // Drop spawns the async recovery; let it run.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if !resumes.lock().is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            resumes.lock().clone(),
+            vec![id],
+            "unwind must resume the guest exactly once",
+        );
+        // Fence cleared + chunk re-queued ⟹ the next flush publishes it.
+        let after = backend.flush().await.unwrap();
+        assert_eq!(
+            after.chunks_flushed, 1,
+            "unwind must clear the fence AND re-queue the drained chunk",
+        );
+        // And that chunk is durable in the store (present in the next
+        // published manifest's chunk set).
+        let manifest = store.get_manifest(after.manifest_ref).await.unwrap();
+        assert!(
+            !manifest.chunks.is_empty(),
+            "the re-queued write must appear in the next published manifest",
+        );
+    }
+
+    /// The success path: a defused guard is an inert no-op — no resume,
+    /// the fence stays as the owning export left it, and the pending it
+    /// no longer holds is owned elsewhere (here: dropped by the test,
+    /// standing in for the export taking ownership).
+    #[tokio::test]
+    async fn capture_unwind_defused_is_a_noop() {
+        let (backend, _store, _dir) = unwind_test_disk_backend().await;
+        let resumes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let inner: Arc<dyn SandboxBackend> = Arc::new(ResumeSpy {
+            resumes: resumes.clone(),
+        });
+        let id = SandboxId::new();
+
+        backend.set_migration_fence(true);
+        let pending = backend.flush_local().await.unwrap();
+
+        {
+            let mut guard = CaptureUnwind::new(inner.clone(), id);
+            guard.arm();
+            guard.disk_backend = Some(backend.clone());
+            guard.fenced = true;
+            guard.disk_pending = Some(pending);
+            // Success path: the export takes ownership of the drained
+            // pending, then the guard is defused.
+            let _owned_by_export = guard.disk_pending.take();
+            guard.defuse();
+        }
+        // Give any erroneously-spawned recovery task a chance to run.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            resumes.lock().is_empty(),
+            "a defused guard must NOT resume the guest",
+        );
+        // Fence untouched by the guard (the export owns it now).
+        assert_eq!(
+            backend.flush().await.unwrap().chunks_flushed,
+            0,
+            "defused guard must leave the fence raised (export owns it)",
+        );
     }
 
     #[tokio::test]
