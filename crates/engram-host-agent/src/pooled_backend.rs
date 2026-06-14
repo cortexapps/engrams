@@ -4293,6 +4293,10 @@ impl SandboxBackend for PooledBackend {
             let state_served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let last_activity =
                 std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+            // Issue #216 Gap 2: the peer page server shares THIS clock so
+            // its TCP-only NeedAt/GetChunk serves refresh the same TTL
+            // anchor the dumb-host sweep reads via `expired()`.
+            let peer_last_activity = last_activity.clone();
             let inserted = self.migrations.insert(crate::migration::MigrationExport {
                 export_id: export_id.to_string(),
                 sandbox_id: id,
@@ -4331,6 +4335,7 @@ impl SandboxBackend for PooledBackend {
                 total_bytes,
                 serve: Default::default(),
                 drained: std::sync::atomic::AtomicBool::new(false),
+                last_activity: peer_last_activity,
             });
 
             tracing::info!(
@@ -4726,12 +4731,18 @@ impl SandboxBackend for PooledBackend {
             let Some(export) = self.migrations.find_by_export_id(export_id) else {
                 return Err(SandboxError::NotFound);
             };
-            // ADR 0045 C2: every serve refreshes the post-copy TTL
-            // clock, and StateBin leaving a post-copy export arms the
-            // split-brain guard (the source must never self-resume —
-            // the dest may be running this state).
+            // Issue #216 Gap 1: every serve refreshes the TTL clock for
+            // ALL exports (C1 + post-copy) — an actively-fetched export
+            // is alive by definition (`expired()` anchors on
+            // `last_activity` now). And StateBin leaving the export arms
+            // the split-brain guard regardless of mode: once `state.bin`
+            // has shipped the dest may be running this state, so the
+            // source must NEVER self-resume — `ttl_verdict`'s
+            // forbidden-unpause arm protects C1 equally (a >120 s C1
+            // teleport that shipped state then expired must NOT be
+            // un-paused in place).
             export.touch();
-            if export.post_copy && items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
+            if items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
                 export
                     .state_served
                     .store(true, std::sync::atomic::Ordering::SeqCst);

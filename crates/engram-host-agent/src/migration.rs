@@ -27,10 +27,11 @@ use engram_chunk_store::manifest::ChunkHash;
 use engram_core::SandboxId;
 
 /// No commit/abort within this window triggers the coordinator
-/// ownership check (see module docs). For post-copy exports the clock
-/// runs from the LAST page-serving activity, not creation — an
-/// actively-draining export is alive by definition; 120 s of silence
-/// is the trigger.
+/// ownership check (see module docs). The clock runs from the LAST
+/// artifact/page-serving activity, not creation — for BOTH C1 (gRPC
+/// `migration_fetch`) and post-copy (the TCP page server) exports: an
+/// export actively serving the move is alive by definition; 120 s of
+/// silence is the trigger.
 pub const EXPORT_TTL: Duration = Duration::from_secs(120);
 
 /// ADR 0045 C2: a sandbox's role in an in-flight post-copy migration.
@@ -84,8 +85,9 @@ pub struct MigrationExport {
     pub created_at: Instant,
     /// ADR 0045 C2: this export serves a post-copy move (the guest
     /// already resumed on the dest; this frozen source is a page
-    /// server). Changes the TTL clock (last_activity, not created_at)
-    /// and FORBIDS the abort-unpause arm once `state_served` is set.
+    /// server). FORBIDS the abort-unpause arm once `state_served` is
+    /// set. (The TTL clock is `last_activity` for ALL exports now — see
+    /// `expired()` — so this no longer gates the anchor.)
     pub post_copy: bool,
     /// ADR 0045 C2 split-brain guard: set the moment `state.bin`
     /// leaves this host (`MigrationFetch` StateBin). From then on the
@@ -188,17 +190,20 @@ impl MigrationRegistry {
     }
 
     /// Exports older than [`EXPORT_TTL`] (the dumb-host sweep input).
-    /// Post-copy exports age from their last serving activity (an
-    /// actively-draining export is alive); C1 exports from creation.
+    /// ALL exports age from their last serving activity, not creation:
+    /// an export actively serving fetches/pages is alive by definition.
+    /// `touch()` is called on every serve for BOTH C1 (gRPC
+    /// `migration_fetch`) and post-copy (the peer page server) exports;
+    /// a fresh export's `last_activity` is seeded to its creation
+    /// instant, so an export that has served NOTHING still ages from
+    /// creation. (Previously C1 anchored on `created_at`, so a >120 s
+    /// live-teleport that was actively serving `migration_fetch`
+    /// streams was spuriously aborted mid-read — issue #216 Gap 1.)
     pub fn expired(&self) -> Vec<SandboxId> {
         self.by_sandbox
             .iter()
             .filter(|e| {
-                let anchor = if e.post_copy {
-                    *e.last_activity.lock().expect("last_activity poisoned")
-                } else {
-                    e.created_at
-                };
+                let anchor = *e.last_activity.lock().expect("last_activity poisoned");
                 anchor.elapsed() > EXPORT_TTL
             })
             .map(|e| e.sandbox_id)
@@ -266,6 +271,49 @@ pub fn ttl_verdict(session_bound: bool, ownership: Option<bool>, state_served: b
     }
 }
 
+/// Issue #216 Gap 3: what a REATTACHED frozen post-copy source should
+/// do on one ownership tick, given (a) whether its session binding has
+/// rehydrated into the in-memory map yet and (b) the coordinator's
+/// ownership answer once it has.
+///
+/// A frozen post-copy source NEVER self-resumes (state.bin already
+/// shipped to the dest), so the only outcomes are `Destroy` (ownership
+/// has explicitly moved on) or `StayPaused` (everything else). Unlike
+/// `ttl_verdict`, a MISSING in-memory binding is NOT "no session owns
+/// this" — it is "we have not LEARNED the binding yet": the register
+/// task's `rehydrate_survivors` races this 30 s tick and backs off up to
+/// 30 s when the coordinator is unreachable (the very condition that
+/// triggered the restart). Destroying on that transient `None` killed a
+/// healthy source mid-move. The invariant ("never guess about
+/// ownership; unreachable ⇒ stay paused") demands we ask the coordinator
+/// — and only an explicit `owned == false` destroys.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReattachSourceVerdict {
+    /// Ownership explicitly moved on (`owned == false`): the frozen
+    /// source is stale — destroy it.
+    Destroy,
+    /// Binding not yet rehydrated, coordinator unreachable, or
+    /// coordinator still owns the session: stay paused, retry next tick.
+    StayPaused,
+}
+
+/// `session_bound = false` ⇒ the in-memory binding has not rehydrated
+/// yet (retry; NEVER destroy on this alone). `ownership` is only
+/// meaningful once bound: `Some(false)` ⇒ destroy; `Some(true)` /
+/// `None` (unreachable) ⇒ stay paused.
+pub fn reattach_source_verdict(
+    session_bound: bool,
+    ownership: Option<bool>,
+) -> ReattachSourceVerdict {
+    if !session_bound {
+        return ReattachSourceVerdict::StayPaused;
+    }
+    match ownership {
+        Some(false) => ReattachSourceVerdict::Destroy,
+        Some(true) | None => ReattachSourceVerdict::StayPaused,
+    }
+}
+
 /// Constant-time string compare (export_id nonces).
 fn constant_time_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -297,12 +345,97 @@ mod tests {
 
     /// ADR 0045 C2: once state.bin shipped, yes⇒un-pause is FORBIDDEN
     /// (split-brain); everything else is unchanged.
+    ///
+    /// Issue #216 Gap 1: `state_served` now arms for C1 too
+    /// (`migration_fetch` sets it on any StateBin serve, dropping the
+    /// old `post_copy` gate). `ttl_verdict` is mode-agnostic, so the
+    /// SAME forbidden-unpause arm protects a C1 export whose state.bin
+    /// shipped before it expired — a >120 s C1 teleport that already
+    /// shipped state must STAY PAUSED, never `AbortInPlace` (which would
+    /// resume the source while the dest may be running that state).
     #[test]
     fn ttl_verdict_state_served_forbids_unpause() {
+        // C2 (post-copy) — the original cases.
         assert_eq!(ttl_verdict(true, Some(true), true), TtlVerdict::StayPaused);
         assert_eq!(ttl_verdict(true, Some(false), true), TtlVerdict::Destroy);
         assert_eq!(ttl_verdict(true, None, true), TtlVerdict::StayPaused);
         assert_eq!(ttl_verdict(false, Some(true), true), TtlVerdict::Destroy);
+
+        // C1 with state_served armed: identical verdicts. The crucial
+        // arm is `(bound, owned=true, state_served=true)` ⇒ StayPaused,
+        // NOT AbortInPlace — the C1 split-brain protection issue #216
+        // wires by dropping the `post_copy` gate on the
+        // `state_served`-set in `migration_fetch`.
+        assert_eq!(
+            ttl_verdict(true, Some(true), true),
+            TtlVerdict::StayPaused,
+            "C1 export that shipped state must not be un-paused (issue #216 Gap 1)"
+        );
+    }
+
+    /// Issue #216 Gap 1: a C1 (non-post-copy) export that is actively
+    /// serving fetches must NOT expire from `created_at` — `expired()`
+    /// anchors on `last_activity`, and `migration_fetch` calls `touch()`
+    /// for C1 too. We simulate by seeding `created_at` and the shared
+    /// `last_activity` clock far in the past, then `touch()`ing: a C1
+    /// export born >TTL ago but touched now must NOT be expired.
+    #[test]
+    fn c1_export_ages_from_last_activity_not_creation() {
+        let reg = MigrationRegistry::default();
+        let id = SandboxId::new();
+        let eid = MigrationRegistry::mint_export_id();
+        let stale = Instant::now() - (EXPORT_TTL + Duration::from_secs(60));
+        let last_activity = Arc::new(std::sync::Mutex::new(stale));
+        let guard = std::sync::Arc::new(tokio::sync::Mutex::new(()))
+            .try_lock_owned()
+            .unwrap();
+        assert!(reg.insert(MigrationExport {
+            export_id: eid,
+            sandbox_id: id,
+            snapshot_dir: "/tmp".into(),
+            allowed_chunks: HashSet::new(),
+            disk_pending: None,
+            disk_seal: None,
+            created_at: stale,
+            // The bug specifically affected C1 (non-post-copy) exports.
+            post_copy: false,
+            state_served: Arc::new(AtomicBool::new(false)),
+            last_activity: last_activity.clone(),
+            capture_guard: guard,
+        }));
+
+        // Born >TTL ago AND silent >TTL ⇒ expired (the abandoned case
+        // the sweep is for).
+        assert_eq!(reg.expired(), vec![id], "stale C1 export must expire");
+
+        // An active fetch refreshes the clock — the export is alive
+        // again even though `created_at` is ancient. (Pre-fix: C1 aged
+        // on `created_at`, so this stayed expired → spurious mid-read
+        // abort of a healthy >120 s teleport.)
+        *last_activity.lock().unwrap() = Instant::now();
+        assert!(
+            reg.expired().is_empty(),
+            "a freshly-touched C1 export must NOT expire (issue #216 Gap 1)"
+        );
+    }
+
+    /// Issue #216 Gap 3: a reattached frozen post-copy source must stay
+    /// paused on a not-yet-rehydrated binding or an unreachable
+    /// coordinator, and destroy ONLY on an explicit `owned == false`.
+    #[test]
+    fn reattach_source_verdict_destroys_only_on_explicit_unowned() {
+        use ReattachSourceVerdict::*;
+        // No binding learned yet ⇒ stay paused regardless of the
+        // (irrelevant, un-asked) ownership input.
+        assert_eq!(reattach_source_verdict(false, None), StayPaused);
+        assert_eq!(reattach_source_verdict(false, Some(false)), StayPaused);
+        assert_eq!(reattach_source_verdict(false, Some(true)), StayPaused);
+        // Bound + coordinator unreachable ⇒ never guess; stay paused.
+        assert_eq!(reattach_source_verdict(true, None), StayPaused);
+        // Bound + still owned ⇒ stay paused (never self-resume).
+        assert_eq!(reattach_source_verdict(true, Some(true)), StayPaused);
+        // Bound + explicitly unowned ⇒ the ONLY destroy arm.
+        assert_eq!(reattach_source_verdict(true, Some(false)), Destroy);
     }
 
     #[test]
