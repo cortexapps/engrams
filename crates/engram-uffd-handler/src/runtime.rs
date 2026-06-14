@@ -38,7 +38,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -213,6 +213,46 @@ fn locate_offset(
     None
 }
 
+/// Per-chunk installation lifecycle. A chunk's `installed` bit was
+/// historically a plain `bool` set *before* the fallible fetch/copy
+/// work — so a transient error (GCS 5xx, partial `UFFDIO_COPY`) left
+/// the bit set with no rollback, permanently poisoning the chunk: the
+/// next fault saw "installed", `wake_page`d a still-missing page, and
+/// the vCPU spun in a fault/wake loop forever (issue #206).
+///
+/// The tri-state makes install atomic *and* serialised:
+/// - `Empty`      — no install has succeeded; the chunk is claimable.
+/// - `Installing` — exactly one installer holds the claim and is doing
+///   the fallible work (which can block multi-seconds on `fetch_chunk`).
+/// - `Installed`  — the bytes are in the guest; durable success.
+///
+/// `Empty → Installing` is the claim (CAS under the lock). Success
+/// publishes `Installing → Installed`; any error rolls back
+/// `Installing → Empty` so the chunk is retried on the next fault. A
+/// concurrent fault that finds `Installing` *waits* for the in-flight
+/// installer to publish a terminal state (closing the busy-spin
+/// livelock window) instead of waking a page that isn't there yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChunkState {
+    Empty,
+    Installing,
+    Installed,
+}
+
+/// Result of attempting to claim a chunk for installation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    /// WE claimed it (state was `Empty`, now `Installing`): the caller
+    /// must perform the install and then `mark_installed` / `release_chunk`.
+    Claimed,
+    /// Another installer is mid-flight (`Installing`). The caller should
+    /// wait for it to finish (`wait_until_settled`) rather than wake a
+    /// missing page.
+    InFlight,
+    /// Already fully `Installed` — the caller short-circuits to a wake.
+    Done,
+}
+
 /// All the state the event loop needs after the handshake.
 pub struct Runtime {
     mappings: Vec<GuestRegionUffdMapping>,
@@ -227,11 +267,18 @@ pub struct Runtime {
     /// on shutdown. `Mutex` is here for correctness, not contention:
     /// the fault loop is single-threaded today.
     recorder: Arc<Mutex<WorkingSetRecorder>>,
-    /// Per-chunk installation tracking. Set to `true` once a chunk's
-    /// bytes are in the guest. Lets the fault loop skip duplicate
-    /// `UFFDIO_COPY` attempts for chunks already pre-faulted from
-    /// a trace (`EEXIST` would otherwise force a retry).
-    installed: Mutex<Vec<bool>>,
+    /// Per-chunk installation lifecycle (see [`ChunkState`]). Lets the
+    /// fault loop skip duplicate `UFFDIO_COPY` attempts for chunks
+    /// already installed (`EEXIST` would otherwise force a retry), and
+    /// — via the tri-state + `install_cv` — lets a fault that races an
+    /// in-flight install *wait* for it instead of waking a missing page.
+    /// A failed install rolls the chunk back to `Empty` so it is retried
+    /// rather than permanently poisoned (issue #206).
+    installed: Mutex<Vec<ChunkState>>,
+    /// Notified whenever a chunk leaves `Installing` (→ `Installed` on
+    /// success, → `Empty` on rollback). A fault that found the chunk
+    /// `Installing` waits on this until the in-flight install settles.
+    install_cv: Condvar,
     page_size: u64,
     /// ADR 0014 M1.14: when set, the fault loop periodically writes
     /// the current recorder snapshot to this path. Belt-and-
@@ -328,7 +375,8 @@ impl Runtime {
             backend,
             handle,
             recorder,
-            installed: Mutex::new(vec![false; chunk_count]),
+            installed: Mutex::new(vec![ChunkState::Empty; chunk_count]),
+            install_cv: Condvar::new(),
             page_size,
             trace_output: None,
             base_shm,
@@ -563,35 +611,115 @@ impl Runtime {
         Ok(())
     }
 
-    /// Atomically claim the per-chunk `installed` bit for `chunk_idx`.
-    /// Returns `true` if WE claimed it (caller must install), `false`
-    /// if a prior install already owns it (caller short-circuits to a
-    /// wake). The bit is set under the lock so concurrent prefault /
-    /// fault / drain installs serialise to exactly one install per
-    /// chunk. On a subsequent install failure the caller MUST call
-    /// `release_chunk` so the chunk stays retryable.
-    fn claim_chunk(&self, chunk_idx: usize) -> bool {
+    /// Atomically claim a chunk for installation (CAS `Empty →
+    /// Installing` under the lock). Concurrent prefault / fault / drain
+    /// installs serialise to exactly one installer per chunk.
+    ///
+    /// - [`Claim::Claimed`]  — WE own the install; on success call
+    ///   `mark_installed`, on ANY error call `release_chunk` so the
+    ///   chunk rolls back to `Empty` and stays retryable (issue #206:
+    ///   the bit is never left set across a failed fetch/copy).
+    /// - [`Claim::InFlight`] — someone else is installing; the caller
+    ///   should `wait_until_settled` rather than wake a missing page.
+    /// - [`Claim::Done`]     — already `Installed`; caller wakes.
+    fn claim_chunk(&self, chunk_idx: usize) -> Claim {
         let mut installed = self.installed.lock().expect("installed bitmap poisoned");
         match installed.get_mut(chunk_idx) {
-            Some(slot) if *slot => false,
-            Some(slot) => {
-                *slot = true;
-                true
+            Some(slot @ ChunkState::Empty) => {
+                *slot = ChunkState::Installing;
+                Claim::Claimed
             }
+            Some(ChunkState::Installing) => Claim::InFlight,
+            Some(ChunkState::Installed) => Claim::Done,
             // Out-of-range index: treat as "claimed" so the caller
             // proceeds and the subsequent locate_offset surfaces the
             // real out-of-bounds error rather than silently looping.
-            None => true,
+            None => Claim::Claimed,
         }
     }
 
-    /// Roll back a `claim_chunk` after a failed install so the chunk
-    /// can be re-claimed and retried (closes the bit-set-before-install
-    /// permanent-loss window).
+    /// Publish a successful install (`Installing → Installed`) and wake
+    /// any faults waiting on the in-flight install. The bytes are in
+    /// the guest before this is called, so it is sound for a woken
+    /// waiter to `wake_page` its faulting page.
+    fn mark_installed(&self, chunk_idx: usize) {
+        let mut installed = self.installed.lock().expect("installed bitmap poisoned");
+        if let Some(slot) = installed.get_mut(chunk_idx) {
+            *slot = ChunkState::Installed;
+        }
+        self.install_cv.notify_all();
+    }
+
+    /// Roll back a failed install (`Installing → Empty`) so the chunk
+    /// can be re-claimed and retried, and wake any waiting faults so
+    /// one of them re-claims and retries the fetch/copy instead of
+    /// spinning (closes the bit-set-before-install permanent-loss window
+    /// AND the in-flight livelock window — issue #206).
     fn release_chunk(&self, chunk_idx: usize) {
         let mut installed = self.installed.lock().expect("installed bitmap poisoned");
         if let Some(slot) = installed.get_mut(chunk_idx) {
-            *slot = false;
+            *slot = ChunkState::Empty;
+        }
+        self.install_cv.notify_all();
+    }
+
+    /// Block until `chunk_idx` is no longer `Installing` (an in-flight
+    /// installer published `Installed` or rolled back to `Empty`).
+    /// Returns the settled state. Used by a fault that raced a producer
+    /// install: it waits for the result instead of waking a page the
+    /// in-flight install hasn't populated yet. The wait is bounded only
+    /// by the installer's own work (a `fetch_chunk` is cache/store-
+    /// bounded); on `Empty` the caller retries, on `Installed` it wakes.
+    fn wait_until_settled(&self, chunk_idx: usize) -> ChunkState {
+        let mut installed = self.installed.lock().expect("installed bitmap poisoned");
+        loop {
+            match installed.get(chunk_idx).copied() {
+                Some(ChunkState::Installing) => {
+                    installed = self
+                        .install_cv
+                        .wait(installed)
+                        .expect("installed bitmap poisoned");
+                }
+                Some(state) => return state,
+                None => return ChunkState::Installed,
+            }
+        }
+    }
+
+    /// Claim a chunk for the calling installer, resolving an in-flight
+    /// race deterministically. Returns either [`Claim::Claimed`] (WE own
+    /// the install; settle it with `settle_install`) or [`Claim::Done`]
+    /// (the chunk is `Installed`; the caller wakes its faulting page).
+    ///
+    /// On [`Claim::InFlight`] we WAIT for the racing installer to settle
+    /// rather than wake a page it hasn't populated (the old busy-spin
+    /// livelock, issue #206). If that install succeeded → `Done`; if it
+    /// failed (rolled back to `Empty`) we re-claim and retry ourselves,
+    /// so a transient producer error is repaired by the next fault
+    /// instead of permanently poisoning the chunk.
+    fn claim_for_install(&self, chunk_idx: usize) -> Claim {
+        loop {
+            match self.claim_chunk(chunk_idx) {
+                Claim::Claimed => return Claim::Claimed,
+                Claim::Done => return Claim::Done,
+                Claim::InFlight => match self.wait_until_settled(chunk_idx) {
+                    // Racing install landed the bytes; wake our page.
+                    ChunkState::Installed => return Claim::Done,
+                    // Racing install failed and rolled back; loop to
+                    // re-claim and retry the fetch/copy ourselves.
+                    ChunkState::Empty | ChunkState::Installing => continue,
+                },
+            }
+        }
+    }
+
+    /// Publish the outcome of an install WE claimed: `Installed` on
+    /// success, rollback to `Empty` on any error (so `?`-propagated
+    /// errors can never leave the chunk stuck `Installing`).
+    fn settle_install<T>(&self, chunk_idx: usize, result: &Result<T, HandlerError>) {
+        match result {
+            Ok(_) => self.mark_installed(chunk_idx),
+            Err(_) => self.release_chunk(chunk_idx),
         }
     }
 
@@ -698,10 +826,12 @@ impl Runtime {
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
 
-        // Cheap idempotency claim — avoid syscalls and EEXIST round-
-        // trips entirely if a prior install already covered this chunk.
-        if !self.claim_chunk(chunk_idx) {
-            return Ok(false);
+        // Claim the chunk (Empty → Installing). If another installer is
+        // mid-flight or already done, short-circuit to a wake (false);
+        // a failed in-flight install rolls back to Empty and we retry.
+        match self.claim_for_install(chunk_idx) {
+            Claim::Claimed => {}
+            _ => return Ok(false),
         }
 
         // The chunk's bytes occupy file offsets
@@ -725,9 +855,7 @@ impl Runtime {
             }
             Ok(())
         });
-        if result.is_err() {
-            self.release_chunk(chunk_idx);
-        }
+        self.settle_install(chunk_idx, &result);
         result.map(|()| true)
     }
 
@@ -740,8 +868,9 @@ impl Runtime {
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
 
-        if !self.claim_chunk(chunk_idx) {
-            return Ok(false);
+        match self.claim_for_install(chunk_idx) {
+            Claim::Claimed => {}
+            _ => return Ok(false),
         }
 
         // Zero the chunk's whole [byte_offset, +total_len) range,
@@ -762,9 +891,7 @@ impl Runtime {
             }
             Ok(())
         });
-        if result.is_err() {
-            self.release_chunk(chunk_idx);
-        }
+        self.settle_install(chunk_idx, &result);
         result.map(|()| true)
     }
 
@@ -783,35 +910,52 @@ impl Runtime {
     ) -> Result<bool, HandlerError> {
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
-        if !self.claim_chunk(chunk_idx) {
-            return Ok(false);
+        match self.claim_for_install(chunk_idx) {
+            Claim::Claimed => {}
+            _ => return Ok(false),
         }
 
         let populate_len = std::cmp::min(
             chunk_size,
             self.backend.total_bytes().saturating_sub(byte_offset),
         );
-        // Ensure the base shm holds this chunk's bytes (file-offset
-        // keyed — independent of the region layout) before we map them.
-        // On failure release the claim so the chunk stays retryable.
+        // All fallible work — the (multi-second, network-bound)
+        // `fetch_chunk`, the base write, and the CONTINUE walk — runs in
+        // `populate_and_continue` so a single `settle_install` publishes
+        // `Installed` only on full success and rolls the claim back to
+        // `Empty` on ANY error. The chunk is never left `Installing`
+        // across `?`, and a transient fetch failure is retried by the
+        // next fault rather than permanently poisoning the chunk (#206).
+        let result = self.populate_and_continue(base, byte_offset, populate_len, hash, wake);
+        self.settle_install(chunk_idx, &result);
+        result.map(|()| true)
+    }
+
+    /// The fallible body of `install_canonical_shared`: ensure the base
+    /// shm holds the chunk's bytes (fetch + write, skipped when a sibling
+    /// already populated the range), then `UFFDIO_CONTINUE` every region
+    /// segment the chunk spans. Split out so the claim is settled in one
+    /// place on the combined `Result`.
+    fn populate_and_continue(
+        &self,
+        base: &crate::base_shm::BaseShm,
+        byte_offset: u64,
+        populate_len: u64,
+        hash: engram_chunk_store::ChunkHash,
+        wake: bool,
+    ) -> Result<(), HandlerError> {
+        // Ensure the base shm holds this chunk's bytes (file-offset keyed
+        // — independent of the region layout) before we map them.
         if !base.is_populated(byte_offset, populate_len) {
-            let bytes = match self.handle.block_on(self.backend.fetch_chunk(hash)) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.release_chunk(chunk_idx);
-                    return Err(e.into());
-                }
-            };
-            if let Err(e) = base.write_chunk(byte_offset, &bytes) {
-                self.release_chunk(chunk_idx);
-                return Err(HandlerError::BaseShm(e));
-            }
+            let bytes = self.handle.block_on(self.backend.fetch_chunk(hash))?;
+            base.write_chunk(byte_offset, &bytes)
+                .map_err(HandlerError::BaseShm)?;
         }
 
         // CONTINUE each region segment the chunk spans. Per segment the
         // kernel may map a prefix and return progress (looped) and may
         // EEXIST on a page a racing fault already mapped.
-        let result = self.install_spanning(byte_offset, populate_len, |host_va, seg_len, _pos| {
+        self.install_spanning(byte_offset, populate_len, |host_va, seg_len, _pos| {
             let mut done: u64 = 0;
             while (done as usize) < seg_len {
                 let start = host_va + done;
@@ -835,11 +979,7 @@ impl Runtime {
                 }
             }
             Ok(())
-        });
-        if result.is_err() {
-            self.release_chunk(chunk_idx);
-        }
-        result.map(|()| true)
+        })
     }
 
     /// ADR 0045 substrate (v2b): zero canonical chunks. Try
@@ -851,8 +991,9 @@ impl Runtime {
         use std::sync::atomic::Ordering;
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
-        if !self.claim_chunk(chunk_idx) {
-            return Ok(false);
+        match self.claim_for_install(chunk_idx) {
+            Claim::Claimed => {}
+            _ => return Ok(false),
         }
 
         // Walk every region the chunk spans (clamped to the manifest's
@@ -895,9 +1036,7 @@ impl Runtime {
             }
             Ok(())
         });
-        if result.is_err() {
-            self.release_chunk(chunk_idx);
-        }
+        self.settle_install(chunk_idx, &result);
         result.map(|()| true)
     }
 
@@ -1101,13 +1240,18 @@ impl Runtime {
         Ok(())
     }
 
-    /// Cheap read of the per-chunk install bit.
+    /// Cheap read of whether a chunk is fully `Installed` (a chunk that
+    /// is merely `Installing` is NOT yet serveable). Drain/seal
+    /// accounting relies on this being `Installed`-exact so
+    /// `sealed_uninstalled_count` doesn't under-report a chunk whose
+    /// install failed and rolled back (issue #206).
     fn chunk_installed(&self, chunk_idx: usize) -> bool {
         self.installed
             .lock()
             .expect("installed bitmap poisoned")
             .get(chunk_idx)
             .copied()
+            .map(|s| s == ChunkState::Installed)
             .unwrap_or(false)
     }
 
@@ -1116,7 +1260,8 @@ impl Runtime {
         let installed = self.installed.lock().expect("installed bitmap poisoned");
         (0..peer.seal().chunk_count)
             .filter(|i| {
-                peer.seal().get(*i) && !installed.get(*i as usize).copied().unwrap_or(false)
+                peer.seal().get(*i)
+                    && installed.get(*i as usize).copied() != Some(ChunkState::Installed)
             })
             .count() as u64
     }
@@ -1620,7 +1765,7 @@ mod tests {
         // Every chunk installed exactly once.
         let installed = rt.installed.lock().unwrap();
         assert!(
-            installed.iter().all(|b| *b),
+            installed.iter().all(|s| *s == ChunkState::Installed),
             "every chunk should be installed"
         );
 
@@ -1840,7 +1985,12 @@ mod tests {
             .expect("sealed fault post-drain");
 
         // Every chunk installed; sealed content is the PEER's truth.
-        assert!(rt.installed.lock().unwrap().iter().all(|b| *b));
+        assert!(rt
+            .installed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| *s == ChunkState::Installed));
         let view = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
         for i in 0..n_chunks {
             let start = i * chunk_size as usize;
@@ -2034,11 +2184,372 @@ mod tests {
         );
 
         assert!(
-            rt.installed.lock().unwrap().iter().all(|b| *b),
+            rt.installed
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|s| *s == ChunkState::Installed),
             "every chunk installed"
         );
 
         unsafe { libc::munmap(ptr_a, boundary as usize) };
         unsafe { libc::munmap(ptr_b, region_b_size as usize) };
+    }
+
+    // ---------------------------------------------------------------
+    // issue #206: the per-chunk install bit was set BEFORE the fallible
+    // fetch/copy and never rolled back, permanently poisoning a chunk on
+    // any transient error (silent guest hang). The tri-state install
+    // lifecycle (`Empty/Installing/Installed`) makes the install atomic
+    // (publish `Installed` only on full success, roll back to `Empty` on
+    // error) and serialised (a racing fault WAITS on an in-flight
+    // install instead of busy-spinning a missing page). The next four
+    // tests cover the issue's acceptance criteria. They drive the
+    // install-state machine directly so they run unconditionally in CI
+    // (no privileged userfaultfd required); the end-to-end retry through
+    // a real UFFD is covered by `fetch_failure_rolls_back_then_retries`.
+
+    /// Build a minimal single-page-per-chunk Runtime with NO real UFFD
+    /// region wired to the guest — only the install bookkeeping is
+    /// exercised. The UFFD is created over a throwaway anonymous page so
+    /// `Runtime::new` has a valid fd; tests here never call the install
+    /// ioctls, only `claim_chunk`/`mark_installed`/`release_chunk`/
+    /// `wait_until_settled`/`chunk_installed`. Returns `None` if the
+    /// kernel forbids unprivileged uffd (so the test SKIPs, like the
+    /// real-region tests above).
+    fn bookkeeping_runtime(n_chunks: usize) -> Option<Arc<Runtime>> {
+        let page_size = 4096u64;
+        let chunk_size = page_size;
+        let total = chunk_size * n_chunks as u64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob);
+        // Manifest of all-zero (canonical-omitted) chunks: total_bytes
+        // only needs to match the mapping sum; no chunk content is
+        // fetched by these bookkeeping-only tests.
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes: total,
+            chunks: Vec::new(),
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend = Arc::new(
+            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+        );
+
+        let len = total as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(true)
+            .create()
+        {
+            Ok(u) => u,
+            Err(e) => {
+                unsafe { libc::munmap(ptr, len) };
+                eprintln!("SKIP: cannot create userfaultfd ({e})");
+                return None;
+            }
+        };
+        uffd.register(ptr, len).expect("register region with uffd");
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: ptr as u64,
+            size: len,
+            offset: 0,
+            page_size: page_size as usize,
+        }];
+        Some(Arc::new(
+            Runtime::new(
+                mappings,
+                uffd,
+                backend,
+                tokio::runtime::Handle::current(),
+                Duration::ZERO,
+                None,
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// Acceptance #2 + #1 (state level): a claim that ends in error rolls
+    /// the chunk back to `Empty` so the SAME chunk can be re-claimed and
+    /// retried — the bit is never left set across a failure, which is the
+    /// whole #206 bug (before the fix the second claim would see the bit
+    /// set forever and short-circuit to a never-resolving wake).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_install_rolls_back_and_chunk_is_reclaimable() {
+        let Some(rt) = bookkeeping_runtime(2) else {
+            return;
+        };
+        // First installer claims chunk 0.
+        assert_eq!(rt.claim_chunk(0), Claim::Claimed);
+        assert!(!rt.chunk_installed(0), "Installing is not yet serveable");
+        // Its install fails -> rollback to Empty.
+        rt.release_chunk(0);
+        assert!(!rt.chunk_installed(0));
+        // The chunk is retryable: a later fault re-claims it (NOT `Done`,
+        // which would short-circuit to a wake on a never-populated page).
+        assert_eq!(
+            rt.claim_chunk(0),
+            Claim::Claimed,
+            "a rolled-back chunk must be re-claimable, not permanently poisoned"
+        );
+        // Success this time publishes Installed; further claims are Done.
+        rt.mark_installed(0);
+        assert!(rt.chunk_installed(0));
+        assert_eq!(rt.claim_chunk(0), Claim::Done);
+    }
+
+    /// Acceptance #3: a fault that races an in-flight install must
+    /// TERMINATE once the install settles — never busy-spin. Here the
+    /// installer holds `Installing`, the waiter blocks in
+    /// `claim_for_install` (no spin), and on the installer's SUCCESS the
+    /// waiter resolves to `Done` (wake its page).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn concurrent_fault_during_inflight_install_waits_then_resolves() {
+        let Some(rt) = bookkeeping_runtime(1) else {
+            return;
+        };
+        // Installer claims chunk 0 and is "mid-flight".
+        assert_eq!(rt.claim_chunk(0), Claim::Claimed);
+
+        let rt_w = Arc::clone(&rt);
+        let waiter = std::thread::spawn(move || {
+            // Must block until the installer settles, then return Done
+            // (installed) — NOT spin, NOT re-claim.
+            rt_w.claim_for_install(0)
+        });
+
+        // Give the waiter time to reach the Condvar wait.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "waiter must block on the in-flight install"
+        );
+
+        // Installer finishes successfully.
+        rt.mark_installed(0);
+        let outcome = waiter.join().unwrap();
+        assert_eq!(
+            outcome,
+            Claim::Done,
+            "a fault racing a successful install must wake, not re-install"
+        );
+    }
+
+    /// Acceptance #3 + #1: same race, but the in-flight install FAILS and
+    /// rolls back. The waiter must then re-claim and retry itself (so a
+    /// transient producer error is repaired by the next fault, not left
+    /// to hang).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn concurrent_fault_during_failed_install_retries_itself() {
+        let Some(rt) = bookkeeping_runtime(1) else {
+            return;
+        };
+        assert_eq!(rt.claim_chunk(0), Claim::Claimed);
+
+        let rt_w = Arc::clone(&rt);
+        let waiter = std::thread::spawn(move || rt_w.claim_for_install(0));
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !waiter.is_finished(),
+            "waiter must block on the in-flight install"
+        );
+
+        // In-flight install fails -> rollback. The waiter, finding the
+        // chunk Empty, must re-claim and own the retry.
+        rt.release_chunk(0);
+        let outcome = waiter.join().unwrap();
+        assert_eq!(
+            outcome,
+            Claim::Claimed,
+            "after a failed in-flight install the racing fault must retry, not wake a missing page"
+        );
+    }
+
+    /// Acceptance #4: drain/seal accounting (`chunk_installed`, the basis
+    /// of `sealed_uninstalled_count`) must be `Installed`-exact. A chunk
+    /// merely `Installing`, or one whose install FAILED (back to
+    /// `Empty`), must NOT count as installed — otherwise PeerLost
+    /// under-reports `remaining` and the host-agent thinks doomed bytes
+    /// are present.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_install_stays_uninstalled_for_accounting() {
+        let Some(rt) = bookkeeping_runtime(1) else {
+            return;
+        };
+        assert!(!rt.chunk_installed(0), "Empty is not installed");
+        assert_eq!(rt.claim_chunk(0), Claim::Claimed);
+        assert!(!rt.chunk_installed(0), "Installing is not installed");
+        rt.release_chunk(0);
+        assert!(
+            !rt.chunk_installed(0),
+            "a failed (rolled-back) install must not count as installed"
+        );
+        // Only a published success counts.
+        assert_eq!(rt.claim_chunk(0), Claim::Claimed);
+        rt.mark_installed(0);
+        assert!(rt.chunk_installed(0));
+    }
+
+    /// Acceptance #1, end-to-end through a real UFFD: a `fetch_chunk`
+    /// that FAILS on the first fault (chunk content absent from the
+    /// store) must roll the chunk back so the SECOND fault — after the
+    /// content lands — actually retries the fetch and installs the bytes.
+    /// Before the fix the first fault set the bit, the error propagated,
+    /// and every later fault returned `Ok(false)` → `wake_page` on a
+    /// never-populated page → permanent fault/wake spin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn fetch_failure_rolls_back_then_retries() {
+        let page_size = 4096u64;
+        let chunk_size = page_size;
+        let n_chunks = 1usize;
+        let total = chunk_size * n_chunks as u64;
+        const TAG: u8 = 0x5A;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob.clone());
+        // Compute the chunk hash WITHOUT storing the content, so the
+        // first fetch fails (blob-not-found) — the transient store error
+        // #206 is about. We re-derive the hash by hashing in a throwaway
+        // store, then build the manifest pointing the session at it.
+        let content = vec![TAG; chunk_size as usize];
+        let throwaway_dir = tempfile::tempdir().unwrap();
+        let throwaway: Arc<dyn BlobStorage> =
+            Arc::new(LocalBlobStorage::new(throwaway_dir.path().to_path_buf()));
+        let hash = ChunkStore::new(throwaway)
+            .put_chunk(&content)
+            .await
+            .unwrap();
+
+        let manifest = Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes: total,
+            chunks: vec![ChunkRef { offset: 0, hash }],
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        // Keep a handle to the (initially empty) backing store so the
+        // test can land the content between the failing and retrying
+        // faults, simulating the transient store error clearing.
+        let store_handle = store.clone();
+        let backend = Arc::new(
+            ChunkedMemoryBackend::new(&manifest, &manifest, ChunkCache::new(cfg), store).unwrap(),
+        );
+
+        let len = total as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+        let uffd = match UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(false)
+            .user_mode_only(true)
+            .create()
+        {
+            Ok(u) => u,
+            Err(e) => {
+                unsafe { libc::munmap(ptr, len) };
+                eprintln!("SKIP: cannot create userfaultfd ({e})");
+                return;
+            }
+        };
+        uffd.register(ptr, len).expect("register region with uffd");
+        let mappings = vec![GuestRegionUffdMapping {
+            base_host_virt_addr: ptr as u64,
+            size: len,
+            offset: 0,
+            page_size: page_size as usize,
+        }];
+        let rt = Arc::new(
+            Runtime::new(
+                mappings,
+                uffd,
+                backend,
+                tokio::runtime::Handle::current(),
+                Duration::ZERO,
+                None,
+            )
+            .unwrap(),
+        );
+
+        let base = ptr as u64;
+        // First fault: the content isn't in the store yet -> fetch fails
+        // -> serve_pagefault returns Err and the chunk MUST roll back.
+        let rt_e = Arc::clone(&rt);
+        let first = std::thread::spawn(move || rt_e.serve_pagefault(base))
+            .join()
+            .unwrap();
+        assert!(
+            first.is_err(),
+            "first fault should surface the transient fetch error"
+        );
+        assert!(
+            !rt.chunk_installed(0),
+            "a failed fetch must NOT leave the chunk marked installed (the #206 poison)"
+        );
+        assert_eq!(
+            rt.claim_chunk(0),
+            Claim::Claimed,
+            "the chunk must be re-claimable after the failed fetch"
+        );
+        rt.release_chunk(0); // undo the probe claim
+
+        // The content lands (transient error cleared).
+        let stored = store_handle.put_chunk(&content).await.unwrap();
+        assert_eq!(
+            stored, hash,
+            "stored content must hash to the manifest entry"
+        );
+
+        // Second fault: the resolver path is NOT gated on a stale bit, so
+        // it retries the fetch and installs for real.
+        let rt_ok = Arc::clone(&rt);
+        std::thread::spawn(move || {
+            rt_ok.serve_pagefault(base).expect("retry fault installs");
+        })
+        .join()
+        .unwrap();
+        assert!(rt.chunk_installed(0), "retry should install the chunk");
+
+        let view = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        assert!(
+            view.iter().all(|b| *b == TAG),
+            "installed bytes must match the (now-available) chunk content"
+        );
+        unsafe { libc::munmap(ptr, len) };
     }
 }
