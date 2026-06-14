@@ -396,6 +396,13 @@ impl MetadataStore for PostgresStore {
             SELECT id, allocatable_mib, total_vcpus
             FROM hosts
             WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
+            -- ORDER BY id BEFORE `FOR UPDATE`: every placer (any replica, both
+            -- this and `place_queued_session`) locks the overlapping host rows
+            -- in the SAME (PK) order, so a burst can't lock {A,B} vs {B,A} and
+            -- deadlock. The LockRows executor node sits atop the sort, so rows
+            -- are locked in id order. (Load test: `deadlock detected` under
+            -- concurrent creates before this.)
+            ORDER BY id
             FOR UPDATE
             "#,
         )
@@ -724,6 +731,13 @@ impl MetadataStore for PostgresStore {
             SELECT id, allocatable_mib, total_vcpus
             FROM hosts
             WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
+            -- ORDER BY id BEFORE `FOR UPDATE`: every placer (any replica, both
+            -- this and `place_queued_session`) locks the overlapping host rows
+            -- in the SAME (PK) order, so a burst can't lock {A,B} vs {B,A} and
+            -- deadlock. The LockRows executor node sits atop the sort, so rows
+            -- are locked in id order. (Load test: `deadlock detected` under
+            -- concurrent creates before this.)
+            ORDER BY id
             FOR UPDATE
             "#,
         )
