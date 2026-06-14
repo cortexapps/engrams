@@ -1383,6 +1383,29 @@ impl HostAgent {
             // dead_conn_timeout until the successor reconfigures.
             #[cfg(target_os = "linux")]
             {
+                // Issue #225: BEFORE abandoning the data planes, run a
+                // bounded final disk-flush pass. NBD WRITEs are acked
+                // from the in-RAM dirty tier and only made durable on
+                // the FlushScheduler's ~30 s cadence; abandoning drops
+                // that tier, so without this pass a routine pod roll
+                // silently rolls a surviving guest's disk back by up to
+                // one cadence window of ACKED writes. The pass drains +
+                // uploads each survivor's dirty chunks and synchronously
+                // republishes its live_disk_manifest so the successor
+                // rehydrates from the current ref. It is budgeted against
+                // the pod's terminationGracePeriodSeconds (minus headroom
+                // for the abandon sweep + detach below); on overrun it
+                // logs the still-dirty survivors loudly and proceeds.
+                let flush_budget = std::time::Duration::from_secs_f64(
+                    std::env::var("ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .filter(|v| *v > 0.0)
+                        .unwrap_or(20.0),
+                );
+                pooled
+                    .flush_nbd_data_planes_for_shutdown(flush_budget)
+                    .await;
                 let abandoned = pooled.abandon_nbd_data_planes_for_shutdown();
                 if abandoned > 0 {
                     tracing::info!(
