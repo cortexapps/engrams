@@ -153,6 +153,36 @@ async fn advance_one(
         tracing::debug!(%session_id, "evac-resumer: session lease held; skipping this tick");
         return Ok(());
     };
+
+    // Issue #211 (ADR 0044 K5 shape, copied from idle_evictor): the
+    // `candidates` list is a sweep snapshot up to ~10s stale. Without a
+    // post-lease re-read we could drive a resume — restoring a live VM
+    // on a peer host and binding it — onto a row that has since gone
+    // terminal (a `DELETE /sessions/:id` flips Evacuating→Failed) or was
+    // already relocated by a competitor. The lease is held until the
+    // pipeline finishes, so once we hold it any concurrent actor has
+    // fully completed; re-read the authoritative PG state and skip
+    // unless the row is still `Evacuating` (the only legal input to the
+    // resume pipeline). This keeps a stale tick from binding a fresh
+    // sandbox onto a terminal row (defeating the orphan reap) — the same
+    // failure the guarded binds in `bind_resumed_session` reject, caught
+    // earlier so we never create the VM in the first place.
+    match state.services.meta.get_session(session_id).await {
+        Ok(s) if s.status != SessionState::Evacuating => {
+            tracing::info!(
+                %session_id,
+                state = s.status.as_str(),
+                "evac-resumer: session no longer Evacuating after lease (terminated or \
+                 relocated by a peer) — skipping",
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("evac-resumer: re-read session state after lease: {e}").into());
+        }
+    }
+
     // Retry budget exhausted → fall back to Idle so the user can
     // `/resume` manually. Idle is a legal target from Evacuating per
     // the legality table; the row's snapshot lineage is already

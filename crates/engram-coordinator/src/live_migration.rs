@@ -460,10 +460,25 @@ pub async fn migrate_session_live(
         // ONE atomic UPDATE: the ownership oracle (`sandbox_ownership`)
         // flips with it — the post-copy ownership transfer point. The
         // source's TTL answer goes `false` from here.
+        //
+        // Issue #211: guard the rebind on the row still being the
+        // `Evacuating` row bound to the SOURCE sandbox we're migrating
+        // off. A `DELETE /sessions/:id` (or a reconcile strike) racing
+        // the copy can flip the row terminal and/or clear its sandbox;
+        // a blind rebind would re-bind the new live VM onto that terminal
+        // row, the ownership oracle would answer `owned = true`, and the
+        // orphan reap would never fire. On `Conflict` we drop into the
+        // error arm below, which destroys `new_sandbox_id` and parachutes.
         state
             .services
             .meta
-            .rebind_session(session_id, target_host_id, new_sandbox_id)
+            .rebind_session_guarded(
+                session_id,
+                target_host_id,
+                new_sandbox_id,
+                Some(Some(sandbox_id)),
+                &[SessionState::Evacuating],
+            )
             .await
             .map_err(|e| format!("rebind: {e}"))?;
         state

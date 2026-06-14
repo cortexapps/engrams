@@ -473,6 +473,121 @@ pub trait MetadataStore: Send + Sync {
         self.assign_session_sandbox(id, Some(sandbox_id)).await
     }
 
+    /// Issue #211: guarded compare-and-swap variant of
+    /// [`Self::assign_session_sandbox`]. The three binding writers
+    /// (`assign_session_{host,sandbox}`, `rebind_session`) are otherwise
+    /// blind `WHERE id = $1` UPDATEs: a racing actor can bind a live
+    /// sandbox onto a row that has *concurrently* gone terminal (the
+    /// terminate-races-resume interleaving), defeating the orphan reap —
+    /// the ownership oracle matches `sandbox_id` only and never re-checks
+    /// status, so a live VM pinned to a `Completed` row leaks forever.
+    ///
+    /// This method conditions the write on:
+    ///   * `expected_current` — `Some(prev)` requires the row's current
+    ///     `sandbox_id` to equal `prev` (use `Some(None)` to require it
+    ///     currently NULL, `Some(Some(s))` to require it equals `s`).
+    ///     `None` means "don't compare the old sandbox".
+    ///   * `allowed_states` — if non-empty, the row's `status` must be one
+    ///     of these. Empty means "any state".
+    ///
+    /// Returns [`MetaError::Conflict`] when the guard rejects the write
+    /// (0 rows matched but the row exists), [`MetaError::NotFound`] when no
+    /// row with this id exists at all. Callers that just created a sandbox
+    /// MUST destroy it on `Conflict` rather than leaking it.
+    ///
+    /// The default impl composes a `get_session` legality check with the
+    /// blind setter — atomic enough for single-threaded mock stores; the
+    /// Postgres store overrides it with a true single-statement CAS.
+    async fn assign_session_sandbox_guarded(
+        &self,
+        id: SessionId,
+        sandbox_id: Option<SandboxId>,
+        expected_current: Option<Option<SandboxId>>,
+        allowed_states: &[SessionState],
+    ) -> Result<(), MetaError> {
+        let session = self.get_session(id).await?;
+        if let Some(expected) = expected_current {
+            if session.sandbox_id != expected {
+                return Err(MetaError::Conflict(format!(
+                    "assign_session_sandbox guard: sandbox_id is {:?}, expected {:?}",
+                    session.sandbox_id, expected
+                )));
+            }
+        }
+        if !allowed_states.is_empty() && !allowed_states.contains(&session.status) {
+            return Err(MetaError::Conflict(format!(
+                "assign_session_sandbox guard: status is {}, not in {:?}",
+                session.status.as_str(),
+                allowed_states
+            )));
+        }
+        self.assign_session_sandbox(id, sandbox_id).await
+    }
+
+    /// Issue #211: guarded CAS variant of [`Self::assign_session_host`].
+    /// See [`Self::assign_session_sandbox_guarded`] for the guard
+    /// semantics; `expected_current` here is matched against the row's
+    /// `sandbox_id` (the host bind in the resume path always lands paired
+    /// with the sandbox bind, so the sandbox is the meaningful witness).
+    async fn assign_session_host_guarded(
+        &self,
+        id: SessionId,
+        host_id: Option<HostId>,
+        expected_current: Option<Option<SandboxId>>,
+        allowed_states: &[SessionState],
+    ) -> Result<(), MetaError> {
+        let session = self.get_session(id).await?;
+        if let Some(expected) = expected_current {
+            if session.sandbox_id != expected {
+                return Err(MetaError::Conflict(format!(
+                    "assign_session_host guard: sandbox_id is {:?}, expected {:?}",
+                    session.sandbox_id, expected
+                )));
+            }
+        }
+        if !allowed_states.is_empty() && !allowed_states.contains(&session.status) {
+            return Err(MetaError::Conflict(format!(
+                "assign_session_host guard: status is {}, not in {:?}",
+                session.status.as_str(),
+                allowed_states
+            )));
+        }
+        self.assign_session_host(id, host_id).await
+    }
+
+    /// Issue #211: guarded CAS variant of [`Self::rebind_session`]. The
+    /// migration `Committing` persist replaces an *old* sandbox with a
+    /// *new* one; `expected_current` (the old sandbox it read) ensures a
+    /// reconcile strike-out or a competing rebind that already moved the
+    /// row doesn't get clobbered. `allowed_states` keeps the rebind from
+    /// landing on a row that went terminal mid-migration.
+    async fn rebind_session_guarded(
+        &self,
+        id: SessionId,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+        expected_current: Option<Option<SandboxId>>,
+        allowed_states: &[SessionState],
+    ) -> Result<(), MetaError> {
+        let session = self.get_session(id).await?;
+        if let Some(expected) = expected_current {
+            if session.sandbox_id != expected {
+                return Err(MetaError::Conflict(format!(
+                    "rebind_session guard: sandbox_id is {:?}, expected {:?}",
+                    session.sandbox_id, expected
+                )));
+            }
+        }
+        if !allowed_states.is_empty() && !allowed_states.contains(&session.status) {
+            return Err(MetaError::Conflict(format!(
+                "rebind_session guard: status is {}, not in {:?}",
+                session.status.as_str(),
+                allowed_states
+            )));
+        }
+        self.rebind_session(id, host_id, sandbox_id).await
+    }
+
     /// ADR 0015 M3: PG-authoritative lookup for "which host owns this
     /// sandbox right now, and what state is its session in?"
     /// `HostRegistry` calls this on cache miss (or after the per-host
