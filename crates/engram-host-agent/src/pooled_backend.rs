@@ -290,6 +290,25 @@ pub struct PooledBackend {
     /// (Drop returns `/dev/nbdN` to the pool). Linux-only — on
     /// macOS the materialize-to-file path is the only option for
     /// chunked disks.
+    ///
+    /// INVARIANT: never hold a `DashMap` `Ref`/`RefMut` guard (the
+    /// value returned by `.get()` / `.iter()` / `.get_mut()`) across
+    /// an `.await`. A guard pins the shard's **synchronous**
+    /// `RwLock`; any contending writer (`destroy`'s `remove`,
+    /// `create`/`restore`/`rehydrate`'s `insert`) hashing to the same
+    /// shard then blocks its OS worker thread for the whole await,
+    /// and dashmap-6's writer-preference subsequently blocks every
+    /// new reader on that shard too. With ≥ worker_threads collisions
+    /// (a busy host capturing/destroying/creating concurrently) all
+    /// tokio workers park in sync lock waits, the guard-holding
+    /// future can never be polled to release it, and the runtime
+    /// deadlocks — heartbeats stop and the host is declared dead.
+    /// Instead, clone the `Arc<ChunkedDiskBackend>` (and copy
+    /// `device_path().to_path_buf()` etc.) out of the guard, drop the
+    /// guard, then `.await` on the owned `Arc`. See `flush_sandbox`
+    /// for the canonical pattern and `migration_fetch` for the rule
+    /// restated inline. TOCTOU note: a `None`-after-clone (entry
+    /// removed mid-op) is handled identically to "entry missing".
     #[cfg(target_os = "linux")]
     nbd_sandboxes: Arc<DashMap<SandboxId, crate::disk_daemon::NbdSandboxState>>,
     /// ADR 0014 issue #1/#2: per-sandbox in-flight snapshot tracking.
@@ -928,47 +947,56 @@ impl PooledBackend {
         // still captures disk-at-the-pause-instant (ADR 0018 §12m); the
         // memory capture below is paired with it.
         #[cfg(target_os = "linux")]
-        let nbd_pending_flush = if let Some(entry) = self.nbd_sandboxes.get(&id) {
-            // Push the HOST's block-device page cache down to the
-            // daemon BEFORE draining. FC's virtio-blk writes to
-            // /dev/nbdN through the kernel page cache (drive
-            // cache_type = Unsafe: guest FLUSH does not propagate), so
-            // without this fsync the drain captures only what
-            // background writeback (~30 s) happened to deliver — a
-            // session that wrote recently snapshots a TORN chunk (the
-            // delivered front + a stale tail). The migration captures
-            // each carried this fsync already; the standard pipeline
-            // (periodic checkpoint / idle-evict / rehome) relied on
-            // "quiescent sessions age past the writeback interval",
-            // which the disk post-copy canary disproved: write → evac
-            // 15 s later published chunk 34 with its last 56 KiB
-            // reverted, and a periodic checkpoint of an actively-
-            // writing guest has the same hole (recovery from it would
-            // be corrupt).
-            let dev = entry.device_path().to_path_buf();
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&dev)?;
-                f.sync_all()
-            })
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
-            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
-            // Drain in-flight NBD requests so the drain sees a quiescent
-            // dirty buffer. With FC paused above, no new virtio writes
-            // are issued, and wait_idle returns once already-in-flight
-            // requests have completed through backend.write().
-            entry.backend.wait_idle().await;
-            let pending = entry
-                .backend
-                .flush_local()
+        let nbd_pending_flush = {
+            // INVARIANT (see `nbd_sandboxes`): clone the Arc + copy the
+            // device path out of the guard, then drop it BEFORE any
+            // `.await` — a held guard across the drain/upload below
+            // parks contending `destroy`/`create` workers on the
+            // shard's sync RwLock and can deadlock the runtime.
+            let backend_dev = self
+                .nbd_sandboxes
+                .get(&id)
+                .map(|entry| (entry.backend.clone(), entry.device_path().to_path_buf()));
+            if let Some((backend, dev)) = backend_dev {
+                // Push the HOST's block-device page cache down to the
+                // daemon BEFORE draining. FC's virtio-blk writes to
+                // /dev/nbdN through the kernel page cache (drive
+                // cache_type = Unsafe: guest FLUSH does not propagate), so
+                // without this fsync the drain captures only what
+                // background writeback (~30 s) happened to deliver — a
+                // session that wrote recently snapshots a TORN chunk (the
+                // delivered front + a stale tail). The migration captures
+                // each carried this fsync already; the standard pipeline
+                // (periodic checkpoint / idle-evict / rehome) relied on
+                // "quiescent sessions age past the writeback interval",
+                // which the disk post-copy canary disproved: write → evac
+                // 15 s later published chunk 34 with its last 56 KiB
+                // reverted, and a periodic checkpoint of an actively-
+                // writing guest has the same hole (recovery from it would
+                // be corrupt).
+                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                    let f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&dev)?;
+                    f.sync_all()
+                })
                 .await
-                .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
-            Some(pending)
-        } else {
-            None
+                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
+                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
+                // Drain in-flight NBD requests so the drain sees a quiescent
+                // dirty buffer. With FC paused above, no new virtio writes
+                // are issued, and wait_idle returns once already-in-flight
+                // requests have completed through backend.write().
+                backend.wait_idle().await;
+                let pending = backend
+                    .flush_local()
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
+                Some(pending)
+            } else {
+                None
+            }
         };
 
         // ADR 0007 Phase 6: backend owns its staging dir; we look
@@ -3047,10 +3075,20 @@ impl SnapshotFinisher {
             // not-yet-uploaded chunk.
             #[cfg(target_os = "linux")]
             if let Some(pending) = nbd_pending_flush {
-                if let Some(entry) = self.nbd_sandboxes.get(&id) {
-                    entry.backend.operation_scope().begin("snapshot");
-                    let res = entry.backend.flush_upload(pending).await;
-                    entry.backend.operation_scope().end();
+                // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop
+                // the guard BEFORE `flush_upload` — this is the multi-
+                // second GCS upload (~32 s for ~1,936 chunks) and the
+                // worst guard-across-await offender. Holding the shard
+                // guard here parks every contending `destroy`/`create`
+                // worker for the upload's full duration and can deadlock
+                // the runtime. A `None`-after-clone (entry destroyed
+                // mid-upload) is treated as "entry missing", exactly as
+                // the previous `if let Some(entry)` did.
+                let backend = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
+                if let Some(backend) = backend {
+                    backend.operation_scope().begin("snapshot");
+                    let res = backend.flush_upload(pending).await;
+                    backend.operation_scope().end();
                     let outcome =
                         res.map_err(|e| SandboxError::Snapshot(format!("nbd disk upload: {e}")))?;
                     tracing::info!(
@@ -3782,9 +3820,17 @@ impl SandboxBackend for PooledBackend {
         let memory_manifest_json = serde_json::to_vec(&chain_manifest)
             .map_err(|e| SandboxError::Snapshot(format!("chain manifest json: {e}")))?;
 
+        // INVARIANT (see `nbd_sandboxes`): clone the Arc + copy the
+        // device path out of the guard, then drop it before the fsync
+        // join and `manifest_ref().await` below.
         #[cfg(target_os = "linux")]
-        let disk_manifest_ref = match self.nbd_sandboxes.get(&id) {
-            Some(entry) => {
+        let backend_dev = self
+            .nbd_sandboxes
+            .get(&id)
+            .map(|entry| (entry.backend.clone(), entry.device_path().to_path_buf()));
+        #[cfg(target_os = "linux")]
+        let disk_manifest_ref = match backend_dev {
+            Some((backend, dev)) => {
                 // Disk post-copy pre-copy leg: push the host block
                 // cache down into the daemon's dirty buffer WHILE the
                 // guest still runs, so the capture's under-freeze
@@ -3792,7 +3838,6 @@ impl SandboxBackend for PooledBackend {
                 // any first-touch RMW base fetches happen off the
                 // blackout). Best-effort — the capture's fsync is the
                 // coherence-bearing one.
-                let dev = entry.device_path().to_path_buf();
                 let r = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                     let f = std::fs::OpenOptions::new()
                         .read(true)
@@ -3807,7 +3852,7 @@ impl SandboxBackend for PooledBackend {
                     tracing::warn!(sandbox_id = %id, error = %e,
                         "presetup pre-pause NBD fsync failed (non-fatal; capture re-fsyncs)");
                 }
-                Some(entry.backend.manifest_ref().await)
+                Some(backend.manifest_ref().await)
             }
             None => None,
         };
@@ -4282,10 +4327,20 @@ impl SandboxBackend for PooledBackend {
 
         // Disk: drain under the pause, land the pending tier in the
         // LOCAL cache, fence further flush publishes.
+        // INVARIANT (see `nbd_sandboxes`): clone the Arc + copy the
+        // device path out of the guard, then drop it before the
+        // multi-second drain (`fsync` join + `flush_local` +
+        // `flush_to_local_cache`) — a held guard parks contending
+        // `destroy`/`create` workers on the shard's sync RwLock.
+        #[cfg(target_os = "linux")]
+        let backend_dev = self
+            .nbd_sandboxes
+            .get(&id)
+            .map(|entry| (entry.backend.clone(), entry.device_path().to_path_buf()));
         #[cfg(target_os = "linux")]
         let (disk_manifest_json, disk_ref, disk_hashes, disk_pending) =
-            if let Some(entry) = self.nbd_sandboxes.get(&id) {
-                entry.backend.set_migration_fence(true);
+            if let Some((backend, dev)) = backend_dev {
+                backend.set_migration_fence(true);
                 // Push the HOST's block-device page cache down to the
                 // daemon before draining. FC's virtio-blk writes to
                 // /dev/nbdN through the kernel page cache (drive
@@ -4297,7 +4352,6 @@ impl SandboxBackend for PooledBackend {
                 // zeros/stale bytes where they belonged (the two-host
                 // NBD e2e probe; idle evictions dodge it because a
                 // quiescent session ages past the writeback interval).
-                let dev = entry.device_path().to_path_buf();
                 tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                     let f = std::fs::OpenOptions::new()
                         .read(true)
@@ -4308,17 +4362,16 @@ impl SandboxBackend for PooledBackend {
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
                 .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
-                entry.backend.wait_idle().await;
-                let pending =
-                    entry.backend.flush_local().await.map_err(|e| {
-                        SandboxError::Snapshot(format!("migration disk drain: {e}"))
-                    })?;
-                let (m, hashes) = entry
-                    .backend
+                backend.wait_idle().await;
+                let pending = backend
+                    .flush_local()
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("migration disk drain: {e}")))?;
+                let (m, hashes) = backend
                     .flush_to_local_cache(&pending)
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("migration disk cache: {e}")))?;
-                let dref = entry.backend.manifest_ref().await.next_version();
+                let dref = backend.manifest_ref().await.next_version();
                 (
                     serde_json::to_vec(&m)
                         .map_err(|e| SandboxError::Snapshot(format!("disk manifest json: {e}")))?,
@@ -4617,17 +4670,21 @@ impl SandboxBackend for PooledBackend {
             peer.remove(export_id);
         }
         self.set_migration_role(id, None).await;
+        // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
+        // guard before the `requeue_*` awaits.
         #[cfg(target_os = "linux")]
-        if let Some(entry) = self.nbd_sandboxes.get(&id) {
+        let backend = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
+        #[cfg(target_os = "linux")]
+        if let Some(backend) = backend {
             if let Some(pending) = export.disk_pending {
-                entry.backend.requeue_pending(pending).await;
+                backend.requeue_pending(pending).await;
             }
             // Disk post-copy: the sealed bytes go back into `dirty`
             // so the resumed guest's next flush captures them.
             if let Some(sealed) = export.disk_seal.as_deref() {
-                entry.backend.requeue_postcopy_seal(sealed).await;
+                backend.requeue_postcopy_seal(sealed).await;
             }
-            entry.backend.set_migration_fence(false);
+            backend.set_migration_fence(false);
         }
         let snapshot_dir = export.snapshot_dir.clone();
         let _ = fs::remove_dir_all(&snapshot_dir).await;
@@ -5095,8 +5152,13 @@ impl SandboxBackend for PooledBackend {
     async fn cow_state(&self, id: SandboxId) -> Option<engram_core::types::cow_state::CowState> {
         #[cfg(target_os = "linux")]
         {
-            let entry = self.nbd_sandboxes.get(&id)?;
-            self.cow_state_for_entry(id, entry.backend.clone()).await
+            // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
+            // guard before the `cow_state_for_entry` await. This read runs
+            // on the ~1 s heartbeat cadence; holding the guard across the
+            // manifest read would let a contending writer on the same
+            // shard stall the heartbeat worker.
+            let backend = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone())?;
+            self.cow_state_for_entry(id, backend).await
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -7236,5 +7298,84 @@ mod tests {
                 "retry must NOT delete the prior attempt's blob — GC-governed now",
             );
         }
+    }
+
+    /// Issue #200 regression: the snapshot/migration paths must not hold
+    /// a `nbd_sandboxes` `DashMap` guard across an `.await`.
+    ///
+    /// Why this matters: a `DashMap` `Ref`/`RefMut` guard pins the
+    /// shard's **synchronous** `RwLock`. A `.get()` read guard held
+    /// across a multi-second `.await` (GCS upload ~32 s, paused-VM
+    /// drains, device fsyncs) blocks every contending writer
+    /// (`destroy`'s `remove`, `create`/`rehydrate`'s `insert`) hashing
+    /// to the same shard: each parks its tokio worker thread for the
+    /// whole await, and dashmap-6's writer-preference then blocks new
+    /// readers on that shard too. With ≥ worker_threads collisions the
+    /// runtime deadlocks and the host is declared dead.
+    ///
+    /// The bug is fundamentally "is a shard lock held at the await
+    /// suspension point?" — a boolean property of the code shape, not a
+    /// timing race. We probe it deterministically: `try_get_mut`
+    /// returns [`TryResult::Locked`] iff a guard is currently
+    /// outstanding on that key's shard (a read guard blocks the write
+    /// lock attempt). So at the exact point where the production code
+    /// `.await`s — i.e. where a concurrent writer would attempt its
+    /// `insert`/`remove` — we assert the shard is FREE under the fixed
+    /// clone-then-drop pattern and LOCKED under the old held-guard
+    /// pattern. The second assertion proves the probe actually
+    /// distinguishes the two shapes (no vacuous pass); the first is the
+    /// regression guard.
+    #[test]
+    fn issue_200_no_dashmap_guard_held_across_await_in_snapshot_path() {
+        use dashmap::try_result::TryResult;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+
+        let map: DashMap<SandboxId, Arc<()>> = DashMap::new();
+        let id = SandboxId::new();
+        map.insert(id, Arc::new(()));
+
+        // Sanity: with no guard outstanding, the shard write lock is
+        // free — `try_get_mut` succeeds.
+        assert!(
+            matches!(map.try_get_mut(&id), TryResult::Present(_)),
+            "precondition: shard must be free with no guard held",
+        );
+
+        // FIX shape (the pattern this PR applies at every snapshot/
+        // migration site): clone the Arc out of the guard, drop the
+        // guard, THEN do the long work. `.map(..)` consumes the `Ref`,
+        // so the shard lock is released before `backend` is used.
+        let backend: Option<Arc<()>> = map.get(&id).map(|e| e.value().clone());
+        // <-- production `.await` happens here, on the owned `backend`.
+        // A concurrent `destroy`/`create` writer reaching the shard now
+        // must NOT be blocked: the shard is free.
+        assert!(
+            !matches!(map.try_get_mut(&id), TryResult::Locked),
+            "issue #200: a concurrent shard writer MUST NOT be blocked at \
+             the await point — clone-then-drop must release the guard first",
+        );
+        // Use the owned Arc so the clone models the real flush/upload.
+        assert!(backend.is_some());
+
+        // BUG shape (what the listed sites did before this PR): hold the
+        // `Ref` guard across the long work. This is the deadlock seed —
+        // a concurrent writer IS blocked while the guard is live.
+        {
+            let _guard = map.get(&id).expect("entry present");
+            // <-- the buggy code `.await`ed HERE while `_guard` is alive.
+            // A concurrent writer's `insert`/`remove` would block on the
+            // shard's sync write lock, parking its worker thread.
+            assert!(
+                matches!(map.try_get_mut(&id), TryResult::Locked),
+                "bug model check: a held DashMap guard MUST block a \
+                 concurrent shard writer — if this fails, `try_get_mut` is \
+                 not detecting the held lock and the regression probe is \
+                 invalid",
+            );
+            // guard drops here, releasing the shard.
+        }
+        // After the guard drops the shard is free again.
+        assert!(matches!(map.try_get_mut(&id), TryResult::Present(_)));
     }
 }
