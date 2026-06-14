@@ -71,6 +71,7 @@ async fn ensure_host(meta: &Arc<dyn MetadataStore>, host_id: HostId) {
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
+        wire_version: 0,
     })
     .await
     .expect("upsert_host");

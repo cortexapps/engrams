@@ -112,6 +112,17 @@ pub enum SandboxError {
     /// `Vm` (the host answered with a real VM error) and `HostLost`
     /// (the host is permanently gone): the call site retries this.
     Unavailable(String),
+    /// Issue #229: the host-agent refused the RPC because its bincode
+    /// `WIRE_VERSION` differs from the coordinator's — a mixed-version
+    /// fleet during a non-atomic rolling deploy (coord pods finish in
+    /// ~1 min, the host DaemonSet rolls over ~20 min). The host detected
+    /// the skew at the RPC boundary and rejected the request BEFORE any
+    /// bincode decode, so the failure surfaces as an explicit, retryable
+    /// version mismatch instead of a misleading "invalid sandbox spec"
+    /// decode error. Retryable (503): the scheduler drains off the
+    /// stale host as the roll completes, so a retry lands on a matching
+    /// host.
+    WireSkew { host: u32, coord: u32 },
 }
 
 impl fmt::Display for SandboxError {
@@ -131,6 +142,11 @@ impl fmt::Display for SandboxError {
             ),
             Self::HostLost => write!(f, "sandbox host is no longer reachable"),
             Self::Unavailable(msg) => write!(f, "sandbox host temporarily unavailable: {msg}"),
+            Self::WireSkew { host, coord } => write!(
+                f,
+                "wire_version skew: host={host} coord={coord} (mixed-version fleet \
+                 during a rolling deploy); retry — the scheduler drains stale hosts"
+            ),
         }
     }
 }

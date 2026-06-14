@@ -133,12 +133,25 @@ pub fn placement_ttl() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Issue #229: is `h`'s reported bincode wire version compatible with the
+/// coordinator's? A host is excluded only when it reports a NONZERO
+/// version that differs from ours — a real, observed skew mid rolling
+/// deploy. `0` (not yet reported: a freshly-registered host before its
+/// first heartbeat, or a pre-0066 row) is tolerated, the same soft
+/// posture an unmeasured allocatable gets — excluding it would strand
+/// brand-new hosts before they could report.
+pub fn host_wire_version_ok(h: &HostRecord) -> bool {
+    h.wire_version == 0 || h.wire_version == engram_protocol::WIRE_VERSION
+}
+
 /// A host the scheduler may place on: host-reported `ready` (a
 /// `draining` status is the agent's own shutdown flag), not
-/// coordinator-cordoned, and heartbeat-fresh within `ttl`.
+/// coordinator-cordoned, heartbeat-fresh within `ttl`, and on a
+/// compatible wire version (issue #229).
 pub fn host_is_schedulable(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> bool {
     h.status == HostStatus::Ready
         && !h.cordoned
+        && host_wire_version_ok(h)
         && now
             .signed_duration_since(h.last_heartbeat_at)
             .to_std()
@@ -526,6 +539,10 @@ mod tests {
             current_bundles: Vec::new(),
             cordoned: false,
             total_vcpus: 0,
+            // Issue #229: 0 = "not yet reported" → tolerated by the
+            // placement filter. Tests that exercise the skew gate set this
+            // to a concrete version explicitly.
+            wire_version: 0,
         }
     }
 
@@ -701,6 +718,55 @@ mod tests {
             pick_from(&[host(1)], &HashMap::new(), &c, Utc::now(), TTL),
             Err(PickError::NoCapacity)
         ));
+    }
+
+    #[test]
+    fn wire_version_skewed_host_is_drained_from_scheduling() {
+        // Issue #229: a host reporting a NONZERO wire version that differs
+        // from the coordinator's is excluded from placement, so a
+        // non-atomic rolling deploy drains off stale hosts instead of
+        // hard-failing sessions on them. A version of 0 (not yet reported)
+        // and the coordinator's own version both stay schedulable.
+        let coord = engram_protocol::WIRE_VERSION;
+
+        let mut skewed = host(1);
+        skewed.wire_version = coord + 1;
+        assert!(
+            !host_wire_version_ok(&skewed),
+            "a nonzero mismatched version must be excluded",
+        );
+        assert!(!host_is_schedulable(&skewed, Utc::now(), TTL));
+
+        let mut not_reported = host(2);
+        not_reported.wire_version = 0;
+        assert!(
+            host_wire_version_ok(&not_reported),
+            "0 = not yet reported is tolerated (soft posture)",
+        );
+        assert!(host_is_schedulable(&not_reported, Utc::now(), TTL));
+
+        let mut matched = host(3);
+        matched.wire_version = coord;
+        assert!(host_wire_version_ok(&matched));
+        assert!(host_is_schedulable(&matched, Utc::now(), TTL));
+
+        // The picker routes AWAY from the skewed host onto the matched one
+        // — it never returns the skewed host and never errors with a
+        // decode-shaped failure.
+        let pick = pick_from(
+            &[skewed.clone(), matched.clone()],
+            &HashMap::new(),
+            &ctx(),
+            Utc::now(),
+            TTL,
+        )
+        .unwrap();
+        assert_eq!(pick, hid(3), "session must be placed on the version-matched host");
+
+        // A fleet of ONLY skewed hosts yields NoCapacity (the scheduler
+        // drains them), not a placement onto a host that would 400.
+        let err = pick_from(&[skewed], &HashMap::new(), &ctx(), Utc::now(), TTL).unwrap_err();
+        assert!(matches!(err, PickError::NoCapacity));
     }
 
     #[test]

@@ -296,6 +296,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
+                wire_version: 0,
             })
             .await
             .expect("seed host");
@@ -316,6 +317,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                     local_snapshots: Vec::new(),
                     current_bundles: Vec::new(),
                     total_vcpus: 8,
+                    wire_version: engram_protocol::WIRE_VERSION,
                 },
             )
             .await

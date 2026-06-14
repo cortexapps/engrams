@@ -1901,7 +1901,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    ready_images, local_snapshots, current_bundles,
-                   cordoned, total_vcpus,
+                   cordoned, total_vcpus, wire_version,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -1973,6 +1973,7 @@ impl MetadataStore for PostgresStore {
                       local_snapshots = $13,
                       current_bundles = $14,
                       total_vcpus = $15,
+                      wire_version = $16,
                       last_heartbeat_at = NOW(),
                       updated_at = NOW()
                 WHERE id = $1"#,
@@ -1992,6 +1993,7 @@ impl MetadataStore for PostgresStore {
         .bind(local_snapshots)
         .bind(current_bundles)
         .bind(hb.total_vcpus as i32)
+        .bind(hb.wire_version as i32)
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2032,7 +2034,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    ready_images, local_snapshots, current_bundles,
-                   cordoned, total_vcpus,
+                   cordoned, total_vcpus, wire_version,
                    last_heartbeat_at, status, host_addr
               FROM hosts
              -- Only `ready` hosts are strike-out candidates. A `draining`

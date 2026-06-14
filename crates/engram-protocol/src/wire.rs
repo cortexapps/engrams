@@ -18,15 +18,60 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Version stamp shipped from the host-agent in
-/// `POST /api/hosts/register`. Coord compares against its own and
-/// tolerates mismatches with a warning — gRPC carries its own
-/// schema discipline so this is informational, not a hard gate.
+/// Version stamp for the bincode payloads crossing the coord ↔ host
+/// gRPC boundary. Bumped on every bincode-payload-incompatible change
+/// (a new field on `SandboxSpec`, etc.).
 ///
-/// Bumped on every bincode-payload-incompatible change (new field
-/// on `SandboxSpec`, etc.). Coord + host deploy together so
-/// mismatched versions are a misconfiguration, not a normal state.
+/// Issue #229: this is NO LONGER advisory. A Helm rollout is not
+/// atomic — coord pods finish in ~1 min while a 40-node host DaemonSet
+/// rolls over ~20 min — so a mixed-version fleet is a *normal*,
+/// transient state, not a misconfiguration. During that window the
+/// version is enforced on both ends:
+///   - The coordinator stamps every coord→host gRPC request with this
+///     value in the [`WIRE_VERSION_METADATA_KEY`] metadata header
+///     (via `TraceparentInjector`).
+///   - The host-agent's gRPC server rejects a request whose stamped
+///     version differs from its own with `failed_precondition` BEFORE
+///     any bincode decode, so the caller sees an explicit, retryable
+///     `WireSkew` (→ HTTP 503) instead of a misleading 400 "invalid
+///     sandbox spec" decode error.
+///   - The host reports its version on every heartbeat; the scheduler
+///     excludes version-mismatched hosts so a rolling deploy becomes a
+///     graceful drain rather than a stream of hard failures.
 pub const WIRE_VERSION: u32 = 2;
+
+/// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
+/// every coord→host request (issue #229). ASCII, lowercase — tonic
+/// rejects non-lowercase ASCII metadata keys. Absent on requests from a
+/// coordinator that predates this field, which the host-agent tolerates
+/// (it can't compare what it didn't receive).
+pub const WIRE_VERSION_METADATA_KEY: &str = "x-engram-wire-version";
+
+/// Marker prefix for the host-agent's wire-version-skew rejection
+/// message (issue #229). The host returns a `failed_precondition` status
+/// whose message starts with this prefix and carries the two versions in
+/// a fixed `host=<u32> coord=<u32>` shape; the coord-side client matches
+/// the prefix to map the status back to a typed
+/// `engram_core::SandboxError::WireSkew` rather than a generic VM error.
+pub const WIRE_SKEW_STATUS_PREFIX: &str = "wire_version skew:";
+
+/// Render the host-agent's skew rejection message. `host` is the
+/// host-agent's own [`WIRE_VERSION`]; `coord` is the version the
+/// coordinator stamped on the request.
+pub fn wire_skew_message(host: u32, coord: u32) -> String {
+    format!("{WIRE_SKEW_STATUS_PREFIX} host={host} coord={coord}")
+}
+
+/// Parse a host/coord version pair out of a [`wire_skew_message`]. Returns
+/// `None` if `msg` isn't a skew message (so a regular `failed_precondition`
+/// from some other source falls through to the default mapping).
+pub fn parse_wire_skew_message(msg: &str) -> Option<(u32, u32)> {
+    let rest = msg.strip_prefix(WIRE_SKEW_STATUS_PREFIX)?.trim();
+    let host = rest.strip_prefix("host=")?;
+    let (host, coord) = host.split_once(' ')?;
+    let coord = coord.trim().strip_prefix("coord=")?;
+    Some((host.trim().parse().ok()?, coord.trim().parse().ok()?))
+}
 
 /// Wire-friendly mirror of [`engram_core::types::sandbox::ExecRequest`].
 ///
@@ -99,6 +144,29 @@ mod tests {
         assert_eq!(recovered.env, original.env);
         assert_eq!(recovered.workdir, original.workdir);
         assert_eq!(recovered.timeout, original.timeout);
+    }
+
+    #[test]
+    fn wire_skew_message_round_trips() {
+        // Issue #229: the host renders the skew message; the coord parses
+        // it back to the two versions. A round-trip must be lossless so a
+        // skewed RPC surfaces as a typed `WireSkew`, never a 400.
+        let msg = wire_skew_message(2, 3);
+        assert_eq!(msg, "wire_version skew: host=2 coord=3");
+        assert_eq!(parse_wire_skew_message(&msg), Some((2, 3)));
+    }
+
+    #[test]
+    fn parse_wire_skew_message_rejects_non_skew_status() {
+        // A `failed_precondition` from some other source (no skew prefix)
+        // must NOT be misread as a version pair — it falls through to the
+        // default error mapping.
+        assert_eq!(parse_wire_skew_message("image not ready"), None);
+        assert_eq!(parse_wire_skew_message("wire_version skew: garbage"), None);
+        assert_eq!(
+            parse_wire_skew_message("wire_version skew: host=x coord=3"),
+            None
+        );
     }
 
     #[test]

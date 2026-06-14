@@ -814,6 +814,32 @@ impl HostAgent {
                                     rehydrate_sandboxes = resp.rehydrate_sandboxes.len(),
                                     "registered with coord via /api/hosts/register",
                                 );
+                                // Issue #229: the coord echoes the wire
+                                // version it understands. Previously this was
+                                // deserialized and silently dropped. A skew is
+                                // a mixed-version fleet mid rolling deploy:
+                                // log LOUD + emit a metric so it's visible
+                                // here (not just at the coord), where the gRPC
+                                // server refuses skewed RPCs (503) and the
+                                // scheduler drains us off until we roll.
+                                if resp.coord_wire_version != 0
+                                    && resp.coord_wire_version != engram_protocol::WIRE_VERSION
+                                {
+                                    ::metrics::counter!(
+                                        "engram_host_wire_skew_at_register_total"
+                                    )
+                                    .increment(1);
+                                    tracing::error!(
+                                        host_wire_version = engram_protocol::WIRE_VERSION,
+                                        coord_wire_version = resp.coord_wire_version,
+                                        "wire_version skew at register: this host and the \
+                                         coordinator disagree on the bincode wire version \
+                                         (mixed-version fleet during a rolling deploy); the \
+                                         coordinator will drain this host from scheduling and \
+                                         refuse RPCs to it until it rolls to the matching \
+                                         version (issue #229)",
+                                    );
+                                }
                                 // ADR 0016 Phase B commit 7: rehydrate
                                 // any survivors PG knew about before
                                 // our restart. Best-effort per row;
@@ -1130,6 +1156,10 @@ impl HostAgent {
                         total_vcpus: std::thread::available_parallelism()
                             .map(|n| n.get() as u32)
                             .unwrap_or(0),
+                        // Issue #229: report our bincode wire version so the
+                        // coordinator drains us off scheduling on a skew
+                        // (mixed-version fleet mid rolling deploy).
+                        wire_version: engram_protocol::WIRE_VERSION,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {

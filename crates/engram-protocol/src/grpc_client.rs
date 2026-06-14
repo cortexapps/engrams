@@ -40,11 +40,19 @@ use crate::grpc::{
 
 use crate::wire::{WireExecRequest, WireReapStats};
 
-/// Per-request interceptor that injects the current span's W3C
-/// `traceparent` into the outbound gRPC metadata, so the host-agent can
-/// stitch its spans onto the coord's trace (ADR 0019). Zero-sized and
-/// `Clone`, so it composes into the tonic client type cleanly. No-op when
-/// OTLP is disabled (`current_traceparent` returns `None`).
+/// Per-request interceptor that injects coord-side request metadata on
+/// every outbound coord→host gRPC call:
+///   - the current span's W3C `traceparent`, so the host-agent can
+///     stitch its spans onto the coord's trace (ADR 0019); and
+///   - the coordinator's [`crate::WIRE_VERSION`] under
+///     [`crate::wire::WIRE_VERSION_METADATA_KEY`], so the host-agent can
+///     refuse a bincode-skewed request loudly (issue #229) instead of
+///     letting it surface as a misleading 400 decode error.
+///
+/// Zero-sized and `Clone`, so it composes into the tonic client type
+/// cleanly. The traceparent leg is a no-op when OTLP is disabled
+/// (`current_traceparent` returns `None`); the wire-version leg always
+/// fires (the value is a compile-time constant that always parses).
 #[derive(Clone, Copy, Default)]
 pub struct TraceparentInjector;
 
@@ -54,6 +62,13 @@ impl Interceptor for TraceparentInjector {
             if let Ok(val) = tp.parse() {
                 req.metadata_mut().insert("traceparent", val);
             }
+        }
+        // Issue #229: stamp our wire version so the host can reject a
+        // skewed request at the RPC boundary. A constant u32 always
+        // renders to a valid ASCII metadata value.
+        if let Ok(val) = crate::WIRE_VERSION.to_string().parse() {
+            req.metadata_mut()
+                .insert(crate::wire::WIRE_VERSION_METADATA_KEY, val);
         }
         Ok(req)
     }
@@ -1290,6 +1305,21 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
         // sites can retry (the pool defers per-RPC retry to them), and
         // the API surfaces a 503, not a 500.
         Code::Unavailable => SandboxError::Unavailable(status.message().to_string()),
+        // Issue #229: the host rejected a wire_version-skewed request at
+        // the RPC boundary (a `failed_precondition` carrying the skew
+        // marker). Map it to the typed, RETRYABLE `WireSkew` variant so
+        // the API surfaces a 503 — never the 400 a raw bincode decode
+        // error would have produced. A `failed_precondition` WITHOUT the
+        // marker (none is emitted host-side today, but be defensive)
+        // falls through to the generic mapping.
+        Code::FailedPrecondition => {
+            match crate::wire::parse_wire_skew_message(status.message()) {
+                Some((host, coord)) => SandboxError::WireSkew { host, coord },
+                None => {
+                    SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into())
+                }
+            }
+        }
         _ => SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into()),
     }
 }
@@ -1314,6 +1344,44 @@ mod grpc_err_tests {
     #[test]
     fn real_vm_error_still_maps_to_vm() {
         let err = grpc_to_sandbox_err(tonic::Status::internal("firecracker panicked"));
+        assert!(matches!(err, SandboxError::Vm(_)));
+    }
+
+    #[test]
+    fn wire_skew_failed_precondition_maps_to_typed_wire_skew_not_invalid_spec() {
+        // Issue #229: a host that refused a wire_version-skewed request
+        // returns `failed_precondition` carrying the skew marker. It MUST
+        // map to the typed, retryable `WireSkew` variant (→ 503), never to
+        // `InvalidSpec` (→ the user-facing 400 "invalid sandbox spec" that
+        // was the bug) nor to a generic `Vm` (→ 500).
+        let status = tonic::Status::failed_precondition(crate::wire::wire_skew_message(2, 3));
+        match grpc_to_sandbox_err(status) {
+            SandboxError::WireSkew { host, coord } => {
+                assert_eq!((host, coord), (2, 3));
+            }
+            other => panic!("expected WireSkew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bincode_decode_invalid_argument_still_maps_to_invalid_spec() {
+        // Guard the contrast: a genuine `invalid_argument` (the shape a raw
+        // bincode decode error takes) still maps to `InvalidSpec`. Only the
+        // pre-decode skew refusal (`failed_precondition` + marker) is
+        // rescued from the 400 path.
+        let status =
+            tonic::Status::invalid_argument("bincode decode SandboxSpec: unexpected end of file");
+        assert!(matches!(
+            grpc_to_sandbox_err(status),
+            SandboxError::InvalidSpec(_)
+        ));
+    }
+
+    #[test]
+    fn unmarked_failed_precondition_falls_through_to_vm() {
+        // A `failed_precondition` WITHOUT the skew marker isn't a version
+        // mismatch — it must not be misread as `WireSkew`.
+        let err = grpc_to_sandbox_err(tonic::Status::failed_precondition("some other precondition"));
         assert!(matches!(err, SandboxError::Vm(_)));
     }
 }

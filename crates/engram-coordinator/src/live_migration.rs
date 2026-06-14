@@ -1125,6 +1125,7 @@ mod tests {
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
+                wire_version: 0,
             });
         meta.snapshots
             .lock()
@@ -1314,6 +1315,7 @@ mod tests {
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
+                wire_version: 0,
             });
         meta.snapshots
             .lock()
@@ -1600,6 +1602,7 @@ mod tests {
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
+                wire_version: 0,
             });
         meta.snapshots
             .lock()
@@ -1848,6 +1851,7 @@ mod tests {
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
+                wire_version: 0,
             });
         meta.snapshots
             .lock()

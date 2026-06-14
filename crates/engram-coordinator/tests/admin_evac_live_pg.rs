@@ -234,6 +234,7 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
+        wire_version: 0,
     })
     .await
     .expect("upsert_host");
@@ -271,6 +272,7 @@ async fn seed_host_with(
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
+        wire_version: 0,
     })
     .await
     .expect("upsert_host");
@@ -783,6 +785,7 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
             local_snapshots: Vec::new(),
             current_bundles: Vec::new(),
             total_vcpus: 8,
+            wire_version: engram_protocol::WIRE_VERSION,
         },
     )
     .await
@@ -844,6 +847,7 @@ async fn seed_ready_host(
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
+        wire_version: 0,
     })
     .await
     .expect("seed host row");
@@ -1065,6 +1069,7 @@ async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
                     local_snapshots: Vec::new(),
                     current_bundles: Vec::new(),
                     total_vcpus: vcpus,
+                    wire_version: engram_protocol::WIRE_VERSION,
                 },
             )
             .await

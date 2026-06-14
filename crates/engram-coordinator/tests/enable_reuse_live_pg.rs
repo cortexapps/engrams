@@ -465,6 +465,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
+        wire_version: 0,
     })
     .await
     .expect("hosts row");
