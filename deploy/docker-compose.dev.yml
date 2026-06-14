@@ -27,6 +27,11 @@ services:
       - "5435:5432"
     volumes:
       - engram-pg-data:/var/lib/postgresql/data
+      # On a fresh volume, initdb scripts create additional databases.
+      # On an existing volume these scripts are NOT re-run (postgres
+      # skips initdb.d entirely when the data directory is non-empty);
+      # the Tilt `orchestrator-migrate` resource handles that case.
+      - ./initdb:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U engram -d engram"]
       interval: 5s
