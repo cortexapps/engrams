@@ -418,9 +418,20 @@ pub async fn heartbeat(
     // places from (ready_images / local_snapshots / current_bundles /
     // total_vcpus). `status` is the HOST-reported side (`draining` =
     // the agent's own shutdown flag); the coordinator-owned `cordoned`
-    // bit is deliberately not written here. Best-effort per tick: a PG
-    // hiccup leaves last tick's row standing and the next heartbeat
-    // (5s) repairs.
+    // bit is deliberately not written here.
+    //
+    // Issue #231: this persist is NOT best-effort. It advances the
+    // host's `last_heartbeat_at`, which is exactly what the dead-host
+    // detector keys on (`list_stale_hosts`: ready + last_heartbeat_at
+    // older than the stale threshold → mark dead + orphan every session
+    // on the host). If we swallow the error and ack 200, an asymmetric
+    // PG failure — this pod's pool saturated while a sibling pod's
+    // detector is healthy — silently staled a *live* host's row and
+    // orphaned its sessions, with the host getting 200s the whole time
+    // so it neither retried nor re-registered. So on failure we count
+    // the metric, warn, and return 5xx: the host's loop tolerates a
+    // failed tick and a 5xx engages its backoff/re-register and makes
+    // the failure visible in the host's own metrics.
     let row_status = if hb.draining {
         HostStatus::Draining
     } else {
@@ -461,7 +472,11 @@ pub async fn heartbeat(
         .touch_host_heartbeat(host_id, row_heartbeat)
         .await
     {
-        tracing::warn!(host_id = %host_id, error = %e, "heartbeat persistence failed; placement reads last tick's row");
+        ::metrics::counter!(crate::metrics::HEARTBEAT_PERSIST_FAILURES_TOTAL).increment(1);
+        tracing::warn!(host_id = %host_id, error = %e, "heartbeat persistence failed; returning 5xx so the host backs off — its last_heartbeat_at did NOT advance and the dead-host detector keys on it (issue #231)");
+        return Err(ApiError::Internal(format!(
+            "heartbeat persistence failed; ack withheld so the host retries: {e}"
+        )));
     }
 
     // ADR 0015 M5: ship the coord's authoritative enabled-images

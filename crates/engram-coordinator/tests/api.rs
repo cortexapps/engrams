@@ -65,6 +65,13 @@ struct MockMetadataStore {
     /// refuse rather than mutate. Default `false` = the lease is free
     /// (preserves the existing tests' behaviour).
     lease_held: std::sync::atomic::AtomicBool,
+    /// Issue #231: simulate `touch_host_heartbeat` failing (a saturated
+    /// coord PG pool). When set, the per-heartbeat persist returns an
+    /// error so the test can assert the handler now returns 5xx (and
+    /// no longer swallows the failure into a 200) — the regression that
+    /// staled a live host's `last_heartbeat_at` and orphaned its
+    /// sessions. Default `false` = persist succeeds.
+    heartbeat_persist_fails: std::sync::atomic::AtomicBool,
 }
 
 impl MockMetadataStore {
@@ -238,6 +245,16 @@ impl MetadataStore for MockMetadataStore {
         _: HostId,
         _: engram_core::types::host::HostHeartbeat,
     ) -> Result<(), MetaError> {
+        if self
+            .heartbeat_persist_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Issue #231: simulate a saturated PG pool dropping the
+            // per-tick persist.
+            return Err(MetaError::Db(Box::new(std::io::Error::other(
+                "simulated pool saturation",
+            ))));
+        }
         Ok(())
     }
     async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
@@ -4047,5 +4064,65 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
     assert_eq!(
         meta.chunk_generation.load(Ordering::SeqCst),
         gen_after_publish + 1,
+    );
+}
+
+/// Issue #231 regression: the heartbeat handler must NOT swallow a
+/// `touch_host_heartbeat` persist failure into a 200. If it does, the
+/// host's `last_heartbeat_at` row goes stale while the host keeps
+/// getting 200-acks (so it never retries/backs off), and a sibling
+/// coord pod's dead-host detector then orphans every session on a host
+/// that is alive and loaded. The contract: persist failure ⇒ 5xx so
+/// the host's loop backs off and the failure is visible.
+#[tokio::test]
+async fn heartbeat_persist_failure_returns_5xx_not_swallowed_200() {
+    let store = MockMetadataStore::arc();
+    let f = TestFixture::new(store.clone(), InMemorySecretStore::new());
+    let host_id = f.test_host_id;
+    let app = f.app;
+
+    let hb_body = json!({
+        "capacity": { "total_mib": 16384u64, "used_mib": 0u64, "running_sandboxes": 0u32 },
+    });
+
+    // Persist fails (saturated pool) → the handler must return a 5xx,
+    // NOT a 200. This is the regression: pre-fix the error was only
+    // logged and the handler fell through to a 200 ack.
+    store
+        .heartbeat_persist_fails
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/hosts/{host_id}/heartbeat"),
+            hb_body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_server_error(),
+        "persist failure must surface as 5xx so the host backs off; got {}",
+        resp.status()
+    );
+
+    // Control: with the persist healthy, the *same* request acks 200 —
+    // proving the 5xx above is caused specifically by the persist
+    // failure, not by an unrelated handler error.
+    store
+        .heartbeat_persist_fails
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let resp = app
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/hosts/{host_id}/heartbeat"),
+            hb_body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "healthy persist should ack 200",
     );
 }

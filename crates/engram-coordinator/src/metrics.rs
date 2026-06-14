@@ -186,3 +186,14 @@ pub const SESSIONS_QUEUED_MIB: &str = "engram_sessions_queued_mib";
 /// Counter (ADR 0048). Queue-scanner per-session outcomes. Labels:
 /// `outcome` = `placed` / `requeued` / `failed` / `timeout`.
 pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";
+
+/// Counter (issue #231). The per-tick `touch_host_heartbeat` persist
+/// failed — the host's `last_heartbeat_at` row did NOT advance even
+/// though the agent's heartbeat reached this pod. Sustained nonzero is
+/// alarm-worthy: an asymmetric PG failure (this pod's pool saturated
+/// while a sibling pod's dead-host detector is healthy) staling a live
+/// host's row is exactly what orphans a healthy host's sessions, so
+/// the handler now also returns 5xx to engage the host's backoff.
+/// No `host_id` label — the cardinality convention above forbids
+/// per-host labels; the paired `warn!` carries the id for forensics.
+pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
