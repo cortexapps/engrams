@@ -825,10 +825,8 @@ impl HostAgent {
                                 if resp.coord_wire_version != 0
                                     && resp.coord_wire_version != engram_protocol::WIRE_VERSION
                                 {
-                                    ::metrics::counter!(
-                                        "engram_host_wire_skew_at_register_total"
-                                    )
-                                    .increment(1);
+                                    ::metrics::counter!("engram_host_wire_skew_at_register_total")
+                                        .increment(1);
                                     tracing::error!(
                                         host_wire_version = engram_protocol::WIRE_VERSION,
                                         coord_wire_version = resp.coord_wire_version,

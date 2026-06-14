@@ -122,7 +122,10 @@ pub enum SandboxError {
     /// decode error. Retryable (503): the scheduler drains off the
     /// stale host as the roll completes, so a retry lands on a matching
     /// host.
-    WireSkew { host: u32, coord: u32 },
+    WireSkew {
+        host: u32,
+        coord: u32,
+    },
 }
 
 impl fmt::Display for SandboxError {
