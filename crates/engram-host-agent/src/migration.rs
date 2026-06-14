@@ -158,6 +158,28 @@ impl MigrationRegistry {
         self.by_sandbox.remove(&sandbox_id).map(|(_, e)| e)
     }
 
+    /// Atomically validate `export_id` against the sandbox's open export
+    /// AND remove it, returning the export iff the nonce matched. This
+    /// is the ONLY safe way to consume an export from a commit/abort:
+    /// the separate `validate()` + `remove()` is a TOCTOU window where
+    /// two concurrent callers (a coordinator RPC and the dumb-host TTL
+    /// sweep) both pass `validate` and then the loser's `remove` returns
+    /// `None`. DashMap's `remove_if` holds the shard lock across the
+    /// predicate + removal, so exactly one racer wins; the other sees
+    /// `None` and the caller maps it to a clean `NotFound`. Constant-time
+    /// nonce compare, same as `validate`.
+    pub fn remove_validated(
+        &self,
+        sandbox_id: SandboxId,
+        export_id: &str,
+    ) -> Option<MigrationExport> {
+        self.by_sandbox
+            .remove_if(&sandbox_id, |_, e| {
+                constant_time_str_eq(&e.export_id, export_id)
+            })
+            .map(|(_, e)| e)
+    }
+
     /// The open export's id for a sandbox (the TTL sweep's handle).
     pub fn export_id_of(&self, sandbox_id: SandboxId) -> Option<String> {
         self.by_sandbox
@@ -343,5 +365,95 @@ mod tests {
             !reg.validate(id, &eid),
             "removed export no longer validates"
         );
+    }
+
+    fn dummy_export(sandbox_id: SandboxId, export_id: String) -> MigrationExport {
+        // `try_lock_owned` consumes the Arc; the returned guard keeps its
+        // own Arc to the Mutex, so it stays valid for the export's life.
+        let guard = std::sync::Arc::new(tokio::sync::Mutex::new(()))
+            .try_lock_owned()
+            .unwrap();
+        MigrationExport {
+            export_id,
+            sandbox_id,
+            snapshot_dir: "/tmp".into(),
+            allowed_chunks: HashSet::new(),
+            disk_pending: None,
+            disk_seal: None,
+            created_at: Instant::now(),
+            post_copy: false,
+            state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            capture_guard: guard,
+        }
+    }
+
+    /// `remove_validated` is the atomic consume that closes the
+    /// validate→remove TOCTOU. It returns the export iff the nonce
+    /// matches, and is idempotent-safe: a second consume (the race
+    /// loser) gets `None`, never a panic.
+    #[test]
+    fn remove_validated_consumes_exactly_once_on_match() {
+        let reg = MigrationRegistry::default();
+        let id = SandboxId::new();
+        let eid = MigrationRegistry::mint_export_id();
+        assert!(reg.insert(dummy_export(id, eid.clone())));
+
+        // Wrong nonce leaves the export in place (constant-time mismatch).
+        assert!(reg.remove_validated(id, "wrong").is_none());
+        assert!(reg.validate_open(id), "wrong-nonce consume is a no-op");
+
+        // Correct nonce consumes it once...
+        assert!(reg.remove_validated(id, &eid).is_some());
+        // ...and the second consume (the race loser) gets None, no panic.
+        assert!(reg.remove_validated(id, &eid).is_none());
+        assert!(!reg.validate_open(id));
+    }
+
+    /// Regression for the TOCTOU panic (issue #203): two concurrent
+    /// consumers of the SAME export — the coordinator's commit/abort RPC
+    /// and the dumb-host TTL sweep — must yield exactly one winner and
+    /// NEVER panic. With the old `validate()` + `remove().expect(...)`
+    /// pattern both racers passed `validate` and the loser's `remove`
+    /// returned `None`, panicking `.expect("validated above")` and (if it
+    /// was the sweep task) permanently killing the TTL safety net.
+    #[test]
+    fn concurrent_remove_validated_has_exactly_one_winner_no_panic() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Barrier;
+
+        // Loop the race many times to make the interleaving likely.
+        for _ in 0..2_000 {
+            let reg = Arc::new(MigrationRegistry::default());
+            let id = SandboxId::new();
+            let eid = MigrationRegistry::mint_export_id();
+            assert!(reg.insert(dummy_export(id, eid.clone())));
+
+            let winners = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let reg = reg.clone();
+                let eid = eid.clone();
+                let winners = winners.clone();
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    // Must not panic regardless of who wins the shard lock.
+                    if reg.remove_validated(id, &eid).is_some() {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("racer thread must not panic (issue #203)");
+            }
+            assert_eq!(
+                winners.load(Ordering::SeqCst),
+                1,
+                "exactly one concurrent consumer wins the export",
+            );
+            assert!(!reg.validate_open(id), "export fully consumed");
+        }
     }
 }

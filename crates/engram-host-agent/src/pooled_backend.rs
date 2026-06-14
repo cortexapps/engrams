@@ -4852,10 +4852,14 @@ impl SandboxBackend for PooledBackend {
     /// ADR 0045 C1: the move landed — drop the export (releasing both
     /// fences) and destroy the frozen VM + its local snapshot dir.
     async fn migration_commit(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
-        if !self.migrations.validate(id, export_id) {
+        // Atomic validate+remove: nothing serializes this RPC against
+        // the dumb-host TTL sweep, so a non-atomic validate-then-remove
+        // would let both racers pass `validate` and panic the loser's
+        // `remove().expect()`. `remove_validated` makes the race loser
+        // see `None` → clean NotFound (callers already handle Err).
+        let Some(export) = self.migrations.remove_validated(id, export_id) else {
             return Err(SandboxError::NotFound);
-        }
-        let export = self.migrations.remove(id).expect("validated above");
+        };
         // ADR 0045 C2: a post-copy commit also retires the page-server
         // export (the dest reported DrainDone — or the coordinator gave
         // up on it) and the source's role fence.
@@ -4877,16 +4881,20 @@ impl SandboxBackend for PooledBackend {
     /// ADR 0045 C1: the move failed — re-queue the drained disk tier,
     /// unfence, un-pause in place. Zero loss.
     async fn migration_abort(&self, id: SandboxId, export_id: &str) -> Result<(), SandboxError> {
-        if !self.migrations.validate(id, export_id) {
-            return Err(SandboxError::NotFound);
-        }
         // ADR 0045 C2 split-brain note: an EXPLICIT abort carries the
         // coordinator's knowledge that the dest provably never loaded
         // the shipped state (the postcopy-never-loaded marker), so it
         // is allowed even after StateBin was fetched. The forbidden
         // arm is the dumb-host TTL's self-resume — gated by
         // `ttl_verdict`'s state_served input, never reaching this RPC.
-        let export = self.migrations.remove(id).expect("validated above");
+        //
+        // Atomic validate+remove (see migration_commit): the TTL sweep
+        // and a coordinator abort RPC race with nothing serializing
+        // them; `remove_validated` ensures exactly one consumes the
+        // export and the loser gets a clean NotFound instead of a panic.
+        let Some(export) = self.migrations.remove_validated(id, export_id) else {
+            return Err(SandboxError::NotFound);
+        };
         if let Some(peer) = self.migrate_peer_server() {
             peer.remove(export_id);
         }
