@@ -1061,6 +1061,50 @@ mod tests {
         assert_eq!(state.resolve_sandbox(session_id).await, None);
     }
 
+    /// ADR 0050 B: a long-lived stream wrapped with the shutdown signal
+    /// (as `/events` and `/exec/stream` are) must END when the
+    /// coordinator begins graceful shutdown — otherwise it blocks hyper's
+    /// drain until SIGKILL (tokio-rs/axum#2673). Exercises the real
+    /// `subscribe_shutdown` / `trigger_shutdown` wiring + the `take_until`
+    /// pattern the SSE handlers use.
+    #[tokio::test]
+    async fn shutdown_ends_a_subscribed_stream() {
+        use futures::StreamExt as _;
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:shutdown".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+
+        // A stream that never ends on its own — like an idle SSE subscriber.
+        let mut shutdown_rx = state.subscribe_shutdown();
+        let shutdown = async move {
+            let _ = shutdown_rx.wait_for(|shutting_down| *shutting_down).await;
+        };
+        let stream = futures::stream::pending::<u8>().take_until(shutdown);
+        tokio::pin!(stream);
+
+        // Begin graceful shutdown; the never-ending stream must terminate.
+        state.trigger_shutdown();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("take_until must end the stream promptly on shutdown");
+        assert!(
+            next.is_none(),
+            "stream must end (None), not yield, on shutdown"
+        );
+    }
+
     fn process_spec() -> SandboxSpec {
         SandboxSpec {
             image: "evict-test".into(),

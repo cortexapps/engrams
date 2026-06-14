@@ -376,10 +376,55 @@ pub async fn run_with_registry_and_local(
         .await
         .map_err(CoordinatorError::Io)?;
     tracing::info!(addr = %cfg.bind_addr, "coordinator listening");
+
+    // ADR 0050 B: graceful shutdown that doesn't hang on long-lived
+    // streams. The graceful future waits for SIGTERM/ctrl-c, then
+    // `trigger_shutdown()` flips the watch so SSE `/events` +
+    // `/exec/stream` handlers end their streams (tokio-rs/axum#2673:
+    // hyper otherwise waits for those connections to close on their own,
+    // which they never do → SIGKILL at the grace period). Only then does
+    // axum begin draining; the now-finite connections drain fast.
+    let shutdown_state = state.clone();
+    let graceful = async move {
+        shutdown_signal().await;
+        shutdown_state.trigger_shutdown();
+    };
+
+    // Force-exit backstop: if the drain somehow exceeds the budget
+    // (a stuck non-streaming request), exit(0) cleanly BEFORE the
+    // kubelet's SIGKILL so we never abandon connections uncleanly.
+    // `terminationGracePeriodSeconds` (chart) must exceed
+    // preStop drain + this budget.
+    {
+        let mut rx = state.subscribe_shutdown();
+        let budget = shutdown_drain_budget();
+        tokio::spawn(async move {
+            let _ = rx.wait_for(|shutting_down| *shutting_down).await;
+            tokio::time::sleep(budget).await;
+            tracing::warn!(
+                budget_secs = budget.as_secs(),
+                "graceful drain exceeded budget; forcing clean exit before SIGKILL",
+            );
+            std::process::exit(0);
+        });
+    }
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(graceful)
         .await
         .map_err(CoordinatorError::Io)
+}
+
+/// ADR 0050 B: how long after shutdown begins to wait for connections to
+/// drain before force-exiting (env `ENGRAM_SHUTDOWN_DRAIN_SECS`, default
+/// 25s). Must be < `terminationGracePeriodSeconds − drainSeconds` so the
+/// clean exit beats the kubelet's SIGKILL.
+fn shutdown_drain_budget() -> std::time::Duration {
+    let secs = std::env::var("ENGRAM_SHUTDOWN_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(25);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Warm `HostRegistry`'s `sandbox_owner` read-through cache from the

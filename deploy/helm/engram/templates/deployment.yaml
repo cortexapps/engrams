@@ -11,9 +11,12 @@ spec:
   selector:
     matchLabels:
       {{- include "engram.coordinator.selectorLabels" . | nindent 6 }}
-  # The coord is stateless; rolling updates pause sessions on the
-  # WS for ~2s while each pod recycles. `maxSurge: 1` keeps total
-  # replicas bounded so a slow rollout doesn't double our DB conns.
+  # The coord is stateless (ADR 0047), so rolls are safe. `maxUnavailable: 0`
+  # keeps ≥replicas Ready throughout (a new pod must pass readiness before an
+  # old one terminates); `maxSurge: 1` bounds the surge so a slow rollout
+  # doesn't double our DB conns. Zero-downtime relies on the preStop drain +
+  # SIGTERM graceful shutdown below (ADR 0050) — without the preStop, the
+  # endpoint-removal race RSTs in-flight clients during the recycle.
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -35,6 +38,16 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "engram.coordinator.serviceAccountName" . }}
+      # ADR 0050: zero-downtime rolls. The grace window must cover the
+      # preStop drain (below) + the app's in-flight drain. preStop sleeps
+      # `drainSeconds` so kube-proxy finishes removing this pod from the
+      # Service endpoints on every node BEFORE the app gets SIGTERM —
+      # otherwise new connections race onto a closing listener and RST
+      # (the n=100 RemoteDisconnected/Connection-refused). The app then
+      # SIGTERM-drains in-flight requests + ends its SSE streams
+      # (engram_coordinator graceful shutdown), and a force-exit backstop
+      # fires at `drainSeconds`+drain so we never wait out the SIGKILL.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 45 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -204,6 +217,17 @@ spec:
               mountPath: /tmp
             - name: local-data
               mountPath: /var/engram
+          # ADR 0050: preStop drain. Runs BEFORE SIGTERM, so the sleep
+          # holds the pod open while kube-proxy removes it from the
+          # Service endpoints across all nodes (propagation lag ~1-2s);
+          # only then does the app get SIGTERM and drain. Closes the
+          # endpoint-removal race that RSTs in-flight clients on a roll.
+          # `/bin/sh` is present in the image; readOnlyRootFilesystem
+          # doesn't block `sleep`.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep {{ .Values.drainSeconds | default 8 }}"]
           livenessProbe:
             {{- toYaml .Values.probes.liveness | nindent 12 }}
           readinessProbe:

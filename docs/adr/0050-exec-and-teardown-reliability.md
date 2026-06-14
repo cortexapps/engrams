@@ -141,3 +141,40 @@ are now both covered.
   2→5→2 with the queue draining FIFO; settled to 2 hosts with **0
   `running_sandboxes`** (the zombie gate). The four prior-run failures (4×
   truncated output, 1× connect 500) did not recur. Accepted.
+
+## Follow-up F: zero-downtime coordinator rolls (2026-06-14)
+
+The n=100 stress run logged ~25 `RemoteDisconnected` / `Connection refused`
+client errors. Root cause: a coordinator roll (a Dependabot auto-merge
+bake-deployed mid-test) **dropped in-flight connections** — which means a
+deploy, a node drain, or any pod recycle is a mini-outage, undermining ADR
+0047's multi-replica HA. Two gaps, both fixed here:
+
+1. **Endpoint-removal race (no preStop).** On termination, the kubelet sends
+   SIGTERM *and* removes the pod from Service endpoints concurrently; axum
+   reacts to SIGTERM instantly (stops accepting) while kube-proxy is still
+   routing new connections to it for ~1–2s → RST. **Fix:** a preStop
+   `sleep {{ drainSeconds }}` (chart) so the pod drains from endpoints across
+   all nodes *before* the app gets SIGTERM. `terminationGracePeriodSeconds`
+   bumped to 45 to cover preStop + drain.
+
+2. **Axum/hyper graceful shutdown hangs on long-lived streams**
+   ([tokio-rs/axum#2673](https://github.com/tokio-rs/axum/issues/2673)).
+   `axum::serve(...).with_graceful_shutdown` waits for *every* connection to
+   close and has no drain timeout; the coord's SSE `/events` + `/exec/stream`
+   never close on their own, so graceful shutdown would hang the full grace
+   period → SIGKILL (drops everything). **This is the workload-dependent part**
+   — a pure short-request service needs only the preStop. **Fix:** a shared
+   `watch` signal in `AppState` (`subscribe_shutdown`/`trigger_shutdown`); the
+   signal handler flips it *before* axum drains, and the SSE handlers
+   `take_until` it so their streams end (the client reconnects to a healthy
+   replica and resumes from the PG log via `Last-Event-ID` — lossless). A
+   force-exit backstop (`ENGRAM_SHUTDOWN_DRAIN_SECS`, default 25s) guarantees a
+   clean exit before the kubelet's SIGKILL even if a non-streaming request
+   stalls. The existing SIGTERM-aware `shutdown_signal()` + `maxUnavailable: 0`
+   rolling strategy were already correct; these two close the gap.
+
+   Validation: `idle_evictor::tests::shutdown_ends_a_subscribed_stream` (a
+   never-ending stream terminates on `trigger_shutdown`); `helm template`
+   renders the preStop + grace period; prod gate = roll the coord under a load
+   burst and observe **0 connection drops**.
