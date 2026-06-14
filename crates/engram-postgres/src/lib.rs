@@ -3222,14 +3222,24 @@ impl MetadataStore for PostgresStore {
         Ok(res.rows_affected() == 1)
     }
 
-    async fn release_session_lease(&self, session_id: SessionId) -> Result<(), MetaError> {
-        sqlx::query("DELETE FROM session_lease WHERE session_id = $1")
+    async fn release_session_lease(
+        &self,
+        session_id: SessionId,
+        locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        // Scoped to the holder: `AND locked_by = $2`. Without it, a holder
+        // whose row was reaped (held >180s without a touch) and then
+        // re-acquired by another holder would blind-delete the new
+        // holder's lease on its own late Drop — the serializer fails open
+        // and two pipelines drive one session. Mirrors the touch's filter.
+        let res = sqlx::query("DELETE FROM session_lease WHERE session_id = $1 AND locked_by = $2")
             .bind(session_id.as_uuid())
+            .bind(locked_by)
             .execute(&self.pool)
             .await
             .map_err(db_err)?;
-        // Idempotent: missing row = already released / never held.
-        Ok(())
+        // Idempotent: missing row = already released / reaped / stolen.
+        Ok(res.rows_affected() == 1)
     }
 
     async fn session_lease_held(&self, session_id: SessionId) -> Result<bool, MetaError> {

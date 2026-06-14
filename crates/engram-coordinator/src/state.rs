@@ -1302,9 +1302,22 @@ pub(crate) mod tests {
             Ok(true)
         }
 
-        async fn release_session_lease(&self, session_id: SessionId) -> Result<(), MetaError> {
-            self.session_leases.lock().remove(&session_id);
-            Ok(())
+        async fn release_session_lease(
+            &self,
+            session_id: SessionId,
+            locked_by: &str,
+        ) -> Result<bool, MetaError> {
+            // Mirror PG's `AND locked_by = $2`: only remove the row if THIS
+            // holder still owns it, so a reaped-then-re-acquired lease can't
+            // be blind-deleted by the old holder's late Drop.
+            let mut guard = self.session_leases.lock();
+            match guard.get(&session_id) {
+                Some((_, owner, _)) if owner == locked_by => {
+                    guard.remove(&session_id);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         }
 
         async fn sweep_stale_session_leases(
