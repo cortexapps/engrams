@@ -120,11 +120,19 @@ pub async fn register(
         ));
     }
     if req.wire_version != 0 && req.wire_version != engram_protocol::WIRE_VERSION {
+        // Issue #229: a mixed-version fleet is a NORMAL transient state
+        // during a non-atomic rolling deploy. The skew is now handled
+        // structurally — the scheduler drains this host off (the
+        // heartbeat-reported `wire_version` gates `host_is_schedulable`),
+        // and the host's gRPC server refuses any racing coord→host RPC
+        // with a retryable 503 (`SandboxError::WireSkew`). This stays a
+        // warn for operator visibility into how much of the fleet is mid-skew.
         tracing::warn!(
             host_id = %req.host_id,
             host_wire_version = req.wire_version,
             coord_wire_version = engram_protocol::WIRE_VERSION,
-            "wire_version mismatch on host register; tolerating (gRPC carries its own schema)",
+            "wire_version mismatch on host register; host will be drained from \
+             scheduling until it rolls to the coordinator's version (issue #229)",
         );
     }
     let record = HostRecord {
@@ -152,6 +160,12 @@ pub async fn register(
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
+        // Issue #229: register carries the host's wire version, but the
+        // scheduling-state columns (this among them) are owned by the
+        // heartbeat path — `upsert_host` deliberately doesn't write them.
+        // The first heartbeat persists the version the scheduler filters
+        // on; carry it here so the in-memory record is consistent.
+        wire_version: req.wire_version,
     };
     state.services.meta.upsert_host(record).await?;
 
@@ -305,6 +319,14 @@ pub struct HeartbeatRequest {
     /// `#[serde(default)]` → 0 (= unknown) from pre-roll host-agents.
     #[serde(default)]
     pub total_vcpus: u32,
+    /// Issue #229: the host-agent's bincode `engram_protocol::WIRE_VERSION`.
+    /// The scheduler excludes a host reporting a nonzero version that
+    /// differs from the coordinator's, so a non-atomic rolling deploy
+    /// drains off stale hosts instead of hard-failing on them.
+    /// `#[serde(default)]` → 0 (= unknown) from a pre-0066 host-agent
+    /// mid-roll, which the placement filter tolerates.
+    #[serde(default)]
+    pub wire_version: u32,
 }
 
 #[derive(Serialize)]
@@ -465,6 +487,7 @@ pub async fn heartbeat(
             .collect(),
         current_bundles: hb.current_bundles.clone(),
         total_vcpus: hb.total_vcpus,
+        wire_version: hb.wire_version,
     };
     if let Err(e) = state
         .services

@@ -62,6 +62,7 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
+        wire_version: 0,
     }
 }
 
@@ -80,6 +81,7 @@ fn heartbeat(status: HostStatus) -> HostHeartbeat {
         local_snapshots: Vec::new(),
         current_bundles: Vec::new(),
         total_vcpus: 0,
+        wire_version: 0,
     }
 }
 

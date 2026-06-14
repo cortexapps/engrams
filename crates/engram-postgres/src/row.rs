@@ -121,6 +121,8 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         .map_err(|e| MetaError::Serialization(e.to_string()))?;
     let cordoned: bool = row.try_get("cordoned").map_err(col_err)?;
     let total_vcpus: i32 = row.try_get("total_vcpus").map_err(col_err)?;
+    // Issue #229: the host's reported bincode wire version (migration 0066).
+    let wire_version: i32 = row.try_get("wire_version").map_err(col_err)?;
     Ok(HostRecord {
         id: HostId(id),
         hostname: row.try_get("hostname").map_err(col_err)?,
@@ -148,6 +150,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         current_bundles,
         cordoned,
         total_vcpus: total_vcpus.max(0) as u32,
+        wire_version: wire_version.max(0) as u32,
     })
 }
 

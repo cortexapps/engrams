@@ -833,6 +833,7 @@ impl TestFixture {
                 current_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
+                wire_version: 0,
             },
         );
         let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
@@ -2822,6 +2823,7 @@ async fn create_session_failure_returns_503_with_no_row() {
             current_bundles: Vec::new(),
             cordoned: false,
             total_vcpus: 8,
+            wire_version: 0,
         })
         .await
         .unwrap();

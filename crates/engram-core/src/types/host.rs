@@ -197,6 +197,16 @@ pub struct HostRecord {
     /// budget is `total_vcpus × overcommit`. 0 = not yet reported.
     #[serde(default)]
     pub total_vcpus: u32,
+    /// Issue #229: the host-agent's bincode `engram_protocol::WIRE_VERSION`,
+    /// reported on every heartbeat (migration 0066). The placement filter
+    /// excludes a host whose version is both NONZERO and != the
+    /// coordinator's, turning a non-atomic rolling deploy into a graceful
+    /// drain instead of a stream of 400 decode errors. `0` = not yet
+    /// reported (a just-registered host before its first heartbeat, or a
+    /// pre-0066 row) and is tolerated — soft, like an unmeasured
+    /// allocatable.
+    #[serde(default)]
+    pub wire_version: u32,
 }
 
 /// ADR 0047: everything a heartbeat persists, in one struct — the
@@ -213,6 +223,8 @@ pub struct HostHeartbeat {
     pub local_snapshots: Vec<HostLocalSnapshot>,
     pub current_bundles: Vec<super::sandbox::AuxBundleRef>,
     pub total_vcpus: u32,
+    /// Issue #229: the host-agent's bincode `WIRE_VERSION` this tick.
+    pub wire_version: u32,
 }
 
 /// ADR 0048: per-host reserved budget across BOTH placement dimensions —

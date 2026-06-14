@@ -166,6 +166,15 @@ impl From<SandboxError> for ApiError {
             SandboxError::Unavailable(msg) => Self::Unavailable(format!(
                 "host temporarily unavailable: {msg}. Retry shortly."
             )),
+            // Issue #229: a wire_version-skewed host (mid rolling deploy)
+            // is a TRANSIENT, retryable condition — a 503, NEVER the 400
+            // BadRequest a raw bincode decode error would have produced.
+            // The scheduler drains the stale host as the roll finishes, so
+            // a retry lands on a version-matched host.
+            SandboxError::WireSkew { host, coord } => Self::Unavailable(format!(
+                "host wire_version {host} != coordinator {coord} (rolling deploy in \
+                 progress); retry shortly."
+            )),
             other => Self::Internal(other.to_string()),
         }
     }
@@ -256,6 +265,24 @@ mod tests {
         let api: ApiError = SandboxError::Unavailable("tcp connect error".into()).into();
         assert_eq!(api.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(api.slug(), "unavailable");
+    }
+
+    #[test]
+    fn sandbox_wire_skew_maps_to_retryable_503_never_400() {
+        // Issue #229: a wire_version-skewed host (mixed-version fleet mid
+        // rolling deploy) must surface as a RETRYABLE 503 — NEVER the 400
+        // BadRequest that a raw bincode decode error produced (the bug).
+        let api: ApiError = SandboxError::WireSkew { host: 2, coord: 3 }.into();
+        assert_eq!(
+            api.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "wire skew must be a retryable 503, not a permanent 400",
+        );
+        assert_ne!(api.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(api.slug(), "unavailable");
+        // The version numbers travel in the message so the operator can
+        // see the skew without grepping host logs.
+        assert!(api.message().contains('2') && api.message().contains('3'));
     }
 
     #[test]

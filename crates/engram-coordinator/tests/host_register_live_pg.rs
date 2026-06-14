@@ -59,6 +59,7 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
+        wire_version: 0,
     }
 }
 

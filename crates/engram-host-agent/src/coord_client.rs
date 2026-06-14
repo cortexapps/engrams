@@ -508,6 +508,12 @@ pub struct HeartbeatRequest {
     /// `#[serde(default)]` for interop both ways (0 = unknown).
     #[serde(default)]
     pub total_vcpus: u32,
+    /// Issue #229: this host's bincode `engram_protocol::WIRE_VERSION`.
+    /// The coordinator's scheduler drains a host reporting a version that
+    /// differs from its own, so a non-atomic rolling deploy degrades
+    /// gracefully instead of surfacing as 400 decode errors.
+    #[serde(default)]
+    pub wire_version: u32,
 }
 
 #[derive(Deserialize)]
@@ -684,6 +690,7 @@ mod tests {
             }],
             utilization: Default::default(),
             total_vcpus: 0,
+            wire_version: engram_protocol::WIRE_VERSION,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");

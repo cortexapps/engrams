@@ -114,6 +114,9 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<CreateSandboxResponse>, Status> {
         let span = tracing::info_span!("host.create_sandbox");
         link_remote_parent(&span, &req);
+        // Issue #229: reject a wire_version-skewed coord BEFORE decoding
+        // the bincode SandboxSpec (a skew would EOF mid-decode → a 400).
+        check_wire_version(&req)?;
         async move {
             let spec = decode_bincode(&req.into_inner().spec_bincode, "SandboxSpec")?;
             let sandbox_id = self.inner.create(spec).await.map_err(sandbox_to_status)?;
@@ -457,6 +460,7 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<SandboxIdMessage>, Status> {
         let span = tracing::info_span!("host.restore");
         link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
         async move {
             let metadata = decode_bincode(&req.into_inner().metadata_bincode, "SnapshotMetadata")?;
             let id = self
@@ -478,6 +482,7 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<BuildBaseSnapshotResponse>, Status> {
         let span = tracing::info_span!("host.build_base_snapshot");
         link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
         async move {
             let spec = decode_bincode(&req.into_inner().spec_bincode, "SandboxSpec")?;
             let metadata = self
@@ -499,6 +504,7 @@ impl HostService for HostServiceImpl {
     ) -> Result<Response<SandboxIdMessage>, Status> {
         let span = tracing::info_span!("host.restore_base_for_session");
         link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
         async move {
             let inner = req.into_inner();
             let metadata = decode_bincode(&inner.metadata_bincode, "SnapshotMetadata")?;
@@ -590,6 +596,7 @@ impl HostService for HostServiceImpl {
         // this span makes it visible in the end-to-end trace (ADR 0019).
         let span = tracing::info_span!("host.start_agent", phase = "agent_handshake");
         link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
         async move {
             let r = req.into_inner();
             let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
@@ -624,6 +631,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<ApplyEgressPolicyRequest>,
     ) -> Result<Response<Empty>, Status> {
+        check_wire_version(&req)?;
         let policy = decode_bincode(&req.into_inner().policy_bincode, "SessionEgressPolicy")?;
         self.inner
             .apply_egress_policy(policy)
@@ -764,6 +772,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<ExecStartRequest>,
     ) -> Result<Response<Self::ExecStartStream>, Status> {
+        check_wire_version(&req)?;
         let r = req.into_inner();
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         let wire: WireExecRequest = decode_bincode(&r.request_bincode, "WireExecRequest")?;
@@ -1025,6 +1034,47 @@ fn encode_bincode<T: serde::Serialize>(value: &T, kind: &'static str) -> Result<
     bincode::serialize(value).map_err(|e| Status::internal(format!("bincode encode {kind}: {e}")))
 }
 
+/// Issue #229: reject a coord→host RPC whose stamped wire version differs
+/// from ours BEFORE any bincode decode. The coordinator's
+/// `TraceparentInjector` puts its `WIRE_VERSION` in the
+/// [`engram_protocol::wire::WIRE_VERSION_METADATA_KEY`] metadata header
+/// on every request; a mismatch means a mixed-version fleet mid rolling
+/// deploy, where a bincode decode would otherwise EOF and surface to the
+/// user as a misleading 400 "invalid sandbox spec". We return
+/// `failed_precondition` with the skew marker so the coord maps it to a
+/// retryable 503 (`SandboxError::WireSkew`).
+///
+/// A request with NO version header (a coordinator that predates this
+/// field) is tolerated — we can't compare what we didn't receive, and
+/// the decode path is the same as before this fix. A header we can't
+/// parse is likewise tolerated (fail-open) rather than blocking traffic
+/// on a malformed value.
+fn check_wire_version<T>(req: &Request<T>) -> Result<(), Status> {
+    let Some(raw) = req
+        .metadata()
+        .get(engram_protocol::wire::WIRE_VERSION_METADATA_KEY)
+    else {
+        return Ok(());
+    };
+    let Some(coord) = raw.to_str().ok().and_then(|s| s.parse::<u32>().ok()) else {
+        return Ok(());
+    };
+    let host = engram_protocol::WIRE_VERSION;
+    if coord == host {
+        return Ok(());
+    }
+    ::metrics::counter!("engram_host_wire_skew_rejections_total").increment(1);
+    tracing::error!(
+        host_wire_version = host,
+        coord_wire_version = coord,
+        "rejecting coord RPC: wire_version skew (mixed-version fleet during a rolling \
+         deploy); coord retries onto a version-matched host",
+    );
+    Err(Status::failed_precondition(
+        engram_protocol::wire::wire_skew_message(host, coord),
+    ))
+}
+
 fn decode_bincode<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     kind: &'static str,
@@ -1075,5 +1125,69 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         // ADR 0050 C: a transient inner failure round-trips back as
         // Unavailable so the coord's retry logic keys on it uniformly.
         SandboxError::Unavailable(_) => Status::unavailable(err.to_string()),
+        // Issue #229: the host-agent never ORIGINATES WireSkew from its
+        // local backend (it's the coord-side decode of our own
+        // `failed_precondition` skew status). Map defensively in case a
+        // future refactor surfaces it here.
+        SandboxError::WireSkew { host, coord } => {
+            Status::failed_precondition(engram_protocol::wire::wire_skew_message(host, coord))
+        }
+    }
+}
+
+#[cfg(test)]
+mod wire_version_tests {
+    use super::*;
+    use engram_protocol::wire::WIRE_VERSION_METADATA_KEY;
+
+    /// Build a `Request<()>` carrying an `x-engram-wire-version` metadata
+    /// header set to `coord` — the shape the coord's `TraceparentInjector`
+    /// produces. `None` simulates a coordinator that predates the field.
+    fn req_with_version(coord: Option<u32>) -> Request<()> {
+        let mut req = Request::new(());
+        if let Some(v) = coord {
+            req.metadata_mut()
+                .insert(WIRE_VERSION_METADATA_KEY, v.to_string().parse().unwrap());
+        }
+        req
+    }
+
+    #[test]
+    fn matching_wire_version_is_accepted() {
+        let req = req_with_version(Some(engram_protocol::WIRE_VERSION));
+        assert!(check_wire_version(&req).is_ok());
+    }
+
+    #[test]
+    fn skewed_wire_version_is_rejected_with_failed_precondition_marker() {
+        // Issue #229: a skewed coord must be refused at the RPC boundary
+        // BEFORE any bincode decode — so the caller sees an explicit,
+        // retryable skew (`failed_precondition` + marker → 503), not the
+        // 400 "invalid sandbox spec" a mid-decode EOF would have produced.
+        let coord = engram_protocol::WIRE_VERSION + 1;
+        let req = req_with_version(Some(coord));
+        let status = check_wire_version(&req).expect_err("skew must be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            engram_protocol::wire::parse_wire_skew_message(status.message()),
+            Some((engram_protocol::WIRE_VERSION, coord)),
+        );
+    }
+
+    #[test]
+    fn absent_version_header_is_tolerated() {
+        // A coordinator that predates the wire-version header (mid-roll)
+        // must not be blocked — we can't compare what we didn't receive.
+        let req = req_with_version(None);
+        assert!(check_wire_version(&req).is_ok());
+    }
+
+    #[test]
+    fn unparseable_version_header_fails_open() {
+        // A malformed header value must not wedge traffic — fail open.
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert(WIRE_VERSION_METADATA_KEY, "not-a-number".parse().unwrap());
+        assert!(check_wire_version(&req).is_ok());
     }
 }
