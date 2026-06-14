@@ -1,11 +1,17 @@
 # ADR 0050: exec + teardown reliability — no swallowed streams, no leaked sandboxes
 
-**Status:** Proposed (2026-06-14). The ADR 0048 fleet load test, re-run at
-`replicas: 2` after the ADR 0047 follow-up (delete `SandboxRegistry`), came back
-with **0 "no live sandbox" 409s** — the multi-replica routing bug was fixed —
-but surfaced a cluster of transient-gRPC reliability gaps that all trace to one
-cause: **the coordinator treats its gRPC channel to a host as reliable, and
-mishandles it when it isn't.** Three symptoms, one root cause:
+**Status:** Accepted (2026-06-14) — shipped as `d0d5188e` (ADR), `273dfc36`
+(coord-side B+C+E-retry), `2d7928ff` (host-side D+E); engrams-internal loadtest
+`7a7df94` (A). **Prod-validated**: the n=30 load test on a clean `kvm` fleet
+went **30/30 lossless** (was 25/30), **0 "no live sandbox"**, **0 genuine data
+loss**, and **0 leaked firecracker VMs after settle** (was 46) with the fleet
+scaling 2→5→2 and the queue draining — the headline acceptance gate. The ADR 0048
+fleet load test, re-run at `replicas: 2` after the ADR 0047 follow-up (delete
+`SandboxRegistry`), had come back with **0 "no live sandbox" 409s** — the
+multi-replica routing bug was fixed — but surfaced a cluster of transient-gRPC
+reliability gaps that all trace to one cause: **the coordinator treats its gRPC
+channel to a host as reliable, and mishandles it when it isn't.** Three symptoms,
+one root cause:
 
 | Symptom (load test, n=30) | What happened | The gap |
 |---|---|---|
@@ -129,3 +135,9 @@ are now both covered.
 - Prod: re-run the ADR 0048 load test (n=30) on the clean fleet — expect
   30/30 lossless (or honest typed failures), and **0 leaked FCs after the run
   settles** (the headline acceptance gate). Flip to Accepted on a clean run.
+
+  **Result (2026-06-14, n=30 on a clean 2-node `kvm` fleet, coord `replicas: 2`):**
+  30/30 OK / 0 FAIL, 0 "no live sandbox", 0 genuine data loss; fleet scaled
+  2→5→2 with the queue draining FIFO; settled to 2 hosts with **0
+  `running_sandboxes`** (the zombie gate). The four prior-run failures (4×
+  truncated output, 1× connect 500) did not recur. Accepted.
