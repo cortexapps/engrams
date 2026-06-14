@@ -485,16 +485,32 @@ async fn finish_eviction_background(
             tokio::select! {
                 res = &mut wait => break res,
                 _ = touch.tick() => {
-                    if !lease.touch().await {
-                        tracing::error!(
-                            session_id = %session_id,
-                            sandbox_id = %sandbox_id,
-                            "D5 finalize: session lease lost mid-upload (reaped or \
-                             released); refusing to record the snapshot row",
-                        );
-                        abort_inflight_snapshot(&state, session_id, sandbox_id, "lease lost (D5)").await;
-                        let _ = state.services.host.destroy(sandbox_id).await;
-                        return;
+                    match lease.touch_checked().await {
+                        LeaseTouch::Held => {}
+                        // A transport blip on the touch is NOT loss
+                        // (issue #209): destroying the sandbox + aborting
+                        // the in-flight snapshot on a single PG hiccup is
+                        // destructive. Log and keep waiting; the 180s
+                        // reaper still backstops a genuinely dead holder.
+                        LeaseTouch::TransientError(e) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                sandbox_id = %sandbox_id,
+                                error = %e,
+                                "D5 finalize: lease touch transport error — retrying, not abandoning",
+                            );
+                        }
+                        LeaseTouch::Lost => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                sandbox_id = %sandbox_id,
+                                "D5 finalize: session lease lost mid-upload (reaped or \
+                                 released); refusing to record the snapshot row",
+                            );
+                            abort_inflight_snapshot(&state, session_id, sandbox_id, "lease lost (D5)").await;
+                            let _ = state.services.host.destroy(sandbox_id).await;
+                            return;
+                        }
                     }
                 }
             }
@@ -616,14 +632,36 @@ impl SessionLeaseGuard {
 
     /// ADR 0045 D5 / issue #147: refresh `locked_at` so a long-running
     /// holder (the eviction finalize task awaiting a slow upload) is
-    /// never reaped mid-work. Returns `false` when the lease is gone —
-    /// the holder must treat its ownership as lost.
-    pub(crate) async fn touch(&self) -> bool {
-        self.meta
+    /// never reaped mid-work by `sweep_stale_session_leases`.
+    ///
+    /// Distinguishes a genuine "lease gone" (`Lost` — the row no longer
+    /// belongs to this holder, reaped or re-acquired) from a transient
+    /// transport error against PG (`TransientError`). Issue #209: a
+    /// holder whose abandonment destroys live state (the migration
+    /// finalize tearing down a VM, the idle-evict finalize destroying a
+    /// sandbox) must retry on `TransientError` rather than collapse one
+    /// PG blip into "lost ownership" and abandon the work. Only `Lost` is
+    /// authoritative.
+    pub(crate) async fn touch_checked(&self) -> LeaseTouch {
+        match self
+            .meta
             .touch_session_lease(self.session_id, &self.locked_by)
             .await
-            .unwrap_or(false)
+        {
+            Ok(true) => LeaseTouch::Held,
+            Ok(false) => LeaseTouch::Lost,
+            Err(e) => LeaseTouch::TransientError(e),
+        }
     }
+}
+
+/// Outcome of a lease `touch_checked`. `Lost` is authoritative (the row
+/// is gone or owned by someone else — give up ownership); a
+/// `TransientError` is a PG-transport blip the caller may retry through.
+pub(crate) enum LeaseTouch {
+    Held,
+    Lost,
+    TransientError(engram_core::MetaError),
 }
 
 impl Drop for SessionLeaseGuard {

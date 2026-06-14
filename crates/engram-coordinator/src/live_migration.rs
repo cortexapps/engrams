@@ -485,6 +485,22 @@ pub async fn migrate_session_live(
         return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
     }
     crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id).await;
+    // CASE 1 (issue #209): the teleport_target pin's ONLY job is to aim
+    // the parachute at the dest while the move is in flight. The rebind
+    // above committed the ownership flip — the dest is now the durable
+    // owner — so the pin has done its job and MUST be cleared here,
+    // BEFORE the fallible refresh / finish_resume_to_active below. The
+    // pin is PG-durable (read back at evac_resumer's get_teleport_target,
+    // honored strictly as require_host), so leaking it on an early `?`
+    // return pins every future rehome of this session to this host for
+    // the process lifetime. Clearing it unconditionally on this exit
+    // path closes that leak; if the move rewinds further down, the
+    // parachute re-arms its own targeting.
+    let _ = state
+        .services
+        .meta
+        .set_teleport_target(session_id, None)
+        .await;
     // D12: `evacuating → active` emits POST-BLACKOUT (the guest is
     // executing on the dest). The prompt-hold (session lease) keeps
     // "messages deliver" honest through the harness rebuild below.
@@ -498,28 +514,34 @@ pub async fn migrate_session_live(
             },
         )
         .await;
-    let session_refreshed = state
-        .services
-        .meta
-        .get_session(session_id)
-        .await
-        .map_err(|e| MigrateError::Parachute(format!("refresh session: {e}")))?;
-    if let Err(e) = crate::api::snapshot::finish_resume_to_active(
-        state,
-        &session_refreshed,
-        new_sandbox_id,
-        false,
-    )
-    .await
-    {
-        tracing::warn!(%session_id, error = %e,
-            "post-copy migration: finish_resume_to_active failed; session left at Created");
+    // A failed refresh / finish_resume_to_active here must NOT abandon
+    // the move with the source still alive: the session is already
+    // rebound + Active on the dest, the finalize (drain + source commit)
+    // still has to run. Fall back to a best-effort log instead of an
+    // early `?` return (which historically skipped both the pin removal
+    // above AND the finalize spawn below — the pre-spawn gap). The
+    // harness rebuild is recoverable post-hoc; abandoning the source
+    // page server is not.
+    match state.services.meta.get_session(session_id).await {
+        Ok(session_refreshed) => {
+            if let Err(e) = crate::api::snapshot::finish_resume_to_active(
+                state,
+                &session_refreshed,
+                new_sandbox_id,
+                false,
+            )
+            .await
+            {
+                tracing::warn!(%session_id, error = %e,
+                    "post-copy migration: finish_resume_to_active failed; session left at Created");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e,
+                "post-copy migration: session refresh failed; skipping harness rebuild \
+                 but proceeding to the finalize (drain + source release)");
+        }
     }
-    let _ = state
-        .services
-        .meta
-        .set_teleport_target(session_id, None)
-        .await;
 
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "presetup")
         .record(presetup_ms as f64 / 1000.0);
@@ -577,26 +599,93 @@ pub async fn migrate_session_live(
     tokio::spawn(async move {
         let lease = lease;
         let _gate_guard = gate_guard;
-        let mut touch = tokio::time::interval(std::time::Duration::from_secs(60));
-        touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        touch.tick().await;
 
-        // 7a. The drain: every sealed chunk lands on the dest.
+        // 7a. The drain: every sealed chunk lands on the dest. Wrapped in
+        // a bounded-backoff retry (CASE 2, issue #209): a TRANSIENT
+        // transport Err on `migration_drain_wait` (a dest host-agent pod
+        // roll, a network blip) used to hit a bare `return` that left the
+        // session Active on the dest while the source's export TTL fired
+        // — the ownership probe then answers owned=false and the host
+        // DESTROYS the frozen source's page server, which the dest may
+        // still need, poisoning it. Retry the RPC a few times; only on
+        // PERSISTENT failure take the SAME rung-1 rewind as PeerLost
+        // (destroy dest, re-arm Evacuating, parachute_or_kill) — never
+        // leave an Active session whose page server gets reaped.
+        const DRAIN_RETRY_BUDGET: u32 = 5;
+        // Base backoff (doubled each attempt: 2s, 4s, 8s, …). Overridable
+        // via `ENGRAM_MIGRATION_DRAIN_RETRY_BASE_MS` for ops tuning and so
+        // the regression test can drive the exhaustion path without a
+        // ~30s real wait.
+        let drain_retry_base = std::time::Duration::from_millis(
+            std::env::var("ENGRAM_MIGRATION_DRAIN_RETRY_BASE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2000),
+        );
         let t_drain = std::time::Instant::now();
-        let drain = state2.services.host.migration_drain_wait(new_sandbox_id);
-        tokio::pin!(drain);
-        let drain = loop {
-            tokio::select! {
-                res = &mut drain => break res,
-                _ = touch.tick() => {
-                    if !lease.touch().await {
-                        tracing::error!(%session_id, "post-copy finalize: lease lost mid-drain");
-                        return;
+        let mut last_err: Option<engram_core::SandboxError> = None;
+        let drain_outcome = 'retry: {
+            for attempt in 0..DRAIN_RETRY_BUDGET {
+                // Refresh the lease across attempts the same way the wait
+                // below does, so a multi-attempt retry doesn't outlive the
+                // lease and stomp a session another holder re-acquired.
+                let mut touch = tokio::time::interval(std::time::Duration::from_secs(60));
+                touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                touch.tick().await;
+
+                let drain = state2.services.host.migration_drain_wait(new_sandbox_id);
+                tokio::pin!(drain);
+                let res = loop {
+                    tokio::select! {
+                        res = &mut drain => break res,
+                        _ = touch.tick() => {
+                            match lease.touch_checked().await {
+                                crate::idle_evictor::LeaseTouch::Held => {}
+                                // A transport blip on the touch is NOT loss
+                                // (CASE: lease touch). Keep waiting; the
+                                // 180s reaper still backstops a truly dead
+                                // holder, and the drain RPC remains in flight.
+                                crate::idle_evictor::LeaseTouch::TransientError(e) => {
+                                    tracing::warn!(%session_id, error = %e,
+                                        "post-copy finalize: lease touch transport error — retrying, not abandoning");
+                                }
+                                crate::idle_evictor::LeaseTouch::Lost => {
+                                    tracing::error!(%session_id,
+                                        "post-copy finalize: lease lost mid-drain (reaped/re-acquired)");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                };
+                match res {
+                    Ok(outcome) => break 'retry Ok(outcome),
+                    Err(e) => {
+                        tracing::warn!(%session_id, error = %e, attempt = attempt + 1,
+                            budget = DRAIN_RETRY_BUDGET,
+                            "post-copy drain_wait transport error; retrying with backoff");
+                        last_err = Some(e);
+                        // Exponential backoff (2s, 4s, 8s, …) — bounded by
+                        // the budget so the whole retry stays well inside
+                        // the source export TTL when started promptly.
+                        if attempt + 1 < DRAIN_RETRY_BUDGET {
+                            tokio::time::sleep(drain_retry_base * (1 << attempt)).await;
+                        }
                     }
                 }
             }
+            // Budget exhausted: fall through to the rewind with the last
+            // transport error as the detail.
+            break 'retry Err(last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "drain_wait exhausted retries".into()));
         };
-        match drain {
+
+        // Normalize: a PeerLost outcome and a persistent transport Err
+        // both demand the rung-1 rewind. Map both into a single rewind
+        // detail so they share one arm (the page server is doomed either
+        // way once we stop owning the drain).
+        let rewind_detail: Option<String> = match drain_outcome {
             Ok(engram_core::types::snapshot::DrainOutcome::Done {
                 pulled,
                 alt_sourced,
@@ -609,52 +698,49 @@ pub async fn migrate_session_live(
                     %session_id, pulled, alt_sourced, zero_chunks, ms,
                     "post-copy drain complete; releasing the source",
                 );
+                None
             }
             Ok(engram_core::types::snapshot::DrainOutcome::PeerLost { remaining, detail }) => {
-                // Rung-1 rewind: the dest holds unfillable state (the
-                // host-agent already poisoned/paused it). Destroy it,
-                // re-arm Evacuating, and let the scanner rehome from
-                // the durable row (or kill when none exists). The
-                // frozen source: ownership now answers `false`
-                // (rebind landed), so its TTL destroys it.
-                metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "peer_lost_rewind")
-                    .increment(1);
                 tracing::error!(%session_id, remaining, %detail,
                     "post-copy drain lost its peer — rewinding the whole VM (rung-1)");
-                let _ = state2.services.host.destroy(new_sandbox_id).await;
-                state2.host_registry.invalidate_sandbox(new_sandbox_id);
-                if state2
-                    .services
-                    .meta
-                    .transition_session(session_id, SessionState::Evacuating)
-                    .await
-                    .is_ok()
-                {
-                    let _ = state2
-                        .emit(
-                            session_id,
-                            SessionEvent::StatusChanged {
-                                from: SessionState::Active,
-                                to: SessionState::Evacuating,
-                                at: chrono::Utc::now(),
-                            },
-                        )
-                        .await;
-                }
-                let _ = parachute_or_kill(
-                    &state2,
-                    session_id,
-                    durable_row.is_some(),
-                    format!("peer lost mid-drain: {detail}"),
-                )
-                .await;
-                return;
+                Some(format!("peer lost mid-drain: {detail}"))
             }
-            Err(e) => {
-                tracing::error!(%session_id, error = %e,
-                    "post-copy drain_wait failed; leaving the source to its TTL");
-                return;
+            Err(detail) => {
+                tracing::error!(%session_id, %detail,
+                    "post-copy drain_wait failed after retries — rewinding the whole VM (rung-1)");
+                Some(format!("drain transport error after retries: {detail}"))
             }
+        };
+        if let Some(detail) = rewind_detail {
+            // Rung-1 rewind: the dest holds unfillable state (or we can no
+            // longer drive the drain). Destroy it, re-arm Evacuating, and
+            // let the scanner rehome from the durable row (or kill when
+            // none exists). The frozen source: ownership now answers
+            // `false` (rebind landed), so its TTL destroys it.
+            metrics::counter!(crate::metrics::MIGRATION_TOTAL, "outcome" => "peer_lost_rewind")
+                .increment(1);
+            let _ = state2.services.host.destroy(new_sandbox_id).await;
+            state2.host_registry.invalidate_sandbox(new_sandbox_id);
+            if state2
+                .services
+                .meta
+                .transition_session(session_id, SessionState::Evacuating)
+                .await
+                .is_ok()
+            {
+                let _ = state2
+                    .emit(
+                        session_id,
+                        SessionEvent::StatusChanged {
+                            from: SessionState::Active,
+                            to: SessionState::Evacuating,
+                            at: chrono::Utc::now(),
+                        },
+                    )
+                    .await;
+            }
+            let _ = parachute_or_kill(&state2, session_id, durable_row.is_some(), detail).await;
+            return;
         }
 
         // 7b. Release the source (destroy; the export retires with it).
@@ -1331,6 +1417,235 @@ mod tests {
             drop(reclaim);
             drop(held);
         }
+    }
+
+    /// Issue #209 (CASE 2 + CASE 1): a successfully-migrated session must
+    /// NOT be abandoned Active-on-the-dest when the finalize's
+    /// `migration_drain_wait` keeps returning a transport `Err`. The
+    /// pre-fix `Err` arm just logged "leaving the source to its TTL" and
+    /// `return`ed — so the source's export TTL fired, the ownership probe
+    /// answered owned=false, and the host destroyed the page server the
+    /// dest still needed, wedging the session Active on a poisoned VM.
+    ///
+    /// With the fix the drain is retried with bounded backoff; on
+    /// persistent failure the finalize takes the SAME rung-1 rewind as
+    /// the PeerLost arm: the dest sandbox is destroyed and the session is
+    /// re-armed Evacuating for the scanner to rehome from the durable
+    /// row. It also asserts (CASE 1) the teleport_target pin is cleared —
+    /// it must never leak past a verb exit, since it strictly pins every
+    /// future rehome of the session to the chosen host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_transport_error_rewinds_instead_of_abandoning_active() {
+        use engram_core::types::snapshot::SnapshotMetadata;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        std::env::set_var("ENGRAM_LIVE_TELEPORT", "1");
+        // Collapse the retry backoff so the exhaustion path is fast.
+        std::env::set_var("ENGRAM_MIGRATION_DRAIN_RETRY_BASE_MS", "1");
+
+        struct DrainFlakyDest {
+            destroy_called: Arc<AtomicBool>,
+            commit_called: Arc<AtomicBool>,
+            drain_attempts: Arc<AtomicU32>,
+        }
+        #[async_trait::async_trait]
+        impl engram_core::traits::SandboxBackend for DrainFlakyDest {
+            async fn create(
+                &self,
+                _: engram_core::types::sandbox::SandboxSpec,
+            ) -> Result<SandboxId, engram_core::SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), engram_core::SandboxError> {
+                self.destroy_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, engram_core::SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                Err(engram_core::SandboxError::NotFound)
+            }
+            async fn snapshot(
+                &self,
+                _: SandboxId,
+            ) -> Result<SnapshotMetadata, engram_core::SandboxError> {
+                Err(engram_core::SandboxError::NotFound)
+            }
+            async fn migration_presetup(
+                &self,
+                _: SandboxId,
+            ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, engram_core::SandboxError>
+            {
+                Ok(engram_core::types::snapshot::MigrationPresetupOut {
+                    export_id: "test-export".into(),
+                    peer_token: "test-token".into(),
+                    peer_port: 9102,
+                    sidecar_json: b"{}".to_vec(),
+                    memory_manifest_json: b"{}".to_vec(),
+                    memory_manifest_ref: engram_core::types::manifest::ManifestRef::new(),
+                    disk_manifest_ref: None,
+                    hot_chunks: vec![],
+                })
+            }
+            async fn migration_capture_postcopy(
+                &self,
+                _: SandboxId,
+                _: &str,
+            ) -> Result<engram_core::types::snapshot::PostCopyCaptureOut, engram_core::SandboxError>
+            {
+                Ok(engram_core::types::snapshot::PostCopyCaptureOut {
+                    sealed_chunks: 3,
+                    total_chunks: 16,
+                    pause_ms: 1,
+                    disk_drain_ms: 1,
+                    vmstate_ms: 1,
+                    scan_ms: 1,
+                    sealed_disk_chunks: 0,
+                    paused_at_unix_ms: 0,
+                })
+            }
+            async fn migration_drain_wait(
+                &self,
+                _: SandboxId,
+            ) -> Result<engram_core::types::snapshot::DrainOutcome, engram_core::SandboxError>
+            {
+                // ALWAYS a transport error — never PeerLost, never Done.
+                // The fix must retry, then (budget exhausted) rewind.
+                self.drain_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(engram_core::SandboxError::Unavailable(
+                    "injected transport blip on drain_wait".into(),
+                ))
+            }
+            async fn migration_commit(
+                &self,
+                _: SandboxId,
+                _: &str,
+            ) -> Result<(), engram_core::SandboxError> {
+                // The source must NOT be committed (destroyed) when the
+                // drain never completed — the rewind owns recovery.
+                self.commit_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn restore(
+                &self,
+                _: SnapshotMetadata,
+            ) -> Result<SandboxId, engram_core::SandboxError> {
+                Ok(SandboxId::new())
+            }
+            fn snapshot_path_for(&self, _: engram_core::types::SnapshotId) -> std::path::PathBuf {
+                std::path::PathBuf::from("/nonexistent")
+            }
+        }
+
+        let session = active_session();
+        let session_id = session.id;
+        let source_host = session.host_id.expect("source host");
+        let old_sandbox = session.sandbox_id.expect("source sandbox");
+        let (state, meta, target) = build_state(session);
+        let destroy_called = Arc::new(AtomicBool::new(false));
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let drain_attempts = Arc::new(AtomicU32::new(0));
+        let flaky: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(DrainFlakyDest {
+            destroy_called: destroy_called.clone(),
+            commit_called: commit_called.clone(),
+            drain_attempts: drain_attempts.clone(),
+        });
+        state.host_registry.register(
+            target,
+            Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(flaky.clone())),
+        );
+        state
+            .host_registry
+            .record_sandbox_owner(old_sandbox, target);
+        meta.hosts
+            .lock()
+            .push(engram_core::types::host::HostRecord {
+                id: source_host,
+                hostname: "src".into(),
+                cloud_metadata: engram_core::types::host::HostMetadata::default(),
+                capacity: engram_core::types::host::HostCapacity {
+                    total_gb: 100,
+                    used_gb: 10,
+                    total_mib: 65_536,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: Default::default(),
+                status: engram_core::types::host::HostStatus::Ready,
+                last_heartbeat_at: chrono::Utc::now(),
+                host_addr: Some("http://127.0.0.1:1".into()),
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
+            });
+        meta.snapshots
+            .lock()
+            .push(engram_core::types::snapshot::SnapshotRecord {
+                id: engram_core::types::SnapshotId::new(),
+                session_id: Some(session_id),
+                host_id: Some(source_host),
+                image_version: "test".into(),
+                size_bytes: 1,
+                created_at: chrono::Utc::now(),
+                last_accessed_at: chrono::Utc::now(),
+                disk_manifest: None,
+                memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
+                recoverable: true,
+                aux_bundles: Vec::new(),
+                events_cursor: None,
+            });
+
+        // The verb returns Ok — the move LANDED; the finalize runs async.
+        migrate_session_live(&state, session_id, target)
+            .await
+            .expect("the move lands; the drain finalize runs in the background");
+
+        // The finalize retries the drain, exhausts the budget, and takes
+        // the rung-1 rewind: the dest sandbox is destroyed and the
+        // session is re-armed Evacuating (durable row present → parachute,
+        // not kill). Poll for the terminal posture.
+        let mut rewound = false;
+        for _ in 0..400 {
+            if destroy_called.load(Ordering::SeqCst)
+                && meta.get_session(session_id).await.unwrap().status == SessionState::Evacuating
+            {
+                rewound = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            rewound,
+            "issue #209: a persistent drain transport error must rewind \
+             (destroy dest + re-arm Evacuating), never abandon the session \
+             Active on the dest while the source page server is reaped",
+        );
+        assert!(
+            drain_attempts.load(Ordering::SeqCst) > 1,
+            "the drain must be RETRIED before giving up, not abandoned on \
+             the first transport error (saw {} attempt(s))",
+            drain_attempts.load(Ordering::SeqCst),
+        );
+        assert!(
+            !commit_called.load(Ordering::SeqCst),
+            "the source must NOT be committed/destroyed when the drain never \
+             completed — the rewind owns recovery from the durable row",
+        );
+        // CASE 1: the teleport_target pin must be cleared — it must never
+        // outlive the verb (it strictly pins every future rehome).
+        assert_eq!(
+            meta.get_teleport_target(session_id).await.unwrap(),
+            None,
+            "issue #209 CASE 1: the teleport_target pin leaked past the verb",
+        );
     }
 
     #[tokio::test]
