@@ -431,7 +431,16 @@ pub async fn exec_stream(
     // its idx).
     let mut shutdown_rx = state.subscribe_shutdown();
     let shutdown = async move {
-        let _ = shutdown_rx.wait_for(|shutting_down| *shutting_down).await;
+        // Resolve ONLY on a genuine shutdown trigger; park on sender-drop
+        // (AppState teardown) so a dropped fixture/process-exit never
+        // force-ends a live stream. See the matching note in `events`.
+        if shutdown_rx
+            .wait_for(|shutting_down| *shutting_down)
+            .await
+            .is_err()
+        {
+            std::future::pending::<()>().await;
+        }
     };
     Ok(Sse::new(sse_stream.take_until(shutdown)).keep_alive(
         KeepAlive::new()

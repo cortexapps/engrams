@@ -82,7 +82,18 @@ pub async fn events(
     // underway (don't open a new stream on a draining pod).
     let mut shutdown_rx = state.subscribe_shutdown();
     let shutdown = async move {
-        let _ = shutdown_rx.wait_for(|shutting_down| *shutting_down).await;
+        // Resolve ONLY on a genuine shutdown trigger (value → true). On
+        // sender-drop `wait_for` returns Err — that's the owning AppState
+        // being torn down (process teardown in prod, a fixture drop in
+        // tests), NOT a shutdown; park so we never force-end a live
+        // stream on it (the stream ends naturally when its source closes).
+        if shutdown_rx
+            .wait_for(|shutting_down| *shutting_down)
+            .await
+            .is_err()
+        {
+            std::future::pending::<()>().await;
+        }
     };
     let stream = build_event_stream(replayed, live_rx, replay_high_water).take_until(shutdown);
     Ok(Sse::new(stream).keep_alive(
