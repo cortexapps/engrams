@@ -58,6 +58,13 @@ struct MockMetadataStore {
     /// test host here and `mark_host_ready_for` mutates its
     /// `ready_images`.
     hosts: Mutex<HashMap<HostId, HostRecord>>,
+    /// Issue #213: simulate the per-session lease being held by another
+    /// holder (a concurrent eviction / resume / live migration). When
+    /// set, `try_acquire_session_lease` returns `false`, so the
+    /// lease-acquiring handlers (snapshot, evict_local) must back off and
+    /// refuse rather than mutate. Default `false` = the lease is free
+    /// (preserves the existing tests' behaviour).
+    lease_held: std::sync::atomic::AtomicBool,
 }
 
 impl MockMetadataStore {
@@ -273,7 +280,19 @@ impl MetadataStore for MockMetadataStore {
         // that the per-session map can't hold; `get_snapshot` reads it.
         self.snapshots_by_id.lock().insert(snap.id, snap.clone());
         if let Some(sid) = snap.session_id {
-            self.snapshots.lock().entry(sid).or_default().push(snap);
+            // Mirror the PG impl's UPSERT-by-id contract: re-recording the
+            // same snapshot id (e.g. issue #213's recoverable=false → flip
+            // to true after commit_snapshot) UPDATES the existing row in
+            // place rather than appending a duplicate. A blind push here
+            // would let the test see two rows for one snapshot and miss the
+            // promotion semantics.
+            let mut by_session = self.snapshots.lock();
+            let rows = by_session.entry(sid).or_default();
+            if let Some(existing) = rows.iter_mut().find(|r| r.id == snap.id) {
+                *existing = snap;
+            } else {
+                rows.push(snap);
+            }
         }
         Ok(())
     }
@@ -283,6 +302,20 @@ impl MetadataStore for MockMetadataStore {
         id: engram_core::types::SnapshotId,
     ) -> Result<Option<SnapshotRecord>, MetaError> {
         Ok(self.snapshots_by_id.lock().get(&id).cloned())
+    }
+
+    // Issue #213: the lease is the serializer the snapshot / evict_local
+    // handlers now acquire. `lease_held` lets a test pin it "held by
+    // another holder" so those handlers must back off (Conflict) instead
+    // of mutating. Default (false) returns `true` like the trait default,
+    // so every other test acquires freely.
+    async fn try_acquire_session_lease(
+        &self,
+        _session_id: SessionId,
+        _sandbox_id: Option<engram_core::SandboxId>,
+        _locked_by: &str,
+    ) -> Result<bool, MetaError> {
+        Ok(!self.lease_held.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     async fn list_snapshots_for_session(
@@ -2127,6 +2160,120 @@ async fn evict_local_after_snapshot_drops_sandbox_and_marks_idle() {
     );
     let v = body_json(resp.into_body()).await;
     assert_eq!(v["stdout"], "back\n");
+}
+
+/// Issue #213 regression: the manual `snapshot` endpoint must acquire
+/// the per-session lease before touching the host / PG. With the lease
+/// held by a concurrent holder (an eviction capture, a resume, a live
+/// migration), the handler must refuse with a retryable 409 rather than
+/// snapshotting the sandbox out from under the lease holder — which, for
+/// a sandbox the eviction scanner is mid-capturing, raced the periodic
+/// checkpoint driver and re-created the 89f7984d phantom-snapshot state.
+///
+/// Before the fix the handler took NO lease, so this returned 200 and
+/// recorded a snapshot row.
+#[tokio::test]
+async fn snapshot_refuses_when_session_lease_held() {
+    // Keep the lease-acquire backoff tiny so the 8-attempt retry loop
+    // exhausts in milliseconds instead of 21s. Process-global, but only
+    // *shortens* the backoff — harmless to any other test (none rely on
+    // the long cadence), so we set it and never unset it to avoid a
+    // remove-mid-flight race with the sibling lease test.
+    std::env::set_var("ENGRAM_LEASE_ACQUIRE_BACKOFF_MS", "1");
+    let store = MockMetadataStore::arc();
+    let app = build_app(store.clone());
+    let id = api_create_session(app.clone(), "r").await;
+
+    // Simulate the lease held by a concurrent holder.
+    store
+        .lease_held
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let resp = post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "snapshot must refuse (retryable 409) while the session lease is held",
+    );
+
+    // No snapshot row was written — the handler bailed out BEFORE touching
+    // the host or PG.
+    assert!(
+        store
+            .list_snapshots_for_session(id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a lease-blocked snapshot must not record a snapshot row",
+    );
+    // Session untouched.
+    assert_eq!(
+        store.get_session(id).await.unwrap().status,
+        SessionState::Active,
+    );
+}
+
+/// Issue #213 regression: the `evict_local` endpoint must acquire the
+/// per-session lease before destroying the sandbox. With the lease held
+/// by a concurrent holder (a host idle-nomination whose scanner capture
+/// is in flight, a resume, a live migration), it must refuse with a 409
+/// rather than destroying a sandbox mid-capture and stomping the session
+/// to Idle over a legal `Evicting → Idle` edge.
+///
+/// Before the fix the handler took NO lease, so this returned 202,
+/// destroyed the sandbox, and flipped the session to Idle.
+#[tokio::test]
+async fn evict_local_refuses_when_session_lease_held() {
+    std::env::set_var("ENGRAM_LEASE_ACQUIRE_BACKOFF_MS", "1");
+    let store = MockMetadataStore::arc();
+    let app = build_app(store.clone());
+    let id = api_create_session(app.clone(), "r").await;
+
+    // Take a snapshot first so the precondition (a snapshot must exist)
+    // passes — we want to prove the LEASE is what stops the eviction, not
+    // the no-snapshot guard.
+    let resp = post(
+        app.clone(),
+        &format!("/api/v1/sessions/{id}/snapshot"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sandbox_before = store.get_session(id).await.unwrap().sandbox_id;
+    assert!(
+        sandbox_before.is_some(),
+        "session should have a live sandbox"
+    );
+
+    // Now simulate the lease held by a concurrent holder.
+    store
+        .lease_held
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let resp = delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "evict_local must refuse (retryable 409) while the session lease is held",
+    );
+
+    // The session is still Active with its sandbox bound — nothing was
+    // destroyed or transitioned out from under the lease holder.
+    let after = store.get_session(id).await.unwrap();
+    assert_eq!(
+        after.status,
+        SessionState::Active,
+        "a lease-blocked evict must not transition the session",
+    );
+    assert_eq!(
+        after.sandbox_id, sandbox_before,
+        "a lease-blocked evict must not clear the sandbox binding",
+    );
 }
 
 #[tokio::test]
