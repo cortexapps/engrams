@@ -4,7 +4,10 @@ use axum::Router;
 
 use crate::state::SharedState;
 
-mod admin;
+// `pub(crate)`: the live-migration regression test (issue #208) drives
+// the real `teleport_session` handler to prove HTTP cancellation no
+// longer abandons the verb.
+pub(crate) mod admin;
 pub mod auth;
 pub(crate) mod enabled_images;
 mod events;
