@@ -32,7 +32,7 @@ pub async fn interrupt(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<Json<InterruptResponse>, ApiError> {
-    let sandbox_id = state.registry.get(id).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox to interrupt — it is idle or not yet started".into(),
         )

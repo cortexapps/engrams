@@ -297,7 +297,6 @@ mod tests {
             })
             .await
             .unwrap();
-        state.registry.bind(session_id, sandbox_id);
         meta.session.lock().sandbox_id = Some(sandbox_id);
         backdate_activity(&meta, 2);
 

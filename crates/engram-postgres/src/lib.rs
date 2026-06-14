@@ -981,14 +981,15 @@ impl MetadataStore for PostgresStore {
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
         // Every non-terminal state except `host_lost` (limbo pending the
         // reconciler; its bindings are stale by definition).
-        // `evicting` matters most: it keeps `sandbox_id` BOUND
-        // while the pipeline runs, and startup's `repopulate_routing`
-        // rebuilds the in-memory SandboxRegistry from this query — when
-        // `evicting` was missing, a coord roll mid-eviction left the new
-        // pod's registry empty for that session, every scanner attempt
-        // no-op'd on the "sandbox no longer bound" guard, and the budget
-        // exhausted into a spurious HostLost with the VM still running
-        // (prod session 5cfb90b8, 2026-06-03).
+        // `evicting` matters most: it keeps `sandbox_id` BOUND while the
+        // pipeline runs, so the eviction scanner re-picks a mid-eviction
+        // session after a coord roll and its "sandbox no longer bound"
+        // guard (which reads `sessions.sandbox_id` directly — ADR 0047,
+        // no in-memory registry) still sees the live binding. When
+        // `evicting` was missing, a roll mid-eviction dropped the session
+        // from the active set, the scanner never re-picked it, and the
+        // budget exhausted into a spurious HostLost with the VM still
+        // running (prod session 5cfb90b8, 2026-06-03).
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, status, host_id, sandbox_id,

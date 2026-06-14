@@ -100,7 +100,7 @@ pub async fn prompt(
         );
     }
 
-    let sandbox_id = state.registry.get(id).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         // After ensure_active, an Active session must have a sandbox
         // bound. If not, we hit a state we don't have a clean
         // affordance for — surface a 409.

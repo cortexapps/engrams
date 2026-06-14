@@ -43,7 +43,7 @@ pub async fn shell(
         return e.into_response();
     }
 
-    let Some(sandbox_id) = state.registry.get(id) else {
+    let Some(sandbox_id) = state.resolve_sandbox(id).await else {
         return (
             StatusCode::CONFLICT,
             "session has no live sandbox after auto-resume; \

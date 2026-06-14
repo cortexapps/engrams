@@ -159,7 +159,7 @@ pub async fn exec(
     // returns once the session is Active again.
     crate::api::snapshot::ensure_active(&state, id).await?;
 
-    let sandbox_id = state.registry.get(id).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox — create a new session or resume from snapshot".into(),
         )
@@ -266,7 +266,7 @@ pub async fn exec_stream(
     let (argv, sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
 
     crate::api::snapshot::ensure_active(&state, id).await?;
-    let sandbox_id = state.registry.get(id).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox — create a new session or resume from snapshot".into(),
         )

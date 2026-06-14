@@ -458,7 +458,7 @@ pub async fn create_from_path(
     Json(req): Json<FromPathRequest>,
 ) -> Result<Json<FromPathResponse>, ApiError> {
     crate::api::snapshot::ensure_active(&state, session).await?;
-    let sandbox_id = state.registry.get(session).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(session).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox — create a new session or resume from snapshot".into(),
         )

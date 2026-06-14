@@ -154,10 +154,11 @@ pub async fn evict_session_to_state(
         "idle eviction pipeline started",
     );
 
-    // Guard: if the registry doesn't think this sandbox is bound to
-    // the session anymore, the session was already evicted by some
-    // other path (operator, dead-host detector). No-op cleanly.
-    if state.registry.get(session_id) != Some(sandbox_id) {
+    // Guard: if the live binding (read through to PG — this scanner may
+    // run on a replica that never cached the bind, ADR 0047) is no
+    // longer this sandbox, the session was already evicted or relocated
+    // by some other path (operator, dead-host detector). No-op cleanly.
+    if state.resolve_sandbox(session_id).await != Some(sandbox_id) {
         tracing::info!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
@@ -305,12 +306,9 @@ pub async fn evict_session_to_state(
     // bookkeeping (proxy unregister, jail teardown) still runs;
     // a failed destroy() is best-effort the same as before.
 
-    // Step 3a: registry.unbind() — purely in-memory, no coord-
-    // visible state change. Safe to run before PG transitions.
-    state.registry.unbind(session_id);
-
-    // Step 3b (PG, Idle-before-destroy): clear sandbox_id on the
-    // session row.
+    // Step 3 (PG, Idle-before-destroy): clear sandbox_id on the
+    // session row — ADR 0047, this is the authoritative unbind (no
+    // in-memory registry to drop).
     if let Err(e) = state
         .services
         .meta
@@ -429,8 +427,8 @@ async fn finish_eviction_background(
         .await
         .unwrap_or_default();
 
-    // Idle-before-durable: in-memory unbind, PG sandbox detach, state flip.
-    state.registry.unbind(session_id);
+    // Idle-before-durable: PG sandbox detach (the authoritative unbind,
+    // ADR 0047 — no in-memory registry), then state flip.
     if let Err(e) = state
         .services
         .meta
@@ -1006,6 +1004,63 @@ mod tests {
         )
     }
 
+    /// ADR 0047: `resolve_sandbox` must read the live binding from
+    /// Postgres (`sessions.sandbox_id`), NOT a per-replica in-memory
+    /// map. This is what makes `/exec` / `/prompt` / `/shell` work
+    /// behind a multi-replica coordinator: a replica that never fielded
+    /// the create/bind still resolves the sandbox. The ADR 0048 fleet
+    /// load test surfaced the bug this guards against — with the old
+    /// in-memory `SandboxRegistry`, a create on pod A then an exec on
+    /// pod B 409'd with "session has no live sandbox" even though the
+    /// sandbox was alive. We simulate "another replica bound it" by
+    /// writing the binding straight to the store; this AppState never
+    /// sees a bind call.
+    #[tokio::test]
+    async fn resolve_sandbox_reads_pg_so_any_replica_routes() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            user_id: None,
+            status: SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:resolve".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        };
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+
+        // Nothing bound yet → genuinely no live sandbox.
+        assert_eq!(state.resolve_sandbox(session_id).await, None);
+
+        // Another replica persists the binding (the create/resume path
+        // writes `sessions.sandbox_id`). This AppState never cached it.
+        let sandbox_id = engram_core::SandboxId::new();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.resolve_sandbox(session_id).await,
+            Some(sandbox_id),
+            "a replica that never bound the session must still resolve it via PG",
+        );
+
+        // Eviction/teardown clears the binding → resolves None again.
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, None)
+            .await
+            .unwrap();
+        assert_eq!(state.resolve_sandbox(session_id).await, None);
+    }
+
     fn process_spec() -> SandboxSpec {
         SandboxSpec {
             image: "evict-test".into(),
@@ -1137,7 +1192,6 @@ mod tests {
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, gate) = d5_state(session, sandbox_root.path(), false);
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -1196,7 +1250,6 @@ mod tests {
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, gate) = d5_state(session, sandbox_root.path(), true);
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -1246,7 +1299,6 @@ mod tests {
         let state = build_state_with_session(session, sandbox_root.path());
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -1269,11 +1321,10 @@ mod tests {
             .await
             .expect("eviction should succeed");
 
-        // Session is Idle, sandbox_id cleared, registry unbound.
+        // Session is Idle and its sandbox_id is cleared (PG authority).
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Idle);
         assert_eq!(after.sandbox_id, None);
-        assert_eq!(state.registry.get(session_id), None);
 
         // A snapshot was recorded.
         let snaps = state
@@ -1500,7 +1551,12 @@ mod tests {
         ));
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
 
         let err = evict_idle_session(&state, session_id, sandbox_id)
             .await
@@ -1707,7 +1763,6 @@ mod tests {
         ));
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -1923,7 +1978,6 @@ mod tests {
         ));
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -1989,7 +2043,6 @@ mod tests {
         let state = build_state_with_session(session, sandbox_root.path());
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -2023,7 +2076,7 @@ mod tests {
             "lease guard must short-circuit before transitioning session",
         );
         assert!(
-            state.registry.get(session_id).is_some(),
+            after.sandbox_id.is_some(),
             "lease guard must short-circuit before unbinding",
         );
 
@@ -2277,7 +2330,6 @@ mod tests {
         ));
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -2461,7 +2513,6 @@ mod tests {
         let state = build_state_with_session(evicting_session(session_id), sandbox_root.path());
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -2476,7 +2527,6 @@ mod tests {
         let after = state.services.meta.get_session(session_id).await.unwrap();
         assert_eq!(after.status, SessionState::Idle);
         assert_eq!(after.sandbox_id, None);
-        assert_eq!(state.registry.get(session_id), None);
         let snaps = state
             .services
             .meta
@@ -2497,7 +2547,6 @@ mod tests {
         let (state, mini) = build_state_and_meta(evicting_session(session_id), sandbox_root.path());
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta

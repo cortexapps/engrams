@@ -665,7 +665,7 @@ pub async fn pause_session(
     State(state): State<SharedState>,
     Path(session_id): Path<SessionId>,
 ) -> Result<Json<PauseResumeResponse>, ApiError> {
-    let sandbox_id = state.registry.get(session_id).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(session_id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox to pause — it is idle or not yet started".into(),
         )
@@ -691,7 +691,7 @@ pub async fn resume_session(
     State(state): State<SharedState>,
     Path(session_id): Path<SessionId>,
 ) -> Result<Json<PauseResumeResponse>, ApiError> {
-    let sandbox_id = state.registry.get(session_id).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(session_id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox to resume in place — it is idle or not yet started".into(),
         )

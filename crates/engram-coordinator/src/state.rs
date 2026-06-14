@@ -358,49 +358,9 @@ impl Default for SessionEventBus {
     }
 }
 
-/// In-process session → live-sandbox-id map.
-///
-/// Sandboxes are ephemeral host-local resources, so this lives in
-/// memory rather than in Postgres. After a coordinator restart the
-/// map is empty; sessions whose sandboxes were lost will need to be
-/// re-created or restored from snapshot before exec can succeed.
-/// That maps cleanly to the "snapshots are a cache, not source of
-/// truth" rule in DESIGN.md.
-#[derive(Default)]
-pub struct SandboxRegistry {
-    inner: DashMap<SessionId, SandboxId>,
-}
-
-impl SandboxRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn bind(&self, session: SessionId, sandbox: SandboxId) {
-        self.inner.insert(session, sandbox);
-    }
-
-    pub fn get(&self, session: SessionId) -> Option<SandboxId> {
-        self.inner.get(&session).map(|r| *r)
-    }
-
-    pub fn unbind(&self, session: SessionId) -> Option<SandboxId> {
-        self.inner.remove(&session).map(|(_, v)| v)
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
-
 pub struct AppState {
     pub cfg: CoordinatorConfig,
     pub services: Services,
-    pub registry: SandboxRegistry,
     /// Shared with the `pg_listener` task so cross-replica events
     /// land on the same broadcast bus as locally-emitted ones. Cheap
     /// to clone (`Arc` clone), so handlers freely take a reference and
@@ -505,7 +465,6 @@ impl AppState {
         Self {
             cfg,
             services,
-            registry: SandboxRegistry::new(),
             events,
             host_registry,
             harness_hub,
@@ -524,6 +483,26 @@ impl AppState {
     /// loss. Cross-host durability for sessions is git, not snapshots.
     pub fn snapshot_dir(&self) -> std::path::PathBuf {
         self.cfg.local_path.join("snapshots")
+    }
+
+    /// Resolve the live sandbox bound to `session` from Postgres
+    /// (`sessions.sandbox_id` — the single source of truth).
+    ///
+    /// ADR 0047: the coordinator holds NO in-memory session→sandbox
+    /// authority. `session_boot` persists the binding via
+    /// `create_session_created`; every rebind/resume path persists it via
+    /// `assign_session_sandbox`; eviction/teardown clears it to `None`.
+    /// Any replica answers `/exec` / `/prompt` / `/shell` / `/snapshot`
+    /// identically by reading this row — one indexed PK select, sub-ms,
+    /// dwarfed by the downstream host exec RPC. A `None` here means the
+    /// session genuinely has no live sandbox (idle / terminal / pre-boot).
+    pub async fn resolve_sandbox(&self, session: SessionId) -> Option<SandboxId> {
+        self.services
+            .meta
+            .get_session(session)
+            .await
+            .ok()
+            .and_then(|s| s.sandbox_id)
     }
 
     /// Register a local VMM backend as an in-process host. Wraps it
@@ -690,25 +669,6 @@ fn harness_event_sink(
 pub(crate) mod tests {
     use super::*;
 
-    #[test]
-    fn registry_bind_get_unbind() {
-        let r = SandboxRegistry::new();
-        let sid = SessionId::new();
-        let sbx = SandboxId::new();
-        assert!(r.is_empty());
-        assert_eq!(r.get(sid), None);
-
-        r.bind(sid, sbx);
-        assert_eq!(r.len(), 1);
-        assert_eq!(r.get(sid), Some(sbx));
-
-        let removed = r.unbind(sid);
-        assert_eq!(removed, Some(sbx));
-        assert!(r.is_empty());
-        assert_eq!(r.get(sid), None);
-        assert_eq!(r.unbind(sid), None, "second unbind is a no-op");
-    }
-
     fn evicted() -> SessionEvent {
         SessionEvent::Evicted {
             at: chrono::Utc::now(),
@@ -836,25 +796,6 @@ pub(crate) mod tests {
         assert!(
             nothing.is_err(),
             "subscribers to other sessions must not receive events"
-        );
-    }
-
-    #[test]
-    fn registry_isolates_sessions() {
-        let r = SandboxRegistry::new();
-        let s1 = SessionId::new();
-        let s2 = SessionId::new();
-        let b1 = SandboxId::new();
-        let b2 = SandboxId::new();
-        r.bind(s1, b1);
-        r.bind(s2, b2);
-        assert_eq!(r.get(s1), Some(b1));
-        assert_eq!(r.get(s2), Some(b2));
-        r.unbind(s1);
-        assert_eq!(
-            r.get(s2),
-            Some(b2),
-            "unbinding one session must not affect another"
         );
     }
 

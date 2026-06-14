@@ -199,7 +199,8 @@ pub(crate) async fn boot_on_reserved_host(
         }
     }
 
-    state.registry.bind(session_id, sandbox_id);
+    // ADR 0047: the session→sandbox binding is persisted by
+    // `create_session_created` above; no in-memory registry to update.
 
     // Egress policy from the resolved guest IP (None on backends without one).
     let egress_policy = build_egress_policy(

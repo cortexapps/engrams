@@ -382,31 +382,31 @@ pub async fn run_with_registry_and_local(
         .map_err(CoordinatorError::Io)
 }
 
-/// Read every active session and re-bind its `sandbox_id`/`host_id`
-/// in the in-memory maps so a coordinator restart doesn't leave
-/// `Active` sessions stranded. Pre-populates `HostRegistry`'s
-/// `sandbox_owner` with the persisted `sandbox_id → host_id` pairs;
-/// once the host dials back in via `/api/hosts/connect` and registers
-/// its backend, routing resumes for those sessions without further
-/// intervention. Sessions in `Pending` (sandbox not created yet),
-/// `Idle` (evicted), or `Dead` (awaiting reschedule) are
-/// left for `/resume` to handle on next access.
+/// Warm `HostRegistry`'s `sandbox_owner` read-through cache from the
+/// persisted `sandbox_id → host_id` pairs of active sessions, so the
+/// first `/exec` after a coordinator (re)start routes without a
+/// PG read-through storm. This is a pure latency optimization — the
+/// session→sandbox binding itself lives only in Postgres now
+/// (ADR 0047; see [`AppState::resolve_sandbox`]), and `sandbox_owner`
+/// self-populates via `host_for_sandbox` on any miss — so a skipped
+/// warm just costs one extra read on first access. Sessions in
+/// `Pending` / `Idle` / `Dead` have no live sandbox and are left for
+/// `/resume`.
 async fn repopulate_routing(state: &AppState) -> Result<(), engram_core::MetaError> {
     let sessions = state.services.meta.list_active_sessions().await?;
-    let mut bound = 0usize;
+    let mut warmed = 0usize;
     for s in sessions {
         if let (Some(sandbox_id), Some(host_id)) = (s.sandbox_id, s.host_id) {
-            state.registry.bind(s.id, sandbox_id);
             state
                 .host_registry
                 .record_sandbox_owner(sandbox_id, host_id);
-            bound += 1;
+            warmed += 1;
         }
     }
-    if bound > 0 {
+    if warmed > 0 {
         tracing::info!(
-            sessions = bound,
-            "rebuilt in-memory routing for active sessions",
+            sessions = warmed,
+            "warmed sandbox_owner cache for active sessions",
         );
     }
     Ok(())
