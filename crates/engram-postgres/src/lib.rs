@@ -96,6 +96,29 @@ impl PostgresStore {
             Err(e) => db_err(e),
         }
     }
+
+    /// Issue #232: disambiguate a 0-row fenced enable-job UPDATE. If the
+    /// row exists, the `claimed_by = $claimant` fence rejected the write
+    /// — the lease has expired and a peer (or nobody) now holds the
+    /// claim, so this is a `Conflict` and the caller must abandon the
+    /// job. Otherwise the id is genuinely unknown — `NotFound`. Mirrors
+    /// [`Self::conflict_or_not_found`].
+    async fn enable_job_fence_miss(&self, id: Uuid, claimant: &str) -> MetaError {
+        match sqlx::query_scalar::<_, Option<String>>(
+            "SELECT claimed_by FROM enable_jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(Some(holder)) => MetaError::Conflict(format!(
+                "enable job {id} lease lost: held by {} (writer is {claimant})",
+                holder.as_deref().unwrap_or("<unclaimed>")
+            )),
+            Ok(None) => MetaError::NotFound,
+            Err(e) => db_err(e),
+        }
+    }
 }
 
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
@@ -3099,78 +3122,105 @@ impl MetadataStore for PostgresStore {
     async fn update_enable_job_progress(
         &self,
         id: Uuid,
+        claimant: &str,
         chunks_done: u32,
         chunks_total: Option<u32>,
     ) -> Result<(), MetaError> {
+        // Fenced by `claimed_by`: a checkpoint (which also renews the
+        // lease via `claimed_at = NOW()`) only lands while the caller
+        // still holds the claim. An expired-lease pod whose job was
+        // re-claimed by a peer would otherwise reset the new
+        // claimant's `chunks_done` and renew the lease on its behalf
+        // — see #232.
         let res = sqlx::query(
             r#"
             UPDATE enable_jobs
-               SET chunks_done = $2,
-                   chunks_total = COALESCE($3, chunks_total),
+               SET chunks_done = $3,
+                   chunks_total = COALESCE($4, chunks_total),
                    claimed_at = NOW(),
                    updated_at = NOW()
-             WHERE id = $1
+             WHERE id = $1 AND claimed_by = $2
             "#,
         )
         .bind(id)
+        .bind(claimant)
         .bind(chunks_done as i32)
         .bind(chunks_total.map(|v| v as i32))
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
         if res.rows_affected() == 0 {
-            return Err(MetaError::NotFound);
+            return Err(self.enable_job_fence_miss(id, claimant).await);
         }
         Ok(())
     }
 
-    async fn set_enable_job_state(&self, id: Uuid, state: EnableJobState) -> Result<(), MetaError> {
+    async fn set_enable_job_state(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        state: EnableJobState,
+    ) -> Result<(), MetaError> {
         // Terminal states release the claim; non-failed targets clear
-        // any stale error from a prior retried attempt.
+        // any stale error from a prior retried attempt. Fenced by
+        // `claimed_by` (#232): a stale pod must not flip the state of
+        // a job a peer now owns, nor release that peer's claim.
         let res = sqlx::query(
             r#"
             UPDATE enable_jobs
-               SET state = $2,
-                   error = CASE WHEN $2 = 'failed' THEN error ELSE NULL END,
-                   claimed_by = CASE WHEN $2 IN ('ready', 'failed') THEN NULL ELSE claimed_by END,
-                   claimed_at = CASE WHEN $2 IN ('ready', 'failed') THEN NULL ELSE NOW() END,
+               SET state = $3,
+                   error = CASE WHEN $3 = 'failed' THEN error ELSE NULL END,
+                   claimed_by = CASE WHEN $3 IN ('ready', 'failed') THEN NULL ELSE claimed_by END,
+                   claimed_at = CASE WHEN $3 IN ('ready', 'failed') THEN NULL ELSE NOW() END,
                    updated_at = NOW()
-             WHERE id = $1
+             WHERE id = $1 AND claimed_by = $2
             "#,
         )
         .bind(id)
+        .bind(claimant)
         .bind(state.as_str())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
         if res.rows_affected() == 0 {
-            return Err(MetaError::NotFound);
+            return Err(self.enable_job_fence_miss(id, claimant).await);
         }
         Ok(())
     }
 
-    async fn record_enable_job_failure(&self, id: Uuid, error: &str) -> Result<u32, MetaError> {
+    async fn record_enable_job_failure(
+        &self,
+        id: Uuid,
+        claimant: &str,
+        error: &str,
+    ) -> Result<u32, MetaError> {
         // Release the claim so ANY pod's next tick can retry — the
-        // failing pod holds no special ownership of the retry.
-        let attempts: i32 = sqlx::query_scalar(
+        // failing pod holds no special ownership of the retry. Fenced
+        // by `claimed_by` (#232): a stale pod's transient error must
+        // not clear a peer's lease or stamp `error` on a job that
+        // peer is actively completing.
+        let attempts: Option<i32> = sqlx::query_scalar(
             r#"
             UPDATE enable_jobs
                SET attempts = attempts + 1,
-                   error = $2,
+                   error = $3,
                    claimed_by = NULL,
                    claimed_at = NULL,
                    updated_at = NOW()
-             WHERE id = $1
+             WHERE id = $1 AND claimed_by = $2
             RETURNING attempts
             "#,
         )
         .bind(id)
+        .bind(claimant)
         .bind(error)
         .fetch_optional(&self.pool)
         .await
-        .map_err(db_err)?
-        .ok_or(MetaError::NotFound)?;
-        Ok(attempts.max(0) as u32)
+        .map_err(db_err)?;
+        match attempts {
+            Some(a) => Ok(a.max(0) as u32),
+            None => Err(self.enable_job_fence_miss(id, claimant).await),
+        }
     }
 
     async fn retry_enable_job(&self, id: Uuid) -> Result<EnableJob, MetaError> {

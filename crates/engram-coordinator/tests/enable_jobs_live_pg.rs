@@ -65,8 +65,12 @@ async fn create_or_get_dedups_active_jobs_per_uri() {
         .expect("re-create");
     assert_eq!(b.id, a.id, "active job must be returned, not duplicated");
 
-    // Terminal job → a fresh enable inserts a NEW row.
-    meta.set_enable_job_state(a.id, EnableJobState::Ready)
+    // Terminal job → a fresh enable inserts a NEW row. Every state
+    // write is now fenced by `claimed_by` (#232), so claim first.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim a");
+    meta.set_enable_job_state(a.id, "pod-a", EnableJobState::Ready)
         .await
         .expect("ready");
     let c = meta
@@ -118,8 +122,9 @@ async fn claim_is_exclusive_until_lease_expires() {
     );
 
     // Cleanup: park the job in a terminal state so later sweeps in
-    // other tests don't pick it up.
-    meta.set_enable_job_state(job.id, EnableJobState::Failed)
+    // other tests don't pick it up. pod-b holds the claim from the
+    // expired-lease re-claim above.
+    meta.set_enable_job_state(job.id, "pod-b", EnableJobState::Failed)
         .await
         .expect("park");
 }
@@ -134,11 +139,17 @@ async fn progress_state_failure_and_retry_round_trip() {
         .await
         .expect("create");
 
+    // Claim the job — every post-claim write is fenced by
+    // `claimed_by` now (#232), so the holder must own the lease.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim");
+
     // Progress: total stamped once, done advances.
-    meta.update_enable_job_progress(job.id, 0, Some(625))
+    meta.update_enable_job_progress(job.id, "pod-a", 0, Some(625))
         .await
         .expect("stamp total");
-    meta.update_enable_job_progress(job.id, 100, None)
+    meta.update_enable_job_progress(job.id, "pod-a", 100, None)
         .await
         .expect("checkpoint");
     let got = meta
@@ -150,19 +161,24 @@ async fn progress_state_failure_and_retry_round_trip() {
     assert_eq!(got.chunks_done, 100);
 
     // State advance.
-    meta.set_enable_job_state(job.id, EnableJobState::Materializing)
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Materializing)
         .await
         .expect("materializing");
     let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
     assert_eq!(got.state, EnableJobState::Materializing);
 
-    // Failures bump attempts and store the error.
+    // Failures bump attempts and store the error. A failure RELEASES
+    // the claim (claimed_by → NULL), so re-claim before the next one —
+    // exactly what the scanner's next tick does.
     let a1 = meta
-        .record_enable_job_failure(job.id, "registry 429")
+        .record_enable_job_failure(job.id, "pod-a", "registry 429")
         .await
         .expect("fail 1");
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("re-claim");
     let a2 = meta
-        .record_enable_job_failure(job.id, "registry 503")
+        .record_enable_job_failure(job.id, "pod-a", "registry 503")
         .await
         .expect("fail 2");
     assert_eq!((a1, a2), (1, 2));
@@ -179,8 +195,12 @@ async fn progress_state_failure_and_retry_round_trip() {
         other => panic!("expected Conflict, got {other:?}"),
     }
 
-    // failed → retry → pending with counters reset.
-    meta.set_enable_job_state(job.id, EnableJobState::Failed)
+    // failed → retry → pending with counters reset. The 2nd failure
+    // released the claim, so re-claim before flipping state.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("re-claim for failed");
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Failed)
         .await
         .expect("failed");
     // `failed` preserves the error for the operator.
@@ -197,8 +217,140 @@ async fn progress_state_failure_and_retry_round_trip() {
         other => panic!("expected NotFound, got {other:?}"),
     }
 
-    // Cleanup.
-    meta.set_enable_job_state(job.id, EnableJobState::Failed)
+    // Cleanup. Retry reset the claim, so re-claim before parking.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("re-claim for park");
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Failed)
+        .await
+        .expect("park");
+}
+
+/// Issue #232 regression: enable-job lease fencing token.
+///
+/// `claim_enable_jobs` arbitrates who STARTS a job, but before this
+/// fix every post-claim write (`update_enable_job_progress`,
+/// `set_enable_job_state`, `record_enable_job_failure`) was `WHERE id
+/// = $1` only — so an expired-lease pod could stomp the new
+/// claimant: reset `chunks_done`, renew `claimed_at` on the wrong
+/// pod's behalf, flip `state`, and clear/steal the claim.
+///
+/// This test claims as pod-a, expires the lease, re-claims as pod-b,
+/// then proves every one of pod-a's stale writes returns `Conflict`
+/// and mutates NOTHING (state, chunks_done, attempts, claimed_by,
+/// error all unchanged), while pod-b's identical writes succeed.
+#[tokio::test]
+#[ignore]
+async fn stale_claimant_writes_are_fenced_off() {
+    let Some(meta) = connect().await else { return };
+    let uri = unique_uri("fencing");
+    let job = meta
+        .create_or_get_enable_job(&uri, None)
+        .await
+        .expect("create");
+
+    // pod-a claims, then drives the job partway: stamps total + 50
+    // chunks done and advances to materializing.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim a");
+    meta.update_enable_job_progress(job.id, "pod-a", 50, Some(625))
+        .await
+        .expect("a progress");
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Materializing)
+        .await
+        .expect("a materializing");
+
+    // pod-a's lease expires (lease_secs = 0 → instantly stale) and
+    // pod-b legitimately re-claims. The crashed/slow-pod recovery
+    // path: one atomic claim hands ownership to pod-b.
+    let reclaimed = meta
+        .claim_enable_jobs("pod-b", 0, 50)
+        .await
+        .expect("claim b");
+    assert!(
+        reclaimed.iter().any(|j| j.id == job.id),
+        "pod-b must re-claim the expired-lease job"
+    );
+
+    // Snapshot the row as pod-b sees it right after re-claiming.
+    let before = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(before.chunks_done, 50);
+    assert_eq!(before.attempts, 0);
+    assert_eq!(before.state, EnableJobState::Materializing);
+
+    // --- pod-a is now stale. Every write it attempts must Conflict. ---
+
+    // 1. A stale progress checkpoint must NOT reset chunks_done to
+    //    pod-a's number, and must NOT renew the lease on pod-a's
+    //    behalf (the core bug — a renewing stale tick makes pod-b's
+    //    claim look perpetually contested).
+    match meta
+        .update_enable_job_progress(job.id, "pod-a", 7, None)
+        .await
+    {
+        Err(MetaError::Conflict(msg)) => {
+            assert!(msg.contains("pod-b"), "should name the new holder: {msg}")
+        }
+        other => panic!("stale progress write must Conflict, got {other:?}"),
+    }
+
+    // 2. A stale state flip must not drive a job pod-b owns backward.
+    match meta
+        .set_enable_job_state(job.id, "pod-a", EnableJobState::Capturing)
+        .await
+    {
+        Err(MetaError::Conflict(_)) => {}
+        other => panic!("stale state write must Conflict, got {other:?}"),
+    }
+
+    // 3. A stale failure must not bump attempts, stamp error, or clear
+    //    pod-b's claim out from under it.
+    match meta
+        .record_enable_job_failure(job.id, "pod-a", "stale transient error")
+        .await
+    {
+        Err(MetaError::Conflict(_)) => {}
+        other => panic!("stale failure write must Conflict, got {other:?}"),
+    }
+
+    // The row is byte-for-byte unchanged by all three stale writes.
+    let after = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(after.chunks_done, before.chunks_done, "chunks_done stomped");
+    assert_eq!(
+        after.chunks_total, before.chunks_total,
+        "chunks_total stomped"
+    );
+    assert_eq!(
+        after.attempts, before.attempts,
+        "attempts bumped by stale pod"
+    );
+    assert_eq!(after.state, before.state, "state flipped by stale pod");
+    assert_eq!(after.error, before.error, "error stamped by stale pod");
+
+    // pod-b — the rightful holder — can still drive the job.
+    meta.update_enable_job_progress(job.id, "pod-b", 600, None)
+        .await
+        .expect("b progress");
+    meta.set_enable_job_state(job.id, "pod-b", EnableJobState::Capturing)
+        .await
+        .expect("b capturing");
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.chunks_done, 600);
+    assert_eq!(got.state, EnableJobState::Capturing);
+
+    // A write fenced against a genuinely absent row is NotFound, not
+    // Conflict — keeps the disambiguation honest.
+    match meta
+        .update_enable_job_progress(Uuid::new_v4(), "pod-b", 1, None)
+        .await
+    {
+        Err(MetaError::NotFound) => {}
+        other => panic!("unknown id must be NotFound, got {other:?}"),
+    }
+
+    // Cleanup: pod-b parks it terminal.
+    meta.set_enable_job_state(job.id, "pod-b", EnableJobState::Failed)
         .await
         .expect("park");
 }

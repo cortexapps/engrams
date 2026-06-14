@@ -1044,13 +1044,22 @@ pub trait MetadataStore: Send + Sync {
     /// Checkpoint materialize progress. Also renews the claim
     /// (`claimed_at = NOW()`) so a long materialize isn't stolen by
     /// a peer mid-run. `chunks_total` is stamped on first call.
+    ///
+    /// Fenced by `claimant`: the write only lands if the row's
+    /// `claimed_by` still equals the caller. A pod whose lease has
+    /// expired and been re-claimed by a peer gets
+    /// [`MetaError::Conflict`] and must abandon the job (its renewal
+    /// would otherwise reset the new claimant's progress and extend
+    /// the lease on the wrong pod's behalf). `NotFound` only for a
+    /// genuinely absent row.
     async fn update_enable_job_progress(
         &self,
         id: uuid::Uuid,
+        claimant: &str,
         chunks_done: u32,
         chunks_total: Option<u32>,
     ) -> Result<(), MetaError> {
-        let _ = (id, chunks_done, chunks_total);
+        let _ = (id, claimant, chunks_done, chunks_total);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))
@@ -1059,12 +1068,19 @@ pub trait MetadataStore: Send + Sync {
     /// Move the job's state forward (also renews the claim, clears
     /// `error` on non-failed targets, and releases the claim on
     /// terminal states).
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// A stale pod must not be able to flip the state (e.g. drive a
+    /// job the new claimant is actively completing back through
+    /// `materializing`), nor release a claim it no longer holds.
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
     async fn set_enable_job_state(
         &self,
         id: uuid::Uuid,
+        claimant: &str,
         state: EnableJobState,
     ) -> Result<(), MetaError> {
-        let _ = (id, state);
+        let _ = (id, claimant, state);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))
@@ -1074,12 +1090,19 @@ pub trait MetadataStore: Send + Sync {
     /// release the claim (so any pod's next tick can retry), keep
     /// the current state. Returns the post-bump attempt count — the
     /// scanner flips to `failed` once it exceeds the budget.
+    ///
+    /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
+    /// A stale pod's transient error must not clear the new
+    /// claimant's lease or stamp `error` on a job that pod is
+    /// actively completing. Returns [`MetaError::Conflict`] when the
+    /// lease has moved on.
     async fn record_enable_job_failure(
         &self,
         id: uuid::Uuid,
+        claimant: &str,
         error: &str,
     ) -> Result<u32, MetaError> {
-        let _ = (id, error);
+        let _ = (id, claimant, error);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))

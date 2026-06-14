@@ -2228,7 +2228,6 @@ async fn snapshot_refuses_when_session_lease_held() {
             .is_empty(),
         "a lease-blocked snapshot must not record a snapshot row",
     );
-
     // Session untouched.
     assert_eq!(
         store.get_session(id).await.unwrap().status,

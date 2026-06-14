@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::types::{EnableJob, EnableJobState};
+use engram_core::MetaError;
 
 use crate::api::enabled_images::{
     capture_and_record_base_snapshot, fetch_and_seal_manifest, materialize_disk_chunks,
@@ -129,42 +130,79 @@ pub(crate) async fn run_once(
     tracing::debug!(count = jobs.len(), "enable-scanner claimed jobs");
     for job in jobs {
         let job_id = job.id;
-        if let Err(e) = advance_one(cfg, state, job).await {
-            // Per-job failure: bump attempts + store the error; flip
-            // to failed once the budget is spent. Keep sweeping —
-            // one wedged job must not stall the queue.
-            let msg = e.to_string();
-            tracing::warn!(%job_id, error = %msg, "enable job pipeline failed");
-            match state
-                .services
-                .meta
-                .record_enable_job_failure(job_id, &msg)
-                .await
-            {
-                Ok(attempts) if attempts >= cfg.max_attempts => {
-                    tracing::warn!(
-                        %job_id,
-                        attempts,
-                        max_attempts = cfg.max_attempts,
-                        "enable job budget exhausted; marking failed",
-                    );
-                    if let Err(e2) = state
-                        .services
-                        .meta
-                        .set_enable_job_state(job_id, EnableJobState::Failed)
-                        .await
-                    {
-                        tracing::warn!(%job_id, error = %e2, "failed to mark enable job failed");
+        match advance_one(cfg, state, &claimant, job).await {
+            Ok(()) => {}
+            Err(AdvanceError::LeaseLost(msg)) => {
+                // #232: our lease expired and a peer re-claimed the job
+                // mid-flight. Abandon immediately — every state write is
+                // fenced, so we hold no authority over the row anymore.
+                // Recording a failure here would clear the new
+                // claimant's lease and stamp `error` on a job it is
+                // actively completing. Do nothing; the peer drives it.
+                tracing::warn!(%job_id, reason = %msg, "enable job lease lost; abandoning to peer");
+            }
+            Err(AdvanceError::Pipeline(e)) => {
+                // Per-job failure: bump attempts + store the error; flip
+                // to failed once the budget is spent. Keep sweeping —
+                // one wedged job must not stall the queue. These writes
+                // are themselves fenced: a Conflict means the lease went
+                // away between the failure and now, so we likewise drop.
+                let msg = e.to_string();
+                tracing::warn!(%job_id, error = %msg, "enable job pipeline failed");
+                match state
+                    .services
+                    .meta
+                    .record_enable_job_failure(job_id, &claimant, &msg)
+                    .await
+                {
+                    Ok(attempts) if attempts >= cfg.max_attempts => {
+                        tracing::warn!(
+                            %job_id,
+                            attempts,
+                            max_attempts = cfg.max_attempts,
+                            "enable job budget exhausted; marking failed",
+                        );
+                        if let Err(e2) = state
+                            .services
+                            .meta
+                            .set_enable_job_state(job_id, &claimant, EnableJobState::Failed)
+                            .await
+                        {
+                            tracing::warn!(%job_id, error = %e2, "failed to mark enable job failed");
+                        }
                     }
-                }
-                Ok(_) => {}
-                Err(e2) => {
-                    tracing::warn!(%job_id, error = %e2, "failed to record enable job failure");
+                    Ok(_) => {}
+                    Err(MetaError::Conflict(msg)) => {
+                        tracing::warn!(%job_id, reason = %msg, "enable job lease lost while recording failure; abandoning to peer");
+                    }
+                    Err(e2) => {
+                        tracing::warn!(%job_id, error = %e2, "failed to record enable job failure");
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Outcome of [`advance_one`] when it doesn't complete the pipeline.
+enum AdvanceError {
+    /// A fenced state write returned [`MetaError::Conflict`]: the lease
+    /// expired and a peer re-claimed the job. The worker must abandon
+    /// the job WITHOUT any further state writes (#232).
+    LeaseLost(String),
+    /// A genuine pipeline error (registry/GCS/capture). Eligible for the
+    /// attempts-budget failure path.
+    Pipeline(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<MetaError> for AdvanceError {
+    fn from(e: MetaError) -> Self {
+        match e {
+            MetaError::Conflict(msg) => AdvanceError::LeaseLost(msg),
+            other => AdvanceError::Pipeline(Box::new(other)),
+        }
+    }
 }
 
 /// Run the enable pipeline for one claimed job. Every step is
@@ -174,8 +212,9 @@ pub(crate) async fn run_once(
 async fn advance_one(
     cfg: &EnableScannerConfig,
     state: &SharedState,
+    claimant: &str,
     job: EnableJob,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), AdvanceError> {
     let job_id = job.id;
     let image_uri = job.image_uri.clone();
     tracing::info!(
@@ -186,13 +225,19 @@ async fn advance_one(
         "enable-scanner: driving job",
     );
 
-    let (mut row, manifest, artifacts) = fetch_and_seal_manifest(state, &image_uri).await?;
+    // Pipeline I/O (registry/GCS/capture) is a `Pipeline` error; fenced
+    // store writes (`?` on `MetaError`) become `LeaseLost` on Conflict
+    // via `From<MetaError>` and bubble all the way out, abandoning the
+    // job without further writes.
+    let (mut row, manifest, artifacts) = fetch_and_seal_manifest(state, &image_uri)
+        .await
+        .map_err(|e| AdvanceError::Pipeline(Box::new(e)))?;
 
     // ---- materializing ----
     state
         .services
         .meta
-        .set_enable_job_state(job_id, EnableJobState::Materializing)
+        .set_enable_job_state(job_id, claimant, EnableJobState::Materializing)
         .await?;
     // chunks_total from the bootstrap (None for harness-only images).
     let chunks_total = artifacts
@@ -204,23 +249,37 @@ async fn advance_one(
     state
         .services
         .meta
-        .update_enable_job_progress(job_id, 0, chunks_total)
+        .update_enable_job_progress(job_id, claimant, 0, chunks_total)
         .await?;
 
     // Checkpoint task: persists the counter every couple of seconds.
-    // Doubles as the claim renewal during a long materialize.
+    // Doubles as the (now fenced) claim renewal during a long
+    // materialize. If a checkpoint hits a Conflict our lease is gone —
+    // stop ticking so we don't keep hammering a row a peer owns; the
+    // next state write in the main path surfaces the LeaseLost.
     let ticker = {
         let meta = state.services.meta.clone();
         let counter = counter.clone();
         let interval = cfg.progress_interval;
+        let claimant = claimant.to_string();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.tick().await;
             loop {
                 tick.tick().await;
                 let done = counter.load(Ordering::Relaxed);
-                if let Err(e) = meta.update_enable_job_progress(job_id, done, None).await {
-                    tracing::debug!(%job_id, error = %e, "enable progress checkpoint failed");
+                match meta
+                    .update_enable_job_progress(job_id, &claimant, done, None)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(MetaError::Conflict(msg)) => {
+                        tracing::warn!(%job_id, reason = %msg, "enable progress checkpoint lost the lease; stopping ticker");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(%job_id, error = %e, "enable progress checkpoint failed");
+                    }
                 }
             }
         })
@@ -228,35 +287,42 @@ async fn advance_one(
     let materialize_result =
         materialize_disk_chunks(state, &image_uri, &artifacts, Some(counter.clone())).await;
     ticker.abort();
-    row.disk_manifest = materialize_result?;
+    row.disk_manifest = materialize_result.map_err(|e| AdvanceError::Pipeline(Box::new(e)))?;
     // Final progress write so the bar lands on 100% even if the last
     // ticker tick raced the abort.
     let done = counter.load(Ordering::Relaxed);
     state
         .services
         .meta
-        .update_enable_job_progress(job_id, done, None)
+        .update_enable_job_progress(job_id, claimant, done, None)
         .await?;
 
     // ---- capturing ----
     state
         .services
         .meta
-        .set_enable_job_state(job_id, EnableJobState::Capturing)
+        .set_enable_job_state(job_id, claimant, EnableJobState::Capturing)
         .await?;
     let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
-        capture_and_record_base_snapshot(state, &row, &manifest).await?;
+        capture_and_record_base_snapshot(state, &row, &manifest)
+            .await
+            .map_err(|e| AdvanceError::Pipeline(Box::new(e)))?;
     row.base_snapshot_id = Some(base_snapshot_id);
     row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
     // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
     row.base_snapshot_memory_manifest = base_snapshot_memory_manifest;
 
     // ---- ready ----
-    state.services.meta.upsert_enabled_image(row).await?;
     state
         .services
         .meta
-        .set_enable_job_state(job_id, EnableJobState::Ready)
+        .upsert_enabled_image(row)
+        .await
+        .map_err(AdvanceError::from)?;
+    state
+        .services
+        .meta
+        .set_enable_job_state(job_id, claimant, EnableJobState::Ready)
         .await?;
     tracing::info!(%job_id, %image_uri, "enable job ready; image enabled");
     Ok(())
@@ -264,11 +330,48 @@ async fn advance_one(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     // The scanner's full loop exercises Postgres + a registry + a
     // capture host; deterministic end-to-end coverage lives in the
     // live-PG integration test `enable_jobs_live_pg` (claim/lease
-    // semantics, re-POST dedup, failure budget) and the FC e2e suite
-    // (bake → push → POST 202 → poll → boot). The per-step plumbing
+    // semantics, re-POST dedup, failure budget, plus the #232
+    // two-claimant fencing test) and the FC e2e suite (bake → push →
+    // POST 202 → poll → boot). The per-step plumbing
     // (`materialize_chunk_blob`, capture reuse) is unit-tested in
     // `api::enabled_images`.
+
+    // #232: the worker's abandon-vs-record decision hinges entirely on
+    // how a store error maps into `AdvanceError`. A fenced write that
+    // lost the lease returns `MetaError::Conflict`; that MUST become
+    // `LeaseLost` so `run_once` abandons the job WITHOUT calling
+    // `record_enable_job_failure` (which would clear the new
+    // claimant's lease + burn its attempts budget). Every other
+    // `MetaError`, and every pipeline error, must stay a `Pipeline`
+    // error so the budget path still runs.
+    #[test]
+    fn lease_conflict_maps_to_lease_lost_not_pipeline() {
+        match AdvanceError::from(MetaError::Conflict("lease lost: held by pod-b".into())) {
+            AdvanceError::LeaseLost(msg) => assert!(msg.contains("pod-b")),
+            AdvanceError::Pipeline(_) => {
+                panic!("a lost-lease Conflict must NOT enter the failure-budget path")
+            }
+        }
+    }
+
+    #[test]
+    fn other_meta_errors_map_to_pipeline() {
+        for e in [
+            MetaError::NotFound,
+            MetaError::Db("connection reset".into()),
+            MetaError::Migration("schema drift".into()),
+        ] {
+            match AdvanceError::from(e) {
+                AdvanceError::Pipeline(_) => {}
+                AdvanceError::LeaseLost(_) => {
+                    panic!("only a Conflict should abandon; other errors retry via the budget")
+                }
+            }
+        }
+    }
 }
