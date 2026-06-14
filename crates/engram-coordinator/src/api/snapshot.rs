@@ -401,48 +401,81 @@ pub(crate) async fn resume_session(
             }
         }
     }
-    let Some(_lease) = lease else {
+    let Some(lease) = lease else {
         return Err(ApiError::Conflict(format!(
             "session {id} is already mid-resume or mid-eviction; retry shortly",
         )));
     };
 
-    let session = state.services.meta.get_session(id).await?;
+    // Issue #210: DETACH the resume pipeline from the cancellable request
+    // future. Between `restore_for_session` (a live VM exists from there)
+    // and the PG writes that record it (`bind_resumed_session`,
+    // `transition(Created)`, `finish_resume_to_active`) sit multi-second
+    // host RPCs (restore deadline 240s). If the HTTP client disconnects in
+    // that window — a CLI Ctrl-C while a prompt "hangs" on a slow resume —
+    // axum drops the handler future at the current await. Awaited INLINE,
+    // that drops the pipeline mid-flight AND drops the `SessionLeaseGuard`,
+    // releasing the lease while the session is physically mid-resume. A
+    // retry then re-takes the freed lease, sees the row still `Idle` (the
+    // bind never landed), and restores a SECOND VM from the same snapshot —
+    // two guests executing the same restored state, the first orphaned (no
+    // PG row references it). Cancelling one step later instead strands the
+    // row at `Created` (no scanner arm; #194).
+    //
+    // Mirror the ADR 0034 idle-eviction pattern (and the live-teleport
+    // detachment in #208): run the pipeline body in a `tokio::spawn`ed task
+    // that MOVES the lease guard into itself, so the lease is held — and the
+    // pipeline always runs to a terminal arm — regardless of the request's
+    // fate. The handler awaits the JoinHandle only to OBSERVE the result for
+    // the connected client; a disconnect drops that await, not the work.
+    let st = state.clone();
+    let handle = tokio::spawn(async move {
+        // Hold the lease for the WHOLE pipeline by moving it in here.
+        let _lease = lease;
+        let session = st.services.meta.get_session(id).await?;
 
-    // ADR 0007: single-tier dispatcher.
-    //   Idle  → restore from the snapshot's chunked manifests
-    //           (snapshot-affinity-scheduled to the host that
-    //           captured it; cross-host materialization is a
-    //           follow-up).
-    //   Dead  → 410 Gone (no recoverable manifests).
-    //   any other status → 409.
-    match session.status {
-        SessionState::Idle => resume_from_idle(state, session).await,
-        // ADR 0018: an auto-evac'd session is left at `Created` on
-        // the new host with the VM restored but the harness stale
-        // (vsock to source's agentd is dead). `/resume` against
-        // `Created` finishes the harness rebuild via the shared
-        // `finish_resume_to_active` primitive. This is the path that
-        // closes the "session survives a MIG roll" loop —
-        // `dead_host.rs` rebinds + restores, the user (or an
-        // automated layer) hits `/resume` to bring it to Active.
-        SessionState::Created => resume_from_created(state, session).await,
-        SessionState::Dead => Err(ApiError::Gone(
-            "snapshot_invalidated: session is terminal; chunked manifests are gone or never existed".into(),
-        )),
-        // ADR 0034: a direct /resume mid-eviction gets the same
-        // honest retryable 409 as ensure_active (between pipeline
-        // attempts the session lease is free, so the status gate —
-        // not the lease — is what catches this).
-        SessionState::Evicting => Err(ApiError::Conflict(
-            "session is mid-eviction; retry shortly (it will land at idle and become resumable)"
-                .into(),
-        )),
-        other => Err(ApiError::Conflict(format!(
-            "session is {} — only Idle / Created sessions can be resumed",
-            other.as_str()
-        ))),
-    }
+        // ADR 0007: single-tier dispatcher.
+        //   Idle  → restore from the snapshot's chunked manifests
+        //           (snapshot-affinity-scheduled to the host that
+        //           captured it; cross-host materialization is a
+        //           follow-up).
+        //   Dead  → 410 Gone (no recoverable manifests).
+        //   any other status → 409.
+        match session.status {
+            SessionState::Idle => resume_from_idle(st, session).await,
+            // ADR 0018: an auto-evac'd session is left at `Created` on
+            // the new host with the VM restored but the harness stale
+            // (vsock to source's agentd is dead). `/resume` against
+            // `Created` finishes the harness rebuild via the shared
+            // `finish_resume_to_active` primitive. This is the path that
+            // closes the "session survives a MIG roll" loop —
+            // `dead_host.rs` rebinds + restores, the user (or an
+            // automated layer) hits `/resume` to bring it to Active.
+            SessionState::Created => resume_from_created(st, session).await,
+            SessionState::Dead => Err(ApiError::Gone(
+                "snapshot_invalidated: session is terminal; chunked manifests are gone or never existed".into(),
+            )),
+            // ADR 0034: a direct /resume mid-eviction gets the same
+            // honest retryable 409 as ensure_active (between pipeline
+            // attempts the session lease is free, so the status gate —
+            // not the lease — is what catches this).
+            SessionState::Evicting => Err(ApiError::Conflict(
+                "session is mid-eviction; retry shortly (it will land at idle and become resumable)"
+                    .into(),
+            )),
+            other => Err(ApiError::Conflict(format!(
+                "session is {} — only Idle / Created sessions can be resumed",
+                other.as_str()
+            ))),
+        }
+    });
+
+    handle.await.map_err(|join_err| {
+        // The pipeline task panicked. It did NOT release the lease cleanly
+        // through a normal exit, so let the stale-lease reaper own recovery
+        // (180s) rather than surface a half-state to the client as success.
+        ApiError::Internal(format!("resume pipeline task panicked: {join_err}"))
+    })?
 }
 
 /// ADR 0018 commit 10: finish bringing an auto-evac'd session back
@@ -489,6 +522,46 @@ async fn resume_from_idle(
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
     let id = session.id;
+
+    // Issue #210 idempotency: an `Idle` row normally has `sandbox_id = NULL`
+    // (evict_local clears it). A residual binding here means a PRIOR resume
+    // attempt restored a VM and bound it but never finished advancing the
+    // row off `Idle` — e.g. a coordinator crash between `bind_resumed_session`
+    // and `transition(Created)`, before the lease/spawn detachment could see
+    // it through. (The normal cancellation path is now handled by the spawn
+    // in `resume_session`; this guards the crash residue the spawn can't.)
+    // Restoring fresh on top of it would leak that earlier VM as an orphan
+    // (no row references it once we overwrite the binding) and produce the
+    // double-restore the issue describes. We can't cheaply prove the residual
+    // sandbox is healthy and mid-restore vs. half-dead, so take the
+    // conservative, idempotent path: destroy it and clear the binding, then
+    // restore cleanly below. `host.destroy` is idempotent (a GC'd/absent
+    // sandbox is a no-op), so this is safe even if the host already reaped it.
+    if let Some(stale_sandbox) = session.sandbox_id {
+        tracing::warn!(
+            session_id = %id,
+            stale_sandbox = %stale_sandbox,
+            "resume_from_idle: Idle session has a residual sandbox binding from a \
+             prior unfinished resume — destroying it before restoring fresh to avoid \
+             a double-restore orphan",
+        );
+        if let Err(e) = state.services.host.destroy(stale_sandbox).await {
+            // Best-effort: the host reconcile GCs an unreachable sandbox. We
+            // still clear the binding so we don't restore on top of it.
+            tracing::warn!(
+                session_id = %id,
+                stale_sandbox = %stale_sandbox,
+                error = %e,
+                "resume_from_idle: residual sandbox destroy failed; clearing binding \
+                 and continuing (host reconcile will GC)",
+            );
+        }
+        if let Err(e) = state.services.meta.assign_session_sandbox(id, None).await {
+            return Err(ApiError::Internal(format!(
+                "resume_from_idle: failed to clear residual sandbox binding: {e}"
+            )));
+        }
+    }
 
     // ADR 0034 durability: walk the session's snapshots newest-first and
     // resume from the first one whose backing artifacts still exist. The
@@ -2067,5 +2140,189 @@ mod evicting_gate_tests {
             .expect("registry-guard no-op");
         let still = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(still.status, SessionState::Completed);
+    }
+
+    /// Issue #210 idempotency guard: a backend that records every
+    /// `destroy` so the resume path's residual-sandbox teardown is
+    /// observable. All non-default methods delegate to a real
+    /// [`ProcessBackend`] except `destroy`, which records the id (and
+    /// still succeeds) so a resume can't double-restore over a residual
+    /// binding without us seeing the cleanup.
+    struct DestroyRecordingBackend {
+        inner: ProcessBackend,
+        destroyed: Arc<parking_lot::Mutex<Vec<SandboxId>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for DestroyRecordingBackend {
+        async fn create(
+            &self,
+            spec: engram_core::types::sandbox::SandboxSpec,
+        ) -> Result<SandboxId, SandboxError> {
+            self.inner.create(spec).await
+        }
+        async fn snapshot(
+            &self,
+            id: SandboxId,
+        ) -> Result<engram_core::types::snapshot::SnapshotMetadata, SandboxError> {
+            self.inner.snapshot(id).await
+        }
+        async fn restore(
+            &self,
+            metadata: engram_core::types::snapshot::SnapshotMetadata,
+        ) -> Result<SandboxId, SandboxError> {
+            self.inner.restore(metadata).await
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.destroyed.lock().push(id);
+            // Delegate too — a ProcessBackend destroy of an unknown
+            // sandbox is an idempotent no-op, matching the real host.
+            let _ = self.inner.destroy(id).await;
+            Ok(())
+        }
+        async fn exec_stream(
+            &self,
+            id: SandboxId,
+            cmd: engram_core::types::sandbox::ExecRequest,
+        ) -> Result<engram_core::types::sandbox::ExecStream, SandboxError> {
+            self.inner.exec_stream(id, cmd).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            self.inner.list().await
+        }
+        fn snapshot_path_for(
+            &self,
+            snapshot_id: engram_core::types::SnapshotId,
+        ) -> std::path::PathBuf {
+            self.inner.snapshot_path_for(snapshot_id)
+        }
+    }
+
+    fn idle_session_with_residual_sandbox(
+        id: SessionId,
+        host: engram_core::HostId,
+        residual: SandboxId,
+    ) -> Session {
+        Session {
+            id,
+            user_id: None,
+            // Idle, but still carrying a host + sandbox binding — the
+            // residue of a prior resume that restored a VM and bound it
+            // (`bind_resumed_session` writes host then sandbox) and then
+            // died before advancing the row off Idle (the crash window the
+            // spawn detachment can't cover). The owner is therefore
+            // resolvable, exactly as it would be in production.
+            status: SessionState::Idle,
+            host_id: Some(host),
+            sandbox_id: Some(residual),
+            image: "test/repo:residual-resume".into(),
+            mode: SessionMode::Agent,
+            created_at: Utc::now(),
+            last_active_at: Utc::now(),
+            live_disk_manifest: None,
+        }
+    }
+
+    /// Issue #210: resuming an `Idle` session that still carries a
+    /// residual `sandbox_id` (a prior resume restored a VM, bound it,
+    /// then crashed before leaving `Idle`) MUST destroy that residual
+    /// sandbox and clear the binding BEFORE restoring fresh — otherwise
+    /// the fresh restore overwrites the binding and orphans the first VM
+    /// (double-restore: two guests executing the same restored state).
+    ///
+    /// We seed no recoverable snapshot, so after the cleanup the resume
+    /// legitimately fails `Gone` (snapshot_invalidated) — but the
+    /// observable cleanup (destroy of the residual + binding cleared) is
+    /// the proof the idempotency guard ran ahead of any fresh restore.
+    /// On the pre-fix code the guard does not exist: `destroy` is never
+    /// called and the binding survives into the (attempted) fresh
+    /// restore.
+    #[tokio::test]
+    async fn resume_from_idle_destroys_residual_sandbox_before_restoring() {
+        let id = SessionId::new();
+        let host = engram_core::HostId::new();
+        let residual = SandboxId::new();
+        let destroyed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        // Build state with the recording backend.
+        let local = TempDir::new().unwrap();
+        let backend: Arc<dyn SandboxBackend> = Arc::new(DestroyRecordingBackend {
+            inner: ProcessBackend::new(local.path().join("sandboxes")),
+            destroyed: destroyed.clone(),
+        });
+        let meta = Arc::new(MiniMeta::new(idle_session_with_residual_sandbox(
+            id, host, residual,
+        )));
+        // Stage the residual sandbox's owner so `host.destroy` resolves to
+        // our recording backend (read-through to PG's host_for_sandbox,
+        // which matches the session's host_id + sandbox_id).
+        meta.add_ready_host(host);
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        let local_host: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+            engram_host_agent::LocalHostClient::with_noop_hub(backend.clone()),
+        );
+        host_registry.register(host, local_host);
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-blobs-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-blobs-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+        };
+        let cfg = CoordinatorConfig {
+            local_path: local.path().to_path_buf(),
+            ..CoordinatorConfig::default()
+        };
+        let state: SharedState =
+            Arc::new(AppState::new_with_registry(cfg, services, host_registry));
+
+        // Drive the full resume (acquires the lease, spawns the pipeline,
+        // dispatches Idle → resume_from_idle).
+        let err = match resume_session(state.clone(), id).await {
+            Err(e) => e,
+            Ok(_) => panic!("no snapshot seeded → resume must fail Gone after cleanup"),
+        };
+        assert!(
+            err.to_string().contains("snapshot_invalidated"),
+            "expected the no-snapshot resume failure after cleanup, got: {err}",
+        );
+
+        // The residual sandbox MUST have been destroyed before the fresh
+        // restore was attempted.
+        {
+            let destroyed = destroyed.lock();
+            assert!(
+                destroyed.contains(&residual),
+                "resume_from_idle must destroy the residual sandbox {residual} before \
+                 restoring fresh; destroyed = {destroyed:?}",
+            );
+        }
+
+        // And the binding MUST have been cleared so nothing routes to the
+        // torn-down sandbox (and so a fresh restore doesn't overwrite a
+        // live binding).
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(
+            after.sandbox_id, None,
+            "residual sandbox binding must be cleared during resume_from_idle cleanup",
+        );
     }
 }
