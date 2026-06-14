@@ -528,23 +528,33 @@ impl HostAgent {
                             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             loop {
                                 tick.tick().await;
-                                let Some(session_id) =
-                                    pooled_for_src.session_for_sandbox(sandbox_id)
-                                else {
-                                    // Binding rehydrates with registration;
-                                    // an unbound frozen source is
-                                    // unreclaimable — destroy.
-                                    tracing::warn!(%sandbox_id,
-                                        "reattached post-copy source has no session binding; destroying");
-                                    pooled_for_src.set_migration_role(sandbox_id, None).await;
-                                    let _ = pooled_for_src.destroy(sandbox_id).await;
-                                    return;
+                                // Issue #216 Gap 3: NEVER destroy on a
+                                // missing in-memory binding. The binding
+                                // rehydrates via the register task's
+                                // `rehydrate_survivors`, which races this
+                                // tick and backs off up to 30 s when the
+                                // coordinator is unreachable — the very
+                                // condition that caused the restart. A
+                                // `None` here means "not learned yet," not
+                                // "unowned." Ask the coordinator (only
+                                // possible once bound) and obey the
+                                // dumb-host rule: destroy ONLY on an
+                                // explicit `owned == false`; stay paused on
+                                // unbound / unreachable / still-owned.
+                                let session = pooled_for_src.session_for_sandbox(sandbox_id);
+                                let ownership = match session {
+                                    Some(session_id) => coord_for_src
+                                        .sandbox_ownership(host_id_for_src, session_id, sandbox_id)
+                                        .await
+                                        .ok(),
+                                    None => None,
                                 };
-                                match coord_for_src
-                                    .sandbox_ownership(host_id_for_src, session_id, sandbox_id)
-                                    .await
-                                {
-                                    Ok(false) => {
+                                let verdict = migration::reattach_source_verdict(
+                                    session.is_some(),
+                                    ownership,
+                                );
+                                match verdict {
+                                    migration::ReattachSourceVerdict::Destroy => {
                                         tracing::info!(%sandbox_id,
                                             "ownership moved on; destroying the frozen post-copy source");
                                         pooled_for_src.set_migration_role(sandbox_id, None).await;
@@ -554,10 +564,9 @@ impl HostAgent {
                                         }
                                         return;
                                     }
-                                    Ok(true) => { /* stay paused; re-ask next tick */ }
-                                    Err(e) => {
-                                        tracing::debug!(%sandbox_id, error = %e,
-                                            "ownership check unreachable; staying paused");
+                                    migration::ReattachSourceVerdict::StayPaused => {
+                                        tracing::debug!(%sandbox_id, ?session,
+                                            "reattached post-copy source staying paused (unbound, unreachable, or still owned); re-asking next tick");
                                     }
                                 }
                             }

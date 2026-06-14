@@ -78,6 +78,28 @@ pub struct PeerExport {
     /// Set when the dest reports `DrainDone` — after this the source FC
     /// is no longer needed as a page source (commit may proceed).
     pub drained: AtomicBool,
+    /// Issue #216 Gap 2: the TTL clock SHARED with the registry's
+    /// `MigrationExport.last_activity` (same `Arc`). The post-copy TTL
+    /// is documented to run from "last page-serving activity," but the
+    /// only `MigrationExport::touch()` call site is the gRPC
+    /// `migration_fetch` — a drain that proceeds purely over this TCP
+    /// page channel never refreshed the clock, so a >120 s drain let
+    /// `expired()` fire and the sweep DESTROY the source mid-drain.
+    /// Every `NeedAt`/`GetChunk` serve now stamps this, keeping the
+    /// registry export alive exactly as long as the dest is pulling.
+    pub last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+impl PeerExport {
+    /// Refresh the SHARED TTL clock (issue #216 Gap 2). Called on every
+    /// page/chunk serve so the dumb-host sweep sees an actively-draining
+    /// post-copy export as alive.
+    fn touch(&self) {
+        *self
+            .last_activity
+            .lock()
+            .expect("peer last_activity poisoned") = std::time::Instant::now();
+    }
 }
 
 /// What one sealed chunk serves as. Pure classification — unit-tested
@@ -384,6 +406,9 @@ impl PeerServer {
                     req_id,
                     chunk_offset,
                 } => {
+                    // Issue #216 Gap 2: stamp the shared TTL clock so an
+                    // active TCP-only drain keeps the registry export alive.
+                    export.touch();
                     let resp = self.serve_need_at(&export, req_id, chunk_offset, purpose);
                     let t_write = std::time::Instant::now();
                     write_frame(&mut stream, &resp)?;
@@ -393,6 +418,10 @@ impl PeerServer {
                         .fetch_add(t_write.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
                 ToSource::GetChunk { req_id, hash } => {
+                    // Issue #216 Gap 2: stamp the shared TTL clock (see
+                    // NeedAt) — a drain that falls back to GetChunk for
+                    // every page must also count as activity.
+                    export.touch();
                     let resp = self.serve_get_chunk(&export, req_id, hash, &handle);
                     write_frame(&mut stream, &resp)?;
                 }
@@ -606,6 +635,16 @@ mod tests {
     }
 
     fn test_export(token: &str) -> PeerExport {
+        test_export_with_clock(
+            token,
+            Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        )
+    }
+
+    fn test_export_with_clock(
+        token: &str,
+        last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
+    ) -> PeerExport {
         let mut seal = SealBitmap::new(4096, 4);
         seal.set(1);
         PeerExport {
@@ -622,6 +661,7 @@ mod tests {
             total_bytes: 4 * 4096,
             serve: Default::default(),
             drained: AtomicBool::new(false),
+            last_activity,
         }
     }
 
@@ -795,6 +835,53 @@ mod tests {
             got[0]
         );
         assert!(matches!(&got[1], FromSource::Seal { .. }));
+    }
+
+    /// Issue #216 Gap 2: a page-serving request over the TCP channel
+    /// must refresh the SHARED registry TTL clock. Pre-fix, only the
+    /// gRPC `migration_fetch` touched `last_activity`; a drain that ran
+    /// purely over this channel for >120 s let `expired()` fire and the
+    /// dumb-host sweep DESTROY the source mid-drain. We seed the shared
+    /// clock far in the past, drive one `NeedAt`, and assert the clock
+    /// advanced. (The serve itself may error on `read_guest_range` —
+    /// the touch is taken in the conn loop BEFORE the serve, so the TTL
+    /// refresh holds regardless of the readv outcome.)
+    #[tokio::test]
+    async fn page_serving_refreshes_the_shared_ttl_clock() {
+        let stale = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        let clock = Arc::new(std::sync::Mutex::new(stale));
+        let server = PeerServer::new(9102, None, None);
+        server.register(test_export_with_clock("t", clock.clone()));
+
+        // Hello + Seal (2 replies) + one NeedAt reply for the sealed
+        // chunk 1 (Page or Error — irrelevant; the touch precedes it).
+        let _ = talk(
+            server.clone(),
+            vec![
+                hello("exp-1", "t"),
+                ToSource::NeedAt {
+                    req_id: 1,
+                    chunk_offset: 4096, // chunk 1 is sealed in test_export
+                },
+            ],
+            3,
+        )
+        .await;
+
+        // The conn handler is on a blocking thread; poll the shared
+        // clock with a deadline (mirrors `drain_done_marks_export`).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let advanced = *clock.lock().unwrap() > stale;
+            if advanced {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "NeedAt never refreshed the shared TTL clock (issue #216 Gap 2)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
