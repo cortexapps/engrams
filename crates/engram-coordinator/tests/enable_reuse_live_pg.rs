@@ -310,7 +310,27 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
             return;
         }
     };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
+    // ADR 0047: placement (the capture-host pick) reads the GLOBAL hosts
+    // table, so this test cannot share a database with concurrent/previous
+    // runs — a residual `Ready` host row from another run is a legal pick,
+    // and since that run's fake capture host is gone the enable job sticks
+    // (poll timeout) or fails `HostUnreachable`. Give the test its own
+    // database, created off the configured URL (mirrors admin_evac_live_pg).
+    // Leaked test databases are fine: CI's Postgres is ephemeral.
+    let admin = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect postgres (admin)");
+    let db_name = format!("engram_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
+        .execute(&admin)
+        .await
+        .expect("create per-test database");
+    let base = database_url
+        .rsplit_once('/')
+        .map(|(b, _)| b)
+        .expect("database url has a path");
+    let test_url = format!("{base}/{db_name}");
+    let store = engram_postgres::PostgresStore::connect(&test_url)
         .await
         .expect("connect postgres");
     store.migrate().await.expect("migrate");
