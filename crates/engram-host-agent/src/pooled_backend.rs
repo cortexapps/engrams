@@ -602,6 +602,24 @@ pub struct PooledBackend {
     /// guard + migration fence). Mirrored into the FC sandbox manifest
     /// for reattach (ADR 0044 K2).
     migration_roles: Arc<DashMap<SandboxId, crate::migration::MigrationRole>>,
+    /// ADR 0044 K2 (issue #224): terminal-mode flag for graceful
+    /// shutdown. `abandon_nbd_data_planes_for_shutdown` sets this
+    /// `true` (SeqCst) BEFORE draining `nbd_sandboxes`, turning
+    /// abandonment from a one-shot sweep of the map's current
+    /// contents into a sticky terminal mode. Every NBD insert site
+    /// (`create`, `restore_with`, `rehydrate_sandbox`) checks it
+    /// immediately before the `insert`: if set, the freshly-built
+    /// `NbdSandboxState` is `abandon_for_shutdown()`-ed (kernel
+    /// config left alive for the successor) rather than inserted —
+    /// so a still-running registration/rehydrate task or an
+    /// in-flight gRPC handler that finishes AFTER the sweep can no
+    /// longer leak a live data plane into the map only to have
+    /// `NbdHandle::Drop` netlink-disconnect a surviving FC's device
+    /// at process exit. `Arc` so the spawned create/restore insert
+    /// tasks (issue #223) can move a clone in. Linux-only — the
+    /// abandon contract exists only where NBD data planes do.
+    #[cfg(target_os = "linux")]
+    abandoning: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PooledBackend {
@@ -873,6 +891,7 @@ impl PooledBackend {
             let nbd_sandboxes = self.nbd_sandboxes.clone();
             let publisher = self.live_manifest_publisher.clone();
             let flush_config = self.flush_config.clone();
+            let abandoning = self.abandoning.clone();
             let join = tokio::spawn(async move {
                 let new_id = if fresh {
                     inner.restore_fresh(metadata).await?
@@ -894,6 +913,26 @@ impl PooledBackend {
                 // `start_agent` (finish_resume_to_active calls it). Memory page-in
                 // is the UFFD side, on the spawn-TRACEPARENT path.
                 state.backend.operation_scope().begin("resume");
+                // Issue #224: terminal-mode check. This task outlives a
+                // dropped HANDLER future by design (issue #223), so it
+                // also outlives a SIGTERM that cancels the handler — and
+                // its `inner.restore` window is multi-second. If the
+                // abandon sweep ran while we were restoring, inserting
+                // here would leak a live data plane the sweep already
+                // passed; process exit would then `NbdHandle::Drop` →
+                // netlink-disconnect the just-restored guest's device.
+                // Abandon in-place instead (kernel config persists for
+                // the successor); the restore itself succeeded, so the
+                // sandbox_id is still returned to the caller.
+                if abandoning.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::warn!(
+                        %new_id,
+                        "restore completed during SIGTERM abandon; abandoning the \
+                         NBD data plane in-place instead of inserting after the sweep",
+                    );
+                    state.abandon_for_shutdown();
+                    return Ok::<SandboxId, SandboxError>(new_id);
+                }
                 nbd_sandboxes.insert(new_id, state);
                 Ok::<SandboxId, SandboxError>(new_id)
             });
@@ -947,6 +986,8 @@ impl PooledBackend {
             pending_presetups: Arc::new(DashMap::new()),
             postcopy_dests: Arc::new(DashMap::new()),
             migration_roles: Arc::new(DashMap::new()),
+            #[cfg(target_os = "linux")]
+            abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -2266,17 +2307,57 @@ impl PooledBackend {
     /// to RECONFIGURE. Called from the SIGTERM path right before the
     /// process exits; per-sandbox destroy keeps its normal
     /// disconnect-on-drop.
+    ///
+    /// Issue #224: this is a TERMINAL mode, not a one-shot sweep. The
+    /// `abandoning` flag is raised (SeqCst) BEFORE the drain so that
+    /// any insert site (`create` / `restore_with` /
+    /// `rehydrate_sandbox`) whose multi-second await window
+    /// (pool-claim, GCS manifest fetch, netlink RECONFIGURE / FC
+    /// restore) is still in flight will observe the flag at its
+    /// pre-insert check and `abandon_for_shutdown()` the state
+    /// in-place instead of leaking a live data plane into the map
+    /// after the drain. We then drain, and re-drain once: the
+    /// flag-before-drain ordering means anything that passes its
+    /// flag check before the store but inserts after the first drain
+    /// is rare, but the belt-and-braces second pass closes it (an
+    /// insert that lands between the two drains is caught here; one
+    /// that lands after both saw the flag set during its own check
+    /// and abandoned instead).
     #[cfg(target_os = "linux")]
     pub fn abandon_nbd_data_planes_for_shutdown(&self) -> usize {
-        let ids: Vec<_> = self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
-        let mut abandoned = 0;
-        for id in ids {
-            if let Some((_, state)) = self.nbd_sandboxes.remove(&id) {
-                state.abandon_for_shutdown();
-                abandoned += 1;
+        // Raise the terminal flag FIRST — ordering is the correctness
+        // gate. Every insert site loads it with SeqCst right before
+        // its `insert`; a store-then-drain here guarantees an insert
+        // that is about to land either (a) already saw the flag and
+        // abandoned in-place, or (b) lands in the map and is swept by
+        // one of the two drains below.
+        self.abandoning
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let drain = |abandoned: &mut usize| {
+            let ids: Vec<_> = self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
+            for id in ids {
+                if let Some((_, state)) = self.nbd_sandboxes.remove(&id) {
+                    state.abandon_for_shutdown();
+                    *abandoned += 1;
+                }
             }
-        }
+        };
+        let mut abandoned = 0;
+        drain(&mut abandoned);
+        // Belt-and-braces second pass: catches a state inserted
+        // between the flag store and the first drain's snapshot.
+        drain(&mut abandoned);
         abandoned
+    }
+
+    /// Issue #224: whether the terminal shutdown-abandon mode is
+    /// engaged. Insert sites consult this immediately before adding a
+    /// freshly-built `NbdSandboxState` to `nbd_sandboxes`; when set
+    /// they `abandon_for_shutdown()` the state instead so the
+    /// successor host-agent generation keeps the kernel-side device.
+    #[cfg(target_os = "linux")]
+    fn is_abandoning(&self) -> bool {
+        self.abandoning.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Attach a chunk store + a per-host directory where chunked
@@ -3878,6 +3959,22 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn create(&self, mut spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        // Issue #224: once SIGTERM has engaged terminal-abandon mode,
+        // refuse new cold-creates outright. Unlike resume/rehydrate
+        // (which re-serve a SURVIVING FC's already-attached device and
+        // must hand it off to the successor), a cold create has no
+        // surviving-VM contract — there is nothing to preserve, and
+        // letting it run would spawn a brand-new NBD daemon racing the
+        // abandon sweep. Reject early so the coordinator reschedules
+        // onto a live host rather than orphaning a half-built sandbox.
+        #[cfg(target_os = "linux")]
+        if self.is_abandoning() {
+            return Err(SandboxError::Vm(
+                "host-agent is shutting down (terminal abandon mode); \
+                 create rejected — reschedule onto another host"
+                    .into(),
+            ));
+        }
         // Phase 5+: resolve OCI image_uri / harness_pack_uri to local
         // cached paths before warm-pool key derivation. Both paths
         // overwrite the legacy filesystem fields when set, so the
@@ -3975,6 +4072,7 @@ impl SandboxBackend for PooledBackend {
                 let nbd_sandboxes = self.nbd_sandboxes.clone();
                 let publisher = self.live_manifest_publisher.clone();
                 let flush_config = self.flush_config.clone();
+                let abandoning = self.abandoning.clone();
                 let join = tokio::spawn(async move {
                     let sandbox_id = inner.create(spec).await?;
                     state.install_flush_scheduler(sandbox_id, publisher, flush_config);
@@ -3983,6 +4081,23 @@ impl SandboxBackend for PooledBackend {
                     // backend) now attach `chunk.fetch` spans to the cold-boot
                     // trace until `start_agent` ends the window at agent_ready.
                     state.backend.operation_scope().begin("cold_boot");
+                    // Issue #224: terminal-mode check (defense in depth past
+                    // the early reject at the top of `create`). The flag may
+                    // have flipped during the `inner.create` await; this task
+                    // outlives a dropped handler future (issue #223), so it
+                    // outlives the SIGTERM too. Abandon the data plane in-place
+                    // rather than inserting after the sweep — the half-built
+                    // sandbox has no successor contract, but its device must
+                    // not be netlink-disconnected by a post-sweep normal drop.
+                    if abandoning.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::warn!(
+                            %sandbox_id,
+                            "create completed during SIGTERM abandon; abandoning the \
+                             NBD data plane in-place instead of inserting after the sweep",
+                        );
+                        state.abandon_for_shutdown();
+                        return Ok::<SandboxId, SandboxError>(sandbox_id);
+                    }
                     nbd_sandboxes.insert(sandbox_id, state);
                     Ok::<SandboxId, SandboxError>(sandbox_id)
                 });
@@ -5790,6 +5905,27 @@ impl PooledBackend {
             self.live_manifest_publisher.clone(),
             self.flush_config.clone(),
         );
+
+        // Issue #224: terminal-mode check. The await window above
+        // (pool.claim → reattach_manifest's netlink RECONFIGURE) is
+        // multi-second; SIGTERM can have raised the abandon flag and
+        // drained the (then-empty-of-this-id) map while we were in it.
+        // If so, inserting `state` here would leak a live NBD data
+        // plane that the abandon sweep has already passed — process
+        // exit would then run `NbdHandle::Drop` and netlink-disconnect
+        // the survivor's device the successor is about to RECONFIGURE.
+        // Abandon in-place instead: the device the RECONFIGURE just
+        // re-established stays kernel-configured for the successor.
+        if self.is_abandoning() {
+            tracing::warn!(
+                %sandbox_id,
+                "rehydrate completed during SIGTERM abandon; abandoning the \
+                 re-served NBD data plane in-place (kernel config left alive \
+                 for the successor) instead of inserting after the sweep",
+            );
+            state.abandon_for_shutdown();
+            return Ok(false);
+        }
         self.nbd_sandboxes.insert(sandbox_id, state);
 
         // Pre-populate session_bindings so the LiveManifestPublisher
