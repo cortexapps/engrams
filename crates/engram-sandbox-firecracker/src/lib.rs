@@ -608,8 +608,15 @@ impl FirecrackerConfig {
 }
 
 /// Live sandbox handle. Keeps the spawned firecracker `Child` so
-/// `destroy` can SIGKILL it; `kill_on_drop` is a backstop in case a
-/// `LiveSandbox` is dropped without going through `destroy` (panic).
+/// `destroy` can SIGKILL it. ADR 0044 K2 removed `kill_on_drop` from
+/// the FC and uffd-handler `Child`s so a live VM is decoupled from the
+/// host-agent's process lifecycle (a host-agent restart *detaches* its
+/// VMs and the successor reattaches them) — so dropping a `LiveSandbox`
+/// no longer kills anything. The kill backstops are explicit instead:
+/// [`SpawnKillGuard`] over the create/restore window, and (issue #196)
+/// over the `destroy` kill window, where the post-removal teardown also
+/// runs in a detached `tokio::spawn` ([`destroy_teardown`]) so a
+/// cancelled `destroy` can't orphan the VM.
 /// `uffd_handler` is `Some` only for sandboxes restored via
 /// `RestoreMode::Uffd`; it lives as long as the VM does and serves
 /// page faults from memory.bin.
@@ -3995,165 +4002,59 @@ impl SandboxBackend for FirecrackerBackend {
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
         // Idempotent: removing an unknown id is a no-op, matching the
         // contract ProcessBackend follows.
-        let Some((_, mut live)) = self.sandboxes.remove(&id) else {
+        let Some((_, live)) = self.sandboxes.remove(&id) else {
             return Ok(());
         };
 
-        // Try a graceful shutdown first: PUT /actions { SendCtrlAltDel }
-        // tells the guest kernel to halt cleanly via the keyboard
-        // controller's CAD signal, draining the page cache before we
-        // pull the plug. If the guest doesn't respond within
-        // `GRACEFUL_SHUTDOWN_TIMEOUT`, we fall through to SIGKILL.
-        let api = FirecrackerClient::new(&live.state.firecracker_socket);
-        // ADR 0009 §6: `child` is `None` for sandboxes pidfd-reattached
-        // on host-agent startup (we don't own a `Child` for those —
-        // the original process was spawned by a previous host-agent
-        // generation). For those, we fall back to libc::kill +
-        // poll-for-exit since there's no `Child::wait` to drive.
-        let graceful = async {
-            api.put_action(ActionType::SendCtrlAltDel).await?;
-            wait_for_fc_exit(&mut live.child, live.fc_pid)
-                .await
-                .map_err(SandboxError::from)
-        };
-        match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful).await {
-            Ok(Ok(_)) => {
-                tracing::debug!(sandbox_id = %id, "firecracker exited cleanly via SendCtrlAltDel");
-            }
-            Ok(Err(e)) => {
-                // SendCtrlAltDel rejected (FC API rejected the action,
-                // socket closed, etc.) — escalate to SIGKILL. This
-                // also covers the case where the API socket is gone
-                // but the child somehow survives.
-                tracing::debug!(
-                    sandbox_id = %id,
-                    error = %e,
-                    "graceful shutdown failed; escalating to SIGKILL",
-                );
-                kill_fc(&mut live.child, live.fc_pid, id).await;
-                let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
-            }
-            Err(_) => {
-                // Timeout: guest didn't honour CAD within the grace
-                // window. Force-kill.
-                tracing::debug!(
-                    sandbox_id = %id,
-                    timeout = ?GRACEFUL_SHUTDOWN_TIMEOUT,
-                    "firecracker didn't exit in time; SIGKILLing",
-                );
-                kill_fc(&mut live.child, live.fc_pid, id).await;
-                let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
-            }
-        }
-
-        // UFFD handler (only set on Uffd-mode restore). When FC dies
-        // the kernel reaps FC's mm but the userfaultfd this handler
-        // holds via SCM_RIGHTS doesn't auto-close — `read_event()`
-        // blocks indefinitely. Send SIGTERM so the kernel-default
-        // handler kills the process; if that doesn't take effect
-        // within a short window, escalate to SIGKILL. ADR 0014 M1.14
-        // relies on the handler having already flushed `--trace-output`
-        // by the time we get here, so the write must happen earlier
-        // (the runtime dumps after the recorder window closes).
-        // We own a `Child` for a handler spawned in THIS host-agent
-        // generation; for a pidfd-reattached one we only have the pid
-        // (`uffd_pid`, ADR 0044 K2). Either way: SIGTERM, then escalate to
-        // SIGKILL if it doesn't exit promptly.
-        if let Some(mut handler) = live.uffd_handler {
-            if let Some(pid) = handler.id() {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                }
-            }
-            match tokio::time::timeout(Duration::from_secs(2), handler.wait()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    let _ = handler.kill().await;
-                    let _ = handler.wait().await;
-                }
-            }
-        } else if let Some(pid) = live.uffd_pid {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-            if wait_for_pid_death(pid, Duration::from_secs(2))
-                .await
-                .is_err()
-            {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
-                let _ = wait_for_pid_death(pid, Duration::from_secs(5)).await;
-            }
-        }
-
-        // ADR 0044 K2: FC + the uffd handler are gone, so the per-VM node
-        // cgroup is now empty — remove it (rmdir of a cgroup only succeeds
-        // once empty). No-op when no `vm_cgroup_parent` is configured.
-        remove_node_cgroup(self.config.vm_cgroup_parent.as_deref(), id);
-
-        // Tear down per-VM networking: yank iptables rules tagged
-        // with this sandbox's chain comment, delete the TAP, return
-        // the /30 to the allocator. Best-effort — each step logs
-        // but doesn't stop the rest.
-        if let Some(net_setup) = live.net.as_ref() {
-            net::teardown(net_setup, &self.net_allocator).await;
-        }
-        // ADR 0014 M1.16: warm-restored VMs ran in their own netns
-        // — delete it (and the TAP + veth-B inside, the SNAT iptables
-        // rule, etc.), unlink the host-side veth-A, free the SNAT
-        // pool slot. Best-effort like cold teardown.
-        if let Some(netns_setup) = live.netns.as_ref() {
-            net::teardown_netns(netns_setup, &self.net_allocator).await;
-        }
-
-        // Do NOT unlink the base vsock UDS file at
-        // `live.state.vsock_uds_path` on destroy. Historically (ADR
-        // 0018 cross-host evac safety) this guarded the
-        // shared-filesystem race where a receiver's `load_snapshot`
-        // re-bound the SAME canonical path the source's destroy was
-        // unlinking. Since the vsock re-key the path is per-sandbox
-        // (restores pass `vsock_override`), so the cross-host race is
-        // gone — but leaving the file behind stays the safe default:
-        // create/restore `remove_file` any stale UDS before binding,
-        // so a future sandbox at the same UUID path picks up clean,
-        // and the orphan is a 0-byte file bounded by sandbox
-        // creation rate.
+        // ADR 0050 / issue #196: destroy MUST be cancel-safe. The map
+        // entry is already gone (above), so once we own `live` the only
+        // record of the running FC + uffd handler is on this stack. The
+        // teardown that follows parks in cancellable awaits for several
+        // seconds (graceful-shutdown timeout, uffd SIGTERM wait), and the
+        // host-agent tonic handler runs destroy inline — so a wire-level
+        // cancellation (client disconnect / RPC deadline) drops this
+        // future. If that happened before the kills ran, FC + uffd kept
+        // running (ADR 0044 K2 removed `kill_on_drop`, so dropping `live`
+        // kills nothing) AND a retried destroy hit the idempotent
+        // early-return above, reporting success while the VM lived on —
+        // a leaked microVM, allocator /30 slot, TAP/netns, and a
+        // `sandbox.json` that reattach re-adopts after a host-agent
+        // restart.
         //
-        // The per-sandbox jail dir + canonical symlinks below are
-        // still removed; those are deterministic per local sandbox
-        // and don't have the cross-host-path-coupling issue.
-
-        // ADR 0014: canonical rootfs / harness symlinks at
-        // `<work_dir>/{rootfs,harness}/<sandbox_id>.{dev,ext4}`
-        // live outside the jail by design. Remove them explicitly;
-        // any restore that wants this sandbox_id back will re-create
-        // them pointing at whatever it has materialized locally.
-        for entry in paths::canonical_entries_for(&self.work_dir, id) {
-            // NotFound is benign — sandbox may have been created
-            // without a harness substrate, or pre-ADR-0014 (no entry
-            // at all). `remove_file` on a symlink unlinks the entry,
-            // not the target.
-            let _ = tokio::fs::remove_file(&entry).await;
+        // The fix: hand the entire teardown to a detached `tokio::spawn`
+        // and merely *await* its `JoinHandle`. Wire cancellation now only
+        // drops the awaiter; the spawned task runs the full
+        // kill/free/cleanup sequence to completion regardless. We still
+        // return the task's outcome to the caller so a retry that races a
+        // still-running teardown sees a coherent result.
+        let net_allocator = self.net_allocator.clone();
+        let vm_cgroup_parent = self.config.vm_cgroup_parent.clone();
+        let work_dir = self.work_dir.clone();
+        let handle = tokio::spawn(destroy_teardown(
+            id,
+            live,
+            net_allocator,
+            vm_cgroup_parent,
+            work_dir,
+        ));
+        match handle.await {
+            Ok(()) => Ok(()),
+            Err(join_err) => {
+                // The detached task panicked. The map entry is already
+                // gone and the kill/free best-effort steps each swallow
+                // their own errors, so a panic here is unexpected — but
+                // surface it rather than silently claim success.
+                tracing::error!(
+                    sandbox_id = %id,
+                    error = %join_err,
+                    "destroy teardown task panicked",
+                );
+                Err(SandboxError::Vm(
+                    format!("destroy teardown task panicked: {join_err}").into(),
+                ))
+            }
         }
-
-        let jail_dir = self.work_dir.join(id.to_string());
-        if let Err(e) = tokio::fs::remove_dir_all(&jail_dir).await {
-            // Don't fail destroy on a stale dir — the VM is gone, which
-            // is what mattered. Log and move on.
-            tracing::warn!(
-                sandbox_id = %id,
-                jail = %jail_dir.display(),
-                error = %e,
-                "removing jail dir failed; leaving for ops cleanup",
-            );
-        }
-        Ok(())
     }
-
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
     }
@@ -4653,6 +4554,215 @@ impl SandboxBackend for FirecrackerBackend {
 
     fn set_upload_sink(&self, sink: engram_core::traits::UploadSink) {
         *self.upload_sink.write() = Some(sink);
+    }
+}
+
+/// The cancel-safe teardown body for
+/// [`FirecrackerBackend::destroy`].
+///
+/// `destroy` removes the map entry, then hands the owned [`LiveSandbox`]
+/// to this function inside a detached `tokio::spawn` and merely *awaits*
+/// the `JoinHandle`. That structure is what makes destroy cancel-safe
+/// (issue #196): the host-agent tonic handler runs `destroy` inline, so a
+/// wire-level cancellation (client disconnect / RPC deadline) drops the
+/// `destroy` future — but that only drops the *awaiter*. This spawned
+/// task runs to completion regardless, so the FC process, the uffd
+/// handler, the per-VM cgroup, the TAP/netns + allocator `/30` slot, and
+/// the jail dir are always reaped. Without this, a cancelled destroy left
+/// a running microVM AND a retried destroy hit the idempotent
+/// early-return and falsely reported success.
+///
+/// Sequence: graceful shutdown → SIGKILL of FC → SIGTERM/SIGKILL of the
+/// uffd handler → cgroup rmdir → TAP/netns teardown + allocator `free()`
+/// → canonical-entry + jail-dir removal. Each step is best-effort and
+/// logs rather than aborting the rest.
+///
+/// Belt-and-braces: FC and the uffd pid are armed with [`SpawnKillGuard`]s
+/// for the kill window, so even if THIS task is itself aborted mid-kill
+/// (e.g. runtime shutdown during a host-agent stop) the guards SIGKILL the
+/// processes on drop. The guards are disarmed once the respective kill is
+/// confirmed. (The guards alone don't free netns/allocator/jail — that's
+/// why the detached-task structure is still required.)
+async fn destroy_teardown(
+    id: SandboxId,
+    mut live: LiveSandbox,
+    net_allocator: Arc<parking_lot::Mutex<net::NetworkAllocator>>,
+    vm_cgroup_parent: Option<PathBuf>,
+    work_dir: PathBuf,
+) {
+    // Belt-and-braces kill backstop (issue #196): arm a SIGKILL guard for
+    // the FC and uffd pids up front. If this task is itself aborted before
+    // the kills complete, dropping these guards SIGKILLs the processes —
+    // so no path between here and the confirmed kills can leave FC/uffd
+    // alive. Disarmed once the respective kill is done.
+    let mut fc_guard = live.fc_pid.map(SpawnKillGuard::new);
+    let mut uffd_guard = live
+        .uffd_handler
+        .as_ref()
+        .and_then(|h| h.id())
+        .or(live.uffd_pid)
+        .map(SpawnKillGuard::new);
+
+    // Try a graceful shutdown first: PUT /actions { SendCtrlAltDel }
+    // tells the guest kernel to halt cleanly via the keyboard
+    // controller's CAD signal, draining the page cache before we
+    // pull the plug. If the guest doesn't respond within
+    // `GRACEFUL_SHUTDOWN_TIMEOUT`, we fall through to SIGKILL.
+    let api = FirecrackerClient::new(&live.state.firecracker_socket);
+    // ADR 0009 §6: `child` is `None` for sandboxes pidfd-reattached
+    // on host-agent startup (we don't own a `Child` for those —
+    // the original process was spawned by a previous host-agent
+    // generation). For those, we fall back to libc::kill +
+    // poll-for-exit since there's no `Child::wait` to drive.
+    let graceful = async {
+        api.put_action(ActionType::SendCtrlAltDel).await?;
+        wait_for_fc_exit(&mut live.child, live.fc_pid)
+            .await
+            .map_err(SandboxError::from)
+    };
+    match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful).await {
+        Ok(Ok(_)) => {
+            tracing::debug!(sandbox_id = %id, "firecracker exited cleanly via SendCtrlAltDel");
+        }
+        Ok(Err(e)) => {
+            // SendCtrlAltDel rejected (FC API rejected the action,
+            // socket closed, etc.) — escalate to SIGKILL. This
+            // also covers the case where the API socket is gone
+            // but the child somehow survives.
+            tracing::debug!(
+                sandbox_id = %id,
+                error = %e,
+                "graceful shutdown failed; escalating to SIGKILL",
+            );
+            kill_fc(&mut live.child, live.fc_pid, id).await;
+            let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
+        }
+        Err(_) => {
+            // Timeout: guest didn't honour CAD within the grace
+            // window. Force-kill.
+            tracing::debug!(
+                sandbox_id = %id,
+                timeout = ?GRACEFUL_SHUTDOWN_TIMEOUT,
+                "firecracker didn't exit in time; SIGKILLing",
+            );
+            kill_fc(&mut live.child, live.fc_pid, id).await;
+            let _ = wait_for_fc_exit(&mut live.child, live.fc_pid).await;
+        }
+    }
+    // FC is confirmed gone — defuse its kill guard.
+    if let Some(g) = fc_guard.as_mut() {
+        g.disarm();
+    }
+
+    // UFFD handler (only set on Uffd-mode restore). When FC dies
+    // the kernel reaps FC's mm but the userfaultfd this handler
+    // holds via SCM_RIGHTS doesn't auto-close — `read_event()`
+    // blocks indefinitely. Send SIGTERM so the kernel-default
+    // handler kills the process; if that doesn't take effect
+    // within a short window, escalate to SIGKILL. ADR 0014 M1.14
+    // relies on the handler having already flushed `--trace-output`
+    // by the time we get here, so the write must happen earlier
+    // (the runtime dumps after the recorder window closes).
+    // We own a `Child` for a handler spawned in THIS host-agent
+    // generation; for a pidfd-reattached one we only have the pid
+    // (`uffd_pid`, ADR 0044 K2). Either way: SIGTERM, then escalate to
+    // SIGKILL if it doesn't exit promptly.
+    if let Some(mut handler) = live.uffd_handler {
+        if let Some(pid) = handler.id() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        match tokio::time::timeout(Duration::from_secs(2), handler.wait()).await {
+            Ok(_) => {}
+            Err(_) => {
+                let _ = handler.kill().await;
+                let _ = handler.wait().await;
+            }
+        }
+    } else if let Some(pid) = live.uffd_pid {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        if wait_for_pid_death(pid, Duration::from_secs(2))
+            .await
+            .is_err()
+        {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = wait_for_pid_death(pid, Duration::from_secs(5)).await;
+        }
+    }
+    // UFFD handler is confirmed gone (or there was none) — defuse its
+    // kill guard.
+    if let Some(g) = uffd_guard.as_mut() {
+        g.disarm();
+    }
+
+    // ADR 0044 K2: FC + the uffd handler are gone, so the per-VM node
+    // cgroup is now empty — remove it (rmdir of a cgroup only succeeds
+    // once empty). No-op when no `vm_cgroup_parent` is configured.
+    remove_node_cgroup(vm_cgroup_parent.as_deref(), id);
+
+    // Tear down per-VM networking: yank iptables rules tagged
+    // with this sandbox's chain comment, delete the TAP, return
+    // the /30 to the allocator. Best-effort — each step logs
+    // but doesn't stop the rest.
+    if let Some(net_setup) = live.net.as_ref() {
+        net::teardown(net_setup, &net_allocator).await;
+    }
+    // ADR 0014 M1.16: warm-restored VMs ran in their own netns
+    // — delete it (and the TAP + veth-B inside, the SNAT iptables
+    // rule, etc.), unlink the host-side veth-A, free the SNAT
+    // pool slot. Best-effort like cold teardown.
+    if let Some(netns_setup) = live.netns.as_ref() {
+        net::teardown_netns(netns_setup, &net_allocator).await;
+    }
+
+    // Do NOT unlink the base vsock UDS file at
+    // `live.state.vsock_uds_path` on destroy. Historically (ADR
+    // 0018 cross-host evac safety) this guarded the
+    // shared-filesystem race where a receiver's `load_snapshot`
+    // re-bound the SAME canonical path the source's destroy was
+    // unlinking. Since the vsock re-key the path is per-sandbox
+    // (restores pass `vsock_override`), so the cross-host race is
+    // gone — but leaving the file behind stays the safe default:
+    // create/restore `remove_file` any stale UDS before binding,
+    // so a future sandbox at the same UUID path picks up clean,
+    // and the orphan is a 0-byte file bounded by sandbox
+    // creation rate.
+    //
+    // The per-sandbox jail dir + canonical symlinks below are
+    // still removed; those are deterministic per local sandbox
+    // and don't have the cross-host-path-coupling issue.
+
+    // ADR 0014: canonical rootfs / harness symlinks at
+    // `<work_dir>/{rootfs,harness}/<sandbox_id>.{dev,ext4}`
+    // live outside the jail by design. Remove them explicitly;
+    // any restore that wants this sandbox_id back will re-create
+    // them pointing at whatever it has materialized locally.
+    for entry in paths::canonical_entries_for(&work_dir, id) {
+        // NotFound is benign — sandbox may have been created
+        // without a harness substrate, or pre-ADR-0014 (no entry
+        // at all). `remove_file` on a symlink unlinks the entry,
+        // not the target.
+        let _ = tokio::fs::remove_file(&entry).await;
+    }
+
+    let jail_dir = work_dir.join(id.to_string());
+    if let Err(e) = tokio::fs::remove_dir_all(&jail_dir).await {
+        // Don't fail destroy on a stale dir — the VM is gone, which
+        // is what mattered. Log and move on.
+        tracing::warn!(
+            sandbox_id = %id,
+            jail = %jail_dir.display(),
+            error = %e,
+            "removing jail dir failed; leaving for ops cleanup",
+        );
     }
 }
 
@@ -5555,5 +5665,173 @@ mod tests {
         assert!(pss <= rss, "Pss ({pss}) can never exceed Rss ({rss})");
         // A nonexistent pid returns None, not an error.
         assert!(super::read_smaps_rollup_pss_rss(u32::MAX).await.is_none());
+    }
+
+    /// True iff `pid` is alive (`kill(pid, 0)` succeeds). A dead/reaped
+    /// pid yields `ESRCH`.
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 performs only the existence/permission check,
+        // it sends nothing. Trivially sound.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Issue #196 regression: `destroy()` must be cancel-safe. The map
+    /// entry is removed up front, so if the post-removal teardown is
+    /// cancelled mid-await (the host-agent tonic handler runs destroy
+    /// inline → wire cancellation drops the future), the OLD code left the
+    /// FC process running forever AND a retried destroy hit the idempotent
+    /// early-return, falsely reporting success.
+    ///
+    /// We model the FC process with a real long-lived child (`sleep`,
+    /// `kill_on_drop(false)` to mirror ADR 0044 K2 — dropping the
+    /// `LiveSandbox` must NOT kill it), and force `destroy` to park in the
+    /// cancellable graceful-shutdown window with a UDS that accepts the
+    /// SendCtrlAltDel connection but never answers (so `put_action` blocks
+    /// for the full `GRACEFUL_SHUTDOWN_TIMEOUT`). We then cancel `destroy`
+    /// after 100ms — well inside that 3s window — and assert the spawned
+    /// teardown task still SIGKILLs the child, removes the jail dir + the
+    /// canonical entry, and that a retried destroy stays `Ok` with the
+    /// invariants holding (idempotency preserved, but no longer a lie).
+    ///
+    /// Pre-fix this test fails: the cancelled future drops `live`, the
+    /// child survives, the jail dir lingers, and the retry no-ops.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroy_is_cancel_safe_kills_fc_and_cleans_up() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        // `_dir` keeps the backend's work_dir tempdir alive for the test.
+        let (be, _dir) = backend();
+        let id = SandboxId::new();
+
+        // A UDS at the FC API socket path that accepts but never replies,
+        // so `FirecrackerClient::put_action(SendCtrlAltDel)` blocks inside
+        // `tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, ..)` — i.e. the
+        // cancellable window the bug lives in. Bound under a short
+        // `/tmp` path because UDS paths are capped at SUN_LEN (~104B) and
+        // the per-test tempdir + sandbox-id filename overflow it.
+        let sock_dir =
+            std::path::PathBuf::from("/tmp").join(format!("eng196-{}", std::process::id()));
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let socket = sock_dir.join("fc.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fc api stub socket");
+        let _accept_task = tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                // Hold the connection open and never write a response;
+                // just drain so the kernel doesn't RST. Dropped when the
+                // test ends.
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = conn.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        // Real, long-lived stand-in for the FC process. `kill_on_drop`
+        // OFF mirrors prod (ADR 0044 K2): dropping the `LiveSandbox`'s
+        // `Child` must NOT reap it — only an explicit kill does. That's
+        // exactly what makes the cancel orphan a VM pre-fix.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("120").kill_on_drop(false);
+        let child = cmd.spawn().expect("spawn sleep stand-in for firecracker");
+        let fc_pid = child.id().expect("sleep child has a pid");
+        assert!(
+            pid_alive(fc_pid),
+            "stand-in FC process is alive pre-destroy"
+        );
+
+        // Materialize the jail dir + a canonical entry so we can assert
+        // they're removed by the (detached) teardown.
+        let jail_dir = be.work_dir.join(id.to_string());
+        std::fs::create_dir_all(&jail_dir).unwrap();
+        let canonical = paths::canonical_entries_for(&be.work_dir, id);
+        for entry in &canonical {
+            if let Some(parent) = entry.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(entry, b"stub").unwrap();
+        }
+
+        let (_tx, agent_ready) = tokio::sync::watch::channel(true);
+        be.sandboxes.insert(
+            id,
+            LiveSandbox {
+                state: SandboxState {
+                    spec: spec(),
+                    firecracker_socket: socket.clone(),
+                    rootfs_path: jail_dir.join("rootfs.ext4"),
+                    vsock_cid: 3,
+                    vsock_uds_path: jail_dir.join("vsock.sock"),
+                    rootfs_canonical: jail_dir.join("rootfs.ext4"),
+                },
+                child: Some(child),
+                fc_pid: Some(fc_pid),
+                uffd_handler: None,
+                uffd_pid: None,
+                net: None,
+                netns: None,
+                guest_ip: parking_lot::Mutex::new(None),
+                agent_ready,
+            },
+        );
+
+        // Cancel destroy 100ms in — deep inside the 3s graceful window.
+        let cancelled = tokio::time::timeout(Duration::from_millis(100), be.destroy(id)).await;
+        assert!(
+            cancelled.is_err(),
+            "destroy must still be parked in the graceful window when we cancel it"
+        );
+
+        // The map entry is gone immediately (removed up front) — pre- and
+        // post-fix alike.
+        assert!(
+            !be.sandboxes.contains_key(&id),
+            "map entry removed by destroy"
+        );
+
+        // THE invariant: despite the cancellation, the detached teardown
+        // task runs to completion. After the graceful window elapses it
+        // SIGKILLs the FC stand-in and removes the on-disk artifacts.
+        // Poll generously (graceful window is 3s; add slack).
+        let mut killed = false;
+        for _ in 0..120 {
+            if !pid_alive(fc_pid) && !jail_dir.exists() {
+                killed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            killed,
+            "cancelled destroy must STILL kill the FC process and remove the jail dir \
+             (pid_alive={}, jail_exists={})",
+            pid_alive(fc_pid),
+            jail_dir.exists(),
+        );
+        for entry in &canonical {
+            assert!(
+                !entry.exists(),
+                "canonical entry {} must be removed by the teardown",
+                entry.display()
+            );
+        }
+
+        // A retried destroy stays Ok AND the invariants still hold — the
+        // idempotent early-return is no longer a lie.
+        be.destroy(id).await.expect("retried destroy is Ok");
+        assert!(!pid_alive(fc_pid), "FC process stays dead after retry");
+        assert!(!be.sandboxes.contains_key(&id), "map entry stays absent");
+
+        // The FC stand-in's `Child` was moved into the `LiveSandbox` and
+        // reaped inside `kill_fc`'s `Child::kill().await`, so no zombie is
+        // left. Tidy up the stub socket dir.
+        let _ = std::fs::remove_dir_all(&sock_dir);
     }
 }
