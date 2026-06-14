@@ -822,9 +822,21 @@ impl HostAgent {
                                     // killed a survivor's disk in prod
                                     // (2026-06-11, /dev/nbd4).
                                     if let Some(nbd_pool) = pooled_for_rehydrate.nbd_pool() {
+                                        // The sweep snapshots free paths,
+                                        // then claim-then-disconnects each
+                                        // candidate so a session that races
+                                        // the (slow, 100ms/device) sweep for
+                                        // the same slot can never have its
+                                        // live binding torn out. Detached so
+                                        // register returns promptly; the
+                                        // claim is the correctness gate, not
+                                        // ordering.
                                         let unclaimed = nbd_pool.free_paths().await;
-                                        tokio::task::spawn_blocking(move || {
-                                            disk_daemon::recover_stuck_nbd_devices(&unclaimed);
+                                        tokio::spawn(async move {
+                                            disk_daemon::recover_stuck_nbd_devices(
+                                                &nbd_pool, &unclaimed,
+                                            )
+                                            .await;
                                         });
                                     }
                                 }
