@@ -569,9 +569,32 @@ pub async fn teleport_session(
     // recovery posture (aborted-to-source vs scanner parachute) is in
     // the error.
     if crate::live_migration::live_teleport_enabled() {
-        match crate::live_migration::migrate_session_live(&state, session_id, req.target_host_id)
-            .await
-        {
+        // Issue #208: the live-teleport verb owns the session lease and a
+        // committed `Evacuating` pin across multi-second pause/capture/
+        // restore awaits. If we awaited it INLINE on the axum handler
+        // future, a client disconnect (LB timeout, operator Ctrl-C) would
+        // drop the handler at the current await — none of the verb's
+        // failure arms (resume-in-place / abort / parachute) would run,
+        // the lease guard's `Drop` would free the lease mid-move, and the
+        // evac-resumer would rehome from the durable checkpoint WHILE the
+        // source VM is still running ⇒ two live copies (split brain).
+        //
+        // Detach the verb onto its own task so HTTP cancellation merely
+        // stops us OBSERVING it; the spawned task always runs to a
+        // terminal commit/abort/parachute arm. We still await the
+        // JoinHandle here for the normal (connected) response. This is the
+        // same lesson ADR 0034 applied to inline idle eviction.
+        let target = req.target_host_id;
+        let st = state.clone();
+        let handle = tokio::spawn(async move {
+            crate::live_migration::migrate_session_live(&st, session_id, target).await
+        });
+        let result = handle.await.map_err(|join_err| {
+            // The verb task panicked. It did NOT release the lease cleanly
+            // through a failure arm, so let the scanner own recovery.
+            ApiError::Internal(format!("live teleport task panicked: {join_err}"))
+        })?;
+        match result {
             Ok(()) => {
                 return Ok((
                     StatusCode::OK,
@@ -918,58 +941,44 @@ pub async fn drain_host(
     // back to the source. A Parachute failure already left the
     // session Evacuating with the scanner armed — same end state as
     // the fallback, so it counts as evacuating.
-    let mut tasks = tokio::task::JoinSet::new();
-    for a in &assignments {
-        let st = state.clone();
-        let sid = a.session_id;
-        let sb = a.sandbox_id;
-        let mem_budget = a.mem_budget_mib;
-        let cpu_budget = a.cpu_budget_vcpus;
-        tasks.spawn(async move {
-            // ADR 0048 C8 don't-strand guard: before starting ANY move,
-            // confirm some SURVIVOR (a non-victim host) fits this session's
-            // budgets. If none does, do NOT begin the move — an Active
-            // session must never be parked Idle just because the fleet is
-            // full. Surface it as a failure so the operator aborts the wave.
-            let (repo, tag) = match st.services.meta.get_session(sid).await {
-                Ok(s) => {
-                    let (r, t) = engram_core::types::session::split_image_ref(&s.image);
-                    (r.to_string(), t.to_string())
-                }
-                Err(e) => return (sid, Err(format!("get_session: {e}"))),
-            };
-            let fit_ctx = crate::placement::ScheduleContext {
-                repo: &repo,
-                image_version: &tag,
-                prefer_snapshot_id: None,
-                memory_mib: Some(mem_budget.max(0) as u32),
-                cpu_budget_vcpus: Some(cpu_budget.max(0) as u32),
-                required_image_digest: None,
-                exclude_host: Some(host_id),
-                prefer_host: None,
-            };
-            match crate::placement::placement_preview(
-                st.services.meta.as_ref(),
-                &fit_ctx,
-                mem_budget,
-                cpu_budget as i64,
-            )
-            .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return (
-                        sid,
-                        Err("no surviving host has capacity for this session — \
-                             drain would strand it (scale up, then retry)"
-                            .to_string()),
-                    );
-                }
-                Err(e) => return (sid, Err(format!("placement_preview: {e:?}"))),
-            }
-
-            if crate::live_migration::live_teleport_enabled() {
-                let ctx = crate::placement::ScheduleContext {
+    //
+    // Issue #208: the per-session bodies each run a live-teleport verb
+    // that holds the session lease across a multi-second pause/capture/
+    // restore blackout. A `JoinSet` ABORTS all of its in-flight tasks
+    // when it is dropped — so if we held the JoinSet directly on this
+    // axum handler future, a client disconnect (drains run for minutes;
+    // LB timeouts and operator Ctrl-C are routine) would drop the
+    // handler, drop the JoinSet, and abort every in-flight migration
+    // mid-blackout. That strands frozen sources and forks sessions
+    // exactly like the inline teleport bug. Drive the whole JoinSet on
+    // its own detached task and merely await its JoinHandle here: HTTP
+    // cancellation then only stops us observing — the per-session verbs
+    // still run to their terminal arms.
+    let total = assignments.len();
+    let driver_state = state.clone();
+    let driver = tokio::spawn(async move {
+        let state = driver_state;
+        let mut tasks = tokio::task::JoinSet::new();
+        for a in &assignments {
+            let st = state.clone();
+            let sid = a.session_id;
+            let sb = a.sandbox_id;
+            let mem_budget = a.mem_budget_mib;
+            let cpu_budget = a.cpu_budget_vcpus;
+            tasks.spawn(async move {
+                // ADR 0048 C8 don't-strand guard: before starting ANY move,
+                // confirm some SURVIVOR (a non-victim host) fits this session's
+                // budgets. If none does, do NOT begin the move — an Active
+                // session must never be parked Idle just because the fleet is
+                // full. Surface it as a failure so the operator aborts the wave.
+                let (repo, tag) = match st.services.meta.get_session(sid).await {
+                    Ok(s) => {
+                        let (r, t) = engram_core::types::session::split_image_ref(&s.image);
+                        (r.to_string(), t.to_string())
+                    }
+                    Err(e) => return (sid, Err(format!("get_session: {e}"))),
+                };
+                let fit_ctx = crate::placement::ScheduleContext {
                     repo: &repo,
                     image_version: &tag,
                     prefer_snapshot_id: None,
@@ -979,67 +988,108 @@ pub async fn drain_host(
                     exclude_host: Some(host_id),
                     prefer_host: None,
                 };
-                let target = crate::placement::pick_for_session(
+                match crate::placement::placement_preview(
                     st.services.meta.as_ref(),
-                    &st.host_registry,
-                    &ctx,
+                    &fit_ctx,
+                    mem_budget,
+                    cpu_budget as i64,
                 )
                 .await
-                .ok()
-                .map(|(h, _)| h);
-                if let Some(target) = target {
-                    match crate::live_migration::migrate_session_live(&st, sid, target).await {
-                        Ok(()) => return (sid, Ok(())),
-                        Err(crate::live_migration::MigrateError::Parachute(e)) => {
-                            tracing::warn!(
-                                %sid, %host_id, error = %e,
-                                "drain: live move parachuted; scanner rehome armed",
-                            );
-                            return (sid, Ok(()));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                %sid, %host_id, error = %e,
-                                "drain: live move failed; falling back to snapshot-rehome",
-                            );
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return (
+                            sid,
+                            Err("no surviving host has capacity for this session — \
+                             drain would strand it (scale up, then retry)"
+                                .to_string()),
+                        );
+                    }
+                    Err(e) => return (sid, Err(format!("placement_preview: {e:?}"))),
+                }
+
+                if crate::live_migration::live_teleport_enabled() {
+                    let ctx = crate::placement::ScheduleContext {
+                        repo: &repo,
+                        image_version: &tag,
+                        prefer_snapshot_id: None,
+                        memory_mib: Some(mem_budget.max(0) as u32),
+                        cpu_budget_vcpus: Some(cpu_budget.max(0) as u32),
+                        required_image_digest: None,
+                        exclude_host: Some(host_id),
+                        prefer_host: None,
+                    };
+                    let target = crate::placement::pick_for_session(
+                        st.services.meta.as_ref(),
+                        &st.host_registry,
+                        &ctx,
+                    )
+                    .await
+                    .ok()
+                    .map(|(h, _)| h);
+                    if let Some(target) = target {
+                        match crate::live_migration::migrate_session_live(&st, sid, target).await {
+                            Ok(()) => return (sid, Ok(())),
+                            Err(crate::live_migration::MigrateError::Parachute(e)) => {
+                                tracing::warn!(
+                                    %sid, %host_id, error = %e,
+                                    "drain: live move parachuted; scanner rehome armed",
+                                );
+                                return (sid, Ok(()));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    %sid, %host_id, error = %e,
+                                    "drain: live move failed; falling back to snapshot-rehome",
+                                );
+                            }
                         }
                     }
                 }
-            }
-            let outcome = crate::idle_evictor::evict_session_to_state(
-                &st,
-                sid,
-                sb,
-                engram_core::types::SessionState::Evacuating,
-            )
-            .await;
-            (sid, outcome.map_err(|e| e.to_string()))
-        });
-    }
+                let outcome = crate::idle_evictor::evict_session_to_state(
+                    &st,
+                    sid,
+                    sb,
+                    engram_core::types::SessionState::Evacuating,
+                )
+                .await;
+                (sid, outcome.map_err(|e| e.to_string()))
+            });
+        }
 
-    let mut evacuating: Vec<SessionId> = Vec::new();
-    let mut failures: Vec<DrainFailure> = Vec::new();
-    while let Some(join) = tasks.join_next().await {
-        match join {
-            Ok((sid, Ok(()))) => evacuating.push(sid),
-            Ok((sid, Err(e))) => {
-                tracing::warn!(%sid, %host_id, error = %e, "drain: per-session evict/guard failed");
-                failures.push(DrainFailure {
-                    session_id: sid,
-                    error: e,
-                });
-            }
-            Err(e) => {
-                tracing::warn!(%host_id, error = %e, "drain: join error in per-session task");
+        let mut evacuating: Vec<SessionId> = Vec::new();
+        let mut failures: Vec<DrainFailure> = Vec::new();
+        while let Some(join) = tasks.join_next().await {
+            match join {
+                Ok((sid, Ok(()))) => evacuating.push(sid),
+                Ok((sid, Err(e))) => {
+                    tracing::warn!(%sid, %host_id, error = %e, "drain: per-session evict/guard failed");
+                    failures.push(DrainFailure {
+                        session_id: sid,
+                        error: e,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(%host_id, error = %e, "drain: join error in per-session task");
+                }
             }
         }
-    }
+        (evacuating, failures)
+    });
+
+    // Await the detached driver for the normal (connected) response. If
+    // the HTTP request is cancelled, this future is dropped — but the
+    // spawned `driver` (and therefore its JoinSet of per-session verbs)
+    // keeps running to completion, so no migration is aborted mid-move.
+    let (evacuating, failures) = driver.await.map_err(|join_err| {
+        ApiError::Internal(format!("drain: driver task panicked: {join_err}"))
+    })?;
 
     tracing::info!(
         %host_id,
         evacuating = evacuating.len(),
         failures = failures.len(),
-        total = assignments.len(),
+        total,
         "admin drain: per-session evac pipeline dispatched; scanner will resume each on a peer",
     );
 
