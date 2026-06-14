@@ -753,16 +753,21 @@ pub async fn provision_netns(
     // `alloc()` doesn't hand the same slot back to a different VM as
     // a SNAT slot (which would collide on the host-visible side).
     //
-    // `Ok(_)` = we are the first restore from this template on this
-    // host; remember so the error path can release it. `Err(SlotTaken)`
-    // = another live restore already reserved it; we MUST NOT release
-    // it on error or teardown (doing so reintroduces the collision —
-    // observed in prod 2026-05-21 where two warm restores from
-    // different templates ended up with two different sandboxes both
-    // claiming 10.200.0.5/30: the kernel's route table double-bound
-    // the slot, the SHELL tab's host→VM dial reached the wrong VM,
-    // and ttyd answered with Connection refused).
-    let reserved_here = allocator.lock().reserve(bake_cidr).is_ok();
+    // We `reserve` the bake CIDR so `alloc()` can't hand the slot out
+    // as someone else's SNAT slot. We do NOT track whether this restore
+    // was the first reserver, because that fact is useless on the
+    // release side: "I reserved first" is not "I am the last holder".
+    // A sibling same-template restore may go live on this exact /30
+    // while we are still inside `provision_netns_inner`, so neither the
+    // error path below nor `teardown_netns` may EVER free the bake CIDR
+    // (doing so reintroduces the collision — observed in prod 2026-05-21
+    // where a freed shared bake slot was reclaimed by a later alloc,
+    // the kernel's route table double-bound the /30, the SHELL tab's
+    // host→VM dial reached the wrong VM, and ttyd answered with
+    // Connection refused). See `teardown_netns` for the leak-rather-
+    // than-collide rationale; the leaked /30 is reclaimed when the
+    // allocator restarts with the host-agent.
+    let _ = allocator.lock().reserve(bake_cidr);
     let snat_cidr = allocator.lock().alloc().map_err(NetError::Alloc)?;
     let t_provision = std::time::Instant::now();
     let res = provision_netns_inner(sandbox_id, bake_cidr, snat_cidr, tap_name).await;
@@ -781,11 +786,14 @@ pub async fn provision_netns(
         let netns = netns_name_for(sandbox_id);
         let _ = run_cmd("ip", &["netns", "delete", &netns]).await;
         let _ = run_cmd("ip", &["link", "delete", &veth_host]).await;
+        // Free ONLY the snat slot we allocated above. We must NOT free
+        // the bake CIDR even though we may have been its first reserver:
+        // a sibling same-template restore may already be live on it (its
+        // `reserve` got SlotTaken but its provision succeeded), and
+        // releasing a shared /30 still in use re-arms the 2026-05-21
+        // cross-VM routing collision. This mirrors `teardown_netns`,
+        // which deliberately leaks the bake CIDR for the same reason.
         allocator.lock().free(snat_cidr);
-        if reserved_here {
-            // We were the first reserver on this host; safe to release.
-            allocator.lock().free(bake_cidr);
-        }
     }
     res
 }
@@ -1365,6 +1373,63 @@ mod tests {
         // It picks up the recently-freed snat_b slot 3 first (LIFO
         // free-list), which is correct.
         assert_eq!(cold.cidr_str(), "10.200.0.12/30");
+    }
+
+    /// Regression test for the `provision_netns` ERROR-PATH variant of
+    /// the prod 2026-05-21 SHELL-tab collision (issue #201).
+    ///
+    /// The teardown path was fixed (test above), but `provision_netns`'s
+    /// error arm still freed the shared bake_cidr when it had been the
+    /// FIRST reserver — "I reserved first" is not "I am the last holder".
+    /// If a sibling same-template restore goes live on that /30 while the
+    /// first restore is mid-provision, and the first restore's inner then
+    /// fails, the error arm released the slot the sibling is alive on. A
+    /// later `alloc()` reclaimed it and re-armed the cross-VM collision.
+    ///
+    /// The fix: the error arm frees ONLY the snat slot, never the bake
+    /// CIDR. This test models the call sequence the handler performs
+    /// (restore A reserve(bake)=Ok + alloc snat; restore B
+    /// reserve(bake)=SlotTaken + alloc snat, B live; A's inner fails so
+    /// A frees only snat_a) and asserts a subsequent `alloc()` never
+    /// returns the still-held bake CIDR.
+    #[test]
+    fn bake_cidr_stays_reserved_when_first_reserver_provision_fails() {
+        let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        // Bake slot 1 (10.200.0.4/30) — older cold-created bakes record
+        // non-zero slots, for which `free()` is NOT a slot-0 no-op, so
+        // the bug is reachable.
+        let bake = VmCidr::new(Ipv4Addr::from_str("10.200.0.4").unwrap());
+
+        // Warm restore A enters provision_netns: reserve(bake) Ok (A is
+        // the first reserver on this host), alloc snat → slot 2.
+        a.reserve(bake).unwrap();
+        let snat_a = a.alloc().unwrap();
+        assert_eq!(snat_a.cidr_str(), "10.200.0.8/30");
+
+        // Warm restore B (same template) enters provision_netns while A
+        // is still inside provision_netns_inner: reserve(bake) →
+        // SlotTaken, alloc snat → slot 3. B's inner SUCCEEDS — B is now
+        // live and depends on the bake slot staying in_use.
+        assert!(matches!(a.reserve(bake), Err(AllocError::SlotTaken)));
+        let snat_b = a.alloc().unwrap();
+        assert_eq!(snat_b.cidr_str(), "10.200.0.12/30");
+
+        // A's provision_netns_inner fails on a transient ip/iptables
+        // error. The fixed error arm frees ONLY snat_a, NOT bake — even
+        // though A was the first reserver. (Pre-fix this also freed bake,
+        // releasing the slot B is alive on.)
+        a.free(snat_a);
+
+        // A later alloc() (a cold-create, or another restore's snat)
+        // must NOT reclaim the bake slot B still relies on.
+        let next = a.alloc().unwrap();
+        assert_ne!(
+            next.cidr_str(),
+            "10.200.0.4/30",
+            "error path must not reclaim a bake_cidr still held by a live sibling restore",
+        );
+        // It picks up the recently-freed snat_a slot 2 (LIFO free-list).
+        assert_eq!(next.cidr_str(), "10.200.0.8/30");
     }
 
     #[test]
