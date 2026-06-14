@@ -23,17 +23,21 @@
 
 use std::path::PathBuf;
 
-use engram_host_agent::disk_daemon::recover_stuck_nbd_devices;
+use engram_host_agent::disk_daemon::{recover_stuck_nbd_devices, NbdSlotAllocator};
 
-#[test]
-fn recovery_is_noop_for_unbound_devices() {
+#[tokio::test]
+async fn recovery_is_noop_for_unbound_devices() {
     // Devices that don't exist (or aren't bound to any NBD daemon)
-    // should probe as not-stuck → no work.
+    // should probe as not-stuck → no work. The candidate paths aren't
+    // in the pool's universe, so `try_claim` skips them (the sweep only
+    // touches slots it can claim) and nothing is probed.
+    let pool = NbdSlotAllocator::from_paths(vec![PathBuf::from("/dev/nbd0")])
+        .expect("build single-slot pool");
     let paths = vec![
         PathBuf::from("/dev/test-fake-nbd-recovery-0"),
         PathBuf::from("/dev/test-fake-nbd-recovery-1"),
     ];
-    let (probed, recovered, stuck) = recover_stuck_nbd_devices(&paths);
+    let (probed, recovered, stuck) = recover_stuck_nbd_devices(&pool, &paths).await;
     assert_eq!(probed, 0, "fake paths should not register as probed");
     assert_eq!(recovered, 0);
     assert_eq!(stuck, 0);
@@ -52,9 +56,9 @@ fn recovery_is_noop_for_unbound_devices() {
 /// Skips cleanly if the env var is unset or no listed device is
 /// actually stuck — so it's safe to leave in CI but only fires when
 /// the operator deliberately stages the scenario.
-#[test]
+#[tokio::test]
 #[ignore]
-fn recovery_clears_kernel_busy_device() {
+async fn recovery_clears_kernel_busy_device() {
     let env = match std::env::var("ENGRAM_NBD_STUCK_DEVICES") {
         Ok(s) if !s.is_empty() => s,
         _ => {
@@ -99,7 +103,12 @@ fn recovery_clears_kernel_busy_device() {
         return;
     }
 
-    let (probed, recovered, _stuck) = recover_stuck_nbd_devices(&paths);
+    // Build a pool whose universe is exactly the candidate devices so
+    // the sweep can `try_claim` each one (the claim-then-disconnect
+    // path). A device kernel-busy under a DEAD pid is "free" to the
+    // pool's reserved-bit accounting, so try_claim reserves it.
+    let pool = NbdSlotAllocator::from_paths(paths.clone()).expect("build pool over stuck devices");
+    let (probed, recovered, _stuck) = recover_stuck_nbd_devices(&pool, &paths).await;
     assert_eq!(
         probed, initial_busy_count,
         "probed count must match the # of initially-busy devices"

@@ -124,11 +124,30 @@ pub struct NbdSlot {
     slot: u32,
     path: PathBuf,
     allocator: Arc<NbdSlotAllocator>,
+    /// When `true`, `Drop` does NOT release the slot back to the pool —
+    /// the reserved bit stays set so the populator never re-warms it and
+    /// no future `acquire`/`try_claim` can hand it out. Used to PARK a
+    /// survivor's device whose rehydrate RECONFIGURE failed: the FC may
+    /// still hold an open fd and read it, so returning the path to the
+    /// general pool would let the startup stale-binding sweep DISCONNECT
+    /// it (guest EIO) or hand it to an unrelated session. Recovery is via
+    /// the evict_local → resume ladder, not the warm pool.
+    quarantined: bool,
 }
 
 impl NbdSlot {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Consume this lease WITHOUT returning the slot to the pool: the
+    /// reserved bit stays set permanently (until process restart). The
+    /// rehydrate failure path uses this to park a survivor's live device
+    /// out of circulation. See the `quarantined` field doc.
+    pub fn quarantine(mut self) {
+        self.quarantined = true;
+        // `self` drops here; the `quarantined` flag makes Drop a no-op,
+        // leaving the reserved bit set so the slot is never re-handed-out.
     }
 }
 
@@ -140,6 +159,11 @@ impl std::fmt::Debug for NbdSlot {
 
 impl Drop for NbdSlot {
     fn drop(&mut self) {
+        if self.quarantined {
+            // Parked out of the pool by design — leave the reserved bit
+            // set so the slot is never re-warmed or re-handed-out.
+            return;
+        }
         let slot = self.slot;
         let allocator = self.allocator.clone();
         // Fire-and-forget release: clears the reserved bit so the
@@ -304,6 +328,7 @@ impl NbdSlotAllocator {
                     slot,
                     path: slot_path(slot),
                     allocator: self.clone(),
+                    quarantined: false,
                 };
             }
             tokio::time::sleep(ACQUIRE_REPOLL).await;
@@ -328,6 +353,7 @@ impl NbdSlotAllocator {
                 slot,
                 path: slot_path(slot),
                 allocator: self.clone(),
+                quarantined: false,
             });
         }
         // Already reserved — it may be sitting warm (validated free,
@@ -341,6 +367,49 @@ impl NbdSlotAllocator {
             slot,
             path: slot_path(slot),
             allocator: self.clone(),
+            quarantined: false,
+        })
+    }
+
+    /// Try to claim a SPECIFIC device that the caller believes to be
+    /// free — the startup stale-binding sweep. Unlike [`Self::claim`]
+    /// (which deliberately grabs busy survivor devices), this RESPECTS
+    /// the reserved bit: it reserves the slot ONLY if it is currently
+    /// free, returning `None` if anyone else already owns it (a survivor
+    /// claim, a warm slot pulled by `claim`, or a concurrent `acquire`).
+    ///
+    /// This closes the snapshot-vs-claim TOCTOU in the sweep: the sweep
+    /// must hold the slot reserved across the (slow, sleeping) DISCONNECT
+    /// so a session that wins the race for the same device can never have
+    /// its live binding torn out from under it. If `try_claim` fails the
+    /// sweep skips the device — someone owns it now, by definition not a
+    /// stale binding.
+    ///
+    /// Returns `None` if the device isn't in this pool. If the slot is
+    /// sitting warm (validated-free, pre-handout), it is pulled out of
+    /// the warm queue and reserved so the populator can't hand it out
+    /// while the sweep holds it.
+    pub async fn try_claim(self: &Arc<Self>, path: &Path) -> Option<NbdSlot> {
+        let slot = parse_nbd_index(path)?;
+        let mut inner = self.inner.lock().await;
+        if !inner.reserve_specific(slot) {
+            // Already reserved by another lease (survivor / handed out /
+            // pulled-warm) — someone owns it; not ours to sweep.
+            return None;
+        }
+        // Reserved by us now. If it happened to be sitting warm, pull it
+        // out of the warm queue so the populator can't hand it out (the
+        // reserved bit alone wouldn't remove an already-queued entry).
+        drop(inner);
+        let mut warm = self.warm.lock().await;
+        if let Some(pos) = warm.iter().position(|&s| s == slot) {
+            warm.remove(pos);
+        }
+        Some(NbdSlot {
+            slot,
+            path: slot_path(slot),
+            allocator: self.clone(),
+            quarantined: false,
         })
     }
 
@@ -612,6 +681,82 @@ mod tests {
         for _ in 0..3 {
             assert_ne!(pool.acquire().await.path(), Path::new("/dev/nbd2"));
         }
+    }
+
+    #[tokio::test]
+    async fn try_claim_succeeds_only_for_a_free_slot() {
+        // try_claim is the sweep's TOCTOU gate: it reserves a specific
+        // device ONLY if free. A second try_claim on the same device
+        // must fail while the first lease is held, and succeed again
+        // after it's released.
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(4, 0, busy); // warm_target 0: no populator handouts
+        let first = pool
+            .try_claim(Path::new("/dev/nbd1"))
+            .await
+            .expect("first try_claim of a free slot");
+        assert_eq!(first.path(), Path::new("/dev/nbd1"));
+        assert!(
+            pool.try_claim(Path::new("/dev/nbd1")).await.is_none(),
+            "try_claim must fail for an already-reserved slot (someone owns it)"
+        );
+        // Not in the pool's universe → None.
+        assert!(pool.try_claim(Path::new("/dev/nbd99")).await.is_none());
+        drop(first);
+        // Drop is async-spawned; let release run, then it's claimable again.
+        for _ in 0..200 {
+            if pool.try_claim(Path::new("/dev/nbd1")).await.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("slot never became try_claim-able again after release");
+    }
+
+    #[tokio::test]
+    async fn try_claim_loses_to_a_concurrent_acquire() {
+        // The exact race the startup sweep must survive: a session
+        // acquires a slot that was "free at snapshot time". try_claim on
+        // that same slot must then FAIL, so the sweep skips it instead of
+        // disconnecting the live session's device.
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(1, 1, busy);
+        wait_warm(&pool, 1).await;
+        let held = pool.acquire().await; // session wins the slot
+        assert_eq!(held.path(), Path::new("/dev/nbd0"));
+        assert!(
+            pool.try_claim(Path::new("/dev/nbd0")).await.is_none(),
+            "sweep's try_claim must lose to a live acquire → device skipped, not swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantined_slot_never_returns_to_the_pool() {
+        // The rehydrate-failure park: a quarantined slot's Drop must NOT
+        // release the reserved bit, so the survivor's device stays out of
+        // circulation (the populator can't re-warm it; try_claim/acquire
+        // can't hand it out).
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(1, 0, busy);
+        let slot = pool
+            .try_claim(Path::new("/dev/nbd0"))
+            .await
+            .expect("claim the only slot");
+        assert_eq!(pool.free_count().await, 0);
+        // Consume + drop without releasing.
+        slot.quarantine();
+        // Give any (incorrect) spawned release a chance to run before we
+        // assert the slot stayed reserved.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            pool.free_count().await,
+            0,
+            "quarantined slot must stay reserved (out of the pool)"
+        );
+        assert!(
+            pool.try_claim(Path::new("/dev/nbd0")).await.is_none(),
+            "quarantined device must not be re-claimable"
+        );
     }
 
     #[tokio::test]

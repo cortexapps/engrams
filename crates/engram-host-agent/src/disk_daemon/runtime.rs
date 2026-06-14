@@ -238,28 +238,74 @@ impl Drop for NbdHandle {
 /// (prod 2026-06-11, /dev/nbd4 → guest rootfs EIO). The caller in
 /// `lib.rs` therefore runs it AFTER the survivor rehydrate pass,
 /// over the slot pool's still-free paths only.
-pub fn recover_stuck_nbd_devices(paths: &[std::path::PathBuf]) -> (usize, usize, usize) {
+///
+/// CLAIM-THEN-DISCONNECT (TOCTOU close): the candidate list is a
+/// point-in-time snapshot of free paths, but the gRPC server is
+/// already up and a concurrent `create()` can `acquire` + CONNECT a
+/// device that was free at snapshot time. Because this pass sleeps
+/// 100 ms per device it runs hundreds of ms behind the snapshot, so a
+/// racing session can win the slot first. We therefore `try_claim`
+/// each candidate FROM THE POOL before touching it: if the claim fails
+/// someone owns it now (a fresh session, a survivor) and we skip; if it
+/// succeeds we hold the reserved bit across the (slow) DISCONNECT so no
+/// one can be handed the device mid-sweep, then release it back. The
+/// per-device pid-liveness/self-pid guard in [`recover_one_stuck_device`]
+/// is the defense-in-depth second line.
+pub async fn recover_stuck_nbd_devices(
+    pool: &Arc<NbdSlotAllocator>,
+    paths: &[std::path::PathBuf],
+) -> (usize, usize, usize) {
     let mut probed = 0;
     let mut recovered = 0;
     let mut still_stuck = 0;
     for path in paths {
-        match recover_one_stuck_device(path) {
-            Ok(NbdRecoveryOutcome::NotStuck) => {}
-            Ok(NbdRecoveryOutcome::Recovered) => {
+        // Reserve the slot before probing/disconnecting. A failed claim
+        // means a concurrent acquire/claim already owns it — by
+        // definition not a stale binding, so skip it entirely.
+        let Some(slot) = pool.try_claim(path).await else {
+            tracing::debug!(
+                device = %path.display(),
+                "NBD recovery: device claimed by another lease since the free-paths \
+                 snapshot; skipping (not stale)",
+            );
+            continue;
+        };
+        // The blocking probe (DISCONNECT + 100ms sleep + re-probe) runs
+        // on a blocking thread; we keep `slot` reserved for its duration
+        // and release it (via Drop) right after.
+        let probe_path = path.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || recover_one_stuck_device(&probe_path)).await;
+        // Drop the lease → release the slot back to the pool for the
+        // populator to re-validate (a still-stuck device fails the
+        // free-check and is skipped; a recovered one re-warms).
+        drop(slot);
+        match outcome {
+            Ok(Ok(NbdRecoveryOutcome::NotStuck)) => {}
+            Ok(Ok(NbdRecoveryOutcome::Recovered)) => {
                 probed += 1;
                 recovered += 1;
             }
-            Ok(NbdRecoveryOutcome::StillStuck) => {
+            Ok(Ok(NbdRecoveryOutcome::StillStuck)) => {
                 probed += 1;
                 still_stuck += 1;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 probed += 1;
                 still_stuck += 1;
                 tracing::debug!(
                     device = %path.display(),
                     error = %e,
                     "NBD recovery: error during probe; treating as still-stuck",
+                );
+            }
+            Err(e) => {
+                probed += 1;
+                still_stuck += 1;
+                tracing::warn!(
+                    device = %path.display(),
+                    error = %e,
+                    "NBD recovery: probe task panicked/cancelled; treating as still-stuck",
                 );
             }
         }
@@ -281,6 +327,24 @@ enum NbdRecoveryOutcome {
     StillStuck,
 }
 
+/// `true` if `pid` names a live process. `kill(pid, 0)` sends no signal
+/// but performs the existence + permission check: `Ok` (or `EPERM`,
+/// meaning the process exists but is owned by another user) → alive;
+/// `ESRCH` → no such process (stale). We run as the same user that
+/// CONNECTed the device, so `EPERM` shouldn't arise, but treat it as
+/// "alive" defensively — never disconnect on an ambiguous signal.
+fn pid_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: `kill` with signal 0 only probes; no memory is touched.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 fn recover_one_stuck_device(path: &std::path::Path) -> io::Result<NbdRecoveryOutcome> {
     // 1. Probe /sys/block/nbdN/pid. Empty / absent → device isn't bound; nothing to do.
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -292,11 +356,44 @@ fn recover_one_stuck_device(path: &std::path::Path) -> io::Result<NbdRecoveryOut
         _ => return Ok(NbdRecoveryOutcome::NotStuck),
     };
 
+    // Liveness / self-pid guard (the function's own doc above promises
+    // "a process that's no longer alive"). The pid in /sys/block/nbdN/pid
+    // is the kernel-side NBD task's pid — for a netlink CONNECT issued by
+    // THIS host-agent it is our own pid. A "stale" binding is one whose
+    // owning process is gone; if the pid is still alive we must NOT
+    // disconnect:
+    //   - pid == our own pid → a live device this very generation just
+    //     CONNECTed (a fresh session that won the claim race after the
+    //     free-paths snapshot; pre-this-fix the sweep killed its rootfs).
+    //   - pid alive but not ours → some other live owner; not stale.
+    // Only a dead pid (kill(pid,0) == ESRCH) is a genuine stale binding.
+    if let Ok(pid) = bound_pid.parse::<i32>() {
+        let self_pid = std::process::id() as i32;
+        if pid == self_pid {
+            tracing::info!(
+                device = %path.display(),
+                bound_pid = %bound_pid,
+                "NBD recovery: skipping — device is bound by THIS host-agent process \
+                 (a live session that claimed it after the sweep snapshot); not stale",
+            );
+            return Ok(NbdRecoveryOutcome::NotStuck);
+        }
+        if pid_is_alive(pid) {
+            tracing::info!(
+                device = %path.display(),
+                bound_pid = %bound_pid,
+                "NBD recovery: skipping — bound pid is still a live process; not a \
+                 stale binding (would be wrong to disconnect a live owner)",
+            );
+            return Ok(NbdRecoveryOutcome::NotStuck);
+        }
+    }
+
     tracing::warn!(
         device = %path.display(),
         bound_pid = %bound_pid,
-        "NBD recovery: unclaimed device kernel-bound to a stale config; \
-         attempting recovery via netlink NBD_CMD_DISCONNECT",
+        "NBD recovery: unclaimed device kernel-bound to a stale config (owning pid \
+         is gone); attempting recovery via netlink NBD_CMD_DISCONNECT",
     );
 
     // 2. Netlink disconnect. Works without an open fd and without
@@ -494,18 +591,33 @@ pub async fn attach_manifest_content(
 /// `dead_conn_timeout`. (The pre-netlink rehydrate acquired a FRESH
 /// slot here, serving a device nobody read while the survivor's
 /// real device stayed dead.)
+/// On failure, returns the `NbdSlot` BACK to the caller (alongside the
+/// error) rather than dropping it. Dropping it would `release()` the
+/// survivor's device into the general pool — but the surviving FC may
+/// still hold an open fd to that exact `/dev/nbdN`, so a released device
+/// can be (a) DISCONNECTed by the startup stale-binding sweep or (b)
+/// handed to an unrelated session, in both cases turning a "recoverable
+/// later" survivor disk into immediate guest EIO. The caller PARKS the
+/// returned slot (quarantine) so it stays out of circulation until the
+/// evict_local → resume ladder recovers the session.
 pub async fn reattach_manifest(
     disk_manifest_ref: engram_core::types::manifest::ManifestRef,
     cache: engram_chunk_store::cache::ChunkCache,
     store: Arc<engram_chunk_store::ChunkStore>,
     slot: NbdSlot,
     threshold_bytes: u64,
-) -> Result<NbdSandboxState, NbdRuntimeError> {
+) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
     let backend_id = disk_manifest_ref.manifest_id.to_string();
-    let backend = Arc::new(
-        ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?,
-    );
-    let handle = reattach(backend.clone(), slot.path(), &backend_id).await?;
+    let backend =
+        match ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await
+        {
+            Ok(b) => Arc::new(b),
+            Err(e) => return Err((slot, e.into())),
+        };
+    let handle = match reattach(backend.clone(), slot.path(), &backend_id).await {
+        Ok(h) => h,
+        Err(e) => return Err((slot, e)),
+    };
     Ok(NbdSandboxState {
         scheduler: None,
         backend,
@@ -836,5 +948,30 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, mut stream: TokioUnixStrea
                 let _ = stream.write_all(&NbdReply::ok(req.handle).encode()).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stale-binding sweep's liveness guard: a binding owned by a
+    /// LIVE process (in particular this very process — a session that
+    /// won the slot after the free-paths snapshot) must read as alive so
+    /// `recover_one_stuck_device` skips it. Only a genuinely-dead pid
+    /// (the actual "stale" case) reads as not-alive and is disconnected.
+    #[test]
+    fn pid_is_alive_distinguishes_live_from_dead() {
+        // Our own pid is alive (this is the self-pid skip case).
+        assert!(pid_is_alive(std::process::id() as i32));
+        // pid 1 (init) always exists on Linux; kill(1,0) → 0 or EPERM,
+        // both of which we treat as alive.
+        assert!(pid_is_alive(1));
+        // A pid far above the kernel's pid_max is guaranteed unused →
+        // ESRCH → dead. (pid_max is at most ~4M on stock Linux.)
+        assert!(!pid_is_alive(i32::MAX));
+        // Non-positive pids are never a real process.
+        assert!(!pid_is_alive(0));
+        assert!(!pid_is_alive(-1));
     }
 }

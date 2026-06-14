@@ -5545,7 +5545,7 @@ impl PooledBackend {
         };
 
         let store_arc = Arc::new(chunk_store.clone());
-        let mut state = crate::disk_daemon::reattach_manifest(
+        let mut state = match crate::disk_daemon::reattach_manifest(
             disk_manifest,
             chunk_cache.clone(),
             store_arc,
@@ -5553,21 +5553,42 @@ impl PooledBackend {
             self.flush_config.dirty_threshold_bytes,
         )
         .await
-        .map_err(|e| {
-            // RECONFIGURE refused — most likely a device configured by
-            // a pre-netlink host-agent generation (the one-roll
-            // transition window) or an identifier mismatch. The
-            // survivor's disk stays dead; the evict_local → resume
-            // ladder recovers the session.
-            SandboxError::Vm(
-                format!(
-                    "rehydrate nbd reconfigure at {}: {e} \
-                     (survivor disk unserved; recover via evict_local → resume)",
-                    device.display()
-                )
-                .into(),
-            )
-        })?;
+        {
+            Ok(state) => state,
+            Err((slot, e)) => {
+                // RECONFIGURE refused — most likely a device configured by
+                // a pre-netlink host-agent generation (the one-roll
+                // transition window) or an identifier mismatch. The
+                // survivor's disk stays dead; the evict_local → resume
+                // ladder recovers the session.
+                //
+                // PARK the slot rather than letting it drop back into the
+                // general pool: the surviving FC may still hold an open fd
+                // to this exact /dev/nbdN, so releasing it would let the
+                // stale-binding sweep DISCONNECT it (immediate guest EIO)
+                // or hand it to an unrelated session. Quarantine keeps the
+                // reserved bit set so the device is unavailable to new
+                // claims until the session is recovered out-of-band.
+                tracing::warn!(
+                    %sandbox_id,
+                    device = %device.display(),
+                    error = %e,
+                    "rehydrate RECONFIGURE failed; parking the survivor's NBD slot \
+                     (quarantined, kept out of the pool) to protect a possibly-live \
+                     device; recover via evict_local → resume",
+                );
+                slot.quarantine();
+                return Err(SandboxError::Vm(
+                    format!(
+                        "rehydrate nbd reconfigure at {}: {e} \
+                         (survivor disk unserved; slot quarantined; recover via \
+                         evict_local → resume)",
+                        device.display()
+                    )
+                    .into(),
+                ));
+            }
+        };
 
         state.install_flush_scheduler(
             sandbox_id,
