@@ -1,0 +1,374 @@
+//! Issue #225 regression: the SIGTERM path must FINAL-FLUSH every surviving
+//! NBD data plane's un-flushed dirty/pending writes BEFORE abandoning it.
+//!
+//! The hazard: NBD WRITEs are acked to the guest the instant the bytes land in
+//! the backend's in-RAM `dirty` tier; durability rides the FlushScheduler's
+//! ~30 s / 256 MiB cadence. A routine pod roll calls
+//! `abandon_nbd_data_planes_for_shutdown` → `abandon_for_shutdown` →
+//! `drop(backend)`, discarding the `dirty` (+ `pending_uploads`) tier with NO
+//! final flush. The VM keeps running (the K2 contract), but the successor
+//! rehydrates from the last *published* `live_disk_manifest`, which predates
+//! the discarded writes — a silent rollback of acked guest I/O on a running VM.
+//!
+//! The fix adds `PooledBackend::flush_nbd_data_planes_for_shutdown`, run in the
+//! SIGTERM path BEFORE the abandon sweep: per surviving sandbox, under a hard
+//! deadline, it `wait_idle()`s, runs a full `flush()` (drain → GCS upload →
+//! manifest rebase), and SYNCHRONOUSLY publishes the new `live_disk_manifest`
+//! to coord (the async publisher's drain task is gone on process exit).
+//!
+//! This test drives the REAL `PooledBackend::restore` over a real NBD slot on
+//! `/dev/nbd0` (mirrors `nbd_shutdown_abandon_race.rs`), lets it install the
+//! data plane in `nbd_sandboxes`, then:
+//!   1. writes a recognizable marker through the live `ChunkedDiskBackend`
+//!      (the acked-from-RAM write the bug discards) WITHOUT flushing,
+//!   2. stands up a tiny mock coord recording the `live-manifest` publish,
+//!   3. calls `flush_nbd_data_planes_for_shutdown`, then asserts:
+//!      - the backend's dirty tier is now EMPTY (the write was drained, not
+//!        discarded),
+//!      - the new manifest_ref's chunks are durably readable from the chunk
+//!        store and reconstruct the marker bytes (the acked write SURVIVED),
+//!      - coord received exactly one publish for this sandbox carrying the new
+//!        manifest version (so the successor rehydrates from the current ref).
+//!
+//! On the pre-fix code there is no final-flush method at all; the marker would
+//! live only in the dropped RAM tier and the published manifest would never
+//! advance — the durability + publish assertions would fail.
+//!
+//! Gating + run (no FC needed):
+//!
+//! ```sh
+//! sudo modprobe nbd nbds_max=4
+//! sudo -E cargo test -p engram-host-agent --test nbd_shutdown_final_flush \
+//!     -- --ignored --nocapture
+//! ```
+//!
+//! Self-skips when `/dev/nbdN` is missing or unwritable.
+
+#![cfg(target_os = "linux")]
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use axum::extract::{Path as AxumPath, State};
+use axum::routing::post;
+use axum::{Json, Router};
+use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
+use engram_chunk_store::{ChunkStore, ManifestKind};
+use engram_core::traits::{BlobStorage, SandboxBackend};
+use engram_core::types::manifest::ManifestRef;
+use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::snapshot::SnapshotMetadata;
+use engram_core::{SandboxError, SandboxId, SessionId};
+use engram_host_agent::coord_client::CoordClient;
+use engram_host_agent::disk_daemon::NbdSlotAllocator;
+use engram_host_agent::pooled_backend::PooledBackend;
+use engram_storage_local::LocalBlobStorage;
+use tokio::sync::mpsc;
+
+fn preflight() -> Option<PathBuf> {
+    let nbd_path = PathBuf::from(
+        std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
+    );
+    if !nbd_path.exists() {
+        eprintln!(
+            "SKIP: {} not present — run `sudo modprobe nbd nbds_max=4`",
+            nbd_path.display()
+        );
+        return None;
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&nbd_path)
+    {
+        Ok(_) => Some(nbd_path),
+        Err(e) => {
+            eprintln!(
+                "SKIP: cannot open {} R/W: {e} — run as root (`sudo -E`)",
+                nbd_path.display()
+            );
+            None
+        }
+    }
+}
+
+fn nbd_index(path: &Path) -> u32 {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("nbd"))
+        .and_then(|s| s.parse().ok())
+        .expect("device path must be /dev/nbdN")
+}
+
+/// Mock inner FC backend: `restore` returns immediately (we want the data
+/// plane INSTALLED, not held in-flight — the opposite of the #224 race test).
+struct ImmediateInner {
+    staging_root: PathBuf,
+    restored_id: SandboxId,
+}
+
+#[async_trait]
+impl SandboxBackend for ImmediateInner {
+    async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        Err(SandboxError::InvalidSpec("unused".into()))
+    }
+    async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
+        Err(SandboxError::InvalidSpec("unused".into()))
+    }
+    async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec("unused".into()))
+    }
+    fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+        self.staging_root.join(id.to_string())
+    }
+    fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
+        true
+    }
+    async fn restore(&self, _meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        Ok(self.restored_id)
+    }
+    async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+    async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+        Ok(Vec::new())
+    }
+}
+
+/// One publish the mock coord recorded.
+#[derive(Clone)]
+struct RecordedPublish {
+    sandbox_id: SandboxId,
+    manifest_version: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct PublishBody {
+    sandbox_id: SandboxId,
+    manifest_version: u64,
+    #[allow(dead_code)]
+    manifest_id: uuid::Uuid,
+    #[allow(dead_code)]
+    session_id: SessionId,
+}
+
+async fn live_manifest_handler(
+    State(tx): State<mpsc::UnboundedSender<RecordedPublish>>,
+    AxumPath(_host_id): AxumPath<String>,
+    Json(body): Json<PublishBody>,
+) -> Json<serde_json::Value> {
+    let _ = tx.send(RecordedPublish {
+        sandbox_id: body.sandbox_id,
+        manifest_version: body.manifest_version,
+    });
+    Json(serde_json::json!({ "outcome": "applied" }))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
+async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
+    let nbd_path = match preflight() {
+        Some(p) => p,
+        None => return,
+    };
+    let index = nbd_index(&nbd_path);
+
+    let work = tempfile::tempdir().expect("tempdir");
+
+    // A zeroed disk image chunked into the store; the resume path attaches
+    // `metadata.disk_manifest` over NBD.
+    let chunk_size = 4 * 1024 * 1024usize;
+    let image = work.path().join("disk.img");
+    let zeros = vec![0u8; chunk_size];
+    std::fs::write(&image, &zeros).expect("write image");
+
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
+    let store = ChunkStore::new(blob);
+    let manifest = store
+        .chunk_file(&image, ManifestKind::Disk, None)
+        .await
+        .expect("chunk image");
+    let disk_ref = ManifestRef::new();
+    store
+        .put_manifest(disk_ref, &manifest)
+        .await
+        .expect("put manifest");
+
+    let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
+    cache_cfg.budget_bytes = 64 * 1024 * 1024;
+    let cache = ChunkCache::new(cache_cfg);
+
+    // Stage the snapshot dir the resume path materializes into.
+    let snapshot_id = engram_core::SnapshotId::new();
+    let staging_root = work.path().join("fc-snaps");
+    let snap_dir = staging_root.join(snapshot_id.to_string());
+    std::fs::create_dir_all(&snap_dir).expect("snap dir");
+    let sidecar = serde_json::json!({
+        "sandbox_id": uuid::Uuid::new_v4(),
+        "created_at": chrono::Utc::now(),
+        "spec": {
+            "image": "t", "rootfs_source": null, "image_uri": null,
+            "harness_pack_uri": null, "cpu": {"vcpus": 1},
+            "memory": {"max_mib": 64}, "disk": {"max_gib": 1},
+            "ttl": null, "env": {}, "workdir": null,
+            "harness_substrate": null, "network": {}
+        },
+        "format": "fc"
+    });
+    std::fs::write(
+        snap_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&sidecar).unwrap(),
+    )
+    .expect("write sidecar");
+    std::fs::write(snap_dir.join("state.bin"), b"state").expect("write state");
+
+    let restored_id = SandboxId::new();
+    let inner: Arc<dyn SandboxBackend> = Arc::new(ImmediateInner {
+        staging_root,
+        restored_id,
+    });
+
+    // Tiny mock coord recording the live-manifest publish.
+    let (tx, mut rx) = mpsc::unbounded_channel::<RecordedPublish>();
+    let app = Router::new()
+        .route(
+            "/api/v1/hosts/:host_id/live-manifest",
+            post(live_manifest_handler),
+        )
+        .with_state(tx);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock coord");
+    let coord_addr = listener.local_addr().expect("addr");
+    let coord_server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // One-device NBD pool over the real /dev/nbd0.
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    assert_eq!(pool.capacity(), 1);
+
+    let host_id = engram_core::HostId::new();
+    let coord = CoordClient::new(format!("http://{coord_addr}"), None);
+
+    let pooled = Arc::new(
+        PooledBackend::new(inner)
+            .with_chunk_store(store.clone(), work.path().join("mat"))
+            .with_chunk_cache(cache)
+            .with_nbd_pool(pool.clone())
+            .with_live_manifest_coord_publisher(coord, host_id),
+    );
+
+    let metadata = SnapshotMetadata {
+        id: snapshot_id,
+        size_bytes: zeros.len() as u64,
+        created_at: chrono::Utc::now(),
+        image_version: "t".into(),
+        disk_manifest: Some(disk_ref),
+        memory_manifest: None,
+        base_memory_manifest: None,
+        migration_source: None,
+        source_sandbox_id: None,
+        state_blob_key: None,
+        sidecar_blob_key: None,
+        rootfs_blob_key: None,
+        working_set_blob_key: None,
+        aux_bundles: vec![],
+    };
+
+    // Resume: installs the NBD data plane in `nbd_sandboxes`.
+    let restored = pooled.restore(metadata).await.expect("restore");
+    assert_eq!(restored, restored_id);
+    assert!(
+        pooled.__test_nbd_sandbox_registered(restored_id),
+        "precondition: the survivor's NBD data plane must be registered",
+    );
+
+    // Bind a session so the shutdown flush can resolve a session id for its
+    // synchronous coord publish (production: notify_session_policy does this).
+    let session_id = SessionId::new();
+    pooled.__test_bind_session(restored_id, session_id);
+
+    // The acked-from-RAM write the bug discards. Write a recognizable marker
+    // into the first chunk through the live backend; do NOT flush.
+    let backend = pooled
+        .__test_nbd_backend(restored_id)
+        .expect("live backend for survivor");
+    let marker = vec![0xABu8; chunk_size];
+    backend.write(0, &marker).await.expect("dirty write");
+    assert!(
+        backend.dirty_bytes().await > 0,
+        "precondition: the write must be buffered dirty (acked from RAM, \
+         not yet durable) — this is exactly what abandon would discard",
+    );
+    let pre_flush_version = backend.manifest_ref().await.version;
+
+    // SIGTERM final-flush pass with a generous budget.
+    pooled
+        .flush_nbd_data_planes_for_shutdown(Duration::from_secs(30))
+        .await;
+
+    // ASSERTION 1: the dirty tier was DRAINED, not discarded.
+    assert_eq!(
+        backend.dirty_bytes().await,
+        0,
+        "issue #225: the survivor's un-flushed dirty write was not drained by \
+         the SIGTERM final-flush pass — abandon would have discarded it",
+    );
+
+    // ASSERTION 2: the manifest advanced and its chunks are DURABLE and
+    // reconstruct the marker — the acked write survived the shutdown.
+    let new_ref = backend.manifest_ref().await;
+    assert!(
+        new_ref.version > pre_flush_version,
+        "issue #225: the manifest_ref did not advance — no durable flush happened",
+    );
+    let published = store.get_manifest(new_ref).await.expect("durable manifest");
+    let first_chunk = published
+        .chunks
+        .iter()
+        .find(|c| c.offset == 0)
+        .expect("chunk at offset 0");
+    let bytes = store
+        .get_chunk(first_chunk.hash)
+        .await
+        .expect("durable chunk readable from store");
+    assert_eq!(
+        &bytes[..chunk_size],
+        &marker[..],
+        "issue #225: the durable chunk does not carry the acked marker bytes — \
+         the successor would rehydrate the OLD (rolled-back) data",
+    );
+
+    // ASSERTION 3: coord received the publish for this sandbox at the new
+    // version, so the successor's rehydrate picks up the current ref.
+    let recorded = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("coord publish never arrived")
+        .expect("publish channel closed");
+    assert_eq!(
+        recorded.sandbox_id, restored_id,
+        "the publish must name the survivor sandbox",
+    );
+    assert_eq!(
+        recorded.manifest_version, new_ref.version,
+        "issue #225: coord must receive the FRESHLY-FLUSHED manifest version, \
+         not the stale pre-shutdown one",
+    );
+
+    // Now the normal abandon sweep can run — it leaves the kernel device alive.
+    let abandoned = pooled.abandon_nbd_data_planes_for_shutdown();
+    assert_eq!(
+        abandoned, 1,
+        "the survivor's data plane is abandoned post-flush"
+    );
+
+    drop(pooled);
+    coord_server.abort();
+    // Operator cleanup: disconnect the left-alive device so the harness doesn't
+    // leak a bound /dev/nbdN across runs.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(index);
+}

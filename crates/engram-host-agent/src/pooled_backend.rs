@@ -620,6 +620,19 @@ pub struct PooledBackend {
     /// abandon contract exists only where NBD data planes do.
     #[cfg(target_os = "linux")]
     abandoning: Arc<std::sync::atomic::AtomicBool>,
+    /// Issue #225: the coord client + host id used to SYNCHRONOUSLY
+    /// publish a survivor's freshly-flushed `live_disk_manifest`
+    /// during the SIGTERM final-flush pass. The normal flush path
+    /// publishes through the async `live_manifest_publisher`'s
+    /// coalescing drain task — but that task is aborted on process
+    /// exit, so a manifest queued during shutdown would never reach
+    /// coord and the successor would rehydrate from the stale ref.
+    /// The shutdown pass therefore POSTs directly here, before the
+    /// process exits. Set by `with_live_manifest_coord_publisher`
+    /// (the same wiring that builds the async publisher); `None` for
+    /// the no-op / test publishers, in which case the shutdown flush
+    /// still drains chunks to GCS but skips the coord publish.
+    shutdown_manifest_publish: Option<(crate::coord_client::CoordClient, engram_core::HostId)>,
 }
 
 impl PooledBackend {
@@ -988,6 +1001,7 @@ impl PooledBackend {
             migration_roles: Arc::new(DashMap::new()),
             #[cfg(target_os = "linux")]
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_manifest_publish: None,
         }
     }
 
@@ -2252,9 +2266,14 @@ impl PooledBackend {
                 session_bindings.get(&sandbox_id).map(|e| *e)
             });
         let (publisher, handle) =
-            crate::disk_daemon::CoordLiveManifestPublisher::spawn(coord, host_id, resolver);
+            crate::disk_daemon::CoordLiveManifestPublisher::spawn(coord.clone(), host_id, resolver);
         self.live_manifest_publisher = publisher;
         self.live_manifest_publisher_handle = Some(handle);
+        // Issue #225: keep a direct handle to coord for the SIGTERM
+        // final-flush pass, which must publish synchronously (the
+        // async publisher's drain task is gone by the time the
+        // process exits).
+        self.shutdown_manifest_publish = Some((coord, host_id));
         self
     }
 
@@ -2299,6 +2318,191 @@ impl PooledBackend {
     #[doc(hidden)]
     pub fn __test_nbd_sandbox_registered(&self, id: SandboxId) -> bool {
         self.nbd_sandboxes.contains_key(&id)
+    }
+
+    /// Test-only: clone the live `ChunkedDiskBackend` Arc for a
+    /// registered sandbox. Used by the issue-#225 SIGTERM-final-flush
+    /// regression test to drive a dirty write through the same backend
+    /// the shutdown pass flushes and then assert durability.
+    #[cfg(target_os = "linux")]
+    #[doc(hidden)]
+    pub fn __test_nbd_backend(
+        &self,
+        id: SandboxId,
+    ) -> Option<Arc<crate::disk_daemon::ChunkedDiskBackend>> {
+        self.nbd_sandboxes.get(&id).map(|e| e.backend.clone())
+    }
+
+    /// Test-only: bind a sandbox to a session in `session_bindings`,
+    /// the same index `notify_session_policy` / registration populate.
+    /// The issue-#225 test uses it so the shutdown flush can resolve a
+    /// session id for its (mock) coord publish.
+    #[cfg(target_os = "linux")]
+    #[doc(hidden)]
+    pub fn __test_bind_session(&self, sandbox_id: SandboxId, session_id: SessionId) {
+        self.session_bindings.insert(sandbox_id, session_id);
+    }
+
+    /// Issue #225: SIGTERM final-flush pass. NBD WRITEs are acked to
+    /// the guest the instant the bytes land in the backend's in-RAM
+    /// `dirty` tier; durability rides the FlushScheduler's ~30 s /
+    /// 256 MiB cadence. A routine pod roll abandons each data plane
+    /// (`abandon_for_shutdown` → `drop(backend)`) WITHOUT a final
+    /// flush, discarding up to one cadence-window of ACKED writes —
+    /// the VM keeps running (K2 contract) but the successor rehydrates
+    /// from the last *published* manifest, silently rolling the live
+    /// guest's disk back under it. This pass closes that window: per
+    /// surviving sandbox, in parallel and under a hard deadline, it
+    /// quiesces in-flight I/O (`wait_idle`) then runs a full `flush()`
+    /// (drain → GCS upload → manifest rebase) and SYNCHRONOUSLY
+    /// publishes the new `live_disk_manifest` to coord — so the
+    /// successor's existing rehydrate path picks up the current ref.
+    ///
+    /// MUST run BEFORE `abandon_nbd_data_planes_for_shutdown`: this
+    /// only flushes, it does not tear anything down, so the abandon
+    /// sweep still runs afterward to leave the kernel-side devices
+    /// alive for the successor. The whole pass is budgeted against
+    /// `deadline` (derived from the pod's `terminationGracePeriodSeconds`
+    /// minus headroom). Any sandbox not flushed within the budget is
+    /// logged LOUDLY with its id + dirty byte count so the (now bounded)
+    /// loss is at least visible — it is then abandoned dirty by the
+    /// following sweep, exactly as before this fix.
+    ///
+    /// The synchronous coord publish is deliberate: the normal flush
+    /// path publishes via the async `live_manifest_publisher`, whose
+    /// coalescing drain task is aborted on process exit — a manifest
+    /// queued there during shutdown would never reach coord. When no
+    /// coord publisher is wired (`shutdown_manifest_publish` is `None`:
+    /// no-op / test publishers) the chunks are still durably uploaded
+    /// to GCS; only the coord publish is skipped.
+    #[cfg(target_os = "linux")]
+    pub async fn flush_nbd_data_planes_for_shutdown(&self, deadline: std::time::Duration) {
+        let entries: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
+            .nbd_sandboxes
+            .iter()
+            .map(|e| (*e.key(), e.value().backend.clone()))
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let total = entries.len();
+        tracing::info!(
+            sandboxes = total,
+            deadline_secs = deadline.as_secs_f64(),
+            "SIGTERM: final disk-flush pass over surviving NBD data planes",
+        );
+
+        // Fan out one flush future per sandbox; each resolves the
+        // session binding + does the synchronous coord publish itself.
+        // Budget the WHOLE fan-out against `deadline` — a single
+        // tokio::time::timeout around the join handles the per-sandbox
+        // parallelism + the global cap in one place.
+        let publish = self.shutdown_manifest_publish.clone();
+        let session_bindings = self.session_bindings.clone();
+        let flush_all = async move {
+            let mut tasks = Vec::with_capacity(entries.len());
+            for (sandbox_id, backend) in entries {
+                let publish = publish.clone();
+                let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
+                tasks.push(tokio::spawn(async move {
+                    // Quiesce the virtio → kernel-NBD → daemon pipeline so
+                    // the flush captures the just-acked disk state, then
+                    // drain + upload + rebase. `flush` no-ops (zero chunks)
+                    // when the dirty tier is empty — cheap for quiescent
+                    // survivors.
+                    backend.wait_idle().await;
+                    let outcome = match backend.flush().await {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::warn!(
+                                %sandbox_id,
+                                error = %e,
+                                "SIGTERM final flush failed; survivor abandoned dirty \
+                                 (successor may roll back its un-flushed writes)",
+                            );
+                            return;
+                        }
+                    };
+                    if outcome.chunks_flushed == 0 {
+                        // Nothing to publish — survivor was already clean.
+                        return;
+                    }
+                    tracing::info!(
+                        %sandbox_id,
+                        chunks = outcome.chunks_flushed,
+                        bytes = outcome.bytes_uploaded,
+                        manifest_version = outcome.manifest_ref.version,
+                        "SIGTERM final flush uploaded survivor's dirty chunks",
+                    );
+                    // Synchronously publish so the successor rehydrates
+                    // from the just-uploaded ref instead of the stale one.
+                    let (Some((coord, host_id)), Some(session_id)) = (publish, session_id) else {
+                        // No coord wired, or the sandbox isn't bound to a
+                        // session yet (warm-pool / pre-start_agent window).
+                        // The chunks are durable in GCS regardless; the
+                        // publish is what we cannot do here.
+                        tracing::debug!(
+                            %sandbox_id,
+                            "SIGTERM final flush: chunks durable in GCS but no \
+                             coord publish (unbound sandbox or no publisher)",
+                        );
+                        return;
+                    };
+                    let req = crate::coord_client::LiveManifestPublishRequest {
+                        session_id,
+                        sandbox_id,
+                        manifest_id: outcome.manifest_ref.manifest_id,
+                        manifest_version: outcome.manifest_ref.version,
+                    };
+                    match coord.publish_live_manifest(host_id, &req).await {
+                        Ok(_) => tracing::info!(
+                            %sandbox_id,
+                            %session_id,
+                            manifest_version = outcome.manifest_ref.version,
+                            "SIGTERM final flush: live_disk_manifest published to coord",
+                        ),
+                        Err(e) => tracing::warn!(
+                            %sandbox_id,
+                            %session_id,
+                            error = %e,
+                            "SIGTERM final flush: chunks uploaded to GCS but coord \
+                             publish failed; successor may rehydrate from the stale ref",
+                        ),
+                    }
+                }));
+            }
+            for t in tasks {
+                let _ = t.await;
+            }
+        };
+
+        if tokio::time::timeout(deadline, flush_all).await.is_err() {
+            // Deadline overrun: some survivors were not flushed in time.
+            // Log each still-dirty sandbox LOUDLY with its byte count so
+            // the (bounded) loss is visible; the abandon sweep that runs
+            // next discards them dirty, exactly as before this fix.
+            // INVARIANT (see `nbd_sandboxes`): snapshot id+backend Arcs out
+            // of the map, then `.await` on the owned Arcs — never hold a
+            // DashMap guard across the `dirty_bytes` await.
+            let stragglers: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
+                .nbd_sandboxes
+                .iter()
+                .map(|e| (*e.key(), e.value().backend.clone()))
+                .collect();
+            for (sandbox_id, backend) in stragglers {
+                let dirty = backend.dirty_bytes().await;
+                if dirty > 0 {
+                    tracing::error!(
+                        %sandbox_id,
+                        dirty_bytes = dirty,
+                        deadline_secs = deadline.as_secs_f64(),
+                        "SIGTERM final flush DEADLINE OVERRUN: survivor abandoned with \
+                         un-flushed dirty bytes; the successor will roll back these \
+                         acked guest writes",
+                    );
+                }
+            }
+        }
     }
 
     /// ADR 0044 K2 graceful shutdown: abandon every live NBD data
