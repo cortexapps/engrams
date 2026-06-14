@@ -1203,6 +1203,26 @@ impl HostAgent {
                             "swept stale eviction-inflight markers (>180s); spawned POSTs presumed wedged",
                         );
                     }
+                    // Issue #219: same hardening for `shell_attached`.
+                    // A shell pin is acquired/released by two independent
+                    // coord→host RPCs from the coord's WS bridge task. If
+                    // that task dies without sending ReleaseShell (coord
+                    // pod killed mid-session, dropped WS), the pin would
+                    // stay ≥1 forever, exempting the sandbox from idle
+                    // eviction — hard-TTL backstop included. The coord
+                    // bridge renews live pins on its keepalive interval;
+                    // reap any pin we've stopped hearing about so it
+                    // falls back under the normal TTLs.
+                    let stale_shells =
+                        eviction_hub.sweep_stale_shells(crate::harness::SHELL_PIN_STALE_AGE);
+                    if !stale_shells.is_empty() {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            count = stale_shells.len(),
+                            "swept stale shell pins (un-renewed past SHELL_PIN_STALE_AGE); \
+                             coord WS bridge presumed dead",
+                        );
+                    }
                     // `idle_sandboxes` now skips sandboxes whose prior
                     // POST is still in flight (ADR 0016 §A.1.5a).
                     let mut pairs = eviction_hub.idle_sandboxes(idle_soft_ttl, idle_hard_ttl);

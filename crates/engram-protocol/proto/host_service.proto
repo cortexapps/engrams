@@ -112,6 +112,11 @@ service HostService {
   // ADR 0011 follow-up #3.
   rpc AcquireShell(SandboxIdMessage) returns (Empty);
   rpc ReleaseShell(SandboxIdMessage) returns (Empty);
+  // Issue #219: refresh the keep-alive stamp on a live shell pin. The
+  // coord shell bridge calls this on its WS-keepalive interval so the
+  // host can reap pins whose coord-side bridge died without a
+  // ReleaseShell (rolling deploy, crash, dropped WS).
+  rpc RenewShell(SandboxIdMessage) returns (Empty);
 
   // ---- admin (ADR 0011 follow-up #1: HostAdminHandler folded in) ----
   rpc ReapMaterializeDir(ReapMaterializeDirRequest) returns (ReapMaterializeDirResponse);
