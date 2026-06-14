@@ -6,4 +6,12 @@ components = ["rustfmt", "clippy"]
 # scratch) without depending on a specific glibc / dynamic-linker
 # location. The Nix dev shell brings glibc/ld-linux from /nix/store,
 # which makes a glibc-linked binary unbootable inside a baked image.
-targets = ["x86_64-unknown-linux-musl"]
+#
+# aarch64-unknown-linux-musl: the native arch of Apple-Silicon dev
+# machines, so `cargo clippy/check --target aarch64-unknown-linux-musl`
+# type-checks all the cfg(target_os = "linux") code (FC backend, uffd
+# handler, host-agent disk/netlink) locally at full speed — no x86
+# emulation, no dev-vm round-trip. Listing it here makes both rustup
+# and the Nix dev shell (flake reads this file via
+# `rust-bin.fromRustupToolchainFile`) ship that target's std.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
