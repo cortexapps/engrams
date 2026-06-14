@@ -19,6 +19,38 @@ impl HostStatus {
             Self::Dead => "dead",
         }
     }
+
+    /// The legal host-lifecycle edge table — the host-state analogue of
+    /// [`crate::types::SessionState::can_transition_to`]. Host status is
+    /// reported two ways (the agent's self-reported `draining` shutdown
+    /// flag, and the coordinator's dead-host sweep), so unlike session
+    /// state it isn't gated by a single CAS writer; this predicate is the
+    /// guard that keeps the writers honest where it matters.
+    ///
+    /// ```text
+    /// Ready    -> Draining (agent preStop / coordinator drive)
+    ///           | Dead     (dead-host sweep)
+    /// Draining -> Ready    (host came back from a self-reported drain)
+    ///           | Dead     (dead-host sweep)
+    /// Dead     -> (terminal via heartbeat) — a `dead` row returns ONLY
+    ///             via an explicit `POST /api/hosts/register`
+    ///             (`upsert_host`, which hardcodes `Ready`), never on the
+    ///             host's next heartbeat. A merely-partitioned host that
+    ///             the sweep marked `dead` (and whose sessions it
+    ///             orphaned) must NOT silently flip back to `ready` and
+    ///             resume taking placements with its sessions unbound.
+    /// ```
+    ///
+    /// Self-transitions return `false`: a no-op status write carries no
+    /// new information and is almost certainly a racing writer.
+    pub const fn can_transition_to(&self, target: Self) -> bool {
+        use HostStatus::*;
+        match self {
+            Ready => matches!(target, Draining | Dead),
+            Draining => matches!(target, Ready | Dead),
+            Dead => false,
+        }
+    }
 }
 
 /// Static identification info reported by a host's CloudBackend.
@@ -233,4 +265,76 @@ pub struct PreemptionNotice {
     /// `None` if the cloud doesn't surface a deadline.
     pub deadline_secs: Option<u32>,
     pub received_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [HostStatus; 3] = [HostStatus::Ready, HostStatus::Draining, HostStatus::Dead];
+
+    /// Exhaustive `{from} × {to}` table — the host-state mirror of the
+    /// session-state transition test. Every pair is asserted explicitly
+    /// so adding/removing an edge forces this table to be updated, and a
+    /// silent widening of the legal set can't slip through.
+    #[test]
+    fn host_status_transition_table_is_exhaustive() {
+        use HostStatus::*;
+        let legal = |from: HostStatus, to: HostStatus| -> bool {
+            matches!(
+                (from, to),
+                (Ready, Draining) | (Ready, Dead) | (Draining, Ready) | (Draining, Dead)
+            )
+        };
+        for &from in &ALL {
+            for &to in &ALL {
+                assert_eq!(
+                    from.can_transition_to(to),
+                    legal(from, to),
+                    "edge {from:?} -> {to:?} disagrees with the expected table",
+                );
+            }
+        }
+    }
+
+    /// The load-bearing invariant for issue #230: a `dead` host can never
+    /// transition anywhere via the predicate (self-transitions included),
+    /// so the only way back to `ready` is an explicit re-register.
+    #[test]
+    fn dead_is_terminal() {
+        for &to in &ALL {
+            assert!(
+                !HostStatus::Dead.can_transition_to(to),
+                "dead -> {to:?} must be illegal; a partitioned host marked \
+                 dead must not resurrect on its next heartbeat",
+            );
+        }
+    }
+
+    #[test]
+    fn self_transitions_are_illegal() {
+        for &s in &ALL {
+            assert!(
+                !s.can_transition_to(s),
+                "self-transition {s:?} -> {s:?} carries no new information",
+            );
+        }
+    }
+
+    #[test]
+    fn host_status_serializes_lowercase() {
+        for (variant, wire) in [
+            (HostStatus::Ready, "ready"),
+            (HostStatus::Draining, "draining"),
+            (HostStatus::Dead, "dead"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                serde_json::json!(wire)
+            );
+            let back: HostStatus = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
+            assert_eq!(back, variant);
+            assert_eq!(variant.as_str(), wire);
+        }
+    }
 }
