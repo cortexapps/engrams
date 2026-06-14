@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -132,6 +133,17 @@ struct HubInner {
     /// entries whose spawned task wedged (>180s — see eviction
     /// task code).
     eviction_inflight: Mutex<HashMap<SandboxId, Instant>>,
+    /// Monotonic generation counter (issue #218). Each `drive_attached`
+    /// task takes a fresh value via `fetch_add` before it inserts its
+    /// `ConnectionHandle`, stamping the handle with that generation.
+    /// The teardown epilogue then removes the per-sandbox entries ONLY
+    /// if the currently-registered handle still carries its own
+    /// generation — so a stale connection's EOF can never delete the
+    /// registration a newer reconnect installed under the same
+    /// `sandbox_id`. Relaxed ordering is sufficient: correctness rests
+    /// on uniqueness + the `connections` mutex serializing the compare,
+    /// not on cross-thread happens-before of the counter itself.
+    next_gen: AtomicU64,
 }
 
 struct ConnectionHandle {
@@ -145,6 +157,11 @@ struct ConnectionHandle {
     /// Stored on the connection so the idle evictor can return
     /// `(SessionId, SandboxId)` pairs without a separate lookup.
     session_id: SessionId,
+    /// Per-hub-unique generation stamped at insert (issue #218). The
+    /// teardown epilogue compares the live entry's generation against
+    /// its own before removing, so a stale connection never evicts the
+    /// replacement registration that a reconnect installed.
+    generation: u64,
 }
 
 impl HarnessHub {
@@ -176,6 +193,7 @@ impl HarnessHub {
                 session_to_sandbox: Mutex::new(HashMap::new()),
                 shell_attached: Mutex::new(HashMap::new()),
                 eviction_inflight: Mutex::new(HashMap::new()),
+                next_gen: AtomicU64::new(0),
             }),
         }
     }
@@ -652,10 +670,23 @@ async fn drive_attached<R, W>(
     );
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessFrame>(32);
+    // Issue #218: stamp this connection with a per-hub-unique
+    // generation BEFORE the insert. On reconnect (agentd kills the old
+    // adapter, the new one redials over vsock) two `drive_attached`
+    // tasks race on the same `sandbox_id`: the new one's `insert`
+    // replaces the old handle, and the old one's reader then hits EOF
+    // and runs its teardown epilogue. Without an identity check that
+    // epilogue would unconditionally remove the *new* registration,
+    // leaving a live-but-unregistered adapter (prompts bounce
+    // NotAttached, the writer half is torn down, the session vanishes
+    // from idle detection). The generation lets the epilogue remove
+    // only when it still owns the live entry.
+    let my_generation = inner.next_gen.fetch_add(1, Ordering::Relaxed);
     let handle = ConnectionHandle {
         cmd_tx,
         pending_checkpoint: Mutex::new(None),
         session_id: attach.session_id,
+        generation: my_generation,
     };
     inner.connections.lock().insert(sandbox_id, handle);
     // Seed only `last_event_at` at attach — the hard TTL needs an
@@ -681,9 +712,31 @@ async fn drive_attached<R, W>(
 
     let writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
     let reader_outcome = reader_loop(reader, &inner, attach.session_id, sandbox_id).await;
-    inner.connections.lock().remove(&sandbox_id);
-    inner.last_event_at.lock().remove(&sandbox_id);
-    inner.last_idle_at.lock().remove(&sandbox_id);
+    // Issue #218: guarded teardown. Only remove the per-sandbox entries
+    // if the live `connections` registration is STILL ours — i.e. no
+    // newer connection has replaced us under the same `sandbox_id`. A
+    // reconnect inserts a fresh handle with a higher generation; if we
+    // see a different generation (or no entry), a newer connection now
+    // owns these entries and we must leave all three untouched.
+    //
+    // We acquire all three locks in the canonical order (last_event_at
+    // → last_idle_at → connections; see HubInner docs / issue #217) and
+    // hold them across the compare-and-remove so the decision and the
+    // removals are atomic versus a concurrent attach/eviction tick.
+    {
+        let mut event_at = inner.last_event_at.lock();
+        let mut idle_at = inner.last_idle_at.lock();
+        let mut conns = inner.connections.lock();
+        let still_ours = conns
+            .get(&sandbox_id)
+            .map(|h| h.generation == my_generation)
+            .unwrap_or(false);
+        if still_ours {
+            conns.remove(&sandbox_id);
+            event_at.remove(&sandbox_id);
+            idle_at.remove(&sandbox_id);
+        }
+    }
     let _ = writer_task.await;
     if let Err(e) = reader_outcome {
         tracing::debug!(
@@ -1622,5 +1675,153 @@ mod tests {
         // Tear down the harness reader.
         harness_task.abort();
         let _ = harness_task.await;
+    }
+
+    /// Regression for issue #218: a stale connection's teardown must
+    /// never remove the registration a newer reconnect installed under
+    /// the same `sandbox_id`.
+    ///
+    /// Models the documented resume/re-prompt sequence: connection A is
+    /// attached, then agentd kills its adapter and the replacement
+    /// adapter B redials and attaches (replacing A's handle under the
+    /// same `sandbox_id`). A's reader then observes EOF and runs its
+    /// teardown epilogue. Before the fix that epilogue did an
+    /// unconditional keyed remove, deleting B's live registration plus
+    /// its idle-tracking timestamps — leaving a healthy adapter that
+    /// bounces every prompt with `NotAttached`, has its writer half torn
+    /// down, and disappears from idle detection.
+    ///
+    /// The test forces the bad interleaving deterministically: it brings
+    /// up A, then brings up B and waits for B to own the registration,
+    /// and only THEN drops A's harness end so A's EOF epilogue runs
+    /// strictly after B's attach. It asserts B still owns
+    /// `connections[S]` and that a `send_prompt` flows through to B's
+    /// live writer (i.e. B's writer half stayed open).
+    #[tokio::test]
+    async fn stale_teardown_does_not_evict_replacement_connection() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+
+        // --- Connection A: attach and register. ---
+        let (host_a, harness_a) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_a);
+        let (mut a_r, mut a_w) = tokio::io::split(harness_a);
+        write_msg(
+            &mut a_w,
+            &HarnessAttach {
+                session_id,
+                harness_version: "test-A/0.1".into(),
+            },
+        )
+        .await
+        .expect("A attach");
+        let ack_a: HarnessAttachAck = read_msg(&mut a_r).await.expect("A ack");
+        assert!(ack_a.ok, "A should attach");
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "A should be registered",
+        );
+        let gen_a = hub
+            .inner
+            .connections
+            .lock()
+            .get(&sandbox_id)
+            .map(|h| h.generation)
+            .expect("A registered");
+
+        // --- Connection B: the replacement adapter redials and
+        // attaches under the SAME sandbox_id (later binds replace
+        // earlier ones). Its insert overwrites A's handle. ---
+        let (host_b, harness_b) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_b);
+        let (mut b_r, mut b_w) = tokio::io::split(harness_b);
+        write_msg(
+            &mut b_w,
+            &HarnessAttach {
+                session_id,
+                harness_version: "test-B/0.1".into(),
+            },
+        )
+        .await
+        .expect("B attach");
+        let ack_b: HarnessAttachAck = read_msg(&mut b_r).await.expect("B ack");
+        assert!(ack_b.ok, "B should attach");
+
+        // Wait until B owns the registration (a strictly newer
+        // generation than A's is in the map). This makes the rest of
+        // the test deterministic regardless of task scheduling.
+        assert!(
+            wait_until(|| {
+                hub.inner
+                    .connections
+                    .lock()
+                    .get(&sandbox_id)
+                    .map(|h| h.generation != gen_a)
+                    .unwrap_or(false)
+            })
+            .await,
+            "B should have replaced A's registration",
+        );
+
+        // --- Now drop A's harness end so A's reader hits EOF and runs
+        // its teardown epilogue STRICTLY after B's attach. This is the
+        // exact stale-teardown ordering from the bug report. ---
+        drop(a_r);
+        drop(a_w);
+
+        // Give A's epilogue ample opportunity to run. With the bug it
+        // would remove B's registration here; with the fix the
+        // generation guard leaves B's entry untouched.
+        assert!(
+            wait_until(|| {
+                // The bug manifests as the entry disappearing; the fix
+                // keeps exactly B's entry. We wait for the map to be
+                // observed at least once after A's drop, then assert
+                // below — but a positive condition keeps this honest:
+                // B must remain registered.
+                hub.attached_count() == 1
+            })
+            .await,
+            "B's registration must survive A's stale teardown",
+        );
+        // A small extra settle so a late, buggy epilogue would have
+        // fired before the hard assertions below.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            hub.attached_count(),
+            1,
+            "exactly B must remain registered after A's teardown",
+        );
+        let live_gen = hub
+            .inner
+            .connections
+            .lock()
+            .get(&sandbox_id)
+            .map(|h| h.generation)
+            .expect("B must still be registered after A's stale teardown");
+        assert_ne!(
+            live_gen, gen_a,
+            "the surviving registration must be B's, not A's",
+        );
+
+        // B's writer half must still be open: a prompt must flow through
+        // to B's harness end. Before the fix the teardown dropped B's
+        // cmd_tx, which made B's writer_loop exit and close the write
+        // half — so this send would fail / never arrive.
+        hub.send_prompt(sandbox_id, "hello-B".into())
+            .await
+            .expect("send_prompt must reach B's live writer");
+        let frame: HarnessFrame = read_msg(&mut b_r)
+            .await
+            .expect("B should receive the prompt");
+        match frame {
+            HarnessFrame::Command(HarnessCommand::Prompt { text }) => {
+                assert_eq!(text, "hello-B");
+            }
+            other => panic!("expected a Prompt frame at B, got {other:?}"),
+        }
     }
 }
