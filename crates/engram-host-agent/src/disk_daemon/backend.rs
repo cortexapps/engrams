@@ -362,6 +362,27 @@ pub struct ChunkedDiskBackend {
     /// page-in shows up in that operation's trace. Default = inactive
     /// (steady state → 0d metrics only).
     operation_scope: crate::trace_scope::OperationScope,
+
+    /// Issue #204 regression test seam: an optional async barrier fired by
+    /// `flush_local` AFTER it has moved the drained chunks into the held
+    /// `pending` map but BEFORE it releases the `pending`+`dirty` locks —
+    /// i.e. exactly the instant the pre-fix code left a chunk in NO tier.
+    /// The test parks `flush_local` here and races a concurrent read/write
+    /// of a drained index to prove the dirty→pending handoff is atomic.
+    /// `None` in every non-test build/path (no runtime cost).
+    #[cfg(test)]
+    flush_local_handoff_seam: std::sync::Mutex<Option<FlushHandoffSeam>>,
+}
+
+/// Issue #204: the two-phase handshake a test installs to pause
+/// `flush_local` at the dirty→pending handoff. `flush_local` signals
+/// `arrived` once it reaches the seam (locks held), then awaits
+/// `proceed`; the test releases `proceed` after it has launched the
+/// racing read/write.
+#[cfg(test)]
+struct FlushHandoffSeam {
+    arrived: Arc<Notify>,
+    proceed: Arc<Notify>,
 }
 
 /// ADR 0018 commit 12m — see `ChunkedDiskBackend::in_flight`.
@@ -615,6 +636,8 @@ impl ChunkedDiskBackend {
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
+            #[cfg(test)]
+            flush_local_handoff_seam: std::sync::Mutex::new(None),
         })
     }
 
@@ -653,6 +676,8 @@ impl ChunkedDiskBackend {
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
+            #[cfg(test)]
+            flush_local_handoff_seam: std::sync::Mutex::new(None),
         })
     }
 
@@ -850,6 +875,12 @@ impl ChunkedDiskBackend {
         // Cheap pre-check: if the chunk is already in dirty, skip
         // the base fetch entirely. Holding the dirty lock briefly
         // here is fine — a HashMap::contains_key is constant-time.
+        //
+        // Issue #204 lock order: like `read_chunk`, this path takes `dirty`
+        // and `pending` SEQUENTIALLY (each scoped guard released before the
+        // next is acquired) — never nested. `flush_local` nests
+        // pending⟶dirty; a `dirty`-then-`pending` nest here would invert it
+        // and could deadlock, so keep these acquisitions disjoint.
         let already_present = self.dirty.lock().await.contains_key(&chunk_idx);
         let prefetched_base: Option<Vec<u8>> = if already_present {
             None
@@ -1004,23 +1035,39 @@ impl ChunkedDiskBackend {
         // an EARLIER drain could publish/rebase after a LATER drain
         // already did, overwriting the newer chunk with the older hash.
         let flush_guard = self.flush_pipeline.clone().lock_owned().await;
+        // Issue #204: the dirty→pending handoff must be ATOMIC w.r.t.
+        // readers/writers. Acquire the `pending` lock BEFORE draining
+        // `dirty`, and hold BOTH across the drain+insert move, so a drained
+        // chunk is never absent from both tiers for any instant. The old
+        // code drained + dropped the dirty lock, then took `pending`
+        // separately — between those two acquisitions a chunk lived in NO
+        // tier: a concurrent `read_chunk` fell through to the stale `base`
+        // (transient stale read), and a concurrent `write_chunk` RMW'd from
+        // the stale base and re-inserted into `dirty`, permanently shadowing
+        // the just-drained bytes (silent lost write on the next publish).
+        //
+        // Lock order on the flush path: flush_pipeline ⟶ pending ⟶ dirty.
+        // This is safe against `read_chunk`/`write_chunk`, which take
+        // `dirty` and `pending` only SEQUENTIALLY (each released before the
+        // other is acquired) — they never NEST the two in any order — so
+        // there is no opposite-order nested acquisition to deadlock against.
+        let mut pending = self.pending_uploads.lock().await;
         let mut dirty_guard = self.dirty.lock().await;
         if dirty_guard.is_empty() {
             // Nothing to publish ⟹ nothing to serialize; release the
             // pipeline guard immediately (don't carry it through an
             // empty no-op flush_upload, which would needlessly block a
             // concurrent flush).
+            drop(dirty_guard);
+            drop(pending);
             drop(flush_guard);
             return Ok(PendingDiskFlush {
                 new_chunks: Vec::new(),
                 flush_guard: None,
             });
         }
-        let drained: Vec<(usize, Vec<u8>)> = dirty_guard.drain().collect();
-        drop(dirty_guard);
-        let mut new_chunks: Vec<(usize, ChunkHash, Bytes)> = Vec::with_capacity(drained.len());
-        let mut pending = self.pending_uploads.lock().await;
-        for (chunk_idx, bytes) in drained {
+        let mut new_chunks: Vec<(usize, ChunkHash, Bytes)> = Vec::with_capacity(dirty_guard.len());
+        for (chunk_idx, bytes) in dirty_guard.drain() {
             let bytes = Bytes::from(bytes);
             // Local hash — identical to what `put_chunk` computes, so the
             // manifest `flush_upload` builds is consistent with the
@@ -1030,14 +1077,46 @@ impl ChunkedDiskBackend {
             // flush window. `flush_upload` uploads from `new_chunks`'s own
             // bytes (carried below), NOT from this shared map — so a
             // concurrent flush clearing `pending[idx]` can't make us skip
-            // a put.
+            // a put. Because we still hold the `dirty` lock here, the chunk
+            // is in `dirty` (until `drain` consumes it) and lands in
+            // `pending` under the same critical section — never in neither.
             pending.insert(chunk_idx, (hash, bytes.clone()));
             new_chunks.push((chunk_idx, hash, bytes));
         }
+        // Issue #204 regression seam: fire while BOTH locks are still held,
+        // i.e. at the exact instant the pre-fix code left a chunk tier-less.
+        #[cfg(test)]
+        {
+            let seam = self.flush_local_handoff_seam.lock().unwrap().take();
+            if let Some(seam) = seam {
+                seam.arrived.notify_one();
+                let proceed = seam.proceed.notified();
+                tokio::pin!(proceed);
+                proceed.await;
+            }
+        }
+        drop(dirty_guard);
+        drop(pending);
         Ok(PendingDiskFlush {
             new_chunks,
             flush_guard: Some(flush_guard),
         })
+    }
+
+    /// Issue #204 test-only: arm the `flush_local` dirty→pending handoff
+    /// seam. The returned `(arrived, proceed)` pair lets a test park
+    /// `flush_local` at the handoff (both locks held) and then race a
+    /// concurrent read/write. `arrived` fires once `flush_local` reaches
+    /// the seam; `flush_local` blocks until the test notifies `proceed`.
+    #[cfg(test)]
+    fn arm_flush_handoff_seam(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let arrived = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        *self.flush_local_handoff_seam.lock().unwrap() = Some(FlushHandoffSeam {
+            arrived: arrived.clone(),
+            proceed: proceed.clone(),
+        });
+        (arrived, proceed)
     }
 
     /// ADR 0038 B3 — phase 2 (runs post-resume on the snapshot path):
@@ -1691,6 +1770,13 @@ impl ChunkedDiskBackend {
     ) -> Result<Bytes, DiskBackendError> {
         // Dirty buffer wins. Hold the lock only long enough to
         // clone the bytes; chunk reads are O(N) memcpy.
+        //
+        // Issue #204 lock order: this path consults `dirty` then `pending`
+        // SEQUENTIALLY — the `dirty` lock is released (end of this scope)
+        // BEFORE the `pending` lock is taken below. It must NEVER nest the
+        // two (hold `dirty` across the `pending` acquisition), because
+        // `flush_local` nests pending⟶dirty; a `dirty`-then-`pending` nest
+        // here would invert that order and risk deadlock.
         {
             let dirty = self.dirty.lock().await;
             if let Some(buf) = dirty.get(&chunk_idx) {
@@ -2119,6 +2205,108 @@ mod tests {
              (stale-base RMW would resurrect the pre-flush base here)",
         );
         assert!(bytes[2048..].iter().all(|b| *b == 0x22), "wave-2 bytes");
+    }
+
+    /// Issue #204: the dirty→pending handoff inside `flush_local` must be
+    /// ATOMIC w.r.t. concurrent readers/writers. The pre-fix code drained
+    /// `dirty`, dropped the dirty lock, then took `pending` separately — so
+    /// for an instant a drained chunk lived in NO tier. A `read` in that gap
+    /// fell through to the stale `base` (transient stale read); a `write` in
+    /// that gap RMW'd from stale base and re-inserted into `dirty`,
+    /// permanently shadowing the drained bytes (silent lost write).
+    ///
+    /// This test installs a seam that parks `flush_local` at exactly that
+    /// handoff point (with the fix: both locks held) and races a read AND a
+    /// write of the drained chunk. It asserts:
+    ///   (a) the racing read returns the DRAINED content, never stale base;
+    ///   (b) the racing write merges onto the drained content (not stale
+    ///       base), so a subsequent flush publishes the correct bytes.
+    /// On the pre-fix code (a) reads base and (b) loses the drained half,
+    /// so this fails; with the fix both readers/writers block on the held
+    /// `pending` lock until the handoff completes and observe drained truth.
+    #[tokio::test]
+    async fn flush_local_handoff_is_atomic_no_tierless_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 4096u64;
+        // Base chunk is all-0xaa — the "stale base" the gap would serve.
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend = Arc::new(
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap(),
+        );
+
+        // Guest writes the WHOLE chunk to 0x11 (acked) — this is the
+        // content the flush is about to drain.
+        backend.write(0, &[0x11u8; 4096]).await.unwrap();
+
+        // Arm the seam, then run flush_local on a task; it will park at the
+        // dirty→pending handoff with both locks held.
+        let (arrived, proceed) = backend.arm_flush_handoff_seam();
+        let flush_backend = backend.clone();
+        let flush_task = tokio::spawn(async move { flush_backend.flush_local().await.map(|_| ()) });
+
+        // Wait until flush_local has reached the seam (chunk drained,
+        // handoff in progress).
+        arrived.notified().await;
+
+        // Race a READ and a WRITE of the drained chunk against the handoff.
+        // With the fix these block on the held `pending` lock; with the bug
+        // they slip through the tier-less gap and hit stale base.
+        let read_backend = backend.clone();
+        let read_task = tokio::spawn(async move { read_backend.read(0, 4096).await });
+        let write_backend = backend.clone();
+        // Overwrite the SECOND half to 0x22; the first half must remain the
+        // drained 0x11 (a stale-base RMW would resurrect 0xaa there).
+        let write_task =
+            tokio::spawn(async move { write_backend.write(2048, &[0x22u8; 2048]).await });
+
+        // Give the racing ops a chance to wedge against the held locks
+        // (or, on the buggy code, to race through the gap), then complete
+        // the handoff.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        proceed.notify_one();
+
+        flush_task.await.unwrap().unwrap();
+        let read_bytes = read_task.await.unwrap().unwrap();
+        write_task.await.unwrap().unwrap();
+
+        // (a) The racing read must observe the drained content (0x11),
+        // never the pre-flush base (0xaa).
+        assert!(
+            read_bytes.iter().all(|b| *b == 0x11),
+            "racing read in the flush handoff window served stale base \
+             instead of the drained content (issue #204 tier-less gap)",
+        );
+
+        // (b) The racing write must have RMW'd from the drained content:
+        // first half stays 0x11, second half becomes 0x22. A stale-base RMW
+        // would leave 0xaa in the first half and lose the acked write.
+        let after = backend.read(0, 4096).await.unwrap();
+        assert!(
+            after[..2048].iter().all(|b| *b == 0x11),
+            "drained bytes were shadowed by a stale-base RMW during the \
+             flush handoff (silent lost write, issue #204)",
+        );
+        assert!(
+            after[2048..].iter().all(|b| *b == 0x22),
+            "racing write's bytes missing after the handoff",
+        );
+
+        // (c) A subsequent flush publishes the merged-correct content (the
+        // write landed in `dirty` after the drain, so it flushes cleanly).
+        backend.flush().await.unwrap();
+        let published = backend.read(0, 4096).await.unwrap();
+        assert!(published[..2048].iter().all(|b| *b == 0x11));
+        assert!(published[2048..].iter().all(|b| *b == 0x22));
     }
 
     /// NBD durability: a read whose backing chunk blob is missing must
