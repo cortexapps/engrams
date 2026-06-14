@@ -1016,32 +1016,14 @@ impl FirecrackerBackend {
         &self,
         metadata: SnapshotMetadata,
         swap_aux_to_current: bool,
-        // ADR 0049 follow-up: the per-restore rootfs device path (the
-        // pooled backend's unique `/dev/nbdN`). `Some` ⇒ authoritative
-        // over the shared sidecar's `spec.rootfs_source`; `None` ⇒ keep
-        // the sidecar value (non-NBD / direct callers).
-        rootfs_override: Option<PathBuf>,
     ) -> Result<SandboxId, SandboxError> {
         // ADR 0007 Phase 6: backend looks up its own staging dir.
         let src = self.snapshot_dir_for(metadata.id);
         let manifest_bytes = tokio::fs::read(src.join("manifest.json"))
             .await
             .map_err(|e| SandboxError::Snapshot(format!("read manifest: {e}")))?;
-        let mut manifest: FcSnapshotManifest = serde_json::from_slice(&manifest_bytes)
+        let manifest: FcSnapshotManifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
-
-        // ADR 0049 follow-up (same-base concurrent-restore corruption):
-        // the sidecar at `snapshots/<base>/manifest.json` is SHARED by
-        // every same-base restore, and each patches its own device into
-        // `spec.rootfs_source` (read-modify-write) before this read. A
-        // sibling's patch landing in that window made this restore open
-        // the WRONG `/dev/nbdN` → cross-session rootfs corruption + reaps.
-        // The pooled backend now passes THIS restore's device directly;
-        // apply it before any consumer (the canonical-symlink target
-        // install in `restore_in_jail`) reads `rootfs_source`.
-        if let Some(dev) = rootfs_override {
-            manifest.spec.rootfs_source = Some(dev);
-        }
 
         // Reject cross-VMM restores fast: a VZ blob (`format == "vz"`)
         // would otherwise reach load_snapshot and fail with a
@@ -3999,31 +3981,15 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.restore_with(metadata, /*swap_aux_to_current=*/ false, None)
+        self.restore_with(metadata, /*swap_aux_to_current=*/ false)
             .await
     }
 
     async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         // ADR 0035 §3: fresh creates track the host's current bundle
         // generations; the swap happens load-paused inside restore_in_jail.
-        self.restore_with(metadata, /*swap_aux_to_current=*/ true, None)
+        self.restore_with(metadata, /*swap_aux_to_current=*/ true)
             .await
-    }
-
-    async fn restore_with_rootfs_override(
-        &self,
-        metadata: SnapshotMetadata,
-        fresh: bool,
-        rootfs_override: Option<PathBuf>,
-    ) -> Result<SandboxId, SandboxError> {
-        // ADR 0049 follow-up: `fresh` selects base-create (swap aux to
-        // current) vs resume, mirroring restore_fresh/restore.
-        self.restore_with(
-            metadata,
-            /*swap_aux_to_current=*/ fresh,
-            rootfs_override,
-        )
-        .await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
