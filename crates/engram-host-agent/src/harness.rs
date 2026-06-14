@@ -63,6 +63,32 @@ pub struct HarnessHub {
     inner: Arc<HubInner>,
 }
 
+/// CANONICAL LOCK ORDER (issue #217).
+///
+/// Several of `HubInner`'s fields are independent `parking_lot::Mutex`es
+/// that some paths must hold simultaneously. parking_lot mutexes are
+/// thread-blocking with no deadlock detection, so any two paths that
+/// nest the same pair of locks in opposite orders can wedge forever
+/// (ABBA) — and once wedged here, the whole harness plane stalls while
+/// heartbeats keep the host looking healthy to coord.
+///
+/// To make nesting safe, every site that holds more than one of these
+/// at once MUST acquire them in this order (acquire a prefix; a path
+/// may skip locks it doesn't need but must not reorder):
+///
+/// 1. `last_event_at`
+/// 2. `last_idle_at`
+/// 3. `connections`
+/// 4. `shell_attached`
+/// 5. `eviction_inflight`
+///
+/// `idle_sandboxes` holds the whole chain and defines this order. The
+/// only path that previously inverted it was `send_prompt`, which held
+/// `connections` while acquiring `last_idle_at`; it now drops the
+/// `connections` guard first (clones `cmd_tx` into an owned value)
+/// before touching `last_idle_at`, so it no longer nests the two.
+/// `session_to_sandbox` and per-connection locks (`pending_checkpoint`)
+/// are leaf locks not nested with this chain.
 struct HubInner {
     /// Per-sandbox connection state. Populated by `accept_connection`,
     /// removed when the harness disconnects (clean or error).
@@ -368,9 +394,23 @@ impl HarnessHub {
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(SEND_PROMPT_ATTACH_WAIT_SECS);
             loop {
-                if let Some(handle) = self.inner.connections.lock().get(&sandbox_id) {
+                // Clone `cmd_tx` out into an owned Option so the
+                // `connections` guard is fully released before we touch
+                // `last_idle_at`. Holding `connections` across the
+                // `last_idle_at.lock()` would invert the canonical lock
+                // order (see HubInner docs) versus `idle_sandboxes`,
+                // which takes last_idle_at → connections — a classic
+                // ABBA deadlock under the prompt/eviction-tick race
+                // (issue #217). Never nest these two locks.
+                let cmd_tx_opt = self
+                    .inner
+                    .connections
+                    .lock()
+                    .get(&sandbox_id)
+                    .map(|h| h.cmd_tx.clone());
+                if let Some(cmd_tx) = cmd_tx_opt {
                     self.inner.last_idle_at.lock().remove(&sandbox_id);
-                    break handle.cmd_tx.clone();
+                    break cmd_tx;
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return Err(HarnessError::NotAttached);
@@ -1485,5 +1525,102 @@ mod tests {
             !hub.inner.eviction_inflight.lock().contains_key(&sb),
             "clear must remove the entry",
         );
+    }
+
+    /// Regression for issue #217: ABBA lock-order inversion between
+    /// `send_prompt` (held `connections` then acquired `last_idle_at`)
+    /// and `idle_sandboxes` (acquires `last_idle_at` then `connections`).
+    ///
+    /// These two run concurrently by design — `send_prompt` on every
+    /// prompt RPC, `idle_sandboxes` on the eviction tick. Under the
+    /// buggy ordering one interleaving wedges both `parking_lot::Mutex`es
+    /// forever (no detection, no poisoning), stalling the entire harness
+    /// plane while the host still looks healthy to coord.
+    ///
+    /// The test hammers both paths from dedicated OS threads against an
+    /// attached sandbox, under a watchdog. With the bug present it
+    /// deadlocks and the watchdog trips; with the fix (`send_prompt`
+    /// drops the `connections` guard before touching `last_idle_at`) the
+    /// loops complete well within the budget.
+    ///
+    /// Run on a multi-thread runtime so the racing tasks land on
+    /// distinct worker threads (a current-thread runtime would serialize
+    /// them and never expose the inversion).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn send_prompt_and_idle_sandboxes_do_not_deadlock() {
+        let hub = HarnessHub::new(noop_sink());
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        // Keep the harness side alive (drain frames) for the whole test
+        // so the connection stays in the `connections` map — that's what
+        // makes `send_prompt`'s lookup take the contended path. Without a
+        // reader the bounded writer channel could fill and change timing.
+        let harness_task = tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(harness_side);
+            write_msg(
+                &mut w,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .expect("attach");
+            let _ack: HarnessAttachAck = read_msg(&mut r).await.expect("ack");
+            // Drain inbound prompt frames until the host closes the link.
+            while read_msg::<_, HarnessFrame>(&mut r).await.is_ok() {}
+        });
+
+        // Wait for the connection to be established before racing.
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "harness should attach before the stress loop",
+        );
+
+        const ITERS: usize = 20_000;
+        let hub_idle = hub.clone();
+        // `idle_sandboxes` loop on its own OS thread (mirrors the
+        // eviction tick). Spawn-blocking so it runs on a blocking
+        // thread, not a tokio worker — a wedge here must not be able to
+        // starve the watchdog.
+        let idle_loop = tokio::task::spawn_blocking(move || {
+            for _ in 0..ITERS {
+                // Tiny TTLs so the lock body does its full work each call.
+                let _ = hub_idle.idle_sandboxes(
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_millis(0),
+                );
+            }
+        });
+
+        // `send_prompt` loop — the connection is attached, so each call
+        // hits the `connections`-then-`last_idle_at` critical section.
+        let hub_prompt = hub.clone();
+        let prompt_loop = tokio::spawn(async move {
+            for i in 0..ITERS {
+                // Ignore the result: WriterClosed at teardown is fine —
+                // we only care that the call returns at all (no wedge).
+                let _ = hub_prompt.send_prompt(sandbox_id, format!("p{i}")).await;
+            }
+        });
+
+        // Watchdog: on the buggy code the two loops deadlock and neither
+        // join future ever resolves. A generous budget keeps a slow CI
+        // runner from flaking while still catching a real wedge.
+        let work = async {
+            let _ = idle_loop.await;
+            let _ = prompt_loop.await;
+        };
+        tokio::time::timeout(Duration::from_secs(30), work)
+            .await
+            .expect("send_prompt/idle_sandboxes deadlocked (issue #217 ABBA inversion)");
+
+        // Tear down the harness reader.
+        harness_task.abort();
+        let _ = harness_task.await;
     }
 }
