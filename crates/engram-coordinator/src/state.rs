@@ -891,6 +891,13 @@ pub(crate) mod tests {
         /// Same lifecycle as `evac_attempts`, for the eviction
         /// scanner.
         pub(crate) evict_attempts: PlMutex<std::collections::HashMap<SessionId, u32>>,
+        /// ADR 0047: in-memory mirror of `teleport_targets` (the
+        /// migration pin honored by evac_resumer as a strict
+        /// require_host). Issue #209 tests assert this is cleared on
+        /// every verb exit path — the default no-op trait impl would make
+        /// such an assertion vacuous, so the mock tracks it for real.
+        pub(crate) teleport_targets:
+            PlMutex<std::collections::HashMap<SessionId, engram_core::HostId>>,
     }
 
     /// Alias so the `clippy::type_complexity` lint stays happy on
@@ -947,6 +954,7 @@ pub(crate) mod tests {
                 chunk_generation: PlMutex::new(0),
                 evac_attempts: PlMutex::new(std::collections::HashMap::new()),
                 evict_attempts: PlMutex::new(std::collections::HashMap::new()),
+                teleport_targets: PlMutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -1018,6 +1026,28 @@ pub(crate) mod tests {
             }
             s.host_id = host_id;
             Ok(())
+        }
+        async fn set_teleport_target(
+            &self,
+            id: engram_core::SessionId,
+            target: Option<HostId>,
+        ) -> Result<(), MetaError> {
+            let mut t = self.teleport_targets.lock();
+            match target {
+                Some(h) => {
+                    t.insert(id, h);
+                }
+                None => {
+                    t.remove(&id);
+                }
+            }
+            Ok(())
+        }
+        async fn get_teleport_target(
+            &self,
+            id: engram_core::SessionId,
+        ) -> Result<Option<HostId>, MetaError> {
+            Ok(self.teleport_targets.lock().get(&id).copied())
         }
         async fn assign_session_sandbox(
             &self,
