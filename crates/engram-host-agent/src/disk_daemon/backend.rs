@@ -127,9 +127,19 @@ pub struct DiskFlushOutcome {
 /// upload read it, silently skipping the put while the manifest still
 /// referenced the (now never-uploaded) chunk. Empty `new_chunks` =
 /// nothing was dirty.
-#[derive(Clone, Debug)]
+///
+/// Issue #199: also carries the owned flush-pipeline guard acquired by
+/// `flush_local`, so the drain and the `flush_upload` that consumes this
+/// handoff are ONE critical section — two flushes can no longer rebase
+/// out of order. The guard is `None` only for the empty/no-dirty
+/// shortcut (nothing to publish, so nothing to serialize). It releases
+/// when this struct is dropped (`flush_upload` consumes it by value;
+/// `requeue_pending` likewise; the migration export drops it on
+/// commit/abort).
 pub struct PendingDiskFlush {
     new_chunks: Vec<(usize, ChunkHash, Bytes)>,
+    /// Held across the publish; see `ChunkedDiskBackend::flush_pipeline`.
+    flush_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// ADR 0045 C2 disk post-copy: the frozen source's sealed disk state
@@ -302,6 +312,34 @@ pub struct ChunkedDiskBackend {
     /// destination's rebind (split-brain). Cleared on abort; moot on
     /// commit (sandbox destroyed).
     migration_fence: std::sync::atomic::AtomicBool,
+    /// Issue #199: serialize the ENTIRE flush pipeline
+    /// (`flush_local` drain → `flush_upload` GCS put → manifest
+    /// rebuild/publish → `base` rebase) so two flushes can never run
+    /// their upload/rebase phases concurrently. Without this only the
+    /// `dirty` drain was serialized, and whichever flush rebased LAST
+    /// won the published manifest + in-memory `base` regardless of data
+    /// recency — an older flush's slow upload could finish after a newer
+    /// flush published its chunk, overwriting it with the older hash and
+    /// silently rolling back acked guest writes (same corruption class
+    /// as the #191 teleport-canary-zeros family).
+    ///
+    /// Acquired by `flush_local` and carried, as an owned guard, inside
+    /// [`PendingDiskFlush`] through to `flush_upload` (or to
+    /// `requeue_pending` / drop on the no-publish migration path), so the
+    /// drain and the publish that consumes it are one critical section.
+    /// The synchronous `flush()` therefore holds it across its whole
+    /// `flush_local` + `flush_upload`.
+    ///
+    /// Lock order: this is the OUTERMOST flush-path lock. It is acquired
+    /// BEFORE `dirty` (in `flush_local`) and BEFORE `state`/`pending`
+    /// (in `flush_upload`); never the reverse. The per-sandbox
+    /// `capture_lock` (PooledBackend) sits ABOVE it — captures and
+    /// migrations already serialize on that, and the scheduler `flush()`
+    /// (which does not take `capture_lock`) serializes against them here.
+    /// `flush()` checks `migration_fence` and returns BEFORE touching
+    /// this lock, so a long-lived fenced migration that holds the guard
+    /// across its export can never deadlock a scheduler tick.
+    flush_pipeline: Arc<tokio::sync::Mutex<()>>,
     /// ADR 0045 C2 disk post-copy (destination): the sealed-chunk
     /// overlay — consulted between `pending` and `base` on the read
     /// path (and before the RMW base fetch on the write path). `None`
@@ -572,6 +610,7 @@ impl ChunkedDiskBackend {
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
             migration_fence: std::sync::atomic::AtomicBool::new(false),
+            flush_pipeline: Arc::new(tokio::sync::Mutex::new(())),
             post_copy: Arc::new(std::sync::Mutex::new(None)),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
@@ -609,6 +648,7 @@ impl ChunkedDiskBackend {
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
             migration_fence: std::sync::atomic::AtomicBool::new(false),
+            flush_pipeline: Arc::new(tokio::sync::Mutex::new(())),
             post_copy: Arc::new(std::sync::Mutex::new(None)),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
@@ -956,10 +996,24 @@ impl ChunkedDiskBackend {
     /// multi-second GCS upload off the frozen-guest path. The drain
     /// still captures disk-at-the-pause-instant (ADR 0018 §12m).
     pub async fn flush_local(&self) -> Result<PendingDiskFlush, DiskBackendError> {
+        // Issue #199: take the flush-pipeline guard BEFORE the `dirty`
+        // lock (lock order: flush_pipeline ⟶ dirty ⟶ state/pending) and
+        // hand it off inside the returned `PendingDiskFlush`, so the
+        // drain and the `flush_upload` that publishes its chunks are one
+        // serialized critical section. Without this, a slow upload from
+        // an EARLIER drain could publish/rebase after a LATER drain
+        // already did, overwriting the newer chunk with the older hash.
+        let flush_guard = self.flush_pipeline.clone().lock_owned().await;
         let mut dirty_guard = self.dirty.lock().await;
         if dirty_guard.is_empty() {
+            // Nothing to publish ⟹ nothing to serialize; release the
+            // pipeline guard immediately (don't carry it through an
+            // empty no-op flush_upload, which would needlessly block a
+            // concurrent flush).
+            drop(flush_guard);
             return Ok(PendingDiskFlush {
                 new_chunks: Vec::new(),
+                flush_guard: None,
             });
         }
         let drained: Vec<(usize, Vec<u8>)> = dirty_guard.drain().collect();
@@ -980,7 +1034,10 @@ impl ChunkedDiskBackend {
             pending.insert(chunk_idx, (hash, bytes.clone()));
             new_chunks.push((chunk_idx, hash, bytes));
         }
-        Ok(PendingDiskFlush { new_chunks })
+        Ok(PendingDiskFlush {
+            new_chunks,
+            flush_guard: Some(flush_guard),
+        })
     }
 
     /// ADR 0038 B3 — phase 2 (runs post-resume on the snapshot path):
@@ -1304,6 +1361,13 @@ impl ChunkedDiskBackend {
         pending: PendingDiskFlush,
     ) -> Result<DiskFlushOutcome, DiskBackendError> {
         let chunk_size = self.chunk_size;
+        // Issue #199: keep the flush-pipeline guard (acquired in
+        // `flush_local`) alive for the WHOLE of `flush_upload` — the
+        // GCS puts, the manifest rebuild/publish, AND the `base` rebase.
+        // It releases on drop at function exit (or on the early returns
+        // below, which also drop it). This is what makes the
+        // drain→upload→publish→rebase one atomic critical section.
+        let _flush_guard = pending.flush_guard;
         let new_chunks = pending.new_chunks;
         if new_chunks.is_empty() {
             let out = DiskFlushOutcome {
@@ -1419,6 +1483,40 @@ impl ChunkedDiskBackend {
         // latency, and reads against this backend during flush are
         // already in-flight or waiting on the dirty lock anyway.
         let mut state = self.state.lock().await;
+        // Issue #199 (fence re-check): `migration_fence` is checked once
+        // at the top of the synchronous `flush()`, but a flush already
+        // PAST that check when `set_migration_fence(true)` runs would
+        // otherwise complete its upload + publish AFTER the migration's
+        // coherence cut — publishing a newer `live_disk_manifest` that
+        // races the destination's rebind (the split-brain the fence
+        // exists to prevent). Re-check here, under the `state` lock and
+        // immediately before the publish, so a fence raised any time
+        // during our (multi-second) upload aborts the publish + rebase.
+        // The drained bytes are re-queued into `dirty` (a newer guest
+        // write wins — same rule as the upload-failure re-queue) and
+        // stay in `pending_uploads`, so reads keep resolving locally.
+        if self
+            .migration_fence
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let manifest_ref = state.manifest_ref;
+            drop(state);
+            let mut dirty = self.dirty.lock().await;
+            for (idx, _hash, bytes) in &new_chunks {
+                dirty.entry(*idx).or_insert_with(|| bytes.to_vec());
+            }
+            drop(dirty);
+            tracing::warn!(
+                chunks = new_chunks.len(),
+                "nbd disk flush_upload aborted: migration fence raised mid-upload; \
+                 manifest NOT advanced, dirty re-queued (issue #199)",
+            );
+            return Ok(DiskFlushOutcome {
+                manifest_ref,
+                chunks_flushed: 0,
+                bytes_uploaded: 0,
+            });
+        }
         let mut chunks: Vec<ChunkRef> = state
             .base
             .chunks
@@ -2914,6 +3012,251 @@ mod tests {
         ) -> Result<Vec<String>, engram_core::error::BlobError> {
             self.inner.list_prefix(prefix).await
         }
+    }
+
+    /// Issue #199 test harness: a `BlobStorage` whose FIRST chunk PUT
+    /// parks until `release` fires, signalling `at_gate` once it has
+    /// arrived. Lets a test freeze one flush mid-upload (after its drain,
+    /// before its publish) while a second, newer flush races — proving
+    /// the flush pipeline serializes drain→upload→publish→rebase so the
+    /// newest-drained chunk always wins. Only `chunks/...` PUTs gate;
+    /// manifest PUTs pass straight through so the un-gated flush can
+    /// publish normally.
+    struct GatedChunkPutBlob {
+        inner: LocalBlobStorage,
+        gate_armed: Arc<std::sync::atomic::AtomicBool>,
+        at_gate: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStorage for GatedChunkPutBlob {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            // Gate exactly the first chunk PUT we see while armed.
+            if key.starts_with("chunks/")
+                && self
+                    .gate_armed
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.at_gate.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.put_streaming(key, body).await
+        }
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<ByteStream, engram_core::error::BlobError> {
+            self.inner.get_streaming(key).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            self.inner.head(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+            self.inner.delete(key).await
+        }
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    /// Issue #199 regression: two flushes that touch the SAME chunk must
+    /// never rebase/publish out of order. We freeze flush A mid-upload
+    /// (after it drained `w1`, before its publish), write `w2` into the
+    /// same chunk, then run flush B — and prove the newest-drained bytes
+    /// (`w1+w2`) win both the live read AND the highest published
+    /// manifest version, with NO dropped write.
+    ///
+    /// Before the fix, A held no lock past its drain: B would drain `w2`
+    /// concurrently, publish + rebase `base[X]=hB` first, then A's slow
+    /// upload would finish LAST, overwrite the manifest entry + `base[X]`
+    /// with its own older `hA`, and bump PAST B's version — silently
+    /// rolling back the acked `w2` write (the #191 corruption class). The
+    /// flush-pipeline mutex serializes the whole drain→upload→rebase, so
+    /// the later drain's data is the one that survives.
+    #[tokio::test]
+    async fn concurrent_flushes_never_rebase_a_chunk_out_of_order() {
+        use std::sync::atomic::AtomicBool;
+        let chunk_size = 4096u64;
+        let total = 4 * chunk_size;
+        let base = synth_manifest(total, chunk_size, vec![]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let gate_armed = Arc::new(AtomicBool::new(true));
+        let at_gate = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let blob: Arc<dyn BlobStorage> = Arc::new(GatedChunkPutBlob {
+            inner: LocalBlobStorage::new(dir.path().to_path_buf()),
+            gate_armed: gate_armed.clone(),
+            at_gate: at_gate.clone(),
+            release: release.clone(),
+        });
+        let store = Arc::new(ChunkStore::new(blob));
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &base).await.unwrap();
+        let backend = Arc::new(
+            ChunkedDiskBackend::new(manifest_ref, &base, cache, store.clone(), u64::MAX).unwrap(),
+        );
+
+        // Chunk 0: w1 (first half = 0x11, rest = 0x00).
+        let mut w1 = vec![0u8; chunk_size as usize];
+        for b in w1.iter_mut().take(chunk_size as usize / 2) {
+            *b = 0x11;
+        }
+        backend.write(0, &w1).await.unwrap();
+
+        // Flush A: drains w1, then parks at the gated chunk PUT — still
+        // holding the flush-pipeline guard it took in flush_local.
+        let a = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.flush().await })
+        };
+        // Wait until A is parked at the gate (drain done, publish pending).
+        at_gate.notified().await;
+
+        // Guest writes w2 into the SAME chunk while A is mid-upload. With
+        // FC-style RMW the dirty buffer now holds the full w1+w2 chunk.
+        let mut w2_full = w1.clone();
+        for b in w2_full
+            .iter_mut()
+            .skip(chunk_size as usize / 2)
+            .take(chunk_size as usize / 2)
+        {
+            *b = 0x22;
+        }
+        backend
+            .write(chunk_size / 2, &vec![0x22; chunk_size as usize / 2])
+            .await
+            .unwrap();
+
+        // Flush B: with the fix its flush_local blocks on the pipeline
+        // guard A holds, so it cannot drain/publish until A is done.
+        let b = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.flush().await })
+        };
+        // Give B a beat to reach (and, with the fix, block on) the guard.
+        tokio::task::yield_now().await;
+
+        // Let A finish: it publishes hA, rebases base[0]=hA, releases the
+        // guard; B then drains w1+w2, uploads hB, publishes, rebases.
+        release.notify_one();
+        let _ = a.await.unwrap().unwrap();
+        let _ = b.await.unwrap().unwrap();
+
+        // (1) Live read of chunk 0 reflects the NEWEST drained data
+        //     (w1+w2) — never the stale w1-only A rebase.
+        let got = backend.read(0, chunk_size).await.unwrap();
+        assert_eq!(
+            &got[..],
+            &w2_full[..],
+            "live read must reflect the newest write (w1+w2), not a stale older flush's rebase",
+        );
+
+        // (2) The HIGHEST published manifest version maps chunk 0 to the
+        //     w1+w2 hash — a resume restoring `latest` is not behind the
+        //     guest's acked writes.
+        let (_latest_ref, latest) = store
+            .get_latest_manifest(manifest_ref.manifest_id)
+            .await
+            .unwrap()
+            .expect("a manifest must have been published");
+        let entry = latest
+            .chunks
+            .iter()
+            .find(|c| c.offset == 0)
+            .expect("chunk 0 must be present in the latest published manifest");
+        assert_eq!(
+            entry.hash,
+            ChunkHash::of(&w2_full),
+            "latest published manifest must map chunk 0 to the newest (w1+w2) bytes",
+        );
+        // And those bytes are durable.
+        assert_eq!(store.get_chunk(entry.hash).await.unwrap(), w2_full);
+    }
+
+    /// Issue #199 fence re-check: a flush already past `flush()`'s
+    /// top-of-function fence check must NOT publish if the migration
+    /// fence is raised mid-upload — otherwise it republishes a newer
+    /// `live_disk_manifest` after the migration's coherence cut
+    /// (split-brain). We park flush A at its chunk PUT, raise the fence,
+    /// release A, and assert A aborts the publish (manifest unchanged,
+    /// chunks_flushed == 0) and re-queues the drained chunk to dirty.
+    #[tokio::test]
+    async fn flush_upload_aborts_publish_when_fence_raised_mid_upload() {
+        use std::sync::atomic::AtomicBool;
+        let chunk_size = 4096u64;
+        let total = 4 * chunk_size;
+        let base = synth_manifest(total, chunk_size, vec![]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let gate_armed = Arc::new(AtomicBool::new(true));
+        let at_gate = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let blob: Arc<dyn BlobStorage> = Arc::new(GatedChunkPutBlob {
+            inner: LocalBlobStorage::new(dir.path().to_path_buf()),
+            gate_armed: gate_armed.clone(),
+            at_gate: at_gate.clone(),
+            release: release.clone(),
+        });
+        let store = Arc::new(ChunkStore::new(blob));
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &base).await.unwrap();
+        let backend = Arc::new(
+            ChunkedDiskBackend::new(manifest_ref, &base, cache, store.clone(), u64::MAX).unwrap(),
+        );
+        let ref0 = backend.manifest_ref().await;
+
+        backend
+            .write(0, &vec![0x42; chunk_size as usize])
+            .await
+            .unwrap();
+
+        // Flush A: passes the top-of-flush() fence check (fence is
+        // clear), drains, then parks at the gated chunk PUT.
+        let a = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.flush().await })
+        };
+        at_gate.notified().await;
+
+        // The migration coherence cut lands while A is mid-upload.
+        backend.set_migration_fence(true);
+
+        // Release A: its upload completes, but the in-publish fence
+        // re-check must abort BEFORE put_manifest.
+        release.notify_one();
+        let outcome = a.await.unwrap().unwrap();
+        assert_eq!(
+            outcome.chunks_flushed, 0,
+            "a flush whose upload finishes after the fence is raised must NOT publish",
+        );
+        assert_eq!(
+            backend.manifest_ref().await,
+            ref0,
+            "the manifest must not advance past the migration coherence cut",
+        );
+        // The drained chunk is re-queued for the post-migration retry.
+        assert!(
+            backend.dirty_chunks_count().await >= 1,
+            "the aborted flush must re-queue its drained chunk to dirty",
+        );
     }
 
     /// ADR 0038: a failed `flush_upload` must be an ATOMIC no-op — the

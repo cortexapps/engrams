@@ -30,12 +30,19 @@
 //! ## Interaction with the idle evictor (ADR 0009 + A.1.5/A.1.6)
 //!
 //! The scheduler runs in parallel with the eviction pipeline. Both
-//! call `ChunkedDiskBackend::flush()` on the same backend; the
-//! backend's `dirty` mutex serializes them, so two concurrent
-//! flushes can't tear the buffer. The losing flush sees an empty
-//! buffer, returns `chunks_flushed = 0`, and skips the publish.
-//! `manifest_ref` retry on `VersionConflict` (ADR 0014 #7) makes
-//! back-to-back flushes idempotent.
+//! call `ChunkedDiskBackend::flush()` on the same backend (and the
+//! snapshot path runs the split `flush_local` + `flush_upload`).
+//! Issue #199: the backend's `flush_pipeline` mutex serializes the
+//! WHOLE drain→upload→publish→rebase of each flush, so two flushes
+//! can never rebase a chunk out of order. (The earlier claim that
+//! the `dirty` mutex sufficed was wrong — it only serialized the
+//! drain; a slow upload from an earlier drain could publish/rebase
+//! AFTER a later drain already did, overwriting the newer chunk with
+//! the older hash and dropping acked writes.) The flush that drains
+//! first publishes first; whichever drains last sees the empty
+//! buffer (`chunks_flushed = 0`, skips the publish) or carries the
+//! superseding bytes. `manifest_ref` retry on `VersionConflict`
+//! (ADR 0014 #7) makes back-to-back flushes idempotent.
 //!
 //! The subtle race is **post-snapshot writes that escape via the
 //! scheduler**. Inside `evict_idle_session`, `host.snapshot()`
@@ -62,8 +69,8 @@
 //! those serialize eviction-driven snapshots, not background
 //! flushes. The scheduler's flushes are short (drain → upload →
 //! manifest tick) and don't pause FC, so there's no contention
-//! with the eviction pipeline beyond the dirty-mutex
-//! serialization above.
+//! with the eviction pipeline beyond the flush-pipeline-mutex
+//! serialization above (issue #199).
 
 use std::sync::Arc;
 use std::time::Duration;
