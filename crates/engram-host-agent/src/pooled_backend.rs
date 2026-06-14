@@ -4183,10 +4183,18 @@ impl SandboxBackend for PooledBackend {
         #[cfg(target_os = "linux")]
         {
             use engram_core::types::snapshot::PostCopyCaptureOut;
+            // Issue #222: remove *only* if the export id matches. A plain
+            // `remove(&id).filter(...)` evicts the entry unconditionally and
+            // only then discards the returned value on mismatch — so a stale
+            // straggler `capture(id, E1)` arriving after presetup re-minted E2
+            // (last-write-wins, see `migration_presetup`) would delete the live
+            // E2 entry and then fail, dooming the legitimate `capture(id, E2)`
+            // to "no matching presetup". `remove_if` removes-and-returns only
+            // when the predicate holds, atomically, so a mismatched straggler
+            // leaves the live presetup intact and just errors.
             let Some((_, pending)) = self
                 .pending_presetups
-                .remove(&id)
-                .filter(|(_, p)| p.export_id == export_id)
+                .remove_if(&id, |_, p| p.export_id == export_id)
             else {
                 return Err(SandboxError::InvalidSpec(
                     "no matching presetup for this capture (export id skew?)".into(),
@@ -6060,6 +6068,75 @@ mod tests {
             .collect();
         assert_eq!(item1, allowed_bytes);
         assert!(frames.iter().any(|f| f.item_idx == 1 && f.last));
+    }
+
+    /// Issue #222: `migration_capture_postcopy` must remove the pending
+    /// presetup ONLY when the export id matches. Presetups are
+    /// last-write-wins (a coordinator retry re-mints a new export under
+    /// the same sandbox id), so a stale straggler `capture(id, E1)`
+    /// arriving after presetup re-minted E2 must NOT evict the live E2
+    /// entry — it must just error, leaving E2 intact for the legitimate
+    /// `capture(id, E2)`.
+    ///
+    /// Regression for the pre-fix `remove(&id).filter(...)`, which evicted
+    /// the entry unconditionally and then discarded it on mismatch,
+    /// dooming the legitimate capture to "no matching presetup".
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn capture_postcopy_export_mismatch_leaves_live_presetup_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            tmp.path().join("sandboxes"),
+        ));
+        let pooled = PooledBackend::new(inner);
+
+        let id = SandboxId::new();
+        // E2 is the live presetup (the newer attempt's mint).
+        let live_export = "E2".to_string();
+        pooled.pending_presetups.insert(
+            id,
+            PendingPresetup {
+                export_id: live_export.clone(),
+                peer_token: "tok".into(),
+                chain_ref: engram_core::types::manifest::ManifestRef::new(),
+            },
+        );
+
+        // A straggler capture from the abandoned attempt (export E1).
+        let Err(err) = pooled.migration_capture_postcopy(id, "E1").await else {
+            panic!("stale-export straggler must be refused");
+        };
+        assert!(
+            matches!(&err, SandboxError::InvalidSpec(m) if m.contains("no matching presetup")),
+            "expected the no-matching-presetup error, got: {err:?}"
+        );
+        // The crux of #222: E2 must SURVIVE the mismatched straggler.
+        assert!(
+            pooled.pending_presetups.contains_key(&id),
+            "the live presetup was evicted by a mismatched straggler (the #222 bug)"
+        );
+        assert_eq!(
+            pooled.pending_presetups.get(&id).unwrap().export_id,
+            live_export,
+            "the surviving presetup must still be E2"
+        );
+
+        // The legitimate capture for E2 now gets PAST the presetup gate:
+        // it consumes E2 (so it no longer returns "no matching presetup")
+        // and instead fails at the next check — the checkpoint chain was
+        // never registered for this synthetic sandbox.
+        let Err(err) = pooled.migration_capture_postcopy(id, &live_export).await else {
+            panic!("E2 capture must proceed past the presetup gate");
+        };
+        assert!(
+            matches!(&err, SandboxError::InvalidSpec(m) if m.contains("checkpoint chain vanished")),
+            "expected to pass the presetup gate and fail at the chain check, got: {err:?}"
+        );
+        // E2 was consumed by the matching capture.
+        assert!(
+            !pooled.pending_presetups.contains_key(&id),
+            "the matching capture must consume the presetup"
+        );
     }
 
     /// ADR 0045 C2 disk post-copy: `DiskChunkAt` serves a sealed
