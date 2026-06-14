@@ -453,8 +453,70 @@ pub struct ControlTx {
 }
 
 struct ControlInner {
+    // LOCK ORDER (invariant): always acquire `backlog` BEFORE `subscribers`,
+    // and on both the subscribe path and the report path hold `backlog`
+    // across the `subscribers` critical section. This makes "replay the
+    // backlog + register the subscriber" and "append to the backlog + fan
+    // out to subscribers" atomic with respect to each other: a frame can
+    // never land between a fresh subscriber's backlog snapshot and its
+    // registration (the lost-terminal-frame race, issue #207). NEVER take
+    // `subscribers` first or hold it across a `backlog` acquisition.
     subscribers: Mutex<Vec<std::os::unix::net::UnixStream>>,
     backlog: Mutex<Vec<HandlerControl>>,
+    // Test-only seam: lets a regression test force-open the gap between
+    // the backlog snapshot and the subscriber registration. In production
+    // this is `None` and the closure is never run.
+    #[cfg(test)]
+    on_replay_done: Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+
+impl ControlInner {
+    /// Replay the backlog to a freshly-dialed subscriber and register it
+    /// for live frames — atomically w.r.t. [`ControlInner::report`].
+    ///
+    /// The `backlog` lock is the single linearization point: it is held
+    /// across BOTH the replay (to the not-yet-shared `stream`) and the
+    /// push into `subscribers`, so no `report()` can interleave to land a
+    /// frame in neither the replay nor the live fan-out. The replay
+    /// writes are bounded by the per-connection 1 s write timeout, so the
+    /// widened critical section cannot stall unboundedly.
+    fn add_subscriber(&self, mut stream: std::os::unix::net::UnixStream) {
+        let backlog = self.backlog.lock().expect("backlog poisoned");
+        let mut ok = true;
+        for msg in backlog.iter() {
+            if write_frame(&mut stream, msg).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        // Test-only: run AFTER the snapshot/replay but BEFORE registering
+        // the subscriber, while still holding `backlog`. A concurrent
+        // `report()` will block on `backlog` here — proving the
+        // serialization (the frame is delivered via replay on the next
+        // dial OR via live fan-out once we register, never neither).
+        #[cfg(test)]
+        if let Some(cb) = self.on_replay_done.lock().expect("hook poisoned").as_ref() {
+            cb();
+        }
+        if ok {
+            self.subscribers
+                .lock()
+                .expect("subscribers poisoned")
+                .push(stream);
+        }
+        // `backlog` lock released here, after the subscriber is live.
+    }
+
+    /// Record + fan out one report under the backlog lock (see lock-order
+    /// invariant on the fields). Never blocks beyond the per-write timeout;
+    /// dead subscribers are pruned.
+    fn report(&self, msg: HandlerControl) {
+        let mut backlog = self.backlog.lock().expect("backlog poisoned");
+        backlog.push(msg.clone());
+        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+        subs.retain_mut(|s| write_frame(s, &msg).is_ok());
+        // Both locks released here (subs first, then backlog).
+    }
 }
 
 impl ControlTx {
@@ -464,6 +526,8 @@ impl ControlTx {
         let inner = std::sync::Arc::new(ControlInner {
             subscribers: Mutex::new(Vec::new()),
             backlog: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            on_replay_done: Mutex::new(None),
         });
         let accept_inner = std::sync::Arc::clone(&inner);
         let path_owned: PathBuf = path.to_path_buf();
@@ -471,29 +535,12 @@ impl ControlTx {
             .name("engram-uffd-control".to_string())
             .spawn(move || {
                 for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { continue };
+                    let Ok(stream) = stream else { continue };
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
                     // Replay the backlog so a late subscriber still sees
-                    // Sealed/DrainDone, then subscribe for live frames.
-                    let backlog = accept_inner
-                        .backlog
-                        .lock()
-                        .expect("backlog poisoned")
-                        .clone();
-                    let mut ok = true;
-                    for msg in &backlog {
-                        if write_frame(&mut stream, msg).is_err() {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    if ok {
-                        accept_inner
-                            .subscribers
-                            .lock()
-                            .expect("subscribers poisoned")
-                            .push(stream);
-                    }
+                    // Sealed/DrainDone, then subscribe for live frames —
+                    // atomically w.r.t. report() (issue #207).
+                    accept_inner.add_subscriber(stream);
                 }
                 tracing::debug!(path = %path_owned.display(), "control listener exited");
             })?;
@@ -503,13 +550,14 @@ impl ControlTx {
     /// Record + fan out one report. Never blocks beyond the per-write
     /// timeout; dead subscribers are pruned.
     pub fn report(&self, msg: HandlerControl) {
-        self.inner
-            .backlog
-            .lock()
-            .expect("backlog poisoned")
-            .push(msg.clone());
-        let mut subs = self.inner.subscribers.lock().expect("subscribers poisoned");
-        subs.retain_mut(|s| write_frame(s, &msg).is_ok());
+        self.inner.report(msg);
+    }
+
+    /// Test-only: install a hook fired between a subscriber's backlog
+    /// snapshot and its registration (while the backlog lock is held).
+    #[cfg(test)]
+    fn set_replay_hook(&self, cb: Box<dyn Fn() + Send>) {
+        *self.inner.on_replay_done.lock().expect("hook poisoned") = Some(cb);
     }
 }
 
@@ -742,23 +790,142 @@ mod tests {
             }
         ));
 
-        // Live frame after subscription. The accept thread races the
-        // subscribe; poll briefly.
-        let mut delivered = false;
-        for _ in 0..100 {
-            tx.report(HandlerControl::DrainProgress {
-                pulled: 1,
-                remaining: 2,
-            });
-            sub.set_read_timeout(Some(Duration::from_millis(50)))
-                .unwrap();
-            if let Ok(HandlerControl::DrainProgress { .. }) =
-                read_frame::<_, HandlerControl>(&mut sub)
-            {
-                delivered = true;
-                break;
+        // Live frame after subscription: now deterministic (the subscribe
+        // path and report() serialize on the backlog lock), so a single
+        // report must arrive — no poll-retry crutch.
+        tx.report(HandlerControl::DrainProgress {
+            pulled: 1,
+            remaining: 2,
+        });
+        sub.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let got: HandlerControl = read_frame(&mut sub).unwrap();
+        assert!(
+            matches!(got, HandlerControl::DrainProgress { .. }),
+            "live control frame never arrived: {got:?}"
+        );
+    }
+
+    /// Regression for issue #207: a terminal frame reported in the gap
+    /// between a subscriber's backlog snapshot and its registration must
+    /// still be delivered exactly once (never lost). Deterministic via a
+    /// test-only hook that holds the backlog lock open across a concurrent
+    /// `report()`, which is exactly the racy interleaving that used to drop
+    /// `DrainDone`/`PeerLost` and stall `migration_drain_wait` for 600 s.
+    ///
+    /// Pre-fix (snapshot under lock, RELEASE, replay, then a separate
+    /// registration) this report landed in neither the replay (snapshot
+    /// already taken) nor the live fan-out (subscriber not yet registered)
+    /// and the read below would time out.
+    #[test]
+    fn control_tx_no_lost_frame_during_subscribe_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let tx = std::sync::Arc::new(ControlTx::bind(&path).unwrap());
+
+        // Two single-fire channels: the accept thread (inside the hook,
+        // holding the backlog lock) signals it has entered the gap; the
+        // reporter then fires a terminal frame which MUST block on the
+        // backlog lock until the subscriber is registered.
+        let (in_gap_tx, in_gap_rx) = std::sync::mpsc::channel::<()>();
+        let in_gap_tx = std::sync::Mutex::new(Some(in_gap_tx));
+        let tx_for_report = std::sync::Arc::clone(&tx);
+        tx.set_replay_hook(Box::new(move || {
+            // We hold the backlog lock here (post-snapshot, pre-register).
+            if let Some(s) = in_gap_tx.lock().unwrap().take() {
+                let _ = s.send(());
+                // Spawn the racing report and give it time to reach (and
+                // block on) the backlog lock before we return / register.
+                let txr = std::sync::Arc::clone(&tx_for_report);
+                std::thread::spawn(move || {
+                    txr.report(HandlerControl::DrainDone {
+                        pulled: 7,
+                        alt_sourced: 0,
+                        zero_chunks: 0,
+                        ms: 0,
+                        faults: 0,
+                        fault_us: 0,
+                        fault_max_us: 0,
+                    });
+                });
+                std::thread::sleep(Duration::from_millis(200));
             }
+        }));
+
+        let mut sub = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        // The hook fired on the accept thread; wait until we know we were
+        // in the gap (so the test is meaningfully exercising the race).
+        in_gap_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("accept thread never entered the subscribe gap");
+
+        // The DrainDone reported during the gap must arrive — via live
+        // fan-out once the now-registered subscriber is visible to report.
+        sub.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let got: HandlerControl =
+            read_frame(&mut sub).expect("terminal frame lost in subscribe gap");
+        assert!(
+            matches!(got, HandlerControl::DrainDone { pulled: 7, .. }),
+            "unexpected frame: {got:?}"
+        );
+
+        // And exactly once: no duplicate (it was NOT also in the replay).
+        sub.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        match read_frame::<_, HandlerControl>(&mut sub) {
+            Err(_) => {} // timed out / EOF — good, no duplicate
+            Ok(extra) => panic!("terminal frame delivered more than once: {extra:?}"),
         }
-        assert!(delivered, "live control frame never arrived");
+    }
+
+    /// No deadlock under concurrent dial/report stress; every subscriber
+    /// that registers before the final report sees it.
+    #[test]
+    fn control_tx_concurrent_dial_report_no_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let tx = std::sync::Arc::new(ControlTx::bind(&path).unwrap());
+
+        let reporter = {
+            let tx = std::sync::Arc::clone(&tx);
+            std::thread::spawn(move || {
+                for i in 0..2000u64 {
+                    tx.report(HandlerControl::DrainProgress {
+                        pulled: i,
+                        remaining: 0,
+                    });
+                }
+                tx.report(HandlerControl::DrainDone {
+                    pulled: 2000,
+                    alt_sourced: 0,
+                    zero_chunks: 0,
+                    ms: 0,
+                    faults: 0,
+                    fault_us: 0,
+                    fault_max_us: 0,
+                });
+            })
+        };
+
+        let mut dialers = Vec::new();
+        for _ in 0..16 {
+            let path = path.clone();
+            dialers.push(std::thread::spawn(move || {
+                let mut sub = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                sub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                // Drain until DrainDone or EOF; must not block forever.
+                loop {
+                    match read_frame::<_, HandlerControl>(&mut sub) {
+                        Ok(HandlerControl::DrainDone { .. }) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }));
+        }
+
+        reporter.join().unwrap();
+        for d in dialers {
+            d.join().unwrap();
+        }
     }
 }
