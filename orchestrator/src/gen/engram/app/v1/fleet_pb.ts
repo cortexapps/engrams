@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/fleet.proto.
  */
 export const file_engram_app_v1_fleet: GenFile = /*@__PURE__*/
-  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IvcCCghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhcKD2xvY2FsX3NuYXBzaG90cxgHIAEoBBIUCgxyZWFkeV9pbWFnZXMYCCABKAQSGwoTcmVhZHlfaW1hZ2VfZGlnZXN0cxgJIAMoCRIbChN1dGlsX2Rpc2tfdG90YWxfbWliGAogASgEEhoKEnV0aWxfZGlza191c2VkX21pYhgLIAEoBBIaChJ1dGlsX21lbV90b3RhbF9taWIYDCABKAQSGQoRdXRpbF9tZW1fdXNlZF9taWIYDSABKAQSFAoMdXRpbF9jcHVfcGN0GA4gASgCEhkKEWxhc3RfaGVhcnRiZWF0X2F0GA8gASgJIiEKDkdldEhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiOAoPR2V0SG9zdFJlc3BvbnNlEiUKBGhvc3QYASABKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IikKFkdldEhvc3RDb3dTdGF0ZVJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSJZChdHZXRIb3N0Q293U3RhdGVSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEi0KCHNlc3Npb25zGAIgAygLMhsuZW5ncmFtLmFwcC52MS5Db3dTdGF0ZVZpZXciIwoQRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIhMKEURyYWluSG9zdFJlc3BvbnNlIigKFUFkbWluRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJImwKFkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRISCgpldmFjdWF0aW5nGAIgAygJEi0KCGZhaWx1cmVzGAMgAygLMhsuZW5ncmFtLmFwcC52MS5EcmFpbkZhaWx1cmUiMQoMRHJhaW5GYWlsdXJlEhIKCnNlc3Npb25faWQYASABKAkSDQoFZXJyb3IYAiABKAkiJAoRQ29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI1ChJDb3Jkb25Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiJgoTVW5jb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIjcKFFVuY29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIhoKGEdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdCLqAQoZR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRIRCglzbmFwc2hvdHMYASABKAQSFgoOc25hcHNob3RfYnl0ZXMYAiABKAQSEgoKZ2NfcGVuZGluZxgDIAEoBBIZChF0cmFja2VkX3NhbmRib3hlcxgEIAEoBBIUCgxkaXJ0eV9jaHVua3MYBSABKAQSFwoPdW5mbHVzaGVkX2J5dGVzGAYgASgEEhgKEGF2Z19sb2NhbGl0eV9wY3QYByABKA0SKgoEcm93cxgIIAMoCzIcLmVuZ3JhbS5hcHAudjEuRHVyYWJpbGl0eVJvdyLlAQoNRHVyYWJpbGl0eVJvdxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIPCgdob3N0X2lkGAMgASgJEhQKDGRpcnR5X2NodW5rcxgEIAEoDRITCgtkaXJ0eV9ieXRlcxgFIAEoBBITCgtiYXNlX2NodW5rcxgGIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgHIAEoDRIaCg1sYXN0X2ZsdXNoX2F0GAggASgJSAGIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXQiKQoTRmx1c2hTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIlsKFEZsdXNoU2Vzc2lvblJlc3BvbnNlEg8KB291dGNvbWUYASABKAkSHQoQbWFuaWZlc3RfdmVyc2lvbhgCIAEoBEgAiAEBQhMKEV9tYW5pZmVzdF92ZXJzaW9uIlYKFkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgt0YXJnZXRfaG9zdBgCIAEoCUgAiAEBQg4KDF90YXJnZXRfaG9zdCI9ChdFdmFjdWF0ZVNlc3Npb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSJJCg5DaHVua0djUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyL3AQoPQ2h1bmtHY1Jlc3BvbnNlEhUKDWxpc3RlZF9jaHVua3MYASABKAQSFgoObWFsZm9ybWVkX2tleXMYAiABKAQSFAoMcGluX3NldF9zaXplGAMgASgEEhkKEWNhbmRpZGF0ZXNfbWFya2VkGAQgASgEEhUKDXJlc3RhcnRfY291bnQYBSABKA0SIAoYcmVzdGFydF9idWRnZXRfZXhoYXVzdGVkGAYgASgIEhgKEHByb21vdGVkX2RlbGV0ZXMYByABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAggASgEEhIKCmdyYWNlX3NlY3MYCSABKAQiSgoPQnVuZGxlR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIqMBChBCdW5kbGVHY1Jlc3BvbnNlEg4KBmxpc3RlZBgBIAEoBBIUCgxwaW5fc2V0X3NpemUYAiABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYAyABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgEIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYBSABKAQSFQoNcmVzdGFydF9jb3VudBgGIAEoDSJQChVTbmFwc2hvdEJsb2JHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3Mi3AEKFlNuYXBzaG90QmxvYkdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhEKCW1hbGZvcm1lZBgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgFIAEoBBIeChZwcm9tb3RlX3JlcGlubmVkX3NraXBzGAYgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgHIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAggASgNMv4ICgxGbGVldFNlcnZpY2USTgoJTGlzdEhvc3RzEh8uZW5ncmFtLmFwcC52MS5MaXN0SG9zdHNSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5MaXN0SG9zdHNSZXNwb25zZRJICgdHZXRIb3N0Eh0uZW5ncmFtLmFwcC52MS5HZXRIb3N0UmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuR2V0SG9zdFJlc3BvbnNlEmAKD0dldEhvc3RDb3dTdGF0ZRIlLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVzcG9uc2USTgoJRHJhaW5Ib3N0Eh8uZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXNwb25zZRJdCg5BZG1pbkRyYWluSG9zdBIkLmVuZ3JhbS5hcHAudjEuQWRtaW5EcmFpbkhvc3RSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlc3BvbnNlElEKCkNvcmRvbkhvc3QSIC5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5Db3Jkb25Ib3N0UmVzcG9uc2USVwoMVW5jb3Jkb25Ib3N0EiIuZW5ncmFtLmFwcC52MS5VbmNvcmRvbkhvc3RSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5VbmNvcmRvbkhvc3RSZXNwb25zZRJmChFHZXRTdG9yYWdlU3VtbWFyeRInLmVuZ3JhbS5hcHAudjEuR2V0U3RvcmFnZVN1bW1hcnlSZXF1ZXN0GiguZW5ncmFtLmFwcC52MS5HZXRTdG9yYWdlU3VtbWFyeVJlc3BvbnNlElcKDEZsdXNoU2Vzc2lvbhIiLmVuZ3JhbS5hcHAudjEuRmx1c2hTZXNzaW9uUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuRmx1c2hTZXNzaW9uUmVzcG9uc2USYAoPRXZhY3VhdGVTZXNzaW9uEiUuZW5ncmFtLmFwcC52MS5FdmFjdWF0ZVNlc3Npb25SZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5FdmFjdWF0ZVNlc3Npb25SZXNwb25zZRJICgdDaHVua0djEh0uZW5ncmFtLmFwcC52MS5DaHVua0djUmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuQ2h1bmtHY1Jlc3BvbnNlEksKCEJ1bmRsZUdjEh4uZW5ncmFtLmFwcC52MS5CdW5kbGVHY1JlcXVlc3QaHy5lbmdyYW0uYXBwLnYxLkJ1bmRsZUdjUmVzcG9uc2USXQoOU25hcHNob3RCbG9iR2MSJC5lbmdyYW0uYXBwLnYxLlNuYXBzaG90QmxvYkdjUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuU25hcHNob3RCbG9iR2NSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session]);
+  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IvcCCghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhcKD2xvY2FsX3NuYXBzaG90cxgHIAEoBBIUCgxyZWFkeV9pbWFnZXMYCCABKAQSGwoTcmVhZHlfaW1hZ2VfZGlnZXN0cxgJIAMoCRIbChN1dGlsX2Rpc2tfdG90YWxfbWliGAogASgEEhoKEnV0aWxfZGlza191c2VkX21pYhgLIAEoBBIaChJ1dGlsX21lbV90b3RhbF9taWIYDCABKAQSGQoRdXRpbF9tZW1fdXNlZF9taWIYDSABKAQSFAoMdXRpbF9jcHVfcGN0GA4gASgCEhkKEWxhc3RfaGVhcnRiZWF0X2F0GA8gASgJIiEKDkdldEhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiOAoPR2V0SG9zdFJlc3BvbnNlEiUKBGhvc3QYASABKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IikKFkdldEhvc3RDb3dTdGF0ZVJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSJZChdHZXRIb3N0Q293U3RhdGVSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEi0KCHNlc3Npb25zGAIgAygLMhsuZW5ncmFtLmFwcC52MS5Db3dTdGF0ZVZpZXciIwoQRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIhMKEURyYWluSG9zdFJlc3BvbnNlIigKFUFkbWluRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJImwKFkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRISCgpldmFjdWF0aW5nGAIgAygJEi0KCGZhaWx1cmVzGAMgAygLMhsuZW5ncmFtLmFwcC52MS5EcmFpbkZhaWx1cmUiMQoMRHJhaW5GYWlsdXJlEhIKCnNlc3Npb25faWQYASABKAkSDQoFZXJyb3IYAiABKAkiJAoRQ29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI1ChJDb3Jkb25Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiJgoTVW5jb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIjcKFFVuY29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIhoKGEdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdCLqAQoZR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRIRCglzbmFwc2hvdHMYASABKAQSFgoOc25hcHNob3RfYnl0ZXMYAiABKAQSEgoKZ2NfcGVuZGluZxgDIAEoBBIZChF0cmFja2VkX3NhbmRib3hlcxgEIAEoBBIUCgxkaXJ0eV9jaHVua3MYBSABKAQSFwoPdW5mbHVzaGVkX2J5dGVzGAYgASgEEhgKEGF2Z19sb2NhbGl0eV9wY3QYByABKA0SKgoEcm93cxgIIAMoCzIcLmVuZ3JhbS5hcHAudjEuRHVyYWJpbGl0eVJvdyLlAQoNRHVyYWJpbGl0eVJvdxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIPCgdob3N0X2lkGAMgASgJEhQKDGRpcnR5X2NodW5rcxgEIAEoDRITCgtkaXJ0eV9ieXRlcxgFIAEoBBITCgtiYXNlX2NodW5rcxgGIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgHIAEoDRIaCg1sYXN0X2ZsdXNoX2F0GAggASgJSAGIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXQiKQoTRmx1c2hTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIlsKFEZsdXNoU2Vzc2lvblJlc3BvbnNlEg8KB291dGNvbWUYASABKAkSHQoQbWFuaWZlc3RfdmVyc2lvbhgCIAEoBEgAiAEBQhMKEV9tYW5pZmVzdF92ZXJzaW9uIlYKFkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgt0YXJnZXRfaG9zdBgCIAEoCUgAiAEBQg4KDF90YXJnZXRfaG9zdCI9ChdFdmFjdWF0ZVNlc3Npb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSIXChVHZXRGbGVldERlbWFuZFJlcXVlc3Qi8QEKFkdldEZsZWV0RGVtYW5kUmVzcG9uc2USEwoLcmVhZHlfaG9zdHMYASABKA0SGQoRc2NoZWR1bGFibGVfaG9zdHMYAiABKA0SEAoIZnJlZV9taWIYAyABKAQSEQoJdG90YWxfbWliGAQgASgEEhIKCmZyZWVfdmNwdXMYBSABKAQSEwoLdG90YWxfdmNwdXMYBiABKAQSFgoOY29yZG9uZWRfaG9zdHMYByABKA0SFwoPcXVldWVkX3Nlc3Npb25zGAggASgEEhIKCnF1ZXVlZF9taWIYCSABKAQSFAoMcXVldWVkX3ZjcHVzGAogASgEIkkKDkNodW5rR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIvcBCg9DaHVua0djUmVzcG9uc2USFQoNbGlzdGVkX2NodW5rcxgBIAEoBBIWCg5tYWxmb3JtZWRfa2V5cxgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSFQoNcmVzdGFydF9jb3VudBgFIAEoDRIgChhyZXN0YXJ0X2J1ZGdldF9leGhhdXN0ZWQYBiABKAgSGAoQcHJvbW90ZWRfZGVsZXRlcxgHIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYCCABKAQSEgoKZ3JhY2Vfc2VjcxgJIAEoBCJKCg9CdW5kbGVHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3MiowEKEEJ1bmRsZUdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhQKDHBpbl9zZXRfc2l6ZRgCIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgDIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAQgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgFIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAYgASgNIlAKFVNuYXBzaG90QmxvYkdjUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyLcAQoWU25hcHNob3RCbG9iR2NSZXNwb25zZRIOCgZsaXN0ZWQYASABKAQSEQoJbWFsZm9ybWVkGAIgASgEEhQKDHBpbl9zZXRfc2l6ZRgDIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgEIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAUgASgEEh4KFnByb21vdGVfcmVwaW5uZWRfc2tpcHMYBiABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAcgASgEEhUKDXJlc3RhcnRfY291bnQYCCABKA0y3QkKDEZsZWV0U2VydmljZRJOCglMaXN0SG9zdHMSHy5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1Jlc3BvbnNlEkgKB0dldEhvc3QSHS5lbmdyYW0uYXBwLnYxLkdldEhvc3RSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRIb3N0UmVzcG9uc2USYAoPR2V0SG9zdENvd1N0YXRlEiUuZW5ncmFtLmFwcC52MS5HZXRIb3N0Q293U3RhdGVSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5HZXRIb3N0Q293U3RhdGVSZXNwb25zZRJOCglEcmFpbkhvc3QSHy5lbmdyYW0uYXBwLnYxLkRyYWluSG9zdFJlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkRyYWluSG9zdFJlc3BvbnNlEl0KDkFkbWluRHJhaW5Ib3N0EiQuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USUQoKQ29yZG9uSG9zdBIgLmVuZ3JhbS5hcHAudjEuQ29yZG9uSG9zdFJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXNwb25zZRJXCgxVbmNvcmRvbkhvc3QSIi5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlc3BvbnNlEmYKEUdldFN0b3JhZ2VTdW1tYXJ5EicuZW5ncmFtLmFwcC52MS5HZXRTdG9yYWdlU3VtbWFyeVJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLkdldFN0b3JhZ2VTdW1tYXJ5UmVzcG9uc2USVwoMRmx1c2hTZXNzaW9uEiIuZW5ncmFtLmFwcC52MS5GbHVzaFNlc3Npb25SZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5GbHVzaFNlc3Npb25SZXNwb25zZRJgCg9FdmFjdWF0ZVNlc3Npb24SJS5lbmdyYW0uYXBwLnYxLkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkV2YWN1YXRlU2Vzc2lvblJlc3BvbnNlEkgKB0NodW5rR2MSHS5lbmdyYW0uYXBwLnYxLkNodW5rR2NSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5DaHVua0djUmVzcG9uc2USSwoIQnVuZGxlR2MSHi5lbmdyYW0uYXBwLnYxLkJ1bmRsZUdjUmVxdWVzdBofLmVuZ3JhbS5hcHAudjEuQnVuZGxlR2NSZXNwb25zZRJdCg5TbmFwc2hvdEJsb2JHYxIkLmVuZ3JhbS5hcHAudjEuU25hcHNob3RCbG9iR2NSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5TbmFwc2hvdEJsb2JHY1Jlc3BvbnNlEl0KDkdldEZsZWV0RGVtYW5kEiQuZW5ncmFtLmFwcC52MS5HZXRGbGVldERlbWFuZFJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkdldEZsZWV0RGVtYW5kUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_session]);
 
 /**
  * @generated from message engram.app.v1.ListHostsRequest
@@ -689,6 +689,104 @@ export const EvacuateSessionResponseSchema: GenMessage<EvacuateSessionResponse> 
   messageDesc(file_engram_app_v1_fleet, 22);
 
 /**
+ * @generated from message engram.app.v1.GetFleetDemandRequest
+ */
+export type GetFleetDemandRequest = Message<"engram.app.v1.GetFleetDemandRequest"> & {
+};
+
+/**
+ * Describes the message engram.app.v1.GetFleetDemandRequest.
+ * Use `create(GetFleetDemandRequestSchema)` to create a new message.
+ */
+export const GetFleetDemandRequestSchema: GenMessage<GetFleetDemandRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 23);
+
+/**
+ * Mirrors api/admin.rs FleetDemandResponse (ADR 0044 K4 / 0047 / 0048). The
+ * autoscaler's input. Every field is PG-derived so replicas agree.
+ *
+ * @generated from message engram.app.v1.GetFleetDemandResponse
+ */
+export type GetFleetDemandResponse = Message<"engram.app.v1.GetFleetDemandResponse"> & {
+  /**
+   * Hosts with a live heartbeat.
+   *
+   * @generated from field: uint32 ready_hosts = 1;
+   */
+  readyHosts: number;
+
+  /**
+   * Non-draining hosts the scheduler can place on.
+   *
+   * @generated from field: uint32 schedulable_hosts = 2;
+   */
+  schedulableHosts: number;
+
+  /**
+   * ADR 0046: Σ max(0, allocatable_mib − reserved) over schedulable hosts —
+   * the host-measured headroom (nets out the daemon/OS/chunk-cache/mlock
+   * baseline), the autoscaler's true demand signal.
+   *
+   * @generated from field: uint64 free_mib = 3;
+   */
+  freeMib: bigint;
+
+  /**
+   * Σ allocatable_mib over schedulable hosts — lets the caller derive the
+   * average per-host capacity (how much one node adds).
+   *
+   * @generated from field: uint64 total_mib = 4;
+   */
+  totalMib: bigint;
+
+  /**
+   * ADR 0048: Σ spare vCPU (Σ cpu_budget − reserved) over schedulable hosts,
+   * and the total CPU budget — the CPU dimension of scale-up.
+   *
+   * @generated from field: uint64 free_vcpus = 5;
+   */
+  freeVcpus: bigint;
+
+  /**
+   * @generated from field: uint64 total_vcpus = 6;
+   */
+  totalVcpus: bigint;
+
+  /**
+   * ADR 0048: hosts cordoned for scale-down (operator visibility; the wave
+   * driver also reads this to know its in-flight footprint).
+   *
+   * @generated from field: uint32 cordoned_hosts = 7;
+   */
+  cordonedHosts: number;
+
+  /**
+   * ADR 0048: the queue. `queued_*` is the demand the operator scales UP to
+   * fit; scale-DOWN is hard-gated on `queued_sessions == 0`.
+   *
+   * @generated from field: uint64 queued_sessions = 8;
+   */
+  queuedSessions: bigint;
+
+  /**
+   * @generated from field: uint64 queued_mib = 9;
+   */
+  queuedMib: bigint;
+
+  /**
+   * @generated from field: uint64 queued_vcpus = 10;
+   */
+  queuedVcpus: bigint;
+};
+
+/**
+ * Describes the message engram.app.v1.GetFleetDemandResponse.
+ * Use `create(GetFleetDemandResponseSchema)` to create a new message.
+ */
+export const GetFleetDemandResponseSchema: GenMessage<GetFleetDemandResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 24);
+
+/**
  * @generated from message engram.app.v1.ChunkGcRequest
  */
 export type ChunkGcRequest = Message<"engram.app.v1.ChunkGcRequest"> & {
@@ -723,7 +821,7 @@ export type ChunkGcRequest = Message<"engram.app.v1.ChunkGcRequest"> & {
  * Use `create(ChunkGcRequestSchema)` to create a new message.
  */
 export const ChunkGcRequestSchema: GenMessage<ChunkGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 23);
+  messageDesc(file_engram_app_v1_fleet, 25);
 
 /**
  * Mirrors api/admin.rs ChunkGcSweepResult.
@@ -800,7 +898,7 @@ export type ChunkGcResponse = Message<"engram.app.v1.ChunkGcResponse"> & {
  * Use `create(ChunkGcResponseSchema)` to create a new message.
  */
 export const ChunkGcResponseSchema: GenMessage<ChunkGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 24);
+  messageDesc(file_engram_app_v1_fleet, 26);
 
 /**
  * @generated from message engram.app.v1.BundleGcRequest
@@ -825,7 +923,7 @@ export type BundleGcRequest = Message<"engram.app.v1.BundleGcRequest"> & {
  * Use `create(BundleGcRequestSchema)` to create a new message.
  */
 export const BundleGcRequestSchema: GenMessage<BundleGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 25);
+  messageDesc(file_engram_app_v1_fleet, 27);
 
 /**
  * Mirrors bundle_gc.rs BundleSweepReport (ADR 0035 §5). Unlike the
@@ -873,7 +971,7 @@ export type BundleGcResponse = Message<"engram.app.v1.BundleGcResponse"> & {
  * Use `create(BundleGcResponseSchema)` to create a new message.
  */
 export const BundleGcResponseSchema: GenMessage<BundleGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 26);
+  messageDesc(file_engram_app_v1_fleet, 28);
 
 /**
  * @generated from message engram.app.v1.SnapshotBlobGcRequest
@@ -898,7 +996,7 @@ export type SnapshotBlobGcRequest = Message<"engram.app.v1.SnapshotBlobGcRequest
  * Use `create(SnapshotBlobGcRequestSchema)` to create a new message.
  */
 export const SnapshotBlobGcRequestSchema: GenMessage<SnapshotBlobGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 27);
+  messageDesc(file_engram_app_v1_fleet, 29);
 
 /**
  * Mirrors snapshot_blob_gc.rs SnapshotBlobSweepReport (ADR 0028
@@ -961,7 +1059,7 @@ export type SnapshotBlobGcResponse = Message<"engram.app.v1.SnapshotBlobGcRespon
  * Use `create(SnapshotBlobGcResponseSchema)` to create a new message.
  */
 export const SnapshotBlobGcResponseSchema: GenMessage<SnapshotBlobGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 28);
+  messageDesc(file_engram_app_v1_fleet, 30);
 
 /**
  * Fleet, storage, and GC operations (ADR 0051 §2.3, rev 2026-06-10).
@@ -1099,6 +1197,19 @@ export const FleetService: GenService<{
     methodKind: "unary";
     input: typeof SnapshotBlobGcRequestSchema;
     output: typeof SnapshotBlobGcResponseSchema;
+  },
+  /**
+   * ADR 0044 K4 / ADR 0047-0048: the node-pool autoscaler's demand signal
+   * (was GET /api/admin/fleet/demand). Counts, headroom (both dims), the
+   * cordoned footprint, and the queue all come from PG so every coordinator
+   * replica reports identical demand.
+   *
+   * @generated from rpc engram.app.v1.FleetService.GetFleetDemand
+   */
+  getFleetDemand: {
+    methodKind: "unary";
+    input: typeof GetFleetDemandRequestSchema;
+    output: typeof GetFleetDemandResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_fleet, 0);

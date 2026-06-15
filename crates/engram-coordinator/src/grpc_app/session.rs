@@ -325,6 +325,21 @@ impl app::session_service_server::SessionService for AppSessionService {
         Ok(Response::new(app::EvictLocalResponse {}))
     }
 
+    async fn evict_idle(
+        &self,
+        req: Request<app::EvictIdleRequest>,
+    ) -> Result<Response<app::EvictIdleResponse>, Status> {
+        self.auth.check(&req)?;
+        let id = parse_session_id(&req.get_ref().session_id)?;
+        let result = crate::api::admin::evict_idle_core(&self.state, id)
+            .await
+            .map_err(into_status)?;
+        Ok(Response::new(app::EvictIdleResponse {
+            session_id: result.session_id.to_string(),
+            status: result.status.to_string(),
+        }))
+    }
+
     async fn get_cow_state(
         &self,
         req: Request<app::GetCowStateRequest>,

@@ -24,6 +24,13 @@ service SessionService {
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
   rpc Resume(ResumeRequest) returns (ResumeResponse);
   rpc EvictLocal(EvictLocalRequest) returns (EvictLocalResponse);
+  // ADR 0051: the explicit admin trigger for the idle-eviction primitive
+  // (was POST /api/admin/sessions/:id/evict-idle). Fires the SAME pipeline
+  // (idle_evictor::evict_idle_session) the host-side idle detector + the
+  // coord idle-detect backstop drive on a timeout, so it is a faithful
+  // stand-in for "the session went idle" WITHOUT waiting out (or lowering)
+  // the idle TTL. Synchronous: the session is Idle by the time this returns.
+  rpc EvictIdle(EvictIdleRequest) returns (EvictIdleResponse);
   rpc GetCowState(GetCowStateRequest) returns (GetCowStateResponse);
   rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
   // STREAMING: artifacts run to 512 MiB (MAX_ARTIFACT_BYTES); a unary
@@ -274,6 +281,19 @@ message EvictLocalRequest {
 
 // Today's HTTP handler returns 202 Accepted with no body.
 message EvictLocalResponse {}
+
+message EvictIdleRequest {
+  string session_id = 1;
+}
+
+// Mirrors api/admin.rs EvictIdleResponse. The synchronous pipeline has
+// already run by the time this returns: the session is paused, flushed,
+// snapshotted, and its local sandbox destroyed; the PG row is at Idle and
+// a subsequent Resume rebinds it. `status` is always "idle" on success.
+message EvictIdleResponse {
+  string session_id = 1;
+  string status = 2;
+}
 
 message GetCowStateRequest {
   string session_id = 1;

@@ -218,6 +218,59 @@ pub(crate) async fn evacuate_session_core(
     })
 }
 
+#[derive(Serialize)]
+pub struct EvictIdleResponse {
+    pub session_id: SessionId,
+    /// "idle" — the session was paused, flushed, snapshotted, and its
+    /// local sandbox destroyed; the PG row is at `Idle` and a subsequent
+    /// `Resume` rebinds it.
+    pub status: &'static str,
+}
+
+/// Transport-agnostic core for the idle-eviction primitive (ADR 0051,
+/// restored on the gRPC surface as `SessionService::EvictIdle`). The
+/// explicit admin trigger for the idle-eviction pipeline: fires the exact
+/// same primitive (`idle_evictor::evict_idle_session`) the host-side idle
+/// detector and the coord `idle_detect_backstop` scanner drive on a timeout,
+/// so it is a faithful stand-in for "the session went idle" — without waiting
+/// out (or globally lowering) the idle TTL. Pre: Active session with a bound
+/// sandbox. Post: session at `Idle`, memory snapshot durable in BlobStorage,
+/// resumable. Synchronous (unlike `evacuate`, which hands off to the resumer
+/// scanner): the pipeline runs inline and the session is `Idle` by the time
+/// this returns.
+pub(crate) async fn evict_idle_core(
+    state: &SharedState,
+    session_id: SessionId,
+) -> Result<EvictIdleResponse, ApiError> {
+    let session = state.services.meta.get_session(session_id).await?;
+    if !matches!(session.status, engram_core::types::SessionState::Active) {
+        return Err(ApiError::Conflict(format!(
+            "evict-idle only supported for Active sessions (got {})",
+            session.status.as_str(),
+        )));
+    }
+    let Some(sandbox_id) = session.sandbox_id else {
+        return Err(ApiError::Conflict(format!(
+            "session {session_id} has no bound sandbox",
+        )));
+    };
+
+    crate::idle_evictor::evict_idle_session(state, session_id, sandbox_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("idle-evict pipeline: {e}")))?;
+
+    tracing::info!(
+        %session_id,
+        %sandbox_id,
+        "admin evict-idle: session suspended to Idle via the idle-eviction primitive",
+    );
+
+    Ok(EvictIdleResponse {
+        session_id,
+        status: "idle",
+    })
+}
+
 // ---------------------------------------------------------------------
 // ADR 0045 Phase F — pause / resume a microVM in place (the freeze/flush
 // test surface). Thin admin passthroughs to the FC pause/resume
@@ -769,4 +822,68 @@ async fn snapshot_blob_gc_run(
     .await
     .map_err(|e| ApiError::Internal(format!("snapshot-blob-gc: {e}")))?;
     Ok(Json(report))
+}
+
+// ---------------------------------------------------------------------
+// ADR 0044 K4 — fleet-demand signal for the node-pool autoscaler
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct FleetDemandResponse {
+    /// Hosts with a live heartbeat.
+    pub ready_hosts: u32,
+    /// Non-draining hosts the scheduler can place on.
+    pub schedulable_hosts: u32,
+    /// ADR 0046: Σ max(0, allocatable_mib − reserved) over schedulable hosts.
+    pub free_mib: u64,
+    /// Σ allocatable_mib over schedulable hosts.
+    pub total_mib: u64,
+    /// ADR 0048: Σ spare vCPU over schedulable hosts, and the total budget.
+    pub free_vcpus: u64,
+    pub total_vcpus: u64,
+    /// ADR 0048: hosts cordoned for scale-down.
+    pub cordoned_hosts: u32,
+    /// ADR 0048: the queue. `queued_*` is the demand to scale UP to fit;
+    /// scale-DOWN is hard-gated on `queued_sessions == 0`.
+    pub queued_sessions: u64,
+    pub queued_mib: u64,
+    pub queued_vcpus: u64,
+}
+
+/// Transport-agnostic core for the fleet-demand signal (ADR 0051, restored on
+/// the gRPC surface as `FleetService::GetFleetDemand`). The autoscaler's
+/// input. ADR 0047/0048: counts, headroom (both dims), the cordoned footprint,
+/// AND the queue all come from PG, so every coordinator replica reports
+/// identical demand. Infallible: a transient PG query failure falls back to
+/// "no pressure" (free = total) so scale-down hysteresis rides out a single
+/// tick rather than surfacing a 5xx to the autoscaler.
+pub(crate) async fn fleet_demand_core(state: &SharedState) -> FleetDemandResponse {
+    let m = crate::placement::fleet_snapshot(state.services.meta.as_ref())
+        .await
+        .unwrap_or_default();
+    let free_mib = state
+        .services
+        .meta
+        .fleet_free_mib()
+        .await
+        .map(|f| f.max(0) as u64)
+        .unwrap_or(m.total_mib);
+    let queued = state
+        .services
+        .meta
+        .queued_demand()
+        .await
+        .unwrap_or_default();
+    FleetDemandResponse {
+        ready_hosts: m.ready_hosts,
+        schedulable_hosts: m.schedulable_hosts,
+        free_mib,
+        total_mib: m.total_mib,
+        free_vcpus: m.free_vcpus,
+        total_vcpus: m.total_vcpus,
+        cordoned_hosts: m.cordoned_hosts,
+        queued_sessions: queued.sessions,
+        queued_mib: queued.mem_mib,
+        queued_vcpus: queued.vcpus,
+    }
 }
