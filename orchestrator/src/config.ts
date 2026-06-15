@@ -40,6 +40,19 @@ export interface Config {
    */
   betterAuthSecret: string;
   /**
+   * ENGRAM_KEK_MASTER_KEY — base64-encoded 32-byte master key (KEK) for
+   * KEK-envelope sealing of user_session_secrets at rest (ADR 0051 Drip A).
+   * This is the SAME key the Rust coordinator's `engram-crypto` uses — the
+   * orchestrator shares the engrams encryption key so a value sealed by either
+   * is format-identical. In prod it is sourced from GCP Secret Manager; in dev
+   * `just bootstrap` writes it to `.env` and the Tiltfile injects it into both
+   * the coordinator and the orchestrator. Required: the server refuses to start
+   * without it (test-mode escape injects a fixed valid 32-byte placeholder, but
+   * the crypto factory takes an injected key in tests so the placeholder is
+   * never actually used for real sealing).
+   */
+  kekMasterKey: string;
+  /**
    * IAP_AUDIENCE — GCP IAP audience string (e.g. /projects/PROJECT_NUM/apps/APP_ID).
    * When unset the IAP bridge is fully inert (zero overhead, no header reads).
    * Set this in production when the orchestrator sits behind GCP IAP.
@@ -124,6 +137,26 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // above applies equally (see isTest comment). Prod/dev must set the real var.
   const betterAuthSecret = require("BETTER_AUTH_SECRET");
 
+  // REQUIRED: ENGRAM_KEK_MASTER_KEY — base64 32-byte KEK shared with the Rust
+  // coordinator (engram-crypto). The orchestrator seals user_session_secrets at
+  // rest with the same envelope format + same key. The generic `require()`
+  // placeholder above would not decode to 32 bytes, so the test-mode escape
+  // here returns a FIXED valid base64 32-byte value (all-zero key). Tests that
+  // exercise crypto inject their own key via makeSealer(); this placeholder
+  // only exists so `loadConfig()` (and seal.ts's lazy default) can be imported
+  // under `bun test` without ENGRAM_KEK_MASTER_KEY set. Prod/dev MUST set the
+  // real var — the Tiltfile injects it (same value as the coordinator).
+  const kekMasterKey = (() => {
+    const v = env["ENGRAM_KEK_MASTER_KEY"];
+    if (v) return v;
+    if (isTest) {
+      // base64 of 32 zero bytes — valid length, never used for real sealing.
+      return Buffer.alloc(32, 0).toString("base64");
+    }
+    missing.push("ENGRAM_KEK_MASTER_KEY");
+    return "";
+  })();
+
   // OPTIONAL: IAP bridge config. When IAP_AUDIENCE is unset the bridge is
   // fully inert in dev (no overhead, no header reads). Set in prod only.
   // No test placeholder needed — unset is valid and means "inert".
@@ -178,6 +211,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     controlPlaneBearer,
     trustedOrigins,
     betterAuthSecret,
+    kekMasterKey,
     iapAudience,
     iapJwksUrl,
     oidc,
