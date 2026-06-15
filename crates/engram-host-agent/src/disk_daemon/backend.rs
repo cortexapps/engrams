@@ -403,6 +403,19 @@ impl Drop for InFlightGuard {
 struct BackendState {
     manifest_ref: ManifestRef,
     base: PositionalDiskManifest,
+    /// ADR 0049 follow-up: when `true`, the FIRST flush mints a fresh
+    /// per-session `manifest_id` (forking the shared base) instead of
+    /// `next_version()`-ing the base's. Set only on the fresh-create
+    /// attach path (`attach_manifest(.., fork_on_first_flush=true)`);
+    /// cleared after the fork. A resumed session attaches its OWN
+    /// already-forked id, so this stays `false` and it just ticks.
+    ///
+    /// Without this, every same-base session writes under ONE shared
+    /// `manifest_id` — concurrent restores race that version chain and
+    /// `(manifest_id, version)` becomes ambiguous across sessions →
+    /// cross-session rootfs corruption (the ADR 0048 load-test
+    /// `reread ''` + stale-drop reaps).
+    fork_pending: bool,
 }
 
 /// ADR 0021 P2: byte budget for the per-backend in-memory chunk cache.
@@ -542,7 +555,11 @@ impl ChunkedDiskBackend {
         let chunk_size = base.chunk_size;
         let total_bytes = base.total_bytes;
         Ok(Self {
-            state: Arc::new(Mutex::new(BackendState { manifest_ref, base })),
+            state: Arc::new(Mutex::new(BackendState {
+                manifest_ref,
+                base,
+                fork_pending: false,
+            })),
             chunk_size,
             total_bytes,
             cache,
@@ -575,7 +592,11 @@ impl ChunkedDiskBackend {
         let chunk_size = base.chunk_size;
         let total_bytes = base.total_bytes;
         Ok(Self {
-            state: Arc::new(Mutex::new(BackendState { manifest_ref, base })),
+            state: Arc::new(Mutex::new(BackendState {
+                manifest_ref,
+                base,
+                fork_pending: false,
+            })),
             chunk_size,
             total_bytes,
             cache,
@@ -912,6 +933,14 @@ impl ChunkedDiskBackend {
     /// chain from here.
     pub async fn rebase_manifest_ref(&self, manifest_ref: ManifestRef) {
         self.state.lock().await.manifest_ref = manifest_ref;
+    }
+
+    /// ADR 0049 follow-up: arm the lazy per-session manifest fork. Called
+    /// on the fresh-create attach path (where the backend is born on the
+    /// SHARED base `manifest_id`) so the first flush mints a private id
+    /// instead of versioning the shared base. See [`BackendState::fork_pending`].
+    pub async fn mark_fork_pending(&self) {
+        self.state.lock().await.fork_pending = true;
     }
 
     /// ADR 0045 C1: see `migration_fence`.
@@ -1450,7 +1479,19 @@ impl ChunkedDiskBackend {
         // attempt counter, no signed-subtraction sin.
         const MAX_FLUSH_RETRIES: u32 = 32;
         let mut attempts: u32 = 0;
-        let mut attempt_ref = state.manifest_ref.next_version();
+        // ADR 0049 follow-up: the FIRST flush of a fresh-base session forks
+        // the shared base manifest to a PRIVATE per-session id (a brand-new
+        // UUID at v1, parent = base above), so concurrent same-base sessions
+        // never share a version chain and `(manifest_id, version)` is
+        // globally unambiguous. A fresh id can't version-conflict, so the
+        // retry loop below only ever fires for the resume/own-id path. The
+        // base chunks the fork's manifest lists stay deduped + pinned (the
+        // enabled-image GC source); only the manifest identity forks.
+        let mut attempt_ref = if state.fork_pending {
+            ManifestRef::new()
+        } else {
+            state.manifest_ref.next_version()
+        };
         let new_ref = loop {
             attempts += 1;
             match self.store.put_manifest(attempt_ref, &new_manifest).await {
@@ -1500,6 +1541,8 @@ impl ChunkedDiskBackend {
             }
         }
         state.manifest_ref = new_ref;
+        // The fork (if any) is done — future flushes tick this private id.
+        state.fork_pending = false;
         drop(state);
 
         // ADR 0038 B3: chunks are now durable in GCS AND `base` is
@@ -1837,6 +1880,107 @@ mod tests {
 
         let bytes = backend.read(4096, 4096).await.unwrap();
         assert!(bytes.iter().all(|b| *b == 0xbb));
+    }
+
+    /// ADR 0049 follow-up regression: the same-base concurrent-restore
+    /// corruption. Two backends built on the SAME base manifest (the
+    /// fresh-create path) must, when fork-armed, each fork to a DISTINCT
+    /// private `manifest_id` on first flush and read back their OWN bytes —
+    /// never collide on one shared version chain. Before the fix both wrote
+    /// under the base id, raced its versions, and `(id, version)` was
+    /// ambiguous across sessions → `reread ''`.
+    #[tokio::test]
+    async fn fresh_same_base_backends_fork_to_distinct_private_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, h0)]);
+        let base_ref = ManifestRef::new();
+        store.put_manifest(base_ref, &manifest).await.unwrap();
+        let mk_cache = || {
+            let mut cfg = ChunkCacheConfig::new(dir.path().join(format!("c{}", rand_suffix())));
+            cfg.budget_bytes = 64 * 1024 * 1024;
+            ChunkCache::new(cfg)
+        };
+
+        // Two fresh-create backends on the SAME base, both fork-armed.
+        let a = ChunkedDiskBackend::new(base_ref, &manifest, mk_cache(), store.clone(), u64::MAX)
+            .unwrap();
+        let b = ChunkedDiskBackend::new(base_ref, &manifest, mk_cache(), store.clone(), u64::MAX)
+            .unwrap();
+        a.mark_fork_pending().await;
+        b.mark_fork_pending().await;
+
+        a.write(0, &[0x11u8; 4096]).await.unwrap();
+        b.write(0, &[0x22u8; 4096]).await.unwrap();
+        let oa = a.flush().await.unwrap();
+        let ob = b.flush().await.unwrap();
+
+        // Each forked off the base to its OWN private id, both at v1.
+        assert_ne!(
+            oa.manifest_ref.manifest_id, base_ref.manifest_id,
+            "A never forked"
+        );
+        assert_ne!(
+            ob.manifest_ref.manifest_id, base_ref.manifest_id,
+            "B never forked"
+        );
+        assert_ne!(
+            oa.manifest_ref.manifest_id, ob.manifest_ref.manifest_id,
+            "same-base backends collided on one manifest id"
+        );
+        assert_eq!(oa.manifest_ref.version, 1);
+        assert_eq!(ob.manifest_ref.version, 1);
+
+        // No cross-session clobber: each reads its OWN bytes.
+        assert!(a.read(0, 4096).await.unwrap().iter().all(|x| *x == 0x11));
+        assert!(b.read(0, 4096).await.unwrap().iter().all(|x| *x == 0x22));
+
+        // A second flush TICKS the private id (no re-fork).
+        a.write(0, &[0x33u8; 4096]).await.unwrap();
+        let oa2 = a.flush().await.unwrap();
+        assert_eq!(
+            oa2.manifest_ref.manifest_id, oa.manifest_ref.manifest_id,
+            "re-forked"
+        );
+        assert_eq!(oa2.manifest_ref.version, 2);
+    }
+
+    /// The resume/recovery path (fork NOT armed) keeps ticking the id it
+    /// attached — it already owns a private manifest from its prior snapshot.
+    #[tokio::test]
+    async fn unforked_backend_ticks_its_attached_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, h0)]);
+        let own_ref = ManifestRef::new();
+        store.put_manifest(own_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend =
+            ChunkedDiskBackend::new(own_ref, &manifest, ChunkCache::new(cfg), store, u64::MAX)
+                .unwrap();
+        // No mark_fork_pending — resume semantics.
+        backend.write(0, &[0x44u8; 4096]).await.unwrap();
+        let out = backend.flush().await.unwrap();
+        assert_eq!(
+            out.manifest_ref.manifest_id, own_ref.manifest_id,
+            "unforked backend forked"
+        );
+        assert_eq!(out.manifest_ref.version, own_ref.version + 1);
+    }
+
+    /// Tiny per-call suffix so the two backends use distinct cache dirs
+    /// without `Math.random`-style nondeterminism in the assertions.
+    fn rand_suffix() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
     }
 
     /// The flush-window write race (the teleport-canary zeros): a write

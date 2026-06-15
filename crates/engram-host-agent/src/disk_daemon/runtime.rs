@@ -447,10 +447,19 @@ pub async fn attach_manifest(
     store: Arc<engram_chunk_store::ChunkStore>,
     slot_pool: &Arc<NbdSlotAllocator>,
     threshold_bytes: u64,
+    // ADR 0049 follow-up: `true` on the FRESH-CREATE path, where the backend
+    // is born on the SHARED base `manifest_id`. Arms a lazy fork so the first
+    // flush mints a private per-session id (concurrent same-base sessions
+    // otherwise race one version chain → cross-session corruption). `false`
+    // for resume / recovery, which attach the session's own already-forked id.
+    fork_on_first_flush: bool,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
     let backend_id = disk_manifest_ref.manifest_id.to_string();
     let backend =
         ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?;
+    if fork_on_first_flush {
+        backend.mark_fork_pending().await;
+    }
     attach_backend(backend, slot_pool, &backend_id).await
 }
 

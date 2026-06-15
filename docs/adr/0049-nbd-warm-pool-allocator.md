@@ -114,3 +114,79 @@ module load, so node-prep reloads the module when the live value differs
   `nbdsMax: 4096` — expect the wedge gone (queue drains, restores complete,
   lossless), host NBD-slot telemetry well below the cap. Flip to Accepted on a
   clean run.
+
+## Follow-ups — bottlenecks the throttle was hiding
+
+The 16-slot pool was *serializing* restores; removing it surfaced three latent
+issues, each fixed in turn (the "fix one bottleneck, expose the next" cascade):
+
+1. **UFFD substrate invisible on fresh nodes.** The host-agent's
+   `/var/lib/engram` volumeMount lacked `mountPropagation: HostToContainer`, so
+   node-prep's base-shm tmpfs (mounted in the host ns *after* the agent starts)
+   never propagated in — FC's shmem-only UFFD restore 503'd. Long-lived nodes
+   hid it via a restart-after-mount race; recreating nodes for `nbds_max=4096`
+   exposed it. Fixed by adding the propagation flag.
+
+2. **helm-deploy wedged the host-fleet release.** The DaemonSet is `OnDelete`
+   (operator owns the drain-gated roll), so `helm upgrade --wait` always timed
+   out → release `failed`; a cancelled run mid-wait left it stuck
+   `pending-upgrade` → next deploy aborts "another operation in progress". The
+   pipeline now self-heals (rollback) + drops `--wait` for that release. Note
+   the operator rolls host-agent pods on **image** change only — a chart/
+   template-only change (e.g. the propagation flag) is rolled by a graceful
+   per-pod delete, not the operator.
+
+3. **Sidecar device race (REVERTED — chasing a phantom).** `restore_with`
+   reads `rootfs_source` from the per-base-snapshot `snapshots/<base>/manifest.json`,
+   which every same-base restore patches with its own `/dev/nbdN`. A sibling's
+   patch landing between a restore's patch and its read could *in theory* make
+   FC open the wrong device. I added a `restore_with_rootfs_override` to pass the
+   device directly — but it never fixed anything observable, because the
+   "corruption" it was chasing **did not exist** (see the IMPORTANT note below).
+   Reverted (commit `97ea3e8f`); no proven impact, kept the diff honest.
+
+4. **Per-session disk-manifest fork (KEPT — fixes a latent durability hazard,
+   NOT corruption).** A restored session's chunked-disk backend is keyed by
+   `disk_manifest_ref.manifest_id`, and on the FRESH-CREATE path that is
+   `bundle.disk_manifest` — the BASE IMAGE's id, identical for every same-base
+   session. The flush path only `next_version()`s that shared id (unlike *memory*,
+   which mints `ManifestRef::new()` per capture). So N concurrent same-base
+   sessions wrote under one `manifests/<base>/vN` chain. Two real, *latent*
+   problems (neither was the load-test failure): (a) they raced the chunk-store
+   version counter — the ADR 0014 "version conflict; retry latest+1" band-aid,
+   live-measured at 22-wide × 41 retries, capped at 32 and wasteful; and (b)
+   `(manifest_id, version)` was AMBIGUOUS across sessions — `(shared_id, v5)`
+   holds one session's content, so an eviction/cold-recovery reading session A's
+   `(shared_id, v5)` could restore session B's disk. **Fix:** lazily fork the disk
+   manifest to a private per-session `manifest_id` on the first flush of a
+   fresh-base session (`BackendState::fork_pending`, armed by
+   `attach_manifest(.., fork_on_first_flush=true)` only on the fresh-create path).
+   The fork's chunk list still references the shared, content-addressed base
+   chunks (**no byte duplication — density preserved**; and it's *faster* under
+   burst — no version contention); only the manifest IDENTITY forks. Mirrors
+   `seed_checkpoint_chain`. Transparent to GC (pins by content hash) and the coord
+   columns (already per-row UUID); the resume selector's
+   `live.manifest_id == snapshot.manifest_id` assumption is *repaired*. Regression
+   tests: `backend::tests::fresh_same_base_backends_fork_to_distinct_private_ids`
+   + `unforked_backend_ticks_its_attached_id` (CI).
+
+   **IMPORTANT — there was no data corruption.** The load test's "lossless"
+   failures (`reread ''`) were a TEST-HARNESS MISDIAGNOSIS: `sha256sum … 2>/dev/null`
+   run against a sandbox that was *gone* (409 "no live sandbox") emits empty
+   output, which the test scored as data loss. A dual-substrate probe (write the
+   same bytes to a rootfs-disk path AND a `/dev/shm` tmpfs path, hash both, and
+   report the reread EXEC status) showed **0 genuine data loss** — every failure
+   was the reread *exec* failing on a vanished sandbox. The disk and memory
+   substrates were sound throughout; (4) is a real but latent durability fix, not
+   the cause of the observed failures. The actual issues the test surfaced are a
+   `reserve_placement` PG deadlock (`FOR UPDATE` without `ORDER BY id`) and
+   sandboxes vanishing mid-session under burst — both availability, not integrity.
+
+   *Residual (lazy fork):* a session idle-evicted with ZERO disk writes (its
+   snapshot `disk_manifest` is still the base) then resumed-and-written would
+   re-attach the base id and tick it — the fork only arms on the fresh-create
+   attach, not on resume-from-base. This is rare (a running guest almost always
+   writes *something* to its rootfs before idling) and strictly better than the
+   pre-fix state, but to close it fully the coordinator would pass a
+   "disk_manifest == image base" flag at resume so the host arms the fork there
+   too (or fork eagerly at attach, trading a manifest PUT per restore). Deferred.

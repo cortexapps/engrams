@@ -1165,6 +1165,14 @@ pub(crate) async fn delete_session_core(
     //
     // An unknown id surfaces as 404 from `terminate_session`'s own
     // `get_session` — matching the get/exec contract — before any teardown.
+    //
+    // Capture the live sandbox binding (PG authority, read through the
+    // per-replica cache) BEFORE the terminal transition clears it, so the
+    // teardown below works on any replica (ADR 0047) — not just the pod
+    // that cached the bind. Without this, a delete fielded by a non-owning
+    // replica would `unbind` nothing and leak the sandbox (host reconcile
+    // GC is the backstop, but we tear down promptly here).
+    let bound_sandbox = state.resolve_sandbox(id).await;
     match state.services.meta.terminate_session(id).await {
         Ok(None) => return Ok(()),
         Ok(Some((prev, target))) => {
@@ -1194,7 +1202,7 @@ pub(crate) async fn delete_session_core(
                 "delete_session: state machine raced us (likely reconciler flipped to terminal first); returning 204 idempotently"
             );
             // Still tear down whatever's left for tidiness, then 204.
-            if let Some(sandbox_id) = state.registry.unbind(id) {
+            if let Some(sandbox_id) = bound_sandbox {
                 let _ = state.services.host.destroy(sandbox_id).await;
             }
             state.services.host.unbind_session(id).await;
@@ -1205,7 +1213,7 @@ pub(crate) async fn delete_session_core(
 
     // Status is now terminal; reconcile won't touch this row anymore.
     // Now tear down the sandbox and clear the routing columns.
-    if let Some(sandbox_id) = state.registry.unbind(id) {
+    if let Some(sandbox_id) = bound_sandbox {
         if let Err(e) = state.services.host.destroy(sandbox_id).await {
             tracing::warn!(
                 session_id = %id,

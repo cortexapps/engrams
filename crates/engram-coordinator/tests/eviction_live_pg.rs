@@ -122,11 +122,11 @@ async fn evicting_round_trip_counter_and_sweep() {
 }
 
 /// Evicting sessions must appear in `list_active_sessions` with the
-/// sandbox binding intact — it's the rehydration source for startup's
-/// `repopulate_routing`. When `evicting` was missing from the status
-/// filter, a coord roll mid-eviction left the new pod's
-/// SandboxRegistry empty for the session; every scanner attempt then
-/// no-op'd on the "sandbox no longer bound" guard until the budget
+/// sandbox binding intact — the eviction scanner re-picks them after a
+/// coord roll and its guard reads `sessions.sandbox_id` directly
+/// (ADR 0047, no in-memory registry). When `evicting` was missing from
+/// the status filter, a coord roll mid-eviction dropped the session
+/// from the active set; the scanner never re-picked it and the budget
 /// exhausted into a spurious HostLost with the VM still running
 /// (prod session 5cfb90b8, 2026-06-03).
 #[tokio::test]

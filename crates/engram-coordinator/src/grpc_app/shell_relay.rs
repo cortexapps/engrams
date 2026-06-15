@@ -149,7 +149,7 @@ impl app::shell_relay_service_server::ShellRelayService for AppShellRelayService
             .await
             .map_err(into_status)?;
 
-        let sandbox_id = self.state.registry.get(session_id).ok_or_else(|| {
+        let sandbox_id = self.state.resolve_sandbox(session_id).await.ok_or_else(|| {
             into_status(crate::error::ApiError::Conflict(
                 "session has no live sandbox after auto-resume; \
                  try again or `engram session resume <id>` and retry"

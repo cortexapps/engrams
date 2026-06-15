@@ -22,6 +22,34 @@ pub struct AppSessionService {
     pub auth: Arc<auth::BearerAuth>,
 }
 
+/// ADR 0050 F: end a long-lived gRPC response stream when the coordinator
+/// begins graceful shutdown, so the open stream doesn't block the drain
+/// (tonic's graceful shutdown otherwise waits for in-flight streams to
+/// finish, which a live `events`/`exec` tail never does → SIGKILL at the
+/// grace period). The client reconnects to a healthy replica and resumes
+/// from the PG-backed log via `Last-Event-ID` — lossless. Parks (never
+/// ends the stream) on sender-drop, since that's `AppState` teardown (a
+/// dropped test fixture / process exit), not a genuine shutdown.
+fn end_on_shutdown<S>(
+    state: &SharedState,
+    stream: S,
+) -> impl tokio_stream::Stream<Item = S::Item> + Send
+where
+    S: tokio_stream::Stream + Send + 'static,
+    S::Item: Send,
+{
+    let mut rx = state.subscribe_shutdown();
+    let shutdown = async move {
+        if rx.wait_for(|shutting_down| *shutting_down).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    // Qualified UFCS: both `futures::StreamExt` and `tokio_stream::StreamExt`
+    // define `take_until`, and a bare `Trait::method` path is rejected
+    // (E0782) — pin it to `S`'s `futures::StreamExt` impl (already imported).
+    <S as futures::StreamExt>::take_until(stream, shutdown)
+}
+
 // EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::session_service_server::SessionService for AppSessionService {
@@ -186,6 +214,9 @@ impl app::session_service_server::SessionService for AppSessionService {
             std::task::Poll::Ready(None)
         }));
 
+        // ADR 0050 F: end the tail on graceful shutdown so it doesn't pin
+        // the drain; the client reconnects and resumes from the PG log.
+        let full_stream = end_on_shutdown(&self.state, full_stream);
         Ok(Response::new(Box::pin(full_stream)))
     }
 
@@ -251,7 +282,10 @@ impl app::session_service_server::SessionService for AppSessionService {
             })
         });
 
-        Ok(Response::new(Box::pin(started.chain(body))))
+        // ADR 0050 F: end a long-running streamed exec on graceful shutdown
+        // so it doesn't pin the drain; the client resumes from the PG log.
+        let out = end_on_shutdown(&self.state, started.chain(body));
+        Ok(Response::new(Box::pin(out)))
     }
 
     async fn get_log(

@@ -18,9 +18,10 @@
 //!      restores from the session's `live_disk_manifest` and/or latest
 //!      snapshot, rebinds PG `(host_id, sandbox_id)`, transitions
 //!      `Evacuating → Created`.
-//!    - [`crate::api::snapshot::bind_session_routing`] updates the
-//!      in-memory registry + the target host-agent's session→sandbox
-//!      map.
+//!    - [`crate::api::snapshot::bind_session_routing`] registers the
+//!      session→sandbox map on the target host-agent (the coordinator
+//!      keeps no in-memory binding — `sessions.sandbox_id` is the
+//!      authority, ADR 0047).
 //!    - [`crate::api::snapshot::finish_resume_to_active`] runs the
 //!      harness rebuild + drives `Created → Active`.
 //! 4. On any error in the pipeline, the session is left at its current
@@ -28,7 +29,7 @@
 //!    tick re-picks it up via the operator-/exec-driven `/resume`
 //!    path). The pre-bump idempotency lives in
 //!    `evacuate_dead_source` (PG rebind is `assign_*` which tolerates
-//!    re-runs) and in `bind_session_routing` (DashMap insert).
+//!    re-runs) and in `bind_session_routing` (an idempotent host RPC).
 //!
 //! ## Why this pattern
 //!

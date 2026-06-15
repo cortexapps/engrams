@@ -435,7 +435,11 @@ pub async fn upload_forward(
 /// Ensures the session is active, streams `cat <path>` from the guest,
 /// and stores the result via [`process_upload`]. Returns a
 /// [`SharedArtifact`] that both the axum handler and the gRPC handler
-/// can encode into their respective wire shapes.
+/// can encode into their respective wire shapes. `ensure_active`
+/// auto-resumes a recoverable (Idle) session; the file is read out of the
+/// guest by streaming `cat` over the existing exec channel so the body
+/// never buffers host-side. A missing/unreadable path surfaces as a
+/// non-zero `cat` exit → the stream errors and the upload aborts.
 pub async fn create_artifact_from_path_core(
     state: &SharedState,
     session: SessionId,
@@ -443,7 +447,7 @@ pub async fn create_artifact_from_path_core(
     caption: Option<String>,
 ) -> Result<SharedArtifact, ApiError> {
     crate::api::snapshot::ensure_active(state, session).await?;
-    let sandbox_id = state.registry.get(session).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(session).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox — create a new session or resume from snapshot".into(),
         )

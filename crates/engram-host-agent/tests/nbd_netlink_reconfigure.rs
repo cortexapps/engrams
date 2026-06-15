@@ -144,9 +144,16 @@ async fn survivor_reconfigure_resumes_parked_io() {
 
     // 1. Generation one: netlink CONNECT + serve.
     let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
-    let state = attach_manifest(manifest_ref, cache.clone(), store.clone(), &pool, u64::MAX)
-        .await
-        .expect("netlink CONNECT attach");
+    let state = attach_manifest(
+        manifest_ref,
+        cache.clone(),
+        store.clone(),
+        &pool,
+        u64::MAX,
+        /*fork=*/ false,
+    )
+    .await
+    .expect("netlink CONNECT attach");
     let device = state.device_path().to_path_buf();
 
     let read1 = pread_direct(&device, 0, 4096).expect("gen-1 read");

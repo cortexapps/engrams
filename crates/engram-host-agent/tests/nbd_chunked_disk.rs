@@ -231,9 +231,16 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
     // this NBD-only test — pass `u64::MAX` to disable. The Phase B
     // scheduler is also not installed (`scheduler: None`); the test
     // only exercises the NBD wire format + kernel binding.
-    let nbd_state = attach_manifest(manifest_ref, cache, store.clone(), &pool, u64::MAX)
-        .await
-        .expect("spawn NBD daemon against /dev/nbd0");
+    let nbd_state = attach_manifest(
+        manifest_ref,
+        cache,
+        store.clone(),
+        &pool,
+        u64::MAX,
+        /*fork=*/ false,
+    )
+    .await
+    .expect("spawn NBD daemon against /dev/nbd0");
     let nbd_device = nbd_state.device_path().to_path_buf();
     eprintln!(
         "READY: NBD daemon serving manifest {} as {}",
@@ -507,9 +514,16 @@ async fn high_offset_write_reads_back_through_the_device() {
         .expect("put manifest");
 
     let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
-    let state = attach_manifest(mref, cache, Arc::new(store), &pool, u64::MAX)
-        .await
-        .expect("attach");
+    let state = attach_manifest(
+        mref,
+        cache,
+        Arc::new(store),
+        &pool,
+        u64::MAX,
+        /*fork=*/ false,
+    )
+    .await
+    .expect("attach");
     let dev = state.device_path().to_path_buf();
     eprintln!("attached at {}", dev.display());
 

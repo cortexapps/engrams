@@ -105,6 +105,13 @@ pub enum SandboxError {
     /// this sandbox" (404 NotFound) so callers can tell a transient
     /// routing miss from a permanent ownership lapse.
     HostLost,
+    /// ADR 0050 C: a TRANSIENT, retryable failure reaching the host —
+    /// the gRPC channel was `Unavailable` (lazy connect failed, or the
+    /// channel was evicted mid-call), typically a freshly-scaled host
+    /// whose server isn't serving this pod yet. Distinct from
+    /// `Vm` (the host answered with a real VM error) and `HostLost`
+    /// (the host is permanently gone): the call site retries this.
+    Unavailable(String),
 }
 
 impl fmt::Display for SandboxError {
@@ -123,6 +130,7 @@ impl fmt::Display for SandboxError {
                 "image with manifest digest {digest} has not been prefetched by any host yet"
             ),
             Self::HostLost => write!(f, "sandbox host is no longer reachable"),
+            Self::Unavailable(msg) => write!(f, "sandbox host temporarily unavailable: {msg}"),
         }
     }
 }

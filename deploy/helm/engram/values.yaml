@@ -258,6 +258,19 @@ probes:
     periodSeconds: 5
     timeoutSeconds: 3
 
+# ─── graceful shutdown (ADR 0050) ─────────────────────────────────
+#
+# Zero-downtime rolls. `drainSeconds` is the preStop sleep that lets
+# kube-proxy finish removing the pod from the Service endpoints across
+# all nodes BEFORE the app receives SIGTERM (closes the endpoint-removal
+# race). 5-10s covers typical propagation. The app then SIGTERM-drains
+# in-flight requests and ends its SSE streams; a force-exit backstop
+# fires `ENGRAM_SHUTDOWN_DRAIN_SECS` after SIGTERM so a stuck stream
+# can't wait out the SIGKILL. `terminationGracePeriodSeconds` must cover
+# drainSeconds + that backstop with margin.
+drainSeconds: 8
+terminationGracePeriodSeconds: 45
+
 # ─── web ──────────────────────────────────────────────────────────
 #
 # nginx pod serving the React SPA + reverse-proxying API calls to

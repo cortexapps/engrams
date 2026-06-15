@@ -88,15 +88,12 @@ async fn run_drain(state: &SharedState, notice: PreemptionNotice) {
             return;
         }
     };
+    // ADR 0047: the live sandbox binding is on the session row
+    // (`sessions.sandbox_id`), not an in-memory map.
     let pairs: Vec<(SessionId, SandboxId)> = sessions
         .into_iter()
         .filter(|s| s.status == SessionState::Active)
-        .filter_map(|s| {
-            state
-                .registry
-                .get(s.id)
-                .map(|sandbox_id| (s.id, sandbox_id))
-        })
+        .filter_map(|s| s.sandbox_id.map(|sandbox_id| (s.id, sandbox_id)))
         .collect();
     let count = pairs.len();
     if count == 0 {
@@ -141,10 +138,11 @@ pub async fn drain_session(
     session_id: SessionId,
     sandbox_id: SandboxId,
 ) -> Result<(), DrainError> {
-    // Race-safe: if the registry doesn't think this sandbox is bound
-    // anymore (operator drained it, idle evictor evicted it, etc.),
+    // Race-safe: if the live binding (read through to PG — this may run
+    // on a replica that never cached the bind, ADR 0047) is no longer
+    // this sandbox (operator drained it, idle evictor evicted it, etc.),
     // there's nothing to drain.
-    if state.registry.get(session_id) != Some(sandbox_id) {
+    if state.resolve_sandbox(session_id).await != Some(sandbox_id) {
         tracing::debug!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
@@ -156,7 +154,6 @@ pub async fn drain_session(
     // Step 1: best-effort destroy. The VM is about to die — this
     // just lets us release Firecracker handles cleanly. Failure is
     // expected sometimes (mid-shutdown FC API may be unresponsive).
-    state.registry.unbind(session_id);
     // ADR 0015 M3: drop the HostRegistry sandbox-owner row before
     // we destroy the sandbox. Otherwise a concurrent request can
     // take the cache fast path and route to a host that's already
@@ -401,7 +398,6 @@ mod tests {
         );
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta
@@ -417,7 +413,6 @@ mod tests {
         assert_eq!(after.status, SessionState::Dead);
         assert_eq!(after.host_id, None);
         assert_eq!(after.sandbox_id, None);
-        assert_eq!(state.registry.get(session_id), None);
 
         let snaps = state
             .services
@@ -444,7 +439,6 @@ mod tests {
         );
 
         let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
-        state.registry.bind(session_id, sandbox_id);
         state
             .services
             .meta

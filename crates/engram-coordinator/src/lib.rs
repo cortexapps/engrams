@@ -408,8 +408,41 @@ pub async fn run_with_registry_and_local(
         .await
         .map_err(CoordinatorError::Io)?;
     tracing::info!(addr = %cfg.bind_addr, "coordinator listening");
+
+    // ADR 0050 B: graceful shutdown that doesn't hang on long-lived
+    // streams. The graceful future waits for SIGTERM/ctrl-c, then
+    // `trigger_shutdown()` flips the watch so SSE `/events` +
+    // `/exec/stream` handlers end their streams (tokio-rs/axum#2673:
+    // hyper otherwise waits for those connections to close on their own,
+    // which they never do → SIGKILL at the grace period). Only then does
+    // axum begin draining; the now-finite connections drain fast.
+    let shutdown_state = state.clone();
+    let graceful = async move {
+        shutdown_signal().await;
+        shutdown_state.trigger_shutdown();
+    };
+
+    // Force-exit backstop: if the drain somehow exceeds the budget
+    // (a stuck non-streaming request), exit(0) cleanly BEFORE the
+    // kubelet's SIGKILL so we never abandon connections uncleanly.
+    // `terminationGracePeriodSeconds` (chart) must exceed
+    // preStop drain + this budget.
+    {
+        let mut rx = state.subscribe_shutdown();
+        let budget = shutdown_drain_budget();
+        tokio::spawn(async move {
+            let _ = rx.wait_for(|shutting_down| *shutting_down).await;
+            tokio::time::sleep(budget).await;
+            tracing::warn!(
+                budget_secs = budget.as_secs(),
+                "graceful drain exceeded budget; forcing clean exit before SIGKILL",
+            );
+            std::process::exit(0);
+        });
+    }
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(graceful)
         .await
         .map_err(CoordinatorError::Io)?;
 
@@ -423,31 +456,43 @@ pub async fn run_with_registry_and_local(
     Ok(())
 }
 
-/// Read every active session and re-bind its `sandbox_id`/`host_id`
-/// in the in-memory maps so a coordinator restart doesn't leave
-/// `Active` sessions stranded. Pre-populates `HostRegistry`'s
-/// `sandbox_owner` with the persisted `sandbox_id → host_id` pairs;
-/// once the host dials back in via `/api/hosts/connect` and registers
-/// its backend, routing resumes for those sessions without further
-/// intervention. Sessions in `Pending` (sandbox not created yet),
-/// `Idle` (evicted), or `Dead` (awaiting reschedule) are
-/// left for `/resume` to handle on next access.
+/// ADR 0050 B: how long after shutdown begins to wait for connections to
+/// drain before force-exiting (env `ENGRAM_SHUTDOWN_DRAIN_SECS`, default
+/// 25s). Must be < `terminationGracePeriodSeconds − drainSeconds` so the
+/// clean exit beats the kubelet's SIGKILL.
+fn shutdown_drain_budget() -> std::time::Duration {
+    let secs = std::env::var("ENGRAM_SHUTDOWN_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(25);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Warm `HostRegistry`'s `sandbox_owner` read-through cache from the
+/// persisted `sandbox_id → host_id` pairs of active sessions, so the
+/// first `/exec` after a coordinator (re)start routes without a
+/// PG read-through storm. This is a pure latency optimization — the
+/// session→sandbox binding itself lives only in Postgres now
+/// (ADR 0047; see [`AppState::resolve_sandbox`]), and `sandbox_owner`
+/// self-populates via `host_for_sandbox` on any miss — so a skipped
+/// warm just costs one extra read on first access. Sessions in
+/// `Pending` / `Idle` / `Dead` have no live sandbox and are left for
+/// `/resume`.
 async fn repopulate_routing(state: &AppState) -> Result<(), engram_core::MetaError> {
     let sessions = state.services.meta.list_active_sessions().await?;
-    let mut bound = 0usize;
+    let mut warmed = 0usize;
     for s in sessions {
         if let (Some(sandbox_id), Some(host_id)) = (s.sandbox_id, s.host_id) {
-            state.registry.bind(s.id, sandbox_id);
             state
                 .host_registry
                 .record_sandbox_owner(sandbox_id, host_id);
-            bound += 1;
+            warmed += 1;
         }
     }
-    if bound > 0 {
+    if warmed > 0 {
         tracing::info!(
-            sessions = bound,
-            "rebuilt in-memory routing for active sessions",
+            sessions = warmed,
+            "warmed sandbox_owner cache for active sessions",
         );
     }
     Ok(())

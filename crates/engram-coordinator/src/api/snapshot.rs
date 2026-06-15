@@ -94,7 +94,7 @@ pub async fn snapshot_core(
 ) -> Result<SnapshotResponse, ApiError> {
     state.services.meta.get_session(id).await?;
 
-    let sandbox_id = state.registry.get(id).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox to snapshot — create or resume first".into(),
         )
@@ -1224,7 +1224,7 @@ async fn resume_from_fc_snapshot(
         }
         Err(e) => return Err(ApiError::from(e)),
     };
-    bind_resumed_session(&state, id, host_id, new_sandbox_id).await;
+    bind_resumed_session(&state, id, host_id, new_sandbox_id).await?;
     // ADR 0015 M2: resume re-runs the create-shape transitions on
     // the new sandbox — Idle → Created (now that a host + sandbox
     // are bound). [`finish_resume_to_active`] handles the rest
@@ -1298,51 +1298,40 @@ async fn bind_resumed_session(
     id: SessionId,
     host_id: engram_core::HostId,
     sandbox_id: SandboxId,
-) {
-    if let Err(e) = state
+) -> Result<(), ApiError> {
+    // ADR 0047: these are the AUTHORITATIVE routing writes. The
+    // coordinator keeps no in-memory session→sandbox binding anymore,
+    // so `sessions.{host_id,sandbox_id}` IS the routing — a failed
+    // write here would leave every replica unable to dispatch `/exec`
+    // to the resumed sandbox. Fail the resume rather than limp on an
+    // in-memory fallback that no longer exists.
+    state
         .services
         .meta
         .assign_session_host(id, Some(host_id))
         .await
-    {
-        tracing::warn!(
-            session_id = %id,
-            host_id = %host_id,
-            error = %e,
-            "assign_session_host on resume failed; HostRegistry routing still works",
-        );
-    }
-    if let Err(e) = state
+        .map_err(|e| ApiError::Internal(format!("assign_session_host on resume: {e}")))?;
+    state
         .services
         .meta
         .assign_session_sandbox(id, Some(sandbox_id))
         .await
-    {
-        tracing::warn!(
-            session_id = %id,
-            sandbox_id = %sandbox_id,
-            error = %e,
-            "assign_session_sandbox on resume failed; live routing still works (in-memory only)",
-        );
-    }
+        .map_err(|e| ApiError::Internal(format!("assign_session_sandbox on resume: {e}")))?;
     bind_session_routing(state, id, sandbox_id).await;
+    Ok(())
 }
 
-/// ADR 0018 commit 10: coord-side session→sandbox cache update +
-/// host-agent-side `bind_session` RPC. Both are critical for
-/// post-relocate routing:
+/// ADR 0018 commit 10 / ADR 0047: register the post-relocate
+/// session→sandbox mapping on the target host-agent.
 ///
-/// - `state.registry.bind(id, sandbox_id)` keeps `/exec` /
-///   `/shell` / `/prompt` handlers (which look up sandbox_id by
-///   session_id via this in-memory map) pointing at the new
-///   sandbox. Without it, the next /exec dispatches to the OLD
-///   sandbox_id, hits `host_for_sandbox` returning None (PG was
-///   rebound), and 404s.
-/// - `host.bind_session(id, sandbox_id)` registers the
-///   session→sandbox mapping on the target host-agent. This is
-///   what the in-VM adapter's vsock-accept path uses to route
-///   reconnects, and what the FlushScheduler's live-manifest
-///   publisher uses to attach session_id to the publish RPC.
+/// `host.bind_session(id, sandbox_id)` is what the in-VM adapter's
+/// vsock-accept path uses to route reconnects, and what the
+/// FlushScheduler's live-manifest publisher uses to attach session_id
+/// to the publish RPC. The coordinator-side binding is NOT updated
+/// here — it lives only in `sessions.sandbox_id` (Postgres), written by
+/// the caller via `assign_session_sandbox` BEFORE this call, so every
+/// replica's `/exec` / `/shell` / `/prompt` resolves the new sandbox by
+/// reading that row ([`AppState::resolve_sandbox`]).
 ///
 /// Shared with `bind_resumed_session` (the /resume path); exposed
 /// `pub(crate)` so the admin evac endpoint and the `evac_resumer`
@@ -1352,7 +1341,6 @@ pub(crate) async fn bind_session_routing(
     id: SessionId,
     sandbox_id: SandboxId,
 ) {
-    state.registry.bind(id, sandbox_id);
     state.services.host.bind_session(id, sandbox_id).await;
 }
 
@@ -1383,7 +1371,11 @@ pub async fn evict_local_core(state: &SharedState, id: SessionId) -> Result<(), 
         ));
     }
 
-    if let Some(sandbox_id) = state.registry.unbind(id) {
+    // Resolve the sandbox from the session row (PG authority, ADR 0047)
+    // so teardown works on any replica — there is no in-memory binding
+    // to consult, and a handler on a non-owning pod must still destroy
+    // the right sandbox rather than silently skip it (orphan).
+    if let Some(sandbox_id) = session.sandbox_id {
         if let Err(e) = state.services.host.destroy(sandbox_id).await {
             // Best-effort: even if destroy fails we drop the binding
             // and mark Idle. The sandbox is the cache, not source of truth.

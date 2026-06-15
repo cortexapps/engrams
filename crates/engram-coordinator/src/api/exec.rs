@@ -169,7 +169,7 @@ pub async fn exec_stream_core(
 
     crate::api::snapshot::ensure_active(state, id).await?;
 
-    let sandbox_id = state.registry.get(id).ok_or_else(|| {
+    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox — create a new session or resume from snapshot".into(),
         )
@@ -200,9 +200,20 @@ pub async fn exec_stream_core(
     let stream = async_stream::stream! {
         let mut events = backend_stream.events;
         let mut exit_status = None;
+        // ADR 0050 B: a clean exec ends with an explicit `Exit` event. If the
+        // backend stream ends WITHOUT one, the host connection dropped
+        // mid-exec — the output is truncated, not a completed command. Track
+        // it so we terminate the stream with an error rather than a synthetic
+        // clean `Exit` (which the caller would read as a successful run). The
+        // byte counters feed the diagnostic — the chunks themselves are
+        // streamed away, not buffered.
+        let mut saw_exit = false;
+        let mut stdout_bytes: usize = 0;
+        let mut stderr_bytes: usize = 0;
         while let Some(ev) = events.next().await {
             match ev {
                 ExecEvent::Stdout(bytes) => {
+                    stdout_bytes += bytes.len();
                     let chunk = String::from_utf8_lossy(&bytes).into_owned();
                     let raw: Vec<u8> = bytes.to_vec();
                     let _ = state_clone
@@ -221,6 +232,7 @@ pub async fn exec_stream_core(
                     yield Ok(ExecStreamEvent::Stdout(raw));
                 }
                 ExecEvent::Stderr(bytes) => {
+                    stderr_bytes += bytes.len();
                     let chunk = String::from_utf8_lossy(&bytes).into_owned();
                     let raw: Vec<u8> = bytes.to_vec();
                     let _ = state_clone
@@ -240,6 +252,7 @@ pub async fn exec_stream_core(
                 }
                 ExecEvent::Exit(code) => {
                     exit_status = code;
+                    saw_exit = true;
                     break;
                 }
             }
@@ -253,7 +266,9 @@ pub async fn exec_stream_core(
                 id,
                 SessionEvent::ExecCompleted {
                     exec_id: exec_id_clone.clone(),
-                    exit_status,
+                    // Truncation has no real exit status — don't stamp the
+                    // log with a misleading code.
+                    exit_status: if saw_exit { exit_status } else { None },
                     rusage,
                     at: Utc::now(),
                 },
@@ -263,6 +278,19 @@ pub async fn exec_stream_core(
                 tracing::warn!(error = %e, "exec_stream_core: exec_completed event persistence failed");
                 e
             });
+        // ADR 0050 B: a truncated stream terminates with an error, never a
+        // clean `Exit` — the coordinator must never report a cut stream as
+        // success. The caller decides whether to retry (exec is not assumed
+        // idempotent).
+        if !saw_exit {
+            yield Err(ApiError::BadGateway(format!(
+                "exec stream truncated after {stdout_bytes} bytes stdout / \
+                 {stderr_bytes} bytes stderr — the host connection dropped \
+                 before the command's exit status; the command may or may \
+                 not have completed",
+            )));
+            return;
+        }
         yield Ok(ExecStreamEvent::Exit { exit_status, rusage });
     };
 

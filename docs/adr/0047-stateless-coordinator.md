@@ -208,3 +208,45 @@ consecutive semantics (pinned by the live-PG test
   schedulable from B.
 - Existing e2e suites prove the demotion didn't change single-replica behavior.
 - Prod: coord `replicas: 2` + kill-one-replica checks (engrams-internal half).
+
+## Follow-up: the cache the audit missed — `SandboxRegistry` (2026-06-14)
+
+The audit above enumerated `sandbox_owner` (sandbox→host) as a read-through
+cache but **missed the `SandboxRegistry`** — the per-pod
+`DashMap<SessionId, SandboxId>` that every `/exec`, `/prompt`, `/shell`,
+`/snapshot`, `/interrupt`, and admin pause/resume handler consulted to find a
+session's live sandbox. It survived the statelessness pass, and the ADR 0048
+fleet load test (run at `replicas: 2`) walked straight into it: a session
+created on pod A bound its sandbox in pod A's map; the immediately-following
+`exec`, load-balanced to pod B, found pod B's map empty and returned
+`409 "session has no live sandbox"` — even though the sandbox was alive and
+publishing disk manifests. Scaling the coordinator to **one** replica made the
+failures vanish entirely, confirming the diagnosis (create + exec then always
+hit the same map).
+
+Worse than a missed cache: the resume path treated the map as the **authority**.
+`bind_resumed_session` wrote `sessions.{host_id,sandbox_id}` to PG *best-effort*
+and logged-and-continued on failure — the comment literally read
+`"assign_session_sandbox on resume failed; live routing still works
+(in-memory only)"`. A read-through cache layered over that write would still be
+unsound (a silently-dropped write leaves every other replica blind).
+
+**Fix (this ADR's pattern, applied one cache later):** delete `SandboxRegistry`
+entirely. `sessions.sandbox_id` — already written by `create_session_created`
+on create and `assign_session_sandbox` on every rebind/resume, cleared to `None`
+on eviction/teardown — is the sole authority. A new `AppState::resolve_sandbox`
+reads it directly; every former `registry.get` handler and the eviction /
+preemption-drain guards route through it, so any replica answers identically.
+The resume writes are now **authoritative**: `bind_resumed_session` returns
+`Result` and fails the resume if `assign_session_host` or
+`assign_session_sandbox` fails, rather than limping on an in-memory fallback
+that no longer exists. Startup's `repopulate_routing` now only warms the
+`sandbox_owner` read-through cache (a restart latency optimization, no longer
+load-bearing). Regression test:
+`idle_evictor::tests::resolve_sandbox_reads_pg_so_any_replica_routes` — a
+replica that never fielded the bind still resolves the sandbox from PG.
+
+Lesson: "no in-memory *authoritative* state" has to be enforced cache-by-cache —
+an audit that reasons about the caches it lists can't catch the one it forgot to
+list. The multi-replica load test surfaced it; the single-replica A/B was the
+cheap confirmation.

@@ -81,6 +81,10 @@ pub(crate) fn into_status(err: ApiError) -> Status {
         ApiError::Unavailable(_) => Code::Unavailable,
         ApiError::Unsupported(_) => Code::Unimplemented,
         ApiError::PayloadTooLarge(_) | ApiError::TooManyRequests(_) => Code::ResourceExhausted,
+        // ADR 0050 B: a truncated exec stream is a TERMINAL failure, not the
+        // retryable `Unavailable` — exec isn't idempotent, so the client must
+        // not silently re-run it. Surface as Internal and let it decide.
+        ApiError::BadGateway(_) => Code::Internal,
         ApiError::Internal(_) => Code::Internal,
     };
     let slug = err.slug();

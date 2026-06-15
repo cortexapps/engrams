@@ -1063,5 +1063,8 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         // signal (ADR 0015 M3). Map defensively in case a future
         // refactor surfaces it here.
         SandboxError::HostLost => Status::failed_precondition(err.to_string()),
+        // ADR 0050 C: a transient inner failure round-trips back as
+        // Unavailable so the coord's retry logic keys on it uniformly.
+        SandboxError::Unavailable(_) => Status::unavailable(err.to_string()),
     }
 }
