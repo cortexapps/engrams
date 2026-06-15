@@ -32,21 +32,31 @@ pub async fn interrupt(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<Json<InterruptResponse>, ApiError> {
+    let note = interrupt_core(&state, id).await?;
+    Ok(Json(InterruptResponse {
+        session_id: id,
+        note,
+    }))
+}
+
+/// ADR 0051: transport-agnostic interrupt — the app-gRPC `Interrupt` RPC
+/// delegates here; the axum `interrupt` keeps its JSON wrapper. No
+/// auto-resume — a missing live sandbox is a 409. Returns the static note
+/// both echo back.
+pub(crate) async fn interrupt_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<&'static str, ApiError> {
     let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox to interrupt — it is idle or not yet started".into(),
         )
     })?;
-
     state
         .services
         .host
         .interrupt(sandbox_id)
         .await
         .map_err(|e| ApiError::Internal(format!("forward interrupt to harness: {e}")))?;
-
-    Ok(Json(InterruptResponse {
-        session_id: id,
-        note: "interrupt forwarded",
-    }))
+    Ok("interrupt forwarded")
 }

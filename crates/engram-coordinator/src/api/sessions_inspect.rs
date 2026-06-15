@@ -42,22 +42,31 @@ pub struct ConversationEntry {
     pub payload: serde_json::Value,
 }
 
-pub async fn log(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-    Query(params): Query<LogQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let _session = state.services.meta.get_session(id).await?;
-    let limit = params.limit.unwrap_or(200).clamp(1, 1000);
+// ----------------------------------------------------------------
+// ADR 0051: transport-agnostic `_core` entry points for the app-gRPC
+// SessionService. Same logic as the axum handlers, reshaped to return
+// the plain bodies the gRPC converters consume. The axum handlers below
+// delegate to these.
+// ----------------------------------------------------------------
 
-    match params.kind.as_deref().unwrap_or("conversation") {
+/// gRPC `GetLog` core. `kind` defaults to `conversation`; anything else is a
+/// 400. `limit` defaults to 200, hard-capped at 1000.
+pub(crate) async fn get_log_core(
+    state: &SharedState,
+    id: SessionId,
+    kind: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<ConversationEntry>, ApiError> {
+    let _session = state.services.meta.get_session(id).await?;
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+    match kind.as_deref().unwrap_or("conversation") {
         "conversation" => {
             let rows = state
                 .services
                 .meta
                 .list_session_events_since(id, -1, limit)
                 .await?;
-            let entries: Vec<ConversationEntry> = rows
+            Ok(rows
                 .into_iter()
                 .map(|e| ConversationEntry {
                     idx: e.idx,
@@ -65,17 +74,25 @@ pub async fn log(
                     at: e.created_at,
                     payload: e.payload,
                 })
-                .collect();
-            Ok(Json(json!({
-                "session_id": id,
-                "kind": "conversation",
-                "events": entries,
-            })))
+                .collect())
         }
         other => Err(ApiError::BadRequest(format!(
             "unknown kind `{other}` — only `conversation` is supported"
         ))),
     }
+}
+
+pub async fn log(
+    State(state): State<SharedState>,
+    Path(id): Path<SessionId>,
+    Query(params): Query<LogQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let entries = get_log_core(&state, id, params.kind, params.limit).await?;
+    Ok(Json(json!({
+        "session_id": id,
+        "kind": "conversation",
+        "events": entries,
+    })))
 }
 
 #[derive(Serialize)]
@@ -93,14 +110,12 @@ pub struct SessionCowStateResponse {
     pub state: Option<CowStateView>,
 }
 
-/// `GET /sessions/:id/cow-state`. ADR 0016 Phase A. Returns the
-/// per-session diagnostic projection for the currently-bound
-/// sandbox, fanned out through the per-host cache (so the web
-/// app's per-session polling doesn't storm the host).
-pub async fn cow_state(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<SessionCowStateResponse>, ApiError> {
+/// gRPC `GetCowState` core. `None` when the session has no live sandbox
+/// (Idle / HostLost / terminal / Pending) or the host doesn't know it.
+pub(crate) async fn cow_state_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<Option<CowStateView>, ApiError> {
     let session = state.services.meta.get_session(id).await?;
     let (host_id, sandbox_id) = match (session.host_id, session.sandbox_id, session.status) {
         (
@@ -110,12 +125,8 @@ pub async fn cow_state(
         ) => (h, sb),
         _ => {
             // No live sandbox for this session (Idle, HostLost,
-            // terminal, or still Pending). Return a payload that
-            // says so without a host RPC.
-            return Ok(Json(SessionCowStateResponse {
-                session_id: id,
-                state: None,
-            }));
+            // terminal, or still Pending).
+            return Ok(None);
         }
     };
     let backend = state.host_registry.backend_of(host_id).ok_or_else(|| {
@@ -128,12 +139,8 @@ pub async fn cow_state(
         .map_err(ApiError::from)?;
     let Some(record) = records.into_iter().find(|r| r.sandbox_id == sandbox_id) else {
         // Host doesn't know this sandbox (transient mid-create, or
-        // it's a non-chunk-tracked backend on this host). Render as
-        // `None`; client interprets as "no live disk-tier data".
-        return Ok(Json(SessionCowStateResponse {
-            session_id: id,
-            state: None,
-        }));
+        // it's a non-chunk-tracked backend on this host).
+        return Ok(None);
     };
     // Memory-tier enrichment from the session's latest snapshot
     // row. Same shape as the per-host handler.
@@ -143,14 +150,26 @@ pub async fn cow_state(
             Ok(None) => (None, None),
             Err(_) => (None, None),
         };
+    Ok(Some(CowStateView::from_record(
+        &record,
+        Some(id),
+        memory_manifest,
+        last_snapshot_at,
+    )))
+}
+
+/// `GET /sessions/:id/cow-state`. ADR 0016 Phase A. Returns the
+/// per-session diagnostic projection for the currently-bound
+/// sandbox, fanned out through the per-host cache (so the web
+/// app's per-session polling doesn't storm the host).
+pub async fn cow_state(
+    State(state): State<SharedState>,
+    Path(id): Path<SessionId>,
+) -> Result<Json<SessionCowStateResponse>, ApiError> {
+    let state_view = cow_state_core(&state, id).await?;
     Ok(Json(SessionCowStateResponse {
         session_id: id,
-        state: Some(CowStateView::from_record(
-            &record,
-            Some(id),
-            memory_manifest,
-            last_snapshot_at,
-        )),
+        state: state_view,
     }))
 }
 
@@ -179,16 +198,14 @@ pub struct CheckpointsResponse {
     pub checkpoints: Vec<CheckpointSummary>,
 }
 
-/// `GET /sessions/:id/checkpoints`. ADR 0028 A.log: the session's
-/// recorded checkpoint chain (newest first) — the durability
-/// timeline's data source and the fork-point list (ADR 0022 horizon).
-pub async fn checkpoints(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<CheckpointsResponse>, ApiError> {
+/// gRPC `ListCheckpoints` core. Newest-first checkpoint chain.
+pub(crate) async fn checkpoints_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<Vec<CheckpointSummary>, ApiError> {
     state.services.meta.get_session(id).await?;
     let rows = state.services.meta.list_snapshots_for_session(id).await?;
-    let checkpoints = rows
+    Ok(rows
         .into_iter()
         .enumerate()
         .map(|(i, r)| CheckpointSummary {
@@ -201,7 +218,17 @@ pub async fn checkpoints(
             // so index 0 is the latest = the rung-1 anchor.
             is_latest: i == 0,
         })
-        .collect();
+        .collect())
+}
+
+/// `GET /sessions/:id/checkpoints`. ADR 0028 A.log: the session's
+/// recorded checkpoint chain (newest first) — the durability
+/// timeline's data source and the fork-point list (ADR 0022 horizon).
+pub async fn checkpoints(
+    State(state): State<SharedState>,
+    Path(id): Path<SessionId>,
+) -> Result<Json<CheckpointsResponse>, ApiError> {
+    let checkpoints = checkpoints_core(&state, id).await?;
     Ok(Json(CheckpointsResponse {
         session_id: id,
         checkpoints,

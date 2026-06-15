@@ -1,5 +1,5 @@
 //! gRPC bindings generated from `proto/engram/app/v1/*.proto`
-//! (ADR 0051 control plane): session, fleet, image, secret.
+//! (ADR 0051 control plane): session, fleet, image.
 //!
 //! `task.proto` is deliberately excluded from codegen — tasks are
 //! orchestrator-native (ADR 0051 §3) and the coordinator must not

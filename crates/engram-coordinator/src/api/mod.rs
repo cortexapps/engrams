@@ -10,27 +10,29 @@ use crate::state::SharedState;
 pub(crate) mod admin;
 pub mod auth;
 pub(crate) mod enabled_images;
-mod events;
-mod exec;
+// `pub(crate)`: ADR 0051 — the app-gRPC services (`grpc_app/*`) call the
+// transport-agnostic `*_core` fns extracted from these handlers.
+pub(crate) mod events;
+pub(crate) mod exec;
 pub(crate) mod forge;
 // ADR 0021 P1.5a retired `mod harnesses;` — the harness_packs
 // registry doesn't exist anymore (the harness is an image property
 // baked at image-bake time).
 mod health;
 mod host_http;
-mod hosts;
-mod interrupt;
+pub(crate) mod hosts;
+pub(crate) mod interrupt;
 pub mod principal;
-mod prompt;
-mod registries;
+pub(crate) mod prompt;
+pub(crate) mod registries;
 pub(crate) mod session_auth;
 // `pub(crate)`: `evacuation::resolve_cold_boot_spec` (ADR 0028 Fix B)
 // reuses `cold_boot_spec` / the resource helpers from outside `api`.
 pub(crate) mod sessions;
-mod sessions_inspect;
+pub(crate) mod sessions_inspect;
 mod shell;
 pub mod snapshot;
-mod storage;
+pub(crate) mod storage;
 pub(crate) mod upload;
 
 pub fn router(state: SharedState) -> Router {

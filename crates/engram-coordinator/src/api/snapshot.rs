@@ -136,10 +136,27 @@ async fn acquire_session_lease(
     )))
 }
 
+/// Thin axum wrapper over [`snapshot_core`] — the HTTP transport for
+/// the manual snapshot endpoint. All the hardened lease / detach /
+/// CAS logic lives in the transport-agnostic core so the gRPC
+/// `SessionService::snapshot` can share it verbatim.
 pub async fn snapshot(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
+    Ok(Json(snapshot_core(&state, id).await?))
+}
+
+/// ADR 0051: transport-agnostic snapshot core (gRPC `Snapshot` + axum
+/// `/snapshot`). Body moved verbatim from the legacy axum `snapshot`
+/// handler — every lease-fence, spawn-detach, and recoverable-flip line
+/// is preserved EXACTLY; only the return shape changed
+/// (`Json<SnapshotResponse>` → `SnapshotResponse`) and the axum
+/// extractors became plain params.
+pub(crate) async fn snapshot_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<SnapshotResponse, ApiError> {
     state.services.meta.get_session(id).await?;
 
     let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
@@ -154,7 +171,7 @@ pub async fn snapshot(
     // and destroying THIS sandbox could race the manual capture, and the
     // record→commit pair below could interleave with another pipeline's
     // `abort_prior_inflight_snapshot`.
-    let lease = acquire_session_lease(&state, id).await?;
+    let lease = acquire_session_lease(state, id).await?;
 
     // Issue #213: DETACH the record→commit body from the cancellable
     // request future. The original handler ran inline in the request task,
@@ -296,19 +313,30 @@ pub async fn snapshot(
         })
     });
 
-    handle
-        .await
-        .map_err(|join_err| {
-            ApiError::Internal(format!("snapshot pipeline task panicked: {join_err}"))
-        })?
-        .map(Json)
+    handle.await.map_err(|join_err| {
+        ApiError::Internal(format!("snapshot pipeline task panicked: {join_err}"))
+    })?
 }
 
+/// Thin axum wrapper over [`resume_core`] — the HTTP transport for the
+/// manual resume endpoint.
 pub async fn resume(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
-    resume_session(state, id).await.map(Json)
+    Ok(Json(resume_core(&state, id).await?))
+}
+
+/// ADR 0051: transport-agnostic resume core (gRPC `Resume` + axum
+/// `/resume`). Thin pass-through to the shared, hardened
+/// [`resume_session`] primitive (lease-fenced + spawn-detached) that
+/// the legacy axum `/resume` handler already drove — only the return
+/// shape differs (`Json<SnapshotResponse>` → `SnapshotResponse`).
+pub(crate) async fn resume_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<SnapshotResponse, ApiError> {
+    resume_session(state.clone(), id).await
 }
 
 /// Auto-resume an `Idle` session if needed, before routing an
@@ -1578,10 +1606,24 @@ pub(crate) async fn bind_session_routing(
     state.services.host.bind_session(id, sandbox_id).await;
 }
 
+/// Thin axum wrapper over [`evict_local_core`] — the HTTP transport for
+/// the manual evict endpoint. Returns `202 Accepted` once the detached
+/// teardown task lands the session at `Idle`.
 pub async fn evict_local(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,
 ) -> Result<StatusCode, ApiError> {
+    evict_local_core(&state, id).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// ADR 0051: transport-agnostic evict core (gRPC `EvictLocal` + axum
+/// `/local`). Body moved verbatim from the legacy axum `evict_local`
+/// handler — every lease-fence, under-lease status re-read (CAS guard),
+/// and spawn-detached PG-first teardown line is preserved EXACTLY; only
+/// the final `Ok(StatusCode::ACCEPTED)` moved up to the axum wrapper so
+/// the core returns the transport-neutral `Ok(())`.
+pub(crate) async fn evict_local_core(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
 
     if session.status != SessionState::Active {
@@ -1614,7 +1656,7 @@ pub async fn evict_local(
     // transition would NOT reject the stomp. Holding the lease for the
     // whole teardown makes manual evict + scanner eviction mutually
     // exclusive per session.
-    let lease = acquire_session_lease(&state, id).await?;
+    let lease = acquire_session_lease(state, id).await?;
 
     // Issue #213: re-read the session UNDER the lease. The status gate
     // above ran before we held the lease, so a concurrent eviction /
@@ -1703,7 +1745,7 @@ pub async fn evict_local(
     handle.await.map_err(|join_err| {
         ApiError::Internal(format!("evict_local pipeline task panicked: {join_err}"))
     })??;
-    Ok(StatusCode::ACCEPTED)
+    Ok(())
 }
 
 /// ADR 0009 Phase 2: HEAD-verify the chunked manifests are durable

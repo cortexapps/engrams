@@ -144,6 +144,124 @@ fn build_exec(
     Ok((argv, sandbox_req))
 }
 
+// ----------------------------------------------------------------
+// ADR 0051: transport-agnostic streaming exec core for the app-gRPC
+// `Exec` RPC. Same backend path + bus-persistence as the SSE handler
+// (`exec_stream`); the gRPC transport prepends the `started` frame and
+// maps these events to proto. Persistence-failure posture matches the
+// SSE handler (log + continue the live tail).
+// ----------------------------------------------------------------
+
+/// One frame of the streaming-exec body (after the `started` frame the
+/// gRPC handler prepends). The terminal `Exit` carries the same
+/// coordinator-side wall-time rusage the SSE/sync paths compute.
+pub(crate) enum ExecStreamEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit {
+        exit_status: Option<i32>,
+        rusage: ExecRusage,
+    },
+}
+
+/// gRPC `Exec` core. Resolves the exec env, auto-resumes the session,
+/// kicks off the backend exec stream, and returns `(exec_id, body)` where
+/// `body` yields stdout/stderr chunks then a terminal `Exit` — persisting
+/// each to the session bus exactly as the SSE handler does.
+pub(crate) async fn exec_stream_core(
+    state: &SharedState,
+    id: SessionId,
+    req: ExecRequest,
+) -> Result<
+    (
+        String,
+        std::pin::Pin<Box<dyn Stream<Item = Result<ExecStreamEvent, ApiError>> + Send>>,
+    ),
+    ApiError,
+> {
+    let (base_env, default_workdir) = session_exec_env(state, id).await;
+    let (argv, sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
+
+    crate::api::snapshot::ensure_active(state, id).await?;
+    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox — create a new session or resume from snapshot".into(),
+        )
+    })?;
+
+    let backend_stream = state
+        .services
+        .host
+        .exec_stream(sandbox_id, sandbox_req)
+        .await?;
+    let exec_id = backend_stream.exec_id.clone();
+
+    state
+        .emit(
+            id,
+            SessionEvent::ExecStarted {
+                exec_id: exec_id.clone(),
+                command: argv.clone(),
+                at: Utc::now(),
+            },
+        )
+        .await?;
+
+    let state_for_stream = state.clone();
+    let exec_id_for_stream = exec_id.clone();
+    let started_at = Instant::now();
+    let body = async_stream::stream! {
+        let mut events = backend_stream.events;
+        let mut exit_status = None;
+        while let Some(ev) = events.next().await {
+            match ev {
+                ExecEvent::Stdout(bytes) => {
+                    let chunk = String::from_utf8_lossy(&bytes).into_owned();
+                    let _ = state_for_stream
+                        .emit(id, SessionEvent::Stdout {
+                            exec_id: exec_id_for_stream.clone(),
+                            chunk,
+                        })
+                        .await
+                        .map_err(|e| tracing::warn!(error = %e, "stdout event persistence failed; live tail continues"));
+                    yield Ok(ExecStreamEvent::Stdout(bytes.to_vec()));
+                }
+                ExecEvent::Stderr(bytes) => {
+                    let chunk = String::from_utf8_lossy(&bytes).into_owned();
+                    let _ = state_for_stream
+                        .emit(id, SessionEvent::Stderr {
+                            exec_id: exec_id_for_stream.clone(),
+                            chunk,
+                        })
+                        .await
+                        .map_err(|e| tracing::warn!(error = %e, "stderr event persistence failed; live tail continues"));
+                    yield Ok(ExecStreamEvent::Stderr(bytes.to_vec()));
+                }
+                ExecEvent::Exit(code) => {
+                    exit_status = code;
+                    break;
+                }
+            }
+        }
+        let rusage = ExecRusage {
+            wall_ms: started_at.elapsed().as_millis() as u64,
+            ..ExecRusage::default()
+        };
+        let _ = state_for_stream
+            .emit(id, SessionEvent::ExecCompleted {
+                exec_id: exec_id_for_stream.clone(),
+                exit_status,
+                rusage,
+                at: Utc::now(),
+            })
+            .await
+            .map_err(|e| tracing::warn!(error = %e, "exec_completed event persistence failed"));
+        yield Ok(ExecStreamEvent::Exit { exit_status, rusage });
+    };
+
+    Ok((exec_id, Box::pin(body)))
+}
+
 pub async fn exec(
     State(state): State<SharedState>,
     Path(id): Path<SessionId>,

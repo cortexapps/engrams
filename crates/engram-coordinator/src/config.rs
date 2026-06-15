@@ -32,6 +32,22 @@ pub struct CoordinatorConfig {
     /// pick a free port; the coordinator reads back the bound address
     /// and plumbs it into the agent's env at session-create time.
     pub harness_listen_addr: std::net::SocketAddr,
+    /// Address the orchestrator-facing app gRPC server binds to
+    /// (ADR 0051 §2.3). Serves Session/ShellRelay/Fleet/Image/Secret
+    /// beside the axum API. Loopback by default — the orchestrator is
+    /// the only intended caller and co-locates with the coordinator
+    /// in dev.
+    pub app_grpc_addr: std::net::SocketAddr,
+    /// Bearer tokens accepted on the app gRPC surface (ADR 0051 §5).
+    /// Machine identity for exactly one caller (the orchestrator) —
+    /// deliberately a separate credential from `auth_tokens` above
+    /// (different caller, different blast radius, independently
+    /// rotatable). More than one entry only during rotation overlap.
+    ///
+    /// Unlike `auth_tokens`, empty does NOT mean "auth disabled":
+    /// this surface fails closed — no configured tokens, every call
+    /// answers `unauthenticated` (boot is unaffected).
+    pub app_grpc_tokens: Vec<String>,
 }
 
 impl Default for CoordinatorConfig {
@@ -52,6 +68,12 @@ impl Default for CoordinatorConfig {
             harness_listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("default harness_listen_addr must parse"),
+            app_grpc_addr: "127.0.0.1:50061"
+                .parse()
+                .expect("default app_grpc_addr must parse"),
+            // Empty = fail closed (every app-gRPC call rejected), NOT
+            // auth-off. Populated from `ENGRAM_APP_GRPC_TOKENS`.
+            app_grpc_tokens: Vec::new(),
         }
     }
 }
