@@ -128,7 +128,7 @@ pub async fn cow_state(
 /// `last_snapshot_at` fields. Returns `(None, None)` when the
 /// session has never been snapshotted — `CowStateView` falls back to
 /// the host's in-memory `last_snapshot_unix_ms` in that case.
-async fn enrichment_for_session(
+pub(crate) async fn enrichment_for_session(
     state: &SharedState,
     session_id: engram_core::SessionId,
 ) -> (
@@ -217,7 +217,7 @@ pub struct HostView {
 }
 
 impl HostView {
-    fn from_row(
+    pub(crate) fn from_row(
         row: engram_core::types::HostRecord,
         reserved: engram_core::types::host::ReservedBudget,
     ) -> Self {

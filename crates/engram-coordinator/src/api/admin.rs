@@ -292,6 +292,17 @@ pub async fn flush_now(
     State(state): State<SharedState>,
     Path(session_id): Path<SessionId>,
 ) -> Result<Json<FlushNowResult>, ApiError> {
+    Ok(Json(flush_now_core(&state, session_id).await?))
+}
+
+/// Transport-agnostic core for the flush-now primitive (ADR 0051). The
+/// axum `flush_now` handler and the gRPC `FleetService::flush_session`
+/// both call this; the only difference is the return-shape wrapper
+/// (`Json<T>` for axum, the bare `T` here).
+pub(crate) async fn flush_now_core(
+    state: &SharedState,
+    session_id: SessionId,
+) -> Result<FlushNowResult, ApiError> {
     // Look up the session's bound sandbox. NotFound on the session
     // row bubbles as 404; bound=None is a domain-level conflict.
     let session = state.services.meta.get_session(session_id).await?;
@@ -305,10 +316,10 @@ pub async fn flush_now(
     let host_client = state.services.host.clone();
     let flush_outcome = host_client.flush_sandbox(sandbox_id).await?;
     let Some(manifest_ref) = flush_outcome else {
-        return Ok(Json(FlushNowResult {
+        return Ok(FlushNowResult {
             outcome: FlushNowOutcome::Idle,
             manifest_version: None,
-        }));
+        });
     };
     // Funnel directly into the same MetadataStore method the
     // publisher's drain task uses. The sandbox_id guard inside the
@@ -328,10 +339,10 @@ pub async fn flush_now(
                 manifest_version = manifest_ref.version,
                 "admin flush_now: applied",
             );
-            Ok(Json(FlushNowResult {
+            Ok(FlushNowResult {
                 outcome: FlushNowOutcome::Applied,
                 manifest_version: Some(manifest_ref.version),
-            }))
+            })
         }
         engram_core::traits::UpdateOutcome::DroppedStale => {
             tracing::warn!(
@@ -341,10 +352,10 @@ pub async fn flush_now(
                 manifest_version = manifest_ref.version,
                 "admin flush_now: stale (sandbox_id mismatch on UPDATE)",
             );
-            Ok(Json(FlushNowResult {
+            Ok(FlushNowResult {
                 outcome: FlushNowOutcome::Stale,
                 manifest_version: None,
-            }))
+            })
         }
     }
 }
@@ -410,6 +421,19 @@ pub async fn evacuate_session(
     Path(session_id): Path<SessionId>,
     Json(_req): Json<EvacuateSessionRequest>,
 ) -> Result<(StatusCode, Json<EvacuateSessionResponse>), ApiError> {
+    let resp = evacuate_session_core(&state, session_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(resp)))
+}
+
+/// Transport-agnostic core for the evacuate primitive (ADR 0051). Marks
+/// an Active session `Evacuating` via the shared eviction pipeline; the
+/// `evac_resumer` scanner resumes it on a peer. The axum handler wraps
+/// this in `(202, Json<_>)`; the gRPC `FleetService::evacuate_session`
+/// reads `.session_id` + `.status` off the bare struct.
+pub(crate) async fn evacuate_session_core(
+    state: &SharedState,
+    session_id: SessionId,
+) -> Result<EvacuateSessionResponse, ApiError> {
     let session = state.services.meta.get_session(session_id).await?;
     if !matches!(session.status, engram_core::types::SessionState::Active) {
         return Err(ApiError::Conflict(format!(
@@ -431,7 +455,7 @@ pub async fn evacuate_session(
     // durable in BlobStorage before destroy, PG state flips before
     // host-side destroy).
     crate::idle_evictor::evict_session_to_state(
-        &state,
+        state,
         session_id,
         sandbox_id,
         engram_core::types::SessionState::Evacuating,
@@ -445,13 +469,10 @@ pub async fn evacuate_session(
         "admin evacuate: session marked Evacuating; scanner will resume on peer",
     );
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(EvacuateSessionResponse {
-            session_id,
-            status: "evacuating",
-        }),
-    ))
+    Ok(EvacuateSessionResponse {
+        session_id,
+        status: "evacuating",
+    })
 }
 
 #[derive(Serialize)]
@@ -849,6 +870,18 @@ pub async fn cordon_host(
     State(state): State<SharedState>,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<Json<CordonResponse>, ApiError> {
+    Ok(Json(cordon_host_core(&state, host_id).await?))
+}
+
+/// Transport-agnostic core for the cordon primitive (ADR 0051). Writes
+/// the durable, coordinator-owned `hosts.cordoned` bit (ADR 0047); a PG
+/// failure is a 500 (durability is the point — no in-memory fallback).
+/// The axum `cordon_host` handler and the gRPC `FleetService::cordon_host`
+/// both call this.
+pub(crate) async fn cordon_host_core(
+    state: &SharedState,
+    host_id: engram_core::HostId,
+) -> Result<CordonResponse, ApiError> {
     match state.services.meta.set_host_cordoned(host_id, true).await {
         Ok(()) => {}
         Err(engram_core::MetaError::NotFound) => {
@@ -861,10 +894,10 @@ pub async fn cordon_host(
         }
     }
     tracing::info!(%host_id, "admin cordon: host marked non-schedulable (durable)");
-    Ok(Json(CordonResponse {
+    Ok(CordonResponse {
         host_id,
         status: "cordoned",
-    }))
+    })
 }
 
 /// `POST /api/admin/hosts/:id/uncordon` — inverse of cordon. The
@@ -873,6 +906,16 @@ pub async fn uncordon_host(
     State(state): State<SharedState>,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<Json<CordonResponse>, ApiError> {
+    Ok(Json(uncordon_host_core(&state, host_id).await?))
+}
+
+/// Transport-agnostic core for the uncordon primitive (ADR 0051). Clears
+/// the durable `hosts.cordoned` bit (ADR 0047). The axum `uncordon_host`
+/// handler and the gRPC `FleetService::uncordon_host` both call this.
+pub(crate) async fn uncordon_host_core(
+    state: &SharedState,
+    host_id: engram_core::HostId,
+) -> Result<CordonResponse, ApiError> {
     match state.services.meta.set_host_cordoned(host_id, false).await {
         Ok(()) => {}
         Err(engram_core::MetaError::NotFound) => {
@@ -885,10 +928,10 @@ pub async fn uncordon_host(
         }
     }
     tracing::info!(%host_id, "admin uncordon: host returned to scheduling");
-    Ok(Json(CordonResponse {
+    Ok(CordonResponse {
         host_id,
         status: "ready",
-    }))
+    })
 }
 
 #[derive(Serialize)]
@@ -920,6 +963,27 @@ pub async fn drain_host(
     State(state): State<SharedState>,
     Path(host_id): Path<engram_core::HostId>,
 ) -> Result<(StatusCode, Json<DrainHostResponse>), ApiError> {
+    let resp = admin_drain_host_core(&state, host_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(resp)))
+}
+
+/// Transport-agnostic core for the drain primitive (ADR 0051). Cordons
+/// the host (durable `hosts.cordoned` bit), then fans out a live-first
+/// move (snapshot-rehome fallback) for every Active session on it. The
+/// axum `drain_host` handler wraps this in `(202, Json<_>)`; the gRPC
+/// `FleetService::admin_drain_host` reads `.host_id`, `.evacuating`, and
+/// `.failures` (each with `.session_id` + `.error`) off the bare struct.
+///
+/// Issue #208: the per-session live-teleport verbs hold the session lease
+/// across multi-second pause/capture/restore blackouts and a `JoinSet`
+/// aborts in-flight tasks on drop — so the whole JoinSet is driven on its
+/// own DETACHED task (not the caller's future). HTTP/gRPC cancellation
+/// then only stops us OBSERVING; the per-session verbs still run to their
+/// terminal commit/abort/parachute arms. This guard is preserved exactly.
+pub(crate) async fn admin_drain_host_core(
+    state: &SharedState,
+    host_id: engram_core::HostId,
+) -> Result<DrainHostResponse, ApiError> {
     // ADR 0047: the durable cordon — heartbeats can't clobber it, every
     // replica's picker reads it. A PG failure fails the drain (no
     // in-memory fallback to half-drain behind).
@@ -949,14 +1013,11 @@ pub async fn drain_host(
 
     if assignments.is_empty() {
         tracing::info!(%host_id, "admin drain: host cordoned; no Active sessions to evacuate");
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(DrainHostResponse {
-                host_id,
-                evacuating: Vec::new(),
-                failures: Vec::new(),
-            }),
-        ));
+        return Ok(DrainHostResponse {
+            host_id,
+            evacuating: Vec::new(),
+            failures: Vec::new(),
+        });
     }
 
     // Fan out per-session moves. JoinSet so we collect outcomes
@@ -984,7 +1045,9 @@ pub async fn drain_host(
     // cancellation then only stops us observing — the per-session verbs
     // still run to their terminal arms.
     let total = assignments.len();
-    let driver_state = state.clone();
+    // Own a clone for the detached driver (the core borrows `state`; the
+    // spawned task needs a `'static` owned `SharedState`).
+    let driver_state: SharedState = (*state).clone();
     let driver = tokio::spawn(async move {
         let state = driver_state;
         let mut tasks = tokio::task::JoinSet::new();
@@ -1128,14 +1191,11 @@ pub async fn drain_host(
         "admin drain: per-session evac pipeline dispatched; scanner will resume each on a peer",
     );
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(DrainHostResponse {
-            host_id,
-            evacuating,
-            failures,
-        }),
-    ))
+    Ok(DrainHostResponse {
+        host_id,
+        evacuating,
+        failures,
+    })
 }
 
 /// `DELETE /api/admin/hosts/:id` (ADR 0048) — deregister a drained host
@@ -1220,15 +1280,7 @@ pub async fn chunk_gc_dry_run(
     State(state): State<SharedState>,
     axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
 ) -> Result<Json<ChunkGcSweepResult>, ApiError> {
-    let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
-    if let Some(secs) = params.grace_secs {
-        cfg.grace_period = std::time::Duration::from_secs(secs);
-    }
-    let grace_secs = cfg.grace_period.as_secs();
-    let report = crate::chunk_gc::run_one_sweep(&state, &cfg, crate::chunk_gc::SweepMode::DryRun)
-        .await
-        .map_err(|e| ApiError::Internal(format!("chunk-gc dry-run: {e}")))?;
-    Ok(Json((report, grace_secs).into()))
+    Ok(Json(chunk_gc_core(&state, true, params.grace_secs).await?))
 }
 
 /// `POST /api/admin/chunk-gc/sweep` — full pipeline: candidate
@@ -1239,15 +1291,70 @@ pub async fn chunk_gc_sweep(
     State(state): State<SharedState>,
     axum::extract::Query(params): axum::extract::Query<ChunkGcSweepParams>,
 ) -> Result<Json<ChunkGcSweepResult>, ApiError> {
+    Ok(Json(chunk_gc_core(&state, false, params.grace_secs).await?))
+}
+
+// ----------------------------------------------------------------
+// ADR 0051: transport-agnostic GC cores for the app-gRPC FleetService.
+// The REST surface keeps its dry-run/sweep route split; the gRPC RPCs
+// fold both into one call discriminated by `dry_run`. `grace_secs`
+// overrides the configured grace period (test seam); `None` uses the
+// config default. Same primitives the background sweep loops fire.
+// ----------------------------------------------------------------
+
+/// gRPC `ChunkGc` core. `dry_run=true` classifies + counts (no writes);
+/// `false` runs the full candidate-upsert + promote pass.
+pub(crate) async fn chunk_gc_core(
+    state: &SharedState,
+    dry_run: bool,
+    grace_secs: Option<u64>,
+) -> Result<ChunkGcSweepResult, ApiError> {
     let mut cfg = crate::chunk_gc::ChunkGcConfig::from_env();
-    if let Some(secs) = params.grace_secs {
+    if let Some(secs) = grace_secs {
         cfg.grace_period = std::time::Duration::from_secs(secs);
     }
-    let grace_secs = cfg.grace_period.as_secs();
-    let report = crate::chunk_gc::run_one_sweep(&state, &cfg, crate::chunk_gc::SweepMode::Full)
+    let grace = cfg.grace_period.as_secs();
+    let mode = if dry_run {
+        crate::chunk_gc::SweepMode::DryRun
+    } else {
+        crate::chunk_gc::SweepMode::Full
+    };
+    let report = crate::chunk_gc::run_one_sweep(state, &cfg, mode)
         .await
-        .map_err(|e| ApiError::Internal(format!("chunk-gc sweep: {e}")))?;
-    Ok(Json((report, grace_secs).into()))
+        .map_err(|e| ApiError::Internal(format!("chunk-gc: {e}")))?;
+    Ok((report, grace).into())
+}
+
+/// gRPC `BundleGc` core (ADR 0035 §5). Same dry-run/full split.
+pub(crate) async fn bundle_gc_core(
+    state: &SharedState,
+    dry_run: bool,
+    grace_secs: Option<u64>,
+) -> Result<crate::bundle_gc::BundleSweepReport, ApiError> {
+    let mode = if dry_run {
+        crate::chunk_gc::SweepMode::DryRun
+    } else {
+        crate::chunk_gc::SweepMode::Full
+    };
+    let params = ChunkGcSweepParams { grace_secs };
+    let Json(report) = bundle_gc_run((*state).clone(), params, mode).await?;
+    Ok(report)
+}
+
+/// gRPC `SnapshotBlobGc` core (ADR 0028 addendum). Same dry-run/full split.
+pub(crate) async fn snapshot_blob_gc_core(
+    state: &SharedState,
+    dry_run: bool,
+    grace_secs: Option<u64>,
+) -> Result<crate::snapshot_blob_gc::SnapshotBlobSweepReport, ApiError> {
+    let mode = if dry_run {
+        crate::chunk_gc::SweepMode::DryRun
+    } else {
+        crate::chunk_gc::SweepMode::Full
+    };
+    let params = ChunkGcSweepParams { grace_secs };
+    let Json(report) = snapshot_blob_gc_run((*state).clone(), params, mode).await?;
+    Ok(report)
 }
 
 /// `POST /api/admin/bundle-gc/dry-run` + `/sweep` — ADR 0035 §5:

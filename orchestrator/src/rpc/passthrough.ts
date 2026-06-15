@@ -18,7 +18,6 @@
  * Excluded from this layer (served elsewhere):
  *   - StreamEvents / GetArtifact → Hono routes (Task 20)
  *   - ShellRelayService.Relay   → WS route (Task 21)
- *   - SecretService.*           → keys come from the session
  *   - TaskService.*             → native impl (Task 19)
  */
 

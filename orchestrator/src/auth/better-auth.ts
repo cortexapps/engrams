@@ -79,6 +79,13 @@ export const auth = betterAuth({
   // allowlist) is decided in Task 22 — do not deploy past Phase 4
   // without it.
   emailAndPassword: { enabled: true },
+  // Encrypt better-auth's stored OAuth access/refresh/id tokens at rest
+  // (the `account` table columns). NOTE: this uses the BETTER_AUTH_SECRET
+  // (the framework's own encryption mechanism) — NOT the shared engrams KEK.
+  // Our user_session_secrets (the Claude harness token) use the engrams KEK
+  // via src/crypto/seal.ts; these OAuth tokens are framework-owned and ride
+  // the better-auth secret. Both are now sealed at rest.
+  account: { encryptOAuthTokens: true },
   // BETTER_AUTH_SECRET: required — config.ts enforces it (test-mode escape
   // injects a placeholder; prod/dev must set the real var). The Tiltfile
   // injects a deterministic dev literal; prod must rotate before Phase 4.

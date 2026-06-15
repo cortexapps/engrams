@@ -10,7 +10,6 @@
  *   - StreamEvents, GetArtifact: served by dedicated Hono routes (Task 20),
  *     not the generic passthrough.
  *   - ShellRelayService.Relay: WS route (Task 21), not passthrough.
- *   - SecretService.* : keys come from the session; not on the user surface.
  *   - TaskService.* : native implementation (Task 19).
  */
 

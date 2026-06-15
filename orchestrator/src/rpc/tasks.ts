@@ -56,10 +56,11 @@ import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
+import { sessions as defaultSessions } from "../control-plane/client.ts";
 import {
-  sessions as defaultSessions,
-  secrets as defaultSecrets,
-} from "../control-plane/client.ts";
+  makeUserSecretStore,
+  type UserSecretStore,
+} from "../db/user-secrets.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,16 +72,13 @@ export interface SessionsClient {
     imageUri: string;
     mode: string;
     prompt?: string;
-    harnessSecretId?: string;
+    // ADR 0051 Drip A: orchestrator-resolved harness identity env (e.g.
+    // CLAUDE_CODE_OAUTH_TOKEN). The coordinator injects + persists it.
+    harnessEnv?: Record<string, string>;
   }): Promise<{ sessionId: string; status: string; imageVersion: string; kind: string }>;
   listSessions(req: Record<string, never>): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
   deleteSession(req: { sessionId: string }): Promise<unknown>;
-}
-
-/** Subset of SecretService client used by TaskService. */
-export interface SecretsClient {
-  hasSecret(req: { key: string }): Promise<{ exists: boolean }>;
 }
 
 /** Drizzle DB type used by TaskService. */
@@ -97,7 +95,8 @@ export type GetSession = (
 export interface TaskDeps {
   getSession?: GetSession;
   sessions?: SessionsClient;
-  secrets?: SecretsClient;
+  /** Per-user KEK-sealed session secret store (ADR 0051 Drip A). */
+  secrets?: UserSecretStore;
   db?: Db;
 }
 
@@ -296,8 +295,11 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
 
   const sessionsClient: SessionsClient = deps?.sessions ?? (defaultSessions as unknown as SessionsClient);
-  const secretsClient: SecretsClient = deps?.secrets ?? (defaultSecrets as unknown as SecretsClient);
   const getDbFn = (): Db => deps?.db ?? getDb();
+  // The secret store defaults to a Drizzle store over the same DB. Resolved
+  // lazily so importing this module does not require a DB at import time.
+  const resolveSecrets = (): UserSecretStore =>
+    deps?.secrets ?? makeUserSecretStore(getDbFn());
 
   router.service(TaskService, {
     // -------------------------------------------------------------------------
@@ -316,19 +318,23 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw new ConnectError("forbidden", Code.PermissionDenied);
       }
 
-      // Check for harness token. hasSecret returns {exists: false} for everyone
-      // until Task 20 (routes/me.ts) writes it — no-harness images work fine.
-      let harnessSecretId: string | undefined;
+      // Resolve ALL of the caller's session secrets from our OWN store (ADR
+      // 0051 Drip A), KEK-envelope sealed at rest. The whole map rides
+      // CreateSession.harness_env (today that's just
+      // { CLAUDE_CODE_OAUTH_TOKEN: <token> }, but it generalizes to any
+      // env-var-keyed secret); the coordinator injects + persists it for resume.
+      // A lookup failure is non-fatal — no-harness images, and users who never
+      // saved a secret, work fine. An empty map is omitted. NEVER log values.
+      let harnessEnv: Record<string, string> | undefined;
       try {
-        const { exists } = await secretsClient.hasSecret({ key: user.id });
-        harnessSecretId = exists ? user.id : undefined;
+        const all = await resolveSecrets().getAll(user.id);
+        harnessEnv = Object.keys(all).length > 0 ? all : undefined;
       } catch (secretErr) {
-        // hasSecret failure is non-fatal — proceed without harness token.
         console.warn(
-          `[TaskService] createTask: hasSecret check failed for user ${user.id} — booting without harness token`,
+          `[TaskService] createTask: session-secret lookup failed for user ${user.id} — booting without harness env`,
           secretErr,
         );
-        harnessSecretId = undefined;
+        harnessEnv = undefined;
       }
 
       // 1. Create the upstream session (control plane).
@@ -336,7 +342,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         imageUri: req.imageUri,
         mode: "agent",
         ...(req.prompt != null ? { prompt: req.prompt } : {}),
-        ...(harnessSecretId != null ? { harnessSecretId } : {}),
+        ...(harnessEnv != null ? { harnessEnv } : {}),
       });
 
       // 2. Insert task + task_session rows. Compensate on failure.

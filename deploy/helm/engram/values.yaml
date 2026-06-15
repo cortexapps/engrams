@@ -102,6 +102,22 @@ auth:
       existingSecret: ""
       secretKey: ENGRAM_OIDC_CLIENT_SECRET
 
+# Coordinator app-gRPC surface (ADR 0051). The orchestrator (cross-pod) and
+# engram-cli (via kubectl port-forward) reach the coordinator over this gRPC
+# port. The deployment binds it on 0.0.0.0 (the coord default is loopback) and
+# the Service exposes a named `app-grpc` port. The surface is bearer-gated
+# (ENGRAM_APP_GRPC_TOKENS — fail-closed when empty) and must stay network-private
+# (ClusterIP / port-forward only; never internet-reachable).
+appGrpc:
+  port: 50061
+  # ENGRAM_APP_GRPC_TOKENS bearer allowlist. Defaults to the SAME Secret as the
+  # REST auth tokens (.Values.auth) so the two token sets stay in sync; override
+  # for a dedicated app-gRPC token. REQUIRED in prod — without it the coord
+  # rejects every app-gRPC call (fail closed), so the orchestrator can't reach it.
+  tokensSecret:
+    existingSecret: ""        # "" -> falls back to .Values.auth.existingSecret
+    secretKey: ""             # "" -> falls back to .Values.auth.secretKey
+
 # Git forge (ADR 0023). Lets in-session agents fetch short-lived git
 # credentials and open pull/merge requests through the platform — no
 # durable token ever lives in the sandbox. Off by default.

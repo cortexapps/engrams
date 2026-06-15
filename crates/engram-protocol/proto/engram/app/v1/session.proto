@@ -85,14 +85,19 @@ message CreateSessionRequest {
   // harness) | "dev_vm" (no harness driven; interact via shell / exec).
   string mode = 2;
   optional string prompt = 3;
-  // Sealed-secret reference (SecretService key). When set and the image's
-  // builtin harness wants a token, the control plane unseals + injects it.
-  // Replaces "auto-inject the calling user's token" — there is no calling
-  // user here (ADR §2.1).
-  optional string harness_secret_id = 4;
+  reserved 4; // was harness_secret_id (SecretService); removed in ADR 0051 Drip A.
   // Per-request secret values keyed by env-var name. Only honored under
   // SecretMode::Literal; broker-mode images reject overrides.
   map<string, string> secrets = 5;
+  // Orchestrator-resolved harness identity env (e.g. CLAUDE_CODE_OAUTH_TOKEN).
+  // The caller is the single trusted orchestrator (bearer-authed); it owns the
+  // user's harness auth token in its OWN store and passes the resolved name→value
+  // map here. The coordinator is harness-agnostic: it injects these verbatim AND
+  // persists them into session_secrets so they are REPLAYED on resume (closing
+  // the gap where an idle-evicted gRPC session — user_id = NULL — would otherwise
+  // silently lose its token). Honored regardless of SecretMode: this is NOT a
+  // user override, it is the trusted orchestrator's identity injection. NEVER logged.
+  map<string, string> harness_env = 6;
 }
 
 message CreateSessionResponse {

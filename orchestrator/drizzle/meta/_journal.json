@@ -15,6 +15,13 @@
       "when": 1781227439965,
       "tag": "0001_lean_silhouette",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1781545555595,
+      "tag": "0002_user_session_secrets",
+      "breakpoints": true
     }
   ]
 }

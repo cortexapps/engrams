@@ -42,6 +42,7 @@ import { makeArtifactsRoute } from "../routes/artifacts.ts";
 import type { ArtifactsDeps } from "../routes/artifacts.ts";
 import { makeMeRoute } from "../routes/me.ts";
 import type { MeDeps } from "../routes/me.ts";
+import type { UserSecretStore } from "../db/user-secrets.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import type { AddressInfo } from "node:net";
 
@@ -528,14 +529,46 @@ describe("Artifact bytes route", () => {
 // 10–12: /me/claude-token tests
 // ---------------------------------------------------------------------------
 
+/**
+ * In-memory fake of the orchestrator's UserSecretStore (ADR 0051 Drip A): the
+ * per-user Claude token now lives in the orchestrator's own KEK-sealed store,
+ * keyed by (userId, envVarName), not the coordinator's SecretService. Keeps the
+ * POST→GET(true)→DELETE→GET(false) round-trip semantics against this local
+ * store. The fake holds plaintext (the real store seals); the seam under test
+ * here is the route, not the crypto.
+ */
+function makeFakeSecretStore(): UserSecretStore & { store: Record<string, string> } {
+  const store: Record<string, string> = {};
+  const key = (userId: string, envVarName: string) => `${userId} ${envVarName}`;
+  return {
+    store,
+    async put(userId, envVarName, plaintext) {
+      store[key(userId, envVarName)] = plaintext;
+    },
+    async getAll(userId) {
+      const out: Record<string, string> = {};
+      for (const k of Object.keys(store)) {
+        const [u, name] = k.split(" ");
+        if (u === userId) out[name!] = store[k]!;
+      }
+      return out;
+    },
+    async get(userId, envVarName) {
+      return store[key(userId, envVarName)] ?? null;
+    },
+    async has(userId, envVarName) {
+      return key(userId, envVarName) in store;
+    },
+    async delete(userId, envVarName) {
+      delete store[key(userId, envVarName)];
+    },
+  };
+}
+
 describe("/me/claude-token route", () => {
   test("10: POST without session → 401", async () => {
     const meRoute = makeMeRoute({
-      secrets: {
-        async putSecret() { return {}; },
-        async hasSecret() { return { exists: false }; },
-        async deleteSecret() { return {}; },
-      },
+      secrets: makeFakeSecretStore(),
       getSession: makeGetSession(null),
     });
 
@@ -564,23 +597,8 @@ describe("/me/claude-token route", () => {
   });
 
   test("11: POST/GET/DELETE round-trip — correct JSON shapes", async () => {
-    const store: Record<string, string> = {};
-    const secretsClient = {
-      async putSecret({ key, value }: { key: string; value: string }) {
-        store[key] = value;
-        return {};
-      },
-      async hasSecret({ key }: { key: string }) {
-        return { exists: key in store };
-      },
-      async deleteSecret({ key }: { key: string }) {
-        delete store[key];
-        return {};
-      },
-    };
-
     const meRoute = makeMeRoute({
-      secrets: secretsClient,
+      secrets: makeFakeSecretStore(),
       getSession: makeGetSession(MEMBER_A),
     });
 
@@ -659,23 +677,8 @@ describe("/me/claude-token route", () => {
     console.debug = capture;
 
     try {
-      const store: Record<string, string> = {};
-      const secretsClient = {
-        async putSecret({ key, value }: { key: string; value: string }) {
-          store[key] = value;
-          return {};
-        },
-        async hasSecret({ key }: { key: string }) {
-          return { exists: key in store };
-        },
-        async deleteSecret({ key }: { key: string }) {
-          delete store[key];
-          return {};
-        },
-      };
-
       const meRoute = makeMeRoute({
-        secrets: secretsClient,
+        secrets: makeFakeSecretStore(),
         getSession: makeGetSession(MEMBER_A),
       });
 

@@ -76,7 +76,7 @@ impl ApiError {
         }
     }
 
-    fn slug(&self) -> &'static str {
+    pub(crate) fn slug(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
@@ -94,7 +94,7 @@ impl ApiError {
         }
     }
 
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             Self::BadRequest(m)
             | Self::NotFound(m)

@@ -33,7 +33,23 @@ pub async fn prompt(
     Path(id): Path<SessionId>,
     Json(req): Json<PromptRequest>,
 ) -> Result<Json<PromptResponse>, ApiError> {
-    if req.text.is_empty() {
+    let note = send_prompt_core(&state, id, req.text).await?;
+    Ok(Json(PromptResponse {
+        session_id: id,
+        note,
+    }))
+}
+
+/// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`). Holds the
+/// SAME hardened auto-resume + mid-move HOLD logic as the axum `prompt`
+/// handler; only the I/O shape changed (request fields → params,
+/// `Json<PromptResponse>` → the `&'static str` note).
+pub(crate) async fn send_prompt_core(
+    state: &SharedState,
+    id: SessionId,
+    text: String,
+) -> Result<&'static str, ApiError> {
+    if text.is_empty() {
         return Err(ApiError::BadRequest("`text` is required".into()));
     }
 
@@ -41,7 +57,7 @@ pub async fn prompt(
     // sessions surface 410 Gone here (ensure_active → resume_session
     // → ApiError::Gone for missing snapshots). Active sessions are a
     // no-op.
-    crate::api::snapshot::ensure_active(&state, id).await?;
+    crate::api::snapshot::ensure_active(state, id).await?;
 
     // HOLD delivery while the session is mid-move/mid-resume.
     // Forwarding into the freeze window writes the prompt into a
@@ -111,7 +127,7 @@ pub async fn prompt(
         )
     })?;
 
-    let prompt_text = req.text;
+    let prompt_text = text;
     state
         .services
         .host
@@ -143,8 +159,5 @@ pub async fn prompt(
         tracing::warn!(session_id = %id, error = %e, "emit user prompt event failed");
     }
 
-    Ok(Json(PromptResponse {
-        session_id: id,
-        note: "prompt forwarded",
-    }))
+    Ok("prompt forwarded")
 }

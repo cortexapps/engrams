@@ -77,6 +77,20 @@ pub async fn add_registry(
     State(state): State<SharedState>,
     Json(req): Json<AddRegistryRequest>,
 ) -> Result<(StatusCode, Json<AddRegistryResponse>), ApiError> {
+    Ok((
+        StatusCode::CREATED,
+        Json(add_registry_core(&state, req).await?),
+    ))
+}
+
+/// ADR 0051: transport-agnostic add-registry core (gRPC `AddRegistry`).
+/// Same per-variant validation + sealing as the axum `add_registry`
+/// handler — only the return shape changed (`(StatusCode, Json<...>)` →
+/// the plain body).
+pub(crate) async fn add_registry_core(
+    state: &SharedState,
+    req: AddRegistryRequest,
+) -> Result<AddRegistryResponse, ApiError> {
     if req.host.trim().is_empty() {
         return Err(ApiError::BadRequest("host must not be empty".into()));
     }
@@ -131,15 +145,12 @@ pub async fn add_registry(
         .await?;
 
     let summary: RegistryCredentialSummary = cred.into();
-    Ok((
-        StatusCode::CREATED,
-        Json(AddRegistryResponse {
-            id: summary.id,
-            host: summary.registry_host,
-            auth_kind: summary.auth_kind,
-            auth_principal: summary.auth_principal,
-        }),
-    ))
+    Ok(AddRegistryResponse {
+        id: summary.id,
+        host: summary.registry_host,
+        auth_kind: summary.auth_kind,
+        auth_principal: summary.auth_principal,
+    })
 }
 
 pub async fn list_registries(

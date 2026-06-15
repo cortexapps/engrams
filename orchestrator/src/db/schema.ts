@@ -143,6 +143,47 @@ export const verification = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// User session secrets — KEK-envelope sealed at rest (ADR 0051 Drip A)
+//
+// A generic, env-var-name-keyed per-user secret store. The orchestrator OWNS
+// the user's harness identity secrets (today just the Claude
+// CLAUDE_CODE_OAUTH_TOKEN) here in its own Postgres, next to the users they
+// belong to, replacing the coordinator's per-user sealed SecretService vault.
+// At session-create the orchestrator opens all of a user's secrets and passes
+// them to the control plane via CreateSession.harness_env; the coordinator
+// injects + persists them so they replay on resume.
+//
+// At-rest posture: every value is KEK-envelope SEALED with the SAME key + SAME
+// envelope format as the Rust coordinator (engram-crypto / ENGRAM_KEK_MASTER_KEY)
+// — see src/crypto/seal.ts. The row holds ciphertext only; the master key lives
+// outside the DB (env var, sourced from GCP Secret Manager in prod). A read of
+// the row alone does not yield plaintext. wrapped_dek / nonce / ciphertext are
+// stored as base64 `text` (simplest in drizzle/Bun). Plaintext is NEVER logged.
+// ---------------------------------------------------------------------------
+
+export const userSessionSecrets = pgTable(
+  "user_session_secrets",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    // e.g. "CLAUDE_CODE_OAUTH_TOKEN" — the harness env var this secret feeds.
+    envVarName: text("env_var_name").notNull(),
+    // KEK-envelope sealed columns (base64 text). Mirrors engram-crypto SealedCred.
+    wrappedDek: text("wrapped_dek").notNull(),
+    nonce: text("nonce").notNull(),
+    ciphertext: text("ciphertext").notNull(),
+    keyId: text("key_id").notNull(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at")
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.envVarName] })],
+);
+
+// ---------------------------------------------------------------------------
 // Relations (informational — drizzle does not require these for queries)
 // ---------------------------------------------------------------------------
 
