@@ -63,6 +63,9 @@ enum Cmd {
         cmd: SessionCmd,
     },
     /// Operations on hosts.
+    // `hosts` alias so the plural reads naturally in scripts (the CI
+    // bring-up gate + the integration dev tools all say `hosts list`).
+    #[command(visible_alias = "hosts")]
     Host {
         #[command(subcommand)]
         cmd: HostCmd,
@@ -910,6 +913,7 @@ fn host_to_json(h: &app::HostView) -> Value {
         "running_sandboxes": h.running_sandboxes,
         "local_snapshots": h.local_snapshots,
         "ready_images": h.ready_images,
+        "ready_image_digests": h.ready_image_digests,
         "last_heartbeat_at": h.last_heartbeat_at,
     })
 }
