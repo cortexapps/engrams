@@ -11,7 +11,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Text } from "@/components/ui/text";
 import { Button } from "@/components/ui/button";
-import { API_BASE } from "../../api";
+import { API_BASE } from "../../lib/base";
 import { fmtBytes, hms } from "../transcriptFmt";
 import type { SystemMarker } from "./buildMessages";
 

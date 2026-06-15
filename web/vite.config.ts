@@ -1,10 +1,10 @@
 /// <reference types="vitest" />
-import http from 'node:http';
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
-import { defineConfig, type Plugin } from 'vite';
-import react from '@vitejs/plugin-react';
-import tailwindcss from '@tailwindcss/vite';
+import http from "node:http";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { defineConfig, type Plugin } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 // ghostty-web embeds the WASM as a data: URI in its JS bundle, but the
 // SPA's CSP (connect-src 'self') blocks fetch() of data: URIs, causing
@@ -18,36 +18,47 @@ import tailwindcss from '@tailwindcss/vite';
 // the dist root for production so nginx serves the file before reaching
 // the try_files fallback.
 function ghosttyWasmPlugin(): Plugin {
-  const wasmSrc = 'node_modules/ghostty-web/ghostty-vt.wasm';
+  const wasmSrc = "node_modules/ghostty-web/ghostty-vt.wasm";
   return {
-    name: 'ghostty-wasm',
+    name: "ghostty-wasm",
     configureServer(server) {
-      server.middlewares.use('/ghostty-vt.wasm', async (_req, res) => {
+      server.middlewares.use("/ghostty-vt.wasm", async (_req, res) => {
         try {
           const buf = await readFile(wasmSrc);
-          res.setHeader('Content-Type', 'application/wasm');
+          res.setHeader("Content-Type", "application/wasm");
           res.end(buf);
         } catch {
           res.statusCode = 404;
-          res.end('not found');
+          res.end("not found");
         }
       });
     },
     async generateBundle() {
       this.emitFile({
-        type: 'asset',
-        fileName: 'ghostty-vt.wasm',
+        type: "asset",
+        fileName: "ghostty-vt.wasm",
         source: await readFile(wasmSrc),
       });
     },
   };
 }
 
-// Coordinator binds to 127.0.0.1:8090 in `just dev` / `just dev-vz`.
-// The whole coord API lives under /api/v1, so proxy /api straight
-// through to the coord; everything else (incl. the SPA's /sessions/:id
-// deep links) is served by Vite as index.html.
-const COORDINATOR = process.env.ENGRAM_COORDINATOR_URL ?? 'http://127.0.0.1:8090';
+// ADR 0051 Task 28: all browser traffic goes to the orchestrator (:8787).
+// The coordinator (:8090) is no longer a browser target. Its REST routes
+// remain live for engram-cli / integration scripts (Task 29) but the browser
+// never hits them directly after this proxy flip.
+//
+// Both /api and /rpc collapse into two orchestrator-only rules:
+//   /rpc  — Connect/gRPC bridge (connect-query). ws:true retained for the
+//            shell WebSocket relay (path: /api/v1/sessions/:id/shell).
+//   /api  — Hono routes: auth, events SSE, artifacts, /me/claude-token,
+//            admin REST proxy (pause/resume). ws:true carries the shell WS
+//            upgrade through this catch-all (the shell path matches /api/v1/…).
+//
+// The per-path orchestrator rules added in Tasks 22–27 (exact /api/auth,
+// /api/v1/me/claude-token, regex events, regex shell) are all subsumed by the
+// catch-all and removed.
+const ORCHESTRATOR = process.env.ENGRAM_ORCHESTRATOR_URL ?? "http://127.0.0.1:8787";
 
 // http-proxy defaults to `agent: false`, which forces a fresh TCP
 // connection plus `Connection: close` on every proxied request. On
@@ -60,17 +71,24 @@ const proxyAgent = new http.Agent({ keepAlive: true });
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), ghosttyWasmPlugin()],
-  resolve: { alias: { '@': path.resolve(__dirname, './src') } },
+  resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
   server: {
     port: 5173,
     proxy: {
-      // The entire coord API (REST + SSE + the /shell WebSocket) lives
-      // under /api/v1, which no longer overlaps any SPA route — so a
-      // single prefix proxy suffices and the old Accept-header bypass is
-      // gone. `ws: true` carries the /api/v1/sessions/:id/shell upgrade;
-      // http-proxy streams SSE through unchanged.
-      '/api': {
-        target: COORDINATOR,
+      // ---- Orchestrator: Connect/gRPC bridge ----
+      "/rpc": {
+        target: ORCHESTRATOR,
+        changeOrigin: true,
+        agent: proxyAgent,
+        ws: true,
+      },
+
+      // ---- Orchestrator: all /api traffic (auth, events, artifacts, me,
+      //      admin, shell WS) ----
+      // ws:true is required so the shell WebSocket upgrade
+      // (/api/v1/sessions/:id/shell) is forwarded correctly.
+      "/api": {
+        target: ORCHESTRATOR,
         changeOrigin: true,
         agent: proxyAgent,
         ws: true,
@@ -78,9 +96,9 @@ export default defineConfig({
     },
   },
   test: {
-    environment: 'jsdom',
+    environment: "jsdom",
     globals: false,
-    setupFiles: ['./src/test-setup.ts'],
-    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    setupFiles: ["./src/test-setup.ts"],
+    include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },
 });

@@ -1,113 +1,96 @@
-// Regression tests for the ImagesPanel wire contract.
+// Regression tests for the ImagesPanel RPC contract.
 //
-// Mirrors the structure of RegistriesPanel.test.tsx: mock fetch with
-// a route-aware stub, drive the panel via user events, assert on the
-// captured POST body. Catches silent drift in the JSON shape we send
-// to /api/enabled-images — a refactor that ships `uri` instead of
-// `image_uri`, or routes /disable as a DELETE, would slip past the
-// Rust integration test.
+// These tests verify the proto request shapes sent to ImageService via
+// connect-query. A refactor that ships `uri` instead of `imageUri`, or
+// routes disable as a DeleteImage instead of DisableImage, would slip
+// past the Rust integration test. The contract sits between the two
+// services; both ends need a regression pin.
+//
+// The tests supply a custom connect-query transport so we can capture
+// the exact proto-shaped request objects the component sends.
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "../../test-utils";
 import { ImagesPanel } from "./ImagesPanel";
+import { ImageService } from "../../gen/engram/app/v1/image_pb";
+import type {
+  EnableImageRequest,
+  DisableImageRequest,
+  RefreshImageRequest,
+  EnabledImageSummary as ProtoEnabledImageSummary,
+  EnableJob as ProtoEnableJob,
+} from "../../gen/engram/app/v1/image_pb";
 
-interface FetchCall {
-  url: string;
-  method: string;
-  body?: string;
+// Minimal proto-shaped enabled-image row for tests that need a row in the list.
+function makeProtoImage(imageUri: string): ProtoEnabledImageSummary {
+  return {
+    $typeName: "engram.app.v1.EnabledImageSummary",
+    id: "row-1",
+    imageUri,
+    manifestDigest: "sha256:abc",
+    manifestName: "cortex-api",
+    manifestDescription: "",
+    harnessName: "",
+    lastRefreshedAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+  };
 }
 
-/** Install a route-aware fetch stub. Returns the spy + a snapshot
- * accessor so each test reads its own POST history. */
-function installFetchMock(initialList: unknown[] = [], initialJobs: unknown[] = []) {
-  let listSnapshot = initialList;
-  let jobsSnapshot = initialJobs;
-  const spy = vi
-    .spyOn(globalThis, "fetch")
-    .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : (input as Request).url;
-      const method = init?.method ?? "GET";
-
-      if (url === "/api/v1/enabled-images" && method === "GET") {
-        return new Response(JSON.stringify({ images: listSnapshot }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      if (url === "/api/v1/enable-jobs" && method === "GET") {
-        return new Response(JSON.stringify({ jobs: jobsSnapshot }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      if (url === "/api/v1/enabled-images" && method === "POST") {
-        return new Response(
-          JSON.stringify({
-            id: "00000000-0000-0000-0000-000000000000",
-            image_uri: "ghcr.io/cortex/api:warm-1",
-            manifest_digest: "sha256:abc",
-            manifest_name: "cortex-api",
-            manifest_description: null,
-            harness_name: null,
-            last_refreshed_at: new Date().toISOString(),
-            created_at: new Date().toISOString(),
-          }),
-          { status: 201, headers: { "content-type": "application/json" } },
-        );
-      }
-      if (url === "/api/v1/enabled-images/disable" && method === "POST") {
-        return new Response(null, { status: 204 });
-      }
-      if (url === "/api/v1/enabled-images/refresh" && method === "POST") {
-        return new Response(
-          JSON.stringify({
-            id: "00000000-0000-0000-0000-000000000000",
-            image_uri: "ghcr.io/cortex/api:warm-1",
-            manifest_digest: "sha256:def",
-            manifest_name: "cortex-api",
-            manifest_description: null,
-            harness_name: null,
-            last_refreshed_at: new Date().toISOString(),
-            created_at: new Date().toISOString(),
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }
-      throw new Error(`unexpected fetch in test: ${method} ${url}`);
-    });
+function makeProtoJob(imageUri: string, state = "materializing"): ProtoEnableJob {
   return {
-    spy,
-    setList: (rows: unknown[]) => {
-      listSnapshot = rows;
-    },
-    setJobs: (rows: unknown[]) => {
-      jobsSnapshot = rows;
-    },
-    callsMatching(pred: (c: FetchCall) => boolean): FetchCall[] {
-      return spy.mock.calls
-        .map(([input, init]) => {
-          const u =
-            typeof input === "string"
-              ? input
-              : input instanceof URL
-                ? input.toString()
-                : (input as Request).url;
-          return {
-            url: u,
-            method: init?.method ?? "GET",
-            body: typeof init?.body === "string" ? init?.body : undefined,
-          };
-        })
-        .filter(pred);
-    },
+    $typeName: "engram.app.v1.EnableJob",
+    id: "job-1",
+    imageUri,
+    manifestDigest: undefined,
+    state,
+    chunksDone: 3,
+    chunksTotal: 10,
+    attempts: 0,
+    error: undefined,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
+}
+
+interface Captures {
+  enableCalls: EnableImageRequest[];
+  disableCalls: DisableImageRequest[];
+  refreshCalls: RefreshImageRequest[];
+}
+
+/** Build a transport that records image-mutation calls with controllable list state. */
+function installCapturingTransport(
+  initialImages: ProtoEnabledImageSummary[] = [],
+  initialJobs: ProtoEnableJob[] = [],
+): { transport: ReturnType<typeof createRouterTransport>; captures: Captures } {
+  const captures: Captures = { enableCalls: [], disableCalls: [], refreshCalls: [] };
+  const transport = createRouterTransport((router) => {
+    router.service(ImageService, {
+      listEnabledImages: () => ({ images: initialImages }),
+      listEnableJobs: () => ({ jobs: initialJobs }),
+      enableImage: (req: EnableImageRequest) => {
+        captures.enableCalls.push(req);
+        return { job: undefined };
+      },
+      disableImage: (req: DisableImageRequest) => {
+        captures.disableCalls.push(req);
+        return {};
+      },
+      refreshImage: (req: RefreshImageRequest) => {
+        captures.refreshCalls.push(req);
+        return { job: undefined };
+      },
+      getEnableJob: () => ({ job: undefined }),
+      retryEnableJob: () => ({ job: undefined }),
+      listRegistries: () => ({ registries: [] }),
+      addRegistry: () => ({ id: "", host: "", authKind: "", authPrincipal: undefined }),
+      deleteRegistry: () => ({}),
+    });
+  });
+  return { transport, captures };
 }
 
 afterEach(() => {
@@ -115,10 +98,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("ImagesPanel wire contract", () => {
-  test("enable form posts {image_uri} to /api/enabled-images", async () => {
-    const mock = installFetchMock([]);
-    renderWithProviders(<ImagesPanel />);
+describe("ImagesPanel RPC contract", () => {
+  test("enable form sends {imageUri} to ImageService.EnableImage", async () => {
+    const { transport, captures } = installCapturingTransport([]);
+    renderWithProviders(<ImagesPanel />, { transport });
 
     const user = userEvent.setup();
     const trigger = await screen.findByRole("button", {
@@ -133,115 +116,59 @@ describe("ImagesPanel wire contract", () => {
     await user.click(screen.getByRole("button", { name: /^enable$/i }));
 
     await waitFor(() => {
-      const posts = mock.callsMatching(
-        (c) => c.method === "POST" && c.url === "/api/v1/enabled-images",
-      );
-      expect(posts.length).toBeGreaterThan(0);
-      expect(JSON.parse(posts.at(-1)!.body!)).toEqual({
-        image_uri: "ghcr.io/cortex/api:warm-1",
-      });
+      expect(captures.enableCalls.length).toBeGreaterThan(0);
     });
+    expect(captures.enableCalls.at(-1)!.imageUri).toBe("ghcr.io/cortex/api:warm-1");
   });
 
-  test("disable button posts URI in body to /disable (not in path)", async () => {
-    // The image URI contains slashes + colons, which makes it
-    // awkward as a path segment. The wire shape uses POST + body
-    // instead of DELETE + path. Lock that here.
-    const mock = installFetchMock([
-      {
-        id: "row-1",
-        image_uri: "ghcr.io/cortex/api:warm-1",
-        manifest_digest: "sha256:abc",
-        manifest_name: "cortex-api",
-        manifest_description: null,
-        harness_name: null,
-        last_refreshed_at: new Date().toISOString(),
-        created_at: new Date().toISOString(),
-      },
+  test("disable button sends {imageUri} to ImageService.DisableImage", async () => {
+    // The image URI contains slashes + colons, which makes it awkward as a
+    // path segment. Lock that the RPC carries it as a field, not URL segment.
+    const { transport, captures } = installCapturingTransport([
+      makeProtoImage("ghcr.io/cortex/api:warm-1"),
     ]);
-    renderWithProviders(<ImagesPanel />);
+    renderWithProviders(<ImagesPanel />, { transport });
 
     const user = userEvent.setup();
     // Wait for the row to render.
     await screen.findByText("ghcr.io/cortex/api:warm-1");
 
     await user.click(screen.getByRole("button", { name: /^disable$/i }));
-    // Confirmation prompt (shadcn AlertDialog) — the confirm action is labelled
-    // "Disable image" to disambiguate it from the row's "Disable" trigger.
+    // Confirmation prompt — the confirm action is labelled "Disable image"
+    // to disambiguate it from the row's "Disable" trigger.
     await user.click(await screen.findByRole("button", { name: /disable image/i }));
 
     await waitFor(() => {
-      const posts = mock.callsMatching(
-        (c) => c.method === "POST" && c.url === "/api/v1/enabled-images/disable",
-      );
-      expect(posts.length).toBe(1);
-      expect(JSON.parse(posts[0].body!)).toEqual({
-        image_uri: "ghcr.io/cortex/api:warm-1",
-      });
+      expect(captures.disableCalls.length).toBe(1);
     });
+    expect(captures.disableCalls[0].imageUri).toBe("ghcr.io/cortex/api:warm-1");
   });
 
-  test("refresh button posts URI to /refresh", async () => {
-    const mock = installFetchMock([
-      {
-        id: "row-1",
-        image_uri: "ghcr.io/cortex/api:warm-1",
-        manifest_digest: "sha256:abc",
-        manifest_name: "cortex-api",
-        manifest_description: null,
-        harness_name: null,
-        last_refreshed_at: new Date().toISOString(),
-        created_at: new Date().toISOString(),
-      },
+  test("refresh button sends {imageUri} to ImageService.RefreshImage", async () => {
+    const { transport, captures } = installCapturingTransport([
+      makeProtoImage("ghcr.io/cortex/api:warm-1"),
     ]);
-    renderWithProviders(<ImagesPanel />);
+    renderWithProviders(<ImagesPanel />, { transport });
 
     const user = userEvent.setup();
     await screen.findByText("ghcr.io/cortex/api:warm-1");
     await user.click(screen.getByRole("button", { name: /^refresh$/i }));
 
     await waitFor(() => {
-      const posts = mock.callsMatching(
-        (c) => c.method === "POST" && c.url === "/api/v1/enabled-images/refresh",
-      );
-      expect(posts.length).toBe(1);
-      expect(JSON.parse(posts[0].body!)).toEqual({
-        image_uri: "ghcr.io/cortex/api:warm-1",
-      });
+      expect(captures.refreshCalls.length).toBe(1);
     });
+    expect(captures.refreshCalls[0].imageUri).toBe("ghcr.io/cortex/api:warm-1");
   });
 
   test("active refresh job suppresses the static image row for the same URI", async () => {
     // Both an enabled-images row and an active enable-job exist for the
     // same URI (the state right after clicking "refresh"). The panel must
     // show only the progress row — not both.
-    installFetchMock(
-      [
-        {
-          id: "row-1",
-          image_uri: "ghcr.io/cortex/api:warm-1",
-          manifest_digest: "sha256:abc",
-          manifest_name: "cortex-api",
-          manifest_description: null,
-          harness_name: null,
-          last_refreshed_at: new Date().toISOString(),
-          created_at: new Date().toISOString(),
-        },
-      ],
-      [
-        {
-          id: "job-1",
-          image_uri: "ghcr.io/cortex/api:warm-1",
-          state: "materializing",
-          chunks_done: 3,
-          chunks_total: 10,
-          error: null,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-      ],
+    const { transport } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [makeProtoJob("ghcr.io/cortex/api:warm-1", "materializing")],
     );
-    renderWithProviders(<ImagesPanel />);
+    renderWithProviders(<ImagesPanel />, { transport });
 
     // The URI should appear exactly once — from the EnableJobRow.
     await waitFor(() => {

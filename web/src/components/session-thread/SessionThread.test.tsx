@@ -7,7 +7,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import { renderWithProviders } from "../../test-utils";
 import { SessionThread } from "./SessionThread";
-import type { IndexedEvent, SessionEvent } from "../../types";
+import type { IndexedEvent, SessionEvent } from "../../lib/types";
 
 afterEach(cleanup);
 

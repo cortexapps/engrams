@@ -1,5 +1,5 @@
 import type { ThreadMessageLike } from "@assistant-ui/react";
-import type { AgentRole, IndexedEvent, SessionState } from "../../types";
+import type { AgentRole, IndexedEvent, SessionState } from "../../lib/types";
 
 // Session statuses that mean "no turn is in flight" — the authoritative
 // signal that overrides the event stream. A session evicted/terminated

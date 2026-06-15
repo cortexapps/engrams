@@ -1,6 +1,7 @@
 import { useRouterState } from "@tanstack/react-router";
-import { useSession, useSessions } from "../../hooks/useSessions";
-import type { Session, SessionListItem, SessionState } from "../../types";
+import { useSession } from "../../hooks/useSessions";
+import { useTasksAsSessionList } from "../../hooks/useTasks";
+import type { Session, SessionListItem, SessionState } from "../../lib/types";
 import { compareSessions } from "./session-format";
 
 // The ordered, capped, open-session-pinned list that backs BOTH the sessions
@@ -8,6 +9,16 @@ import { compareSessions } from "./session-format";
 // keeps the rail's visible numbers and the jump targets in lockstep: the rail
 // renders these rows, and the shortcuts navigate to rows[n-1] of the same
 // array. Both consumers share React Query's cache, so there's no extra fetch.
+//
+// ADR 0051 Task 28: migrated from useSessions (REST /api/v1/sessions) to
+// useTasksAsSessionList (connect-query ListTasks → orchestrator native
+// TaskService). The REST surface is no longer reachable from the browser after
+// the vite proxy flips all /api to the orchestrator. One deliberate scope
+// change: ListTasks has no scope param, so an ADMIN's rail now previews ALL
+// tasks (incl. unattributed rows) like the list page, where the old
+// useSessions("mine") was own-only even for admins. Members are unaffected
+// (server-side CASL scoping). Otherwise behaviour is unchanged:
+// member sees own tasks, admin sees all (CASL gate on the server).
 
 export const RAIL_CAP = 10;
 
@@ -60,7 +71,8 @@ export function useRailSessions(): RailSessions {
   const seg = pathname.startsWith("/sessions/") ? pathname.split("/")[2] : undefined;
   const openId = seg && seg !== "all" ? seg : undefined;
 
-  const { data, isPending, error } = useSessions("mine");
+  // ADR 0051 Task 28: use TaskService-backed list instead of REST /sessions.
+  const { data, isPending, error } = useTasksAsSessionList();
   const all = data ?? [];
   const recent = sortForRail(all).slice(0, RAIL_CAP);
 
