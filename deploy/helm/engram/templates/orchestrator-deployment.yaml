@@ -80,6 +80,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.orchestrator.databaseSecret.existingSecret }}
                   key: {{ .Values.orchestrator.databaseSecret.authSecretKey }}
+            # ADR 0051: shared engrams KEK for sealing user_session_secrets at rest.
+            # The orchestrator seals IN-PROCESS, so it needs the raw 32-byte key
+            # (base64) — the same ENGRAM_KEK_MASTER_KEY the coordinator's env-var KEK
+            # provider uses. Defaults to the coordinator's secret (shared key);
+            # config.ts makes this REQUIRED, so it is always injected.
+            - name: ENGRAM_KEK_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.kekSecret.existingSecret | default .Values.database.existingSecret }}
+                  key: {{ .Values.orchestrator.kekSecret.key }}
             {{- if .Values.orchestrator.auth.oidc.clientSecret.existingSecret }}
             # OIDC client secret (only when OIDC is configured). config.ts makes
             # CLIENT_ID + CLIENT_SECRET required once ORCHESTRATOR_OIDC_ISSUER is

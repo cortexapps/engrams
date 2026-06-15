@@ -434,6 +434,21 @@ orchestrator:
     bearerKey: CONTROL_PLANE_BEARER
     authSecretKey: BETTER_AUTH_SECRET
 
+  # ADR 0051: the orchestrator KEK-envelope-seals `user_session_secrets` at rest
+  # (the user's harness tokens, e.g. CLAUDE_CODE_OAUTH_TOKEN) using the SAME
+  # 32-byte key + envelope format as the coordinator's `kek.provider: env-var`
+  # path — ENGRAM_KEK_MASTER_KEY (base64). It seals IN-PROCESS, so it needs the
+  # RAW key (env-var), not gcp-kms. config.ts makes it REQUIRED — the orchestrator
+  # refuses to start without it.
+  #   - Default (existingSecret: "") sources the key from the COORDINATOR's secret
+  #     (.Values.database.existingSecret) — the shared engrams key; correct for
+  #     `kek.provider: env-var` deployments (key in a k8s Secret / Secret Manager).
+  #   - For a `gcp-kms` coordinator (no raw key in a Secret), point this at a
+  #     Secret holding a raw 32-byte base64 key for the orchestrator.
+  kekSecret:
+    existingSecret: ""          # "" -> falls back to .Values.database.existingSecret
+    key: ENGRAM_KEK_MASTER_KEY
+
   # Drizzle migrations (orchestrator/drizzle/) MUST be applied to the
   # orchestrator's database before/at deploy. We run them as a pre-install /
   # pre-upgrade Helm Job (mirrors chart conventions: hooks, weights) that
