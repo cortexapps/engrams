@@ -7,7 +7,7 @@
 #   1-3. bake + enable + ready-poll, factored out into
 #        `integration-bake-demo.sh` so the CI e2e lane and this
 #        smoke test share one bake path.
-#   4. session create — should succeed cold-create with the
+#   4. POST /sessions — should succeed cold-create with the
 #      chunks already local; sub-5s TTFM (down from ~17s with
 #      on-demand GCS page-ins).
 #   5. clean up.
@@ -20,13 +20,10 @@ cd "$(git rev-parse --show-toplevel)"
 INTEG_DIR="./var/integration"
 COORD="http://127.0.0.1:8090"
 
-# gRPC address and bearer token for the app surface (ADR 0051).
-export ENGRAM_APP_GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
-
-# Fail-closed app surface (ADR 0051 Task 9): token always required;
-# default to the Tiltfile dev literal, override via env elsewhere.
-ENGRAM_APP_TOKEN="${ENGRAM_APP_TOKEN:-dev-app-grpc-token}"
-CLI_TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
+AUTH_HEADER=()
+if [ -n "${ENGRAM_TOKEN:-}" ]; then
+    AUTH_HEADER=(-H "Authorization: Bearer $ENGRAM_TOKEN")
+fi
 
 dump_logs() {
     echo ""
@@ -43,26 +40,29 @@ IMAGE_URI=$(bash deploy/dev/integration-bake-demo.sh)
 echo "    image enabled and ready: $IMAGE_URI"
 
 echo ""
-echo "==> step 4/5: session create (cold-create with chunks already local)"
+echo "==> step 4/5: POST /sessions (cold-create with chunks already local)"
+SESS_BODY=$(printf '{"image": "%s", "harness": {"kind": "none"}}' "$IMAGE_URI")
 T0=$(date +%s.%N)
-# mode=dev_vm: harness=none equivalent (no harness driven)
-SESS_ID=$(./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} \
-    session create \
-    --image "$IMAGE_URI" \
-    --dev-vm)
+SESS_RESP=$(curl -fsS -X POST "${AUTH_HEADER[@]}" \
+    -H "Content-Type: application/json" \
+    -d "$SESS_BODY" \
+    "$COORD/api/v1/sessions")
 T1=$(date +%s.%N)
 SESS_ELAPSED=$(echo "$T1 - $T0" | bc)
+SESS_KIND=$(echo "$SESS_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kind","?"))')
+SESS_ID=$(echo "$SESS_RESP"  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("session_id","?"))')
 echo "    session create elapsed: ${SESS_ELAPSED}s"
 echo "    session_id: $SESS_ID"
+echo "    kind:       $SESS_KIND"
 
 echo ""
-echo "==> step 5/5: cleanup — delete session $SESS_ID"
-./target/release/engram-cli ${CLI_TOKEN_FLAG[@]+"${CLI_TOKEN_FLAG[@]}"} \
-    session delete "$SESS_ID"
+echo "==> step 5/5: cleanup — DELETE /sessions/$SESS_ID"
+curl -fsS -X DELETE "${AUTH_HEADER[@]}" \
+    "$COORD/api/v1/sessions/$SESS_ID" >/dev/null || true
 echo "    session deleted"
 
 trap - ERR
 echo ""
 echo "✓ integration smoke passed"
-echo "  session:      ${SESS_ELAPSED}s (cold)"
+echo "  session:      ${SESS_ELAPSED}s ($SESS_KIND)"
 echo "  (bake + enable + ready-wait timings printed by integration-bake-demo.sh above)"
