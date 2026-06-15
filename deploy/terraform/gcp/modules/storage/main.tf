@@ -18,6 +18,15 @@ resource "google_storage_bucket" "chunks" {
   uniform_bucket_level_access = true
   public_access_prevention    = "enforced"
 
+  # Soft-delete OFF. GCS enables a 7-day soft-delete retention by
+  # default, which keeps (and bills for) every deleted object for a
+  # week. The chunk store is content-addressed and the GC sweep's
+  # deletes are intentional — soft-delete just adds cost + retains
+  # blobs we meant to drop. Zero retention disables it.
+  soft_delete_policy {
+    retention_duration_seconds = 0
+  }
+
   versioning {
     enabled = false
   }
