@@ -17,7 +17,7 @@
     "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}": "oxfmt"
   },
   "dependencies": {
-    "@assistant-ui/react": "^0.14.20",
+    "@assistant-ui/react": "^0.14.22",
     "@assistant-ui/react-markdown": "^0.14.3",
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@fontsource-variable/saira": "^5.2.11",
