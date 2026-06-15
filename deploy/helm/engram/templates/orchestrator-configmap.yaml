@@ -10,7 +10,13 @@ that auth path inert and the env var simply absent.
 CONTROL_PLANE_{GRPC,HTTP}_URL default to the in-cluster coord Service when the
 operator leaves them empty, so a same-chart deploy needs zero wiring.
 */ -}}
-{{- $coord := printf "%s.%s.svc.cluster.local:%v" (include "engram.coordinator.fullname" .) .Release.Namespace .Values.service.port -}}
+{{- $coordHost := printf "%s.%s.svc.cluster.local" (include "engram.coordinator.fullname" .) .Release.Namespace -}}
+{{- $coordHttp := printf "%s:%v" $coordHost .Values.service.port -}}
+{{- /* app-gRPC port (ADR 0051). Default 50061 so this renders even before the
+       coordinator chart's appGrpc.port value merges (stacked PRs). */ -}}
+{{- $agPort := 50061 -}}
+{{- if .Values.appGrpc -}}{{- $agPort = .Values.appGrpc.port -}}{{- end -}}
+{{- $coordGrpc := printf "%s:%v" $coordHost $agPort -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -22,8 +28,8 @@ data:
   {{- with .Values.orchestrator.publicUrl }}
   ORCHESTRATOR_PUBLIC_URL: {{ . | quote }}
   {{- end }}
-  CONTROL_PLANE_GRPC_URL: {{ .Values.orchestrator.controlPlane.grpcUrl | default (printf "http://%s" $coord) | quote }}
-  CONTROL_PLANE_HTTP_URL: {{ .Values.orchestrator.controlPlane.httpUrl | default (printf "http://%s" $coord) | quote }}
+  CONTROL_PLANE_GRPC_URL: {{ .Values.orchestrator.controlPlane.grpcUrl | default (printf "http://%s" $coordGrpc) | quote }}
+  CONTROL_PLANE_HTTP_URL: {{ .Values.orchestrator.controlPlane.httpUrl | default (printf "http://%s" $coordHttp) | quote }}
   {{- with .Values.orchestrator.trustedOrigins }}
   TRUSTED_ORIGINS: {{ join "," . | quote }}
   {{- end }}
