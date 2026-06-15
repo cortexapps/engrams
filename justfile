@@ -129,6 +129,15 @@ migrate:
     docker compose -f deploy/docker-compose.dev.yml exec -T postgres \
         psql -U engram -d engram < deploy/migrations/0001_initial.sql
 
+# Create + migrate the orchestrator DB (ADR 0051). The Tiltfile's
+# `orchestrator-migrate` resource does this on `tilt up`; this recipe is
+# the same steps for ad-hoc use (e.g. after a `just db-reset`).
+migrate-orchestrator:
+    cd orchestrator && bun install --silent && \
+        (PGPASSWORD=engram createdb -h localhost -p 5435 -U engram engram_orchestrator 2>/dev/null || true) && \
+        ORCHESTRATOR_DATABASE_URL=postgres://engram:engram@localhost:5435/engram_orchestrator \
+        bunx drizzle-kit migrate
+
 # Drop the dev DB volume (destructive). Use when migrations diverge.
 db-reset:
     docker compose -f deploy/docker-compose.dev.yml down -v
