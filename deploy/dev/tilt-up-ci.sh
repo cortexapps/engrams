@@ -49,9 +49,14 @@ if ! curl -fsS http://127.0.0.1:8090/healthz >/dev/null 2>&1; then
 fi
 echo "    coord up"
 
-# Wait for at least one host-agent to register, via the app gRPC surface
+# Wait for the host-agent(s) to register, via the app gRPC surface
 # (ADR 0039). The engram-cli binary is available — it was built in a
 # prior CI step (ENGRAM_INTEG_BIN_DIR or ./target/release).
+#
+# The two-host topology (`ENGRAM_INTEG_TWO_HOSTS=1`, used by the teleport
+# e2e) brings up host-agent + host-agent-b, so require both before
+# returning — else the bake/teleport step races a half-up fleet.
+# Single-host default needs 1.
 CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
 GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
 # Fail-closed app surface (ADR 0039 Task 9): a bearer is always required.
@@ -61,18 +66,22 @@ GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
 ENGRAM_APP_TOKEN="${ENGRAM_APP_TOKEN:-dev-app-grpc-token}"
 TOKEN_FLAG=(--token "$ENGRAM_APP_TOKEN")
 
-echo "==> waiting for host registration"
+case "${ENGRAM_INTEG_TWO_HOSTS:-}" in
+    1 | true | yes) want_hosts=2 ;;
+    *) want_hosts=1 ;;
+esac
+echo "==> waiting for host registration (want >= $want_hosts)"
 for _ in $(seq 1 180); do
     n=$("$CLI" ${TOKEN_FLAG[@]+"${TOKEN_FLAG[@]}"} --grpc-addr "$GRPC" --json host list 2>/dev/null \
         | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('hosts',[])))" 2>/dev/null || echo 0)
-    [ "${n:-0}" -ge 1 ] && break
+    [ "${n:-0}" -ge "$want_hosts" ] && break
     sleep 1
 done
 n=$("$CLI" ${TOKEN_FLAG[@]+"${TOKEN_FLAG[@]}"} --grpc-addr "$GRPC" --json host list 2>/dev/null \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('hosts',[])))" 2>/dev/null || echo 0)
-if [ "${n:-0}" -lt 1 ]; then
-    echo "ERROR: no host-agent registered" >&2
+if [ "${n:-0}" -lt "$want_hosts" ]; then
+    echo "ERROR: expected >= $want_hosts host-agent(s), got ${n:-0}" >&2
     tail -80 "$LOG" >&2 || true
     exit 1
 fi
-echo "    host registered; prod-shape stack ready"
+echo "    $n host(s) registered; prod-shape stack ready"

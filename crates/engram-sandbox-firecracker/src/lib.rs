@@ -176,6 +176,47 @@ fn upload_uds_for(base_vsock_uds: &Path) -> PathBuf {
 /// (hypervisor / loopback / host); user-allocatable starts at 3.
 const FIRST_GUEST_CID: u32 = 3;
 
+/// vsock CIDs reserved per test slot (see [`test_resource_slot`]). A
+/// single test boots a small handful of VMs, so 4096 is generous
+/// headroom and keeps each slot's range far from its neighbours'.
+const CID_SLOT_STRIDE: u32 = 4096;
+
+/// Per-process isolation slot for HOST-GLOBAL sandbox resources — the
+/// vsock CID space and (when networking is on) the /30 IP pool. Both
+/// live outside any per-VM netns, so two `FirecrackerBackend`s in
+/// different processes that start their allocators at the same base
+/// collide on the host.
+///
+/// Production runs exactly one backend per host and never sets this, so
+/// the slot is 0 and every allocation is byte-for-byte unchanged. Under
+/// `cargo nextest`, each concurrently-running test gets its own process
+/// with a distinct `NEXTEST_TEST_GLOBAL_SLOT` in `[0, test-threads)`;
+/// reading it here lets the FC integration tests run in parallel (their
+/// jail/work dirs are already per-process temp dirs and their TAP/netns
+/// names are UUID-derived, so the CID — and the pool, for any future
+/// networked parallel test — are the only shared namespaces left).
+fn test_resource_slot() -> u32 {
+    std::env::var("NEXTEST_TEST_GLOBAL_SLOT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Shift the /30 pool into a per-slot /16 (`10.200.x` → `10.(200+slot).x`)
+/// so parallel test processes hand out disjoint guest IPs. Slot 0
+/// (production, and every serial test) is unchanged; the disabled-
+/// networking sentinel (`0.0.0.0`) is left alone. Only the second octet
+/// moves, and the test runner's thread count bounds `slot` well under
+/// the 55 slots available before the octet saturates.
+fn pool_for_slot(pool: std::net::Ipv4Addr, slot: u32) -> std::net::Ipv4Addr {
+    if slot == 0 || pool.is_unspecified() {
+        return pool;
+    }
+    let o = pool.octets();
+    let second = u32::from(o[1]).saturating_add(slot).min(255) as u8;
+    std::net::Ipv4Addr::new(o[0], second, 0, 0)
+}
+
 /// How long `destroy` waits for the guest to honour SendCtrlAltDel
 /// before escalating to SIGKILL. A healthy debian-slim/ubuntu rootfs
 /// halts within ~1s; 3s leaves room for the page-cache drain at
@@ -196,6 +237,10 @@ pub const UFFD_CONTROL_SOCK_FILE: &str = "uffd-control.sock";
 /// state.bin appears late via the fetch poller).
 pub const MIGRATION_PEER_FILE: &str = "migration-peer.json";
 
+/// ADR 0045 C2 (E2B fold): the staged source-hot-set trace the spawn
+/// writes into the jail for the handler's drain ordering + prefault.
+pub const MIGRATION_HOT_TRACE_FILE: &str = "migration-hot-trace.json";
+
 /// ADR 0045 C2: `migration-peer.json` content.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MigrationPeerSpec {
@@ -206,6 +251,14 @@ pub struct MigrationPeerSpec {
     /// on /proc/*/cmdline). The file lives root-owned in the snapshot
     /// staging dir for the restore's lifetime.
     pub peer_token: String,
+    /// E2B fold: the SOURCE's resume-time working set (the capture
+    /// rider's `hot_chunks`) — the prediction of exactly the pages
+    /// the dest guest will fault first. The spawn stages it as a
+    /// local trace file so the handler drains hot-first AND the
+    /// post-drain prefault walks it. Serde-default: an old spec
+    /// simply yields no hot ordering.
+    #[serde(default)]
+    pub hot_chunks: Vec<[u8; 32]>,
 }
 
 /// Host-wide knobs for `FirecrackerBackend`. The kernel image lives
@@ -753,12 +806,20 @@ pub struct FirecrackerBackend {
 
 impl FirecrackerBackend {
     pub fn new(work_dir: impl Into<PathBuf>, config: FirecrackerConfig) -> Self {
+        // Per-process test-isolation slot (0 in production). Partitions
+        // the two host-global namespaces — vsock CID space + the /30 IP
+        // pool — so the FC integration suite can run in parallel under
+        // nextest without collisions. See `test_resource_slot`.
+        let slot = test_resource_slot();
         // Allocator over the configured pool; falls back to a
         // throwaway 0.0.0.0 pool when networking is disabled (the
         // allocator is created but never consulted in that mode).
-        let pool = config
-            .net_pool
-            .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
+        let pool = pool_for_slot(
+            config
+                .net_pool
+                .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
+            slot,
+        );
         let net_allocator = Arc::new(parking_lot::Mutex::new(net::NetworkAllocator::new(pool)));
         let work_dir: PathBuf = work_dir.into();
         // ADR 0007 Phase 5: default the UFFD handler's chunk cache
@@ -785,7 +846,7 @@ impl FirecrackerBackend {
             work_dir,
             config,
             sandboxes: Arc::new(DashMap::new()),
-            next_cid: AtomicU32::new(FIRST_GUEST_CID),
+            next_cid: AtomicU32::new(FIRST_GUEST_CID + slot * CID_SLOT_STRIDE),
             net_allocator,
             harness_sink: Arc::new(parking_lot::RwLock::new(None)),
             forge_sink: Arc::new(parking_lot::RwLock::new(None)),
@@ -1631,7 +1692,37 @@ impl FirecrackerBackend {
             }
             cmd.arg("--base-shm").arg(&base);
         }
-        if let Some(host) = prefault_trace_host {
+        // Post-copy: the source's hot set beats any host-local trace —
+        // it is the working set of THIS guest measured minutes ago,
+        // not a same-template cousin's. Staged as a local file; the
+        // handler both orders its drain by it and prefaults from it.
+        let migration_hot_trace = match peer {
+            Some(p) if !p.hot_chunks.is_empty() => {
+                let trace = engram_chunk_store::working_set::WorkingSetTrace {
+                    schema_version: 1,
+                    captured_at: chrono::Utc::now(),
+                    vcpu_count: 0, // unknown here; replay ignores it
+                    capture_window_ms: 0,
+                    chunks: p
+                        .hot_chunks
+                        .iter()
+                        .map(|h| engram_chunk_store::manifest::ChunkHash::from_bytes(*h))
+                        .collect(),
+                };
+                let path = jail_dir.join(MIGRATION_HOT_TRACE_FILE);
+                let json = serde_json::to_vec(&trace)
+                    .map_err(|e| vm_err(format!("serialize migration hot trace: {e}")))?;
+                tokio::fs::write(&path, json)
+                    .await
+                    .map_err(|e| vm_err(format!("write migration hot trace: {e}")))?;
+                Some(path)
+            }
+            _ => None,
+        };
+        if let Some(path) = migration_hot_trace.as_ref() {
+            cmd.arg("--prefault-trace")
+                .arg(format!("file:{}", path.display()));
+        } else if let Some(host) = prefault_trace_host {
             cmd.arg("--prefault-trace").arg(host.to_string());
         }
         if let Some(host) = publish_trace_host {
@@ -2342,6 +2433,16 @@ impl FirecrackerBackend {
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
 
+        // ADR 0048 (surfaced by the fleet load test): same-base concurrent
+        // restores share the FC-embedded `source_rootfs_canonical` rootfs path
+        // and collide on it. The fix — install that symlink + hold a
+        // per-source-path lock ONLY across `load_snapshot` (when FC opens the
+        // rootfs fd) — lives right before the load below, NOT here: holding it
+        // across all of `restore_in_jail` (netns + spawn + the cold chunk
+        // fetch) serialized a burst so hard the coordinator's restore RPC timed
+        // out. The load itself is ~5 ms in UFFD mode, so the tight window is
+        // nearly free.
+
         // ADR 0035 §3/§4: aux RO bundles.
         //
         // The PINNED generation must be present regardless of flavor —
@@ -2696,6 +2797,42 @@ impl FirecrackerBackend {
         // bundle mounts at session bind so the guest's squashfs superblock
         // re-parses the swapped device. With no swap pending, keep the
         // single-call load-and-resume.
+        // ADR 0048 (load-test finding): install the SHARED, FC-embedded
+        // `source_rootfs_canonical` rootfs symlink pointing at OUR device, and
+        // hold a per-source-path lock ACROSS the load below so a concurrent
+        // same-base restore can't repoint it between our install and FC opening
+        // the rootfs fd (that repoint → FC opens the WRONG device; the racing
+        // install → "/dev/nbdN: File exists" 503). The per-NEW-sandbox
+        // `canonical` was already installed in leg 1 (unique, uncontended).
+        // Scoped to the load only: UFFD load returns in ~ms, so this serializes
+        // just the FD-open instant — the netns/spawn/cold chunk-fetch above all
+        // ran concurrently. Distinct bases use distinct paths and never contend.
+        let uniq_canonical = paths::rootfs_canonical(&self.work_dir, sandbox_id);
+        let _src_canon_guard = match (
+            manifest.source_rootfs_canonical.as_ref(),
+            manifest.spec.rootfs_source.as_ref(),
+        ) {
+            (Some(src), Some(target)) if src.as_path() != uniq_canonical.as_path() => {
+                let guard = source_canonical_lock(src).lock_owned().await;
+                if let Some(parent) = src.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        vm_err(format!(
+                            "create source rootfs canonical parent {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                paths::install_symlink(src, target).await.map_err(|e| {
+                    vm_err(format!(
+                        "restore source rootfs canonical symlink {} -> {}: {e}",
+                        src.display(),
+                        target.display()
+                    ))
+                })?;
+                Some(guard)
+            }
+            _ => None,
+        };
         let load_result: Result<(), SandboxError> = async {
             match &uffd_leg {
                 None => {
@@ -2747,7 +2884,11 @@ impl FirecrackerBackend {
                                     state_path.exists(),
                                 )));
                             }
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            // 2 ms: a file-existence check is ~µs and
+                            // this wait sits inside the guest-observed
+                            // blackout — the old 25 ms grain was pure
+                            // tax.
+                            tokio::time::sleep(Duration::from_millis(2)).await;
                         }
                         tracing::info!(
                             sandbox_id = %sandbox_id,
@@ -2762,6 +2903,7 @@ impl FirecrackerBackend {
                     let base = base_memory_manifest
                         .or(manifest.memory_manifest)
                         .and_then(|r| self.uffd_base_path(&r));
+                    let t_load = std::time::Instant::now();
                     tracing::Instrument::instrument(
                         async {
                             api.load_snapshot_uffd_opts(
@@ -2777,6 +2919,16 @@ impl FirecrackerBackend {
                         tracing::info_span!("fc.load_snapshot", mode = "uffd"),
                     )
                     .await?;
+                    // Restore-tail attribution (blackout-critical on a
+                    // post-copy dest: the load demand-faults early
+                    // guest pages through the handler → P2P, and the
+                    // resume rides this call when no aux swap runs).
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        load_ms = t_load.elapsed().as_millis() as u64,
+                        resumed_in_load = aux_swap_plan.is_empty(),
+                        "fc snapshot load complete (uffd)",
+                    );
                 }
             }
             if !aux_swap_plan.is_empty() {
@@ -2800,6 +2952,9 @@ impl FirecrackerBackend {
             Ok(())
         }
         .await;
+        // FC has opened the rootfs fd (load returned); the shared path is free
+        // for the next same-base restore. Release before the post-load work.
+        drop(_src_canon_guard);
 
         let uffd_handler: Option<Child> = match load_result {
             Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
@@ -3051,6 +3206,20 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
 /// `swap_harness_drive` re-points the symlink at the session's real
 /// harness ext4 at warm-lease time, so the stub only needs to be
 /// openable as a block device by `load_snapshot`.
+/// ADR 0048: per-host lock keyed by a base snapshot's `source_rootfs_canonical`
+/// path. Restores that descend from the SAME base share this path (FC opens the
+/// rootfs at the state.bin-embedded absolute path, and there's no load-time
+/// rootfs override the way there is for vsock), so their
+/// `restore_canonical_symlinks` → `load_snapshot` windows must not interleave on
+/// one host. Distinct base paths (e.g. per-session resumes) get distinct keys
+/// and never contend. The map only ever grows by the number of distinct base
+/// paths a host serves (bounded by enabled images), so it isn't reaped.
+fn source_canonical_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> =
+        std::sync::LazyLock::new(DashMap::new);
+    LOCKS.entry(path.to_path_buf()).or_default().clone()
+}
+
 async fn restore_canonical_symlinks(
     work_dir: &Path,
     new_sandbox_id: SandboxId,
@@ -3088,27 +3257,13 @@ async fn restore_canonical_symlinks(
         // its canonical path on the manifest, recreate the file there
         // too (mkdir parent + symlink) so FC `load_snapshot` finds
         // the drive at the absolute path it expects.
-        if let Some(source_canonical) = manifest.source_rootfs_canonical.as_ref() {
-            if source_canonical != &canonical {
-                if let Some(parent) = source_canonical.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                        vm_err(format!(
-                            "create source rootfs canonical parent {}: {e}",
-                            parent.display()
-                        ))
-                    })?;
-                }
-                paths::install_symlink(source_canonical, rootfs_target)
-                    .await
-                    .map_err(|e| {
-                        vm_err(format!(
-                            "restore source rootfs canonical symlink {} -> {}: {e}",
-                            source_canonical.display(),
-                            rootfs_target.display()
-                        ))
-                    })?;
-            }
-        }
+        // NOTE: the SHARED `source_rootfs_canonical` symlink (the state.bin-
+        // embedded path, identical across every VM descended from one base) is
+        // installed by `restore_in_jail` under a per-source-path lock held only
+        // across `load_snapshot` — NOT here. Doing it here, off the lock, let
+        // same-base concurrent restores race it (TOCTOU `EEXIST` 503 + cross-VM
+        // repoint). This function only installs the per-NEW-sandbox `canonical`
+        // above, which is unique and never contended.
     }
     // Vsock: nothing to recreate. The load passes `vsock_override`
     // keyed to the NEW live sandbox id, so FC never binds the

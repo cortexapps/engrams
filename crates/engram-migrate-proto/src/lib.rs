@@ -34,7 +34,7 @@
 //!
 //! ## Soundness notes encoded in the message set
 //!
-//! - `Page.sha256` lets the dest verify peer bytes before `UFFDIO_COPY`;
+//! - `Page.hash` (blake3) lets the dest verify peer bytes before `UFFDIO_COPY`;
 //!   a mismatch is fatal (peer-authoritative content has no second
 //!   source).
 //! - `AltSource` demotes an over-approximated dirty chunk to class 2: the
@@ -52,7 +52,45 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Protocol version carried in `Hello`/`HelloAck`. Bump on any
 /// wire-incompatible change; the server rejects mismatches loudly.
-pub const PROTO_VERSION: u32 = 1;
+///
+/// v2: `Page.lz4` — payloads ship lz4-block-compressed when that is
+/// smaller, and `sha256` covers the WIRE bytes. The measured per-fault
+/// cost on the no-SHA-NI fleet was ~6.7 ms, dominated by the 512 KiB
+/// transfer + double sha256 — compression cuts all three.
+///
+/// v3: `Hello.purpose` — connections identify as Fault or Drain. The
+/// source skips the AltSource classify hash on fault connections: a
+/// demote there ADDS a dest-side cache/GCS fetch (strictly worse
+/// latency than shipping the resident bytes), and the classify sha256
+/// of the raw 512 KiB was ~1 ms of the per-fault constant on the
+/// no-SHA-NI fleet. Drain connections keep the demote (it saves wire
+/// and the drain is latency-insensitive).
+///
+/// v4: `Page.hash` is blake3 (was sha256) — measured 1.63 ms/serve in
+/// the encode leg, ~1.2 ms of it soft sha256 of the compressed wire
+/// bytes (no SHA-NI on the fleet); blake3 is cryptographic at
+/// ~1–2 GB/s in software. `AltSource.durable_sha256` STAYS sha256 —
+/// that is the chunk-store's content address, not wire integrity.
+pub const PROTO_VERSION: u32 = 4;
+
+/// Wire-integrity hash for `Page` payloads (v4: blake3 over the wire
+/// bytes — the SAME bytes shipped, compressed or raw). One helper so
+/// both endpoints can never disagree on the algorithm.
+pub fn wire_hash(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
+/// What a peer connection is FOR — the source's serve policy keys on
+/// it (see the v3 note on [`PROTO_VERSION`]).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConnPurpose {
+    /// The handler's fault-loop connection: latency-critical, single
+    /// in-flight request, a stalled vCPU behind every frame.
+    Fault,
+    /// Background drain: throughput-oriented, pipelined, yields to
+    /// faults on the dest side.
+    Drain,
+}
 
 /// Default TCP port for the source host-agent's page-server listener.
 pub const DEFAULT_PEER_PORT: u16 = 9102;
@@ -145,6 +183,7 @@ pub enum ToSource {
         version: u32,
         export_id: String,
         token: String,
+        purpose: ConnPurpose,
     },
     /// Demand-fault or drain request for the sealed chunk containing
     /// `chunk_offset` (a chunk-aligned byte offset in the snapshot memory
@@ -182,13 +221,19 @@ pub enum FromSource {
     /// handler keeps the first and sanity-checks duplicates.
     Seal { bitmap: SealBitmap },
     /// Peer-authoritative chunk bytes read via `process_vm_readv` from
-    /// the paused source VM. `sha256` is computed over `bytes`; the
-    /// handler MUST verify before installing.
+    /// the paused source VM. `hash` is [`wire_hash`] over `bytes`
+    /// (as-shipped); the handler MUST verify before installing.
     Page {
         req_id: u64,
         chunk_offset: u64,
+        /// WIRE bytes: lz4-block-compressed (size-prepended) when
+        /// `lz4`, raw otherwise (the source ships whichever is
+        /// smaller — incompressible chunks go raw).
         bytes: Vec<u8>,
-        sha256: [u8; 32],
+        /// [`wire_hash`] over the WIRE bytes — verify BEFORE
+        /// decompressing.
+        hash: [u8; 32],
+        lz4: bool,
     },
     /// The whole chunk is zero bytes — install via the zero path instead
     /// of shipping 512 KiB of zeros.
@@ -212,6 +257,25 @@ pub enum FromSource {
     },
 }
 
+/// Compress a page payload for the wire: returns the smaller of the
+/// lz4 block (size-prepended) and the raw bytes, plus the `lz4` flag.
+pub fn compress_page(raw: Vec<u8>) -> (Vec<u8>, bool) {
+    let compressed = lz4_flex::block::compress_prepend_size(&raw);
+    if compressed.len() < raw.len() {
+        (compressed, true)
+    } else {
+        (raw, false)
+    }
+}
+
+/// Reverse [`compress_page`] AFTER wire-integrity verification.
+pub fn decompress_page(wire: Vec<u8>, lz4: bool) -> Result<Vec<u8>, String> {
+    if !lz4 {
+        return Ok(wire);
+    }
+    lz4_flex::block::decompress_size_prepended(&wire).map_err(|e| format!("lz4 decompress: {e}"))
+}
+
 /// handler → host-agent over the `--control-sock` UDS (same framing).
 /// Strictly one-way; the handler never blocks on control backpressure
 /// (the fault path has priority over observability).
@@ -229,12 +293,20 @@ pub enum HandlerControl {
     DrainProgress { pulled: u64, remaining: u64 },
     /// All sealed chunks installed or demoted; the peer connections are
     /// closed and the handler is byte-identical to a C1 restore from
-    /// here on.
+    /// here on. `faults`/`fault_us` are the FAULT-path totals (guest
+    /// faults that round-tripped the peer + their cumulative wall) —
+    /// the serial P2P cost inside the FC load + early execution, the
+    /// restore-tail attribution the drain numbers can't show. Control
+    /// sock is same-host (handler ↔ its own host-agent, one image), so
+    /// extending the variant is bincode-safe.
     DrainDone {
         pulled: u64,
         alt_sourced: u64,
         zero_chunks: u64,
         ms: u64,
+        faults: u64,
+        fault_us: u64,
+        fault_max_us: u64,
     },
     /// The peer is gone (dial/reconnect exhausted, frame error, or sha
     /// mismatch) with sealed chunks still uninstalled. FATAL by design:
@@ -308,6 +380,13 @@ mod tests {
             version: PROTO_VERSION,
             export_id: "ab12".into(),
             token: "secret".into(),
+            purpose: ConnPurpose::Fault,
+        });
+        round_trip(&ToSource::Hello {
+            version: PROTO_VERSION,
+            export_id: "ab12".into(),
+            token: "secret".into(),
+            purpose: ConnPurpose::Drain,
         });
         round_trip(&ToSource::NeedAt {
             req_id: 7,
@@ -339,8 +418,24 @@ mod tests {
             req_id: 1,
             chunk_offset: 0,
             bytes: vec![0xCD; 512 * 1024],
-            sha256: [0x11; 32],
+            hash: [0x11; 32],
+            lz4: false,
         });
+        // The v2 compression helpers: a compressible chunk round-trips
+        // through lz4; an incompressible one ships raw.
+        let raw = vec![0xCD; 512 * 1024];
+        let (wire, lz4) = compress_page(raw.clone());
+        assert!(
+            lz4 && wire.len() < raw.len(),
+            "repetitive chunk must compress"
+        );
+        assert_eq!(decompress_page(wire, lz4).unwrap(), raw);
+        let noise: Vec<u8> = (0..4096u32)
+            .flat_map(|i| i.wrapping_mul(2654435761).to_le_bytes())
+            .collect();
+        let (wire, lz4) = compress_page(noise.clone());
+        assert!(!lz4, "incompressible bytes must ship raw");
+        assert_eq!(decompress_page(wire, lz4).unwrap(), noise);
         round_trip(&FromSource::ZeroChunk {
             req_id: 2,
             chunk_offset: 512 * 1024,
@@ -376,6 +471,9 @@ mod tests {
             alt_sourced: 1,
             zero_chunks: 1,
             ms: 1234,
+            faults: 42,
+            fault_us: 55_000,
+            fault_max_us: 9_000,
         });
         round_trip(&HandlerControl::PeerLost {
             remaining: 3,

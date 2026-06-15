@@ -922,6 +922,10 @@ impl HostAgent {
                         current_bundles: current_bundles.clone(),
                         checkpoints,
                         utilization,
+                        // ADR 0048: the CPU packing budget's basis.
+                        total_vcpus: std::thread::available_parallelism()
+                            .map(|n| n.get() as u32)
+                            .unwrap_or(0),
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {

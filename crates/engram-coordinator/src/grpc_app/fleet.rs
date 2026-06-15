@@ -32,11 +32,20 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .list_active_hosts()
             .await
             .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
+        // ADR 0047: PG-authoritative — render from the rows + per-host reserved
+        // budget (the in-memory scheduler mirror is gone, ADR 0047 S2).
+        let reserved = self
+            .state
+            .services
+            .meta
+            .per_host_reserved()
+            .await
+            .unwrap_or_default();
         let hosts = rows
             .into_iter()
             .map(|row| {
-                let live = self.state.host_registry.snapshot_state(row.id);
-                let view = crate::api::hosts::HostView::from_row_and_live(row, live);
+                let r = reserved.get(&row.id).copied().unwrap_or_default();
+                let view = crate::api::hosts::HostView::from_row(row, r);
                 convert::host_view_to_proto(&view)
             })
             .collect();
@@ -63,8 +72,15 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         let row = rows.into_iter().find(|r| r.id == host_id).ok_or_else(|| {
             into_status(crate::error::ApiError::NotFound("host not found".into()))
         })?;
-        let live = self.state.host_registry.snapshot_state(host_id);
-        let view = crate::api::hosts::HostView::from_row_and_live(row, live);
+        let reserved = self
+            .state
+            .services
+            .meta
+            .per_host_reserved()
+            .await
+            .unwrap_or_default();
+        let r = reserved.get(&host_id).copied().unwrap_or_default();
+        let view = crate::api::hosts::HostView::from_row(row, r);
         Ok(Response::new(app::GetHostResponse {
             host: Some(convert::host_view_to_proto(&view)),
         }))
@@ -138,20 +154,12 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
-        // Soft drain: mirrors api/hosts.rs::drain (POST /hosts/:id/drain).
-        // DRIFT WARNING: this replicates api/hosts.rs::drain.
-        // If that handler changes, this must change too.
-        // Back-pointer: api/hosts.rs::drain.
-        self.state
-            .services
-            .meta
-            .set_host_status(host_id, engram_core::types::HostStatus::Draining)
+        // Soft drain: ADR 0047 durable cordon (PG-authoritative; the in-memory
+        // scheduler mirror is gone). New placements skip this host; in-flight
+        // sessions stay. Shares the core with CordonHost + admin drain.
+        crate::api::admin::set_cordon_core(&self.state, host_id, true)
             .await
-            .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
-        if let Some(mut s) = self.state.host_registry.snapshot_state(host_id) {
-            s.draining = true;
-            self.state.host_registry.update_state(host_id, s);
-        }
+            .map_err(into_status)?;
         Ok(Response::new(app::DrainHostResponse {}))
     }
 
@@ -194,23 +202,11 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
-        // DRIFT WARNING: this replicates api/admin.rs::cordon_host.
-        // If that handler changes, this must change too.
-        // Back-pointer: api/admin.rs::cordon_host.
-        if !self.state.host_registry.cordon(host_id) {
-            return Err(into_status(crate::error::ApiError::NotFound(format!(
-                "host {host_id} not registered"
-            ))));
-        }
-        if let Err(e) = self
-            .state
-            .services
-            .meta
-            .set_host_status(host_id, engram_core::types::HostStatus::Draining)
+        // ADR 0047: durable cordon via the shared core (PG-authoritative; no
+        // in-memory mirror). NotFound when the host has no row.
+        crate::api::admin::set_cordon_core(&self.state, host_id, true)
             .await
-        {
-            tracing::warn!(%host_id, error = %e, "cordon_host: PG write failed; in-memory flag set");
-        }
+            .map_err(into_status)?;
         Ok(Response::new(app::CordonHostResponse {
             host_id: host_id.to_string(),
             status: "draining".to_string(),
@@ -227,23 +223,11 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
-        // DRIFT WARNING: this replicates api/admin.rs::uncordon_host.
-        // If that handler changes, this must change too.
-        // Back-pointer: api/admin.rs::uncordon_host.
-        if !self.state.host_registry.uncordon(host_id) {
-            return Err(into_status(crate::error::ApiError::NotFound(format!(
-                "host {host_id} not registered"
-            ))));
-        }
-        if let Err(e) = self
-            .state
-            .services
-            .meta
-            .set_host_status(host_id, engram_core::types::HostStatus::Ready)
+        // ADR 0047: durable uncordon via the shared core. NotFound when the
+        // host has no row.
+        crate::api::admin::set_cordon_core(&self.state, host_id, false)
             .await
-        {
-            tracing::warn!(%host_id, error = %e, "uncordon_host: PG write failed; in-memory flag set");
-        }
+            .map_err(into_status)?;
         Ok(Response::new(app::UncordonHostResponse {
             host_id: host_id.to_string(),
             status: "ready".to_string(),
@@ -325,5 +309,82 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         Ok(Response::new(convert::snapshot_blob_gc_result_to_proto(
             result,
         )))
+    }
+
+    async fn fleet_demand(
+        &self,
+        req: Request<app::FleetDemandRequest>,
+    ) -> Result<Response<app::FleetDemandResponse>, Status> {
+        self.auth.check(&req)?;
+        let d = crate::api::admin::fleet_demand_core(&self.state).await;
+        Ok(Response::new(app::FleetDemandResponse {
+            ready_hosts: d.ready_hosts,
+            schedulable_hosts: d.schedulable_hosts,
+            free_mib: d.free_mib,
+            total_mib: d.total_mib,
+            free_vcpus: d.free_vcpus,
+            total_vcpus: d.total_vcpus,
+            cordoned_hosts: d.cordoned_hosts,
+            queued_sessions: d.queued_sessions,
+            queued_mib: d.queued_mib,
+            queued_vcpus: d.queued_vcpus,
+        }))
+    }
+
+    async fn delete_host(
+        &self,
+        req: Request<app::DeleteHostRequest>,
+    ) -> Result<Response<app::DeleteHostResponse>, Status> {
+        self.auth.check(&req)?;
+        let host_id: engram_core::HostId = req
+            .get_ref()
+            .host_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("malformed host_id"))?;
+        use engram_core::types::session::DeleteHostOutcome;
+        match crate::api::admin::delete_host_core(&self.state, host_id)
+            .await
+            .map_err(into_status)?
+        {
+            DeleteHostOutcome::Deleted => Ok(Response::new(app::DeleteHostResponse {})),
+            DeleteHostOutcome::SessionsBound(n) => Err(Status::failed_precondition(format!(
+                "host {host_id} still has {n} bound session(s); drain it before deleting"
+            ))),
+        }
+    }
+
+    async fn teleport(
+        &self,
+        req: Request<app::TeleportRequest>,
+    ) -> Result<Response<app::TeleportResponse>, Status> {
+        self.auth.check(&req)?;
+        let r = req.into_inner();
+        let session_id = parse_session_id(&r.session_id)?;
+        let target_host_id: engram_core::HostId = r
+            .target_host_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("malformed target_host_id"))?;
+        let status = crate::api::admin::teleport_core(&self.state, session_id, target_host_id)
+            .await
+            .map_err(into_status)?;
+        Ok(Response::new(app::TeleportResponse {
+            session_id: session_id.to_string(),
+            status: status.to_string(),
+        }))
+    }
+
+    async fn evict_idle(
+        &self,
+        req: Request<app::EvictIdleRequest>,
+    ) -> Result<Response<app::EvictIdleResponse>, Status> {
+        self.auth.check(&req)?;
+        let id = parse_session_id(&req.get_ref().session_id)?;
+        crate::api::admin::evict_idle_core(&self.state, id)
+            .await
+            .map_err(into_status)?;
+        Ok(Response::new(app::EvictIdleResponse {
+            session_id: id.to_string(),
+            status: "idle".to_string(),
+        }))
     }
 }

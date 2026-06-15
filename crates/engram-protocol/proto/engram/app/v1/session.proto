@@ -93,6 +93,13 @@ message CreateSessionRequest {
   // Per-request secret values keyed by env-var name. Only honored under
   // SecretMode::Literal; broker-mode images reject overrides.
   map<string, string> secrets = 5;
+  // ADR 0039: git-attribution identity of the initiating user, supplied by the
+  // orchestrator (which owns user identity). Persisted on the session and
+  // re-injected as ENGRAM_USER_EMAIL / ENGRAM_USER_NAME on create AND every
+  // resume so the guest /etc/gitconfig [user] block attributes the agent's
+  // commits to the real user. Attribution metadata only — NOT an authz id.
+  optional string user_email = 6;
+  optional string user_name = 7;
 }
 
 message CreateSessionResponse {

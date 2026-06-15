@@ -995,6 +995,7 @@ impl Runtime {
     pub fn drain_from_peer(
         &self,
         peer: &crate::peer::PeerSession,
+        hot: Option<&engram_chunk_store::working_set::WorkingSetTrace>,
     ) -> Result<crate::peer::DrainStats, HandlerError> {
         use crate::peer::{DrainStats, PeerPage};
 
@@ -1009,18 +1010,50 @@ impl Runtime {
         let next_req = std::sync::atomic::AtomicU64::new(1_000_000); // distinct from fault-conn ids in logs
 
         // Pending sealed chunk offsets, skipping anything already
-        // installed by a racing fault.
-        let todo: Vec<u64> = (0..seal.chunk_count)
-            .filter(|i| seal.get(*i))
-            .map(|i| i * chunk_size)
-            .collect();
+        // installed by a racing fault. HOT-FIRST: the source's
+        // resume-time working set (in first-fault order) leads, so
+        // the chunks the guest touches first are installed first and
+        // most would-be faults are already local when they happen —
+        // the no-added-pause version of a hot-set pre-install. The
+        // cold remainder keeps offset order.
+        let mut todo: Vec<u64> = Vec::with_capacity(seal.count_ones() as usize);
+        let mut queued = std::collections::HashSet::new();
+        if let Some(trace) = hot {
+            for hash in &trace.chunks {
+                for offset in self.backend.session_positions_of(*hash) {
+                    let idx = offset / chunk_size;
+                    if seal.get(idx) && queued.insert(idx) {
+                        todo.push(idx * chunk_size);
+                    }
+                }
+            }
+        }
+        let hot_leading = todo.len();
+        for i in (0..seal.chunk_count).filter(|i| seal.get(*i)) {
+            if !queued.contains(&i) {
+                todo.push(i * chunk_size);
+            }
+        }
+        if hot_leading > 0 {
+            tracing::info!(hot_leading, total = todo.len(), "drain ordered hot-first");
+        }
         let total_sealed = todo.len();
 
         let mut in_flight: std::collections::VecDeque<(u64, u64)> = Default::default(); // (req_id, offset)
         let mut iter = todo.into_iter();
         let mut processed = 0usize;
         loop {
-            // Fill the pipeline.
+            // Fill the pipeline — but YIELD to guest faults. A fault
+            // request queuing behind the drain's in-flight bulk bytes
+            // was the measured ~7 ms/fault (vs ~1 ms on a quiet wire);
+            // during a post-resume fault storm the guest's stall
+            // matters and the drain's finish time does not (it only
+            // delays the source release). Parking REFILLS only: the
+            // up-to-8 outstanding responses flush in a few ms, then
+            // the wire belongs to the fault path until it goes quiet.
+            while peer.fault_active_within(std::time::Duration::from_millis(2)) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
             while in_flight.len() < PIPELINE_DEPTH {
                 let Some(offset) = iter.next() else { break };
                 if self.chunk_installed((offset / chunk_size) as usize) {
@@ -1224,13 +1257,17 @@ pub fn run_listener(
                 // whole VM; warming a doomed guest is wasted I/O.
                 if let Some(peer) = rt.peer.clone() {
                     let started = std::time::Instant::now();
-                    match rt.drain_from_peer(&peer) {
+                    match rt.drain_from_peer(&peer, prefault_trace.as_ref()) {
                         Ok(stats) => {
+                            let (faults, fault_us, fault_max_us) = peer.fault_stats();
                             tracing::info!(
                                 pulled = stats.pulled,
                                 alt_sourced = stats.alt_sourced,
                                 zero_chunks = stats.zero_chunks,
                                 ms = started.elapsed().as_millis() as u64,
+                                faults,
+                                fault_us,
+                                fault_max_us,
                                 "post-copy drain complete"
                             );
                             if let Some(control) = rt.control.as_ref() {
@@ -1239,6 +1276,9 @@ pub fn run_listener(
                                     alt_sourced: stats.alt_sourced,
                                     zero_chunks: stats.zero_chunks,
                                     ms: started.elapsed().as_millis() as u64,
+                                    faults,
+                                    fault_us,
+                                    fault_max_us,
                                 });
                             }
                         }
@@ -1469,8 +1509,6 @@ mod tests {
         use engram_migrate_proto::{
             read_frame, write_frame, FromSource, SealBitmap, ToSource, PROTO_VERSION,
         };
-        use sha2::{Digest, Sha256};
-
         let page_size = 4096u64;
         let chunk_size = page_size;
         let n_chunks = 8usize;
@@ -1542,13 +1580,15 @@ mod tests {
                     {
                         let resp = match chunk_offset / chunk_size {
                             1 => {
-                                let bytes = vec![PEER_BYTE; chunk_size as usize];
-                                let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+                                let raw = vec![PEER_BYTE; chunk_size as usize];
+                                let (bytes, lz4) = engram_migrate_proto::compress_page(raw);
+                                let hash = engram_migrate_proto::wire_hash(&bytes);
                                 FromSource::Page {
                                     req_id,
                                     chunk_offset,
                                     bytes,
-                                    sha256,
+                                    hash,
+                                    lz4,
                                 }
                             }
                             3 => FromSource::ZeroChunk {
@@ -1639,7 +1679,7 @@ mod tests {
         let rt_drain = Arc::clone(&rt);
         let sess = Arc::clone(&session);
         let stats = std::thread::spawn(move || {
-            let stats = rt_drain.drain_from_peer(&sess).expect("drain");
+            let stats = rt_drain.drain_from_peer(&sess, None).expect("drain");
             rt_drain.sweep_all().expect("sweep");
             stats
         })

@@ -1132,6 +1132,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, gate) = d5_state(session, sandbox_root.path(), false);
@@ -1190,6 +1193,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let (state, meta, gate) = d5_state(session, sandbox_root.path(), true);
@@ -1237,6 +1243,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1435,6 +1444,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1642,6 +1654,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1859,6 +1874,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -1977,6 +1995,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2206,6 +2227,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
 
         let sandbox_root = TempDir::new().unwrap();
@@ -2320,6 +2344,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2410,6 +2437,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         let sandbox_root = TempDir::new().unwrap();
         let state = build_state_with_session(session, sandbox_root.path());
@@ -2437,6 +2467,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         }
     }
 

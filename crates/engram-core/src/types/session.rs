@@ -13,18 +13,25 @@ use super::ids::{HostId, SandboxId, SessionId};
 /// truth — call sites do not encode their own preconditions.
 ///
 /// Persistence: the column is `TEXT`; the wire form is the
-/// snake_case spelling of each variant. `Pending` is the only
-/// non-persisted state (it exists in the API caller's pre-insert
-/// view and as the `from` of the first `StatusChanged` event — no
-/// row in `sessions` ever has `status='pending'`).
+/// snake_case spelling of each variant. (`Pending` is persisted since
+/// ADR 0046 — a sandbox-less `pending` row is the placement
+/// reservation — and is also the `from` of the first `StatusChanged`
+/// event a freshly-created session emits.)
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
-    /// Request accepted; scheduler hasn't returned yet. In-memory /
-    /// events-only — no row in `sessions` is ever written with this
-    /// state. The `from` side of the first `StatusChanged` event a
-    /// freshly-created session emits.
+    /// Request accepted; a host has been reserved (ADR 0046 — a
+    /// sandbox-less `pending` row IS the reservation) but the sandbox
+    /// isn't bound yet. Also the `from` side of the first
+    /// `StatusChanged` event a freshly-created session emits.
     Pending,
+    /// ADR 0048: accepted but no host had capacity, so instead of a 503
+    /// the session waits in a FIFO queue (`host_id` NULL, `queued_at`
+    /// set). The queue scanner re-attempts placement each tick and
+    /// either drives it forward (`Queued → Pending` for a create,
+    /// `Queued → Idle` to resume) or fails it on timeout
+    /// (`Queued → Failed`). Holds no host memory reservation.
+    Queued,
     /// Sandbox is bound to a host (`host_id` + `sandbox_id` populated)
     /// but nothing further is proven. `start_agent` has not yet run;
     /// agentd may not be reachable; harness (if any) has not been
@@ -140,6 +147,7 @@ impl SessionState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Queued => "queued",
             Self::Created => "created",
             Self::GuestReady => "guest_ready",
             Self::Active => "active",
@@ -169,19 +177,26 @@ impl SessionState {
     /// startup `repopulate_routing` strands the session after a pod
     /// roll. Mock stores filter with this so they can't drift.
     pub fn is_live(&self) -> bool {
-        !self.is_terminal() && !matches!(self, Self::HostLost)
+        // `Queued` is excluded alongside `HostLost`: it has no sandbox
+        // binding to rehydrate (host_id NULL), and the queue scanner
+        // finds it via its own FIFO query, not `list_active_sessions`.
+        !self.is_terminal() && !matches!(self, Self::HostLost | Self::Queued)
     }
 
     /// Single source of truth for legal transitions. Per ADR 0015 M2
     /// + ADR 0018 commit 12 (Evacuating) + ADR 0034 (Evicting):
     ///
     /// ```text
-    /// Pending     -> Created | Failed
+    /// Pending     -> Created | Failed | Queued
+    /// Queued      -> Pending (placed create) | Idle (resume dequeue
+    ///                / resume-origin timeout) | Failed (create timeout
+    ///                / cancel)
     /// Created     -> GuestReady | Active | Failed | HostLost
     /// GuestReady  -> Active | Failed | HostLost
     /// Active      -> Idle | HostLost | Evacuating | Evicting | Failed
     ///              | Completed | Dead
-    /// Idle        -> Created (resume) | Dead | Completed
+    /// Idle        -> Created (resume) | Dead | Completed | Queued (resume
+    ///                hit no capacity, ADR 0048)
     /// HostLost    -> Created | Idle | Evacuating | Dead | Completed
     /// Evacuating  -> Created (scanner resumes on peer)
     ///              | Idle (scanner exhausted retries; user /resume)
@@ -208,14 +223,19 @@ impl SessionState {
         // comment block above). Every `from` state covered, including
         // the three terminal arms that always return false.
         match self {
-            Pending => matches!(target, Created | Failed),
+            Pending => matches!(target, Created | Failed | Queued),
+            // ADR 0048: a placed create flips Queued → Pending (re-enters
+            // the normal boot path); a resume dequeue or a resume-origin
+            // timeout goes Queued → Idle; a create-origin timeout / cancel
+            // goes Queued → Failed.
+            Queued => matches!(target, Pending | Idle | Failed),
             Created => matches!(target, GuestReady | Active | Failed | HostLost),
             GuestReady => matches!(target, Active | Failed | HostLost),
             Active => matches!(
                 target,
                 Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead
             ),
-            Idle => matches!(target, Created | Dead | Completed),
+            Idle => matches!(target, Created | Dead | Completed | Queued),
             HostLost => matches!(target, Created | Idle | Evacuating | Dead | Completed),
             Evacuating => matches!(target, Created | Idle | Dead | Completed),
             Evicting => matches!(target, Idle | HostLost | Dead | Completed),
@@ -234,7 +254,9 @@ impl SessionState {
         use SessionState::*;
         let target = match self {
             Active | Idle | HostLost | Evacuating | Evicting => Completed,
-            Pending | Created | GuestReady => Failed,
+            // Queued never ran → Failed, alongside the other never-usable
+            // early states.
+            Pending | Queued | Created | GuestReady => Failed,
             Failed | Completed | Dead => return None,
         };
         debug_assert!(
@@ -304,6 +326,74 @@ pub type ImageRef = String;
 /// Returns `(uri, "")` if there's no `:tag` suffix (a digest-only
 /// reference uses `@sha256:...` syntax which we don't decompose
 /// here).
+/// ADR 0048: whether a queued session is waiting to boot a fresh create
+/// or to resume an idle session — they have different dequeue + timeout
+/// targets (`Queued → Pending` vs `Queued → Idle`; timeout → `Failed`
+/// vs back to `Idle`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueOrigin {
+    Create,
+    Resume,
+}
+
+impl QueueOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Resume => "resume",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "create" => Some(Self::Create),
+            "resume" => Some(Self::Resume),
+            _ => None,
+        }
+    }
+}
+
+/// ADR 0048: a row the queue scanner sees — the session plus its queue
+/// metadata (origin, the stashed create prompt, the budgets to reserve
+/// with, and when it was queued for FIFO + timeout).
+#[derive(Clone, Debug)]
+pub struct QueuedSession {
+    pub session: Session,
+    pub origin: QueueOrigin,
+    pub prompt: Option<String>,
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i32,
+    pub queued_at: DateTime<Utc>,
+}
+
+/// ADR 0048 C8: an Active session bound to a host, with its reservation
+/// budgets — the drain don't-strand guard needs the budgets to ask
+/// "does some survivor fit this session?".
+#[derive(Clone, Copy, Debug)]
+pub struct SandboxAssignment {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i32,
+}
+
+/// ADR 0048: outcome of [`crate::traits::MetadataStore::delete_host`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteHostOutcome {
+    /// The host row was deleted (or was already gone — idempotent).
+    Deleted,
+    /// Refused: `n` sessions are still bound to the host.
+    SessionsBound(u64),
+}
+
+/// ADR 0048: the queue's aggregate demand — the autoscaler's scale-up
+/// signal (`/admin/fleet/demand`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueuedDemand {
+    pub sessions: u64,
+    pub mem_mib: u64,
+    pub vcpus: u64,
+}
+
 pub fn split_image_ref(uri: &str) -> (&str, &str) {
     // Find the LAST ':' AFTER the last '/' — protects against
     // splitting on the registry's port (e.g. `localhost:5001/...`).
@@ -376,6 +466,25 @@ pub struct SessionSpec {
     pub image: ImageRef,
     #[serde(default)]
     pub mode: SessionMode,
+    /// ADR 0039: a reference (key) into the deployment-sealed `sealed_secrets`
+    /// store for the harness OAuth secret the orchestrator staged via
+    /// `PutSecret`. Persisted on the session row (NOT the plaintext) so the
+    /// control plane can re-resolve + re-inject it on every resume — including
+    /// coordinator-driven auto-resume (idle→active, queue scanner) where the
+    /// orchestrator is not in the loop. `None` for sessions with no staged
+    /// harness secret.
+    #[serde(default)]
+    pub harness_secret_id: Option<String>,
+    /// ADR 0039: the initiating user's git-attribution identity, supplied by the
+    /// orchestrator (which owns user identity). Persisted + re-injected as
+    /// `ENGRAM_USER_EMAIL` / `ENGRAM_USER_NAME` on create AND every resume, so
+    /// `engram-session-bundles` writes the guest `/etc/gitconfig` `[user]` block
+    /// and the agent's commits stay attributed to the real user. These are
+    /// attribution metadata only — NOT an authz identity (no `user_id`, no FK).
+    #[serde(default)]
+    pub user_email: Option<String>,
+    #[serde(default)]
+    pub user_name: Option<String>,
 }
 
 /// A persisted session row.
@@ -383,6 +492,18 @@ pub struct SessionSpec {
 pub struct Session {
     pub id: SessionId,
     pub status: SessionState,
+    /// ADR 0039: reference into the deployment-sealed `sealed_secrets` store
+    /// for this session's harness OAuth secret. Re-resolved + re-injected on
+    /// every resume (see `api/sessions.rs::resolve_session_env`). `None` when
+    /// no harness secret was staged.
+    #[serde(default)]
+    pub harness_secret_id: Option<String>,
+    /// ADR 0039: git-attribution identity (NOT an authz identity). Re-injected
+    /// as `ENGRAM_USER_EMAIL` / `ENGRAM_USER_NAME` on every resume.
+    #[serde(default)]
+    pub user_email: Option<String>,
+    #[serde(default)]
+    pub user_name: Option<String>,
     pub host_id: Option<HostId>,
     /// In-memory `SandboxId` of the live sandbox serving this
     /// session. Populated from `Created` onward; cleared back to
@@ -451,6 +572,7 @@ mod tests {
     fn session_state_as_str_matches_serde_form() {
         for s in [
             SessionState::Pending,
+            SessionState::Queued,
             SessionState::Created,
             SessionState::GuestReady,
             SessionState::Active,
@@ -479,6 +601,11 @@ mod tests {
         let allowed: &[(SessionState, SessionState)] = &[
             (Pending, Created),
             (Pending, Failed),
+            (Pending, Queued),
+            (Queued, Pending),
+            (Queued, Idle),
+            (Queued, Failed),
+            (Idle, Queued),
             (Created, GuestReady),
             (Created, Active),
             (Created, Failed),
@@ -511,8 +638,8 @@ mod tests {
             (Evicting, Completed),
         ];
         let all_states = [
-            Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting, Failed,
-            Completed, Dead,
+            Pending, Queued, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
+            Failed, Completed, Dead,
         ];
         for &from in &all_states {
             for &to in &all_states {
@@ -538,7 +665,7 @@ mod tests {
         for terminal in [Failed, Completed, Dead] {
             assert!(terminal.is_terminal());
             for target in [
-                Pending, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
+                Pending, Queued, Created, GuestReady, Active, Idle, HostLost, Evacuating, Evicting,
             ] {
                 assert_eq!(
                     terminal.try_transition_to(target),
@@ -652,6 +779,9 @@ mod tests {
         let original = Session {
             id: SessionId::new(),
             status: SessionState::Active,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),
             image: "ghcr.io/cortex/api:warm-20260101T000000Z".into(),

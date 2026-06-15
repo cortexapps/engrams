@@ -40,6 +40,9 @@ impl MetadataStore for MiniMeta {
                 mode: spec.mode,
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
+                harness_secret_id: None,
+                user_email: None,
+                user_name: None,
             },
         );
         Ok(id)
@@ -63,6 +66,9 @@ impl MetadataStore for MiniMeta {
                 mode: spec.mode,
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
+                harness_secret_id: None,
+                user_email: None,
+                user_name: None,
             },
         );
         Ok(())
@@ -122,10 +128,11 @@ impl MetadataStore for MiniMeta {
     async fn touch_host_heartbeat(
         &self,
         _id: HostId,
-        _s: HostStatus,
-        _cap: engram_core::types::HostCapacity,
-        _util: engram_core::types::HostUtilization,
+        _hb: engram_core::types::host::HostHeartbeat,
     ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
         Ok(())
     }
     async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
@@ -277,6 +284,9 @@ async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionState) -> Se
         .create_session(SessionSpec {
             image: "localhost:5001/demo:warm-test".into(),
             mode: SessionMode::Agent,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         })
         .await
         .unwrap();
@@ -295,6 +305,7 @@ fn legal_path_from_pending(target: SessionState) -> &'static [SessionState] {
     use SessionState::*;
     match target {
         Pending => &[],
+        Queued => &[Queued],
         Created => &[Created],
         GuestReady => &[Created, GuestReady],
         Active => &[Created, Active],

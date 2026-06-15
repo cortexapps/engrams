@@ -399,7 +399,7 @@ else:
 if sandbox_backend == 'firecracker':
     print('engram dev: NBD devices discovered = %r (two_hosts=%s)' % (_nbd, two_hosts))
 
-def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port):
     env = {
         # Same per-image kernel as the coord-side mode=all path uses.
         kernel_key: kernel_path,
@@ -423,6 +423,13 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         # bind. Same machine in dev, so loopback works for both.
         'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:' + grpc_port,
         'ENGRAM_GRPC_ADVERTISE_ADDR': 'http://127.0.0.1:' + grpc_port,
+        # ADR 0045 C2 post-copy page-server listener. Per-host port
+        # derived from the gRPC port: the binary default (9102) collides
+        # with host-agent-b's gRPC port in the two-host stack, so the
+        # coord's gRPC dial lands on the page-server protocol and every
+        # restore 503s. +20 keeps it clear of the 910x/911x grpc+metrics
+        # block for both hosts.
+        'ENGRAM_MIGRATE_PEER_LISTEN_ADDR': '0.0.0.0:' + str(int(grpc_port) + 20),
         'ENGRAM_COORDINATOR_ENDPOINT': 'http://127.0.0.1:8090',
         # Same GCS backend the coord uses, so chunks materialized
         # coord-side are reachable from the PooledBackend at runtime.
@@ -432,7 +439,10 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         # Egress proxy off in dev — set ENGRAM_EGRESS_PROXY_PORT to
         # enable. CI sets it (Blacksmith doesn't NAT FC TAP traffic, so
         # guests route via the proxy); local dev relies on host masquerade.
-        'ENGRAM_EGRESS_PROXY_PORT': env_or('ENGRAM_EGRESS_PROXY_PORT', '0'),
+        # Per-host port (each host-agent binds its own 0.0.0.0:<port> +
+        # iptables REDIRECTs its VMs there) so a co-located second host
+        # in the two-host stack doesn't collide on the bind.
+        'ENGRAM_EGRESS_PROXY_PORT': egress_proxy_port,
         'ENGRAM_HOST_METRICS_ADDR': '0.0.0.0:' + metrics_port,
         # ADR 0019: same OTLP target as the coord, so the host-side
         # restore/boot spans land in the same Jaeger trace.
@@ -501,10 +511,14 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv):
         trigger_mode=TRIGGER_MODE_MANUAL,
         auto_init=True)
 
+_proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', '0'))
 if dev_split:
-    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a)
+    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base))
     if two_hosts:
-        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b)
+        # Distinct proxy port for the second host-agent; 0 (disabled)
+        # stays 0 so the dev default is unchanged.
+        _proxy_b = str(_proxy_base + 1) if _proxy_base > 0 else '0'
+        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b)
 
 # ----------------------------------------------------------------
 # Web SPA (vite dev server).

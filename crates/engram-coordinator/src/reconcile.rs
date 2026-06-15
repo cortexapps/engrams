@@ -22,14 +22,12 @@
 //! both flip the same session simultaneously.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::SessionState;
 use engram_core::{HostId, SandboxId, SessionId};
-use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::host_registry::HostRegistry;
@@ -54,33 +52,22 @@ pub fn grace_ticks_from_env() -> u8 {
         .unwrap_or(DEFAULT_GRACE_TICKS)
 }
 
-/// Per-coord strikes counter. A session that's present in the
-/// host's heartbeat resets its entry to zero; a missing session
-/// increments; reaching `grace_ticks` triggers the flip + clears
-/// the entry so a re-emerging sandbox starts fresh.
-///
-/// In-memory + per-coord. On coord restart the counter resets and
-/// the next 3 heartbeats re-build it from scratch — at worst a 15 s
-/// delay after a coord redeploy before the first flip. Acceptable.
+/// Strike-driven flipper. ADR 0047: the counter itself lives on the
+/// session row (`sessions.missing_strikes`,
+/// `MetadataStore::apply_missing_sandbox_strikes`) so the "missing N
+/// CONSECUTIVE heartbeats" semantics hold when a host's heartbeats
+/// round-robin across coordinator replicas — per-pod counters would
+/// miss the resets that land on siblings and flip healthy sessions.
 #[derive(Clone, Default)]
 pub struct Reconciler {
-    strikes: Arc<Mutex<HashMap<SessionId, u8>>>,
     grace_ticks: u8,
 }
 
 impl Reconciler {
     pub fn new(grace_ticks: u8) -> Self {
         Self {
-            strikes: Arc::new(Mutex::new(HashMap::new())),
             grace_ticks: grace_ticks.max(1),
         }
-    }
-
-    /// Snapshot the strikes map. Useful for telemetry / tests; not
-    /// hot-path.
-    #[allow(dead_code)]
-    pub fn snapshot_strikes(&self) -> HashMap<SessionId, u8> {
-        self.strikes.lock().clone()
     }
 
     /// Reconcile this host's view via the live `SharedState`. Thin
@@ -139,9 +126,27 @@ impl Reconciler {
         let sandbox_by_session: HashMap<SessionId, SandboxId> =
             assignments.iter().copied().collect();
 
-        let to_flip = {
-            let mut strikes = self.strikes.lock();
-            apply_strikes(&mut strikes, &assignments, &running, self.grace_ticks)
+        // ADR 0047: strike accounting happens on the session rows so
+        // every replica shares one counter.
+        let mut present: Vec<SessionId> = Vec::new();
+        let mut missing: Vec<SessionId> = Vec::new();
+        for (session_id, sandbox_id) in &assignments {
+            if running.contains(sandbox_id) {
+                present.push(*session_id);
+            } else {
+                missing.push(*session_id);
+            }
+        }
+        let to_flip = match meta
+            .apply_missing_sandbox_strikes(&present, &missing, self.grace_ticks as i32)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(host_id = %host_id, error = %e,
+                    "reconcile: strike accounting failed; skipping tick");
+                return Vec::new();
+            }
         };
 
         for session_id in &to_flip {
@@ -370,34 +375,6 @@ pub fn spawn_in_proc(state: SharedState, tick: Duration) -> JoinHandle<()> {
     })
 }
 
-/// Pure strikes-counter update. Extracted from `reconcile_host` so
-/// the load-bearing decision logic is testable without standing up
-/// a full `SharedState`. Mutates `strikes`; returns the set of
-/// sessions whose strike count just hit `grace_ticks` and should be
-/// flipped (and entries removed from `strikes` to start fresh on a
-/// re-emerging sandbox).
-fn apply_strikes(
-    strikes: &mut HashMap<SessionId, u8>,
-    assignments: &[(SessionId, SandboxId)],
-    running: &HashSet<SandboxId>,
-    grace_ticks: u8,
-) -> Vec<SessionId> {
-    let mut to_flip = Vec::new();
-    for (session_id, sandbox_id) in assignments {
-        if running.contains(sandbox_id) {
-            strikes.remove(session_id);
-        } else {
-            let s = strikes.entry(*session_id).or_insert(0);
-            *s = s.saturating_add(1);
-            if *s >= grace_ticks {
-                to_flip.push(*session_id);
-                strikes.remove(session_id);
-            }
-        }
-    }
-    to_flip
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,109 +388,5 @@ mod tests {
     #[test]
     fn default_grace_is_three() {
         assert_eq!(DEFAULT_GRACE_TICKS, 3);
-    }
-
-    fn assignment() -> (SessionId, SandboxId) {
-        (SessionId::new(), SandboxId::new())
-    }
-
-    #[test]
-    fn present_sandbox_resets_strikes() {
-        // Even if the sandbox was missing for a few ticks, a single
-        // present-heartbeat resets to zero (no flip carry-over).
-        let (sid, sb) = assignment();
-        let mut strikes = HashMap::new();
-        strikes.insert(sid, 2);
-        let running: HashSet<_> = [sb].into_iter().collect();
-        let flipped = apply_strikes(&mut strikes, &[(sid, sb)], &running, 3);
-        assert!(flipped.is_empty());
-        assert!(!strikes.contains_key(&sid), "present resets to zero");
-    }
-
-    #[test]
-    fn missing_sandbox_accumulates_one_strike_per_tick() {
-        let (sid, sb) = assignment();
-        let mut strikes = HashMap::new();
-        let running = HashSet::new();
-        apply_strikes(&mut strikes, &[(sid, sb)], &running, 5);
-        assert_eq!(strikes.get(&sid).copied(), Some(1));
-        apply_strikes(&mut strikes, &[(sid, sb)], &running, 5);
-        assert_eq!(strikes.get(&sid).copied(), Some(2));
-    }
-
-    #[test]
-    fn flips_on_third_consecutive_missing_with_default_grace() {
-        let (sid, sb) = assignment();
-        let mut strikes = HashMap::new();
-        let running = HashSet::new();
-        let flipped1 = apply_strikes(&mut strikes, &[(sid, sb)], &running, 3);
-        let flipped2 = apply_strikes(&mut strikes, &[(sid, sb)], &running, 3);
-        let flipped3 = apply_strikes(&mut strikes, &[(sid, sb)], &running, 3);
-        assert!(flipped1.is_empty());
-        assert!(flipped2.is_empty());
-        assert_eq!(flipped3, vec![sid]);
-        // After flip, the entry is cleared so a re-emerging sandbox
-        // starts fresh — and a never-resolved missing won't keep
-        // accumulating strikes (we already flipped it once).
-        assert!(!strikes.contains_key(&sid));
-    }
-
-    #[test]
-    fn re_present_after_two_strikes_resets_and_no_flip() {
-        // Common in-the-wild scenario: backend.list() blips for two
-        // ticks then recovers. Reconcile must NOT flip.
-        let (sid, sb) = assignment();
-        let mut strikes = HashMap::new();
-        let empty = HashSet::new();
-        let present: HashSet<_> = [sb].into_iter().collect();
-        apply_strikes(&mut strikes, &[(sid, sb)], &empty, 3);
-        apply_strikes(&mut strikes, &[(sid, sb)], &empty, 3);
-        let flipped = apply_strikes(&mut strikes, &[(sid, sb)], &present, 3);
-        assert!(flipped.is_empty(), "recovery before grace must not flip");
-        assert!(!strikes.contains_key(&sid));
-    }
-
-    #[test]
-    fn many_sessions_strike_independently() {
-        // Per-session strike counters are independent: one session's
-        // strikes do not affect another's.
-        let (sid_a, sb_a) = assignment();
-        let (sid_b, sb_b) = assignment();
-        let mut strikes = HashMap::new();
-        // sb_a missing for two ticks; sb_b present every tick.
-        let present_b: HashSet<_> = [sb_b].into_iter().collect();
-        apply_strikes(&mut strikes, &[(sid_a, sb_a), (sid_b, sb_b)], &present_b, 3);
-        apply_strikes(&mut strikes, &[(sid_a, sb_a), (sid_b, sb_b)], &present_b, 3);
-        assert_eq!(strikes.get(&sid_a).copied(), Some(2));
-        assert!(!strikes.contains_key(&sid_b));
-        // Third tick: sb_a flips, sb_b unaffected.
-        let flipped = apply_strikes(&mut strikes, &[(sid_a, sb_a), (sid_b, sb_b)], &present_b, 3);
-        assert_eq!(flipped, vec![sid_a]);
-    }
-
-    #[test]
-    fn grace_one_flips_on_first_missing() {
-        // grace_ticks=1 is the no-grace mode — useful for the future
-        // operator endpoint `POST /api/admin/reconcile-now`.
-        let (sid, sb) = assignment();
-        let mut strikes = HashMap::new();
-        let running = HashSet::new();
-        let flipped = apply_strikes(&mut strikes, &[(sid, sb)], &running, 1);
-        assert_eq!(flipped, vec![sid]);
-    }
-
-    #[test]
-    fn unknown_sandbox_in_running_set_is_ignored() {
-        // Host reporting sandboxes the coord doesn't know about (e.g.
-        // sessions on a different host, or sandboxes spawned outside
-        // platform control) must not affect the strikes counter for
-        // sessions we ARE tracking.
-        let (sid, sb) = assignment();
-        let mut strikes = HashMap::new();
-        let foreign_sb = SandboxId::new();
-        let running: HashSet<_> = [foreign_sb].into_iter().collect();
-        let flipped = apply_strikes(&mut strikes, &[(sid, sb)], &running, 3);
-        assert!(flipped.is_empty());
-        assert_eq!(strikes.get(&sid).copied(), Some(1));
     }
 }

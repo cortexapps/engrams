@@ -26,7 +26,7 @@ use engram_core::{SandboxError, SandboxId, SessionId};
 use serde::Serialize;
 
 use crate::error::ApiError;
-use crate::host_registry::ScheduleContext;
+use crate::placement::ScheduleContext;
 use crate::state::{RecoveryCause, SessionEvent, SharedState};
 
 /// ADR 0039 follow-up #20: how long `ensure_active` will HOLD a
@@ -263,6 +263,15 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         SessionState::Pending => Err(ApiError::Conflict(
             "session is pending — scheduling has not completed".into(),
         )),
+        // ADR 0048: accepted but waiting for fleet capacity. Retryable —
+        // the queue scanner drives it to Active (or Idle, then resume)
+        // once a host frees up / scales in; the client polls
+        // /sessions/:id/events for the flip, same as Pending.
+        SessionState::Queued => Err(ApiError::Conflict(
+            "session is queued — waiting for host capacity (the fleet is \
+             scaling up). It will resume automatically once placed."
+                .into(),
+        )),
         SessionState::HostLost => Err(ApiError::HostLost(
             "session's host went away; resume from a snapshot if one exists".into(),
         )),
@@ -353,7 +362,10 @@ async fn ensure_active_after_evicting_hold_for(
     }
 }
 
-async fn resume_session(state: SharedState, id: SessionId) -> Result<SnapshotResponse, ApiError> {
+pub(crate) async fn resume_session(
+    state: SharedState,
+    id: SessionId,
+) -> Result<SnapshotResponse, ApiError> {
     // Serialize resume against concurrent resume + eviction for this session.
     // Reuses the per-session `session_lease` lease (keyed on session_id).
     // Without it, two concurrent resumes — e.g. the prompt path's auto-resume
@@ -861,32 +873,42 @@ pub async fn finish_resume_to_active(
     // HarnessSpec. The resume bundle already loaded the manifest;
     // a None bundle (manifest fetch failed above) means we skip the
     // agent re-attach, same as the dev-VM path.
-    let agent_opt = resume_bundle.as_ref().and_then(|b| {
-        // Same split as create: agentd holds the durable session env (image
-        // env + secrets + session id); the harness gets the forge broker
-        // token as a per-spawn extra — re-minted here so it's valid even
-        // after a coord restart dropped the in-memory token map.
-        let mut session_env = resume_base_env.clone();
-        session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
-        let mut agent = crate::api::sessions::resolve_harness(
-            state,
-            b.manifest.harness.as_ref(),
-            session.mode,
-            id,
-            None,
-            session_env,
-            b.manifest.workdir.clone(),
-        )
-        .ok()
-        .flatten()?;
-        crate::api::sessions::inject_harness_env(
-            state,
-            id,
-            b.manifest.git.as_ref(),
-            &mut agent.env,
-        );
-        Some(agent)
-    });
+    let agent_opt = match resume_bundle.as_ref() {
+        Some(b) => {
+            // Same split as create: agentd holds the durable session env
+            // (image env + secrets + session id); the harness gets the
+            // forge broker token as a per-spawn extra — loaded from the
+            // PG-sealed row (ADR 0047), so it's the same token across
+            // coord restarts and replicas.
+            let mut session_env = resume_base_env.clone();
+            session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
+            match crate::api::sessions::resolve_harness(
+                state,
+                b.manifest.harness.as_ref(),
+                session.mode,
+                id,
+                None,
+                session_env,
+                b.manifest.workdir.clone(),
+            )
+            .ok()
+            .flatten()
+            {
+                Some(mut agent) => {
+                    crate::api::sessions::inject_harness_env(
+                        state,
+                        id,
+                        b.manifest.git.as_ref(),
+                        &mut agent.env,
+                    )
+                    .await;
+                    Some(agent)
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
     let mut start_agent_failed = false;
     if let Some(agent) = agent_opt {
         // Rebuild the SessionEgressPolicy for the new sandbox.
@@ -1028,6 +1050,7 @@ async fn resume_from_fc_snapshot(
         image_version: image_tag,
         prefer_snapshot_id: Some(record.id),
         memory_mib: None,
+        cpu_budget_vcpus: None,
         // Restore from a snapshot reuses an existing in-memory image —
         // no chunked-rootfs prefetch needed on the resume path. Snapshot
         // affinity already constrains to a host that has the bytes.
@@ -1038,6 +1061,48 @@ async fn resume_from_fc_snapshot(
         // host first, else wherever the session last ran.
         prefer_host: record.host_id.or(session.host_id),
     };
+
+    // ADR 0048 C7: if NO host can take this resume (the fleet is fully
+    // cordoned for a scale-down wave, or scaled to zero), QUEUE it
+    // (Idle → queued) instead of erroring. The queue scanner resumes it
+    // once capacity returns / the fleet scales up. Only triggers on an
+    // empty candidate set — a present-but-full fleet still soft-picks
+    // (the pre-existing ADR 0046 resume-isn't-reserved posture).
+    if matches!(session.status, SessionState::Idle) {
+        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
+            Ok(c) if c.hosts.is_empty() => {
+                state
+                    .services
+                    .meta
+                    .enqueue_session_resume(id)
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("enqueue_session_resume: {e}")))?;
+                let _ = state
+                    .emit(
+                        id,
+                        SessionEvent::StatusChanged {
+                            from: SessionState::Idle,
+                            to: SessionState::Queued,
+                            at: Utc::now(),
+                        },
+                    )
+                    .await;
+                tracing::info!(%id, "resume found no host capacity — queued (ADR 0048)");
+                return Ok(SnapshotResponse {
+                    session_id: id,
+                    snapshot_id: Some(record.id.to_string()),
+                    size_bytes: Some(record.size_bytes),
+                    note: "queued",
+                });
+            }
+            Ok(_) => {} // a candidate exists — proceed with the soft pick
+            Err(e) => {
+                // Read error: don't queue blindly, fall through to the
+                // restore attempt (which surfaces the real error).
+                tracing::warn!(%id, error = ?e, "resume: candidates_for failed; attempting restore");
+            }
+        }
+    }
     // ADR 0016 Phase B commit 6: pick the newer of
     // `session.live_disk_manifest` and `record.disk_manifest`.
     // Without this, the first resume after Phase B's continuous
@@ -1127,10 +1192,13 @@ async fn resume_from_fc_snapshot(
         // host materializes any the receiving host is missing.
         aux_bundles: record.aux_bundles.clone(),
     };
-    let (host_id, new_sandbox_id) = match state
-        .host_registry
-        .restore_for_session(&ctx, restore_metadata)
-        .await
+    let (host_id, new_sandbox_id) = match crate::placement::restore_for_session(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        &ctx,
+        restore_metadata,
+    )
+    .await
     {
         Ok(v) => v,
         Err(SandboxError::Snapshot(msg)) => {
@@ -1839,6 +1907,9 @@ mod evicting_gate_tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         }
     }
 

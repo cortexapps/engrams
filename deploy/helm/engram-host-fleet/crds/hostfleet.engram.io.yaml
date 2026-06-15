@@ -37,7 +37,26 @@ spec:
                   noop scaler the operator only *logs* the desired size.'
                 nullable: true
                 properties:
+                  maxConcurrentDrains:
+                    default: 1
+                    description: "ADR 0048: the most victims to DRAIN concurrently\
+                      \ within one reconcile. 1 is the safe default \u2014 the coordinator's\
+                      \ R8 gate already serialises per-host live migrations, so concurrent\
+                      \ drains mostly help when many victims are idle (nothing to\
+                      \ teleport)."
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
                   maxHosts:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  maxShedPerWave:
+                    default: 1
+                    description: 'ADR 0048: the most victim nodes a single scale-down
+                      WAVE may target. Small waves are observable + bound the blast
+                      radius; the cost-optimal target may be much lower, but we approach
+                      it a few nodes at a time.'
                     format: uint32
                     minimum: 0.0
                     type: integer

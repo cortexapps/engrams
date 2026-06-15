@@ -44,21 +44,18 @@ impl app::session_service_server::SessionService for AppSessionService {
     ) -> Result<Response<app::CreateSessionResponse>, Status> {
         self.auth.check(&req)?;
         let r = req.into_inner();
-        // ADR 0039 Task 13: extract harness_secret_id before moving r into
-        // the converter. convert.rs binds it as `_`; we handle it here.
-        let harness_secret_id = r.harness_secret_id.clone();
-        let api_req = super::convert::create_request_from_proto(r).map_err(into_status)?;
-        // Build identity_env from harness_secret_id if set (SecretService
-        // injection). If the secret resolves and the image has a builtin
-        // claude harness, inject the token into the session env exactly as
-        // the axum path does from the per-user saved token.
-        let identity_env = if let Some(secret_id) = harness_secret_id.as_deref() {
-            super::session_impl::build_harness_secret_env(&self.state, secret_id, &api_req).await?
-        } else {
-            std::collections::HashMap::new()
+        // ADR 0039: extract the orchestrator-supplied identity metadata before
+        // moving `r` into the converter (convert.rs binds these as `_`). The
+        // coordinator persists the harness-secret REFERENCE + git attribution on
+        // the session and re-applies them on every resume (incl. auto-resume),
+        // so we hand `create_session_core` the reference, not a pre-resolved env.
+        let identity = crate::api::sessions::SessionIdentity {
+            harness_secret_id: r.harness_secret_id.clone(),
+            user_email: r.user_email.clone(),
+            user_name: r.user_name.clone(),
         };
-        // ADR 0039 Task 31: owner removed; identity_env carries harness secret env only.
-        let body = crate::api::sessions::create_session_core(&self.state, identity_env, api_req)
+        let api_req = super::convert::create_request_from_proto(r).map_err(into_status)?;
+        let body = crate::api::sessions::create_session_core(&self.state, identity, api_req)
             .await
             .map_err(into_status)?;
         Ok(Response::new(app::CreateSessionResponse {
@@ -452,11 +449,10 @@ impl app::session_service_server::SessionService for AppSessionService {
 mod tests {
     /// `create_request_from_proto` must NOT map `harness_secret_id` into the
     /// api request — it is intentionally dropped (bind as `_` in convert.rs).
-    /// The RPC layer (create_session above) extracts it before convert.rs is
-    /// called (Task 13: `build_harness_secret_env`); this test confirms the
-    /// converter itself does not surface the field on the output struct
-    /// (i.e., `CreateSessionRequest` has no such field, proving the totality
-    /// drop is correct).
+    /// The RPC layer (create_session above) extracts it into a `SessionIdentity`
+    /// before convert.rs is called; this test confirms the converter itself does
+    /// not surface the field on the output struct (i.e., `CreateSessionRequest`
+    /// has no such field, proving the totality drop is correct).
     #[test]
     fn create_request_from_proto_does_not_map_harness_secret_id() {
         use engram_protocol::app;
@@ -470,6 +466,8 @@ mod tests {
             prompt: None,
             harness_secret_id: Some("secret-abc-123".into()),
             secrets: std::collections::HashMap::new(),
+            user_email: None,
+            user_name: None,
         };
         // Intentionally bypass the RPC-layer rejection: call convert directly.
         let api = super::super::convert::create_request_from_proto(r)

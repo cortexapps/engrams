@@ -376,7 +376,13 @@ pub struct NetworkPolicy {
 #[serde(deny_unknown_fields)]
 pub struct ResourceHints {
     pub suggested_memory_mib: Option<u32>,
-    pub suggested_vcpus: Option<u32>,
+    /// ADR 0048: the guest's vCPU count. A DECLARATION, not a hint —
+    /// enable-time validation rejects an image that omits it, and
+    /// placement reserves it against the host's
+    /// `total_vcpus × overcommit` budget so packing has a CPU bound.
+    /// (Renamed from `suggested_vcpus`; `#[serde(deny_unknown_fields)]`
+    /// makes a stale manifest fail to parse — re-bake on the roll.)
+    pub vcpus: Option<u32>,
     pub suggested_disk_gib: Option<u32>,
 }
 
@@ -504,7 +510,7 @@ mod tests {
 
             [resources]
             suggested_memory_mib = 4096
-            suggested_vcpus = 2
+            vcpus = 2
         "#;
         let m: ImageManifest = toml::from_str(src).unwrap();
         assert_eq!(m.name, "cortex-api");
@@ -521,6 +527,7 @@ mod tests {
 
         assert_eq!(m.network.allow_hosts.len(), 2);
         assert_eq!(m.resources.suggested_memory_mib, Some(4096));
+        assert_eq!(m.resources.vcpus, Some(2));
     }
 
     #[test]

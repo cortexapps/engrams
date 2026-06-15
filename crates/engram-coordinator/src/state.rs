@@ -449,22 +449,13 @@ pub struct AppState {
     /// via the `ENGRAM_COORD_POD_ID` env var if local tests want
     /// a deterministic value.
     pub pod_id: Arc<String>,
-    /// ADR 0023: per-session credential-broker tokens (session →
-    /// expected bearer). Minted at session create and injected into the
-    /// guest as `ENGRAM_FORGE_TOKEN`; the in-session forge endpoints
-    /// authenticate the caller by matching against this, then resolve
-    /// the session's `GitForge`. Cleared at terminal. In-memory (one
-    /// `--mode=all` process); PG-backed is the multi-pod follow-on.
+    /// ADR 0023/0047: per-session credential-broker tokens (session →
+    /// expected bearer). PURE READ-THROUGH CACHE over the KEK-sealed
+    /// `session_broker_tokens` PG rows (the authority — minted
+    /// first-writer-wins, so the token is stable for the session's
+    /// lifetime on every replica). A miss loads + unseals from PG;
+    /// cleared at terminal alongside the row.
     pub git_broker_tokens: Arc<dashmap::DashMap<SessionId, String>>,
-    /// ADR 0045 Phase F (teleport): operator-pinned relocation targets
-    /// (session → destination host). Set by `POST .../sessions/:id/teleport`
-    /// before the session is marked `Evacuating`; the `evac_resumer`
-    /// scanner reads it to place on that exact host instead of the
-    /// capacity-ranked pick, and clears it once the session leaves
-    /// `Evacuating` (resolved or fell back to Idle). In-memory — the
-    /// coordinator is single-replica (ADR 0044); a coord restart loses
-    /// pending pins, which degrade to a standard any-peer move.
-    pub teleport_targets: Arc<dashmap::DashMap<SessionId, HostId>>,
     /// ADR 0023: the configured git forge authority (GitHub App, etc).
     /// Set on `main`'s run path via `run_with_registry_and_local`;
     /// `None` in tests and when `--git-forge` is unset (the forge
@@ -518,7 +509,6 @@ impl AppState {
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
             pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
-            teleport_targets: Arc::new(dashmap::DashMap::new()),
             forge: None,
         }
     }
@@ -946,6 +936,32 @@ pub(crate) mod tests {
     >;
 
     impl MiniMeta {
+        /// ADR 0047: placement reads host rows now — tests stage a
+        /// schedulable (ready, fresh-heartbeat) host with this.
+        pub(crate) fn add_ready_host(&self, id: engram_core::HostId) {
+            self.hosts.lock().push(HostRecord {
+                id,
+                hostname: format!("test-{id}"),
+                cloud_metadata: Default::default(),
+                capacity: engram_core::types::HostCapacity {
+                    total_gb: 0,
+                    used_gb: 0,
+                    total_mib: 16_384,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: Default::default(),
+                status: HostStatus::Ready,
+                last_heartbeat_at: chrono::Utc::now(),
+                host_addr: None,
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
+            });
+        }
+
         pub(crate) fn new(session: Session) -> Self {
             Self {
                 session: PlMutex::new(session),
@@ -1050,7 +1066,13 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {
+        async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
+            let mut hosts = self.hosts.lock();
+            if let Some(existing) = hosts.iter_mut().find(|h| h.id == host.id) {
+                *existing = host;
+            } else {
+                hosts.push(host);
+            }
             Ok(())
         }
         async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
@@ -1061,12 +1083,31 @@ pub(crate) mod tests {
         }
         async fn touch_host_heartbeat(
             &self,
-            _: HostId,
-            _: HostStatus,
-            _: engram_core::types::HostCapacity,
-            _: engram_core::types::HostUtilization,
+            id: HostId,
+            hb: engram_core::types::host::HostHeartbeat,
         ) -> Result<(), MetaError> {
+            let mut hosts = self.hosts.lock();
+            if let Some(h) = hosts.iter_mut().find(|h| h.id == id) {
+                h.status = hb.status;
+                h.capacity = hb.capacity;
+                h.utilization = hb.utilization;
+                h.ready_images = hb.ready_images;
+                h.local_snapshots = hb.local_snapshots;
+                h.current_bundles = hb.current_bundles;
+                h.total_vcpus = hb.total_vcpus;
+                h.last_heartbeat_at = chrono::Utc::now();
+            }
             Ok(())
+        }
+        async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
+            let mut hosts = self.hosts.lock();
+            match hosts.iter_mut().find(|h| h.id == id) {
+                Some(h) => {
+                    h.cordoned = cordoned;
+                    Ok(())
+                }
+                None => Err(MetaError::NotFound),
+            }
         }
         async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
             Ok(Vec::new())
@@ -1444,6 +1485,9 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -1504,6 +1548,9 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         (session_id, Arc::new(MiniMeta::new(session)))
     }

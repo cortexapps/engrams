@@ -46,6 +46,9 @@ struct ReconcileMeta {
     next_event_idx: Mutex<HashMap<SessionId, i64>>,
     /// Captured emitted events for assertions.
     emitted: Mutex<Vec<(SessionId, String, serde_json::Value)>>,
+    /// ADR 0047: in-memory mirror of `sessions.missing_strikes` — the
+    /// same reset/increment/flip-at-grace semantics as the PG impl.
+    strikes: Mutex<HashMap<SessionId, i32>>,
 }
 
 impl ReconcileMeta {
@@ -64,6 +67,9 @@ impl ReconcileMeta {
                 created_at: now,
                 last_active_at: now,
                 live_disk_manifest: None,
+                harness_secret_id: None,
+                user_email: None,
+                user_name: None,
             },
         );
         id
@@ -182,11 +188,35 @@ impl MetadataStore for ReconcileMeta {
     async fn touch_host_heartbeat(
         &self,
         _: HostId,
-        _: HostStatus,
-        _: engram_core::types::HostCapacity,
-        _: engram_core::types::HostUtilization,
+        _: engram_core::types::host::HostHeartbeat,
     ) -> Result<(), MetaError> {
         Ok(())
+    }
+    async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn apply_missing_sandbox_strikes(
+        &self,
+        present: &[SessionId],
+        missing: &[SessionId],
+        grace_ticks: i32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        let mut strikes = self.strikes.lock();
+        for id in present {
+            strikes.remove(id);
+        }
+        let mut flipped = Vec::new();
+        for id in missing {
+            let s = strikes.entry(*id).or_insert(0);
+            *s += 1;
+            if *s >= grace_ticks {
+                flipped.push(*id);
+            }
+        }
+        for id in &flipped {
+            strikes.remove(id);
+        }
+        Ok(flipped)
     }
     async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
         Ok(Vec::new())

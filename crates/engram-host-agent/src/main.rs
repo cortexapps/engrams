@@ -482,43 +482,23 @@ async fn main() -> Result<(), HostAgentError> {
     if let Some(fc) = fc_for_reattach {
         agent = agent.with_fc_reattach(fc);
     }
-    // ADR 0007 Phase 4: opt-in NBD daemon. `ENGRAM_NBD_DEVICES`
-    // is a comma-separated list of `/dev/nbdN` paths the daemon
-    // allocates from. Empty / unset → keep the materialize-to-
-    // file path. Production Packer images load `modprobe nbd
-    // nbds_max=64` + set this env var to match.
-    if let Ok(s) = std::env::var("ENGRAM_NBD_DEVICES") {
-        let paths: Vec<std::path::PathBuf> = s
-            .split(',')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(std::path::PathBuf::from)
-            .collect();
-        if !paths.is_empty() {
-            // ADR 0044 K2: stale-binding recovery does NOT run here
-            // anymore. A device bound to the dead previous
-            // generation might be a SURVIVOR's live disk (its FC
-            // keeps reading it; rehydrate RECONFIGUREs it) — the
-            // old eager pass actively disconnected one in prod
-            // (2026-06-11, /dev/nbd4 → guest rootfs EIO). The sweep
-            // now runs in `lib.rs` AFTER the registration-time
-            // survivor rehydrate, scoped to the slot pool's
-            // still-free paths.
-            match engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(paths) {
-                Ok(pool) => {
-                    tracing::info!(
-                        slots = pool.capacity(),
-                        "NBD daemon enabled; chunked rootfs serves /dev/nbdN",
-                    );
-                    agent = agent.with_nbd_pool(pool);
-                }
-                Err(e) => {
-                    return Err(HostAgentError::Config(format!(
-                        "ENGRAM_NBD_DEVICES misconfigured: {e}"
-                    )));
-                }
-            }
-        }
+    // ADR 0007 Phase 4 / ADR 0049: NBD daemon with a warm-pool slot
+    // allocator. The pool sizes itself from the kernel's `nbds_max`
+    // (the chart's `modprobe nbd nbds_max=<N>`), capped by
+    // `ENGRAM_NBD_MAX_SLOTS`, keeping `ENGRAM_NBD_WARM_SLOTS` slots
+    // pre-validated and ready for O(1) `acquire()`. Returns `None`
+    // (materialize-to-file fallback) when the nbd module isn't loaded
+    // or `ENGRAM_NBD_DISABLE` is set.
+    //
+    // ADR 0044 K2: stale-binding recovery does NOT run at construction.
+    // A device bound to the dead previous generation might be a
+    // SURVIVOR's live disk (its FC keeps reading it; rehydrate
+    // RECONFIGUREs it) — the old eager pass disconnected one in prod
+    // (2026-06-11, /dev/nbd4 → guest rootfs EIO). The sweep runs in
+    // `lib.rs` AFTER the registration-time survivor rehydrate, scoped
+    // to the slot pool's still-free paths.
+    if let Some(pool) = engram_host_agent::disk_daemon::build_nbd_pool_from_kernel() {
+        agent = agent.with_nbd_pool(pool);
     }
     if cli.egress_proxy_port > 0 {
         match build_host_egress(&cli).await {

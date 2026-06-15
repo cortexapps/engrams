@@ -93,12 +93,13 @@ impl MetadataStore for StubMeta {
     async fn set_host_status(&self, _id: HostId, _s: HostStatus) -> Result<(), MetaError> {
         Ok(())
     }
+    async fn set_host_cordoned(&self, _id: HostId, _cordoned: bool) -> Result<(), MetaError> {
+        Ok(())
+    }
     async fn touch_host_heartbeat(
         &self,
         _id: HostId,
-        _s: HostStatus,
-        _cap: engram_core::types::HostCapacity,
-        _util: engram_core::types::HostUtilization,
+        _hb: engram_core::types::HostHeartbeat,
     ) -> Result<(), MetaError> {
         Ok(())
     }
@@ -467,6 +468,8 @@ async fn create_session_with_missing_harness_secret_gate_runs_first() {
         prompt: None,
         harness_secret_id: Some("nonexistent-secret".into()),
         secrets: std::collections::HashMap::new(),
+        user_email: None,
+        user_name: None,
     })
     .await
     .expect_err("non-enabled image → error");

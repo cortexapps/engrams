@@ -31,9 +31,12 @@ pub mod idle_evictor;
 pub mod live_migration;
 pub mod metrics;
 pub mod pg_listener;
+pub mod placement;
 pub mod preemption_drain;
+pub mod queue_scanner;
 pub mod reconcile;
 pub mod scheduler;
+pub mod session_boot;
 pub mod snapshot_blob_gc;
 pub mod state;
 
@@ -206,6 +209,13 @@ pub async fn run_with_registry_and_local(
     // require its own PgPool — it goes through MetadataStore.
     let _evac_resumer =
         evac_resumer::spawn(evac_resumer::EvacResumerConfig::default(), state.clone());
+
+    // ADR 0048: the session queue scanner. Drives `queued` sessions to
+    // placement (best-fit, FIFO) as capacity frees / the fleet scales up,
+    // or times them out. Lease-guarded → replica-safe. Without it, a
+    // session enqueued on no-capacity sits forever.
+    let _queue_scanner =
+        queue_scanner::spawn(queue_scanner::QueueScannerConfig::default(), state.clone());
 
     // ADR 0028 Fix A: prune aged-out per-session checkpoint rows
     // (latest-per-session always kept; the window doubles as the

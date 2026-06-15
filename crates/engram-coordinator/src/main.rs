@@ -435,20 +435,20 @@ async fn main() -> Result<(), CoordinatorError> {
     // autoscaler scales on these). Also wires HOSTS_READY, defined in
     // metrics.rs but previously never emitted.
     {
-        let reg = host_registry.clone();
         let meta = meta_arc.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             loop {
                 tick.tick().await;
-                let m = reg.fleet_metrics();
-                ::metrics::gauge!(engram_coordinator::metrics::HOSTS_READY)
-                    .set(m.ready_hosts as f64);
-                ::metrics::gauge!(engram_coordinator::metrics::FLEET_SCHEDULABLE_HOSTS)
-                    .set(m.schedulable_hosts as f64);
-                // ADR 0046: real free_mib = Σ(allocatable − reserved) from PG,
-                // not the in-memory `total − used(=0)` phantom. Leave the gauge
-                // at its last value on a transient query error.
+                // ADR 0047: counts from the hosts rows (replica-consistent).
+                // Leave gauges at their last value on a transient query error.
+                if let Ok(m) = engram_coordinator::placement::fleet_snapshot(meta.as_ref()).await {
+                    ::metrics::gauge!(engram_coordinator::metrics::HOSTS_READY)
+                        .set(m.ready_hosts as f64);
+                    ::metrics::gauge!(engram_coordinator::metrics::FLEET_SCHEDULABLE_HOSTS)
+                        .set(m.schedulable_hosts as f64);
+                }
+                // ADR 0046: real free_mib = Σ(allocatable − reserved) from PG.
                 if let Ok(free) = meta.fleet_free_mib().await {
                     ::metrics::gauge!(engram_coordinator::metrics::FLEET_FREE_MIB)
                         .set(free.max(0) as f64);
@@ -678,39 +678,15 @@ async fn main() -> Result<(), CoordinatorError> {
                     cli.local_path.join("chunk-cache"),
                 ),
             );
-            // ADR 0007 Phase 4: optional NBD daemon for chunked
-            // rootfs. `ENGRAM_NBD_DEVICES` is a comma-separated list
-            // of `/dev/nbdN` paths the host-agent allocates from when
-            // serving sessions whose image bundle carries a
-            // `disk_manifest`. Empty / unset → fall back to the
-            // materialize-to-file path (still correct, just slower
-            // cold start). Production Packer images load
-            // `modprobe nbd nbds_max=64` and populate this env var to
-            // match.
-            let nbd_pool = match std::env::var("ENGRAM_NBD_DEVICES") {
-                Ok(s) if !s.trim().is_empty() => {
-                    let paths: Vec<std::path::PathBuf> = s
-                        .split(',')
-                        .map(|p| p.trim())
-                        .filter(|p| !p.is_empty())
-                        .map(std::path::PathBuf::from)
-                        .collect();
-                    match engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(paths) {
-                        Ok(pool) => {
-                            tracing::info!(
-                                slots = pool.capacity(),
-                                "NBD daemon enabled; chunked rootfs serves /dev/nbdN",
-                            );
-                            Some(pool)
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "ENGRAM_NBD_DEVICES misconfigured; aborting");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                _ => None,
-            };
+            // ADR 0007 Phase 4 / ADR 0049: optional NBD daemon for
+            // chunked rootfs, with a warm-pool slot allocator that
+            // sizes itself from the kernel's `nbds_max` (the chart's
+            // `modprobe nbd nbds_max=<N>`), capped by
+            // `ENGRAM_NBD_MAX_SLOTS` and keeping `ENGRAM_NBD_WARM_SLOTS`
+            // slots warm. `None` (materialize-to-file fallback) when the
+            // nbd module isn't loaded or `ENGRAM_NBD_DISABLE` is set —
+            // still correct, just a slower cold start.
+            let nbd_pool = engram_host_agent::disk_daemon::build_nbd_pool_from_kernel();
 
             Arc::new({
                 let mut p = engram_host_agent::pooled_backend::PooledBackend::new(raw_backend)
@@ -767,6 +743,11 @@ async fn main() -> Result<(), CoordinatorError> {
             status: engram_core::types::host::HostStatus::Ready,
             last_heartbeat_at: chrono::Utc::now(),
             host_addr: None,
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            cordoned: false,
+            total_vcpus: 0,
         };
         if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg, host_record).await {
             return Err(CoordinatorError::Config(format!(
@@ -798,6 +779,11 @@ async fn main() -> Result<(), CoordinatorError> {
                     status: engram_core::types::host::HostStatus::Ready,
                     last_heartbeat_at: chrono::Utc::now(),
                     host_addr: None,
+                    ready_images: Vec::new(),
+                    local_snapshots: Vec::new(),
+                    current_bundles: Vec::new(),
+                    cordoned: false,
+                    total_vcpus: 0,
                 };
                 if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg_for_hb, r).await
                 {
@@ -851,6 +837,9 @@ async fn main() -> Result<(), CoordinatorError> {
     // on `/api/hosts/register` POSTs and (in `run_with_registry`) at
     // startup from already-registered `hosts` rows.
     let host_pool = Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new());
+    // ADR 0047: let the registry dial hosts this replica has never
+    // fielded a heartbeat from (multi-replica routing read-through).
+    host_registry.set_dialer(host_pool.clone());
     let services = Services {
         meta: meta_arc.clone(),
         cloud,

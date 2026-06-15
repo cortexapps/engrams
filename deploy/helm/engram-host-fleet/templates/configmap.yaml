@@ -27,8 +27,11 @@ data:
   ENGRAM_S3_REGION: {{ . | quote }}
   {{- end }}
   {{- end }}
-  {{- with .Values.nbd.devices }}
-  ENGRAM_NBD_DEVICES: {{ . | quote }}
+  {{- if .Values.nbd.nbdsMax }}
+  # ADR 0049: cap the host-agent's slot universe at the same value the
+  # module was loaded with, and keep `warmSlots` pre-validated slots warm.
+  ENGRAM_NBD_MAX_SLOTS: {{ .Values.nbd.nbdsMax | quote }}
+  ENGRAM_NBD_WARM_SLOTS: {{ .Values.nbd.warmSlots | default 64 | quote }}
   {{- end }}
   {{- with .Values.firecracker.restoreMode }}
   ENGRAM_FC_RESTORE_MODE: {{ . | quote }}

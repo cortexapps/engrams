@@ -125,6 +125,35 @@ env:
   HARNESS_PLATFORM: linux-x86_64
 
 jobs:
+  # Change-detection for the expensive, NON-REQUIRED e2e lane. Reuses the
+  # same cargo-dep-closure detector as bake-images.yml so "any crate in
+  # the e2e binaries' release closure" is expressed precisely (a glob
+  # filter can't). Only the `e2e` output is consumed here; the rest are
+  # emitted for free. The e2e jobs gate on this for pull_request events;
+  # push-to-main and merge_group always run them (see their `if:`).
+  detect:
+    name: detect changed lanes
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      e2e: ${{ steps.lanes.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history so the PR base SHA is present for the diff.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Detect changed lanes
+        id: lanes
+        run: |
+          # PRs diff against the base SHA (an ancestor of the checked-out
+          # merge commit under fetch-depth:0). Other events fall back to
+          # HEAD^! — irrelevant since their e2e `if:` runs unconditionally.
+          BASE=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          fi
+          python3 .github/scripts/detect-rebake-lanes.py --base "$BASE" --head HEAD
+
   lint:
     name: fmt + clippy + check
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -315,6 +344,7 @@ jobs:
             --test enable_reuse_live_pg \
             --test placement_reservation_live_pg \
             --test host_register_live_pg \
+            --test queue_scanner_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -708,6 +738,16 @@ jobs:
           # `option_d_latency_bench` were also deleted with the
           # substrate subsystem; `restore_chain` came back (baked-in
           # variant) in the P1.6 e2e resurrection.
+          #
+          # Runs in PARALLEL (--test-threads=4 ≈ runner vCPUs): these are
+          # unprivileged tests (net_pool=None — no TAP), so the only
+          # host-global resource they share is the vsock CID space, which
+          # FirecrackerBackend now partitions per nextest slot
+          # (NEXTEST_TEST_GLOBAL_SLOT → CID base offset). Jail/work dirs
+          # are per-process temp dirs and the substrate shm base is
+          # PID-keyed, so nothing else collides. ~4x faster than the old
+          # serial run. The 128-256 MiB test VMs keep 4 concurrent slots
+          # well within the runner's RAM.
           cargo nextest run \
             -p engram-sandbox-firecracker \
             --test boot \
@@ -731,7 +771,7 @@ jobs:
             --test substrate_uffd_base \
             --run-ignored ignored-only \
             --no-fail-fast \
-            --test-threads=1
+            --test-threads=4
           # ADR 0028 Fix A: the checkpoint-chain pipeline test lives in
           # engram-host-agent (it exercises PooledBackend), same gating
           # as the FC tests above (KVM + Docker + musl agentd).
@@ -740,6 +780,7 @@ jobs:
             --test checkpoint_chain \
             --test migration_source \
             --test two_host_live_teleport \
+            --test two_host_drain_wave \
             --test pagemap_scanner \
             --run-ignored ignored-only \
             --no-fail-fast \
@@ -752,39 +793,47 @@ jobs:
       # demand. Validates the kernel-userspace NBD boundary that
       # the unit tests can't exercise.
       #
-      # Blacksmith caveat: each runner job runs inside a Firecracker
-      # microVM with Blacksmith's own bespoke guest kernel (uname
-      # reports a bare `6.5.13` with no Ubuntu variant suffix), and
-      # `nbd.ko` isn't compiled in or shipped via any apt package.
-      # We can't `apt-get install linux-modules-extra-$(uname -r)`
-      # — that package only exists for Ubuntu's stock kernels.
-      # See https://docs.blacksmith.sh/blacksmith-runners/overview.
-      #
-      # Result: this test currently does not run in CI. It runs
-      # locally on the dev VM (which uses the standard Ubuntu cloud
-      # kernel) and is covered by the dev-vm test runbook
-      # (`bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh`).
-      # Wiring the dev VM as a GH self-hosted runner specifically
-      # for this test is tracked as a follow-up — see
-      # `docs/chunked-storage-rollout.md` Tier 4.
-      - name: Detect NBD kernel module
+      # Blacksmith DOES ship NBD — it's compiled BUILT-IN
+      # (`CONFIG_BLK_DEV_NBD=y`) in the runner's guest kernel (a bare
+      # `6.5.13`), not as a loadable module. That distinction is why
+      # this test was skipped for so long: the old gate keyed off
+      # `modprobe nbd` succeeding, but you can't modprobe a built-in
+      # driver — it FATALs with "Module nbd not found" even though
+      # the kernel already registered `/dev/nbd0..15` at boot and they
+      # work. Verified by the `nbd-probe` workflow: on both Blacksmith
+      # sizes CONFIG_BLK_DEV_NBD=y, /dev/nbd0 exists, and a qemu-nbd
+      # read/write round trip passes. So we gate on the DEVICE NODE,
+      # not on modprobe's exit code.
+      - name: Detect NBD availability
         id: nbd_setup
         run: |
-          if sudo modprobe nbd nbds_max=4 2>/dev/null \
-             && sudo chmod 666 /dev/nbd0 /dev/nbd1 2>/dev/null; then
+          # `=m` kernels (the GitHub-hosted control, dev VM) need the
+          # module loaded; `=y` kernels (Blacksmith) already expose the
+          # devices and modprobe is a harmless FATAL. Either way the
+          # truth is whether /dev/nbd0 exists afterward — so try the
+          # load best-effort and decide on the device node.
+          sudo modprobe nbd nbds_max=16 2>/dev/null || true
+          if [ -e /dev/nbd0 ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             ls -la /dev/nbd0
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=NBD test skipped on Blacksmith::nbd.ko unavailable in the runner kernel; nbd_chunked_disk runs locally via the dev VM. Tracking a self-hosted-runner follow-up to close the CI gap."
+            echo "::warning title=NBD unavailable::/dev/nbd0 absent after modprobe — NBD integration tests skipped on this runner."
           fi
 
-      - name: NBD chunked-disk integration test (Linux + KVM + nbd)
+      # Runs under `sudo -E` (not plain cargo): the test's own preamble
+      # (nbd_chunked_disk.rs) notes that current kernels gate NBD
+      # configuration (netlink AND ioctl) behind CAP_SYS_ADMIN
+      # regardless of the device's permission bits, mirroring the
+      # root-required FC tests below. `env "PATH=$PATH"` re-adds the
+      # cargo/rustc PATH that sudo scrubs; `-E` preserves
+      # ENGRAM_TEST_NBD_DEVICE + FC_TEST_KERNEL/FC_TEST_ROOTFS.
+      - name: NBD chunked-disk + netlink tests (Linux + KVM + nbd, root)
         if: steps.nbd_setup.outputs.available == 'true'
         env:
           ENGRAM_TEST_NBD_DEVICE: /dev/nbd0
         run: |
-          cargo nextest run \
+          sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent \
             --test nbd_chunked_disk \
             --test nbd_netlink_reconfigure \
@@ -1236,6 +1285,14 @@ jobs:
     name: build e2e binaries
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 25
+    # Only consumed by test-e2e-stack, so gate it on the same condition —
+    # no point building the e2e binaries when the e2e lane won't run.
+    needs:
+      - detect
+    if: >-
+      needs.detect.outputs.e2e == 'true'
+      || github.event_name == 'merge_group'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v6
 
@@ -1319,8 +1376,40 @@ jobs:
   # flaky `proxy_e2e` doesn't suppress e2e-stack signal.
   # ------------------------------------------------------------------
   test-e2e-stack:
-    name: e2e stack (coord HTTP → gRPC → FC)
+    name: e2e stack ${{ matrix.variant }} (coord HTTP → gRPC → FC)
+    # Two variants of the same prod-shape stack (egress proxy on for
+    # both — the proven config):
+    #   - suite: single host. Runs every e2e_stack test EXCEPT the
+    #     teleport one (incl. the egress-dependent claude auth test,
+    #     which a single host serves reliably).
+    #   - teleport: two hosts (host-a + host-b). Runs ONLY the teleport
+    #     test, hard-asserting >=2 hosts. The egress-dependent claude
+    #     test is NOT run here — two FC host-agents sharing one runner
+    #     with egress on destabilizes that test specifically (the claude
+    #     session can land on host-b and emit no events); the teleport
+    #     test uses mode=dev_vm and doesn't touch egress, so it's stable.
+    # e2e stack is not a required check, so the matrix-suffixed job names
+    # don't affect branch protection.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: suite
+            two_hosts: ""
+            expect_two_hosts: ""
+            nextest_filter: "not test(e2e_two_host_teleport_preserves_sentinel)"
+          - variant: teleport
+            two_hosts: "1"
+            expect_two_hosts: "1"
+            nextest_filter: "test(e2e_two_host_teleport_preserves_sentinel)"
+    # Gate (e2e is not required → a skip can't block merge): run on any
+    # e2e-relevant change, and always on merge_group + push-to-main.
+    if: >-
+      needs.detect.outputs.e2e == 'true'
+      || github.event_name == 'merge_group'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs:
+      - detect
       - lint
       - test-linux
       - web
@@ -1478,14 +1567,18 @@ jobs:
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release
           ENGRAM_SKIP_WEB: "1"
-          # Enable the per-session egress proxy. The local dev path
-          # defaults to disabled (unfiltered network — relies on the
-          # dev VM's host masquerade). The Blacksmith runner doesn't
-          # NAT FC TAP traffic to its outbound interface, so guests
-          # need to route via the proxy. Mirrors what `e2e_harness.rs`
-          # in test-firecracker already does at the PooledBackend
-          # layer.
+          # Per-session egress proxy. The local dev path defaults to
+          # disabled (unfiltered network — relies on the dev VM's host
+          # masquerade). The Blacksmith runner doesn't NAT FC TAP
+          # traffic to its outbound interface, so guests need to route
+          # via the proxy. Mirrors what `e2e_harness.rs` in
+          # test-firecracker already does at the PooledBackend layer.
+          # (Host-b gets a distinct port in the two-host variant; see
+          # the Tiltfile.)
           ENGRAM_EGRESS_PROXY_PORT: "14443"
+          # Empty for suite (single host), "1" for teleport (host-a +
+          # host-b). tilt-up-ci.sh waits for the matching host count.
+          ENGRAM_INTEG_TWO_HOSTS: "${{ matrix.two_hosts }}"
         run: |
           # ADR 0025/0027: boot the OWNED guest kernel (6.1.102) the fetch
           # script provides + prod runs — it carries CONFIG_SQUASHFS_ZSTD=y so
@@ -1622,13 +1715,29 @@ jobs:
           # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
           # points at the just-baked `demo-claude` image whose
           # manifest.toml carries the resolved Claude harness contract.
+          #
+          # Blacksmith's kernel ships NBD built-in (CONFIG_BLK_DEV_NBD=y),
+          # so the Tiltfile's `ls /dev/nbd*` discovery wires
+          # ENGRAM_NBD_DEVICES and the root host-agent NBD-attaches the
+          # chunked disk. Assert it: a null cow-state here is now a real
+          # regression, not the old "no nbd.ko" environment gap, so the
+          # Phase B chunked-disk tests fail loud instead of skipping.
+          ENGRAM_EXPECT_NBD: "1"
+          # suite: "" → teleport test self-skips (and is filtered out
+          # below anyway). teleport: "1" → the teleport test hard-asserts
+          # >=2 hosts instead of skipping.
+          ENGRAM_EXPECT_TWO_HOSTS: "${{ matrix.expect_two_hosts }}"
+          # Per-variant nextest filterset: suite runs everything except
+          # the teleport test; teleport runs only it.
+          E2E_NEXTEST_FILTER: "${{ matrix.nextest_filter }}"
         run: |
           cargo nextest run \
               -p engram-coordinator \
               --test e2e_stack \
               --run-ignored ignored-only \
               --no-fail-fast \
-              --test-threads=1
+              --test-threads=1 \
+              -E "$E2E_NEXTEST_FILTER"
 
       - name: Dump tilt + stack logs on failure
         if: failure()

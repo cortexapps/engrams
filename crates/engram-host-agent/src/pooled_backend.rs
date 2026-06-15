@@ -929,6 +929,33 @@ impl PooledBackend {
         // memory capture below is paired with it.
         #[cfg(target_os = "linux")]
         let nbd_pending_flush = if let Some(entry) = self.nbd_sandboxes.get(&id) {
+            // Push the HOST's block-device page cache down to the
+            // daemon BEFORE draining. FC's virtio-blk writes to
+            // /dev/nbdN through the kernel page cache (drive
+            // cache_type = Unsafe: guest FLUSH does not propagate), so
+            // without this fsync the drain captures only what
+            // background writeback (~30 s) happened to deliver — a
+            // session that wrote recently snapshots a TORN chunk (the
+            // delivered front + a stale tail). The migration captures
+            // each carried this fsync already; the standard pipeline
+            // (periodic checkpoint / idle-evict / rehome) relied on
+            // "quiescent sessions age past the writeback interval",
+            // which the disk post-copy canary disproved: write → evac
+            // 15 s later published chunk 34 with its last 56 KiB
+            // reverted, and a periodic checkpoint of an actively-
+            // writing guest has the same hole (recovery from it would
+            // be corrupt).
+            let dev = entry.device_path().to_path_buf();
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&dev)?;
+                f.sync_all()
+            })
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
+            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
             // Drain in-flight NBD requests so the drain sees a quiescent
             // dirty buffer. With FC paused above, no new virtio writes
             // are issued, and wait_idle returns once already-in-flight
@@ -1144,6 +1171,7 @@ impl PooledBackend {
             peer_addr: peer_addr.clone(),
             export_id: mig.export_id.clone(),
             peer_token: peer_token.clone(),
+            hot_chunks: mig.hot_chunks.clone(),
         };
         fs::write(
             dest.join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
@@ -1188,8 +1216,14 @@ impl PooledBackend {
             let tmp = dest_dir.join("postcopy-tmp");
             let _ = fs::create_dir_all(&tmp).await;
 
-            // 1. Poll until the export serves (capture done).
-            let (seal_path, state_tmp) = loop {
+            // 1. Poll until the export serves (capture done). Dial
+            //    ONCE and poll tight over the live channel — the old
+            //    250 ms sleep (plus a fresh TCP+HTTP/2 handshake per
+            //    attempt) was a pure blackout tax whenever the
+            //    pre-stage finished before the capture; a failed
+            //    attempt is a sub-ms NotFound on the pod network.
+            let mut source: Option<engram_protocol::grpc_client::GrpcHostClient> = None;
+            let (seal_path, state_tmp, fetch_ms) = loop {
                 if started.elapsed() > budget {
                     tracing::error!(
                         export_id = %pending.export_id,
@@ -1197,18 +1231,42 @@ impl PooledBackend {
                     );
                     return;
                 }
+                let client = match &source {
+                    Some(c) => c,
+                    None => match Self::dial_migration_source(&pending.source_addr).await {
+                        Ok(c) => source.insert(c),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "post-copy source dial failed; retrying");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    },
+                };
+                let t_fetch = std::time::Instant::now();
                 match Self::fetch_export_items(
-                    &pending.source_addr,
+                    client,
                     &pending.export_id,
                     vec![MigrationItem::DiskSealInfo, MigrationItem::StateBin],
                     &tmp,
                 )
                 .await
                 {
-                    Ok(()) => break (tmp.join("disk-seal.json"), tmp.join("state.bin")),
+                    Ok(()) => {
+                        break (
+                            tmp.join("disk-seal.json"),
+                            tmp.join("state.bin"),
+                            t_fetch.elapsed().as_millis() as u64,
+                        )
+                    }
                     Err(e) => {
-                        tracing::debug!(error = %e, "post-copy fetch not ready; retrying");
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        // A transport-level failure poisons the cached
+                        // channel; NotFound (export not open yet) does
+                        // not.
+                        if !matches!(e, SandboxError::NotFound) {
+                            tracing::debug!(error = %e, "post-copy fetch not ready; retrying");
+                            source = None;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
                     }
                 }
             };
@@ -1322,6 +1380,7 @@ impl PooledBackend {
             tracing::info!(
                 export_id = %pending.export_id,
                 elapsed_ms = started.elapsed().as_millis() as u64,
+                fetch_ms,
                 "post-copy restore inputs staged (state.bin landed)",
             );
         });
@@ -1374,24 +1433,33 @@ impl PooledBackend {
         Ok(())
     }
 
-    /// Fetch named export items into `dir` (each written under its
-    /// canonical filename). One-shot; errors when the export isn't
-    /// open yet (the poller's retry signal).
+    /// Dial a migration source's gRPC endpoint.
     #[cfg(target_os = "linux")]
-    async fn fetch_export_items(
+    async fn dial_migration_source(
         source_addr: &str,
-        export_id: &str,
-        items: Vec<engram_core::types::snapshot::MigrationItem>,
-        dir: &std::path::Path,
-    ) -> Result<(), SandboxError> {
-        use engram_core::types::snapshot::MigrationItem;
+    ) -> Result<engram_protocol::grpc_client::GrpcHostClient, SandboxError> {
         let channel = tonic::transport::Endpoint::from_shared(source_addr.to_string())
             .map_err(|e| SandboxError::InvalidSpec(format!("bad source_addr: {e}")))?
             .connect_timeout(std::time::Duration::from_secs(5))
             .connect()
             .await
             .map_err(|e| SandboxError::Snapshot(format!("dial migration source: {e}")))?;
-        let source = engram_protocol::grpc_client::GrpcHostClient::new(channel);
+        Ok(engram_protocol::grpc_client::GrpcHostClient::new(channel))
+    }
+
+    /// Fetch named export items into `dir` (each written under its
+    /// canonical filename). One-shot; errors when the export isn't
+    /// open yet (the poller's retry signal). Takes a CONNECTED client
+    /// — the poller reuses one channel across attempts instead of a
+    /// TCP+HTTP/2 handshake per poll.
+    #[cfg(target_os = "linux")]
+    async fn fetch_export_items(
+        source: &engram_protocol::grpc_client::GrpcHostClient,
+        export_id: &str,
+        items: Vec<engram_core::types::snapshot::MigrationItem>,
+        dir: &std::path::Path,
+    ) -> Result<(), SandboxError> {
+        use engram_core::types::snapshot::MigrationItem;
         let item_specs = items.clone();
         let mut stream = source
             .migration_fetch(export_id, items)
@@ -4019,6 +4087,7 @@ impl SandboxBackend for PooledBackend {
                 allowed_chunks: allowed,
                 chunk_size,
                 total_bytes,
+                serve: Default::default(),
                 drained: std::sync::atomic::AtomicBool::new(false),
             });
 
@@ -4088,7 +4157,20 @@ impl SandboxBackend for PooledBackend {
                         alt_sourced,
                         zero_chunks,
                         ms,
+                        faults,
+                        fault_us,
+                        fault_max_us,
                     } => {
+                        // Restore-tail attribution: the fault-path
+                        // totals are the serial P2P cost inside the FC
+                        // load + early guest execution (cross-ref with
+                        // the load_ms log).
+                        tracing::info!(
+                            faults,
+                            fault_ms = fault_us / 1000,
+                            fault_max_us,
+                            "post-copy memory drain done (handler fault-path totals)",
+                        );
                         return Ok(DrainOutcome::Done {
                             pulled,
                             alt_sourced,

@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 engram-core.workspace = true
 engram-cloud-gcp.workspace = true
+engram-protocol.workspace = true
+tonic.workspace = true
 async-trait.workspace = true
 kube.workspace = true
 k8s-openapi.workspace = true

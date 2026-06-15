@@ -148,6 +148,8 @@ async fn stream_events_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_secret_id: None,
+        user_email: None,
+        user_name: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -320,6 +322,8 @@ async fn session_crud_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_secret_id: None,
+        user_email: None,
+        user_name: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -449,6 +453,8 @@ async fn exec_streaming_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_secret_id: None,
+        user_email: None,
+        user_name: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -574,6 +580,8 @@ async fn snapshot_evict_resume_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_secret_id: None,
+        user_email: None,
+        user_name: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -715,6 +723,8 @@ async fn get_artifact_not_found_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_secret_id: None,
+        user_email: None,
+        user_name: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -811,6 +821,8 @@ async fn shell_relay_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_secret_id: None,
+        user_email: None,
+        user_name: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = session_client

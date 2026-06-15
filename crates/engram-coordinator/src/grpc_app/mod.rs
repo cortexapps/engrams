@@ -16,7 +16,6 @@ mod fleet;
 mod image;
 mod secret;
 mod session;
-mod session_impl;
 mod shell_relay;
 
 use std::pin::Pin;
@@ -280,7 +279,7 @@ mod convention {
     /// test below enforces this. Files here are additionally checked to
     /// contain no `_server::` token (a service-impl token in a helper
     /// file would defeat the allowlist).
-    const NON_RPC_HELPERS: &[&str] = &["convert.rs", "auth.rs", "session_impl.rs"];
+    const NON_RPC_HELPERS: &[&str] = &["convert.rs", "auth.rs"];
 
     /// The auth line that must open every RPC body. The trailing `;` is
     /// load-bearing: it distinguishes a real call site from the prose

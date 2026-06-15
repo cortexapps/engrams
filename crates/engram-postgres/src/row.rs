@@ -54,9 +54,18 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         }),
         _ => None,
     };
+    // ADR 0039: harness secret reference (migration 0068) + git-attribution
+    // identity (migration 0069). Tolerant — SELECTs that don't project these
+    // columns fall back to None.
+    let harness_secret_id: Option<String> = row.try_get("harness_secret_id").ok().flatten();
+    let user_email: Option<String> = row.try_get("user_email").ok().flatten();
+    let user_name: Option<String> = row.try_get("user_name").ok().flatten();
     Ok(Session {
         id: SessionId(id),
         status: parse_session_state(&status)?,
+        harness_secret_id,
+        user_email,
+        user_name,
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),
         image: image_uri,
@@ -64,6 +73,28 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         created_at,
         last_active_at,
         live_disk_manifest,
+    })
+}
+
+pub(crate) fn queued_session_from_row(
+    row: &PgRow,
+) -> Result<engram_core::types::session::QueuedSession, MetaError> {
+    let session = session_from_row(row)?;
+    let origin_str: String = row.try_get("queue_origin").map_err(col_err)?;
+    let origin = engram_core::types::session::QueueOrigin::parse(&origin_str).ok_or_else(|| {
+        MetaError::Serialization(format!("queue_origin: unknown value {origin_str:?}"))
+    })?;
+    let prompt: Option<String> = row.try_get("queue_prompt").map_err(col_err)?;
+    let mem_budget_mib: i64 = row.try_get("mem_budget_mib").map_err(col_err)?;
+    let cpu_budget_vcpus: i32 = row.try_get("cpu_budget_vcpus").map_err(col_err)?;
+    let queued_at: DateTime<Utc> = row.try_get("queued_at").map_err(col_err)?;
+    Ok(engram_core::types::session::QueuedSession {
+        session,
+        origin,
+        prompt,
+        mem_budget_mib,
+        cpu_budget_vcpus,
+        queued_at,
     })
 }
 
@@ -86,6 +117,17 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let cloud_metadata: HostMetadata =
         serde_json::from_value(cloud_meta).map_err(|e| MetaError::Serialization(e.to_string()))?;
     let host_addr: Option<String> = row.try_get("host_addr").map_err(col_err)?;
+    // ADR 0047: heartbeat-persisted scheduling state + the
+    // coordinator-owned cordon bit (migration 0060).
+    let ready_images: Vec<String> =
+        serde_json::from_value(row.try_get("ready_images").map_err(col_err)?)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let local_snapshots = serde_json::from_value(row.try_get("local_snapshots").map_err(col_err)?)
+        .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let current_bundles = serde_json::from_value(row.try_get("current_bundles").map_err(col_err)?)
+        .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let cordoned: bool = row.try_get("cordoned").map_err(col_err)?;
+    let total_vcpus: i32 = row.try_get("total_vcpus").map_err(col_err)?;
     Ok(HostRecord {
         id: HostId(id),
         hostname: row.try_get("hostname").map_err(col_err)?,
@@ -108,6 +150,11 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         status: parse_host_status(&status)?,
         last_heartbeat_at,
         host_addr,
+        ready_images,
+        local_snapshots,
+        current_bundles,
+        cordoned,
+        total_vcpus: total_vcpus.max(0) as u32,
     })
 }
 
@@ -340,6 +387,7 @@ pub(crate) fn parse_session_state_for_lib(s: &str) -> Result<SessionState, MetaE
 fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
     Ok(match s {
         "pending" => SessionState::Pending,
+        "queued" => SessionState::Queued,
         "created" => SessionState::Created,
         "guest_ready" => SessionState::GuestReady,
         "active" => SessionState::Active,
@@ -423,12 +471,14 @@ mod tests {
     fn session_state_parses_every_variant() {
         let variants = [
             ("pending", SessionState::Pending),
+            ("queued", SessionState::Queued),
             ("created", SessionState::Created),
             ("guest_ready", SessionState::GuestReady),
             ("active", SessionState::Active),
             ("idle", SessionState::Idle),
             ("host_lost", SessionState::HostLost),
             ("evacuating", SessionState::Evacuating),
+            ("evicting", SessionState::Evicting),
             ("completed", SessionState::Completed),
             ("failed", SessionState::Failed),
             ("dead", SessionState::Dead),

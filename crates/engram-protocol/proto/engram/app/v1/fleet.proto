@@ -39,6 +39,20 @@ service FleetService {
   rpc ChunkGc(ChunkGcRequest) returns (ChunkGcResponse);
   rpc BundleGc(BundleGcRequest) returns (BundleGcResponse);
   rpc SnapshotBlobGc(SnapshotBlobGcRequest) returns (SnapshotBlobGcResponse);
+  // ADR 0044/0048: the autoscaler's demand signal (was GET
+  // /api/admin/fleet/demand). PG-authoritative — every replica reports
+  // identical demand.
+  rpc FleetDemand(FleetDemandRequest) returns (FleetDemandResponse);
+  // ADR 0048: deregister a drained host immediately (was DELETE
+  // /api/admin/hosts/:id) so scale-down doesn't wait for the dead-host
+  // detector. FAILED_PRECONDITION if sessions are still bound.
+  rpc DeleteHost(DeleteHostRequest) returns (DeleteHostResponse);
+  // ADR 0045 Phase F: relocate an Active session to a chosen host (was
+  // POST /api/admin/sessions/:id/teleport).
+  rpc Teleport(TeleportRequest) returns (TeleportResponse);
+  // Explicit idle-eviction trigger (was POST
+  // /api/admin/sessions/:id/evict-idle) — drives Active→Idle on demand.
+  rpc EvictIdle(EvictIdleRequest) returns (EvictIdleResponse);
 }
 
 message ListHostsRequest {}
@@ -81,6 +95,23 @@ message HostView {
   // (api/host_http.rs) and refreshed on every heartbeat. A
   // never-heartbeated host still carries its registration stamp.
   string last_heartbeat_at = 15;
+  // ADR 0047: the coordinator-owned durable cordon bit — non-schedulable
+  // regardless of the host-reported status.
+  bool cordoned = 16;
+  // ADR 0046/0047: host-measured allocatable RAM — what placement budgets
+  // against (nets out the daemon/OS/residency baseline).
+  uint64 allocatable_mib = 17;
+  // ADR 0048: Σ reserved RAM (mem_budget_mib) and the resulting free
+  // (allocatable − reserved) — the operator's wave planner reads these for
+  // victim-picking + the 2D drain guard.
+  uint64 reserved_mib = 18;
+  uint64 free_mib = 19;
+  // ADR 0048: host core count + budget (total_vcpus × overcommit), Σ reserved
+  // vCPU, and the resulting free vCPU.
+  uint32 total_vcpus = 20;
+  uint64 cpu_budget_vcpus = 21;
+  uint64 reserved_vcpus = 22;
+  uint64 free_vcpus = 23;
 }
 
 message GetHostRequest {
@@ -322,4 +353,47 @@ message SnapshotBlobGcResponse {
   uint64 promote_repinned_skips = 6;
   uint64 promote_delete_errors = 7;
   uint32 restart_count = 8;
+}
+
+// ADR 0044/0048: autoscaler demand signal. All fields come from PG so every
+// coordinator replica reports identical demand.
+message FleetDemandRequest {}
+message FleetDemandResponse {
+  uint32 ready_hosts = 1;
+  uint32 schedulable_hosts = 2;
+  uint64 free_mib = 3;
+  uint64 total_mib = 4;
+  uint64 free_vcpus = 5;
+  uint64 total_vcpus = 6;
+  uint32 cordoned_hosts = 7;
+  uint64 queued_sessions = 8;
+  uint64 queued_mib = 9;
+  uint64 queued_vcpus = 10;
+}
+
+// ADR 0048: deregister a drained host.
+message DeleteHostRequest {
+  string host_id = 1;
+}
+message DeleteHostResponse {}
+
+// ADR 0045 Phase F: relocate an Active session to a chosen host.
+message TeleportRequest {
+  string session_id = 1;
+  string target_host_id = 2;
+}
+message TeleportResponse {
+  string session_id = 1;
+  // "migrated" (live teleport) | "evacuating" (snapshot-rehome fallback).
+  string status = 2;
+}
+
+// Explicit idle-eviction trigger (Active→Idle).
+message EvictIdleRequest {
+  string session_id = 1;
+}
+message EvictIdleResponse {
+  string session_id = 1;
+  // "idle" — paused, flushed, snapshotted, local sandbox destroyed.
+  string status = 2;
 }

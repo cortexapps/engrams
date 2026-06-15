@@ -41,6 +41,11 @@ mod tests {
             status,
             last_heartbeat_at: Utc::now(),
             host_addr: None,
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            cordoned: false,
+            total_vcpus: 0,
         }
     }
 

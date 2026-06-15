@@ -764,7 +764,17 @@ pub async fn provision_netns(
     // and ttyd answered with Connection refused).
     let reserved_here = allocator.lock().reserve(bake_cidr).is_ok();
     let snat_cidr = allocator.lock().alloc().map_err(NetError::Alloc)?;
+    let t_provision = std::time::Instant::now();
     let res = provision_netns_inner(sandbox_id, bake_cidr, snat_cidr, tap_name).await;
+    // Lever-3 attribution: this leg was ~90 ms of subprocess spawns
+    // pre-netlink; it sits in every restore (and the teleport dest
+    // pipeline), so keep it honest in the logs.
+    tracing::info!(
+        sandbox_id = %sandbox_id,
+        netns_provision_ms = t_provision.elapsed().as_millis() as u64,
+        ok = res.is_ok(),
+        "netns provisioned (netlink-first)",
+    );
     if let Err(ref e) = res {
         tracing::debug!(error = %e, "provision_netns failed; releasing snat slot");
         let (veth_host, _) = veth_names_for(sandbox_id);
@@ -797,39 +807,155 @@ async fn provision_netns_inner(
     let _ = run_cmd("ip", &["netns", "delete", &netns_name]).await;
     let _ = run_cmd("ip", &["link", "delete", &veth_host]).await;
 
+    // `ip netns add` stays a subprocess: it owns the
+    // /var/run/netns/<name> bind-mount bookkeeping that the teardown
+    // cascade (`ip netns delete`) and the K2 reattach (`ip netns
+    // attach`) both key on. Everything below it is netlink/ioctl —
+    // the ~12 subprocess spawns this replaces (worst offenders: the
+    // `ip netns exec` forks) were ~90 ms of every sandbox boot AND
+    // the teleport dest pipeline (ADR 0045 C2 lever 3; ADR 0020 P4
+    // measured the same leg on the cold path).
     run_cmd("ip", &["netns", "add", &netns_name]).await?;
+
+    // Host-root netlink handle.
+    let (conn, handle, _) = rtnetlink::new_connection()
+        .map_err(|e| netlink_err("host netlink socket", e.to_string()))?;
+    let conn_task = tokio::spawn(conn);
 
     // veth pair: A in host root (gets the SNAT-slot host octet),
     // B moved into the netns.
-    run_cmd(
-        "ip",
-        &[
-            "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_ns,
-        ],
-    )
-    .await?;
-    run_cmd("ip", &["link", "set", &veth_ns, "netns", &netns_name]).await?;
-    let veth_host_addr = format!("{}/30", snat_cidr.host());
-    run_cmd("ip", &["addr", "add", &veth_host_addr, "dev", &veth_host]).await?;
-    run_cmd("ip", &["link", "set", "dev", &veth_host, "up"]).await?;
+    handle
+        .link()
+        .add(rtnetlink::LinkVeth::new(&veth_host, &veth_ns).build())
+        .execute()
+        .await
+        .map_err(|e| netlink_err("veth add", e.to_string()))?;
+    let host_idx = link_index(&handle, &veth_host).await?;
+    let ns_idx = link_index(&handle, &veth_ns).await?;
+
+    let ns_path = format!("/var/run/netns/{netns_name}");
+    let ns_file =
+        std::fs::File::open(&ns_path).map_err(|e| netlink_err("open netns fd", e.to_string()))?;
+    {
+        use std::os::unix::io::AsRawFd;
+        handle
+            .link()
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(ns_idx)
+                    .setns_by_fd(ns_file.as_raw_fd())
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| netlink_err("veth move to netns", e.to_string()))?;
+    }
+    handle
+        .address()
+        .add(host_idx, std::net::IpAddr::V4(snat_cidr.host()), 30)
+        .execute()
+        .await
+        .map_err(|e| netlink_err("veth host addr", e.to_string()))?;
+    handle
+        .link()
+        .set(rtnetlink::LinkUnspec::new_with_index(host_idx).up().build())
+        .execute()
+        .await
+        .map_err(|e| netlink_err("veth host up", e.to_string()))?;
+    // The host-root connection task ends when its handle drops; abort
+    // explicitly so a long-lived runtime doesn't accumulate them.
+    drop(handle);
+    conn_task.abort();
 
     // Inside the netns: loopback up, veth-B up + addressed at
     // snat_cidr.guest, TAP created + addressed at bake_cidr.host
-    // (the VM's gateway), default route via veth-A peer.
-    let veth_ns_addr = format!("{}/30", snat_cidr.guest());
-    run_ip_in_netns(&netns_name, &["link", "set", "lo", "up"]).await?;
-    run_ip_in_netns(
-        &netns_name,
-        &["addr", "add", &veth_ns_addr, "dev", &veth_ns],
-    )
-    .await?;
-    run_ip_in_netns(&netns_name, &["link", "set", "dev", &veth_ns, "up"]).await?;
-    run_ip_in_netns(&netns_name, &["tuntap", "add", tap_name, "mode", "tap"]).await?;
-    let tap_addr = format!("{}/30", bake_cidr.host());
-    run_ip_in_netns(&netns_name, &["addr", "add", &tap_addr, "dev", tap_name]).await?;
-    run_ip_in_netns(&netns_name, &["link", "set", "dev", tap_name, "up"]).await?;
-    let snat_host = snat_cidr.host().to_string();
-    run_ip_in_netns(&netns_name, &["route", "add", "default", "via", &snat_host]).await?;
+    // (the VM's gateway), default route via veth-A peer. The netlink
+    // socket AND the tun fd must be created on a thread that has
+    // setns'd into the target ns — a THROWAWAY std::thread, never a
+    // tokio blocking-pool thread (setns is thread-sticky and would
+    // contaminate the pool).
+    let tap = tap_name.to_string();
+    // netlink-sys wraps the socket in tokio's AsyncFd at creation, so
+    // the thread needs an ENTERED runtime handle — the fd is still
+    // created inside the ns (that's thread state); only the reactor
+    // registration rides the main runtime.
+    let rt = tokio::runtime::Handle::current();
+    let (ns_conn, ns_handle) = tokio::task::spawn_blocking(move || {
+        std::thread::scope(|s| {
+            s.spawn(move || -> Result<_, NetError> {
+                use std::os::unix::io::AsRawFd;
+                if unsafe { libc::setns(ns_file.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(netlink_err(
+                        "setns",
+                        std::io::Error::last_os_error().to_string(),
+                    ));
+                }
+                create_persistent_tap(&tap)?;
+                let _rt = rt.enter();
+                rtnetlink::new_connection()
+                    .map(|(c, h, _)| (c, h))
+                    .map_err(|e| netlink_err("netns netlink socket", e.to_string()))
+            })
+            .join()
+            .expect("netns setup thread panicked")
+        })
+    })
+    .await
+    .map_err(|e| netlink_err("netns setup join", e.to_string()))??;
+    let ns_conn_task = tokio::spawn(ns_conn);
+    let ns_setup = async {
+        let lo_idx = link_index(&ns_handle, "lo").await?;
+        ns_handle
+            .link()
+            .set(rtnetlink::LinkUnspec::new_with_index(lo_idx).up().build())
+            .execute()
+            .await
+            .map_err(|e| netlink_err("lo up", e.to_string()))?;
+        let veth_ns_idx = link_index(&ns_handle, &veth_ns).await?;
+        ns_handle
+            .address()
+            .add(veth_ns_idx, std::net::IpAddr::V4(snat_cidr.guest()), 30)
+            .execute()
+            .await
+            .map_err(|e| netlink_err("veth ns addr", e.to_string()))?;
+        ns_handle
+            .link()
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(veth_ns_idx)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| netlink_err("veth ns up", e.to_string()))?;
+        let tap_idx = link_index(&ns_handle, tap_name).await?;
+        ns_handle
+            .address()
+            .add(tap_idx, std::net::IpAddr::V4(bake_cidr.host()), 30)
+            .execute()
+            .await
+            .map_err(|e| netlink_err("tap addr", e.to_string()))?;
+        ns_handle
+            .link()
+            .set(rtnetlink::LinkUnspec::new_with_index(tap_idx).up().build())
+            .execute()
+            .await
+            .map_err(|e| netlink_err("tap up", e.to_string()))?;
+        let route = rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+            .destination_prefix(std::net::Ipv4Addr::UNSPECIFIED, 0)
+            .gateway(snat_cidr.host())
+            .build();
+        ns_handle
+            .route()
+            .add(route)
+            .execute()
+            .await
+            .map_err(|e| netlink_err("default route", e.to_string()))?;
+        Ok::<(), NetError>(())
+    }
+    .await;
+    drop(ns_handle);
+    ns_conn_task.abort();
+    ns_setup?;
 
     // Netns-local SNAT. Rewrites every outbound packet's source
     // from `bake_cidr.guest()` (the VM's baked-in eth0 IP) to
@@ -897,11 +1023,68 @@ pub async fn teardown_netns(setup: &NetnsSetup, allocator: &parking_lot::Mutex<N
     // ttyd: IO error: Connection refused` 503.
 }
 
+/// Netlink-leg failures reuse `NetError::Failed` (status `-1`) so every
+/// existing caller/teardown arm keeps working — the `cmd` names the leg.
 #[cfg(target_os = "linux")]
-async fn run_ip_in_netns(netns: &str, args: &[&str]) -> Result<(), NetError> {
-    let mut full = vec!["-n", netns];
-    full.extend_from_slice(args);
-    run_cmd("ip", &full).await
+fn netlink_err(leg: &str, detail: String) -> NetError {
+    NetError::Failed {
+        cmd: format!("netlink:{leg}"),
+        status: -1,
+        stderr: detail,
+    }
+}
+
+/// Resolve an interface index by name on `handle`'s netns.
+#[cfg(target_os = "linux")]
+async fn link_index(handle: &rtnetlink::Handle, name: &str) -> Result<u32, NetError> {
+    use futures_util::stream::TryStreamExt;
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
+    match links.try_next().await {
+        Ok(Some(link)) => Ok(link.header.index),
+        Ok(None) => Err(netlink_err("link_index", format!("no link named {name}"))),
+        Err(e) => Err(netlink_err("link_index", format!("{name}: {e}"))),
+    }
+}
+
+/// Create a persistent TAP device named `tap` in the CALLING THREAD's
+/// netns (`TUNSETIFF` binds the device to the creator's ns) — the
+/// netlink replacement for `ip tuntap add <tap> mode tap`. The fd is
+/// closed on return; `TUNSETPERSIST` keeps the device alive for FC to
+/// open, and the netns teardown cascade destroys it.
+#[cfg(target_os = "linux")]
+fn create_persistent_tap(tap: &str) -> Result<(), NetError> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")
+        .map_err(|e| netlink_err("open /dev/net/tun", e.to_string()))?;
+    // SAFETY: zeroed ifreq + a NUL-bounded name copy; both ioctls take
+    // the struct/int the kernel ABI specifies.
+    unsafe {
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        let name = tap.as_bytes();
+        if name.len() >= libc::IFNAMSIZ {
+            return Err(netlink_err("tap name", format!("{tap} >= IFNAMSIZ")));
+        }
+        for (i, b) in name.iter().enumerate() {
+            ifr.ifr_name[i] = *b as libc::c_char;
+        }
+        ifr.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+        if libc::ioctl(f.as_raw_fd(), libc::TUNSETIFF, &ifr) != 0 {
+            return Err(netlink_err(
+                "TUNSETIFF",
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        if libc::ioctl(f.as_raw_fd(), libc::TUNSETPERSIST, 1) != 0 {
+            return Err(netlink_err(
+                "TUNSETPERSIST",
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

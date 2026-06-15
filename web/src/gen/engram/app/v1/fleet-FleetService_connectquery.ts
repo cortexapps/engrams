@@ -89,3 +89,37 @@ export const bundleGc = FleetService.method.bundleGc;
  * @generated from rpc engram.app.v1.FleetService.SnapshotBlobGc
  */
 export const snapshotBlobGc = FleetService.method.snapshotBlobGc;
+
+/**
+ * ADR 0044/0048: the autoscaler's demand signal (was GET
+ * /api/admin/fleet/demand). PG-authoritative — every replica reports
+ * identical demand.
+ *
+ * @generated from rpc engram.app.v1.FleetService.FleetDemand
+ */
+export const fleetDemand = FleetService.method.fleetDemand;
+
+/**
+ * ADR 0048: deregister a drained host immediately (was DELETE
+ * /api/admin/hosts/:id) so scale-down doesn't wait for the dead-host
+ * detector. FAILED_PRECONDITION if sessions are still bound.
+ *
+ * @generated from rpc engram.app.v1.FleetService.DeleteHost
+ */
+export const deleteHost = FleetService.method.deleteHost;
+
+/**
+ * ADR 0045 Phase F: relocate an Active session to a chosen host (was
+ * POST /api/admin/sessions/:id/teleport).
+ *
+ * @generated from rpc engram.app.v1.FleetService.Teleport
+ */
+export const teleport = FleetService.method.teleport;
+
+/**
+ * Explicit idle-eviction trigger (was POST
+ * /api/admin/sessions/:id/evict-idle) — drives Active→Idle on demand.
+ *
+ * @generated from rpc engram.app.v1.FleetService.EvictIdle
+ */
+export const evictIdle = FleetService.method.evictIdle;

@@ -25,6 +25,7 @@ const ACTIVEISH = new Set<SessionState>([
   "created",
   "guest_ready",
   "pending",
+  "queued",
   "host_lost",
   "evacuating",
   "evicting",

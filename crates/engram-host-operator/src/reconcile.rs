@@ -11,7 +11,7 @@
 //! snapshot-rehome rewind). Drain/evac is reserved for actual node removal
 //! (see [`gate_drain`]).
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +27,6 @@ use engram_core::traits::cloud::NodePoolScaler;
 use crate::coord::CoordClient;
 use crate::crd::{HostFleet, HostFleetSpec};
 use crate::error::OperatorError;
-use crate::scaler::{desired_hosts, AutoscalePolicy};
 
 const HOST_AGENT_CONTAINER: &str = "host-agent";
 const STAGE_ASSETS_CONTAINER: &str = "stage-node-assets";
@@ -132,13 +131,25 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     );
     tracing::info!(fleet = %hf.name_any(), ?decision, "reconcile");
 
-    // ADR 0044 K4: autoscale the node pool from coordinator demand. Best-
-    // effort + independent of the roll — a coord hiccup shouldn't block rolls.
-    if let Err(e) = maybe_autoscale(spec, &ctx).await {
-        tracing::warn!(error = %e, "autoscale step failed; continuing");
-    }
+    // ADR 0044 K4 + ADR 0048: autoscale the node pool from coordinator demand
+    // (scale-up via set_size; scale-down via the teleport-packed wave). A fresh
+    // wave only starts when the image roll is quiescent (`roll_idle`); an
+    // in-flight wave blocks new rolls (returned in `wave_in_flight`). Best-
+    // effort — a coord hiccup shouldn't wedge the controller.
+    let roll_idle = matches!(decision, RollDecision::UpToDate { .. });
+    let wave_in_flight = match run_autoscale(spec, &ctx, &pods, roll_idle).await {
+        Ok(status) => status.wave_in_flight,
+        Err(e) => {
+            tracing::warn!(error = %e, "autoscale step failed; continuing");
+            false
+        }
+    };
 
-    // 4. Act.
+    // 4. Act. An in-flight scale-down wave takes precedence over image rolls
+    //    (the wave's drains are consuming receiving capacity) — requeue soon.
+    if wave_in_flight {
+        return Ok(Action::requeue(Duration::from_secs(10)));
+    }
     match decision {
         RollDecision::UpToDate { .. } => Ok(Action::requeue(Duration::from_secs(60))),
         RollDecision::WaitForReady => Ok(Action::requeue(Duration::from_secs(10))),
@@ -159,75 +170,32 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     }
 }
 
-/// ADR 0044 K4 + ADR 0045 Phase E: read coordinator fleet demand and drive
-/// the node pool toward the headroom target. No-op unless the CR sets
+/// One autoscale reconcile: builds the live coordinator + K8s seams and runs
+/// [`crate::autoscale::step`]. No-op (returns "no wave") unless the CR sets
 /// `autoscaling`.
-///
-/// **Scale-up / hold** actuate immediately via `set_size` (idempotent
-/// re-assert), and reset the scale-down hysteresis counter.
-///
-/// **Scale-down** is *never* actuated through `set_size` — that's count-only,
-/// so the cloud could remove a node with live microVMs. Instead the decision
-/// is hysteresis-gated and, once confirmed, **logged** (the safe live
-/// actuation — drain the specific least-loaded node, then remove *that* node
-/// via a node-specific cloud call — is the follow-up actuator, ADR 0045 Phase
-/// E). This mirrors how K4 scale-up first shipped behind the logging
-/// `NoopScaler`.
-async fn maybe_autoscale(spec: &HostFleetSpec, ctx: &Ctx) -> Result<(), OperatorError> {
-    let Some(a) = &spec.autoscaling else {
-        return Ok(());
-    };
-    let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
-    let demand = coord.fleet_demand().await?;
-    let current = demand.schedulable_hosts;
-    let policy = AutoscalePolicy {
-        min_hosts: a.min_hosts,
-        max_hosts: a.max_hosts,
-        target_free_mib: a.target_free_mib,
-        scale_down: a.scale_down,
-    };
-    let desired = desired_hosts(demand, policy);
-
-    if desired < current {
-        // Scale-down pressure. Hold the hysteresis counter and only surface a
-        // CONFIRMED decision after it persists — never call set_size here.
-        let ticks = ctx.scaledown_ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        let required = a.scale_down_hysteresis_ticks.max(1);
-        if ticks >= required {
-            tracing::info!(
-                node_pool = %a.node_pool,
-                current,
-                desired,
-                free_mib = demand.free_mib,
-                mode = ?a.scale_down,
-                "autoscale: scale-down CONFIRMED — would drain the least-loaded \
-                 host and remove its node (live node removal pending the \
-                 node-specific actuator; ADR 0045 Phase E)"
-            );
-        } else {
-            tracing::info!(
-                node_pool = %a.node_pool,
-                current,
-                desired,
-                ticks,
-                required,
-                "autoscale: scale-down candidate, holding for hysteresis"
-            );
-        }
-        return Ok(());
+async fn run_autoscale(
+    spec: &HostFleetSpec,
+    ctx: &Ctx,
+    pods: &[PodInfo],
+    roll_idle: bool,
+) -> Result<crate::autoscale::AutoscaleStatus, OperatorError> {
+    if spec.autoscaling.is_none() {
+        return Ok(crate::autoscale::AutoscaleStatus::default());
     }
-
-    // Scale-up or hold: actuate (idempotent) and clear any scale-down streak.
-    ctx.scaledown_ticks.store(0, Ordering::Relaxed);
-    tracing::info!(
-        node_pool = %a.node_pool,
-        current,
-        free_mib = demand.free_mib,
-        desired,
-        "autoscale: computed desired host count"
-    );
-    ctx.scaler.set_size(&a.node_pool, desired).await?;
-    Ok(())
+    let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
+    let nodes = crate::autoscale::K8sNodeOps {
+        client: ctx.client.clone(),
+    };
+    crate::autoscale::step(
+        spec,
+        ctx.scaler.as_ref(),
+        &ctx.scaledown_ticks,
+        &coord,
+        &nodes,
+        pods,
+        roll_idle,
+    )
+    .await
 }
 
 /// Roll one node's host-agent pod onto the target image **by reattach, not
@@ -323,39 +291,6 @@ async fn gate_successor_ready(
             });
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-}
-
-/// Poll the coordinator's drain gate until the host reports
-/// `running_sandboxes == 0`, or the budget elapses. **Reserved for the node-
-/// removal drain path** (ADR 0045 Phase E scale-down actuation) — image rolls
-/// reattach (see [`roll_node`]) and never drain.
-#[allow(dead_code)]
-async fn gate_drain(
-    coord: &CoordClient,
-    host: HostId,
-    budget: Duration,
-) -> Result<(), OperatorError> {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        match coord.host_status(host).await? {
-            // Deregistered — nothing left on this host.
-            None => return Ok(()),
-            Some(st) if st.running_sandboxes == 0 => {
-                tracing::info!(%host, "drain complete (0 running sandboxes)");
-                return Ok(());
-            }
-            Some(st) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(OperatorError::DrainTimeout {
-                        host_id: host.to_string(),
-                        remaining: st.running_sandboxes,
-                    });
-                }
-                tracing::info!(%host, running = st.running_sandboxes, "draining…");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
     }
 }
 
@@ -484,7 +419,7 @@ async fn set_node_unschedulable(
     Ok(())
 }
 
-fn coord_token() -> Option<String> {
+pub(crate) fn coord_token() -> Option<String> {
     std::env::var("ENGRAM_COORDINATOR_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())

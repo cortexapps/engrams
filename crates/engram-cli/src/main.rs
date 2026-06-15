@@ -658,6 +658,8 @@ async fn session_create(
                 prompt: prompt.map(str::to_string),
                 harness_secret_id: None,
                 secrets: Default::default(),
+                user_email: None,
+                user_name: None,
             },
             tok,
         ))

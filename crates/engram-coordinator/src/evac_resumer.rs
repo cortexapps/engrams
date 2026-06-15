@@ -193,7 +193,11 @@ async fn advance_one(
         }
         // Gave up relocating — drop any teleport pin so a later manual
         // /resume isn't constrained to the (evidently unavailable) target.
-        state.teleport_targets.remove(&session_id);
+        let _ = state
+            .services
+            .meta
+            .set_teleport_target(session_id, None)
+            .await;
         return Ok(());
     }
 
@@ -242,7 +246,14 @@ async fn run_resume_pipeline(
     // ADR 0045 Phase F: an operator-pinned teleport destination, if any.
     // Honored strictly (a bad pin retries then falls back to Idle, never
     // silently lands elsewhere); cleared below once the session resolves.
-    let require_host = state.teleport_targets.get(&session_id).map(|e| *e.value());
+    let require_host = match state.services.meta.get_teleport_target(session_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e,
+                "get_teleport_target failed; treating as unpinned");
+            None
+        }
+    };
 
     let receipt = match evacuate_dead_source(
         &state.host_registry,
@@ -303,14 +314,22 @@ async fn run_resume_pipeline(
                 }
             }
             // Session left Evacuating terminally — drop any teleport pin.
-            state.teleport_targets.remove(&session_id);
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
             return Ok(());
         }
         Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
     };
 
     // Resolved onto a peer (Created) — the teleport pin is consumed.
-    state.teleport_targets.remove(&session_id);
+    let _ = state
+        .services
+        .meta
+        .set_teleport_target(session_id, None)
+        .await;
 
     tracing::info!(
         %session_id,
@@ -423,6 +442,9 @@ mod tests {
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             live_disk_manifest: live_disk,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         }
     }
 

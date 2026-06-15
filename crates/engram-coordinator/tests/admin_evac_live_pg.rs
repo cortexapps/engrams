@@ -60,7 +60,26 @@ async fn rig() -> Option<TestRig> {
             return None;
         }
     };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
+    // ADR 0047: placement reads the GLOBAL hosts table now, so tests in
+    // this binary can no longer share a database — a sibling test's
+    // fresh host row would be a legal pick. Give each rig its own
+    // database, created off the configured URL. (Leaked test databases
+    // are fine: CI's Postgres is ephemeral, and local dev reuses names
+    // rarely enough to not matter.)
+    let admin = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect postgres (admin)");
+    let db_name = format!("engram_test_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
+        .execute(&admin)
+        .await
+        .expect("create per-test database");
+    let base = database_url
+        .rsplit_once('/')
+        .map(|(b, _)| b)
+        .expect("database url has a path");
+    let test_url = format!("{base}/{db_name}");
+    let store = engram_postgres::PostgresStore::connect(&test_url)
         .await
         .expect("connect postgres");
     store.migrate().await.expect("migrate");
@@ -210,6 +229,11 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
         host_addr: None,
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
     })
     .await
     .expect("upsert_host");
@@ -242,6 +266,11 @@ async fn seed_host_with(
         status,
         last_heartbeat_at,
         host_addr: None,
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
     })
     .await
     .expect("upsert_host");
@@ -260,6 +289,9 @@ async fn seed_active_session(
         .create_session(SessionSpec {
             image: format!("ghcr.io/test/img:t-{}", uuid::Uuid::new_v4()),
             mode: SessionMode::Agent,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         })
         .await
         .expect("create_session");
@@ -587,22 +619,29 @@ async fn evac_attempts_primitives_round_trip() {
     );
 }
 
-/// HostRegistry::cordon flips `HostState.draining` such that
-/// `pick_for_session` skips the host. Pins the load-bearing user-
-/// visible promise of the cordon admin endpoint: cordoned hosts
-/// cannot be picked as evac targets.
+/// ADR 0047: the durable coordinator cordon. `set_host_cordoned` writes
+/// the PG bit; `placement::pick_for_session` (reading host rows) must
+/// skip the host — from ANY replica (a second registry over the same
+/// store sees the same cordon), and the cordon survives heartbeats
+/// (`touch_host_heartbeat` never writes the bit).
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn host_registry_cordon_excludes_host_from_pick_for_session() {
-    use engram_coordinator::host_registry::{HostRegistry, ScheduleContext};
+async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
+    use engram_coordinator::host_registry::HostRegistry;
+    use engram_coordinator::placement::{self, ScheduleContext};
     let Some(rig) = rig().await else { return };
     let meta = rig.meta.clone();
     let registry = Arc::new(HostRegistry::new(meta.clone()));
+    let replica_b = Arc::new(HostRegistry::new(meta.clone()));
 
     let cordoned = HostId::new();
     let healthy = HostId::new();
+    seed_ready_host(&meta, cordoned, "cordon-target").await;
+    seed_ready_host(&meta, healthy, "cordon-peer").await;
     registry.register(cordoned, FakeBackend::new());
     registry.register(healthy, FakeBackend::new());
+    replica_b.register(cordoned, FakeBackend::new());
+    replica_b.register(healthy, FakeBackend::new());
 
     // Both hosts available → either can be picked.
     let ctx = ScheduleContext {
@@ -610,55 +649,113 @@ async fn host_registry_cordon_excludes_host_from_pick_for_session() {
         image_version: "v1",
         prefer_snapshot_id: None,
         memory_mib: None,
+        cpu_budget_vcpus: None,
         required_image_digest: None,
         exclude_host: None,
         prefer_host: None,
     };
-    let (first_pick, _) = registry.pick_for_session(&ctx).expect("pick succeeds");
+    let (first_pick, _) = placement::pick_for_session(meta.as_ref(), &registry, &ctx)
+        .await
+        .expect("pick succeeds");
     assert!(first_pick == cordoned || first_pick == healthy);
 
-    // Cordon `cordoned` — picker MUST avoid it.
-    assert!(registry.cordon(cordoned), "cordon a registered host");
-    for _ in 0..20 {
-        let (picked, _) = registry.pick_for_session(&ctx).expect("pick succeeds");
-        assert_eq!(
-            picked, healthy,
-            "cordoned host must never be picked (got {picked} after cordon)"
-        );
+    // Cordon — every replica's picker MUST avoid it.
+    meta.set_host_cordoned(cordoned, true)
+        .await
+        .expect("cordon a rowed host");
+    for reg in [&registry, &replica_b] {
+        for _ in 0..10 {
+            let (picked, _) = placement::pick_for_session(meta.as_ref(), reg, &ctx)
+                .await
+                .expect("pick succeeds");
+            assert_eq!(
+                picked, healthy,
+                "cordoned host must never be picked (got {picked} after cordon)"
+            );
+        }
     }
 
-    // Uncordon — the previously-cordoned host is now eligible. Use
-    // exclude_host to filter the other healthy host out, then verify
-    // the picker returns the (now-uncordoned) host. This avoids
-    // depending on DashMap's iteration order, which is stable but
-    // hash-dependent — the test would be flaky if we relied on it.
-    assert!(registry.uncordon(cordoned), "uncordon known host");
+    // A heartbeat must NOT clobber the cordon (the pre-0047 bug).
+    meta.touch_host_heartbeat(
+        cordoned,
+        engram_core::types::host::HostHeartbeat {
+            status: engram_core::types::HostStatus::Ready,
+            capacity: engram_core::types::HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 16_384,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: Default::default(),
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            total_vcpus: 8,
+        },
+    )
+    .await
+    .expect("heartbeat");
+    let (picked, _) = placement::pick_for_session(meta.as_ref(), &registry, &ctx)
+        .await
+        .expect("pick succeeds");
+    assert_eq!(picked, healthy, "heartbeat must not clear the cordon");
+
+    // Uncordon — the previously-cordoned host is eligible again. Use
+    // exclude_host to force the pick deterministically.
+    meta.set_host_cordoned(cordoned, false)
+        .await
+        .expect("uncordon");
     let exclude_healthy_ctx = ScheduleContext {
-        repo: "test/img",
-        image_version: "v1",
-        prefer_snapshot_id: None,
-        memory_mib: None,
-        required_image_digest: None,
         exclude_host: Some(healthy),
-        prefer_host: None,
+        ..ctx.clone()
     };
-    let (picked, _) = registry
-        .pick_for_session(&exclude_healthy_ctx)
+    let (picked, _) = placement::pick_for_session(meta.as_ref(), &registry, &exclude_healthy_ctx)
+        .await
         .expect("post-uncordon pick must succeed when healthy host is excluded");
     assert_eq!(
         picked, cordoned,
         "after uncordon, the picker must return the previously-cordoned host"
     );
 
-    // Unknown host id → false (admin endpoint maps to 404).
-    assert!(
-        !registry.cordon(HostId::new()),
-        "unknown host returns false"
-    );
-    assert!(
-        !registry.uncordon(HostId::new()),
-        "unknown host returns false"
-    );
+    // Unknown host id → NotFound (admin endpoint maps to 404).
+    assert!(matches!(
+        meta.set_host_cordoned(HostId::new(), true).await,
+        Err(engram_core::MetaError::NotFound)
+    ));
+}
+
+/// Seed a fresh-heartbeat `ready` host row so ADR 0047 placement (which
+/// reads PG) can schedule onto it.
+async fn seed_ready_host(
+    meta: &Arc<dyn engram_core::traits::MetadataStore>,
+    id: HostId,
+    hostname: &str,
+) {
+    use engram_core::types::host::HostRecord;
+    meta.upsert_host(HostRecord {
+        id,
+        hostname: hostname.into(),
+        cloud_metadata: Default::default(),
+        capacity: engram_core::types::HostCapacity {
+            total_gb: 0,
+            used_gb: 0,
+            total_mib: 16_384,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: Default::default(),
+        status: engram_core::types::HostStatus::Ready,
+        last_heartbeat_at: Utc::now(),
+        host_addr: None,
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
+    })
+    .await
+    .expect("seed host row");
 }
 
 /// ADR 0044 K3 amendment: the dead-host detector must NOT strike out a
@@ -708,4 +805,227 @@ async fn list_stale_hosts_excludes_draining_hosts() {
         !stale_ids.contains(&fresh_ready),
         "a fresh host is not stale"
     );
+}
+
+/// ADR 0047: `apply_missing_sandbox_strikes` semantics on the real SQL —
+/// the consecutive-reset behavior that per-pod counters corrupted under
+/// round-robin heartbeats. (Ports the pre-0047 in-memory `apply_strikes`
+/// unit tests onto the shared `sessions.missing_strikes` column.)
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn missing_sandbox_strikes_are_consecutive_and_shared() {
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+    let host = HostId::new();
+    let sb_a = SandboxId::new();
+    let sb_b = SandboxId::new();
+    let sid_a = seed_active_session(&meta, host, sb_a).await;
+    let sid_b = seed_active_session(&meta, host, sb_b).await;
+
+    // Two missing ticks for A (B present) — no flip yet.
+    for _ in 0..2 {
+        let flipped = meta
+            .apply_missing_sandbox_strikes(&[sid_b], &[sid_a], 3)
+            .await
+            .expect("strike tick");
+        assert!(flipped.is_empty(), "below grace must not flip");
+    }
+    // A re-appears: resets — the two prior strikes must not carry over.
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[sid_a, sid_b], &[], 3)
+        .await
+        .expect("reset tick");
+    assert!(flipped.is_empty());
+    // Three consecutive missing ticks now flip A exactly at grace —
+    // proving the reset took (2 stale + 1 would have flipped at tick 1).
+    for tick in 0..3 {
+        let flipped = meta
+            .apply_missing_sandbox_strikes(&[sid_b], &[sid_a], 3)
+            .await
+            .expect("strike tick");
+        if tick < 2 {
+            assert!(flipped.is_empty(), "tick {tick} must not flip");
+        } else {
+            assert_eq!(flipped, vec![sid_a], "third consecutive miss flips");
+        }
+    }
+    // The flip reset the counter: the next miss starts from scratch.
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[sid_b], &[sid_a], 3)
+        .await
+        .expect("post-flip tick");
+    assert!(flipped.is_empty(), "post-flip counter starts fresh");
+    // B was present throughout — untouched. grace=1 flips immediately.
+    let flipped = meta
+        .apply_missing_sandbox_strikes(&[], &[sid_b], 1)
+        .await
+        .expect("grace-1 tick");
+    assert_eq!(flipped, vec![sid_b], "grace=1 is the no-grace mode");
+}
+
+/// ADR 0048 C9: `delete_host` is the operator's immediate-deregister
+/// primitive for the scale-down wave. It must REFUSE while any session
+/// is still bound (the operator finishes draining first — deleting the
+/// row out from under a live session orphans its routing), then succeed
+/// once the host is empty, and be idempotent if the row is already gone
+/// (the wave driver may re-issue it after a restart). This pins the
+/// SQL the `DELETE /api/admin/hosts/:id` handler maps onto.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn delete_host_refuses_bound_then_idempotent() {
+    use engram_core::types::session::DeleteHostOutcome;
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+
+    let host = HostId::new();
+    let sid = seed_active_session(&meta, host, SandboxId::new()).await;
+
+    // An Active session is bound → refuse with the bound count.
+    match meta.delete_host(host).await.expect("delete_host") {
+        DeleteHostOutcome::SessionsBound(n) => assert_eq!(n, 1, "one Active session bound"),
+        other => panic!("expected SessionsBound(1) while a session is Active, got {other:?}"),
+    }
+    // Row must survive the refusal.
+    assert!(
+        meta.list_active_hosts()
+            .await
+            .expect("list hosts")
+            .iter()
+            .any(|h| h.id == host),
+        "a refused delete must leave the host row intact"
+    );
+
+    // Move the session out of the bound set (Idle is not counted). Now
+    // the host is drainable.
+    meta.transition_session(sid, SessionState::Idle)
+        .await
+        .expect("Active → Idle");
+
+    match meta.delete_host(host).await.expect("delete_host") {
+        DeleteHostOutcome::Deleted => {}
+        other => panic!("expected Deleted once no session is bound, got {other:?}"),
+    }
+    assert!(
+        !meta
+            .list_active_hosts()
+            .await
+            .expect("list hosts")
+            .iter()
+            .any(|h| h.id == host),
+        "row must be gone after a successful delete"
+    );
+    // The Idle straggler was detached, not deleted.
+    let after = meta.get_session(sid).await.expect("get session");
+    assert_eq!(after.host_id, None, "delete_host detaches idle stragglers");
+
+    // Idempotent: deleting an already-gone row is a no-op success (the
+    // wave driver re-issues after a restart without a row to find).
+    match meta
+        .delete_host(host)
+        .await
+        .expect("delete_host (idempotent)")
+    {
+        DeleteHostOutcome::Deleted => {}
+        other => panic!("a second delete of a gone row must be Deleted, got {other:?}"),
+    }
+}
+
+/// ADR 0048 C8 (drain don't-strand guard): `placement_preview` is the
+/// HARD 2D fit check `drain_host` runs before starting ANY move. If the
+/// only survivor (the victim excluded) can't hold the session's budgets,
+/// it returns `false` so the drain surfaces a failure instead of parking
+/// an Active session Idle on a full fleet. A measured-but-too-small
+/// survivor → false; growing it (or its CPU budget) → true. An UNMEASURED
+/// survivor (allocatable 0) keeps the soft-fits posture → true.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
+    use engram_coordinator::placement::{self, ScheduleContext};
+    let Some(rig) = rig().await else { return };
+    let meta = rig.meta.clone();
+
+    let victim = HostId::new();
+    let survivor = HostId::new();
+    seed_ready_host(&meta, victim, "drain-victim").await;
+    seed_ready_host(&meta, survivor, "drain-survivor").await;
+
+    // Heartbeat the survivor as MEASURED with a small allocatable + a
+    // CPU budget. allocatable 4096 MiB; total_vcpus 4 ⇒ CPU budget
+    // 4 × overcommit (default 4.0) = 16 vCPU.
+    let heartbeat = |alloc_mib: u64, vcpus: u32| {
+        let meta = meta.clone();
+        async move {
+            meta.touch_host_heartbeat(
+                survivor,
+                engram_core::types::host::HostHeartbeat {
+                    status: engram_core::types::HostStatus::Ready,
+                    capacity: engram_core::types::HostCapacity {
+                        total_gb: 0,
+                        used_gb: 0,
+                        total_mib: 65_536,
+                        used_mib: 0,
+                        running_sandboxes: 0,
+                    },
+                    utilization: engram_core::types::host::HostUtilization {
+                        allocatable_mib: alloc_mib,
+                        ..Default::default()
+                    },
+                    ready_images: Vec::new(),
+                    local_snapshots: Vec::new(),
+                    current_bundles: Vec::new(),
+                    total_vcpus: vcpus,
+                },
+            )
+            .await
+            .expect("heartbeat survivor");
+        }
+    };
+    heartbeat(4_096, 4).await;
+
+    // The victim is excluded (it's draining); the survivor is the only
+    // candidate left.
+    let ctx = ScheduleContext {
+        repo: "test/img",
+        image_version: "v1",
+        prefer_snapshot_id: None,
+        memory_mib: Some(8_192),
+        cpu_budget_vcpus: Some(2),
+        required_image_digest: None,
+        exclude_host: Some(victim),
+        prefer_host: None,
+    };
+
+    // 8 GiB session, survivor has 4 GiB free → no fit → would strand.
+    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 2)
+        .await
+        .expect("placement_preview");
+    assert!(
+        !fits,
+        "a 8 GiB session must NOT fit a 4 GiB survivor — the guard blocks the drain"
+    );
+
+    // Grow the survivor's RAM → now it fits both dims.
+    heartbeat(16_384, 4).await;
+    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 2)
+        .await
+        .expect("placement_preview");
+    assert!(fits, "a 8 GiB session fits a 16 GiB survivor");
+
+    // CPU dimension binds independently: plenty of RAM, but a 32-vCPU
+    // ask against a 4-core × 4.0 = 16-vCPU budget → no fit.
+    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 32)
+        .await
+        .expect("placement_preview");
+    assert!(
+        !fits,
+        "CPU budget binds before RAM — a 32-vCPU ask exceeds the 16-vCPU host budget"
+    );
+
+    // An UNMEASURED survivor (allocatable 0, no reported cores) keeps the
+    // soft-fits posture reserve_placement takes for brand-new / dev hosts.
+    heartbeat(0, 0).await;
+    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 32)
+        .await
+        .expect("placement_preview");
+    assert!(fits, "an unmeasured survivor soft-fits any budget");
 }

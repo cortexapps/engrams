@@ -93,6 +93,12 @@ pub(crate) async fn fetch_and_seal_manifest(
         ))
     })?;
 
+    // ADR 0048: an enabled image MUST declare its vCPU count so
+    // placement can pack against a host's CPU budget. (A stale manifest
+    // using the old `suggested_vcpus` key already fails the parse above
+    // via `deny_unknown_fields`.)
+    validate_enabled_manifest(&manifest, image_uri).map_err(ApiError::BadRequest)?;
+
     let now = Utc::now();
     let row = EnabledImage {
         id: Uuid::new_v4(),
@@ -410,13 +416,15 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // and ADR 0028's disk-only recovery boots the same shape.
     let spec = crate::api::sessions::cold_boot_spec(&row.image_uri, manifest, None);
 
-    let (host_id, host) = state.host_registry.pick_capture_host().ok_or_else(|| {
-        ApiError::Unavailable(
-            "no host is available to capture this image's base snapshot. \
-             Register a host and retry the enable."
-                .into(),
-        )
-    })?;
+    let (host_id, host) =
+        crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
+            .await
+            .map_err(|e| {
+                ApiError::Unavailable(format!(
+                    "no host is available to capture this image's base snapshot \
+                     ({e:?}). Register a host and retry the enable."
+                ))
+            })?;
 
     tracing::info!(
         image_uri = %row.image_uri,
@@ -491,6 +499,20 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // memory snapshot, VZ cold-boots and captures disk only. Pass through
     // whatever the backend produced — `None` skips memory residency.
     Ok((meta.id, disk_manifest, meta.memory_manifest))
+}
+
+/// ADR 0048: enable-time manifest validation. An enabled image must
+/// declare `[resources] vcpus = N` so placement can reserve CPU and pack
+/// hosts against a budget. Pure (no I/O) so it's unit-tested directly.
+fn validate_enabled_manifest(manifest: &ImageManifest, image_uri: &str) -> Result<(), String> {
+    if manifest.resources.vcpus.is_none() {
+        return Err(format!(
+            "manifest.toml at `{image_uri}` must declare `[resources] vcpus = N` \
+             (ADR 0048: placement reserves CPU). Re-bake the image with a vcpus \
+             declaration and retry the enable."
+        ));
+    }
+    Ok(())
 }
 
 /// Parse the bake's bundle.json and pull out its `disk_manifest`
@@ -685,6 +707,30 @@ mod tests {
     use engram_core::traits::BlobStorage;
     use engram_storage_local::LocalBlobStorage;
     use std::sync::Arc;
+
+    #[test]
+    fn enable_validation_requires_a_vcpus_declaration() {
+        // No [resources] at all → rejected.
+        let bare: ImageManifest = toml::from_str("name = \"x\"\n").unwrap();
+        let err = validate_enabled_manifest(&bare, "r/x:t").unwrap_err();
+        assert!(err.contains("vcpus"), "error must name the field: {err}");
+
+        // [resources] present but vcpus omitted → rejected.
+        let no_vcpus: ImageManifest =
+            toml::from_str("name = \"x\"\n[resources]\nsuggested_memory_mib = 2048\n").unwrap();
+        assert!(validate_enabled_manifest(&no_vcpus, "r/x:t").is_err());
+
+        // Declared → accepted.
+        let ok: ImageManifest = toml::from_str("name = \"x\"\n[resources]\nvcpus = 4\n").unwrap();
+        assert!(validate_enabled_manifest(&ok, "r/x:t").is_ok());
+
+        // A stale `suggested_vcpus` key fails the PARSE (deny_unknown_fields),
+        // so it never reaches validation — proven here for completeness.
+        assert!(toml::from_str::<ImageManifest>(
+            "name = \"x\"\n[resources]\nsuggested_vcpus = 2\n"
+        )
+        .is_err());
+    }
 
     /// Regression guard for the OCI → BlobStorage materializer.
     /// Constructs a synthetic chunks-blob + bootstrap, runs the

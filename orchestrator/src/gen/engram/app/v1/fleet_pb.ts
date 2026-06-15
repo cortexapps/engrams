@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/fleet.proto.
  */
 export const file_engram_app_v1_fleet: GenFile = /*@__PURE__*/
-  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IvcCCghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhcKD2xvY2FsX3NuYXBzaG90cxgHIAEoBBIUCgxyZWFkeV9pbWFnZXMYCCABKAQSGwoTcmVhZHlfaW1hZ2VfZGlnZXN0cxgJIAMoCRIbChN1dGlsX2Rpc2tfdG90YWxfbWliGAogASgEEhoKEnV0aWxfZGlza191c2VkX21pYhgLIAEoBBIaChJ1dGlsX21lbV90b3RhbF9taWIYDCABKAQSGQoRdXRpbF9tZW1fdXNlZF9taWIYDSABKAQSFAoMdXRpbF9jcHVfcGN0GA4gASgCEhkKEWxhc3RfaGVhcnRiZWF0X2F0GA8gASgJIiEKDkdldEhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiOAoPR2V0SG9zdFJlc3BvbnNlEiUKBGhvc3QYASABKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IikKFkdldEhvc3RDb3dTdGF0ZVJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSJZChdHZXRIb3N0Q293U3RhdGVSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEi0KCHNlc3Npb25zGAIgAygLMhsuZW5ncmFtLmFwcC52MS5Db3dTdGF0ZVZpZXciIwoQRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIhMKEURyYWluSG9zdFJlc3BvbnNlIigKFUFkbWluRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJImwKFkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRISCgpldmFjdWF0aW5nGAIgAygJEi0KCGZhaWx1cmVzGAMgAygLMhsuZW5ncmFtLmFwcC52MS5EcmFpbkZhaWx1cmUiMQoMRHJhaW5GYWlsdXJlEhIKCnNlc3Npb25faWQYASABKAkSDQoFZXJyb3IYAiABKAkiJAoRQ29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI1ChJDb3Jkb25Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiJgoTVW5jb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIjcKFFVuY29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIhoKGEdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdCLqAQoZR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRIRCglzbmFwc2hvdHMYASABKAQSFgoOc25hcHNob3RfYnl0ZXMYAiABKAQSEgoKZ2NfcGVuZGluZxgDIAEoBBIZChF0cmFja2VkX3NhbmRib3hlcxgEIAEoBBIUCgxkaXJ0eV9jaHVua3MYBSABKAQSFwoPdW5mbHVzaGVkX2J5dGVzGAYgASgEEhgKEGF2Z19sb2NhbGl0eV9wY3QYByABKA0SKgoEcm93cxgIIAMoCzIcLmVuZ3JhbS5hcHAudjEuRHVyYWJpbGl0eVJvdyLlAQoNRHVyYWJpbGl0eVJvdxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIPCgdob3N0X2lkGAMgASgJEhQKDGRpcnR5X2NodW5rcxgEIAEoDRITCgtkaXJ0eV9ieXRlcxgFIAEoBBITCgtiYXNlX2NodW5rcxgGIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgHIAEoDRIaCg1sYXN0X2ZsdXNoX2F0GAggASgJSAGIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXQiKQoTRmx1c2hTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIlsKFEZsdXNoU2Vzc2lvblJlc3BvbnNlEg8KB291dGNvbWUYASABKAkSHQoQbWFuaWZlc3RfdmVyc2lvbhgCIAEoBEgAiAEBQhMKEV9tYW5pZmVzdF92ZXJzaW9uIlYKFkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgt0YXJnZXRfaG9zdBgCIAEoCUgAiAEBQg4KDF90YXJnZXRfaG9zdCI9ChdFdmFjdWF0ZVNlc3Npb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSJJCg5DaHVua0djUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyL3AQoPQ2h1bmtHY1Jlc3BvbnNlEhUKDWxpc3RlZF9jaHVua3MYASABKAQSFgoObWFsZm9ybWVkX2tleXMYAiABKAQSFAoMcGluX3NldF9zaXplGAMgASgEEhkKEWNhbmRpZGF0ZXNfbWFya2VkGAQgASgEEhUKDXJlc3RhcnRfY291bnQYBSABKA0SIAoYcmVzdGFydF9idWRnZXRfZXhoYXVzdGVkGAYgASgIEhgKEHByb21vdGVkX2RlbGV0ZXMYByABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAggASgEEhIKCmdyYWNlX3NlY3MYCSABKAQiSgoPQnVuZGxlR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIqMBChBCdW5kbGVHY1Jlc3BvbnNlEg4KBmxpc3RlZBgBIAEoBBIUCgxwaW5fc2V0X3NpemUYAiABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYAyABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgEIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYBSABKAQSFQoNcmVzdGFydF9jb3VudBgGIAEoDSJQChVTbmFwc2hvdEJsb2JHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3Mi3AEKFlNuYXBzaG90QmxvYkdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhEKCW1hbGZvcm1lZBgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgFIAEoBBIeChZwcm9tb3RlX3JlcGlubmVkX3NraXBzGAYgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgHIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAggASgNMv4ICgxGbGVldFNlcnZpY2USTgoJTGlzdEhvc3RzEh8uZW5ncmFtLmFwcC52MS5MaXN0SG9zdHNSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5MaXN0SG9zdHNSZXNwb25zZRJICgdHZXRIb3N0Eh0uZW5ncmFtLmFwcC52MS5HZXRIb3N0UmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuR2V0SG9zdFJlc3BvbnNlEmAKD0dldEhvc3RDb3dTdGF0ZRIlLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVzcG9uc2USTgoJRHJhaW5Ib3N0Eh8uZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXNwb25zZRJdCg5BZG1pbkRyYWluSG9zdBIkLmVuZ3JhbS5hcHAudjEuQWRtaW5EcmFpbkhvc3RSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlc3BvbnNlElEKCkNvcmRvbkhvc3QSIC5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5Db3Jkb25Ib3N0UmVzcG9uc2USVwoMVW5jb3Jkb25Ib3N0EiIuZW5ncmFtLmFwcC52MS5VbmNvcmRvbkhvc3RSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5VbmNvcmRvbkhvc3RSZXNwb25zZRJmChFHZXRTdG9yYWdlU3VtbWFyeRInLmVuZ3JhbS5hcHAudjEuR2V0U3RvcmFnZVN1bW1hcnlSZXF1ZXN0GiguZW5ncmFtLmFwcC52MS5HZXRTdG9yYWdlU3VtbWFyeVJlc3BvbnNlElcKDEZsdXNoU2Vzc2lvbhIiLmVuZ3JhbS5hcHAudjEuRmx1c2hTZXNzaW9uUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuRmx1c2hTZXNzaW9uUmVzcG9uc2USYAoPRXZhY3VhdGVTZXNzaW9uEiUuZW5ncmFtLmFwcC52MS5FdmFjdWF0ZVNlc3Npb25SZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5FdmFjdWF0ZVNlc3Npb25SZXNwb25zZRJICgdDaHVua0djEh0uZW5ncmFtLmFwcC52MS5DaHVua0djUmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuQ2h1bmtHY1Jlc3BvbnNlEksKCEJ1bmRsZUdjEh4uZW5ncmFtLmFwcC52MS5CdW5kbGVHY1JlcXVlc3QaHy5lbmdyYW0uYXBwLnYxLkJ1bmRsZUdjUmVzcG9uc2USXQoOU25hcHNob3RCbG9iR2MSJC5lbmdyYW0uYXBwLnYxLlNuYXBzaG90QmxvYkdjUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuU25hcHNob3RCbG9iR2NSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session]);
+  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IqUECghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhcKD2xvY2FsX3NuYXBzaG90cxgHIAEoBBIUCgxyZWFkeV9pbWFnZXMYCCABKAQSGwoTcmVhZHlfaW1hZ2VfZGlnZXN0cxgJIAMoCRIbChN1dGlsX2Rpc2tfdG90YWxfbWliGAogASgEEhoKEnV0aWxfZGlza191c2VkX21pYhgLIAEoBBIaChJ1dGlsX21lbV90b3RhbF9taWIYDCABKAQSGQoRdXRpbF9tZW1fdXNlZF9taWIYDSABKAQSFAoMdXRpbF9jcHVfcGN0GA4gASgCEhkKEWxhc3RfaGVhcnRiZWF0X2F0GA8gASgJEhAKCGNvcmRvbmVkGBAgASgIEhcKD2FsbG9jYXRhYmxlX21pYhgRIAEoBBIUCgxyZXNlcnZlZF9taWIYEiABKAQSEAoIZnJlZV9taWIYEyABKAQSEwoLdG90YWxfdmNwdXMYFCABKA0SGAoQY3B1X2J1ZGdldF92Y3B1cxgVIAEoBBIWCg5yZXNlcnZlZF92Y3B1cxgWIAEoBBISCgpmcmVlX3ZjcHVzGBcgASgEIiEKDkdldEhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiOAoPR2V0SG9zdFJlc3BvbnNlEiUKBGhvc3QYASABKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IikKFkdldEhvc3RDb3dTdGF0ZVJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSJZChdHZXRIb3N0Q293U3RhdGVSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEi0KCHNlc3Npb25zGAIgAygLMhsuZW5ncmFtLmFwcC52MS5Db3dTdGF0ZVZpZXciIwoQRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIhMKEURyYWluSG9zdFJlc3BvbnNlIigKFUFkbWluRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJImwKFkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRISCgpldmFjdWF0aW5nGAIgAygJEi0KCGZhaWx1cmVzGAMgAygLMhsuZW5ncmFtLmFwcC52MS5EcmFpbkZhaWx1cmUiMQoMRHJhaW5GYWlsdXJlEhIKCnNlc3Npb25faWQYASABKAkSDQoFZXJyb3IYAiABKAkiJAoRQ29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI1ChJDb3Jkb25Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiJgoTVW5jb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIjcKFFVuY29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIhoKGEdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdCLqAQoZR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRIRCglzbmFwc2hvdHMYASABKAQSFgoOc25hcHNob3RfYnl0ZXMYAiABKAQSEgoKZ2NfcGVuZGluZxgDIAEoBBIZChF0cmFja2VkX3NhbmRib3hlcxgEIAEoBBIUCgxkaXJ0eV9jaHVua3MYBSABKAQSFwoPdW5mbHVzaGVkX2J5dGVzGAYgASgEEhgKEGF2Z19sb2NhbGl0eV9wY3QYByABKA0SKgoEcm93cxgIIAMoCzIcLmVuZ3JhbS5hcHAudjEuRHVyYWJpbGl0eVJvdyLlAQoNRHVyYWJpbGl0eVJvdxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIPCgdob3N0X2lkGAMgASgJEhQKDGRpcnR5X2NodW5rcxgEIAEoDRITCgtkaXJ0eV9ieXRlcxgFIAEoBBITCgtiYXNlX2NodW5rcxgGIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgHIAEoDRIaCg1sYXN0X2ZsdXNoX2F0GAggASgJSAGIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXQiKQoTRmx1c2hTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIlsKFEZsdXNoU2Vzc2lvblJlc3BvbnNlEg8KB291dGNvbWUYASABKAkSHQoQbWFuaWZlc3RfdmVyc2lvbhgCIAEoBEgAiAEBQhMKEV9tYW5pZmVzdF92ZXJzaW9uIlYKFkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgt0YXJnZXRfaG9zdBgCIAEoCUgAiAEBQg4KDF90YXJnZXRfaG9zdCI9ChdFdmFjdWF0ZVNlc3Npb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSJJCg5DaHVua0djUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyL3AQoPQ2h1bmtHY1Jlc3BvbnNlEhUKDWxpc3RlZF9jaHVua3MYASABKAQSFgoObWFsZm9ybWVkX2tleXMYAiABKAQSFAoMcGluX3NldF9zaXplGAMgASgEEhkKEWNhbmRpZGF0ZXNfbWFya2VkGAQgASgEEhUKDXJlc3RhcnRfY291bnQYBSABKA0SIAoYcmVzdGFydF9idWRnZXRfZXhoYXVzdGVkGAYgASgIEhgKEHByb21vdGVkX2RlbGV0ZXMYByABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAggASgEEhIKCmdyYWNlX3NlY3MYCSABKAQiSgoPQnVuZGxlR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIqMBChBCdW5kbGVHY1Jlc3BvbnNlEg4KBmxpc3RlZBgBIAEoBBIUCgxwaW5fc2V0X3NpemUYAiABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYAyABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgEIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYBSABKAQSFQoNcmVzdGFydF9jb3VudBgGIAEoDSJQChVTbmFwc2hvdEJsb2JHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3Mi3AEKFlNuYXBzaG90QmxvYkdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhEKCW1hbGZvcm1lZBgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgFIAEoBBIeChZwcm9tb3RlX3JlcGlubmVkX3NraXBzGAYgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgHIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAggASgNIhQKEkZsZWV0RGVtYW5kUmVxdWVzdCLuAQoTRmxlZXREZW1hbmRSZXNwb25zZRITCgtyZWFkeV9ob3N0cxgBIAEoDRIZChFzY2hlZHVsYWJsZV9ob3N0cxgCIAEoDRIQCghmcmVlX21pYhgDIAEoBBIRCgl0b3RhbF9taWIYBCABKAQSEgoKZnJlZV92Y3B1cxgFIAEoBBITCgt0b3RhbF92Y3B1cxgGIAEoBBIWCg5jb3Jkb25lZF9ob3N0cxgHIAEoDRIXCg9xdWV1ZWRfc2Vzc2lvbnMYCCABKAQSEgoKcXVldWVkX21pYhgJIAEoBBIUCgxxdWV1ZWRfdmNwdXMYCiABKAQiJAoRRGVsZXRlSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSIUChJEZWxldGVIb3N0UmVzcG9uc2UiPQoPVGVsZXBvcnRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFgoOdGFyZ2V0X2hvc3RfaWQYAiABKAkiNgoQVGVsZXBvcnRSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSImChBFdmljdElkbGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiNwoRRXZpY3RJZGxlUmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkyxAsKDEZsZWV0U2VydmljZRJOCglMaXN0SG9zdHMSHy5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1Jlc3BvbnNlEkgKB0dldEhvc3QSHS5lbmdyYW0uYXBwLnYxLkdldEhvc3RSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRIb3N0UmVzcG9uc2USYAoPR2V0SG9zdENvd1N0YXRlEiUuZW5ncmFtLmFwcC52MS5HZXRIb3N0Q293U3RhdGVSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5HZXRIb3N0Q293U3RhdGVSZXNwb25zZRJOCglEcmFpbkhvc3QSHy5lbmdyYW0uYXBwLnYxLkRyYWluSG9zdFJlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkRyYWluSG9zdFJlc3BvbnNlEl0KDkFkbWluRHJhaW5Ib3N0EiQuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USUQoKQ29yZG9uSG9zdBIgLmVuZ3JhbS5hcHAudjEuQ29yZG9uSG9zdFJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXNwb25zZRJXCgxVbmNvcmRvbkhvc3QSIi5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlc3BvbnNlEmYKEUdldFN0b3JhZ2VTdW1tYXJ5EicuZW5ncmFtLmFwcC52MS5HZXRTdG9yYWdlU3VtbWFyeVJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLkdldFN0b3JhZ2VTdW1tYXJ5UmVzcG9uc2USVwoMRmx1c2hTZXNzaW9uEiIuZW5ncmFtLmFwcC52MS5GbHVzaFNlc3Npb25SZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5GbHVzaFNlc3Npb25SZXNwb25zZRJgCg9FdmFjdWF0ZVNlc3Npb24SJS5lbmdyYW0uYXBwLnYxLkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkV2YWN1YXRlU2Vzc2lvblJlc3BvbnNlEkgKB0NodW5rR2MSHS5lbmdyYW0uYXBwLnYxLkNodW5rR2NSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5DaHVua0djUmVzcG9uc2USSwoIQnVuZGxlR2MSHi5lbmdyYW0uYXBwLnYxLkJ1bmRsZUdjUmVxdWVzdBofLmVuZ3JhbS5hcHAudjEuQnVuZGxlR2NSZXNwb25zZRJdCg5TbmFwc2hvdEJsb2JHYxIkLmVuZ3JhbS5hcHAudjEuU25hcHNob3RCbG9iR2NSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5TbmFwc2hvdEJsb2JHY1Jlc3BvbnNlElQKC0ZsZWV0RGVtYW5kEiEuZW5ncmFtLmFwcC52MS5GbGVldERlbWFuZFJlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkZsZWV0RGVtYW5kUmVzcG9uc2USUQoKRGVsZXRlSG9zdBIgLmVuZ3JhbS5hcHAudjEuRGVsZXRlSG9zdFJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkRlbGV0ZUhvc3RSZXNwb25zZRJLCghUZWxlcG9ydBIeLmVuZ3JhbS5hcHAudjEuVGVsZXBvcnRSZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5UZWxlcG9ydFJlc3BvbnNlEk4KCUV2aWN0SWRsZRIfLmVuZ3JhbS5hcHAudjEuRXZpY3RJZGxlUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuRXZpY3RJZGxlUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_session]);
 
 /**
  * @generated from message engram.app.v1.ListHostsRequest
@@ -147,6 +147,59 @@ export type HostView = Message<"engram.app.v1.HostView"> & {
    * @generated from field: string last_heartbeat_at = 15;
    */
   lastHeartbeatAt: string;
+
+  /**
+   * ADR 0047: the coordinator-owned durable cordon bit — non-schedulable
+   * regardless of the host-reported status.
+   *
+   * @generated from field: bool cordoned = 16;
+   */
+  cordoned: boolean;
+
+  /**
+   * ADR 0046/0047: host-measured allocatable RAM — what placement budgets
+   * against (nets out the daemon/OS/residency baseline).
+   *
+   * @generated from field: uint64 allocatable_mib = 17;
+   */
+  allocatableMib: bigint;
+
+  /**
+   * ADR 0048: Σ reserved RAM (mem_budget_mib) and the resulting free
+   * (allocatable − reserved) — the operator's wave planner reads these for
+   * victim-picking + the 2D drain guard.
+   *
+   * @generated from field: uint64 reserved_mib = 18;
+   */
+  reservedMib: bigint;
+
+  /**
+   * @generated from field: uint64 free_mib = 19;
+   */
+  freeMib: bigint;
+
+  /**
+   * ADR 0048: host core count + budget (total_vcpus × overcommit), Σ reserved
+   * vCPU, and the resulting free vCPU.
+   *
+   * @generated from field: uint32 total_vcpus = 20;
+   */
+  totalVcpus: number;
+
+  /**
+   * @generated from field: uint64 cpu_budget_vcpus = 21;
+   */
+  cpuBudgetVcpus: bigint;
+
+  /**
+   * @generated from field: uint64 reserved_vcpus = 22;
+   */
+  reservedVcpus: bigint;
+
+  /**
+   * @generated from field: uint64 free_vcpus = 23;
+   */
+  freeVcpus: bigint;
 };
 
 /**
@@ -964,6 +1017,207 @@ export const SnapshotBlobGcResponseSchema: GenMessage<SnapshotBlobGcResponse> = 
   messageDesc(file_engram_app_v1_fleet, 28);
 
 /**
+ * ADR 0044/0048: autoscaler demand signal. All fields come from PG so every
+ * coordinator replica reports identical demand.
+ *
+ * @generated from message engram.app.v1.FleetDemandRequest
+ */
+export type FleetDemandRequest = Message<"engram.app.v1.FleetDemandRequest"> & {
+};
+
+/**
+ * Describes the message engram.app.v1.FleetDemandRequest.
+ * Use `create(FleetDemandRequestSchema)` to create a new message.
+ */
+export const FleetDemandRequestSchema: GenMessage<FleetDemandRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 29);
+
+/**
+ * @generated from message engram.app.v1.FleetDemandResponse
+ */
+export type FleetDemandResponse = Message<"engram.app.v1.FleetDemandResponse"> & {
+  /**
+   * @generated from field: uint32 ready_hosts = 1;
+   */
+  readyHosts: number;
+
+  /**
+   * @generated from field: uint32 schedulable_hosts = 2;
+   */
+  schedulableHosts: number;
+
+  /**
+   * @generated from field: uint64 free_mib = 3;
+   */
+  freeMib: bigint;
+
+  /**
+   * @generated from field: uint64 total_mib = 4;
+   */
+  totalMib: bigint;
+
+  /**
+   * @generated from field: uint64 free_vcpus = 5;
+   */
+  freeVcpus: bigint;
+
+  /**
+   * @generated from field: uint64 total_vcpus = 6;
+   */
+  totalVcpus: bigint;
+
+  /**
+   * @generated from field: uint32 cordoned_hosts = 7;
+   */
+  cordonedHosts: number;
+
+  /**
+   * @generated from field: uint64 queued_sessions = 8;
+   */
+  queuedSessions: bigint;
+
+  /**
+   * @generated from field: uint64 queued_mib = 9;
+   */
+  queuedMib: bigint;
+
+  /**
+   * @generated from field: uint64 queued_vcpus = 10;
+   */
+  queuedVcpus: bigint;
+};
+
+/**
+ * Describes the message engram.app.v1.FleetDemandResponse.
+ * Use `create(FleetDemandResponseSchema)` to create a new message.
+ */
+export const FleetDemandResponseSchema: GenMessage<FleetDemandResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 30);
+
+/**
+ * ADR 0048: deregister a drained host.
+ *
+ * @generated from message engram.app.v1.DeleteHostRequest
+ */
+export type DeleteHostRequest = Message<"engram.app.v1.DeleteHostRequest"> & {
+  /**
+   * @generated from field: string host_id = 1;
+   */
+  hostId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.DeleteHostRequest.
+ * Use `create(DeleteHostRequestSchema)` to create a new message.
+ */
+export const DeleteHostRequestSchema: GenMessage<DeleteHostRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 31);
+
+/**
+ * @generated from message engram.app.v1.DeleteHostResponse
+ */
+export type DeleteHostResponse = Message<"engram.app.v1.DeleteHostResponse"> & {
+};
+
+/**
+ * Describes the message engram.app.v1.DeleteHostResponse.
+ * Use `create(DeleteHostResponseSchema)` to create a new message.
+ */
+export const DeleteHostResponseSchema: GenMessage<DeleteHostResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 32);
+
+/**
+ * ADR 0045 Phase F: relocate an Active session to a chosen host.
+ *
+ * @generated from message engram.app.v1.TeleportRequest
+ */
+export type TeleportRequest = Message<"engram.app.v1.TeleportRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string target_host_id = 2;
+   */
+  targetHostId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.TeleportRequest.
+ * Use `create(TeleportRequestSchema)` to create a new message.
+ */
+export const TeleportRequestSchema: GenMessage<TeleportRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 33);
+
+/**
+ * @generated from message engram.app.v1.TeleportResponse
+ */
+export type TeleportResponse = Message<"engram.app.v1.TeleportResponse"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * "migrated" (live teleport) | "evacuating" (snapshot-rehome fallback).
+   *
+   * @generated from field: string status = 2;
+   */
+  status: string;
+};
+
+/**
+ * Describes the message engram.app.v1.TeleportResponse.
+ * Use `create(TeleportResponseSchema)` to create a new message.
+ */
+export const TeleportResponseSchema: GenMessage<TeleportResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 34);
+
+/**
+ * Explicit idle-eviction trigger (Active→Idle).
+ *
+ * @generated from message engram.app.v1.EvictIdleRequest
+ */
+export type EvictIdleRequest = Message<"engram.app.v1.EvictIdleRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.EvictIdleRequest.
+ * Use `create(EvictIdleRequestSchema)` to create a new message.
+ */
+export const EvictIdleRequestSchema: GenMessage<EvictIdleRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 35);
+
+/**
+ * @generated from message engram.app.v1.EvictIdleResponse
+ */
+export type EvictIdleResponse = Message<"engram.app.v1.EvictIdleResponse"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * "idle" — paused, flushed, snapshotted, local sandbox destroyed.
+   *
+   * @generated from field: string status = 2;
+   */
+  status: string;
+};
+
+/**
+ * Describes the message engram.app.v1.EvictIdleResponse.
+ * Use `create(EvictIdleResponseSchema)` to create a new message.
+ */
+export const EvictIdleResponseSchema: GenMessage<EvictIdleResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 36);
+
+/**
  * Fleet, storage, and GC operations (ADR 0039 §2.3, rev 2026-06-10).
  * The caller is a single trusted service (bearer-authed); there is no
  * per-user anything here. Attribution and authz live in the orchestrator.
@@ -1099,6 +1353,52 @@ export const FleetService: GenService<{
     methodKind: "unary";
     input: typeof SnapshotBlobGcRequestSchema;
     output: typeof SnapshotBlobGcResponseSchema;
+  },
+  /**
+   * ADR 0044/0048: the autoscaler's demand signal (was GET
+   * /api/admin/fleet/demand). PG-authoritative — every replica reports
+   * identical demand.
+   *
+   * @generated from rpc engram.app.v1.FleetService.FleetDemand
+   */
+  fleetDemand: {
+    methodKind: "unary";
+    input: typeof FleetDemandRequestSchema;
+    output: typeof FleetDemandResponseSchema;
+  },
+  /**
+   * ADR 0048: deregister a drained host immediately (was DELETE
+   * /api/admin/hosts/:id) so scale-down doesn't wait for the dead-host
+   * detector. FAILED_PRECONDITION if sessions are still bound.
+   *
+   * @generated from rpc engram.app.v1.FleetService.DeleteHost
+   */
+  deleteHost: {
+    methodKind: "unary";
+    input: typeof DeleteHostRequestSchema;
+    output: typeof DeleteHostResponseSchema;
+  },
+  /**
+   * ADR 0045 Phase F: relocate an Active session to a chosen host (was
+   * POST /api/admin/sessions/:id/teleport).
+   *
+   * @generated from rpc engram.app.v1.FleetService.Teleport
+   */
+  teleport: {
+    methodKind: "unary";
+    input: typeof TeleportRequestSchema;
+    output: typeof TeleportResponseSchema;
+  },
+  /**
+   * Explicit idle-eviction trigger (was POST
+   * /api/admin/sessions/:id/evict-idle) — drives Active→Idle on demand.
+   *
+   * @generated from rpc engram.app.v1.FleetService.EvictIdle
+   */
+  evictIdle: {
+    methodKind: "unary";
+    input: typeof EvictIdleRequestSchema;
+    output: typeof EvictIdleResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_fleet, 0);

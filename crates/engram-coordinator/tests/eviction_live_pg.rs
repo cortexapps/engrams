@@ -43,6 +43,9 @@ async fn seed_active(meta: &Arc<dyn MetadataStore>) -> (SessionId, SandboxId) {
         .create_session(SessionSpec {
             image: "localhost:5001/demo:warm-evict-test".into(),
             mode: SessionMode::Agent,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         })
         .await
         .expect("create");

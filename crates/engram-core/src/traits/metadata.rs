@@ -2,13 +2,16 @@ use async_trait::async_trait;
 
 use crate::error::MetaError;
 use crate::types::event::{ArtifactRow, PersistedEvent};
-use crate::types::host::{HostCapacity, HostRecord, HostStatus, HostUtilization};
+use crate::types::host::{HostHeartbeat, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
 use crate::types::manifest::ManifestRef;
 use crate::types::registry::{
     EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
 };
-use crate::types::session::{Session, SessionSpec, SessionState};
+use crate::types::session::{
+    DeleteHostOutcome, QueuedDemand, QueuedSession, SandboxAssignment, Session, SessionSpec,
+    SessionState,
+};
 use crate::types::snapshot::SnapshotRecord;
 
 /// ADR 0021 P1.8: outcome of [`MetadataStore::soft_delete_enabled_image`].
@@ -107,22 +110,25 @@ pub trait MetadataStore: Send + Sync {
         Ok(0)
     }
 
-    /// ADR 0046: atomically pick a host from `candidates` (ranked — the
-    /// in-memory affinity/readiness order) and reserve `mem_budget_mib` on it,
-    /// returning the chosen host, or `None` when no candidate has room
-    /// (`total − reserved − residency_floor ≥ mem_budget_mib`). The Postgres
-    /// impl runs under `SELECT … FROM hosts … FOR UPDATE` so concurrent placers
-    /// (any coordinator replica) serialize and a burst can't overcommit; it
-    /// inserts a `pending`, sandbox-less session row as the reservation — later
-    /// finalized by `create_session_created` (an upsert) after boot, or released
-    /// by `delete_pending_session` on boot failure. Default impl (mock stores)
-    /// just returns the first candidate, no capacity check or row insert.
+    /// ADR 0046/0048: atomically pick a host from `candidates` (ranked — the
+    /// affinity/readiness order) and reserve BOTH `mem_budget_mib` and
+    /// `cpu_budget_vcpus` on it, returning the chosen host, or `None` when no
+    /// candidate fits both dimensions (RAM: `allocatable − reserved`; CPU:
+    /// `total_vcpus × overcommit − reserved`). The Postgres impl runs under
+    /// `SELECT … FROM hosts … FOR UPDATE` so concurrent placers (any
+    /// coordinator replica) serialize and a burst can't overcommit; it inserts
+    /// a `pending`, sandbox-less session row as the reservation — later
+    /// finalized by `create_session_created` (an upsert) after boot, or
+    /// released by `delete_pending_session` on boot failure. Default impl (mock
+    /// stores) just returns the first candidate, no capacity check or row insert.
     async fn reserve_placement(
         &self,
         _session_id: SessionId,
         _spec: &SessionSpec,
         _mem_budget_mib: i64,
+        _cpu_budget_vcpus: i32,
         candidates: &[HostId],
+        _affinity_len: usize,
     ) -> Result<Option<HostId>, MetaError> {
         Ok(candidates.first().copied())
     }
@@ -131,6 +137,148 @@ pub trait MetadataStore: Send + Sync {
     /// `pending`, sandbox-less row. Default impl (mocks) is a no-op.
     async fn delete_pending_session(&self, _session_id: SessionId) -> Result<(), MetaError> {
         Ok(())
+    }
+
+    // ---- ADR 0048: session queue ----
+
+    /// Insert a create that found no capacity as a `queued` row (host_id
+    /// NULL, the budgets the scanner will reserve with, `queued_at` =
+    /// NOW(), `queue_origin = 'create'`, the initial prompt). The queue
+    /// scanner re-attempts placement FIFO. Default impl (mocks) no-op.
+    async fn enqueue_session_create(
+        &self,
+        _id: SessionId,
+        _spec: &SessionSpec,
+        _mem_budget_mib: i64,
+        _cpu_budget_vcpus: i32,
+        _prompt: Option<&str>,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// Park an `Idle` session that hit no capacity on resume back in the
+    /// queue (`Idle → queued`, `queue_origin = 'resume'`). Default no-op.
+    async fn enqueue_session_resume(&self, _id: SessionId) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// Every `queued` session, oldest-first (FIFO). The scanner walks
+    /// this each tick. Default impl (mocks): empty.
+    async fn list_queued_sessions_fifo(&self) -> Result<Vec<QueuedSession>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Atomically re-attempt placement for a `queued` session: pick a
+    /// host from `candidates` (same best-fit 2D logic as
+    /// `reserve_placement`) and, if one fits, flip the row
+    /// `queued → pending` with the host bound + `last_active_at` bumped,
+    /// returning the host. `None` = nothing fit (stay queued) or the row
+    /// already left `queued` (lost a race). Default impl (mocks): place
+    /// on the first candidate.
+    async fn place_queued_session(
+        &self,
+        _id: SessionId,
+        _mem_budget_mib: i64,
+        _cpu_budget_vcpus: i32,
+        candidates: &[HostId],
+        _affinity_len: usize,
+    ) -> Result<Option<HostId>, MetaError> {
+        Ok(candidates.first().copied())
+    }
+
+    /// Boot failed on a placed (`pending`) queued session — return it to
+    /// the queue (`pending → queued`), but ONLY while still `pending`
+    /// (a row that advanced to `created` is past requeue; the caller
+    /// fails it). Returns whether a row was requeued. Default: no-op false.
+    async fn requeue_session(&self, _id: SessionId) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
+    /// Crash recovery: `pending` rows with a `queue_origin` (i.e. placed
+    /// queued sessions) whose `last_active_at` is older than `older_than`
+    /// — a coord died mid-boot — flip back to `queued` for the scanner to
+    /// retry. Returns the count requeued. Default: 0.
+    async fn requeue_stale_pending(
+        &self,
+        _older_than: std::time::Duration,
+    ) -> Result<u64, MetaError> {
+        Ok(0)
+    }
+
+    /// The queue's demand (count, Σ mem_budget_mib, Σ cpu_budget_vcpus) —
+    /// the scale-up signal the operator reads via `/admin/fleet/demand`.
+    /// Default: zeros.
+    async fn queued_demand(&self) -> Result<QueuedDemand, MetaError> {
+        Ok(QueuedDemand::default())
+    }
+
+    /// ADR 0047 (was `state.teleport_targets`): pin / clear the
+    /// operator-chosen teleport destination on the session row. The
+    /// evac scanner — on ANY replica — honors the pin as its required
+    /// placement. Default impls (mocks): no-op / no pin.
+    async fn set_teleport_target(
+        &self,
+        _id: SessionId,
+        _target: Option<HostId>,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+    async fn get_teleport_target(&self, _id: SessionId) -> Result<Option<HostId>, MetaError> {
+        Ok(None)
+    }
+
+    /// ADR 0047 (was `state.git_broker_tokens`): the KEK-sealed
+    /// per-session broker token. `insert_broker_token` is
+    /// first-writer-wins (`ON CONFLICT DO NOTHING`) and returns whether
+    /// THIS call inserted — a `false` means a sibling replica won the
+    /// mint race and the caller re-reads. Default impls (mocks):
+    /// insert always "wins", get finds nothing, delete no-ops — mock
+    /// flows ride the in-memory cache alone, which is exactly the
+    /// pre-0047 behavior.
+    async fn insert_broker_token(
+        &self,
+        _token: crate::types::registry::SessionBrokerToken,
+    ) -> Result<bool, MetaError> {
+        Ok(true)
+    }
+    async fn get_broker_token(
+        &self,
+        _id: SessionId,
+    ) -> Result<Option<crate::types::registry::SessionBrokerToken>, MetaError> {
+        Ok(None)
+    }
+    async fn delete_broker_token(&self, _id: SessionId) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// ADR 0047 (replica-safe reconciler): apply one heartbeat's
+    /// missing-sandbox strike accounting on the session rows. Sessions
+    /// whose sandbox WAS in the heartbeat get their counter reset;
+    /// missing ones increment; ids that reach `grace_ticks` are
+    /// returned (their counters reset in the same transaction) and the
+    /// caller flips them. The shared column restores the "missing N
+    /// CONSECUTIVE heartbeats" semantics that per-pod counters corrupt
+    /// when a host's heartbeats round-robin across replicas. Default
+    /// impl (mocks): never flips; reconcile-exercising mocks override.
+    async fn apply_missing_sandbox_strikes(
+        &self,
+        _present: &[SessionId],
+        _missing: &[SessionId],
+        _grace_ticks: i32,
+    ) -> Result<Vec<SessionId>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0047/0048: per-host reserved budget (Σ `mem_budget_mib` AND
+    /// Σ `cpu_budget_vcpus` over the memory-reserving session states) —
+    /// the read-side twin of `reserve_placement`'s aggregate, for the
+    /// capacity-soft resume/evac picker and the fleet view. Default impl
+    /// (mocks): empty map (no reservations).
+    async fn per_host_reserved(
+        &self,
+    ) -> Result<std::collections::HashMap<HostId, crate::types::host::ReservedBudget>, MetaError>
+    {
+        Ok(std::collections::HashMap::new())
     }
 
     /// ADR 0009 reconcile pass: enumerate the `(session_id,
@@ -157,6 +305,42 @@ pub trait MetadataStore: Send + Sync {
                 _ => None,
             })
             .collect())
+    }
+
+    /// ADR 0048 C8: the Active assignments on `host_id` WITH their
+    /// reservation budgets, for the drain don't-strand guard (it must
+    /// pre-check that some survivor fits each session's budgets before
+    /// starting a move). Default impl scans `list_active_sessions` (mocks
+    /// carry no budgets → 0, which the guard treats as "no constraint").
+    async fn list_active_assignments_with_budgets_on_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<SandboxAssignment>, MetaError> {
+        let all = self.list_active_sessions().await?;
+        Ok(all
+            .into_iter()
+            .filter_map(|s| match (s.status, s.host_id, s.sandbox_id) {
+                (SessionState::Active, Some(h), Some(sb)) if h == host_id => {
+                    Some(SandboxAssignment {
+                        session_id: s.id,
+                        sandbox_id: sb,
+                        mem_budget_mib: 0,
+                        cpu_budget_vcpus: 0,
+                    })
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// ADR 0048: deregister a drained host immediately — its `hosts` row
+    /// is deleted so the operator's scale-down doesn't wait ~30-40s for
+    /// the dead-host detector. REFUSES (returns the bound count) if any
+    /// session is still bound (`pending`/`created`/`guest_ready`/`active`/
+    /// `evacuating`/`evicting`); idempotent (a missing row = `Ok(Deleted)`).
+    /// Default impl (mocks): `Deleted`.
+    async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
+        Ok(DeleteHostOutcome::Deleted)
     }
 
     /// ADR 0016 Phase B commit 7 — restart-time rehydration source.
@@ -326,23 +510,27 @@ pub trait MetadataStore: Send + Sync {
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
     /// Record a heartbeat from `host_id`: bump `last_heartbeat_at` to
-    /// NOW(), set `status`, and persist `capacity` so cross-pod
-    /// `/api/hosts` reads stay consistent (the in-memory
-    /// `host_registry` only knows about hosts whose WS connects to
-    /// *this* coord pod, so the API view has to fall back to
-    /// Postgres for any host owned by a sibling). Distinct from
-    /// `set_host_status` because drain/dead transitions imply
-    /// nothing about liveness and must not refresh the dead-host
-    /// detector's timestamp. The WS dialer's heartbeat handler is
-    /// the only caller; in `--mode=all` the in-process timer calls
-    /// `upsert_host` instead.
-    async fn touch_host_heartbeat(
-        &self,
-        id: HostId,
-        status: HostStatus,
-        capacity: HostCapacity,
-        utilization: HostUtilization,
-    ) -> Result<(), MetaError>;
+    /// NOW(), set the host-reported `status`, and persist the full
+    /// [`HostHeartbeat`] payload — capacity, utilization, and (ADR
+    /// 0047) the scheduling state that used to live only in the
+    /// per-pod in-memory mirror: `ready_images`, `local_snapshots`,
+    /// `current_bundles`, `total_vcpus`. This is the single
+    /// per-heartbeat `hosts` UPDATE; every coordinator replica
+    /// schedules from these columns. Deliberately does NOT touch
+    /// `cordoned` (coordinator-owned; see `set_host_cordoned`).
+    /// Distinct from `set_host_status` because drain/dead transitions
+    /// imply nothing about liveness and must not refresh the
+    /// dead-host detector's timestamp.
+    async fn touch_host_heartbeat(&self, id: HostId, hb: HostHeartbeat) -> Result<(), MetaError>;
+
+    /// ADR 0047: flip the coordinator-owned `hosts.cordoned` bit.
+    /// Written only by the admin cordon/uncordon endpoints and the
+    /// ADR 0048 scale-down wave driver; heartbeats never touch it, so
+    /// a cordon survives until an explicit uncordon. Returns
+    /// `MetaError::NotFound` when no row exists — but succeeds for a
+    /// host that has a row yet no live connection (wave-cordon during
+    /// pod churn must stick).
+    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError>;
 
     /// List hosts whose `last_heartbeat_at` is older than `threshold_secs`
     /// AND whose status is `Ready`. The dead-host detector polls this every

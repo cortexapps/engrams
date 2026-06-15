@@ -151,7 +151,15 @@ spec:
             - {name: dev, mountPath: /dev}
             # firecracker + vmlinux, staged by the init container (GAP 2)
             - {name: engram-assets, mountPath: /opt/engram}
-            - {name: work, mountPath: /var/lib/engram}
+            # ADR 0045 D3: node-prep mounts the base-shm tmpfs at
+            # /var/lib/engram/shm in the HOST mount namespace *after* this
+            # container may have started. Without HostToContainer
+            # propagation, that mount never appears in the host-agent's
+            # view — it sees plain ext4 at /shm and FC's shmem-only UFFD
+            # MINOR-fault restore fails to register ("System error").
+            # Long-lived nodes hid this (the agent restarted after the
+            # mount existed); a freshly-booted node loses the race.
+            - {name: work, mountPath: /var/lib/engram, mountPropagation: HostToContainer}
             - {name: cgroup, mountPath: /sys/fs/cgroup}
       volumes:
         - {name: dev, hostPath: {path: /dev, type: Directory}}

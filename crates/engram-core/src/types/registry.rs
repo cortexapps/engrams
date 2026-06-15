@@ -149,6 +149,20 @@ impl From<RegistryCredential> for RegistryCredentialSummary {
 /// supplied, read once per resume, deleted via the table's
 /// `ON DELETE CASCADE` on `sessions(id)`. The coordinator never
 /// echoes the row in any list endpoint.
+/// ADR 0047: the per-session credential-broker token, KEK-sealed (same
+/// envelope shape as [`SessionSecrets`]). Minted exactly once per
+/// session; any coordinator replica unseals it to authorize a guest
+/// forge/upload request or to re-inject the env. Deleted at terminal
+/// transition (plus the table's `ON DELETE CASCADE`).
+#[derive(Clone, Debug)]
+pub struct SessionBrokerToken {
+    pub session_id: crate::SessionId,
+    pub wrapped_dek: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub key_id: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionSecrets {
     pub session_id: crate::SessionId,

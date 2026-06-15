@@ -57,6 +57,13 @@ unsafe_code = "forbid"
 # feature since the operator is the sole consumer.
 kube = { version = "0.99", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
 k8s-openapi = { version = "0.24", features = ["latest"] }
+# ADR 0045 C2: peer page-channel payload compression. Pure Rust on
+# purpose — the uffd-handler's musl build must not grow a C dep.
+lz4_flex = "0.11"
+# v4: blake3 for the page-channel wire integrity — cryptographic at
+# ~1-2 GB/s WITHOUT hardware support (the fleet has no SHA-NI; soft
+# sha256 of the payload was ~1.2 ms per serve, the dominant encode leg).
+blake3 = "1"
 # schemars is required by kube's CustomResource derive (CRD schema gen).
 schemars = "0.8"
 # internal
@@ -98,6 +105,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3"
+# Lever 3 (ADR 0045 C2 restore tail): netlink-first netns provisioning —
+# the ~14 ip/iptables subprocess spawns were ~90-95ms of every sandbox
+# boot AND the teleport dest pipeline.
+rtnetlink = "0.21"
 bytes = "1"
 pin-project-lite = "0.2"
 base64 = "0.22"

@@ -86,10 +86,15 @@ storage:
   chunkCacheBudgetBytes: ""   # "" => host-agent default (200 GiB)
 
 nbd:
-  # Comma-separated /dev/nbdN the host-agent serves. Empty => file-mode
-  # (no NBD). node-prep loads the module with nbdsMax slots.
-  devices: "/dev/nbd0,/dev/nbd1,/dev/nbd2,/dev/nbd3"
+  # ADR 0049: warm-pool slot allocator. node-prep loads the nbd module
+  # with `nbdsMax` devices (`modprobe nbd nbds_max=<N>`); the host-agent
+  # sizes its slot pool from the kernel's nbds_max (capped at this same
+  # value) and keeps `warmSlots` pre-validated slots ready for an O(1)
+  # `acquire()`. Total is overridable per deployment — a dense fleet
+  # (engrams-internal) runs nbdsMax: 4096. Set nbdsMax: 0 to disable NBD
+  # (materialize-to-file fallback).
   nbdsMax: 64
+  warmSlots: 64
 
 nodePrep:
   enabled: true
@@ -132,9 +137,16 @@ operator:
     tag: main
     pullPolicy: IfNotPresent
   logLevel: info
+  # ADR 0048: the operator's OWN ServiceAccount annotations — the Workload
+  # Identity binding for `scaler: gke` (a GSA with nodePool/instanceGroupManager
+  # perms). Distinct from the top-level `serviceAccount` (the host-agent's
+  # engram-fc-host). Empty for noop/dev.
+  serviceAccount:
+    annotations: {}
+    # e.g.: iam.gke.io/gcp-service-account: engram-host-operator@<project>.iam.gserviceaccount.com
   # ADR 0044 K4: node-pool scaler. `noop` logs the desired size only; `gke`
   # resizes a GKE pool via the Container API + Workload Identity (the operator
-  # GSA needs container.clusters.update). New clouds add their own value.
+  # GSA needs container.nodePools.update + compute.instanceGroupManagers.update).
   scaler: noop          # noop | gke
   # Render a HostFleet CR for this release's host-agent DaemonSet (the common
   # case). Set false to manage the CR out-of-band.
@@ -153,15 +165,22 @@ operator:
   # kvm nodes (default: schedule anywhere untainted).
   nodeSelector: {}
 
-  # ADR 0044 K4: node-pool autoscaling. The operator reads coordinator demand
-  # and sizes the host node pool to hold targetFreeMib of headroom (scale-up
-  # only in v1; drain-gated scale-down is a follow-up). The operator's default
-  # scaler is a noop that only LOGS the desired size — a GKE actuator is the
-  # follow-up, so enabling this today gives you the decision in logs, not a
-  # live resize.
+  # ADR 0044 K4 + ADR 0048: node-pool autoscaling. The operator reads
+  # coordinator demand and sizes the host node pool — scale-UP via set_size
+  # (2D + queue-aware, one-shot), scale-DOWN via the teleport-packed wave
+  # (drain the least-loaded nodes onto peers, then remove them). The default
+  # scaler (ENGRAM_NODE_POOL_SCALER unset) is a NOOP that only LOGS decisions;
+  # set it to "gke" (operator.scaler below) to actuate a real GKE pool.
   autoscaling:
     enabled: false
     nodePool: ""           # the cloud node pool the scaler resizes
     minHosts: 1            # set >= 1 (an empty fleet has no demand signal)
     maxHosts: 10
     targetFreeMib: 16384   # keep ~16 GiB of free guest-RAM headroom
+    # ADR 0048 scale-DOWN. off (default) = scale-up only. idleOnly sheds only
+    # fully-idle hosts; aggressive teleport-packs live sessions off the
+    # least-loaded hosts. The wave is bounded by the two caps below.
+    scaleDown: "off"
+    scaleDownHysteresisTicks: 3  # enter scale-down only after N agreeing ticks
+    maxShedPerWave: 1            # most victim nodes per wave
+    maxConcurrentDrains: 1       # most victims drained at once within a tick

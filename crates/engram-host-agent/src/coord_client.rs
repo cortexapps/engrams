@@ -497,6 +497,11 @@ pub struct HeartbeatRequest {
     /// coord that predates the field.
     #[serde(default)]
     pub utilization: engram_core::types::host::HostUtilization,
+    /// ADR 0048: this host's core count — the basis of the
+    /// coordinator's CPU packing budget (`total_vcpus × overcommit`).
+    /// `#[serde(default)]` for interop both ways (0 = unknown).
+    #[serde(default)]
+    pub total_vcpus: u32,
 }
 
 #[derive(Deserialize)]
@@ -671,6 +676,7 @@ mod tests {
                 sha256: "ff00".into(),
             }],
             utilization: Default::default(),
+            total_vcpus: 0,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");

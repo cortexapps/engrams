@@ -40,6 +40,11 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         created_at,
         last_active_at,
         live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
+        // ADR 0039 identity metadata — persisted on the row, surfaced on the
+        // wire via SessionListItem.owner_* (not the bare Session). Dropped here.
+        harness_secret_id: _,
+        user_email: _,
+        user_name: _,
     } = s;
     app::Session {
         id: id.to_string(),
@@ -110,14 +115,17 @@ pub(crate) fn list_sessions_to_proto(resp: ListSessionsResponse) -> app::ListSes
 pub(crate) fn create_request_from_proto(
     r: app::CreateSessionRequest,
 ) -> Result<CreateSessionRequest, ApiError> {
-    // Totality guard: destructure ALL proto fields. `harness_secret_id` is
-    // handled at the RPC layer (Task 13: wired via SecretService injection);
-    // bind it as `_` here to acknowledge the drop.
+    // Totality guard: destructure ALL proto fields. The identity metadata
+    // (`harness_secret_id`, `user_email`, `user_name`) is handled at the RPC
+    // layer — it becomes a `SessionIdentity` persisted on the session and
+    // re-applied on resume — so bind those as `_` here to acknowledge the drop.
     let app::CreateSessionRequest {
         image_uri,
         mode,
         prompt,
-        harness_secret_id: _, // Handled at RPC layer (Task 13: SecretService harness injection).
+        harness_secret_id: _, // Handled at RPC layer (SessionIdentity).
+        user_email: _,        // Handled at RPC layer (SessionIdentity).
+        user_name: _,         // Handled at RPC layer (SessionIdentity).
         secrets,
     } = r;
     let mode = match mode.as_str() {
@@ -282,6 +290,7 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         id,
         hostname,
         status,
+        cordoned,
         capacity_total_mib,
         capacity_used_mib,
         running_sandboxes,
@@ -293,12 +302,20 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_mem_total_mib,
         util_mem_used_mib,
         util_cpu_pct,
+        allocatable_mib,
+        reserved_mib,
+        free_mib,
+        total_vcpus,
+        cpu_budget_vcpus,
+        reserved_vcpus,
+        free_vcpus,
         last_heartbeat_at,
     } = v;
     app::HostView {
         id: id.to_string(),
         hostname: hostname.clone(),
         status: status.to_string(),
+        cordoned: *cordoned,
         capacity_total_mib: *capacity_total_mib,
         capacity_used_mib: *capacity_used_mib,
         running_sandboxes: *running_sandboxes,
@@ -310,6 +327,13 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_mem_total_mib: *util_mem_total_mib,
         util_mem_used_mib: *util_mem_used_mib,
         util_cpu_pct: *util_cpu_pct,
+        allocatable_mib: *allocatable_mib,
+        reserved_mib: *reserved_mib,
+        free_mib: *free_mib,
+        total_vcpus: *total_vcpus,
+        cpu_budget_vcpus: *cpu_budget_vcpus,
+        reserved_vcpus: *reserved_vcpus,
+        free_vcpus: *free_vcpus,
         last_heartbeat_at: last_heartbeat_at.to_rfc3339(),
     }
 }
@@ -613,6 +637,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         }
     }
 

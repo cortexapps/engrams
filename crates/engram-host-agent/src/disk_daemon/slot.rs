@@ -1,80 +1,127 @@
-//! `/dev/nbdN` slot allocator.
+//! `/dev/nbdN` slot allocator with a warm pool.
 //!
 //! The Linux kernel exposes a fixed number of NBD devices
-//! (`/dev/nbd0`..`/dev/nbdN`) sized by the `nbds_max` module
-//! parameter at `modprobe` time. The host-agent treats them as a
-//! pool: each FC sandbox grabs a slot at create time, holds it for
-//! the VM's lifetime, and returns it on destroy.
+//! (`/dev/nbd0`..`/dev/nbd{nbds_max-1}`) sized by the `nbds_max`
+//! module parameter at `modprobe` time. The host-agent treats them
+//! as a pool: each FC sandbox grabs a slot at restore time, holds it
+//! for the VM's lifetime, and returns it on destroy.
 //!
-//! Allocator semantics:
+//! ## Why a warm pool (ADR 0049)
 //!
-//! - **Free list** is the source of truth. On `acquire()`, pop one
-//!   path. On `release(path)`, push it back. No reference counting
-//!   — each path is held by exactly one sandbox at a time.
-//! - **Async-friendly**. `acquire()` is async because under
-//!   pressure (more sandboxes than slots) callers need to wait
-//!   rather than fail. Wrapping a `tokio::sync::Mutex` + a
-//!   `Notify` makes the wait wake-up explicit.
-//! - **No automatic device-file probing.** Operators populate the
-//!   pool explicitly with the paths they want available — that
-//!   way an accidental `/dev/nbd17` (outside the configured
-//!   `nbds_max`) can't sneak in.
+//! The original allocator held an explicit free-list of device paths
+//! and, on every `acquire()`, scanned the list calling a `/sys`
+//! `stat` per slot to skip kernel-busy devices, sleeping-and-retrying
+//! when the (small) pool was exhausted. Under a same-image burst —
+//! many sessions restoring at once on one host — that pool (16 slots
+//! in prod) exhausted instantly, every `acquire()` did O(slots)
+//! syscalls, and restores blocked in the sleep-retry loop holding
+//! their reservation. The fleet wedged.
 //!
-//! Production wiring: the host-agent's startup reads
-//! `ENGRAM_NBD_DEVICES=/dev/nbd0,/dev/nbd1,...` (env var; defaults
-//! to empty) and instantiates one `NbdSlotAllocator` from that
-//! list. The Packer manifest loads the `nbd` kernel module with
-//! `nbds_max` matching.
+//! This allocator mirrors E2B's `DevicePool`:
+//!
+//! - **Bitset over `0..max`.** Slots are tracked by a reserved bit,
+//!   not an enumerated path list — so the universe can be thousands
+//!   of devices cheaply (`modprobe nbd nbds_max=4096`).
+//! - **Warm pool.** A background populator keeps up to `warm_target`
+//!   *pre-validated* free slots ready in a queue. `acquire()` is an
+//!   O(1) pop with **zero hot-path syscalls** — the populator already
+//!   paid the `/sys` free-check.
+//! - **Sturdier free-check.** A device is free iff `/sys/block/nbdN/pid`
+//!   is absent AND `/sys/block/nbdN/size == 0` (two signals, like
+//!   E2B), so a half-torn-down device is never handed out.
+//!
+//! ## Wiring
+//!
+//! Production builds the pool from the kernel's `nbds_max` via
+//! [`build_from_kernel`]; the chart sets `modprobe nbd
+//! nbds_max=<N>` and the matching `ENGRAM_NBD_MAX_SLOTS` /
+//! `ENGRAM_NBD_WARM_SLOTS`. The FC integration tests build a
+//! restricted pool over one specific device via [`NbdSlotAllocator::from_paths`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
-/// ADR 0017 Phase A: probe the kernel-side binding state of a
-/// `/dev/nbdN` device. Returns `true` iff `/sys/block/nbdN/pid`
-/// exists and has non-empty contents — the kernel's signal that
-/// the device is currently bound to an NBD daemon thread.
+/// Hard ceiling on the slot universe, bounding the bitset regardless
+/// of what `nbds_max` the kernel module loaded with. ADR 0049 / E2B
+/// parity — 4096 is "more than enough" headroom for the densest host.
+pub const MAX_SUPPORTED_SLOTS: u32 = 4096;
+
+/// Default number of pre-validated slots the populator keeps warm.
+/// `acquire()` is an O(1) pop off this pool. Overridable via
+/// `ENGRAM_NBD_WARM_SLOTS`.
+pub const DEFAULT_WARM_SLOTS: usize = 64;
+
+/// How long the populator naps when the warm pool is already full —
+/// the idle heartbeat. A released slot rejoins circulation within
+/// this bound.
+const POLL_IDLE: Duration = Duration::from_millis(100);
+/// How long the populator naps while actively refilling (warm pool
+/// below target). Short so a burst that drains the warm pool gets it
+/// topped back up promptly.
+const POLL_REFILL: Duration = Duration::from_millis(10);
+/// Fallback re-poll interval for `acquire()` when the warm pool is
+/// momentarily empty (burst outran the populator). The populator runs
+/// independently; this just bounds the wait if a wakeup is missed.
+const ACQUIRE_REPOLL: Duration = Duration::from_millis(20);
+
+/// Parse the device index out of a `/dev/nbdN` path. `None` if the
+/// path isn't a `nbd<digits>` device.
+fn parse_nbd_index(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("nbd")?
+        .parse()
+        .ok()
+}
+
+/// Device path for a slot index.
+fn slot_path(slot: u32) -> PathBuf {
+    PathBuf::from(format!("/dev/nbd{slot}"))
+}
+
+/// Kernel-truth free-check: a device is free iff `/sys/block/nbdN/pid`
+/// is absent AND `/sys/block/nbdN/size` reads `0`. The pid file is the
+/// kernel's "bound to an NBD thread" signal; size catches a device
+/// whose binding is mid-teardown (pid cleared, size not yet zeroed).
 ///
-/// Used by [`NbdSlotAllocator::acquire`] to skip slots whose
-/// kernel-side cleanup is still in flight (the destroy path's
-/// detached `kernel_thread.join()` hasn't completed yet) AND
-/// slots whose bound PID is dead but the kernel hasn't released
-/// (the Phase B startup-cleanup target). Both cases produce a
-/// non-empty pid file; the probe treats them identically: skip
-/// for now, re-probe later.
-///
-/// On non-Linux platforms (macOS dev), `/sys/block` doesn't
-/// exist; the probe returns `false` (not busy) so the in-process
-/// slot pool used by tests on Mac stays functional.
-fn nbd_kernel_busy(path: &Path) -> bool {
+/// On non-Linux (macOS dev) `/sys` doesn't exist, so the real probe is
+/// never used there — production builds the pool only when the kernel
+/// `nbds_max` is readable, and unit tests inject a fake.
+fn device_is_free(slot: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        if Path::new(&format!("/sys/block/nbd{slot}/pid")).exists() {
             return false;
-        };
-        let pid_path = format!("/sys/block/{name}/pid");
-        match std::fs::read_to_string(&pid_path) {
-            Ok(s) => !s.trim().is_empty(),
-            // ENOENT: device has never been bound (or the kernel
-            // released the binding). Either way, not busy from our
-            // perspective.
+        }
+        match std::fs::read_to_string(format!("/sys/block/nbd{slot}/size")) {
+            Ok(s) => s.trim() == "0",
+            // Size unreadable → be conservative, treat as not free so
+            // the populator skips and re-checks rather than handing out
+            // a device in an unknown state.
             Err(_) => false,
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = path;
-        false
+        let _ = slot;
+        true
     }
 }
 
-/// Lease handle for one `/dev/nbdN` slot. Auto-returns the slot to
-/// the allocator on `Drop` — sandboxes hold one of these for the
-/// lifetime of their NBD daemon and the lease's drop is what
-/// releases the slot back into the pool.
+/// Injectable free-check (real `/sys` probe in prod; a fake in unit
+/// tests so the allocator is exercisable off-Linux).
+type FreeCheck = Arc<dyn Fn(u32) -> bool + Send + Sync>;
+
+/// Lease handle for one `/dev/nbdN` slot. Auto-returns the slot to the
+/// allocator on `Drop` — a sandbox holds one for the lifetime of its
+/// NBD daemon, and the lease's drop releases the slot back into the
+/// pool.
 pub struct NbdSlot {
+    slot: u32,
     path: PathBuf,
     allocator: Arc<NbdSlotAllocator>,
 }
@@ -93,258 +140,499 @@ impl std::fmt::Debug for NbdSlot {
 
 impl Drop for NbdSlot {
     fn drop(&mut self) {
-        let path = std::mem::take(&mut self.path);
+        let slot = self.slot;
         let allocator = self.allocator.clone();
-        // Spawn a small blocking-task-free release: locking is
-        // synchronous via try_lock_owned would be cleaner, but
-        // tokio's Mutex needs async. Spawn so the Drop doesn't
-        // block on a busy lock. Fire-and-forget is safe because
-        // the path is unique per slot and release is idempotent
-        // at the allocator level.
+        // Fire-and-forget release: clears the reserved bit so the
+        // populator can re-validate and re-warm the slot. Spawned so
+        // Drop never blocks on the lock.
         tokio::spawn(async move {
-            allocator.release(path).await;
+            allocator.release(slot).await;
         });
     }
 }
 
-/// Pool of `/dev/nbdN` device paths. Cheap to clone via `Arc`.
+/// Reserved-slot bookkeeping. `universe` is the set of device indices
+/// this pool may hand out (`0..max` in prod; a single device in FC
+/// tests); `reserved[i]` tracks whether `universe[i]` is currently
+/// warm-waiting or handed out.
 #[derive(Debug)]
+struct Inner {
+    universe: Vec<u32>,
+    pos_of: HashMap<u32, usize>,
+    reserved: Vec<bool>,
+    cursor: usize,
+    reserved_count: usize,
+}
+
+impl Inner {
+    /// Reserve the next free slot scanning forward from the cursor.
+    /// Returns the device index, or `None` if every slot is reserved.
+    fn reserve_next(&mut self) -> Option<u32> {
+        let n = self.universe.len();
+        if n == 0 {
+            return None;
+        }
+        for _ in 0..n {
+            let pos = self.cursor;
+            self.cursor = (self.cursor + 1) % n;
+            if !self.reserved[pos] {
+                self.reserved[pos] = true;
+                self.reserved_count += 1;
+                return Some(self.universe[pos]);
+            }
+        }
+        None
+    }
+
+    /// Reserve a SPECIFIC device index (survivor-rehydrate path).
+    /// `false` if it's not in this pool or already reserved.
+    fn reserve_specific(&mut self, slot: u32) -> bool {
+        let Some(&pos) = self.pos_of.get(&slot) else {
+            return false;
+        };
+        if self.reserved[pos] {
+            return false;
+        }
+        self.reserved[pos] = true;
+        self.reserved_count += 1;
+        true
+    }
+
+    fn unreserve(&mut self, slot: u32) {
+        if let Some(&pos) = self.pos_of.get(&slot) {
+            if self.reserved[pos] {
+                self.reserved[pos] = false;
+                self.reserved_count -= 1;
+            }
+        }
+    }
+}
+
+/// Pool of `/dev/nbdN` device slots with a warm-pool front. Cheap to
+/// clone via `Arc`.
 pub struct NbdSlotAllocator {
-    free: Mutex<VecDeque<PathBuf>>,
-    notify: Notify,
+    inner: Mutex<Inner>,
+    /// Pre-validated slots ready for O(1) handout.
+    warm: Mutex<VecDeque<u32>>,
+    warm_target: usize,
+    /// Total universe size — constant after construction, so kept out
+    /// of the mutex for a lock-free `capacity()`.
     capacity: usize,
+    free_check: FreeCheck,
+}
+
+impl std::fmt::Debug for NbdSlotAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NbdSlotAllocator")
+            .field("warm_target", &self.warm_target)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NbdSlotAllocator {
-    /// Build from a list of device paths. Each path is checked for
-    /// uniqueness; duplicates are rejected loud so a misconfigured
-    /// operator can't accidentally double-allocate the same
-    /// device.
-    pub fn from_paths(paths: Vec<PathBuf>) -> Result<Arc<Self>, String> {
-        let mut seen = std::collections::HashSet::new();
-        for p in &paths {
-            if !seen.insert(p.clone()) {
-                return Err(format!(
-                    "duplicate NBD device path in pool: {}",
-                    p.display()
-                ));
-            }
-        }
-        let capacity = paths.len();
-        Ok(Arc::new(Self {
-            free: Mutex::new(paths.into()),
-            notify: Notify::new(),
-            capacity,
-        }))
+    /// Production constructor: a contiguous universe `0..max_devices`,
+    /// the real `/sys` free-check, `warm_target` warm slots. Spawns
+    /// the background populator.
+    pub fn with_capacity(max_devices: u32, warm_target: usize) -> Arc<Self> {
+        let universe: Vec<u32> = (0..max_devices).collect();
+        Self::build(universe, warm_target, Arc::new(device_is_free))
     }
 
-    /// Total slot count. Useful for telemetry / capacity reports.
+    /// Build a pool restricted to a specific set of device paths — the
+    /// FC integration tests (which reserve one real `/dev/nbdN`) and
+    /// the survivor-rehydrate harness. Duplicate / non-`nbdN` paths are
+    /// rejected loud. `warm_target` defaults to the universe size so a
+    /// single-device test pool keeps its device warm.
+    pub fn from_paths(paths: Vec<PathBuf>) -> Result<Arc<Self>, String> {
+        let mut universe = Vec::with_capacity(paths.len());
+        let mut seen = std::collections::HashSet::new();
+        for p in &paths {
+            let idx = parse_nbd_index(p)
+                .ok_or_else(|| format!("not a /dev/nbdN device path: {}", p.display()))?;
+            if !seen.insert(idx) {
+                return Err(format!("duplicate NBD device in pool: {}", p.display()));
+            }
+            universe.push(idx);
+        }
+        let warm = universe.len();
+        Ok(Self::build(universe, warm, Arc::new(device_is_free)))
+    }
+
+    fn build(universe: Vec<u32>, warm_target: usize, free_check: FreeCheck) -> Arc<Self> {
+        let pos_of = universe
+            .iter()
+            .enumerate()
+            .map(|(i, &slot)| (slot, i))
+            .collect();
+        let reserved = vec![false; universe.len()];
+        let capacity = universe.len();
+        let warm_target = warm_target.min(capacity);
+        let me = Arc::new(Self {
+            inner: Mutex::new(Inner {
+                universe,
+                pos_of,
+                reserved,
+                cursor: 0,
+                reserved_count: 0,
+            }),
+            warm: Mutex::new(VecDeque::with_capacity(warm_target)),
+            warm_target,
+            capacity,
+            free_check,
+        });
+        // The populator holds only a Weak ref so the allocator can drop
+        // naturally (dropping the last Arc stops the populator on its
+        // next tick).
+        let weak = Arc::downgrade(&me);
+        tokio::spawn(async move { populate(weak).await });
+        me
+    }
+
+    /// Total slot count in this pool's universe. Constant; lock-free.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Wait for + claim a free slot. Returns immediately when the
-    /// pool has a free path; otherwise sleeps until a sibling
-    /// sandbox releases one.
-    ///
-    /// ADR 0017 Phase A: before handing out a path, probe its
-    /// kernel-side `/sys/block/nbdN/pid` to confirm the device is
-    /// actually free. The destroy path detaches the
-    /// kernel-thread join into a `std::thread::spawn` so the
-    /// destroy RPC returns immediately, but the kernel side may
-    /// still be cleaning up when the slot returns to the pool.
-    /// Without this probe, a fast re-acquire would hand out a
-    /// path whose `NBD_SET_SOCK` fails with EBUSY.
-    ///
-    /// The probe is best-effort: a missing `/sys/block/nbdN/pid`
-    /// is treated as "not busy" (matches kernel semantics when
-    /// the device has never been bound). On macOS the cfg-gated
-    /// no-op path is used; the slot pool is target-agnostic
-    /// but the probe is Linux-only.
+    /// Wait for + claim a free slot. Pops a pre-validated slot off the
+    /// warm pool (O(1), no syscall). If the warm pool is momentarily
+    /// empty (a burst outran the populator), re-polls until one is
+    /// ready — the populator refills concurrently.
     pub async fn acquire(self: &Arc<Self>) -> NbdSlot {
         loop {
-            {
-                let mut free = self.free.lock().await;
-                let initial_len = free.len();
-                let mut probed = 0usize;
-                // Rotate-and-probe: pop, check kernel-busy, push to
-                // back if busy and continue. Bounded by the deque
-                // length so we don't spin forever when every slot
-                // is kernel-busy.
-                while let Some(path) = free.pop_front() {
-                    if !nbd_kernel_busy(&path) {
-                        return NbdSlot {
-                            path,
-                            allocator: self.clone(),
-                        };
-                    }
-                    tracing::debug!(
-                        device = %path.display(),
-                        "NBD slot kernel-busy (/sys/block/.../pid populated); skipping",
-                    );
-                    free.push_back(path);
-                    probed += 1;
-                    if probed >= initial_len {
-                        // Cycled through every slot in the deque,
-                        // all busy. Fall through to the wait below.
-                        break;
-                    }
-                }
+            if let Some(slot) = self.warm.lock().await.pop_front() {
+                return NbdSlot {
+                    slot,
+                    path: slot_path(slot),
+                    allocator: self.clone(),
+                };
             }
-            // Lock dropped before await: standard tokio Notify
-            // pattern. `notified()` registers interest BEFORE the
-            // re-check, so a release-then-wait race can't miss a
-            // wakeup.
-            //
-            // Wake sources: another sandbox's NbdSlot::Drop fires
-            // a release; OR a slot's kernel-busy state clears and
-            // a separate caller re-probes it. The second source is
-            // best-effort — kernel state isn't observable as an
-            // event, so we just rely on the next caller's probe
-            // to pick up the cleared slot. To avoid permanent
-            // wait when only that path opens, periodic re-probe
-            // happens via tokio::time::sleep + retry — short
-            // timeout so a freshly-cleared kernel-stuck slot gets
-            // picked up within seconds, not minutes.
-            tokio::select! {
-                _ = self.notify.notified() => {},
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
-            }
+            tokio::time::sleep(ACQUIRE_REPOLL).await;
         }
     }
 
-    /// Claim a SPECIFIC device out of the pool — the survivor-
-    /// rehydrate path, where the kernel already serves the device
-    /// under a surviving FC and the new host-agent generation must
-    /// take ownership of exactly that slot (then RECONFIGURE it)
-    /// rather than acquire a fresh one. Deliberately skips the
-    /// kernel-busy probe: a survivor's device is busy BY DESIGN.
+    /// Claim a SPECIFIC device — the survivor-rehydrate path, where the
+    /// kernel already serves the device under a surviving FC and the
+    /// new host-agent generation must take ownership of exactly that
+    /// slot (then RECONFIGURE it) rather than acquire a fresh one.
+    /// Deliberately skips the free-check: a survivor's device is busy
+    /// BY DESIGN.
     ///
-    /// `None` if the path isn't in the free list (not part of this
-    /// pool, or already held by another lease).
+    /// `None` if the device isn't in this pool, or is already reserved
+    /// by another lease (pulling it out of the warm pool if it happens
+    /// to be sitting there pre-validated).
     pub async fn claim(self: &Arc<Self>, path: &Path) -> Option<NbdSlot> {
-        let mut free = self.free.lock().await;
-        let pos = free.iter().position(|p| p == path)?;
-        let path = free.remove(pos)?;
+        let slot = parse_nbd_index(path)?;
+        let mut inner = self.inner.lock().await;
+        if inner.reserve_specific(slot) {
+            return Some(NbdSlot {
+                slot,
+                path: slot_path(slot),
+                allocator: self.clone(),
+            });
+        }
+        // Already reserved — it may be sitting warm (validated free,
+        // not yet handed out). Pull it from the warm pool and hand it
+        // out, keeping the reserved bit set.
+        drop(inner);
+        let mut warm = self.warm.lock().await;
+        let pos = warm.iter().position(|&s| s == slot)?;
+        warm.remove(pos);
         Some(NbdSlot {
-            path,
+            slot,
+            path: slot_path(slot),
             allocator: self.clone(),
         })
     }
 
-    /// Snapshot of the currently-free device paths. Used by the
-    /// post-rehydrate startup recovery to scope its stale-binding
-    /// sweep to slots NOT claimed by surviving sandboxes.
+    /// Snapshot of the device paths NOT currently reserved. The
+    /// post-rehydrate startup recovery scopes its stale-binding sweep
+    /// to these (a survivor's claimed device is reserved, so it's never
+    /// swept). With a large universe this is a one-time, off-runtime
+    /// (`spawn_blocking`) scan.
     pub async fn free_paths(&self) -> Vec<PathBuf> {
-        self.free.lock().await.iter().cloned().collect()
+        let inner = self.inner.lock().await;
+        inner
+            .reserved
+            .iter()
+            .enumerate()
+            .filter(|(_, &r)| !r)
+            .map(|(i, _)| slot_path(inner.universe[i]))
+            .collect()
     }
 
-    /// Return a path to the pool. Wakes one waiter (if any).
-    /// `Drop` on `NbdSlot` calls this; direct callers shouldn't
-    /// need to.
-    async fn release(&self, path: PathBuf) {
-        let mut free = self.free.lock().await;
-        free.push_back(path);
-        self.notify.notify_one();
+    /// Return a slot to the pool. Clears the reserved bit; the
+    /// populator re-validates (free-check) before re-warming, so a
+    /// still-tearing-down device is skipped until truly free.
+    async fn release(&self, slot: u32) {
+        self.inner.lock().await.unreserve(slot);
     }
 
-    /// Current count of free slots. Cheap snapshot for heartbeat
-    /// telemetry; not part of the acquisition critical path.
+    /// Count of slots neither warm-waiting nor handed out — i.e. still
+    /// available to be warmed. Cheap snapshot for heartbeat telemetry.
     pub async fn free_count(&self) -> usize {
-        self.free.lock().await.len()
+        let inner = self.inner.lock().await;
+        inner.universe.len() - inner.reserved_count
+    }
+
+    /// Count of pre-validated slots currently sitting warm. Telemetry.
+    pub async fn warm_count(&self) -> usize {
+        self.warm.lock().await.len()
+    }
+}
+
+/// Read the kernel's `nbds_max` — the count of `/dev/nbdN` devices the
+/// `nbd` module created at load. `None` if the module isn't loaded
+/// (macOS dev, or a host that never ran `modprobe nbd`).
+fn kernel_nbds_max() -> Option<u32> {
+    std::fs::read_to_string("/sys/module/nbd/parameters/nbds_max")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Build the production NBD slot pool from the kernel's `nbds_max`,
+/// capped at [`MAX_SUPPORTED_SLOTS`] and the optional
+/// `ENGRAM_NBD_MAX_SLOTS` override, keeping `ENGRAM_NBD_WARM_SLOTS`
+/// slots warm (default [`DEFAULT_WARM_SLOTS`]).
+///
+/// `None` — selecting the materialize-to-file fallback — when the nbd
+/// module isn't loaded or `ENGRAM_NBD_DISABLE` is set. Must be called
+/// from within a Tokio runtime (spawns the populator).
+pub fn build_from_kernel() -> Option<Arc<NbdSlotAllocator>> {
+    if std::env::var_os("ENGRAM_NBD_DISABLE").is_some() {
+        tracing::info!("ENGRAM_NBD_DISABLE set; NBD daemon off (materialize-to-file)");
+        return None;
+    }
+    let kernel = kernel_nbds_max()?;
+    let env_cap = std::env::var("ENGRAM_NBD_MAX_SLOTS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(MAX_SUPPORTED_SLOTS);
+    let max = kernel.min(env_cap).min(MAX_SUPPORTED_SLOTS);
+    if max == 0 {
+        tracing::warn!("kernel nbds_max is 0; NBD daemon off (materialize-to-file)");
+        return None;
+    }
+    let warm = std::env::var("ENGRAM_NBD_WARM_SLOTS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_WARM_SLOTS)
+        .clamp(1, max as usize);
+    tracing::info!(
+        slots = max,
+        warm_slots = warm,
+        kernel_nbds_max = kernel,
+        "NBD daemon enabled (ADR 0049 warm-pool allocator); chunked rootfs serves /dev/nbdN",
+    );
+    Some(NbdSlotAllocator::with_capacity(max, warm))
+}
+
+/// Background populator: keeps the warm pool topped up to
+/// `warm_target` with pre-validated free slots. Holds a `Weak` so the
+/// allocator drops when its last `Arc` does; the loop then exits.
+async fn populate(weak: Weak<NbdSlotAllocator>) {
+    loop {
+        let Some(me) = weak.upgrade() else {
+            return;
+        };
+
+        // Top up the warm pool without blocking: reserve a slot,
+        // validate it against the kernel, push it warm. Bounded to one
+        // pass over the universe so a cluster of permanently-busy slots
+        // (e.g. survivors, when warm_target exceeds the free count) can
+        // never hot-spin — we scan at most `capacity` slots, then nap.
+        let mut warmed = false;
+        let mut scanned = 0usize;
+        let budget = me.capacity.max(1);
+        loop {
+            if scanned >= budget || me.warm.lock().await.len() >= me.warm_target {
+                break;
+            }
+            scanned += 1;
+            let Some(slot) = me.inner.lock().await.reserve_next() else {
+                // Every slot reserved (pool fully utilized). Nothing to
+                // warm right now.
+                break;
+            };
+            if (me.free_check)(slot) {
+                me.warm.lock().await.push_back(slot);
+                warmed = true;
+            } else {
+                // Busy (survivor / mid-teardown). Un-reserve so it isn't
+                // leaked; the cursor has already advanced past it, so the
+                // next pass won't immediately re-pick it.
+                me.inner.lock().await.unreserve(slot);
+            }
+        }
+
+        let full = me.warm.lock().await.len() >= me.warm_target;
+        drop(me);
+        // Nap long when steady (pool full) or stuck (nothing warmable);
+        // nap short while actively refilling after a drain.
+        let nap = if full || !warmed {
+            POLL_IDLE
+        } else {
+            POLL_REFILL
+        };
+        tokio::time::sleep(nap).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::Duration;
 
-    fn paths(n: usize) -> Vec<PathBuf> {
-        // ADR 0017 Phase A: `nbd_kernel_busy` probes `/sys/block/nbdN/pid`
-        // on Linux. Using real `/dev/nbdN` device names would make these
-        // tests host-dependent — a stuck NBD binding on dev-vm hangs
-        // `acquire()` indefinitely. Sentinel paths beneath `/dev/` that
-        // don't shadow a `/sys/block/` entry probe as "not busy" (the
-        // ENOENT branch in `nbd_kernel_busy`).
-        (0..n)
-            .map(|i| PathBuf::from(format!("/dev/test-fake-nbd-{i}")))
-            .collect()
+    /// Build a test pool over `0..n` with an injectable busy-set so the
+    /// allocator is exercisable off-Linux (no real `/sys`).
+    fn test_pool(
+        n: u32,
+        warm: usize,
+        busy: Arc<std::sync::Mutex<HashSet<u32>>>,
+    ) -> Arc<NbdSlotAllocator> {
+        let check_busy = busy.clone();
+        NbdSlotAllocator::build(
+            (0..n).collect(),
+            warm,
+            Arc::new(move |slot| !check_busy.lock().unwrap().contains(&slot)),
+        )
     }
 
-    #[tokio::test]
-    async fn acquires_each_slot_until_pool_empties() {
-        let pool = NbdSlotAllocator::from_paths(paths(3)).unwrap();
-        let s0 = pool.acquire().await;
-        let s1 = pool.acquire().await;
-        let s2 = pool.acquire().await;
-        assert_eq!(pool.free_count().await, 0);
-
-        // All three are distinct device paths.
-        let mut seen = std::collections::HashSet::new();
-        for s in [&s0, &s1, &s2] {
-            assert!(seen.insert(s.path().to_path_buf()));
-        }
-    }
-
-    #[tokio::test]
-    async fn release_wakes_pending_acquire() {
-        let pool = NbdSlotAllocator::from_paths(paths(1)).unwrap();
-        let first = pool.acquire().await;
-        // Second acquire should block; spawn it and assert it
-        // hasn't completed within a tight bound.
-        let pool2 = pool.clone();
-        let task = tokio::spawn(async move { pool2.acquire().await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            !task.is_finished(),
-            "second acquire must block while pool is full"
-        );
-
-        // Drop first → release → second completes.
-        drop(first);
-        let second = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("second acquire didn't wake within 1s")
-            .expect("acquire task panicked");
-        assert!(matches!(
-            second.path().to_str(),
-            Some("/dev/test-fake-nbd-0")
-        ));
-    }
-
-    #[tokio::test]
-    async fn drop_returns_path_to_pool() {
-        let pool = NbdSlotAllocator::from_paths(paths(1)).unwrap();
-        {
-            let _slot = pool.acquire().await;
-            assert_eq!(pool.free_count().await, 0);
-        }
-        // Drop is async via tokio::spawn — give it a moment to run.
-        for _ in 0..20 {
-            if pool.free_count().await == 1 {
+    async fn wait_warm(pool: &Arc<NbdSlotAllocator>, want: usize) {
+        for _ in 0..200 {
+            if pool.warm_count().await >= want {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("slot was not released back to the pool after drop");
-    }
-
-    #[test]
-    fn rejects_duplicate_paths_in_pool() {
-        let dup = vec![PathBuf::from("/dev/nbd0"), PathBuf::from("/dev/nbd0")];
-        let err = NbdSlotAllocator::from_paths(dup).unwrap_err();
-        assert!(err.contains("/dev/nbd0"));
+        panic!(
+            "warm pool never reached {want} (got {})",
+            pool.warm_count().await
+        );
     }
 
     #[tokio::test]
-    async fn capacity_reports_total_slot_count() {
-        let pool = NbdSlotAllocator::from_paths(paths(7)).unwrap();
-        assert_eq!(pool.capacity(), 7);
-        assert_eq!(pool.free_count().await, 7);
-        let _s = pool.acquire().await;
-        assert_eq!(pool.free_count().await, 6);
-        // capacity stays constant even after acquisition.
-        assert_eq!(pool.capacity(), 7);
+    async fn populator_warms_up_to_target() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(16, 4, busy);
+        wait_warm(&pool, 4).await;
+        // Warm pool caps at the target, not the universe.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(pool.warm_count().await, 4);
+        assert_eq!(pool.capacity(), 16);
+    }
+
+    #[tokio::test]
+    async fn acquire_hands_out_distinct_slots() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(8, 8, busy);
+        wait_warm(&pool, 8).await;
+        let mut seen = HashSet::new();
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let s = pool.acquire().await;
+            assert!(
+                seen.insert(s.path().to_path_buf()),
+                "duplicate slot handed out"
+            );
+            held.push(s);
+        }
+        assert_eq!(pool.free_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn drop_returns_slot_and_repopulates() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(1, 1, busy);
+        wait_warm(&pool, 1).await;
+        let s = pool.acquire().await;
+        assert_eq!(pool.free_count().await, 0);
+        let path = s.path().to_path_buf();
+        drop(s);
+        // Drop is async (spawned); the populator then re-warms it.
+        wait_warm(&pool, 1).await;
+        let s2 = pool.acquire().await;
+        assert_eq!(s2.path(), path);
+    }
+
+    #[tokio::test]
+    async fn acquire_blocks_until_a_slot_frees() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(1, 1, busy);
+        wait_warm(&pool, 1).await;
+        let first = pool.acquire().await;
+        let pool2 = pool.clone();
+        let task = tokio::spawn(async move { pool2.acquire().await });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !task.is_finished(),
+            "acquire must block while the pool is full"
+        );
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("blocked acquire didn't wake within 2s")
+            .expect("acquire task panicked");
+        assert_eq!(second.path(), Path::new("/dev/nbd0"));
+    }
+
+    #[tokio::test]
+    async fn populator_skips_busy_slots() {
+        // Mark slot 0 busy: the populator must warm 1 and 2, never 0.
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::from([0u32])));
+        let pool = test_pool(3, 3, busy.clone());
+        // Only 2 of 3 are free, so warm tops out at 2.
+        wait_warm(&pool, 2).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(pool.warm_count().await, 2);
+        let a = pool.acquire().await;
+        let b = pool.acquire().await;
+        let got: HashSet<_> = [a.path().to_path_buf(), b.path().to_path_buf()].into();
+        assert!(
+            !got.contains(Path::new("/dev/nbd0")),
+            "busy slot 0 was handed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_reserves_a_specific_device() {
+        // Slot 2 busy (survivor): claim must grab it even though the
+        // populator won't warm it.
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::from([2u32])));
+        let pool = test_pool(4, 4, busy);
+        let claimed = pool
+            .claim(Path::new("/dev/nbd2"))
+            .await
+            .expect("claim survivor");
+        assert_eq!(claimed.path(), Path::new("/dev/nbd2"));
+        // It's reserved now: acquiring the rest never yields nbd2.
+        wait_warm(&pool, 3).await;
+        for _ in 0..3 {
+            assert_ne!(pool.acquire().await.path(), Path::new("/dev/nbd2"));
+        }
+    }
+
+    #[tokio::test]
+    async fn from_paths_rejects_non_nbd_and_duplicates() {
+        assert!(NbdSlotAllocator::from_paths(vec![PathBuf::from("/dev/sda")]).is_err());
+        let dup = vec![PathBuf::from("/dev/nbd0"), PathBuf::from("/dev/nbd0")];
+        assert!(NbdSlotAllocator::from_paths(dup)
+            .unwrap_err()
+            .contains("/dev/nbd0"));
+    }
+
+    #[tokio::test]
+    async fn free_paths_excludes_reserved() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(4, 4, busy);
+        wait_warm(&pool, 4).await;
+        let held = pool.acquire().await;
+        let free = pool.free_paths().await;
+        assert!(
+            !free.contains(&held.path().to_path_buf()),
+            "held slot leaked into free_paths"
+        );
     }
 }

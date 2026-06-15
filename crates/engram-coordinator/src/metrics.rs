@@ -173,3 +173,16 @@ pub const FLEET_FREE_MIB: &str = "engram_fleet_free_mib";
 /// Gauge (ADR 0044 K4). Non-draining hosts the scheduler can place on — the
 /// schedulable fleet size the autoscaler drives toward demand.
 pub const FLEET_SCHEDULABLE_HOSTS: &str = "engram_fleet_schedulable_hosts";
+
+/// Gauge (ADR 0048). Sessions currently `queued` (waiting for capacity).
+/// A sustained nonzero value with a flat fleet size means the autoscaler
+/// isn't keeping up (or has hit maxHosts).
+pub const SESSIONS_QUEUED: &str = "engram_sessions_queued";
+
+/// Gauge (ADR 0048). Σ `mem_budget_mib` over queued sessions — the RAM the
+/// queue is waiting for; the operator scales the fleet to cover it.
+pub const SESSIONS_QUEUED_MIB: &str = "engram_sessions_queued_mib";
+
+/// Counter (ADR 0048). Queue-scanner per-session outcomes. Labels:
+/// `outcome` = `placed` / `requeued` / `failed` / `timeout`.
+pub const QUEUE_OUTCOME_TOTAL: &str = "engram_queue_outcome_total";

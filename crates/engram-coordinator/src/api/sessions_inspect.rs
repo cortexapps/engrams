@@ -224,6 +224,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         }
     }
 

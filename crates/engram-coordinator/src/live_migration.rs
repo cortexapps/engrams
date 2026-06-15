@@ -97,18 +97,26 @@ impl MigrationGateGuard {
     fn claim(source: Option<HostId>, dest: HostId, session: SessionId) -> Option<Self> {
         let mut claimed = Vec::new();
         for host in source.into_iter().chain([dest]) {
-            match MIGRATION_GATE.entry(host) {
+            // Compute the claim outcome and DROP the entry guard before
+            // any rollback `remove` — holding a shard lock across a
+            // `remove` of a host that hashes to the SAME shard
+            // self-deadlocks (DashMap shards are RwLocks; fewer shards
+            // on low-core CI made the collision a real hang).
+            let inserted = match MIGRATION_GATE.entry(host) {
                 dashmap::mapref::entry::Entry::Vacant(v) => {
                     v.insert(session);
-                    claimed.push(host);
+                    true
                 }
-                dashmap::mapref::entry::Entry::Occupied(_) => {
-                    // Roll back partial claims.
-                    for h in claimed {
-                        MIGRATION_GATE.remove(&h);
-                    }
-                    return None;
+                dashmap::mapref::entry::Entry::Occupied(_) => false,
+            };
+            if inserted {
+                claimed.push(host);
+            } else {
+                // Roll back partial claims — no entry guard held now.
+                for h in claimed {
+                    MIGRATION_GATE.remove(&h);
                 }
+                return None;
             }
         }
         Some(Self { hosts: claimed })
@@ -157,10 +165,14 @@ pub async fn migrate_session_live(
 
     // The destination must be takeable and the source addressable
     // before we freeze anything.
-    let (_, dest_backend) = state
-        .host_registry
-        .pick_specific_host(target_host_id, session.host_id)
-        .map_err(|e| MigrateError::Fatal(format!("target host can't take the session: {e:?}")))?;
+    let (_, dest_backend) = crate::placement::pick_specific_host(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        target_host_id,
+        session.host_id,
+    )
+    .await
+    .map_err(|e| MigrateError::Fatal(format!("target host can't take the session: {e:?}")))?;
     let source_addr = source_host_addr(state, session.host_id)
         .await
         .ok_or_else(|| {
@@ -325,7 +337,15 @@ pub async fn migrate_session_live(
         restore_task.abort();
         return Err(MigrateError::Fatal(format!("transition: {e}")));
     }
-    state.teleport_targets.insert(session_id, target_host_id);
+    if let Err(e) = state
+        .services
+        .meta
+        .set_teleport_target(session_id, Some(target_host_id))
+        .await
+    {
+        tracing::warn!(%session_id, error = %e,
+            "set_teleport_target failed; parachute would fall back to any-peer");
+    }
     // Observer-facing truth: the session leaves `active` as the
     // blackout begins.
     let _ = state
@@ -353,7 +373,11 @@ pub async fn migrate_session_live(
             // running VM is a benign FC error).
             restore_task.abort();
             let _ = source_backend.resume(sandbox_id).await;
-            state.teleport_targets.remove(&session_id);
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
             if walk_back_to_active(state, session_id).await {
                 return Err(MigrateError::AbortedToSource(format!(
                     "post-copy capture: {e}"
@@ -376,7 +400,11 @@ pub async fn migrate_session_live(
     let new_sandbox_id = match restore_task.await {
         Ok(Ok(id)) => id,
         Ok(Err(e)) => {
-            state.teleport_targets.remove(&session_id);
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
             // The load-gate marker proves the dest never ran the
             // shipped state — un-pausing the source is zero-loss
             // sound. Anything else is ambiguous: parachute.
@@ -400,7 +428,11 @@ pub async fn migrate_session_live(
             .await);
         }
         Err(join_err) => {
-            state.teleport_targets.remove(&session_id);
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
             return Err(parachute_or_kill(
                 state,
                 session_id,
@@ -411,6 +443,13 @@ pub async fn migrate_session_live(
         }
     };
     let restore_ms = t_restore.elapsed().as_millis();
+    // The guest is RUNNING on the dest from here (FC resumed inside
+    // the load) — this is where the guest-observed blackout ends. The
+    // rebind + harness rebuild below happen while the guest executes,
+    // so folding them into `blackout_ms` (the old shape) overstated
+    // the user-facing gap by the `finish_resume_to_active` wall.
+    let blackout_wall_ms = t_blackout.elapsed().as_millis() as u64;
+    let t_reactivate = std::time::Instant::now();
 
     // ---- 6. The Committing persist + reactivate ----
     state.host_registry.invalidate_sandbox(sandbox_id);
@@ -438,7 +477,11 @@ pub async fn migrate_session_live(
     .await;
     if let Err(e) = rebind {
         let _ = dest_backend.destroy(new_sandbox_id).await;
-        state.teleport_targets.remove(&session_id);
+        let _ = state
+            .services
+            .meta
+            .set_teleport_target(session_id, None)
+            .await;
         return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
     }
     crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id).await;
@@ -472,7 +515,11 @@ pub async fn migrate_session_live(
         tracing::warn!(%session_id, error = %e,
             "post-copy migration: finish_resume_to_active failed; session left at Created");
     }
-    state.teleport_targets.remove(&session_id);
+    let _ = state
+        .services
+        .meta
+        .set_teleport_target(session_id, None)
+        .await;
 
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "presetup")
         .record(presetup_ms as f64 / 1000.0);
@@ -505,13 +552,18 @@ pub async fn migrate_session_live(
         sealed_disk_chunks = capture.sealed_disk_chunks,
         // Blackout decomposition (source-measured, under the freeze):
         // pause + disk_drain + vmstate + scan ≈ the host-side blackout;
-        // `blackout_ms` is the coordinator wall incl. the RPC round trip.
+        // `blackout_ms` is the coordinator wall from capture start to
+        // the dest restore returning (guest running) — the closest
+        // coordinator-side proxy for the guest-observed gap.
+        // `reactivate_ms` (rebind + emits + harness rebuild) runs
+        // while the guest already executes.
         blackout_pause_ms = capture.pause_ms,
         blackout_disk_drain_ms = capture.disk_drain_ms,
         blackout_vmstate_ms = capture.vmstate_ms,
         scan_ms = capture.scan_ms,
-        blackout_ms = t_blackout.elapsed().as_millis() as u64,
+        blackout_ms = blackout_wall_ms,
         restore_await_ms = restore_ms,
+        reactivate_ms = t_reactivate.elapsed().as_millis() as u64,
         total_ms = t_total.elapsed().as_millis(),
         "post-copy live teleport landed (ADR 0045 C2); drain + durability finalizing",
     );
@@ -737,6 +789,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         }
     }
 
@@ -758,21 +813,9 @@ mod tests {
             target,
             Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(backend)),
         );
-        host_registry.update_state(
-            target,
-            crate::host_registry::HostState {
-                capacity: engram_protocol::heartbeat::HostCapacityReport {
-                    total_mib: 16_384,
-                    used_mib: 0,
-                    running_sandboxes: 0,
-                },
-                local_snapshots: Vec::new(),
-                draining: false,
-                ready_images: Default::default(),
-                current_bundles: Vec::new(),
-                utilization: Default::default(),
-            },
-        );
+        // ADR 0047: placement reads host rows — stage the target as a
+        // schedulable host in the mock store.
+        meta.add_ready_host(target);
         let services = Services {
             meta: meta.clone(),
             cloud: Arc::new(MockCloud::new()),
@@ -954,22 +997,6 @@ mod tests {
             target,
             Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(flaky.clone())),
         );
-        // Re-register resets the heartbeat state — restore capacity.
-        state.host_registry.update_state(
-            target,
-            crate::host_registry::HostState {
-                capacity: engram_protocol::heartbeat::HostCapacityReport {
-                    total_mib: 16_384,
-                    used_mib: 0,
-                    running_sandboxes: 0,
-                },
-                local_snapshots: Vec::new(),
-                draining: false,
-                ready_images: Default::default(),
-                current_bundles: Vec::new(),
-                utilization: Default::default(),
-            },
-        );
         // The SOURCE is resolved through services.host (the registry) by
         // sandbox owner — record the source sandbox's owner as the same
         // flaky backend (it serves capture + abort).
@@ -994,6 +1021,11 @@ mod tests {
                 status: engram_core::types::host::HostStatus::Ready,
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: Some("http://127.0.0.1:1".into()),
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
             });
         meta.snapshots
             .lock()
@@ -1156,22 +1188,6 @@ mod tests {
             target,
             Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(happy.clone())),
         );
-        // Re-register resets the heartbeat state — restore capacity.
-        state.host_registry.update_state(
-            target,
-            crate::host_registry::HostState {
-                capacity: engram_protocol::heartbeat::HostCapacityReport {
-                    total_mib: 16_384,
-                    used_mib: 0,
-                    running_sandboxes: 0,
-                },
-                local_snapshots: Vec::new(),
-                draining: false,
-                ready_images: Default::default(),
-                current_bundles: Vec::new(),
-                utilization: Default::default(),
-            },
-        );
         // The source resolves through the recorded sandbox owner (the
         // same fake backend serves both roles, as in the abort test).
         state
@@ -1194,6 +1210,11 @@ mod tests {
                 status: engram_core::types::host::HostStatus::Ready,
                 last_heartbeat_at: chrono::Utc::now(),
                 host_addr: Some("http://127.0.0.1:1".into()),
+                ready_images: Vec::new(),
+                local_snapshots: Vec::new(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
             });
         meta.snapshots
             .lock()
@@ -1284,6 +1305,34 @@ mod tests {
         // (No global-emptiness assert: the gate is a process-global and
         // sibling tests claim it concurrently; release is proven by the
         // successful re-claim above.)
+    }
+
+    /// Regression guard for the rollback-path shard deadlock: the
+    /// `Occupied` arm used to `remove` rolled-back claims while still
+    /// holding the current host's `entry()` shard lock, which hangs
+    /// when two hosts collide on a shard. Run the rollback sequence
+    /// enough times with fresh random ids that a same-shard collision
+    /// is near-certain — a reintroduced deadlock hangs the whole suite.
+    #[test]
+    fn claim_rollback_never_deadlocks_on_shard_collision() {
+        for _ in 0..5000 {
+            let dest = HostId::new();
+            let held = MigrationGateGuard::claim(None, dest, SessionId::new()).expect("hold dest");
+            // `claim(Some(src), dest, …)` claims src (vacant) then hits
+            // dest (occupied) → rolls back src while the dest entry
+            // guard is live. If src and dest share a shard, the old
+            // code deadlocked here.
+            let src = HostId::new();
+            assert!(
+                MigrationGateGuard::claim(Some(src), dest, SessionId::new()).is_none(),
+                "dest is held; the claim must fail and roll back src cleanly",
+            );
+            // src must be fully released by the rollback — re-claimable.
+            let reclaim = MigrationGateGuard::claim(Some(src), HostId::new(), SessionId::new())
+                .expect("rolled-back src is reusable");
+            drop(reclaim);
+            drop(held);
+        }
     }
 
     #[tokio::test]

@@ -26,7 +26,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use engram_core::types::host::{HostCapacity, HostMetadata, HostRecord, HostStatus};
+use engram_core::types::host::{
+    HostCapacity, HostHeartbeat, HostLocalSnapshot, HostMetadata, HostRecord, HostStatus,
+};
 use engram_core::types::SessionState;
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use engram_harness_proto::HarnessEvent;
@@ -36,7 +38,6 @@ use engram_protocol::heartbeat::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::host_registry::HostState;
 use crate::state::{SessionEvent, SharedState};
 
 // ---- POST /api/hosts/register ----
@@ -143,6 +144,14 @@ pub async fn register(
         status: HostStatus::Ready,
         last_heartbeat_at: Utc::now(),
         host_addr: Some(req.host_addr.clone()),
+        // ADR 0047: scheduling state arrives with the first heartbeat.
+        // NOTE: `upsert_host` deliberately does not write `cordoned` —
+        // a re-registering host must not clear an operator cordon.
+        ready_images: Vec::new(),
+        local_snapshots: Vec::new(),
+        current_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 0,
     };
     state.services.meta.upsert_host(record).await?;
 
@@ -271,12 +280,15 @@ pub struct HeartbeatRequest {
     #[serde(default)]
     pub checkpoints: Vec<engram_protocol::heartbeat::CheckpointAdvert>,
     /// Observed disk/mem/cpu utilization this tick. Persisted to the
-    /// `hosts` row (migration 0056) + mirrored into the in-memory
-    /// scheduler view so `/api/hosts` renders the operator fleet
-    /// gauges consistently across coord replicas. `#[serde(default)]`
+    /// `hosts` row (migration 0056) so `/api/hosts` and placement read
+    /// consistently across coord replicas. `#[serde(default)]`
     /// so a pre-utilization host-agent mid-roll reports none → 0.
     #[serde(default)]
     pub utilization: engram_core::types::host::HostUtilization,
+    /// ADR 0048: the host's core count, for the CPU packing budget.
+    /// `#[serde(default)]` → 0 (= unknown) from pre-roll host-agents.
+    #[serde(default)]
+    pub total_vcpus: u32,
 }
 
 #[derive(Serialize)]
@@ -367,44 +379,60 @@ pub async fn heartbeat(
         );
     }
 
-    // Refresh in-memory scheduler view so the next session-create
-    // on this pod sees fresh capacity + readiness.
-    state.host_registry.update_state(
-        host_id,
-        HostState {
-            capacity: hb.capacity.clone(),
-            local_snapshots: hb.local_snapshots.clone(),
-            draining: hb.draining,
-            ready_images: hb.ready_images.iter().cloned().collect(),
-            current_bundles: hb.current_bundles.clone(),
-            utilization: hb.utilization.clone(),
-        },
-    );
+    // Bump the routing cache's freshness stamp for this host (ADR
+    // 0015 M3). The scheduling payload itself goes to PG below — ADR
+    // 0047 removed the in-memory scheduler mirror.
+    state.host_registry.touch_seen(host_id);
 
-    // Persist capacity to Postgres alongside `last_heartbeat_at`
-    // so `/api/hosts` reads stay consistent across coord replicas.
-    // Wire `host_addr` stays NULL here — the register endpoint owns
-    // that field, and `upsert_host`'s `COALESCE` prevents this
-    // heartbeat-shaped path from clobbering it.
+    // ADR 0047: the single per-heartbeat persist — capacity +
+    // utilization + the scheduling state every coordinator replica
+    // places from (ready_images / local_snapshots / current_bundles /
+    // total_vcpus). `status` is the HOST-reported side (`draining` =
+    // the agent's own shutdown flag); the coordinator-owned `cordoned`
+    // bit is deliberately not written here. Best-effort per tick: a PG
+    // hiccup leaves last tick's row standing and the next heartbeat
+    // (5s) repairs.
     let row_status = if hb.draining {
         HostStatus::Draining
     } else {
         HostStatus::Ready
     };
-    let row_capacity = HostCapacity {
-        total_gb: 0,
-        used_gb: 0,
-        total_mib: hb.capacity.total_mib,
-        used_mib: hb.capacity.used_mib,
-        running_sandboxes: hb.capacity.running_sandboxes,
+    let row_heartbeat = HostHeartbeat {
+        status: row_status,
+        capacity: HostCapacity {
+            total_gb: 0,
+            used_gb: 0,
+            total_mib: hb.capacity.total_mib,
+            used_mib: hb.capacity.used_mib,
+            running_sandboxes: hb.capacity.running_sandboxes,
+        },
+        utilization: hb.utilization.clone(),
+        ready_images: hb
+            .ready_images
+            .iter()
+            .map(|d| d.as_str().to_string())
+            .collect(),
+        local_snapshots: hb
+            .local_snapshots
+            .iter()
+            .map(|s| HostLocalSnapshot {
+                snapshot_id: s.snapshot_id,
+                session_id: s.session_id,
+                size_bytes: s.size_bytes,
+                replicated: s.replicated,
+                last_accessed_at: s.last_accessed_at,
+            })
+            .collect(),
+        current_bundles: hb.current_bundles.clone(),
+        total_vcpus: hb.total_vcpus,
     };
     if let Err(e) = state
         .services
         .meta
-        .touch_host_heartbeat(host_id, row_status, row_capacity, hb.utilization.clone())
+        .touch_host_heartbeat(host_id, row_heartbeat)
         .await
     {
-        tracing::debug!(host_id = %host_id, error = %e, "heartbeat persistence failed");
+        tracing::warn!(host_id = %host_id, error = %e, "heartbeat persistence failed; placement reads last tick's row");
     }
 
     // ADR 0015 M5: ship the coord's authoritative enabled-images
@@ -910,6 +938,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         }
     }
 

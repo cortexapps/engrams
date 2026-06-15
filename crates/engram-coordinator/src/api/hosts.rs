@@ -12,6 +12,11 @@ use serde::Serialize;
 
 use crate::state::SharedState;
 
+// ADR 0039 Task 32: the axum shims `list`, `get`, `cow_state` are removed.
+// The gRPC FleetService (grpc_app/fleet.rs) owns all fleet read surface; it
+// builds `HostView` from the PG rows + per-host reserved budget (ADR 0047:
+// PG-authoritative, no in-memory mirror).
+
 /// Memory-tier enrichment: project the session's latest snapshot row
 /// into the diagnostic view's `memory_manifest` +
 /// `last_snapshot_at` fields. Returns `(None, None)` when the
@@ -46,23 +51,25 @@ pub(crate) async fn enrichment_for_session(
     }
 }
 
-// ADR 0039 Task 32: `drain` axum shim removed.
-// `ListHostsResponse` and `HostCowStateResponse` removed (axum-only types).
-// The gRPC FleetService uses proto-generated `app::ListHostsResponse` /
-// `app::GetHostCowStateResponse` instead.
+// ADR 0039 Task 32: `drain` axum shim removed (the gRPC FleetService DrainHost
+// RPC owns it). `ListHostsResponse` and `HostCowStateResponse` removed
+// (axum-only types) — the gRPC FleetService uses proto-generated
+// `app::ListHostsResponse` / `app::GetHostCowStateResponse` instead.
 
 #[derive(Serialize)]
 pub struct HostView {
     pub id: HostId,
     pub hostname: String,
     pub status: &'static str,
+    /// ADR 0047: the coordinator-owned cordon bit — non-schedulable
+    /// regardless of the host-reported `status`.
+    pub cordoned: bool,
     pub capacity_total_mib: u64,
     pub capacity_used_mib: u64,
     pub running_sandboxes: u32,
     pub local_snapshots: usize,
-    /// ADR 0015 M5: count of images this host has fully
-    /// prefetched and is ready to serve. Live-only — reads as 0
-    /// on a coord replica that hasn't received a heartbeat yet.
+    /// ADR 0015 M5: count of images this host has fully prefetched
+    /// and is ready to serve (heartbeat-persisted; ADR 0047).
     pub ready_images: usize,
     /// ADR 0015 M5: manifest digests of the prefetched images.
     /// Exposed so callers (operators, integration tests) can
@@ -70,76 +77,67 @@ pub struct HostView {
     /// from the count. Sorted for deterministic output.
     pub ready_image_digests: Vec<String>,
     /// Observed disk/mem/cpu utilization from the latest heartbeat
-    /// (the fleet view's bars). Like capacity, these prefer the
-    /// persisted `hosts` row so they're consistent across coord
-    /// replicas; 0 until the host's first post-migration heartbeat.
+    /// (the fleet view's bars); 0 until the host's first
+    /// post-migration heartbeat.
     pub util_disk_total_mib: u64,
     pub util_disk_used_mib: u64,
     pub util_mem_total_mib: u64,
     pub util_mem_used_mib: u64,
     pub util_cpu_pct: f32,
+    /// ADR 0046/0047: host-measured allocatable RAM — what placement
+    /// budgets against.
+    pub allocatable_mib: u64,
+    /// ADR 0048: Σ reserved RAM (mem_budget_mib) and the resulting free
+    /// (allocatable − reserved) — the operator's wave planner reads these
+    /// for victim-picking + the 2D drain guard.
+    pub reserved_mib: u64,
+    pub free_mib: u64,
+    /// ADR 0048: host core count + budget (`total_vcpus × overcommit`),
+    /// Σ reserved vCPU, and the resulting free vCPU.
+    pub total_vcpus: u32,
+    pub cpu_budget_vcpus: u64,
+    pub reserved_vcpus: u64,
+    pub free_vcpus: u64,
     pub last_heartbeat_at: DateTime<Utc>,
 }
 
 impl HostView {
-    pub(crate) fn from_row_and_live(
+    /// `pub(crate)` so `grpc_app/fleet.rs` (list_hosts / get_host) can build
+    /// the view from the PG row + per-host reserved budget (ADR 0047:
+    /// PG-authoritative, no in-memory mirror).
+    pub(crate) fn from_row(
         row: engram_core::types::HostRecord,
-        live: Option<crate::host_registry::HostState>,
+        reserved: engram_core::types::host::ReservedBudget,
     ) -> Self {
-        // Capacity prefers the Postgres row (consistent across coord
-        // replicas — persisted on every heartbeat). If `live` is
-        // present *and* the row's MiB total is zero (pre-migration
-        // row, never had a fresh heartbeat write), fall back to the
-        // in-memory value so the operator isn't stuck staring at 0
-        // during a single-replica deploy or right after the
-        // migration runs.
-        //
-        // `local_snapshots` stays live-only — the count isn't
-        // persisted yet. It'll read as 0 on the heartbeat-non-owning
-        // pod, which matches the existing pre-MiB-fields behaviour.
-        let live = live.unwrap_or_default();
-        // Same row-vs-live preference as capacity: the row is written
-        // on every heartbeat and is replica-consistent; fall back to
-        // the in-memory value only for a pre-MiB-fields row that has
-        // never had a fresh heartbeat write.
-        let (capacity_total_mib, capacity_used_mib, running_sandboxes, util) =
-            if row.capacity.total_mib > 0 {
-                (
-                    row.capacity.total_mib,
-                    row.capacity.used_mib,
-                    row.capacity.running_sandboxes,
-                    row.utilization.clone(),
-                )
-            } else {
-                (
-                    live.capacity.total_mib,
-                    live.capacity.used_mib,
-                    live.capacity.running_sandboxes,
-                    live.utilization.clone(),
-                )
-            };
-        let ready_images = live.ready_images.len();
-        let mut ready_image_digests: Vec<String> = live
-            .ready_images
-            .iter()
-            .map(|d| d.as_str().to_string())
-            .collect();
+        let mut ready_image_digests = row.ready_images.clone();
         ready_image_digests.sort();
+        let allocatable_mib = row.utilization.allocatable_mib;
+        let reserved_mib = reserved.mem_mib.max(0) as u64;
+        let cpu_budget = engram_core::types::host::host_cpu_budget(row.total_vcpus).max(0) as u64;
+        let reserved_vcpus = reserved.vcpus.max(0) as u64;
         Self {
             id: row.id,
             hostname: row.hostname,
             status: row.status.as_str(),
-            capacity_total_mib,
-            capacity_used_mib,
-            running_sandboxes,
-            local_snapshots: live.local_snapshots.len(),
-            ready_images,
+            cordoned: row.cordoned,
+            capacity_total_mib: row.capacity.total_mib,
+            capacity_used_mib: row.capacity.used_mib,
+            running_sandboxes: row.capacity.running_sandboxes,
+            local_snapshots: row.local_snapshots.len(),
+            ready_images: ready_image_digests.len(),
             ready_image_digests,
-            util_disk_total_mib: util.disk_total_mib,
-            util_disk_used_mib: util.disk_used_mib,
-            util_mem_total_mib: util.mem_total_mib,
-            util_mem_used_mib: util.mem_used_mib,
-            util_cpu_pct: util.cpu_pct,
+            util_disk_total_mib: row.utilization.disk_total_mib,
+            util_disk_used_mib: row.utilization.disk_used_mib,
+            util_mem_total_mib: row.utilization.mem_total_mib,
+            util_mem_used_mib: row.utilization.mem_used_mib,
+            util_cpu_pct: row.utilization.cpu_pct,
+            allocatable_mib,
+            reserved_mib,
+            free_mib: allocatable_mib.saturating_sub(reserved_mib),
+            total_vcpus: row.total_vcpus,
+            cpu_budget_vcpus: cpu_budget,
+            reserved_vcpus,
+            free_vcpus: cpu_budget.saturating_sub(reserved_vcpus),
             last_heartbeat_at: row.last_heartbeat_at,
         }
     }

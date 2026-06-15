@@ -58,6 +58,10 @@ struct MockMetadataStore {
     /// tests can assert the barrier ticked atomically with the
     /// session-row write.
     chunk_generation: std::sync::atomic::AtomicU64,
+    /// ADR 0047: PG-authoritative host rows. Placement reads these via
+    /// `list_active_hosts` (the in-memory scheduler mirror is gone); tests seed
+    /// a ready host through [`MockMetadataStore::seed_ready_host`].
+    hosts: Mutex<HashMap<engram_core::HostId, HostRecord>>,
 }
 
 impl MockMetadataStore {
@@ -67,6 +71,43 @@ impl MockMetadataStore {
 
     fn arc() -> Arc<Self> {
         Arc::new(Self::new())
+    }
+
+    /// ADR 0047: seed (or update) a schedulable host row so placement
+    /// (`list_active_hosts` → `candidates_for`) can pick it. Fresh heartbeat,
+    /// ample RAM/vCPU budget; the digest accumulates into `ready_images`.
+    /// Replaces HEAD's retired in-memory `host_registry.update_state` path.
+    fn seed_ready_host(&self, id: engram_core::HostId, digest: String) {
+        let mut hosts = self.hosts.lock();
+        let h = hosts.entry(id).or_insert_with(|| HostRecord {
+            id,
+            hostname: format!("test-host-{id}"),
+            cloud_metadata: engram_core::types::HostMetadata::default(),
+            capacity: engram_core::types::HostCapacity {
+                total_gb: 64,
+                used_gb: 0,
+                total_mib: 65_536,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: engram_core::types::HostUtilization {
+                allocatable_mib: 65_536,
+                mem_total_mib: 65_536,
+                ..Default::default()
+            },
+            status: HostStatus::Ready,
+            last_heartbeat_at: Utc::now(),
+            host_addr: None,
+            ready_images: Vec::new(),
+            local_snapshots: Vec::new(),
+            current_bundles: Vec::new(),
+            cordoned: false,
+            total_vcpus: 16,
+        });
+        h.last_heartbeat_at = Utc::now();
+        if !h.ready_images.contains(&digest) {
+            h.ready_images.push(digest);
+        }
     }
 }
 
@@ -84,6 +125,9 @@ impl MetadataStore for MockMetadataStore {
             mode: spec.mode,
             last_active_at: Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         self.sessions.lock().insert(id, session);
         Ok(id)
@@ -106,6 +150,9 @@ impl MetadataStore for MockMetadataStore {
             mode: spec.mode,
             last_active_at: Utc::now(),
             live_disk_manifest: None,
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         };
         self.sessions.lock().insert(session_id, session);
         Ok(())
@@ -203,26 +250,38 @@ impl MetadataStore for MockMetadataStore {
             .load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    async fn upsert_host(&self, _host: HostRecord) -> Result<(), MetaError> {
+    async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
+        self.hosts.lock().insert(host.id, host);
         Ok(())
     }
 
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
-        Ok(Vec::new())
+        Ok(self.hosts.lock().values().cloned().collect())
     }
 
-    async fn set_host_status(&self, _id: HostId, _status: HostStatus) -> Result<(), MetaError> {
+    async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError> {
+        if let Some(h) = self.hosts.lock().get_mut(&id) {
+            h.status = status;
+        }
         Ok(())
     }
 
     async fn touch_host_heartbeat(
         &self,
         _id: HostId,
-        _status: HostStatus,
-        _cap: engram_core::types::HostCapacity,
-        _util: engram_core::types::HostUtilization,
+        _hb: engram_core::types::HostHeartbeat,
     ) -> Result<(), MetaError> {
         Ok(())
+    }
+
+    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
+        match self.hosts.lock().get_mut(&id) {
+            Some(h) => {
+                h.cordoned = cordoned;
+                Ok(())
+            }
+            None => Err(MetaError::NotFound),
+        }
     }
 
     async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
@@ -491,6 +550,9 @@ async fn build_forge_app() -> (axum::Router, SessionId, Arc<engram_git_dev::Stat
         .create_session(engram_core::types::session::SessionSpec {
             image: "cortexapps/engrams:warm-bootstrap".to_string(),
             mode: Default::default(),
+            harness_secret_id: None,
+            user_email: None,
+            user_name: None,
         })
         .await
         .expect("seed session");
@@ -685,12 +747,10 @@ async fn forge_forward_runs_the_core_for_split_hosts() {
 struct TestFixture {
     app: axum::Router,
     meta: Arc<MockMetadataStore>,
-    /// ADR 0015 M5: pinned to the single in-process host so test
-    /// helpers can flip its `ready_images` set in lockstep with
-    /// `seed_enabled` calls. Production hosts populate this from
-    /// the prefetch supervisor + heartbeat, but the in-test ProcessBackend
-    /// has no chunks to prefetch — we just declare it ready.
-    host_registry: Arc<engram_coordinator::HostRegistry>,
+    /// ADR 0015 M5 / ADR 0047: pinned to the single in-process host so test
+    /// helpers can seed its host row + `ready_images` in lockstep with
+    /// `seed_enabled` calls (via `MockMetadataStore::seed_ready_host`).
+    /// Production hosts populate this from the prefetch supervisor + heartbeat.
     test_host_id: engram_core::HostId,
 }
 
@@ -749,7 +809,6 @@ impl TestFixture {
         let fx = Self {
             app: api::router(state),
             meta: meta.clone(),
-            host_registry,
             test_host_id,
         };
         // Seed baseline images for the repos most tests use against
@@ -781,13 +840,9 @@ impl TestFixture {
     }
 
     fn mark_host_ready_for(&self, digest: engram_protocol::heartbeat::ManifestDigest) {
-        let prior = self
-            .host_registry
-            .snapshot_state(self.test_host_id)
-            .unwrap_or_default();
-        let mut next = prior;
-        next.ready_images.insert(digest);
-        self.host_registry.update_state(self.test_host_id, next);
+        // ADR 0047: placement is PG-authoritative — seed the host ROW (served by
+        // `list_active_hosts`), not the retired in-memory scheduler mirror.
+        self.meta.seed_ready_host(self.test_host_id, digest.to_string());
     }
 }
 
@@ -1034,6 +1089,9 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
+                harness_secret_id: None,
+                user_email: None,
+                user_name: None,
             },
         );
     }
@@ -1117,6 +1175,9 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
                 created_at: Utc::now(),
                 last_active_at: Utc::now(),
                 live_disk_manifest: None,
+                harness_secret_id: None,
+                user_email: None,
+                user_name: None,
             },
         );
     }

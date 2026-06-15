@@ -35,7 +35,6 @@ use std::time::Duration;
 use engram_migrate_proto::{
     read_frame, write_frame, FromSource, HandlerControl, SealBitmap, ToSource, PROTO_VERSION,
 };
-use sha2::{Digest, Sha256};
 
 /// Reconnect policy: the source export outlives transient dials (its
 /// TTL is ~120 s of silence), but a dead source must surface fast —
@@ -118,6 +117,20 @@ pub struct PeerSession {
     fault_conn: Mutex<TcpStream>,
     next_req: AtomicU64,
     lost: AtomicBool,
+    /// Fault-path accounting (restore-tail attribution): how many
+    /// guest faults round-tripped the peer and their cumulative wall —
+    /// the serial P2P cost inside the FC load + early execution.
+    fault_count: AtomicU64,
+    fault_us: AtomicU64,
+    fault_max_us: AtomicU64,
+    /// Fault-priority gate for the drain: guest faults in flight +
+    /// the µs-since-`epoch` stamp of the last fault completion. The
+    /// drain parks while a fault is active-or-recent so the fault
+    /// never queues behind the drain's bulk bytes on the wire (the
+    /// measured ~7 ms/fault was exactly that queueing).
+    faults_inflight: AtomicU64,
+    last_fault_us: AtomicU64,
+    epoch: std::time::Instant,
 }
 
 /// Dial + `Hello` + `HelloAck` + `Seal` on a fresh connection,
@@ -128,6 +141,7 @@ fn dial(
     token: &str,
     expect_chunk_size: u64,
     expect_total_bytes: u64,
+    purpose: engram_migrate_proto::ConnPurpose,
 ) -> Result<(TcpStream, SealBitmap), PeerError> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
@@ -137,6 +151,7 @@ fn dial(
             version: PROTO_VERSION,
             export_id: export_id.to_string(),
             token: token.to_string(),
+            purpose,
         },
     )?;
     match read_frame::<_, FromSource>(&mut stream)? {
@@ -197,6 +212,7 @@ impl PeerSession {
             &token,
             expect_chunk_size,
             expect_total_bytes,
+            engram_migrate_proto::ConnPurpose::Fault,
         )?;
         tracing::info!(
             addr,
@@ -215,7 +231,36 @@ impl PeerSession {
             fault_conn: Mutex::new(stream),
             next_req: AtomicU64::new(1),
             lost: AtomicBool::new(false),
+            fault_count: AtomicU64::new(0),
+            fault_us: AtomicU64::new(0),
+            fault_max_us: AtomicU64::new(0),
+            faults_inflight: AtomicU64::new(0),
+            last_fault_us: AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
         })
+    }
+
+    /// Fault-path totals: `(count, cumulative_µs, max_µs)`.
+    pub fn fault_stats(&self) -> (u64, u64, u64) {
+        (
+            self.fault_count.load(Ordering::Relaxed),
+            self.fault_us.load(Ordering::Relaxed),
+            self.fault_max_us.load(Ordering::Relaxed),
+        )
+    }
+
+    /// True while a guest fault is in flight or one completed within
+    /// `window` — the drain's park condition.
+    pub fn fault_active_within(&self, window: std::time::Duration) -> bool {
+        if self.faults_inflight.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        let last = self.last_fault_us.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = self.epoch.elapsed().as_micros() as u64;
+        now.saturating_sub(last) < window.as_micros() as u64
     }
 
     /// The sealed dirty map (held from construction — no waiting).
@@ -240,6 +285,7 @@ impl PeerSession {
             &self.token,
             self.chunk_size,
             self.expected_total,
+            engram_migrate_proto::ConnPurpose::Drain,
         )?;
         Ok(stream)
     }
@@ -251,6 +297,7 @@ impl PeerSession {
         if self.is_lost() {
             return Err(PeerError::Lost("peer already marked lost".into()));
         }
+        let _fault = self.begin_fault();
         let mut conn = self.fault_conn.lock().expect("fault conn poisoned");
         let mut last_err: Option<PeerError> = None;
         for attempt in 0..=RECONNECT_ATTEMPTS {
@@ -262,6 +309,7 @@ impl PeerSession {
                     &self.token,
                     self.chunk_size,
                     self.expected_total,
+                    engram_migrate_proto::ConnPurpose::Fault,
                 ) {
                     Ok((fresh, _seal)) => *conn = fresh,
                     Err(e) => {
@@ -294,6 +342,30 @@ impl PeerSession {
     }
 }
 
+impl PeerSession {
+    /// Fault-scope guard: counts the fault, marks it in-flight (the
+    /// drain's park condition), and on drop — every return path —
+    /// accumulates the elapsed wall, tracks the max, and stamps the
+    /// completion time for the drain's recent-fault window.
+    fn begin_fault(&self) -> impl Drop + '_ {
+        self.fault_count.fetch_add(1, Ordering::Relaxed);
+        self.faults_inflight.fetch_add(1, Ordering::Relaxed);
+        struct G<'a>(&'a PeerSession, std::time::Instant);
+        impl Drop for G<'_> {
+            fn drop(&mut self) {
+                let us = self.1.elapsed().as_micros() as u64;
+                self.0.fault_us.fetch_add(us, Ordering::Relaxed);
+                self.0.fault_max_us.fetch_max(us, Ordering::Relaxed);
+                self.0.faults_inflight.fetch_sub(1, Ordering::Relaxed);
+                self.0
+                    .last_fault_us
+                    .store(self.0.epoch.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        G(self, std::time::Instant::now())
+    }
+}
+
 /// One `NeedAt` round-trip on `conn` (used by the fault path and, with
 /// its own connection, the drain).
 pub fn request_chunk(
@@ -323,7 +395,8 @@ pub fn decode_page(
             req_id,
             chunk_offset,
             bytes,
-            sha256,
+            hash,
+            lz4,
         } => {
             if req_id != want_req || chunk_offset != want_offset {
                 return Err(PeerError::Server(format!(
@@ -331,13 +404,18 @@ pub fn decode_page(
                      {chunk_offset:#x}/{want_offset:#x}"
                 )));
             }
-            let got: [u8; 32] = Sha256::digest(&bytes).into();
-            if got != sha256 {
+            // Integrity covers the WIRE bytes; decompress only after.
+            if engram_migrate_proto::wire_hash(&bytes) != hash {
                 return Err(PeerError::ShaMismatch {
                     chunk_offset: want_offset,
                 });
             }
-            Ok(PeerPage::Bytes(bytes))
+            let raw = engram_migrate_proto::decompress_page(bytes, lz4)
+                // Verified-but-undecompressable = the source is
+                // serving garbage; terminal, same class as a sha
+                // mismatch.
+                .map_err(PeerError::Server)?;
+            Ok(PeerPage::Bytes(raw))
         }
         FromSource::ZeroChunk { req_id, .. } if req_id == want_req => Ok(PeerPage::Zero),
         FromSource::AltSource {
@@ -508,13 +586,16 @@ mod tests {
     }
 
     fn page_resp(req_id: u64, chunk_offset: u64) -> FromSource {
-        let bytes = vec![0xAB; CHUNK as usize];
-        let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        // Through the REAL compression path — the canned server
+        // serves exactly what the prod source serves.
+        let (bytes, lz4) = engram_migrate_proto::compress_page(vec![0xAB; CHUNK as usize]);
+        let hash = engram_migrate_proto::wire_hash(&bytes);
         FromSource::Page {
             req_id,
             chunk_offset,
             bytes,
-            sha256,
+            hash,
+            lz4,
         }
     }
 
@@ -559,7 +640,8 @@ mod tests {
                         req_id,
                         chunk_offset: o,
                         bytes,
-                        sha256: [0u8; 32],
+                        hash: [0u8; 32],
+                        lz4: false,
                     }
                 }
             },

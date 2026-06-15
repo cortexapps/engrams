@@ -126,6 +126,13 @@ export const POLICY: Record<string, PolicyEntry> = {
   "FleetService.ChunkGc": { action: "manage", subject: "all" },
   "FleetService.BundleGc": { action: "manage", subject: "all" },
   "FleetService.SnapshotBlobGc": { action: "manage", subject: "all" },
+  // ADR 0048 fleet autoscaling + ADR 0045 teleport — admin-only, like the
+  // rest of FleetService. The host-operator calls these directly with the
+  // deployment bearer; the orchestrator passthrough gates human callers.
+  "FleetService.FleetDemand": { action: "manage", subject: "all" },
+  "FleetService.DeleteHost": { action: "manage", subject: "all" },
+  "FleetService.Teleport": { action: "manage", subject: "all" },
+  "FleetService.EvictIdle": { action: "manage", subject: "all" },
 };
 
 /**

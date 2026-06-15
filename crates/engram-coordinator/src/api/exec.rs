@@ -82,12 +82,12 @@ async fn session_exec_env(
     };
     let mut env = HashMap::new();
     if let Some(b) = bundle.as_ref() {
-        crate::api::sessions::inject_forge_env(state, id, b.manifest.git.as_ref(), &mut env);
+        crate::api::sessions::inject_forge_env(state, id, b.manifest.git.as_ref(), &mut env).await;
     }
     // ADR 0026: upload token is not git-gated and doesn't need the
     // manifest bundle — inject it unconditionally so `engram-share`
     // works from `/exec` even when the bundle load above failed.
-    crate::api::sessions::inject_upload_env(state, id, &mut env);
+    crate::api::sessions::inject_upload_env(state, id, &mut env).await;
     (env, bundle.and_then(|b| b.manifest.workdir))
 }
 
