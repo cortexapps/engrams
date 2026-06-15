@@ -14,10 +14,11 @@ control plane becomes an AWS-style raw resource API with machine-to-machine
 auth only, and sheds its `users` table entirely (this reverses the original
 §5/§6 and supersedes ADR 0031's in-coordinator ownership model); (5) a **task
 model** becomes the application-layer aggregate root — sessions are resources
-tasks consume. An implementation plan exists at
-`docs/orchestration-tier-plan.md` (written against the original draft; being
-re-cut against this revision). Builds on the existing gRPC fabric (ADR 0013)
-and the `ProxyShell` bidi shell tunnel (ADR 0014).
+tasks consume. The implementation lands as a stacked PR chain: the app-contract
+protos + buf pipeline (this PR), the orchestrator tier, the coordinator's
+gRPC-only control plane, the schema migrations, the web cutover, and the deploy
+wiring. Builds on the existing gRPC fabric (ADR 0013) and the `ProxyShell` bidi
+shell tunnel (ADR 0014).
 
 ## Context
 
