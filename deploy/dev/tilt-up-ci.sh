@@ -53,23 +53,43 @@ echo "    coord up"
 # host-agent + host-agent-b, so require both before returning — else the
 # bake/teleport step races a half-up fleet. Single-host default needs 1.
 #
-# `{ grep || true; }` scopes grep's no-match exit-1 so `set -o pipefail`
-# + `set -e` don't abort the script on the first poll (before any host
-# has registered, /api/hosts is `{"hosts":[]}` and grep matches nothing).
-# Same guard integration-up.sh used; omitting it kills the loop instantly.
+# ADR 0051: the orchestrator-facing host list left the HTTP surface
+# (`GET /api/v1/hosts` is gone); it now lives on app-gRPC
+# (FleetService::ListHosts). Poll it via `engram-cli host list --json`,
+# which dials ENGRAM_APP_GRPC (default 127.0.0.1:50061) with the bearer in
+# ENGRAM_APP_TOKEN. The Tiltfile launches the coord with the matching
+# ENGRAM_APP_GRPC_TOKENS; mirror that token here (same dev default), and
+# point the CLI at the gRPC addr.
 case "${ENGRAM_INTEG_TWO_HOSTS:-}" in
     1 | true | yes) want_hosts=2 ;;
     *) want_hosts=1 ;;
 esac
-echo "==> waiting for host registration (want >= $want_hosts)"
+
+# The release binary the workflow downloaded (ENGRAM_INTEG_BIN_DIR) or a
+# repo-local debug build. `command -v` resolves a PATH-installed cli too.
+CLI="${ENGRAM_INTEG_BIN_DIR:+$ENGRAM_INTEG_BIN_DIR/}engram-cli"
+if [ ! -x "$CLI" ] && ! command -v "$CLI" >/dev/null 2>&1; then
+    CLI="$(command -v engram-cli || echo ./target/release/engram-cli)"
+fi
+export ENGRAM_APP_GRPC="${ENGRAM_APP_GRPC:-http://127.0.0.1:50061}"
+# Token must match the coord's ENGRAM_APP_GRPC_TOKENS (Tiltfile dev default).
+export ENGRAM_APP_TOKEN="${ENGRAM_APP_TOKEN:-${ENGRAM_E2E_GRPC_TOKEN:-dev-app-grpc-token}}"
+
+# `{ grep || true; }` scopes grep's no-match exit-1 so `set -o pipefail`
+# + `set -e` don't abort the script on the first poll (before any host
+# has registered, the list is `{"hosts": []}` and grep matches nothing).
+count_hosts() {
+    "$CLI" host list --json 2>/dev/null \
+        | { grep -o '"hostname"' || true; } | wc -l | tr -d ' '
+}
+
+echo "==> waiting for host registration (want >= $want_hosts) via $CLI host list"
 for _ in $(seq 1 180); do
-    n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
-        | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
+    n=$(count_hosts)
     [ "${n:-0}" -ge "$want_hosts" ] && break
     sleep 1
 done
-n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
-    | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
+n=$(count_hosts)
 if [ "${n:-0}" -lt "$want_hosts" ]; then
     echo "ERROR: expected >= $want_hosts host-agent(s), got ${n:-0}" >&2
     tail -80 "$LOG" >&2 || true

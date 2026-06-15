@@ -1070,7 +1070,6 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot",
- "reqwest",
  "serde",
  "serde_json",
  "sha2",
