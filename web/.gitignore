@@ -3,3 +3,12 @@ dist
 .vite
 *.log
 tsconfig.tsbuildinfo
+# snap harness output is scratch; only the committed baselines are tracked
+e2e/__shots__/*
+!e2e/__shots__/baseline/
+# playwright scratch
+test-results
+playwright-report
+# better-auth session state — contains HttpOnly cookie data, never commit
+e2e/.auth-state.json
+e2e/.member-auth-state.json

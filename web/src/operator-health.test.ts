@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { DurabilityRow, HostStatus, HostView, StorageSummaryResponse } from "./types";
+import type { DurabilityRow, HostStatus, HostView, StorageSummaryResponse } from "./lib/types";
 import { deriveHealthMetrics, operatorIssues } from "./operator-health";
 
 const host = (status: HostStatus, total = 100, used = 0): HostView => ({

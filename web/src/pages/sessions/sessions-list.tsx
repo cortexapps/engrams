@@ -4,7 +4,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusGlyph } from "../../components/Glyph";
-import type { SessionListItem } from "../../types";
+import type { SessionListItem } from "../../lib/types";
 import {
   compareSessions,
   lifecycleOf,
@@ -153,7 +153,7 @@ function SkeletonRows() {
 
 function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }) {
   return (
-    <li>
+    <li data-testid="session-row" data-session-id={s.id}>
       <Link
         to="/sessions/$id"
         params={{ id: s.id }}

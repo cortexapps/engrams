@@ -1,5 +1,9 @@
-// Mirrors the wire format produced by engram-coordinator. Hand-written
-// rather than generated — kept narrow to what the UI consumes.
+// Canonical UI type definitions (ADR 0051 Task 28: moved from web/src/types.ts).
+//
+// These are UI-VIEW shapes (mapping TARGETS), not wire mirrors: hooks in
+// hooks/ convert generated proto types into these before handing them to
+// consumers. Do NOT add raw wire/response types here — the generated
+// bindings in src/gen are the only wire contract (ADR 0051 §7).
 //
 // Shapes traced from:
 //   crates/engram-core/src/types/session.rs       (Session, SessionState)
@@ -91,10 +95,6 @@ export interface SessionListItem extends Session {
   /** `'system'` for warm-pool / automated sessions; `'user'` or absent for
    * human-launched sessions. Drives the OwnerCell badge choice. */
   owner_kind?: "user" | "system" | null;
-}
-
-export interface ListSessionsResponse {
-  sessions: SessionListItem[];
 }
 
 // ---- ADR 0031: identity ------------------------------------------------
@@ -233,136 +233,17 @@ export interface SessionCowStateResponse {
 
 // ---- Session creation -------------------------------------------------
 
-export interface CreateSessionResponse {
-  session_id: string;
-  status: string;
-  image_version: string;
-}
-
 // ---- Session events (SSE) ----------------------------------------------
-
-export type AgentRole = "assistant" | "user" | "system";
-
-export interface ExecRusage {
-  duration_ms: number;
-  // Other rusage fields exist on the wire but the UI doesn't read them.
-  [k: string]: unknown;
-}
-
-// `serde(tag = "type", rename_all = "snake_case")` produces a discriminated
-// union with `type` as the discriminant.
-export type SessionEvent =
-  | {
-      type: "status_changed";
-      from: SessionState;
-      to: SessionState;
-      at: string;
-    }
-  | {
-      type: "exec_started";
-      exec_id: string;
-      command: string[];
-      at: string;
-    }
-  | {
-      type: "exec_completed";
-      exec_id: string;
-      exit_status: number | null;
-      rusage: ExecRusage;
-      at: string;
-    }
-  | { type: "stdout"; exec_id: string; chunk: string }
-  | { type: "stderr"; exec_id: string; chunk: string }
-  | {
-      type: "snapshot_taken";
-      snapshot_id: string;
-      size_bytes: number;
-      at: string;
-    }
-  | { type: "evicted"; at: string }
-  | { type: "resumed"; snapshot_id: string; at: string }
-  | {
-      type: "run_started";
-      run_id: string;
-      prompt_summary: string | null;
-      at: string;
-    }
-  | {
-      type: "agent_message";
-      run_id: string;
-      message_id: string;
-      role: AgentRole;
-      text: string;
-      at: string;
-    }
-  | {
-      type: "tool_call_started";
-      run_id: string;
-      tool_call_id: string;
-      tool_name: string;
-      args_summary: string | null;
-      at: string;
-    }
-  | {
-      type: "tool_call_completed";
-      run_id: string;
-      tool_call_id: string;
-      tool_name: string;
-      ok: boolean;
-      duration_ms: number;
-      result_summary: string | null;
-      at: string;
-    }
-  | { type: "run_completed"; run_id: string; ok: boolean; at: string }
-  // ADR 0030: the in-flight run was stopped by an operator interrupt
-  // (`POST /sessions/:id/interrupt`). The session stays alive; the
-  // transcript renders an "interrupted" receipt and the run closes.
-  | { type: "run_interrupted"; run_id: string; at: string }
-  | { type: "harness_idle"; at: string }
-  | {
-      type: "pull_request_opened";
-      url: string;
-      repo: string;
-      title: string;
-      number: number;
-      head_branch: string;
-      base_branch: string;
-      at: string;
-    }
-  // ADR 0026: a file artifact (agent screenshot/recording, or an
-  // operator file pull) shared into the session. `media_type` is the
-  // coord-detected type; the transcript renders image/video inline and
-  // anything else as a download chip.
-  | {
-      type: "file_shared";
-      artifact_id: string;
-      media_type: string;
-      size_bytes: number;
-      caption: string | null;
-      at: string;
-    }
-  // ADR 0028 A.log: a rung-1 recovery rewound the live transcript to a
-  // checkpoint. The boundary the transcript renders ("↩ Recovered from
-  // a checkpoint…"); `rolled_back` events with idx > through_idx are
-  // tombstoned (rendered collapsed/greyed). `surviving_side_effects`
-  // are outside-world actions in the rolled-back span the platform
-  // can't undo (opened PRs, shared files) — surfaced, not hidden.
-  | {
-      type: "recovered_from_checkpoint";
-      recovery_epoch: number;
-      through_idx: number;
-      rolled_back: number;
-      surviving_side_effects: string[];
-      // ADR 0045 F1: why the rewind happened — `planned_relocation`
-      // (operator drain / teleport, no host failed) vs the original
-      // `host_failure_recovery`. Optional: events persisted before this
-      // field omit it, and the renderer treats a missing value as a
-      // host failure (the card's historical meaning).
-      cause?: "planned_relocation" | "host_failure_recovery";
-      at: string;
-    };
-
-export type SessionEventKind = SessionEvent["type"];
+//
+// Canonical types live in ./events.ts (moved Task 26); re-exported here
+// so existing consumers need no import changes.
+export type {
+  AgentRole,
+  ExecRusage,
+  IndexedEvent,
+  SessionEvent,
+  SessionEventKind,
+} from "../events";
 
 // ADR 0028 A.log: one checkpoint in a session's chain.
 export interface CheckpointSummary {
@@ -381,21 +262,6 @@ export interface CheckpointsResponse {
   session_id: string;
   /** Newest first; bounded to the forkable-history retention window. */
   checkpoints: CheckpointSummary[];
-}
-
-/**
- * An event together with its monotonic per-session index (the SSE id).
- *
- * ADR 0028 A.log: `rewound` marks events tombstoned by a rung-1
- * recovery (kept for audit, rendered collapsed/greyed). `recoveryEpoch`
- * segments the transcript across recoveries. Both default to
- * not-rewound / epoch 0 for the common no-recovery case.
- */
-export interface IndexedEvent {
-  idx: number;
-  event: SessionEvent;
-  rewound?: boolean;
-  recoveryEpoch?: number;
 }
 
 // ---- Settings · Registries ---------------------------------------------

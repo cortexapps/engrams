@@ -1,0 +1,5 @@
+# oxfmt reads this by default (see `oxfmt --help`, Ignore Options).
+# src/gen is buf-generated (`just gen-proto`); reformatting it would
+# diverge from `buf generate` output and trip CI's codegen drift check.
+# Never hand-edit or format generated bindings.
+src/gen/

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { MoreHorizontal } from "lucide-react";
-import { fetchUsers, updateUser } from "../api";
+import { authClient } from "@/lib/auth-client";
 import { useAuth } from "../auth/AuthProvider";
 import { PageHeading } from "../components/page-heading";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -20,7 +20,33 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import type { AdminUser, Role } from "../types";
+import type { AdminUser, Role } from "../lib/types";
+
+// BaUser: shape from better-auth admin.listUsers
+interface BaUser {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  banned: boolean;
+}
+
+function baUserToAdminUser(u: BaUser): AdminUser {
+  return {
+    id: u.id,
+    email: u.email,
+    display_name: u.name || null,
+    role: u.role === "admin" ? "admin" : "member",
+    role_source: "manual",
+    active: !u.banned,
+  };
+}
+
+async function fetchAdminUsers(): Promise<AdminUser[]> {
+  const result = await authClient.admin.listUsers({ query: { limit: 100 } });
+  const users = (result.data as { users?: BaUser[] } | null)?.users ?? [];
+  return users.map(baUserToAdminUser);
+}
 
 export function Members() {
   const { principal } = useAuth();
@@ -29,10 +55,33 @@ export function Members() {
     data: users = [],
     isLoading,
     error,
-  } = useQuery({ queryKey: ["admin", "users"], queryFn: fetchUsers });
+  } = useQuery({ queryKey: ["admin", "users"], queryFn: fetchAdminUsers });
+
   const mutation = useMutation({
-    mutationFn: ({ id, patch }: { id: string; patch: { role?: Role; active?: boolean } }) =>
-      updateUser(id, patch),
+    mutationFn: async ({
+      id,
+      patch,
+    }: {
+      id: string;
+      patch: { role?: Role; active?: boolean };
+    }): Promise<AdminUser> => {
+      if (patch.role !== undefined) {
+        // better-auth uses "user" | "admin"; our Role type uses "member" | "admin"
+        const baRole = patch.role === "member" ? "user" : "admin";
+        await authClient.admin.setRole({ userId: id, role: baRole });
+      }
+      if (patch.active === false) {
+        await authClient.admin.banUser({ userId: id });
+      } else if (patch.active === true) {
+        await authClient.admin.unbanUser({ userId: id });
+      }
+      // Re-fetch the updated user from the list.
+      const result = await authClient.admin.listUsers({ query: { limit: 100 } });
+      const users = (result.data as { users?: BaUser[] } | null)?.users ?? [];
+      const updated = users.find((u) => u.id === id);
+      if (!updated) throw new Error(`User ${id} not found after update`);
+      return baUserToAdminUser(updated);
+    },
     onSuccess: (u) =>
       qc.setQueryData<AdminUser[]>(["admin", "users"], (prev) =>
         prev ? prev.map((x) => (x.id === u.id ? u : x)) : [u],
@@ -143,7 +192,7 @@ export function Members() {
       </Table>
       <p className="max-w-prose text-sm text-muted-foreground">
         Roles are provisioned from your identity provider on first sign-in and stay in sync over
-        SCIM; promote or revoke here and the change is marked “set by an admin”. A deactivated
+        SCIM; promote or revoke here and the change is marked "set by an admin". A deactivated
         member keeps their sessions but can't sign in.
       </p>
     </div>

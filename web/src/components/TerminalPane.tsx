@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { API_BASE } from "../api";
+import { API_BASE } from "../lib/base";
 
 // In-browser shell tab. Lazy-loads `ghostty-web` (~400 KB WASM) on
 // first mount, opens a WebSocket to `/sessions/:id/shell`, and bridges
@@ -160,6 +160,25 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       fitAddon = new mod.FitAddon();
       term.loadAddon(fitAddon);
       term.open(container);
+      // ghostty-web creates a hidden <textarea> for keyboard/IME capture
+      // with `position:absolute; left:0; top:0` but no `caret-color:
+      // transparent`. Without a positioned ancestor the textarea escapes
+      // to the page origin and its blinking text caret shows at the
+      // top-left of the viewport. Two fixes together eliminate it:
+      //   1. The container carries `position:relative` (see JSX below) so
+      //      the textarea stays inside the terminal box.
+      //   2. We also set `caret-color:transparent` directly so the caret
+      //      is invisible even if the element somehow lands elsewhere.
+      // Keyboard input is unaffected — the textarea is still in the DOM,
+      // focusable, and receives events; only its paint caret is hidden.
+      try {
+        const ta = container.querySelector("textarea");
+        if (ta) {
+          (ta as HTMLTextAreaElement).style.caretColor = "transparent";
+        }
+      } catch {
+        // ignore — cosmetic-only; don't break the terminal for this
+      }
       try {
         fitAddon.fit();
         fitAddon.observeResize();
@@ -330,7 +349,10 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
           {errorMessage ?? "shell unavailable"}
         </p>
       )}
-      <div ref={containerRef} className="min-h-0 flex-1 rounded-md border bg-card px-3 py-2" />
+      <div
+        ref={containerRef}
+        className="relative min-h-0 flex-1 rounded-md border bg-card px-3 py-2"
+      />
     </section>
   );
 }

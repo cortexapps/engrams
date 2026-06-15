@@ -1,34 +1,40 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { drainHost } from "../api";
-import type { HostView } from "../types";
+import { useMutation, createConnectQueryKey } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
+import { drainHost, listHosts } from "../gen/engram/app/v1/fleet-FleetService_connectquery";
+import type { ListHostsResponse } from "../gen/engram/app/v1/fleet_pb";
 
 // Cordon a host from the Fleet surface. Optimistic: the host flips to
 // `draining` (and its running-sandbox / capacity figures zero out)
-// immediately in the `['hosts']` cache so the strata redraw without
-// waiting on the 1s poll; on error we roll back, and we always
+// immediately in the connect-query listHosts cache so the strata redraw
+// without waiting on the 1s poll; on error we roll back, and we always
 // invalidate on settle so the next heartbeat is authoritative.
 
 export function useDrainHost() {
   const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (hostId: string) => drainHost(hostId),
-    onMutate: async (hostId: string) => {
-      await qc.cancelQueries({ queryKey: ["hosts"] });
-      const previous = qc.getQueryData<HostView[]>(["hosts"]);
-      qc.setQueryData<HostView[]>(["hosts"], (old) =>
-        (old ?? []).map((h) =>
-          h.id === hostId
-            ? { ...h, status: "draining", running_sandboxes: 0, capacity_used_mib: 0 }
-            : h,
-        ),
-      );
+  const hostsKey = createConnectQueryKey({ schema: listHosts, input: {}, cardinality: "finite" });
+  return useMutation(drainHost, {
+    onMutate: async (req) => {
+      const hostId = req.hostId ?? "";
+      await qc.cancelQueries({ queryKey: hostsKey });
+      const previous = qc.getQueryData<ListHostsResponse>(hostsKey);
+      qc.setQueryData<ListHostsResponse>(hostsKey, (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          hosts: old.hosts.map((h) =>
+            h.id === hostId
+              ? { ...h, status: "draining", runningSandboxes: 0, capacityUsedMib: 0n }
+              : h,
+          ),
+        };
+      });
       return { previous };
     },
-    onError: (_err, _hostId, ctx) => {
-      if (ctx?.previous) qc.setQueryData(["hosts"], ctx.previous);
+    onError: (_err, _req, ctx) => {
+      if (ctx?.previous) qc.setQueryData(hostsKey, ctx.previous);
     },
     onSettled: () => {
-      qc.invalidateQueries({ queryKey: ["hosts"] });
+      qc.invalidateQueries({ queryKey: hostsKey });
     },
   });
 }

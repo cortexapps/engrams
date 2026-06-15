@@ -1,6 +1,8 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
-import { AuthProvider, useAuth } from "./auth/AuthProvider";
+import { TransportProvider } from "@connectrpc/connect-query";
+import { createConnectTransport } from "@connectrpc/connect-web";
+import { AuthProvider, useOptionalAuth } from "./auth/AuthProvider";
 import { router } from "./router";
 
 const queryClient = new QueryClient({
@@ -12,21 +14,24 @@ const queryClient = new QueryClient({
   },
 });
 
-// AuthProvider resolves the principal (GET /me) and renders boot/not-member/
-// error screens until it does — so by the time InnerApp mounts the router,
-// `auth` is fully resolved and safe to hand to the router context that
-// beforeLoad admin guards read.
+// ADR 0051 Task 23: Connect transport targeting /rpc (Vite proxy → orchestrator :8787).
+// TransportProvider makes it available to all useQuery/useMutation connect-query hooks
+// without threading a transport prop everywhere.
+const transport = createConnectTransport({ baseUrl: "/rpc" });
+
 function InnerApp() {
-  const auth = useAuth();
+  const auth = useOptionalAuth();
   return <RouterProvider router={router} context={{ auth }} />;
 }
 
 export function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <InnerApp />
-      </AuthProvider>
-    </QueryClientProvider>
+    <TransportProvider transport={transport}>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <InnerApp />
+        </AuthProvider>
+      </QueryClientProvider>
+    </TransportProvider>
   );
 }

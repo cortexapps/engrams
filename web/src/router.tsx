@@ -7,12 +7,14 @@
 // rail stays mounted across the list views and the transcript (the highlight
 // moves; the rail doesn't remount).
 //
+// Auth gate: appLayoutRoute.beforeLoad redirects to /login when context.auth is
+// null (unauthenticated). /login is a sibling of appLayoutRoute (not a child),
+// so it is never caught by the guard. This replaces the old window.location
+// redirect in AuthProvider, which caused an infinite reload loop on /login.
+//
 // Admin surfaces guard via a shared `requireAdmin` beforeLoad reading `isAdmin`
-// from typed router context; the context's `auth` is populated at
-// <RouterProvider/> time (see App.tsx), and AuthProvider gates rendering until
-// the principal resolves, so `context.auth` is always present when beforeLoad
-// runs. The coordinator's require_admin layer remains the real gate — these
-// guards are UX-only.
+// from typed router context. The coordinator's require_admin layer remains the
+// real gate — these guards are UX-only.
 import {
   createRootRouteWithContext,
   createRoute,
@@ -21,6 +23,7 @@ import {
 } from "@tanstack/react-router";
 import type { AuthState } from "./auth/AuthProvider";
 import { RootLayout } from "./pages/RootLayout";
+import { Login } from "./pages/Login";
 import { SessionsLayout } from "./pages/sessions/SessionsLayout";
 import { MySessions } from "./pages/sessions/MySessions";
 import { AllSessions } from "./pages/sessions/AllSessions";
@@ -37,22 +40,56 @@ import { RegistriesPanel } from "./components/settings/RegistriesPanel";
 import { TokensPanel } from "./components/settings/TokensPanel";
 
 export interface RouterContext {
-  auth: AuthState;
+  /** Null when the session has resolved but no user is signed in.
+   * The appLayoutRoute.beforeLoad gate redirects to /login in that case.
+   * Authenticated routes can safely assert non-null after the gate runs. */
+  auth: AuthState | null;
+}
+
+/** Auth gate for all authenticated routes (appLayoutRoute and its children).
+ * Redirects to /login when no session is present. The /login route is a
+ * sibling of appLayoutRoute — it is never covered by this guard. */
+function requireAuth({ context }: { context: RouterContext }) {
+  if (!context.auth) {
+    throw redirect({ to: "/login" });
+  }
 }
 
 /** Shared UX-only admin guard. Members who deep-link to an admin route get
  * bounced to their profile instead of rendering an empty/erroring panel. */
 function requireAdmin({ context }: { context: RouterContext }) {
-  if (!context.auth.isAdmin) {
+  if (!context.auth?.isAdmin) {
     throw redirect({ to: "/settings/profile" });
   }
 }
 
 const createRootRoute = createRootRouteWithContext<RouterContext>();
-const rootRoute = createRootRoute({ component: RootLayout });
+
+// The true root is a bare passthrough (no component) so the tree can host
+// both the app shell (RootLayout) and the /login page (no chrome) as siblings.
+const rootRoute = createRootRoute();
+
+// /login — unauthenticated entry point; no app chrome.
+const loginRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/login",
+  component: Login,
+});
+
+// The app shell — pathless layout wrapping all authenticated routes.
+// Using id (no path) makes TanStack Router treat this as a layout-only segment
+// that contributes no URL prefix — children like /sessions still resolve
+// as /sessions, not /app/sessions.
+// beforeLoad: requireAuth redirects unauthenticated visitors to /login.
+const appLayoutRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  id: "_app",
+  beforeLoad: requireAuth,
+  component: RootLayout,
+});
 
 const indexRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/",
   beforeLoad: () => {
     throw redirect({ to: "/sessions" });
@@ -61,7 +98,7 @@ const indexRoute = createRoute({
 
 // /sessions layout route (second sidebar) ----------------------------------
 const sessionsLayoutRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/sessions",
   component: SessionsLayout,
 });
@@ -88,7 +125,7 @@ const sessionDetailRoute = createRoute({
 // /operator layout route (second sidebar) — the admin hat. The whole section
 // is admin-gated here, so the child telemetry/config routes don't each re-guard.
 const operatorLayoutRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/operator",
   beforeLoad: requireAdmin,
   component: OperatorLayout,
@@ -121,7 +158,7 @@ const operatorRegistriesRoute = createRoute({
 
 // /settings layout route (second sidebar) ----------------------------------
 const settingsLayoutRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/settings",
   component: SettingsLayout,
 });
@@ -150,22 +187,28 @@ const membersRoute = createRoute({
 });
 
 const routeTree = rootRoute.addChildren([
-  indexRoute,
-  sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
-  operatorLayoutRoute.addChildren([
-    operatorIndexRoute,
-    operatorFleetRoute,
-    operatorStorageRoute,
-    operatorImagesRoute,
-    operatorRegistriesRoute,
+  // /login — bare page, no app chrome
+  loginRoute,
+  // Authenticated app shell — all authenticated routes nested here
+  appLayoutRoute.addChildren([
+    indexRoute,
+    sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
+    operatorLayoutRoute.addChildren([
+      operatorIndexRoute,
+      operatorFleetRoute,
+      operatorStorageRoute,
+      operatorImagesRoute,
+      operatorRegistriesRoute,
+    ]),
+    settingsLayoutRoute.addChildren([settingsIndexRoute, profileRoute, tokensRoute, membersRoute]),
   ]),
-  settingsLayoutRoute.addChildren([settingsIndexRoute, profileRoute, tokensRoute, membersRoute]),
 ]);
 
 export const router = createRouter({
   routeTree,
   // Populated per-render at <RouterProvider context={{ auth }} /> in App.tsx.
-  context: { auth: undefined! as AuthState },
+  // auth is null when signed out; appLayoutRoute.beforeLoad redirects to /login.
+  context: { auth: null },
 });
 
 declare module "@tanstack/react-router" {

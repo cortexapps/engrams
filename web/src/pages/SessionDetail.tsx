@@ -25,7 +25,7 @@ import { useHosts } from "../hooks/useHosts";
 import { useTeleportSession } from "../hooks/useTeleportSession";
 import { usePauseResumeSession } from "../hooks/usePauseResumeSession";
 import { useIsAdmin } from "../auth/AuthProvider";
-import type { Session } from "../types";
+import type { Session } from "../lib/types";
 
 type ViewTab = "transcript" | "shell" | "raw";
 
@@ -36,7 +36,7 @@ const TABS = [
 ];
 
 export function SessionDetail() {
-  const { id } = useParams({ from: "/sessions/$id" });
+  const { id } = useParams({ from: "/_app/sessions/$id" });
   const { data: session } = useSession(id);
   const events = useSessionEvents(id);
   const [tab, setTab] = useState<ViewTab>("transcript");
@@ -129,7 +129,7 @@ function SessionMeta({
     <div className="space-y-5">
       <div className="flex items-center gap-2">
         <StatusGlyph status={session.status} />
-        <span className="text-sm font-medium text-foreground">
+        <span data-testid="session-status" className="text-sm font-medium text-foreground">
           {session.status.replace(/_/g, " ")}
         </span>
       </div>
@@ -142,7 +142,9 @@ function SessionMeta({
           </dd>
         </div>
         <MetricRow label="created" value={`${relativeTime(session.created_at)} ago`} />
-        <MetricRow label="events" value={eventCount} />
+        {/* The count gets its own element: e2e polls Number(textContent) of
+            exactly this span — tagging surrounding prose would yield NaN. */}
+        <MetricRow label="events" value={<span data-testid="event-count">{eventCount}</span>} />
       </dl>
 
       {/* ADR 0016 Phase A + ADR 0028 A.log: per-session durability — "is my
@@ -271,6 +273,7 @@ function RawEvents({ events }: { events: ReturnType<typeof useSessionEvents> }) 
       {events.map((e) => (
         <div
           key={e.idx}
+          data-testid="event-row"
           className="grid items-baseline gap-3"
           style={{ gridTemplateColumns: "4ch min-content 1fr" }}
         >

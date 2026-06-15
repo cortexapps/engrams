@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import type { SessionState } from "../types";
+import type { SessionState } from "../lib/types";
 
 // Status glyphs in the margin — these stand in for colored dots. The
 // shape carries the meaning, not the color.
