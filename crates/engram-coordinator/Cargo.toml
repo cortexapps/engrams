@@ -82,5 +82,4 @@ engram-git-dev.workspace = true
 futures = { workspace = true }
 http-body-util = "0.1"
 parking_lot.workspace = true
-reqwest.workspace = true
 tempfile = "3"
