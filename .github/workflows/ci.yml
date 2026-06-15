@@ -331,7 +331,6 @@ jobs:
             --test snapshot_blob_gc_live_pg \
             --test admin_chunk_gc_live_pg \
             --test admin_evac_live_pg \
-            --test users_live_pg \
             --test eviction_live_pg \
             --test checkpoint_reconcile_live_pg \
             --test enable_jobs_live_pg \
@@ -1368,18 +1367,20 @@ jobs:
   # flaky `proxy_e2e` doesn't suppress e2e-stack signal.
   # ------------------------------------------------------------------
   test-e2e-stack:
-    name: e2e stack ${{ matrix.variant }} (coord HTTP → gRPC → FC)
-    # Two variants of the same prod-shape stack (egress proxy on for
-    # both — the proven config):
-    #   - suite: single host. Runs every e2e_stack test EXCEPT the
-    #     teleport one (incl. the egress-dependent claude auth test,
-    #     which a single host serves reliably).
-    #   - teleport: two hosts (host-a + host-b). Runs ONLY the teleport
-    #     test, hard-asserting >=2 hosts. The egress-dependent claude
-    #     test is NOT run here — two FC host-agents sharing one runner
-    #     with egress on destabilizes that test specifically (the claude
-    #     session can land on host-b and emit no events); the teleport
-    #     test uses mode=dev_vm and doesn't touch egress, so it's stable.
+    name: e2e stack ${{ matrix.variant }} (coord app-gRPC → FC)
+    # Single-host prod-shape stack (egress proxy on — the proven config),
+    # driven over the coordinator's app-gRPC surface (ADR 0051 Drip E
+    # removed the web-facing REST surface the suite used to drive). Runs
+    # every e2e_stack test, incl. the egress-dependent claude auth test,
+    # which a single host serves reliably.
+    #
+    # ADR 0051: the former `teleport` matrix variant (two hosts: host-a +
+    # host-b) is dropped — it existed solely to run
+    # `e2e_two_host_teleport_preserves_sentinel`, which was deleted because
+    # there is no Teleport RPC on the app-gRPC surface (adding one would be
+    # a breaking app/v1 proto change). The two-host evacuation path is still
+    # covered end-to-end by the dev-vm `integration-evac-test.sh`.
+    #
     # e2e stack is not a required check, so the matrix-suffixed job names
     # don't affect branch protection.
     strategy:
@@ -1388,12 +1389,7 @@ jobs:
         include:
           - variant: suite
             two_hosts: ""
-            expect_two_hosts: ""
-            nextest_filter: "not test(e2e_two_host_teleport_preserves_sentinel)"
-          - variant: teleport
-            two_hosts: "1"
-            expect_two_hosts: "1"
-            nextest_filter: "test(e2e_two_host_teleport_preserves_sentinel)"
+            nextest_filter: "test(/e2e_/)"
     # Gate (e2e is not required → a skip can't block merge): run on any
     # e2e-relevant change, and always on merge_group + push-to-main.
     if: >-
@@ -1697,7 +1693,13 @@ jobs:
 
       - name: Run e2e_stack tests
         env:
-          ENGRAM_E2E_COORD_URL: http://127.0.0.1:8090
+          # ADR 0051 Drip E: the coordinator's web-facing REST surface is
+          # gone; e2e_stack now drives the coord over app-gRPC. These match
+          # the Tiltfile's coord_env (ENGRAM_APP_GRPC_ADDR /
+          # ENGRAM_APP_GRPC_TOKENS). The address needs the http:// scheme so
+          # tonic's Endpoint::from_shared parses it.
+          ENGRAM_E2E_GRPC_ADDR: http://127.0.0.1:50061
+          ENGRAM_E2E_GRPC_TOKEN: dev-app-grpc-token
           # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
           # points at the just-baked `demo-claude` image whose
           # manifest.toml carries the resolved Claude harness contract.
@@ -1709,12 +1711,10 @@ jobs:
           # regression, not the old "no nbd.ko" environment gap, so the
           # Phase B chunked-disk tests fail loud instead of skipping.
           ENGRAM_EXPECT_NBD: "1"
-          # suite: "" → teleport test self-skips (and is filtered out
-          # below anyway). teleport: "1" → the teleport test hard-asserts
-          # >=2 hosts instead of skipping.
-          ENGRAM_EXPECT_TWO_HOSTS: "${{ matrix.expect_two_hosts }}"
-          # Per-variant nextest filterset: suite runs everything except
-          # the teleport test; teleport runs only it.
+          # nextest filterset: run every e2e_stack test (all are named
+          # `e2e_*`). ADR 0051 dropped the per-variant teleport split — the
+          # two-host teleport test (and the ENGRAM_EXPECT_TWO_HOSTS gate it
+          # read) no longer exist.
           E2E_NEXTEST_FILTER: "${{ matrix.nextest_filter }}"
         run: |
           cargo nextest run \

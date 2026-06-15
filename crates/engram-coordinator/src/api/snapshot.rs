@@ -2317,7 +2317,7 @@ mod evicting_gate_tests {
         let id = SessionId::new();
         let (state, _local) = build_state_for_session(evicting_session(id));
 
-        let err = match resume(State(state.clone()), Path(id)).await {
+        let err = match resume_core(&state, id).await {
             Err(e) => e,
             Ok(_) => panic!("Evicting must not resume"),
         };
@@ -2343,10 +2343,9 @@ mod evicting_gate_tests {
             .sandbox_id
             .unwrap();
 
-        let code = crate::api::sessions::delete_session(State(state.clone()), Path(id))
+        crate::api::sessions::delete_session_core(&state, id)
             .await
             .expect("delete mid-eviction");
-        assert_eq!(code, StatusCode::NO_CONTENT);
         let after = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(after.status, SessionState::Completed);
 

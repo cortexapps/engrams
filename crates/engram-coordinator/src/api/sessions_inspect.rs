@@ -21,7 +21,7 @@ use crate::cow_state::{fetch_for_host, CowStateView};
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ConversationEntry {
     pub idx: i64,
     pub kind: String,
