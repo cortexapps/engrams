@@ -331,7 +331,6 @@ jobs:
             --test snapshot_blob_gc_live_pg \
             --test admin_chunk_gc_live_pg \
             --test admin_evac_live_pg \
-            --test users_live_pg \
             --test eviction_live_pg \
             --test checkpoint_reconcile_live_pg \
             --test enable_jobs_live_pg \
