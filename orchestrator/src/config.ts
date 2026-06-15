@@ -9,6 +9,14 @@
 export interface Config {
   /** ORCHESTRATOR_PORT — default 8787 */
   port: number;
+  /**
+   * ORCHESTRATOR_PUBLIC_URL — externally-reachable base URL, used as
+   * better-auth's `baseURL` (session-cookie domain + the OIDC redirect
+   * callback `${baseUrl}/api/auth/oauth2/callback/<provider>`). Default:
+   * http://127.0.0.1:${port} (dev). MUST be set to the public https URL in
+   * any OIDC prod deploy, else the IdP redirect lands on an unreachable host.
+   */
+  baseUrl: string;
   /** ORCHESTRATOR_DATABASE_URL — required (Task 15) */
   databaseUrl: string;
   /** CONTROL_PLANE_GRPC_URL — default http://127.0.0.1:50061 */
@@ -46,6 +54,27 @@ export interface Config {
    * fixture server. Not needed in prod.
    */
   iapJwksUrl: string;
+  /**
+   * Env-driven OIDC ("Sign in with your IdP"), restoring the old coordinator
+   * `--auth-mode=oidc` parity. Present only when ORCHESTRATOR_OIDC_ISSUER +
+   * CLIENT_ID + CLIENT_SECRET are all set; otherwise `undefined` (OIDC off,
+   * email+password / IAP remain). Federated SSO this way also yields real
+   * user names (the ID token's `name`/`given_name` claims via the `profile`
+   * scope, which stock GCP IAP can't supply).
+   */
+  oidc: OidcConfig | undefined;
+}
+
+/** A configured generic OIDC provider (better-auth genericOAuth). */
+export interface OidcConfig {
+  /** Issuer base URL; discovery doc is `${issuer}/.well-known/openid-configuration`. */
+  issuer: string;
+  clientId: string;
+  clientSecret: string;
+  /** Stable provider id used in the sign-in call + callback path. */
+  providerId: string;
+  /** Requested scopes (`profile` pulls the display name). */
+  scopes: string[];
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -77,6 +106,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 
   const portStr = optional("ORCHESTRATOR_PORT", "8787");
   const port = parseInt(portStr, 10);
+  const baseUrl = optional("ORCHESTRATOR_PUBLIC_URL", `http://127.0.0.1:${port}`);
   const controlPlaneBearer = require("CONTROL_PLANE_BEARER");
   const controlPlaneGrpcUrl = optional("CONTROL_PLANE_GRPC_URL", "http://127.0.0.1:50061");
   const controlPlaneHttpUrl = optional("CONTROL_PLANE_HTTP_URL", "http://127.0.0.1:8090");
@@ -103,6 +133,30 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     "https://www.gstatic.com/iap/verify/public_key-jwk",
   );
 
+  // OPTIONAL: env-driven OIDC. Opt-in via ORCHESTRATOR_OIDC_ISSUER; when set,
+  // CLIENT_ID + CLIENT_SECRET become required (partial config is a hard error,
+  // mirroring the old `--auth-mode=oidc` validation — you meant to enable OIDC
+  // but under-configured it). Unset = OIDC off.
+  const oidcIssuer = env["ORCHESTRATOR_OIDC_ISSUER"]?.trim() || undefined;
+  let oidc: OidcConfig | undefined;
+  if (oidcIssuer) {
+    const clientId = env["ORCHESTRATOR_OIDC_CLIENT_ID"]?.trim() || "";
+    const clientSecret = env["ORCHESTRATOR_OIDC_CLIENT_SECRET"]?.trim() || "";
+    if (!clientId)
+      missing.push("ORCHESTRATOR_OIDC_CLIENT_ID (required when ORCHESTRATOR_OIDC_ISSUER is set)");
+    if (!clientSecret)
+      missing.push("ORCHESTRATOR_OIDC_CLIENT_SECRET (required when ORCHESTRATOR_OIDC_ISSUER is set)");
+    oidc = {
+      issuer: oidcIssuer.replace(/\/$/, ""),
+      clientId,
+      clientSecret,
+      providerId: optional("ORCHESTRATOR_OIDC_PROVIDER_ID", "sso"),
+      scopes: optional("ORCHESTRATOR_OIDC_SCOPES", "openid email profile")
+        .split(/[\s,]+/)
+        .filter(Boolean),
+    };
+  }
+
   if (missing.length > 0) {
     throw new Error(
       `Orchestrator: missing required environment variable(s): ${missing.join(", ")}`,
@@ -117,6 +171,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 
   return {
     port,
+    baseUrl,
     databaseUrl,
     controlPlaneGrpcUrl,
     controlPlaneHttpUrl,
@@ -125,6 +180,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     betterAuthSecret,
     iapAudience,
     iapJwksUrl,
+    oidc,
   };
 }
 

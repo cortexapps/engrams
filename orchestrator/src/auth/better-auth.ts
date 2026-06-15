@@ -28,11 +28,35 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { admin } from "better-auth/plugins/admin";
+import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { getDb } from "../db/client.ts";
 import { config } from "../config.ts";
 
+// Env-driven OIDC ("Sign in with your IdP"), restoring the old coordinator
+// `--auth-mode=oidc` parity. Added only when config.oidc is present (issuer +
+// client id/secret all set). Federated SSO also yields real display names via
+// the `profile` scope's ID-token claims — something stock GCP IAP can't supply.
+const oidcPlugins = config.oidc
+  ? [
+      genericOAuth({
+        config: [
+          {
+            providerId: config.oidc.providerId,
+            clientId: config.oidc.clientId,
+            clientSecret: config.oidc.clientSecret,
+            discoveryUrl: `${config.oidc.issuer}/.well-known/openid-configuration`,
+            scopes: config.oidc.scopes,
+          },
+        ],
+      }),
+    ]
+  : [];
+
 export const auth = betterAuth({
-  baseURL: `http://127.0.0.1:${config.port}`,
+  // Public base URL (ORCHESTRATOR_PUBLIC_URL); dev defaults to loopback. Drives
+  // the cookie domain + the OIDC redirect callback, so it MUST be the
+  // externally-reachable URL in an OIDC prod deploy.
+  baseURL: config.baseUrl,
   // The browser reaches this through the vite proxy with
   // Origin: http://localhost:5173 — without trustedOrigins, better-auth
   // 403s every non-GET auth route (CSRF protection).
@@ -61,5 +85,6 @@ export const auth = betterAuth({
   secret: config.betterAuthSecret,
   plugins: [
     admin(), // role field ('admin'|'user'), setRole/ban/list APIs → Members UI
+    ...oidcPlugins, // env-driven OIDC provider (genericOAuth) when configured
   ],
 });
