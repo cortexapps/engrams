@@ -254,6 +254,16 @@ otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
     'ENGRAM_BIND_ADDR': '127.0.0.1:8090',
+    # ADR 0051: the orchestrator-facing control plane is now app-gRPC only
+    # (engram.app.v1, default 127.0.0.1:50061). The coordinator FAILS CLOSED
+    # if `ENGRAM_APP_GRPC_TOKENS` is unset (every RPC → Unauthenticated), so
+    # always seed a token. `engram-cli` (registry add, image enable, host
+    # list) and the e2e_stack harness both authenticate with it via
+    # ENGRAM_APP_TOKEN / ENGRAM_E2E_GRPC_TOKEN. Overridable in .env for dev;
+    # the default is a fixed dev token (not a secret — the surface is bound
+    # to loopback in the dev/CI rig).
+    'ENGRAM_APP_GRPC_ADDR': env_or('ENGRAM_APP_GRPC_ADDR', '127.0.0.1:50061'),
+    'ENGRAM_APP_GRPC_TOKENS': env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token'),
     'ENGRAM_MODE': 'coordinator' if dev_split else 'all',
     'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
     'ENGRAM_SANDBOX_WORK_DIR': './var/sandboxes',

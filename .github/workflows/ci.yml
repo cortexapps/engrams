@@ -1553,6 +1553,15 @@ jobs:
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release
           ENGRAM_SKIP_WEB: "1"
+          # ADR 0051: the coordinator's orchestrator-facing control plane is
+          # app-gRPC only (engram.app.v1) and FAILS CLOSED without a token —
+          # every RPC returns Unauthenticated. Seed the static bearer the
+          # Tiltfile passes to the coord as ENGRAM_APP_GRPC_TOKENS; the e2e
+          # test (ENGRAM_E2E_GRPC_TOKEN) and the registry-seed CLI step
+          # (ENGRAM_APP_TOKEN) authenticate with the same value. Not a secret
+          # — the gRPC surface is bound to loopback in the CI rig.
+          ENGRAM_APP_GRPC_TOKENS: e2e-app-grpc-token
+          ENGRAM_APP_TOKEN: e2e-app-grpc-token
           # Per-session egress proxy. The local dev path defaults to
           # disabled (unfiltered network — relies on the dev VM's host
           # masquerade). The Blacksmith runner doesn't NAT FC TAP
@@ -1603,9 +1612,14 @@ jobs:
       - name: Seed GHCR credential in coord PG
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ADR 0051: `engram-cli registry add` drives ImageService over
+          # app-gRPC now (the HTTP `--endpoint` flag is gone). Dial the
+          # gRPC surface (default 127.0.0.1:50061) with the bearer the
+          # coord was seeded with above.
+          ENGRAM_APP_GRPC: http://127.0.0.1:50061
+          ENGRAM_APP_TOKEN: e2e-app-grpc-token
         run: |
           printf '%s' "$GHCR_TOKEN" | ./target/release/engram-cli \
-              --endpoint http://localhost:8090 \
               registry add \
               --host ghcr.io \
               --username "${{ github.actor }}" \
@@ -1675,6 +1689,13 @@ jobs:
           echo "Catalog override set: ENGRAM_BUILTIN_HARNESS_CLAUDE_REPO=${LOCAL_REPO}"
 
       - name: Bake demo image + capture URI
+        env:
+          # ADR 0051: integration-bake-demo.sh enables the image + polls
+          # readiness over app-gRPC now (ImageService / FleetService via
+          # the CLI). Point the CLI at the gRPC surface + authenticate with
+          # the coord's bearer.
+          ENGRAM_APP_GRPC: http://127.0.0.1:50061
+          ENGRAM_APP_TOKEN: e2e-app-grpc-token
         run: |
           IMAGE_URI=$(bash deploy/dev/integration-bake-demo.sh)
           echo "    baked image: $IMAGE_URI"
@@ -1691,7 +1712,12 @@ jobs:
 
       - name: Run e2e_stack tests
         env:
-          ENGRAM_E2E_COORD_URL: http://127.0.0.1:8090
+          # ADR 0051: the harness drives the app-gRPC surface
+          # (engram.app.v1 SessionService/FleetService), not the deleted
+          # HTTP routes. Dial the gRPC addr + authenticate with the bearer
+          # the coord was seeded with (ENGRAM_APP_GRPC_TOKENS above).
+          ENGRAM_E2E_GRPC_ADDR: http://127.0.0.1:50061
+          ENGRAM_E2E_GRPC_TOKEN: e2e-app-grpc-token
           # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
           # points at the just-baked `demo-claude` image whose
           # manifest.toml carries the resolved Claude harness contract.
