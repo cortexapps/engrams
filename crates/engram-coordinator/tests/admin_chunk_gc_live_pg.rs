@@ -243,9 +243,9 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
     let session_id = rig
         .meta
         .create_session(SessionSpec {
+            user_id: None,
             image: image_uri.clone(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");
@@ -681,9 +681,9 @@ async fn non_recoverable_snapshots_do_not_pin() {
     let session_id = rig
         .meta
         .create_session(SessionSpec {
+            user_id: None,
             image: format!("phase-c-unrec-test:warm-{}", Uuid::new_v4()),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");

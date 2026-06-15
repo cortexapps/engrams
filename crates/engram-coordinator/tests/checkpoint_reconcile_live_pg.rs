@@ -37,9 +37,9 @@ async fn pg() -> Option<Arc<dyn MetadataStore>> {
 async fn seed_active(meta: &Arc<dyn MetadataStore>) -> (SessionId, SandboxId) {
     let id = meta
         .create_session(SessionSpec {
+            user_id: None,
             image: "localhost:5001/demo:warm-ckpt-test".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create");

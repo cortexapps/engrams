@@ -8,32 +8,22 @@
 //! Dead sessions return 410 Gone — the only affordance there is
 //! `engram session fork <id>`.
 
-use axum::extract::{Path, State};
-use axum::Json;
 use engram_core::SessionId;
 use engram_harness_proto::AgentRole;
-use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
 
-#[derive(Deserialize)]
-pub struct PromptRequest {
-    pub text: String,
-}
-
-#[derive(Serialize)]
-pub struct PromptResponse {
-    pub session_id: SessionId,
-    pub note: &'static str,
-}
-
-pub async fn prompt(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-    Json(req): Json<PromptRequest>,
-) -> Result<Json<PromptResponse>, ApiError> {
-    if req.text.is_empty() {
+/// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`). Extracted
+/// verbatim from the legacy axum `prompt` handler — only the I/O shape
+/// changed (request fields → params, `Json<PromptResponse>` → the `&'static
+/// str` note). The auto-resume + mid-move hold logic is unchanged.
+pub(crate) async fn send_prompt_core(
+    state: &SharedState,
+    id: SessionId,
+    text: String,
+) -> Result<&'static str, ApiError> {
+    if text.is_empty() {
         return Err(ApiError::BadRequest("`text` is required".into()));
     }
 
@@ -41,7 +31,7 @@ pub async fn prompt(
     // sessions surface 410 Gone here (ensure_active → resume_session
     // → ApiError::Gone for missing snapshots). Active sessions are a
     // no-op.
-    crate::api::snapshot::ensure_active(&state, id).await?;
+    crate::api::snapshot::ensure_active(state, id).await?;
 
     // HOLD delivery while the session is mid-move/mid-resume.
     // Forwarding into the freeze window writes the prompt into a
@@ -111,7 +101,7 @@ pub async fn prompt(
         )
     })?;
 
-    let prompt_text = req.text;
+    let prompt_text = text;
     state
         .services
         .host
@@ -143,8 +133,5 @@ pub async fn prompt(
         tracing::warn!(session_id = %id, error = %e, "emit user prompt event failed");
     }
 
-    Ok(Json(PromptResponse {
-        session_id: id,
-        note: "prompt forwarded",
-    }))
+    Ok("prompt forwarded")
 }

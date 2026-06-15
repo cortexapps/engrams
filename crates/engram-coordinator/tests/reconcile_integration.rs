@@ -58,8 +58,8 @@ impl ReconcileMeta {
         self.sessions.lock().insert(
             id,
             Session {
-                id,
                 user_id: None,
+                id,
                 status: SessionState::Active,
                 host_id: Some(host),
                 sandbox_id: Some(sandbox),

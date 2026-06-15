@@ -347,9 +347,12 @@ impl ChunkCache {
     /// Test/explicit constructor that sets the free-space floor directly,
     /// bypassing env resolution. Used by unit tests that need a
     /// deterministic floor (real test filesystems are huge, so the
-    /// default 10% floor never trips). Not part of the public surface.
+    /// default 10% floor never trips — but a nearly-full dev disk DOES
+    /// trip it, evicting the very chunks a test just wrote; see the
+    /// local-sink re-chunk test in `file.rs`). Not part of the public
+    /// surface.
     #[cfg(test)]
-    fn new_with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
+    pub(crate) fn new_with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
         Self {
             inner: Arc::new(CacheInner {
                 config,

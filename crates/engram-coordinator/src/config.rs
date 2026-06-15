@@ -21,17 +21,32 @@ pub struct CoordinatorConfig {
     /// expected to source tokens from a secret manager and rotate
     /// the process; for v1 we don't hot-reload.
     pub auth_tokens: Vec<String>,
-    /// ADR 0031 human authentication config (OIDC / forward-auth / synthetic).
-    /// `AuthMode::None` (the default) → synthetic admin, so `just dev` and the
-    /// test harness run with zero auth setup. `auth_tokens` above is folded
-    /// into `auth.service_tokens` at startup for the machine-caller path.
-    pub auth: engram_auth::AuthConfig,
+    // ADR 0039 Task 32: `auth: engram_auth::AuthConfig` removed.
+    // The human-auth runtime is gone; the coordinator no longer resolves
+    // per-user principals or runs OIDC/forward-auth flows.
     /// Local address the harness-channel TCP listener binds to.
     /// Harnesses spawned via `start_agent` on the Process backend dial
     /// this from the same host. `127.0.0.1:0` (default) lets the OS
     /// pick a free port; the coordinator reads back the bound address
     /// and plumbs it into the agent's env at session-create time.
     pub harness_listen_addr: std::net::SocketAddr,
+    /// Address the orchestrator-facing app gRPC server binds to
+    /// (ADR 0039 §2.3). Serves Session/ShellRelay/Fleet/Image/Secret
+    /// beside the axum API during the migration; the axum web routes
+    /// retire in Phase 5. Loopback by default — the orchestrator is
+    /// the only intended caller and co-locates with the coordinator
+    /// in dev.
+    pub app_grpc_addr: std::net::SocketAddr,
+    /// Bearer tokens accepted on the app gRPC surface (ADR 0039 §5).
+    /// Machine identity for exactly one caller (the orchestrator) —
+    /// deliberately a separate credential from `auth_tokens` above
+    /// (different caller, different blast radius, independently
+    /// rotatable). More than one entry only during rotation overlap.
+    ///
+    /// Unlike `auth_tokens`, empty does NOT mean "auth disabled":
+    /// this surface fails closed — no configured tokens, every call
+    /// answers `unauthenticated` (boot is unaffected).
+    pub app_grpc_tokens: Vec<String>,
 }
 
 impl Default for CoordinatorConfig {
@@ -48,10 +63,15 @@ impl Default for CoordinatorConfig {
             // this from `ENGRAM_AUTH_TOKENS` (or a future secret-store
             // hookup) at startup.
             auth_tokens: Vec::new(),
-            auth: engram_auth::AuthConfig::default(),
             harness_listen_addr: "127.0.0.1:0"
                 .parse()
                 .expect("default harness_listen_addr must parse"),
+            app_grpc_addr: "127.0.0.1:50061"
+                .parse()
+                .expect("default app_grpc_addr must parse"),
+            // Empty = fail closed (every app-gRPC call rejected), NOT
+            // auth-off. Populated from `ENGRAM_APP_GRPC_TOKENS`.
+            app_grpc_tokens: Vec::new(),
         }
     }
 }

@@ -17,146 +17,117 @@
 //! captured by the bus subscription; we de-dupe by tracking the
 //! highest replayed idx and skipping live events at or below it.
 
-use std::convert::Infallible;
-use std::time::Duration;
-
-use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use engram_core::SessionId;
 use futures::stream::{Stream, StreamExt};
-use serde::Deserialize;
 
 use crate::error::ApiError;
 use crate::state::{IndexedEvent, SharedState};
 
 const REPLAY_LIMIT: i64 = 1000;
 
-#[derive(Deserialize)]
-pub struct EventsQuery {
-    /// Replay events with `idx > since`. Combine with `Last-Event-ID`
-    /// header (EventSource auto-reconnect) — the larger of the two
-    /// wins so an explicit query never goes backward across reconnect.
-    pub since: Option<i64>,
-}
-
-pub async fn events(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-    Query(query): Query<EventsQuery>,
-    headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+/// ADR 0051: the sequencing-sensitive core (existence check → subscribe
+/// FIRST → replay) shared by the axum SSE handler above and the app-gRPC
+/// `StreamEvents` RPC (`grpc_app/session.rs`). Returns the replayed events
+/// plus a live receiver already subscribed *before* the query, so nothing
+/// emitted during the query is lost. `since`: replay `idx > since`; `None`
+/// ≡ `-1` (from the start of the log). The gRPC handler maps the items to
+/// proto; the axum handler frames them as SSE + ADR 0050 B shutdown.
+pub(crate) async fn events_core(
+    state: &SharedState,
+    id: SessionId,
+    since: Option<i64>,
+) -> Result<
+    (
+        Vec<engram_core::types::PersistedEvent>,
+        tokio::sync::broadcast::Receiver<IndexedEvent>,
+    ),
+    ApiError,
+> {
     state.services.meta.get_session(id).await?;
-
-    // Pick the higher of explicit query and Last-Event-ID — explicit
-    // query wins ties. Default of -1 means "from the start of the log."
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok());
-    let since = match (query.since, last_event_id) {
-        (Some(q), Some(h)) => q.max(h),
-        (Some(q), None) => q,
-        (None, Some(h)) => h,
-        (None, None) => -1,
-    };
-
-    // 1) Subscribe FIRST so any event published while we're querying
-    //    the log lands in the broadcast queue rather than getting
-    //    dropped on the floor.
+    let since = since.unwrap_or(-1);
+    // Subscribe FIRST (the sequencing rule at the top of this file), then
+    // replay — same order as the axum handler.
     let live_rx = state.events.subscribe(id);
-
-    // 2) Replay from the persistent log.
     let replayed = state
         .services
         .meta
         .list_session_events_since(id, since, REPLAY_LIMIT)
         .await?;
-    let replay_high_water = replayed.last().map(|e| e.idx).unwrap_or(since);
-
-    // ADR 0050 B: end the stream when the coordinator begins graceful
-    // shutdown so this long-lived SSE connection doesn't block hyper's
-    // drain (tokio-rs/axum#2673). The browser EventSource auto-reconnects
-    // to a healthy replica and resumes from the PG log via Last-Event-ID,
-    // so the close is lossless. Fires immediately if shutdown is already
-    // underway (don't open a new stream on a draining pod).
-    let mut shutdown_rx = state.subscribe_shutdown();
-    let shutdown = async move {
-        // Resolve ONLY on a genuine shutdown trigger (value → true). On
-        // sender-drop `wait_for` returns Err — that's the owning AppState
-        // being torn down (process teardown in prod, a fixture drop in
-        // tests), NOT a shutdown; park so we never force-end a live
-        // stream on it (the stream ends naturally when its source closes).
-        if shutdown_rx
-            .wait_for(|shutting_down| *shutting_down)
-            .await
-            .is_err()
-        {
-            std::future::pending::<()>().await;
-        }
-    };
-    let stream = build_event_stream(replayed, live_rx, replay_high_water).take_until(shutdown);
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    Ok((replayed, live_rx))
 }
 
-fn build_event_stream(
+/// A single item from the unified replay→live event stream. The app-gRPC
+/// `StreamEvents` RPC maps over [`merged_event_stream`]; all dedupe / lag /
+/// high-water semantics live there (the axum SSE handler has its own
+/// [`build_event_stream`] that frames the same merge as SSE messages).
+pub(crate) enum MergedEvent {
+    /// An event replayed from the persistent log.
+    Replay(engram_core::types::PersistedEvent),
+    /// A live event from the broadcast bus (deduplicated against replay).
+    Live(IndexedEvent),
+    /// Broadcast receiver lagged; `n` = number of missed events. No `idx`
+    /// — never disturbs the caller's cursor / high-water state.
+    Lagged(u64),
+}
+
+/// THE replay→live merge for the app-gRPC `StreamEvents` transport.
+/// Dedupe / lag / high-water semantics live here ONLY.
+///
+/// `replay_high_water` is `replayed.last().idx`, or `since.unwrap_or(-1)`
+/// (the "from the start" sentinel) when replay is empty. Replay items
+/// stream first; the live [`BroadcastStream`] follows, dropping any event
+/// at or below the high-water so the seam is gap-free and dup-free. Lag
+/// maps to [`MergedEvent::Lagged`] rather than an error.
+pub(crate) fn merged_event_stream(
     replayed: Vec<engram_core::types::PersistedEvent>,
-    live_rx: tokio::sync::broadcast::Receiver<IndexedEvent>,
-    replay_high_water: i64,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+    live: tokio::sync::broadcast::Receiver<IndexedEvent>,
+    since: Option<i64>,
+) -> impl Stream<Item = MergedEvent> + Send {
     use tokio_stream::wrappers::BroadcastStream;
 
-    // Replay segment: each persisted event becomes an SSE message with
-    // the persisted `kind` and `payload` carried verbatim.
-    let replay = futures::stream::iter(replayed.into_iter().map(persisted_to_sse));
+    let replay_high_water = replayed
+        .last()
+        .map(|e| e.idx)
+        .unwrap_or(since.unwrap_or(-1));
 
-    // Live segment: drop events we already replayed (idx <= high water)
-    // so the seam between the two is gap-free and dup-free.
-    let live = BroadcastStream::new(live_rx).filter_map(move |recv| async move {
+    let replay = futures::stream::iter(replayed.into_iter().map(MergedEvent::Replay));
+
+    let live_stream = BroadcastStream::new(live).filter_map(move |recv| async move {
         match recv {
-            Ok(indexed) if indexed.idx > replay_high_water => Some(indexed_to_sse(indexed)),
+            Ok(indexed) if indexed.idx > replay_high_water => Some(MergedEvent::Live(indexed)),
             Ok(_) => None,
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => Some(
-                Event::default()
-                    .event("lagged")
-                    .data(format!(r#"{{"missed":{n}}}"#)),
-            ),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                Some(MergedEvent::Lagged(n))
+            }
         }
     });
 
-    replay.chain(live).map(Ok::<Event, Infallible>)
+    replay.chain(live_stream)
 }
 
-fn persisted_to_sse(ev: engram_core::types::PersistedEvent) -> Event {
-    // ADR 0028 A.log: fold the rewind metadata into the data object so
-    // the transcript can grey/collapse tombstoned events and segment by
-    // recovery epoch. Underscore-prefixed to never collide with a
-    // SessionEvent field. `_rewound` true → this event was rolled back
-    // by a rung-1 recovery (kept for audit, not the live head).
-    let rewound = ev.rewound_at.is_some();
-    let data = with_rewind_meta(ev.payload, ev.recovery_epoch, rewound);
-    Event::default()
-        .id(ev.idx.to_string())
-        .event(ev.kind)
-        .data(data)
-}
-
-fn indexed_to_sse(indexed: IndexedEvent) -> Event {
-    // Live events are, by construction, never tombstoned (they were
-    // just emitted). They carry the session's current epoch — but the
-    // boundary `recovered_from_checkpoint` event itself carries the
-    // new epoch in its payload, so the web tracks "current epoch" from
-    // that and live events ride along as not-rewound.
-    let payload = serde_json::to_value(&indexed.event).unwrap_or(serde_json::Value::Null);
-    let data = with_rewind_meta(payload, 0, false);
-    Event::default()
-        .id(indexed.idx.to_string())
-        .event(indexed.event.kind())
-        .data(data)
+/// Decode a [`MergedEvent`] into its wire-ready parts: `(idx, kind,
+/// payload_json)`. `payload_json` already has the ADR 0028 A.log rewind
+/// metadata folded in (via [`with_rewind_meta`]) so the gRPC framing is
+/// byte-identical to the SSE one. `idx` is `None` for the lagged sentinel
+/// so it never disturbs client cursors.
+pub(crate) fn merged_to_parts(ev: MergedEvent) -> (Option<i64>, String, String) {
+    match ev {
+        MergedEvent::Replay(ev) => {
+            let rewound = ev.rewound_at.is_some();
+            let payload_json = with_rewind_meta(ev.payload, ev.recovery_epoch, rewound);
+            (Some(ev.idx), ev.kind, payload_json)
+        }
+        MergedEvent::Live(indexed) => {
+            let payload = serde_json::to_value(&indexed.event).unwrap_or(serde_json::Value::Null);
+            let payload_json = with_rewind_meta(payload, 0, false);
+            (
+                Some(indexed.idx),
+                indexed.event.kind().to_string(),
+                payload_json,
+            )
+        }
+        MergedEvent::Lagged(n) => (None, "lagged".to_string(), format!(r#"{{"missed":{n}}}"#)),
+    }
 }
 
 /// Merge ADR 0028 A.log rewind metadata into an event's data object.

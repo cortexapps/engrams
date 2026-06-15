@@ -1222,8 +1222,8 @@ mod tests {
     async fn d5_eviction_is_idle_before_durable_and_records_at_finalize() {
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1280,8 +1280,8 @@ mod tests {
     async fn d5_eviction_upload_failure_writes_no_row_and_destroys() {
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1327,8 +1327,8 @@ mod tests {
         // is no longer the platform's durability primitive.
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1524,8 +1524,8 @@ mod tests {
         // toggle MiniMeta to fail the next record_snapshot.
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1737,8 +1737,8 @@ mod tests {
 
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1954,8 +1954,8 @@ mod tests {
 
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2072,8 +2072,8 @@ mod tests {
     async fn evict_idle_session_lease_serializes_concurrent_calls() {
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2301,8 +2301,8 @@ mod tests {
 
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2415,8 +2415,8 @@ mod tests {
     async fn sweep_stale_session_leases_reaps_old_entries() {
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2506,8 +2506,8 @@ mod tests {
         // Ok(()) without touching anything else.
         let session_id = engram_core::SessionId::new();
         let session = Session {
-            id: session_id,
             user_id: None,
+            id: session_id,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2534,8 +2534,8 @@ mod tests {
 
     fn evicting_session(id: engram_core::SessionId) -> Session {
         Session {
-            id,
             user_id: None,
+            id,
             status: SessionState::Evicting,
             host_id: None,
             sandbox_id: None,

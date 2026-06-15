@@ -44,9 +44,9 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
     // Need a parent session row (FK on snapshots.session_id).
     let session_id = meta
         .create_session(SessionSpec {
+            user_id: None,
             image: "snap-disk-manifest-test:warm-1".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");

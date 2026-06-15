@@ -2997,6 +2997,11 @@ mod tests {
     /// chunks resident on NVMe instead of re-fetching its writes from GCS.
     #[tokio::test]
     async fn flush_write_throughs_chunks_into_local_cache() {
+        // Low-disk hosts (a dev box at >90% used) trip the cache's
+        // free-space floor and evict the just-flushed chunk this test
+        // asserts is resident — same posture as migration_source.rs.
+        // Safe: nextest runs each test in its own process.
+        std::env::set_var(engram_chunk_store::cache::FREE_FLOOR_PCT_ENV_VAR, "0");
         let chunk_size = 4096u64;
         let total = 3 * chunk_size;
         let base = synth_manifest(total, chunk_size, vec![]);

@@ -618,6 +618,38 @@ impl SandboxBackend for VzBackend {
         crate::snapshot::build_metadata(dest, &spec.image, disk_manifest, snapshot_id).await
     }
 
+    /// ADR 0039: pause the VZ VM by freezing its vCPUs via Apple's
+    /// `pauseWithCompletionHandler`. This is the VzBackend override
+    /// of the trait's default no-op — previously the freeze/pause
+    /// button was a silent no-op on the VZ backend because this
+    /// override was absent. Mirrors the Firecracker override: look up
+    /// the live VM by id, return `SandboxError::NotFound` if absent
+    /// (the coordinator already 409s on idle sessions before reaching
+    /// here, so this is the defensive path), then delegate to
+    /// `VzVm::pause` which calls `VZVirtualMachine.pauseWithCompletionHandler`.
+    async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vm = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vm.clone()
+        };
+        vm.pause().await.map_err(SandboxError::from)
+    }
+
+    /// ADR 0039: resume a paused VZ VM via Apple's
+    /// `resumeWithCompletionHandler`. Symmetric companion to
+    /// [`Self::pause`] above. As with Firecracker's override,
+    /// idempotency of double-resume is handled by VZ itself (the
+    /// underlying `dispatch_op` will surface a VzError::Op if the
+    /// VM is already running, mirroring FC's behavior of surfacing
+    /// the error rather than silently eating it).
+    async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vm = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vm.clone()
+        };
+        vm.resume().await.map_err(SandboxError::from)
+    }
+
     fn snapshot_path_for(&self, snapshot_id: SnapshotId) -> PathBuf {
         self.snapshot_dir_for(snapshot_id)
     }

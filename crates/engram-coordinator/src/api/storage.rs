@@ -20,8 +20,6 @@
 
 use std::collections::HashMap;
 
-use axum::extract::State;
-use axum::Json;
 use chrono::{DateTime, Utc};
 use engram_core::types::cow_state::unix_ms_to_dt;
 use engram_core::{HostId, SandboxId, SessionId};
@@ -71,9 +69,12 @@ pub struct StorageSummaryResponse {
     pub rows: Vec<DurabilityRow>,
 }
 
-pub async fn summary(
-    State(state): State<SharedState>,
-) -> Result<Json<StorageSummaryResponse>, ApiError> {
+/// ADR 0051: transport-agnostic storage-summary core (gRPC
+/// `GetStorageSummary`). Extracted verbatim from the legacy axum `summary`
+/// handler — only the return shape changed (`Json<...>` → the plain body).
+pub(crate) async fn storage_summary_core(
+    state: &SharedState,
+) -> Result<StorageSummaryResponse, ApiError> {
     let hosts = state.services.meta.list_active_hosts().await?;
 
     let mut rows: Vec<DurabilityRow> = Vec::new();
@@ -139,7 +140,7 @@ pub async fn summary(
     let totals = state.services.meta.snapshot_totals().await?;
     let gc_pending = state.services.meta.count_gc_candidates().await?;
 
-    Ok(Json(StorageSummaryResponse {
+    Ok(StorageSummaryResponse {
         snapshots: totals.count,
         snapshot_bytes: totals.total_bytes,
         gc_pending,
@@ -148,5 +149,5 @@ pub async fn summary(
         unflushed_bytes,
         avg_locality_pct,
         rows,
-    }))
+    })
 }

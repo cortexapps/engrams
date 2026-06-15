@@ -14,39 +14,29 @@
 //! (harness → host → `SessionEvent::from_harness` → SSE), not from this
 //! handler.
 
-use axum::extract::{Path, State};
-use axum::Json;
 use engram_core::SessionId;
-use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-#[derive(Serialize)]
-pub struct InterruptResponse {
-    pub session_id: SessionId,
-    pub note: &'static str,
-}
-
-pub async fn interrupt(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<InterruptResponse>, ApiError> {
+/// ADR 0051: transport-agnostic interrupt — the app-gRPC `Interrupt` RPC
+/// delegates here; the axum `interrupt` above keeps its JSON wrapper. No
+/// auto-resume — a missing live sandbox is a 409. No authz (trusted gRPC
+/// caller / axum route layer gates). Returns the static note both echo back.
+pub(crate) async fn interrupt_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<&'static str, ApiError> {
     let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox to interrupt — it is idle or not yet started".into(),
         )
     })?;
-
     state
         .services
         .host
         .interrupt(sandbox_id)
         .await
         .map_err(|e| ApiError::Internal(format!("forward interrupt to harness: {e}")))?;
-
-    Ok(Json(InterruptResponse {
-        session_id: id,
-        note: "interrupt forwarded",
-    }))
+    Ok("interrupt forwarded")
 }

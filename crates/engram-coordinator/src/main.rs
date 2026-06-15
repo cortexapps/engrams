@@ -98,6 +98,25 @@ struct Cli {
     )]
     harness_listen_addr: std::net::SocketAddr,
 
+    /// Address the orchestrator-facing app gRPC server binds to (ADR 0039).
+    #[arg(long, env = "ENGRAM_APP_GRPC_ADDR", default_value = "127.0.0.1:50061")]
+    app_grpc_addr: std::net::SocketAddr,
+
+    /// Comma-separated bearer tokens accepted on the app gRPC surface
+    /// (ADR 0039 §5) — the orchestrator's machine credential, separate
+    /// from `--auth-tokens` (different caller, different blast radius,
+    /// independently rotatable; >1 entry only during rotation overlap).
+    /// Unlike `--auth-tokens`, empty does NOT disable auth: the app
+    /// surface fails closed and rejects every call until a token is
+    /// configured. Boot is unaffected.
+    #[arg(
+        long,
+        env = "ENGRAM_APP_GRPC_TOKENS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    app_grpc_tokens: Vec<String>,
+
     /// Address the Prometheus `/metrics` exporter listens on.
     /// Separate port from the main API so scrapers reach a
     /// bearer-free endpoint without going through nginx + IAP.
@@ -173,56 +192,10 @@ struct Cli {
     /// manager). Takes precedence over `--github-app-private-key-path`.
     #[arg(long, env = "ENGRAM_GITHUB_APP_PRIVATE_KEY")]
     github_app_private_key: Option<String>,
-
-    // ---- ADR 0031 human authentication ----
-    /// How humans authenticate: `none` (default → synthetic admin, zero-setup
-    /// dev), `oidc` (coordinator runs the Authorization-Code+PKCE flow), or
-    /// `forward-auth` (trust a signed JWT from an edge proxy, e.g. GCP IAP).
-    #[arg(long, env = "ENGRAM_AUTH_MODE", default_value = "none")]
-    auth_mode: String,
-    /// OIDC issuer base URL (discovery at `{issuer}/.well-known/...`).
-    #[arg(long, env = "ENGRAM_OIDC_ISSUER")]
-    oidc_issuer: Option<String>,
-    #[arg(long, env = "ENGRAM_OIDC_CLIENT_ID")]
-    oidc_client_id: Option<String>,
-    #[arg(long, env = "ENGRAM_OIDC_CLIENT_SECRET")]
-    oidc_client_secret: Option<String>,
-    /// The coordinator's absolute `/api/v1/auth/callback` URL.
-    #[arg(long, env = "ENGRAM_OIDC_REDIRECT_URL")]
-    oidc_redirect_url: Option<String>,
-    /// Forward-auth assertion header. GCP IAP preset: `X-Goog-IAP-JWT-Assertion`.
-    #[arg(long, env = "ENGRAM_FORWARD_AUTH_HEADER")]
-    forward_auth_header: Option<String>,
-    /// Forward-auth JWKS URL. GCP IAP: `https://www.gstatic.com/iap/verify/public_key-jwk`.
-    #[arg(long, env = "ENGRAM_FORWARD_AUTH_JWKS_URL")]
-    forward_auth_jwks_url: Option<String>,
-    /// Forward-auth expected issuer. GCP IAP: `https://cloud.google.com/iap`.
-    #[arg(long, env = "ENGRAM_FORWARD_AUTH_ISSUER")]
-    forward_auth_issuer: Option<String>,
-    /// Forward-auth expected audience (the IAP backend service string).
-    #[arg(long, env = "ENGRAM_FORWARD_AUTH_AUDIENCE")]
-    forward_auth_audience: Option<String>,
-    /// Forward-auth email claim. GCP IAP: `email`.
-    #[arg(long, env = "ENGRAM_FORWARD_AUTH_EMAIL_CLAIM", default_value = "email")]
-    forward_auth_email_claim: String,
-    /// Emails promoted to admin on first login (comma-separated).
-    #[arg(
-        long,
-        env = "ENGRAM_BOOTSTRAP_ADMINS",
-        value_delimiter = ',',
-        default_value = ""
-    )]
-    bootstrap_admins: Vec<String>,
-    /// Synthetic-admin (dev) committer/display email.
-    #[arg(
-        long,
-        env = "ENGRAM_DEV_DEFAULT_EMAIL",
-        default_value = "dev@engram.local"
-    )]
-    dev_default_email: String,
-    /// Set the session cookie `Secure` flag. Leave off for http-localhost dev.
-    #[arg(long, env = "ENGRAM_COOKIE_SECURE", default_value_t = false)]
-    cookie_secure: bool,
+    // ADR 0039 Task 32: human-auth CLI flags removed (--auth-mode, --oidc-*,
+    // --forward-auth-*, --bootstrap-admins, --dev-default-email,
+    // --cookie-secure). The coordinator no longer runs OIDC/forward-auth
+    // flows; the orchestrator owns all browser sessions.
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,84 +255,6 @@ fn build_forge(
             "invalid --git-forge `{other}` (expected none | github)"
         ))),
     }
-}
-
-/// Build the ADR 0031 [`AuthConfig`](engram_auth::AuthConfig) from CLI/env.
-/// `none` (default) → synthetic admin; `oidc` and `forward-auth` validate
-/// their required fields up front so a misconfiguration fails at startup, not
-/// on the first login.
-fn build_auth_config(cli: &Cli) -> Result<engram_auth::AuthConfig, CoordinatorError> {
-    use engram_auth::{AuthMode, ForwardAuthConfig, OidcConfig};
-
-    let mode = AuthMode::parse(&cli.auth_mode).ok_or_else(|| {
-        CoordinatorError::Config(format!(
-            "invalid --auth-mode `{}` (expected none | oidc | forward-auth)",
-            cli.auth_mode
-        ))
-    })?;
-
-    let oidc = if mode == AuthMode::Oidc {
-        let missing = |f: &str| CoordinatorError::Config(format!("--auth-mode=oidc requires {f}"));
-        Some(OidcConfig {
-            issuer: cli
-                .oidc_issuer
-                .clone()
-                .ok_or_else(|| missing("--oidc-issuer"))?,
-            client_id: cli
-                .oidc_client_id
-                .clone()
-                .ok_or_else(|| missing("--oidc-client-id"))?,
-            client_secret: cli
-                .oidc_client_secret
-                .clone()
-                .ok_or_else(|| missing("--oidc-client-secret"))?,
-            redirect_url: cli
-                .oidc_redirect_url
-                .clone()
-                .ok_or_else(|| missing("--oidc-redirect-url"))?,
-            scopes: vec!["openid".into(), "email".into(), "profile".into()],
-        })
-    } else {
-        None
-    };
-
-    let forward_auth = if mode == AuthMode::ForwardAuth {
-        let missing =
-            |f: &str| CoordinatorError::Config(format!("--auth-mode=forward-auth requires {f}"));
-        Some(ForwardAuthConfig {
-            header: cli
-                .forward_auth_header
-                .clone()
-                .ok_or_else(|| missing("--forward-auth-header"))?,
-            jwks_url: cli
-                .forward_auth_jwks_url
-                .clone()
-                .ok_or_else(|| missing("--forward-auth-jwks-url"))?,
-            issuer: cli.forward_auth_issuer.clone(),
-            audience: cli.forward_auth_audience.clone(),
-            email_claim: cli.forward_auth_email_claim.clone(),
-        })
-    } else {
-        None
-    };
-
-    Ok(engram_auth::AuthConfig {
-        mode,
-        oidc,
-        forward_auth,
-        // Folded with `auth_tokens` at runtime construction.
-        service_tokens: Vec::new(),
-        service_email: "service@engram.local".to_string(),
-        bootstrap_admins: cli
-            .bootstrap_admins
-            .iter()
-            .filter(|e| !e.is_empty())
-            .cloned()
-            .collect(),
-        dev_default_email: cli.dev_default_email.clone(),
-        session_ttl_hours: 24 * 7,
-        cookie_secure: cli.cookie_secure,
-    })
 }
 
 /// Initialise the global tracing subscriber (+ optional OpenTelemetry
@@ -422,8 +317,19 @@ async fn main() -> Result<(), CoordinatorError> {
             .filter(|t| !t.is_empty())
             .cloned()
             .collect(),
-        auth: build_auth_config(&cli)?,
+        // ADR 0039 Task 32: `auth` field removed from CoordinatorConfig.
         harness_listen_addr: cli.harness_listen_addr,
+        app_grpc_addr: cli.app_grpc_addr,
+        // Same empty-entry stripping as `auth_tokens` above (clap's
+        // value_delimiter turns an unset env into one "" entry), plus
+        // trim so `a, b` rotation lists don't mint a " b" token. An
+        // empty result fails closed in grpc_app — never auth-off.
+        app_grpc_tokens: cli
+            .app_grpc_tokens
+            .iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
     };
 
     let pg = PostgresStore::connect(&cfg.database_url)
@@ -950,28 +856,9 @@ async fn main() -> Result<(), CoordinatorError> {
 
     let forge = build_forge(&cli)?;
 
-    // ADR 0031: assemble the auth runtime. The Postgres store satisfies
-    // UserStore + WebSessionStore; `auth_tokens` becomes the service-bearer
-    // link in the chain. `None` mode → synthetic admin (dev/test).
-    let auth = {
-        let users: Arc<dyn engram_core::traits::UserStore> = Arc::new(pg.clone());
-        let web_sessions: Arc<dyn engram_core::traits::WebSessionStore> = Arc::new(pg.clone());
-        let mut auth_cfg = cfg.auth.clone();
-        auth_cfg.service_tokens = cfg.auth_tokens.clone();
-        let chain = engram_auth::build_chain(&auth_cfg, users.clone(), web_sessions.clone());
-        let oidc = auth_cfg
-            .oidc
-            .clone()
-            .map(engram_auth::OidcAuthenticator::new);
-        tracing::info!(mode = auth_cfg.mode.as_str(), "auth runtime configured");
-        Some(Arc::new(engram_coordinator::api::principal::AuthRuntime {
-            chain,
-            oidc,
-            users,
-            web_sessions,
-            config: auth_cfg,
-        }))
-    };
+    // ADR 0039 Task 32: auth runtime removed. The coordinator no longer
+    // resolves per-user principals; the orchestrator owns all browser
+    // sessions and calls the coordinator over app-gRPC.
 
     engram_coordinator::run_with_registry_and_local(
         cfg,
@@ -979,7 +866,6 @@ async fn main() -> Result<(), CoordinatorError> {
         host_registry,
         in_proc_local_backend.map(|b| (in_proc_host, b)),
         forge,
-        auth,
     )
     .await
 }

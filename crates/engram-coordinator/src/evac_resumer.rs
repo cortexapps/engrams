@@ -434,8 +434,8 @@ mod tests {
 
     fn evacuating_session(live_disk: Option<engram_core::types::manifest::ManifestRef>) -> Session {
         Session {
-            id: engram_core::SessionId::new(),
             user_id: None,
+            id: engram_core::SessionId::new(),
             status: SessionState::Evacuating,
             host_id: None,
             sandbox_id: None,

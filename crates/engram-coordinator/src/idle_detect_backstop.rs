@@ -231,8 +231,8 @@ mod tests {
 
     fn active_session(id: engram_core::SessionId, sandbox: engram_core::SandboxId) -> Session {
         Session {
-            id,
             user_id: None,
+            id,
             status: engram_core::types::SessionState::Active,
             host_id: None,
             sandbox_id: Some(sandbox),

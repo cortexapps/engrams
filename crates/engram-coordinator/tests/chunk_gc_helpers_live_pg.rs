@@ -167,9 +167,9 @@ async fn list_live_session_disk_manifest_ids_picks_up_live_writes() {
     // Need a session row to attach a sandbox + live manifest to.
     let session_id = meta
         .create_session(SessionSpec {
+            user_id: None,
             image: "phase-c-helpers-test:warm-1".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");
@@ -248,9 +248,9 @@ async fn record_snapshot_bumps_chunk_generation() {
     // Need a session row for the snapshot FK.
     let session_id = meta
         .create_session(SessionSpec {
+            user_id: None,
             image: "phase-c-snapshot-bump-test:warm-1".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");

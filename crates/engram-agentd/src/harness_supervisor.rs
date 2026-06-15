@@ -376,8 +376,23 @@ mod tests {
         };
         let sup2 = HarnessSupervisor::new();
         let pid3 = sup2.spawn(short.clone()).await.unwrap().expect("pid");
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let pid4 = sup2.spawn(short).await.unwrap().expect("pid");
+        // Poll rather than fixed-sleep: under full-suite load even
+        // `sh -c true` can outlive a constant grace period, and a
+        // still-live child legitimately REATTACHES (same pid) — which
+        // is the first arm's behavior, not a reap bug. Keep spawning
+        // until the supervisor observes the exit and respawns.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pid4 = loop {
+            let pid = sup2.spawn(short.clone()).await.unwrap().expect("pid");
+            if pid != pid3 {
+                break pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "exited child must be reaped and respawned (still reattaching pid {pid3} after 10s)",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         assert_ne!(pid3, pid4, "exited child must be reaped and respawned");
     }
 

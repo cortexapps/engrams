@@ -96,9 +96,9 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
 
 fn spec() -> SessionSpec {
     SessionSpec {
+        user_id: None,
         image: "localhost:5001/placement-reservation:test".into(),
         mode: SessionMode::Agent,
-        user_id: None,
     }
 }
 

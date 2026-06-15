@@ -1037,6 +1037,28 @@ mod tests {
         ) -> Result<(), engram_core::MetaError> {
             unreachable!()
         }
+        async fn put_sealed_secret(
+            &self,
+            _: &str,
+            _: Vec<u8>,
+            _: Vec<u8>,
+            _: Vec<u8>,
+            _: String,
+        ) -> Result<(), engram_core::MetaError> {
+            unimplemented!()
+        }
+        async fn has_sealed_secret(&self, _: &str) -> Result<bool, engram_core::MetaError> {
+            unimplemented!()
+        }
+        async fn get_sealed_secret(
+            &self,
+            _: &str,
+        ) -> Result<Option<engram_core::traits::SealedSecretRow>, engram_core::MetaError> {
+            unimplemented!()
+        }
+        async fn delete_sealed_secret(&self, _: &str) -> Result<(), engram_core::MetaError> {
+            unimplemented!()
+        }
     }
 
     fn stub_registry() -> HostRegistry {

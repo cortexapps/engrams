@@ -287,9 +287,9 @@ async fn seed_active_session(
     ensure_host_row(meta, host_id, "source").await;
     let session_id = meta
         .create_session(SessionSpec {
+            user_id: None,
             image: format!("ghcr.io/test/img:t-{}", uuid::Uuid::new_v4()),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create_session");

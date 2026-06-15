@@ -983,6 +983,54 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Option<SessionSecrets>, MetaError>;
     async fn delete_session_secrets(&self, session_id: SessionId) -> Result<(), MetaError>;
 
+    // ---- sealed secrets (ADR 0039 Task 13) ----
+    //
+    // KEK-sealed opaque store keyed by caller-supplied string keys.
+    // The orchestrator uses its better-auth user ids as keys; the
+    // coordinator never interprets the key. Three operations; no Get
+    // (the plaintext never leaves the coordinator — the create-session
+    // path unseals inline to inject into env, then drops the plaintext).
+
+    // Defaults below let the many hand-rolled test mocks compile without
+    // churn: reads report "absent", writes fail loudly. The one real
+    // store (engram-postgres) overrides all four.
+
+    /// Store the sealed parts (caller seals via CredCipher) and upsert the row.
+    /// `PutSecret seals + upserts` — no create/update distinction.
+    async fn put_sealed_secret(
+        &self,
+        key: &str,
+        wrapped_dek: Vec<u8>,
+        nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+        key_id: String,
+    ) -> Result<(), MetaError> {
+        let _ = (key, wrapped_dek, nonce, ciphertext, key_id);
+        Err(MetaError::Db(
+            "sealed secrets not supported by this metadata store".into(),
+        ))
+    }
+
+    /// Returns `true` when a row exists for `key`.
+    async fn has_sealed_secret(&self, key: &str) -> Result<bool, MetaError> {
+        let _ = key;
+        Ok(false)
+    }
+
+    /// Fetch the sealed row to unseal in the caller. `None` = not found.
+    async fn get_sealed_secret(&self, key: &str) -> Result<Option<SealedSecretRow>, MetaError> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Idempotent: deleting a key that does not exist succeeds.
+    async fn delete_sealed_secret(&self, key: &str) -> Result<(), MetaError> {
+        let _ = key;
+        Err(MetaError::Db(
+            "sealed secrets not supported by this metadata store".into(),
+        ))
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — cross-replica per-session op lease.
     // Serializes mutually-exclusive session-lifecycle ops (idle
@@ -1437,4 +1485,14 @@ pub struct StaleSessionLease {
     pub sandbox_id: Option<SandboxId>,
     pub locked_by: String,
     pub locked_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One row from [`MetadataStore::get_sealed_secret`].
+#[derive(Debug, Clone)]
+pub struct SealedSecretRow {
+    pub key: String,
+    pub wrapped_dek: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub key_id: String,
 }

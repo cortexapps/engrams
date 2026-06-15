@@ -17,9 +17,6 @@
 
 use std::time::Duration;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::Json;
 use chrono::Utc;
 use engram_core::traits::storage::BlobStorage;
 use engram_core::types::manifest::ManifestRef;
@@ -90,10 +87,13 @@ pub struct SnapshotResponse {
     pub note: &'static str,
 }
 
-pub async fn snapshot(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
+/// ADR 0051: transport-agnostic snapshot core (gRPC `Snapshot`). Extracted
+/// verbatim from the legacy axum `snapshot` handler — only the return shape
+/// changed (`Json<SnapshotResponse>` → `SnapshotResponse`).
+pub(crate) async fn snapshot_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<SnapshotResponse, ApiError> {
     state.services.meta.get_session(id).await?;
 
     let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
@@ -191,19 +191,22 @@ pub async fn snapshot(
 
     // Snapshot does NOT change session state — the live sandbox keeps
     // running. evict_local is the explicit "drop from RAM" action.
-    Ok(Json(SnapshotResponse {
+    Ok(SnapshotResponse {
         session_id: id,
         snapshot_id: Some(metadata.id.to_string()),
         size_bytes: Some(metadata.size_bytes),
         note: "snapshot recorded; live sandbox still running",
-    }))
+    })
 }
 
-pub async fn resume(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
-    resume_session(state, id).await.map(Json)
+/// ADR 0051: transport-agnostic resume core (gRPC `Resume`). Thin wrapper
+/// over the shared `resume_session` primitive (the same one the legacy axum
+/// `/resume` handler drove).
+pub(crate) async fn resume_core(
+    state: &SharedState,
+    id: SessionId,
+) -> Result<SnapshotResponse, ApiError> {
+    resume_session(state.clone(), id).await
 }
 
 /// Auto-resume an `Idle` session if needed, before routing an
@@ -1344,10 +1347,12 @@ pub(crate) async fn bind_session_routing(
     state.services.host.bind_session(id, sandbox_id).await;
 }
 
-pub async fn evict_local(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<StatusCode, ApiError> {
+/// ADR 0051: transport-agnostic evict-local core (gRPC `EvictLocal`).
+/// Durability-critical: refuses to evict without a recoverable snapshot.
+/// Extracted verbatim from the legacy axum `evict_local` handler — only the
+/// return shape changed (`StatusCode` → `()`); the teardown + state-machine
+/// logic is unchanged.
+pub(crate) async fn evict_local_core(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
     let session = state.services.meta.get_session(id).await?;
 
     if session.status != SessionState::Active {
@@ -1413,7 +1418,7 @@ pub async fn evict_local(
             },
         )
         .await?;
-    Ok(StatusCode::ACCEPTED)
+    Ok(())
 }
 
 /// ADR 0009 Phase 2: HEAD-verify the chunked manifests are durable
@@ -2020,7 +2025,7 @@ mod evicting_gate_tests {
         let id = SessionId::new();
         let (state, _local) = build_state_for_session(evicting_session(id));
 
-        let err = match resume(State(state.clone()), Path(id)).await {
+        let err = match resume_core(&state, id).await {
             Err(e) => e,
             Ok(_) => panic!("Evicting must not resume"),
         };
@@ -2046,10 +2051,9 @@ mod evicting_gate_tests {
             .sandbox_id
             .unwrap();
 
-        let code = crate::api::sessions::delete_session(State(state.clone()), Path(id))
+        crate::api::sessions::delete_session_core(&state, id)
             .await
             .expect("delete mid-eviction");
-        assert_eq!(code, StatusCode::NO_CONTENT);
         let after = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(after.status, SessionState::Completed);
 

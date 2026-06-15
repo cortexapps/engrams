@@ -1,0 +1,802 @@
+//! Dumb, total field copies between the axum/serde-facing api types
+//! (`crate::api::sessions`, `engram_core::types::Session`) and the
+//! generated proto types (`engram_protocol::app`). No business logic
+//! lives here — every function is a mechanical field-by-field copy.
+//!
+//! The proto `Session` is the JSON wire shape minus `user_id` (ADR 0039
+//! §2.1: attribution leaves the contract). Timestamps cross as ISO-8601
+//! strings, exactly as the JSON wire serializes them; the string-literal
+//! status/mode unions stay strings via the core types' `as_str()`.
+//!
+//! **Totality is enforced in BOTH directions.** Every converter that reads
+//! from a source struct must exhaustively destructure it so that a field
+//! added later breaks the build here instead of being silently dropped on
+//! the floor. Deliberately-unused fields are bound as `field: _` with a
+//! comment explaining the intentional drop.
+
+use engram_protocol::app;
+
+use crate::api::exec::ExecRequest as ApiExecRequest;
+use crate::api::sessions::{CreateSessionRequest, ListSessionsResponse, SessionListItem};
+use crate::cow_state::CowStateView;
+use crate::error::ApiError;
+use engram_core::types::session::SessionMode;
+
+/// `engram_core::types::Session` → proto `Session`. Drops `user_id`
+/// (off-contract per ADR 0039 §2.1: attribution leaves the contract) and
+/// `live_disk_manifest` (internal coord state, not on the wire shape).
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `engram_core::types::Session` without updating this converter,
+/// the build will fail here rather than silently drop the new field.
+pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session {
+    let engram_core::types::Session {
+        id,
+        status,
+        host_id,
+        sandbox_id,
+        image,
+        mode,
+        created_at,
+        last_active_at,
+        live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
+        user_id: _, // ADR 0051: owner left the coord contract — attribution lives in the orchestrator task model.
+    } = s;
+    app::Session {
+        id: id.to_string(),
+        status: status.as_str().to_string(),
+        host_id: host_id.map(|h| h.to_string()),
+        sandbox_id: sandbox_id.map(|sb| sb.to_string()),
+        image: image.clone(),
+        mode: mode.as_str().to_string(),
+        // ISO-8601, matching the JSON wire (chrono's Serialize is RFC3339).
+        created_at: created_at.to_rfc3339(),
+        last_active_at: last_active_at.to_rfc3339(),
+    }
+}
+
+/// api `SessionListItem` → proto `SessionListItem`. `owner_kind` is a
+/// TS-mirror-only field — left unset from Rust (the api type has no such
+/// field).
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `SessionListItem` without updating this converter, the build
+/// will fail here rather than silently drop the new field.
+pub(crate) fn session_list_item_to_proto(item: SessionListItem) -> app::SessionListItem {
+    let SessionListItem {
+        session,
+        owner_email,
+        owner_name,
+    } = item;
+    app::SessionListItem {
+        session: Some(session_to_proto(&session)),
+        owner_email,
+        owner_name,
+        owner_kind: None, // TS-mirror-only field; no Rust equivalent in SessionListItem.
+    }
+}
+
+/// api `ListSessionsResponse` → proto `ListSessionsResponse`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `ListSessionsResponse` without updating this converter, the
+/// build will fail here.
+pub(crate) fn list_sessions_to_proto(resp: ListSessionsResponse) -> app::ListSessionsResponse {
+    let ListSessionsResponse { sessions } = resp;
+    app::ListSessionsResponse {
+        sessions: sessions
+            .into_iter()
+            .map(session_list_item_to_proto)
+            .collect(),
+    }
+}
+
+/// proto `CreateSessionRequest` → api `CreateSessionRequest`. The
+/// `mode` string parses to [`SessionMode`] (empty defaults to `Agent`,
+/// matching the axum `#[serde(default)]`); an unknown mode is a
+/// `BadRequest`.
+///
+/// `harness_secret_id` is handled at the RPC layer (in
+/// `grpc_app/session.rs`) before this function is called — the RPC
+/// handler unseals the secret and builds `identity_env` from it
+/// (ADR 0039 Task 13 wired via SecretService injection). It is NOT
+/// bound in the destructure here (the caller has already handled it);
+/// to keep the totality guard intact the proto struct is destructured
+/// exhaustively, binding `harness_secret_id: _` as the signal that the
+/// caller has taken responsibility for it.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `app::CreateSessionRequest` without updating this converter,
+/// the build will fail here rather than silently drop the new field.
+pub(crate) fn create_request_from_proto(
+    r: app::CreateSessionRequest,
+) -> Result<CreateSessionRequest, ApiError> {
+    // Totality guard: destructure ALL proto fields. `harness_secret_id` is
+    // handled at the RPC layer (Task 13: wired via SecretService injection);
+    // bind it as `_` here to acknowledge the drop.
+    let app::CreateSessionRequest {
+        image_uri,
+        mode,
+        prompt,
+        harness_secret_id: _, // Handled at RPC layer (Task 13: SecretService harness injection).
+        secrets,
+    } = r;
+    let mode = match mode.as_str() {
+        "" | "agent" => SessionMode::Agent,
+        "dev_vm" => SessionMode::DevVm,
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown session mode {other:?}; expected \"agent\" or \"dev_vm\""
+            )))
+        }
+    };
+    let secrets = if secrets.is_empty() {
+        None
+    } else {
+        Some(secrets.into_iter().collect())
+    };
+    Ok(CreateSessionRequest {
+        image: image_uri,
+        mode,
+        prompt,
+        secrets,
+    })
+}
+
+/// proto `ExecRequest` → api `ExecRequest`.
+///
+/// `argv` wins when non-empty; `command` wins otherwise — matching the
+/// `build_exec` validation in `api/exec.rs` which errors on neither-or-both.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `app::ExecRequest` without updating this converter, the build
+/// will fail here rather than silently drop the new field.
+pub(crate) fn exec_request_from_proto(r: app::ExecRequest) -> ApiExecRequest {
+    let app::ExecRequest {
+        session_id: _, // Routing field consumed by the caller before conversion.
+        command,
+        argv,
+        env,
+        workdir,
+        timeout_secs,
+    } = r;
+    ApiExecRequest {
+        command,
+        argv: if argv.is_empty() { None } else { Some(argv) },
+        env,
+        workdir,
+        timeout_secs,
+    }
+}
+
+/// [`CowStateView`] → proto [`CowStateView`] (session.proto).
+///
+/// Exhaustive destructure below is the totality guard — a new field on
+/// `CowStateView` must be handled here or the build fails.
+pub(crate) fn cow_state_to_proto(v: &CowStateView) -> app::CowStateView {
+    let CowStateView {
+        sandbox_id,
+        session_id,
+        disk_manifest_id,
+        disk_manifest_version,
+        dirty_chunks,
+        dirty_bytes,
+        last_flush_at,
+        base_chunks,
+        base_chunks_local,
+        memory_manifest_id,
+        memory_manifest_version,
+        last_snapshot_at,
+    } = v;
+    app::CowStateView {
+        sandbox_id: sandbox_id.to_string(),
+        session_id: session_id.map(|s| s.to_string()),
+        disk_manifest_id: disk_manifest_id.clone(),
+        disk_manifest_version: *disk_manifest_version,
+        dirty_chunks: *dirty_chunks,
+        dirty_bytes: *dirty_bytes,
+        last_flush_at: last_flush_at.map(|t| t.to_rfc3339()),
+        base_chunks: *base_chunks,
+        base_chunks_local: *base_chunks_local,
+        memory_manifest_id: memory_manifest_id.clone(),
+        memory_manifest_version: *memory_manifest_version,
+        last_snapshot_at: last_snapshot_at.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// api `ConversationEntry` → proto `ConversationEntry`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `ConversationEntry` without updating this converter, the build
+/// will fail here rather than silently drop the new field.
+pub(crate) fn conversation_entry_to_proto(
+    e: crate::api::sessions_inspect::ConversationEntry,
+) -> app::ConversationEntry {
+    let crate::api::sessions_inspect::ConversationEntry {
+        idx,
+        kind,
+        at,
+        payload,
+    } = e;
+    app::ConversationEntry {
+        idx,
+        kind,
+        at: at.to_rfc3339(),
+        // `payload` is a serde_json::Value; serialize to a JSON string for the
+        // proto `payload_json` field, matching the SSE wire shape.
+        payload_json: payload.to_string(),
+    }
+}
+
+/// api `CheckpointSummary` → proto `CheckpointSummary`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `CheckpointSummary` without updating this converter, the build
+/// will fail here rather than silently drop the new field.
+pub(crate) fn checkpoint_summary_to_proto(
+    s: crate::api::sessions_inspect::CheckpointSummary,
+) -> app::CheckpointSummary {
+    let crate::api::sessions_inspect::CheckpointSummary {
+        snapshot_id,
+        created_at,
+        size_bytes,
+        events_cursor,
+        recoverable,
+        is_latest,
+    } = s;
+    app::CheckpointSummary {
+        snapshot_id,
+        created_at: created_at.to_rfc3339(),
+        size_bytes,
+        events_cursor,
+        recoverable,
+        is_latest,
+    }
+}
+
+/// api `ExecRusage` → proto `ExecRusage`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `ExecRusage` without updating this converter, the build will
+/// fail here rather than silently drop the new field.
+pub(crate) fn exec_rusage_to_proto(r: engram_core::types::ExecRusage) -> app::ExecRusage {
+    let engram_core::types::ExecRusage {
+        wall_ms,
+        peak_rss_kb,
+        user_cpu_ms,
+        sys_cpu_ms,
+    } = r;
+    app::ExecRusage {
+        wall_ms,
+        peak_rss_kb,
+        user_cpu_ms,
+        sys_cpu_ms,
+    }
+}
+
+/// api `HostView` → proto `HostView`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `HostView` without updating this converter, the build will fail.
+pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostView {
+    let crate::api::hosts::HostView {
+        id,
+        hostname,
+        status,
+        capacity_total_mib,
+        capacity_used_mib,
+        running_sandboxes,
+        local_snapshots,
+        ready_images,
+        ready_image_digests,
+        util_disk_total_mib,
+        util_disk_used_mib,
+        util_mem_total_mib,
+        util_mem_used_mib,
+        util_cpu_pct,
+        last_heartbeat_at,
+        // ADR 0047/0048/0058 fleet telemetry added after #245 forked. The
+        // app `HostView` proto predates them; explicitly ignored to keep
+        // this totality guard honest. Exposing them on the proto is a
+        // follow-up contract change (not a silent `..`).
+        cordoned: _,
+        allocatable_mib: _,
+        reserved_mib: _,
+        free_mib: _,
+        total_vcpus: _,
+        cpu_budget_vcpus: _,
+        reserved_vcpus: _,
+        free_vcpus: _,
+    } = v;
+    app::HostView {
+        id: id.to_string(),
+        hostname: hostname.clone(),
+        status: status.to_string(),
+        capacity_total_mib: *capacity_total_mib,
+        capacity_used_mib: *capacity_used_mib,
+        running_sandboxes: *running_sandboxes,
+        local_snapshots: *local_snapshots as u64,
+        ready_images: *ready_images as u64,
+        ready_image_digests: ready_image_digests.clone(),
+        util_disk_total_mib: *util_disk_total_mib,
+        util_disk_used_mib: *util_disk_used_mib,
+        util_mem_total_mib: *util_mem_total_mib,
+        util_mem_used_mib: *util_mem_used_mib,
+        util_cpu_pct: *util_cpu_pct,
+        last_heartbeat_at: last_heartbeat_at.to_rfc3339(),
+    }
+}
+
+/// api `StorageSummaryResponse` → proto `GetStorageSummaryResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn storage_summary_to_proto(
+    r: crate::api::storage::StorageSummaryResponse,
+) -> app::GetStorageSummaryResponse {
+    let crate::api::storage::StorageSummaryResponse {
+        snapshots,
+        snapshot_bytes,
+        gc_pending,
+        tracked_sandboxes,
+        dirty_chunks,
+        unflushed_bytes,
+        avg_locality_pct,
+        rows,
+    } = r;
+    app::GetStorageSummaryResponse {
+        snapshots,
+        snapshot_bytes,
+        gc_pending,
+        tracked_sandboxes,
+        dirty_chunks,
+        unflushed_bytes,
+        avg_locality_pct,
+        rows: rows.into_iter().map(durability_row_to_proto).collect(),
+    }
+}
+
+fn durability_row_to_proto(r: crate::api::storage::DurabilityRow) -> app::DurabilityRow {
+    let crate::api::storage::DurabilityRow {
+        sandbox_id,
+        session_id,
+        host_id,
+        dirty_chunks,
+        dirty_bytes,
+        base_chunks,
+        base_chunks_local,
+        last_flush_at,
+    } = r;
+    app::DurabilityRow {
+        sandbox_id: sandbox_id.to_string(),
+        session_id: session_id.map(|s| s.to_string()),
+        host_id: host_id.to_string(),
+        dirty_chunks,
+        dirty_bytes,
+        base_chunks,
+        base_chunks_local,
+        last_flush_at: last_flush_at.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// api `FlushNowResult` → proto `FlushSessionResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn flush_now_result_to_proto(
+    r: crate::api::admin::FlushNowResult,
+) -> app::FlushSessionResponse {
+    let crate::api::admin::FlushNowResult {
+        outcome,
+        manifest_version,
+    } = r;
+    app::FlushSessionResponse {
+        outcome: match outcome {
+            crate::api::admin::FlushNowOutcome::Applied => "applied".to_string(),
+            crate::api::admin::FlushNowOutcome::Idle => "idle".to_string(),
+            crate::api::admin::FlushNowOutcome::Stale => "stale".to_string(),
+        },
+        manifest_version,
+    }
+}
+
+/// `ChunkGcSweepResult` → proto `ChunkGcResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn chunk_gc_result_to_proto(
+    r: crate::api::admin::ChunkGcSweepResult,
+) -> app::ChunkGcResponse {
+    let crate::api::admin::ChunkGcSweepResult {
+        listed_chunks,
+        malformed_keys,
+        pin_set_size,
+        candidates_marked,
+        restart_count,
+        restart_budget_exhausted,
+        promoted_deletes,
+        promote_delete_errors,
+        grace_secs,
+    } = r;
+    app::ChunkGcResponse {
+        listed_chunks: listed_chunks as u64,
+        malformed_keys: malformed_keys as u64,
+        pin_set_size: pin_set_size as u64,
+        candidates_marked: candidates_marked as u64,
+        restart_count,
+        restart_budget_exhausted,
+        promoted_deletes: promoted_deletes as u64,
+        promote_delete_errors: promote_delete_errors as u64,
+        grace_secs,
+    }
+}
+
+/// `BundleSweepReport` → proto `BundleGcResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn bundle_gc_result_to_proto(
+    r: crate::bundle_gc::BundleSweepReport,
+) -> app::BundleGcResponse {
+    let crate::bundle_gc::BundleSweepReport {
+        listed,
+        pin_set_size,
+        candidates_marked,
+        promoted_deletes,
+        promote_delete_errors,
+        restart_count,
+    } = r;
+    app::BundleGcResponse {
+        listed: listed as u64,
+        pin_set_size: pin_set_size as u64,
+        candidates_marked: candidates_marked as u64,
+        promoted_deletes: promoted_deletes as u64,
+        promote_delete_errors: promote_delete_errors as u64,
+        restart_count,
+    }
+}
+
+/// `SnapshotBlobSweepReport` → proto `SnapshotBlobGcResponse`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn snapshot_blob_gc_result_to_proto(
+    r: crate::snapshot_blob_gc::SnapshotBlobSweepReport,
+) -> app::SnapshotBlobGcResponse {
+    let crate::snapshot_blob_gc::SnapshotBlobSweepReport {
+        listed,
+        malformed,
+        pin_set_size,
+        candidates_marked,
+        promoted_deletes,
+        promote_repinned_skips,
+        promote_delete_errors,
+        restart_count,
+    } = r;
+    app::SnapshotBlobGcResponse {
+        listed: listed as u64,
+        malformed: malformed as u64,
+        pin_set_size: pin_set_size as u64,
+        candidates_marked: candidates_marked as u64,
+        promoted_deletes: promoted_deletes as u64,
+        promote_repinned_skips: promote_repinned_skips as u64,
+        promote_delete_errors: promote_delete_errors as u64,
+        restart_count,
+    }
+}
+
+/// `EnabledImageSummary` → proto `EnabledImageSummary`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn enabled_image_summary_to_proto(
+    s: &engram_core::types::EnabledImageSummary,
+) -> app::EnabledImageSummary {
+    let engram_core::types::EnabledImageSummary {
+        id,
+        image_uri,
+        manifest_digest,
+        manifest_name,
+        manifest_description,
+        harness_name,
+        last_refreshed_at,
+        created_at,
+    } = s;
+    app::EnabledImageSummary {
+        id: id.to_string(),
+        image_uri: image_uri.clone(),
+        manifest_digest: manifest_digest.clone(),
+        manifest_name: manifest_name.clone(),
+        manifest_description: manifest_description.clone(),
+        harness_name: harness_name.clone(),
+        last_refreshed_at: last_refreshed_at.to_rfc3339(),
+        created_at: created_at.to_rfc3339(),
+    }
+}
+
+/// `EnableJob` → proto `EnableJob`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn enable_job_to_proto(j: &engram_core::types::EnableJob) -> app::EnableJob {
+    let engram_core::types::EnableJob {
+        id,
+        image_uri,
+        manifest_digest,
+        state,
+        chunks_total,
+        chunks_done,
+        attempts,
+        error,
+        created_at,
+        updated_at,
+    } = j;
+    app::EnableJob {
+        id: id.to_string(),
+        image_uri: image_uri.clone(),
+        manifest_digest: manifest_digest.clone(),
+        state: state.as_str().to_string(),
+        chunks_total: *chunks_total,
+        chunks_done: *chunks_done,
+        attempts: *attempts,
+        error: error.clone(),
+        created_at: created_at.to_rfc3339(),
+        updated_at: updated_at.to_rfc3339(),
+    }
+}
+
+/// `RegistryCredentialSummary` → proto `RegistryCredentialSummary`.
+///
+/// The exhaustive destructure below is the totality guard.
+pub(crate) fn registry_credential_summary_to_proto(
+    s: &engram_core::types::RegistryCredentialSummary,
+) -> app::RegistryCredentialSummary {
+    let engram_core::types::RegistryCredentialSummary {
+        id,
+        registry_host,
+        auth_kind,
+        auth_principal,
+        created_at,
+        updated_at,
+    } = s;
+    app::RegistryCredentialSummary {
+        id: id.to_string(),
+        registry_host: registry_host.clone(),
+        auth_kind: auth_kind.clone(),
+        auth_principal: auth_principal.clone(),
+        created_at: created_at.to_rfc3339(),
+        updated_at: updated_at.map(|t| t.to_rfc3339()),
+    }
+}
+
+/// proto `AddRegistryRequest` → api `AddRegistryRequest`.
+/// The `oneof auth` is mapped exhaustively to the serde-tagged `AddRegistryAuth` enum.
+pub(crate) fn add_registry_request_from_proto(
+    r: app::AddRegistryRequest,
+) -> Result<crate::api::registries::AddRegistryRequest, crate::error::ApiError> {
+    use app::add_registry_request::Auth;
+    let app::AddRegistryRequest { host, auth } = r;
+    let auth = match auth {
+        Some(Auth::Static(s)) => {
+            let app::StaticRegistryAuth { username, password } = s;
+            crate::api::registries::AddRegistryAuth::Static { username, password }
+        }
+        Some(Auth::GcpWorkloadIdentity(g)) => {
+            let app::GcpWorkloadIdentityRegistryAuth { impersonate_sa } = g;
+            crate::api::registries::AddRegistryAuth::GcpWorkloadIdentity { impersonate_sa }
+        }
+        Some(Auth::Anonymous(_a)) => crate::api::registries::AddRegistryAuth::Anonymous,
+        None => {
+            return Err(crate::error::ApiError::BadRequest(
+                "AddRegistryRequest.auth is required (oneof unset)".into(),
+            ))
+        }
+    };
+    Ok(crate::api::registries::AddRegistryRequest { host, auth })
+}
+
+/// api `ArtifactMeta` → proto `ArtifactMetadata`.
+///
+/// The exhaustive destructure below is the totality guard — if a field is
+/// added to `ArtifactMeta` without updating this converter, the build will
+/// fail here rather than silently drop the new field.
+pub(crate) fn artifact_meta_to_proto(m: crate::api::upload::ArtifactMeta) -> app::ArtifactMetadata {
+    let crate::api::upload::ArtifactMeta {
+        media_type,
+        size_bytes,
+        file_name,
+    } = m;
+    app::ArtifactMetadata {
+        media_type,
+        // size_bytes comes from the DB as i64; DB constraint ensures non-negative.
+        // 0 = corrupt row, which is better than a huge wrapping value.
+        size_bytes: size_bytes.try_into().unwrap_or(0),
+        file_name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_core::types::session::SessionMode;
+    use engram_core::types::{Session, SessionState};
+    use engram_core::{HostId, SandboxId, SessionId};
+
+    fn populated_session() -> Session {
+        Session {
+            id: SessionId::new(),
+            user_id: None,
+            status: SessionState::Active,
+            host_id: Some(HostId::new()),
+            sandbox_id: Some(SandboxId::new()),
+            image: "localhost:5001/demo:warm".into(),
+            mode: SessionMode::DevVm,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            live_disk_manifest: None,
+        }
+    }
+
+    #[test]
+    fn session_round_trips_every_field() {
+        let s = populated_session();
+        let p = session_to_proto(&s);
+
+        assert_eq!(p.id, s.id.to_string());
+        assert_eq!(p.status, "active");
+        assert_eq!(p.host_id, Some(s.host_id.unwrap().to_string()));
+        assert_eq!(p.sandbox_id, Some(s.sandbox_id.unwrap().to_string()));
+        assert_eq!(p.image, s.image);
+        assert_eq!(p.mode, "dev_vm");
+        assert_eq!(p.created_at, s.created_at.to_rfc3339());
+        assert_eq!(p.last_active_at, s.last_active_at.to_rfc3339());
+    }
+
+    #[test]
+    fn session_optionals_unset_when_none() {
+        let mut s = populated_session();
+        s.host_id = None;
+        s.sandbox_id = None;
+        let p = session_to_proto(&s);
+        assert_eq!(p.host_id, None);
+        assert_eq!(p.sandbox_id, None);
+    }
+
+    #[test]
+    fn list_item_carries_owner_identity_and_leaves_kind_unset() {
+        let item = SessionListItem {
+            session: populated_session(),
+            owner_email: Some("a@b.com".into()),
+            owner_name: Some("Ada".into()),
+        };
+        let p = session_list_item_to_proto(item);
+        assert!(p.session.is_some());
+        assert_eq!(p.owner_email.as_deref(), Some("a@b.com"));
+        assert_eq!(p.owner_name.as_deref(), Some("Ada"));
+        // owner_kind is TS-mirror-only — never set from Rust.
+        assert_eq!(p.owner_kind, None);
+    }
+
+    #[test]
+    fn list_response_maps_all_rows() {
+        let resp = ListSessionsResponse {
+            sessions: vec![
+                SessionListItem {
+                    session: populated_session(),
+                    owner_email: None,
+                    owner_name: None,
+                },
+                SessionListItem {
+                    session: populated_session(),
+                    owner_email: Some("x@y.z".into()),
+                    owner_name: None,
+                },
+            ],
+        };
+        let p = list_sessions_to_proto(resp);
+        assert_eq!(p.sessions.len(), 2);
+        assert_eq!(p.sessions[1].owner_email.as_deref(), Some("x@y.z"));
+    }
+
+    #[test]
+    fn conversation_entry_round_trips() {
+        let now = chrono::Utc::now();
+        let entry = crate::api::sessions_inspect::ConversationEntry {
+            idx: 42,
+            kind: "status_changed".to_string(),
+            at: now,
+            payload: serde_json::json!({"status": "active"}),
+        };
+        let p = conversation_entry_to_proto(entry);
+        assert_eq!(p.idx, 42);
+        assert_eq!(p.kind, "status_changed");
+        assert_eq!(p.at, now.to_rfc3339());
+        assert!(
+            p.payload_json.contains("active"),
+            "payload_json must contain payload data"
+        );
+    }
+
+    #[test]
+    fn checkpoint_summary_round_trips() {
+        let now = chrono::Utc::now();
+        let s = crate::api::sessions_inspect::CheckpointSummary {
+            snapshot_id: "snap-abc".to_string(),
+            created_at: now,
+            size_bytes: 1024,
+            events_cursor: Some(7),
+            recoverable: true,
+            is_latest: true,
+        };
+        let p = checkpoint_summary_to_proto(s);
+        assert_eq!(p.snapshot_id, "snap-abc".to_string());
+        assert_eq!(p.created_at, now.to_rfc3339());
+        assert_eq!(p.size_bytes, 1024);
+        assert_eq!(p.events_cursor, Some(7));
+        assert!(p.recoverable);
+        assert!(p.is_latest);
+    }
+
+    #[test]
+    fn exec_rusage_round_trips() {
+        let r = engram_core::types::ExecRusage {
+            wall_ms: 150,
+            peak_rss_kb: Some(2048),
+            user_cpu_ms: Some(100),
+            sys_cpu_ms: Some(50),
+        };
+        let p = exec_rusage_to_proto(r);
+        assert_eq!(p.wall_ms, 150);
+        assert_eq!(p.peak_rss_kb, Some(2048));
+        assert_eq!(p.user_cpu_ms, Some(100));
+        assert_eq!(p.sys_cpu_ms, Some(50));
+    }
+
+    #[test]
+    fn artifact_meta_round_trips() {
+        let m = crate::api::upload::ArtifactMeta {
+            media_type: "image/png".to_string(),
+            size_bytes: 4096,
+            file_name: "abc123.png".to_string(),
+        };
+        let p = artifact_meta_to_proto(m);
+        assert_eq!(p.media_type, "image/png");
+        assert_eq!(p.size_bytes, 4096u64);
+        assert_eq!(p.file_name, "abc123.png");
+    }
+
+    /// `exec_request_from_proto` maps all fields and applies the
+    /// argv-wins-when-non-empty rule. Population test per Fix 1.
+    #[test]
+    fn exec_request_from_proto_maps_all_fields() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+
+        // argv non-empty: argv wins, command is still passed through.
+        let r = app::ExecRequest {
+            session_id: "ignored-by-converter".to_string(),
+            command: Some("sh -c echo".to_string()),
+            argv: vec!["echo".to_string(), "hello".to_string()],
+            env: env.clone(),
+            workdir: Some("/tmp".to_string()),
+            timeout_secs: Some(30),
+        };
+        let api = exec_request_from_proto(r);
+        assert_eq!(
+            api.argv,
+            Some(vec!["echo".to_string(), "hello".to_string()])
+        );
+        assert_eq!(api.command, Some("sh -c echo".to_string()));
+        assert_eq!(api.env.get("FOO").map(|s| s.as_str()), Some("bar"));
+        assert_eq!(api.workdir.as_deref(), Some("/tmp"));
+        assert_eq!(api.timeout_secs, Some(30));
+
+        // argv empty: argv maps to None.
+        let r2 = app::ExecRequest {
+            session_id: "ignored".to_string(),
+            command: Some("ls".to_string()),
+            argv: vec![],
+            env: std::collections::HashMap::new(),
+            workdir: None,
+            timeout_secs: None,
+        };
+        let api2 = exec_request_from_proto(r2);
+        assert_eq!(api2.argv, None);
+        assert_eq!(api2.command, Some("ls".to_string()));
+        assert_eq!(api2.workdir, None);
+        assert_eq!(api2.timeout_secs, None);
+    }
+}

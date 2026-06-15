@@ -13,14 +13,10 @@
 //! `GET /api/registries` returns [`RegistryCredentialSummary`] only
 //! — never plaintext passwords, never ciphertext bytes.
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::Json;
 use chrono::Utc;
 use engram_core::types::registry::{
     RegistryAuthSpec, RegistryCredential, RegistryCredentialSummary,
 };
-use engram_core::MetaError;
 use engram_crypto::CredCipher;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -68,15 +64,13 @@ pub struct AddRegistryResponse {
     pub auth_principal: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct ListRegistriesResponse {
-    pub registries: Vec<RegistryCredentialSummary>,
-}
-
-pub async fn add_registry(
-    State(state): State<SharedState>,
-    Json(req): Json<AddRegistryRequest>,
-) -> Result<(StatusCode, Json<AddRegistryResponse>), ApiError> {
+/// ADR 0051: transport-agnostic add-registry core (gRPC `AddRegistry`).
+/// Extracted verbatim from the legacy axum `add_registry` handler — only the
+/// return shape changed (`(StatusCode, Json<...>)` → the plain body).
+pub(crate) async fn add_registry_core(
+    state: &SharedState,
+    req: AddRegistryRequest,
+) -> Result<AddRegistryResponse, ApiError> {
     if req.host.trim().is_empty() {
         return Err(ApiError::BadRequest("host must not be empty".into()));
     }
@@ -131,37 +125,10 @@ pub async fn add_registry(
         .await?;
 
     let summary: RegistryCredentialSummary = cred.into();
-    Ok((
-        StatusCode::CREATED,
-        Json(AddRegistryResponse {
-            id: summary.id,
-            host: summary.registry_host,
-            auth_kind: summary.auth_kind,
-            auth_principal: summary.auth_principal,
-        }),
-    ))
-}
-
-pub async fn list_registries(
-    State(state): State<SharedState>,
-) -> Result<Json<ListRegistriesResponse>, ApiError> {
-    let creds = state.services.meta.list_registry_credentials().await?;
-    let registries = creds
-        .into_iter()
-        .map(RegistryCredentialSummary::from)
-        .collect();
-    Ok(Json(ListRegistriesResponse { registries }))
-}
-
-pub async fn delete_registry(
-    State(state): State<SharedState>,
-    Path(host): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    match state.services.meta.delete_registry_credential(&host).await {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(MetaError::NotFound) => Err(ApiError::NotFound(format!(
-            "no registry credential for host {host:?}"
-        ))),
-        Err(e) => Err(e.into()),
-    }
+    Ok(AddRegistryResponse {
+        id: summary.id,
+        host: summary.registry_host,
+        auth_kind: summary.auth_kind,
+        auth_principal: summary.auth_principal,
+    })
 }

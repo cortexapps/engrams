@@ -3,13 +3,12 @@
 
 use chrono::{DateTime, Utc};
 use engram_core::types::session::SessionMode;
-use engram_core::types::user::{Role, RoleSource, User, UserToken, WebSession};
 use engram_core::types::{
     EnableJob, EnableJobState, EnabledImage, HostCapacity, HostMetadata, HostRecord, HostStatus,
     HostUtilization, PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionState,
     SnapshotRecord,
 };
-use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId, UserId};
+use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 use uuid::Uuid;
@@ -20,6 +19,10 @@ pub(crate) fn col_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> Met
 
 pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     let id: Uuid = row.try_get("id").map_err(col_err)?;
+    // Owning user (ADR 0051): legacy column, dropped in the final cutover.
+    // Defensive `.ok().flatten()` like live_disk_manifest below — a SELECT
+    // that doesn't project `user_id` falls back to None rather than erroring.
+    let user_id: Option<String> = row.try_get("user_id").ok().flatten();
     let host_id: Option<Uuid> = row.try_get("host_id").map_err(col_err)?;
     let sandbox_id: Option<Uuid> = row.try_get("sandbox_id").map_err(col_err)?;
     let status: String = row.try_get("status").map_err(col_err)?;
@@ -57,7 +60,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     };
     Ok(Session {
         id: SessionId(id),
-        user_id: row.try_get("user_id").map_err(col_err)?,
+        user_id,
         status: parse_session_state(&status)?,
         host_id: host_id.map(HostId),
         sandbox_id: sandbox_id.map(SandboxId),
@@ -370,62 +373,8 @@ pub(crate) fn session_secrets_from_row(row: &PgRow) -> Result<SessionSecrets, Me
 // ADR 0021 P1.5a retired `harness_pack_from_row` with the rest of
 // the harness-packs registry.
 
-// ---------- ADR 0031 user identity ----------
-
-pub(crate) fn user_from_row(row: &PgRow) -> Result<User, MetaError> {
-    let id: Uuid = row.try_get("id").map_err(col_err)?;
-    let role_text: String = row.try_get("role").map_err(col_err)?;
-    let role = Role::parse(&role_text).ok_or_else(|| {
-        MetaError::Serialization(format!("users.role: unknown value {role_text:?}"))
-    })?;
-    let role_source_text: String = row.try_get("role_source").map_err(col_err)?;
-    let role_source = RoleSource::parse(&role_source_text).ok_or_else(|| {
-        MetaError::Serialization(format!(
-            "users.role_source: unknown value {role_source_text:?}"
-        ))
-    })?;
-    // `groups` is a JSONB string array; decode to Vec<String>. A malformed
-    // payload fails loud rather than silently dropping group membership.
-    let groups_json: serde_json::Value = row.try_get("groups").map_err(col_err)?;
-    let groups: Vec<String> = serde_json::from_value(groups_json)
-        .map_err(|e| MetaError::Serialization(format!("users.groups decode: {e}")))?;
-    Ok(User {
-        id: UserId(id),
-        email: row.try_get("email").map_err(col_err)?,
-        display_name: row.try_get("display_name").map_err(col_err)?,
-        role,
-        role_source,
-        active: row.try_get("active").map_err(col_err)?,
-        groups,
-        created_at: row.try_get("created_at").map_err(col_err)?,
-        updated_at: row.try_get("updated_at").map_err(col_err)?,
-    })
-}
-
-pub(crate) fn user_token_from_row(row: &PgRow) -> Result<UserToken, MetaError> {
-    let user_id: Uuid = row.try_get("user_id").map_err(col_err)?;
-    Ok(UserToken {
-        user_id: UserId(user_id),
-        kind: row.try_get("kind").map_err(col_err)?,
-        wrapped_dek: row.try_get("wrapped_dek").map_err(col_err)?,
-        nonce: row.try_get("nonce").map_err(col_err)?,
-        ciphertext: row.try_get("ciphertext").map_err(col_err)?,
-        key_id: row.try_get("key_id").map_err(col_err)?,
-        created_at: row.try_get("created_at").map_err(col_err)?,
-        updated_at: row.try_get("updated_at").map_err(col_err)?,
-    })
-}
-
-pub(crate) fn web_session_from_row(row: &PgRow) -> Result<WebSession, MetaError> {
-    let user_id: Uuid = row.try_get("user_id").map_err(col_err)?;
-    Ok(WebSession {
-        token_hash: row.try_get("token_hash").map_err(col_err)?,
-        user_id: UserId(user_id),
-        created_at: row.try_get("created_at").map_err(col_err)?,
-        expires_at: row.try_get("expires_at").map_err(col_err)?,
-        last_seen_at: row.try_get("last_seen_at").map_err(col_err)?,
-    })
-}
+// ADR 0039 final cleanup: user_from_row / user_token_from_row / web_session_from_row
+// removed — users/user_tokens/web_sessions tables and their traits deleted (ADR 0039 §5).
 
 pub(crate) fn parse_session_state_for_lib(s: &str) -> Result<SessionState, MetaError> {
     parse_session_state(s)

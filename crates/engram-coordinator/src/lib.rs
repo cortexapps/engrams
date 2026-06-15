@@ -23,6 +23,7 @@ pub mod enable_scanner;
 pub mod error;
 pub mod evac_resumer;
 pub mod evacuation;
+pub mod grpc_app;
 pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_detect_backstop;
@@ -106,7 +107,7 @@ pub async fn run_with_registry(
     services: Services,
     host_registry: Arc<HostRegistry>,
 ) -> Result<(), CoordinatorError> {
-    run_with_registry_and_local(cfg, services, host_registry, None, None, None).await
+    run_with_registry_and_local(cfg, services, host_registry, None, None).await
 }
 
 /// Variant of [`run_with_registry`] that also accepts a local VMM
@@ -116,6 +117,10 @@ pub async fn run_with_registry(
 /// `services.host` land on the same hub that `lib.rs::set_harness_sink`
 /// plumbs vsock dials into. Without this, in-process harness routing
 /// would target a different hub than the FC backend's sink writes to.
+///
+/// ADR 0039 Task 32: the `auth` parameter is removed. The coordinator
+/// no longer resolves per-user principals; the orchestrator owns all
+/// browser sessions and calls the coordinator over app-gRPC.
 pub async fn run_with_registry_and_local(
     cfg: CoordinatorConfig,
     services: Services,
@@ -127,14 +132,10 @@ pub async fn run_with_registry_and_local(
     // ADR 0023: configured git forge authority, or `None`. Set onto
     // `AppState.forge` for the in-session forge endpoints.
     forge: Option<Arc<dyn GitForge>>,
-    // ADR 0031: the authentication runtime, or `None` (→ synthetic admin).
-    // Set onto `AppState.auth` for the principal layer + `/auth` endpoints.
-    auth: Option<Arc<crate::api::principal::AuthRuntime>>,
 ) -> Result<(), CoordinatorError> {
     let meta_for_listener = services.meta.clone();
     let mut app = AppState::new_with_registry(cfg.clone(), services, host_registry);
     app.forge = forge;
-    app.auth = auth;
     let state = Arc::new(app);
     if let Some((host_id, backend)) = in_proc_local {
         state.register_local_host(host_id, backend);
@@ -371,6 +372,37 @@ pub async fn run_with_registry_and_local(
         state.services.host.set_upload_sink(sink);
     }
 
+    // ADR 0039 §2.3: the orchestrator-facing app gRPC server, beside
+    // the axum API for the duration of the migration (the axum web
+    // routes retire in Phase 5). The listener is bound eagerly so a
+    // bad/conflicting ENGRAM_APP_GRPC_ADDR fails startup loudly,
+    // exactly like the axum bind below; only the serve loop is
+    // spawned, so a runtime serve crash doesn't take the web surface
+    // down with it (the task just logs). Awaits the same
+    // `shutdown_signal()` future the axum side uses below — tokio
+    // signal listeners are multi-subscriber, so one SIGTERM/ctrl-c
+    // gracefully closes both servers — and the JoinHandle is awaited
+    // after axum returns so shutdown drains BOTH servers before the
+    // process exits.
+    let app_grpc = {
+        let grpc_listener = tokio::net::TcpListener::bind(cfg.app_grpc_addr)
+            .await
+            .map_err(CoordinatorError::Io)?;
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(grpc_listener, true, None)
+                .map_err(|e| {
+                    CoordinatorError::Config(format!("app gRPC listener setup failed: {e}"))
+                })?;
+        tracing::info!(addr = %cfg.app_grpc_addr, "app gRPC server listening");
+        let serve = grpc_app::server(state.clone())
+            .serve_with_incoming_shutdown(incoming, shutdown_signal());
+        tokio::spawn(async move {
+            if let Err(e) = serve.await {
+                tracing::error!(error = %e, "app gRPC server exited");
+            }
+        })
+    };
+
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr.as_str())
         .await
@@ -412,7 +444,16 @@ pub async fn run_with_registry_and_local(
     axum::serve(listener, app)
         .with_graceful_shutdown(graceful)
         .await
-        .map_err(CoordinatorError::Io)
+        .map_err(CoordinatorError::Io)?;
+
+    // Graceful shutdown drains both servers: axum has returned, now
+    // wait for the app gRPC serve loop to finish its own drain. A
+    // JoinError here means the spawned task panicked — log it rather
+    // than turning a clean web-side shutdown into a process error.
+    if let Err(e) = app_grpc.await {
+        tracing::error!(error = %e, "app gRPC server task panicked");
+    }
+    Ok(())
 }
 
 /// ADR 0050 B: how long after shutdown begins to wait for connections to

@@ -466,6 +466,11 @@ pub struct SessionSpec {
     pub image: ImageRef,
     #[serde(default)]
     pub mode: SessionMode,
+    /// Owning user (legacy axum create stamps the authenticated
+    /// principal; the app-gRPC create passes `None` — attribution
+    /// lives in the orchestrator task model, ADR 0051). Dropped in
+    /// the final cutover.
+    #[serde(default)]
     pub user_id: Option<String>,
 }
 
@@ -473,6 +478,7 @@ pub struct SessionSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
+    /// Owning user, or `None` for app-gRPC-created sessions (ADR 0051).
     pub user_id: Option<String>,
     pub status: SessionState,
     pub host_id: Option<HostId>,
@@ -749,7 +755,6 @@ mod tests {
     fn session_round_trips_through_json() {
         let original = Session {
             id: SessionId::new(),
-            user_id: Some("u1".into()),
             status: SessionState::Active,
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),
