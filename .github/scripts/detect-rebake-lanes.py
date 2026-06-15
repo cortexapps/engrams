@@ -11,7 +11,7 @@ ship), or a changed file matches a non-crate path rule for the lane.
 
 Lanes:
   images        container rebake — release closure of {coordinator, host-agent}
-                + web/ + docker/ + migrations/
+                + web/ + orchestrator/ + docker/ + migrations/
   host_binaries FC host binaries changed — release closure of
                 {host-agent, uffd-handler} + rust-toolchain.toml. Drives the
                 fast per-commit THIN bake (just re-drop the two binaries onto
@@ -110,7 +110,13 @@ HOST_BINARIES_PATHS = ["rust-toolchain.toml"] + BINARY_COMMON
 # from the old single host_image lane — an otel-config change silently never
 # rebaked the host.)
 HOST_BASE_PATHS = ["deploy/packer/", "deploy/otel/"]
-IMAGES_PATHS = ["docker/", "web/", "deploy/migrations/"] + BINARY_COMMON
+# `orchestrator/` (ADR 0051): the Bun/Hono orchestrator builds its own
+# container image (docker/orchestrator.Dockerfile) just like `web/` — it has no
+# crate in the cargo graph, so it rides the `images` lane via this path rule,
+# exactly mirroring `web/`'s treatment. A source-only orchestrator change
+# rebakes the orchestrator (and the other images in the matrix; that's the same
+# coarse behavior `web/` has always had).
+IMAGES_PATHS = ["docker/", "web/", "orchestrator/", "deploy/migrations/"] + BINARY_COMMON
 TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 # ADR 0027: the RO session bundles (skills / playwright). A change here means
 # the bundle artifacts must be rebuilt + republished, and the FC-host image

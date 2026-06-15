@@ -70,3 +70,20 @@ app.kubernetes.io/name: {{ .Chart.Name }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: web
 {{- end -}}
+
+{{/* ─── orchestrator (ADR 0051) ───────────────────────────────── */}}
+
+{{- define "engram.orchestrator.fullname" -}}
+{{- printf "%s-orchestrator" (include "engram.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "engram.orchestrator.labels" -}}
+{{ include "engram.labels" . }}
+app.kubernetes.io/component: orchestrator
+{{- end -}}
+
+{{- define "engram.orchestrator.selectorLabels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: orchestrator
+{{- end -}}

@@ -104,7 +104,7 @@ jobs:
       # Surface every image's failure independently — easier to debug.
       fail-fast: false
       matrix:
-        image: [coordinator, host-agent, host-operator, web]
+        image: [coordinator, host-agent, host-operator, web, orchestrator]
 
     steps:
       - uses: actions/checkout@v6

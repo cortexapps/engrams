@@ -1,0 +1,54 @@
+{{- if .Values.orchestrator.enabled -}}
+{{- /*
+Non-secret orchestrator env (ADR 0051). The three REQUIRED vars
+(ORCHESTRATOR_DATABASE_URL, CONTROL_PLANE_BEARER, BETTER_AUTH_SECRET) come
+from a Secret in the Deployment — never from this ConfigMap. Everything here
+is non-sensitive config the orchestrator reads at boot (config.ts). Optional
+auth knobs (IAP / OIDC) are emitted ONLY when set, so an unset block leaves
+that auth path inert and the env var simply absent.
+
+CONTROL_PLANE_{GRPC,HTTP}_URL default to the in-cluster coord Service when the
+operator leaves them empty, so a same-chart deploy needs zero wiring.
+*/ -}}
+{{- $coordHost := printf "%s.%s.svc.cluster.local" (include "engram.coordinator.fullname" .) .Release.Namespace -}}
+{{- $coordHttp := printf "%s:%v" $coordHost .Values.service.port -}}
+{{- /* app-gRPC port (ADR 0051). Default 50061 so this renders even before the
+       coordinator chart's appGrpc.port value merges (stacked PRs). */ -}}
+{{- $agPort := 50061 -}}
+{{- if .Values.appGrpc -}}{{- $agPort = .Values.appGrpc.port -}}{{- end -}}
+{{- $coordGrpc := printf "%s:%v" $coordHost $agPort -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "engram.orchestrator.fullname" . }}-config
+  labels:
+    {{- include "engram.orchestrator.labels" . | nindent 4 }}
+data:
+  ORCHESTRATOR_PORT: {{ .Values.orchestrator.containerPort | quote }}
+  {{- with .Values.orchestrator.publicUrl }}
+  ORCHESTRATOR_PUBLIC_URL: {{ . | quote }}
+  {{- end }}
+  CONTROL_PLANE_GRPC_URL: {{ .Values.orchestrator.controlPlane.grpcUrl | default (printf "http://%s" $coordGrpc) | quote }}
+  CONTROL_PLANE_HTTP_URL: {{ .Values.orchestrator.controlPlane.httpUrl | default (printf "http://%s" $coordHttp) | quote }}
+  {{- with .Values.orchestrator.trustedOrigins }}
+  TRUSTED_ORIGINS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.orchestrator.auth.iap.audience }}
+  IAP_AUDIENCE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.orchestrator.auth.iap.jwksUrl }}
+  IAP_JWKS_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.orchestrator.auth.oidc.issuer }}
+  ORCHESTRATOR_OIDC_ISSUER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.orchestrator.auth.oidc.clientId }}
+  ORCHESTRATOR_OIDC_CLIENT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.orchestrator.auth.oidc.providerId }}
+  ORCHESTRATOR_OIDC_PROVIDER_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.orchestrator.auth.oidc.scopes }}
+  ORCHESTRATOR_OIDC_SCOPES: {{ . | quote }}
+  {{- end }}
+{{- end -}}

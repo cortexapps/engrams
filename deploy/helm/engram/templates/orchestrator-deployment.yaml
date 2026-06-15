@@ -1,0 +1,142 @@
+{{- if .Values.orchestrator.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "engram.orchestrator.fullname" . }}
+  labels:
+    {{- include "engram.orchestrator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.orchestrator.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "engram.orchestrator.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "engram.orchestrator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.orchestrator.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll pods when the non-secret env config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/orchestrator-configmap.yaml") . | sha256sum }}
+        {{- with .Values.orchestrator.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # The oven/bun image ships a non-root `bun` user (UID 1000). Run as it,
+      # readonly rootfs, drop all caps — the orchestrator writes nothing to its
+      # FS at runtime (Bun reads .ts from the image and runs in memory).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000           # `bun` user in the oven/bun image
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orchestrator
+          image: "{{ .Values.orchestrator.image.repository }}:{{ .Values.orchestrator.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.orchestrator.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.orchestrator.containerPort }}
+              protocol: TCP
+          # Non-secret config (port, public URL, control-plane URLs, trusted
+          # origins, IAP/OIDC knobs) from the ConfigMap; the three REQUIRED
+          # secrets (+ optional OIDC client secret) from Secret refs below.
+          # The orchestrator FAILS CLOSED without the three required vars
+          # (orchestrator/src/config.ts).
+          envFrom:
+            - configMapRef:
+                name: {{ include "engram.orchestrator.fullname" . }}-config
+          env:
+            - name: ORCHESTRATOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.databaseSecret.existingSecret }}
+                  key: {{ .Values.orchestrator.databaseSecret.urlKey }}
+            - name: CONTROL_PLANE_BEARER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.databaseSecret.existingSecret }}
+                  key: {{ .Values.orchestrator.databaseSecret.bearerKey }}
+            - name: BETTER_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.databaseSecret.existingSecret }}
+                  key: {{ .Values.orchestrator.databaseSecret.authSecretKey }}
+            # ADR 0051: shared engrams KEK for sealing user_session_secrets at rest.
+            # The orchestrator seals IN-PROCESS, so it needs the raw 32-byte key
+            # (base64) — the same ENGRAM_KEK_MASTER_KEY the coordinator's env-var KEK
+            # provider uses. Defaults to the coordinator's secret (shared key);
+            # config.ts makes this REQUIRED, so it is always injected.
+            - name: ENGRAM_KEK_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.kekSecret.existingSecret | default .Values.database.existingSecret }}
+                  key: {{ .Values.orchestrator.kekSecret.key }}
+            {{- if .Values.orchestrator.auth.oidc.clientSecret.existingSecret }}
+            # OIDC client secret (only when OIDC is configured). config.ts makes
+            # CLIENT_ID + CLIENT_SECRET required once ORCHESTRATOR_OIDC_ISSUER is
+            # set — supply the secret here so the boot-time check passes.
+            - name: ORCHESTRATOR_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.auth.oidc.clientSecret.existingSecret }}
+                  key: {{ .Values.orchestrator.auth.oidc.clientSecret.secretKey }}
+            {{- end }}
+          # /healthz returns 503 when the DB is unreachable (orchestrator still
+          # alive). So it's a READINESS signal, not liveness — a DB blip must
+          # not SIGKILL otherwise-healthy pods. Liveness is a cheap TCP connect
+          # to the port: the process is up iff it accepts the connection.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.orchestrator.resources | nindent 12 }}
+          # readOnlyRootFilesystem: true — give Bun a writable /tmp (it may
+          # spill caches there) without letting writes bleed into the image.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.orchestrator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.orchestrator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.orchestrator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end -}}
