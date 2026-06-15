@@ -382,6 +382,25 @@ impl Driver {
             .map(|r| r.into_inner())
     }
 
+    /// The session's bound `host_id`, or `None` if unbound (Idle / Pending /
+    /// terminal). Used by the teleport/evac test to assert the session
+    /// relocated off the source host.
+    async fn session_host_id(&mut self, sid: SessionId) -> Option<String> {
+        self.get_session(sid).await.host_id
+    }
+
+    /// `FleetService.ListHosts` → the registered hosts' ids. The two-host
+    /// evac test uses this to size the fleet + find a peer of the source.
+    async fn list_host_ids(&mut self) -> Vec<String> {
+        let resp = self
+            .fleet
+            .list_hosts(app::ListHostsRequest {})
+            .await
+            .expect("ListHosts")
+            .into_inner();
+        resp.hosts.into_iter().map(|h| h.id).collect()
+    }
+
     /// `FleetService.ChunkGc` with `dry_run = true`.
     async fn chunk_gc_dry_run(&mut self, grace_secs: Option<u64>) -> app::ChunkGcResponse {
         let req = app::ChunkGcRequest {
@@ -1261,12 +1280,129 @@ async fn e2e_evac_admin_endpoint_shape() {
     driver.delete(sid).await;
 }
 
-// ADR 0051: `e2e_two_host_teleport_preserves_sentinel` deleted. It drove the
-// old `POST /api/v1/admin/sessions/:id/teleport` route, which has NO app-gRPC
-// analog — there is no Teleport RPC on `FleetService`/`SessionService`, and
-// adding one would be a breaking app/v1 proto change (out of scope). The
-// two-host evacuation path is still exercised end-to-end by the dev-vm
-// `integration-evac-test.sh`; the single-host async-accept shape is pinned by
-// `e2e_evac_admin_endpoint_shape` above. The `teleport` CI matrix variant in
-// ci.yml's `test-e2e-stack` (which existed solely to run this test on a
-// two-host stack) is dropped alongside it.
+/// Whether this environment is REQUIRED to have ≥2 hosts (the teleport/evac
+/// relocation scenario). Set `ENGRAM_EXPECT_TWO_HOSTS=1` on the CI lane that
+/// boots the two-host stack (`ENGRAM_INTEG_TWO_HOSTS=1`) so a single-host
+/// regression is a hard failure rather than a silent skip. Unset → the test
+/// skips gracefully when only one host registered (the default single-host
+/// `test-e2e-stack` lane).
+fn two_hosts_required() -> bool {
+    matches!(
+        std::env::var("ENGRAM_EXPECT_TWO_HOSTS").ok().as_deref(),
+        Some("1") | Some("true"),
+    )
+}
+
+/// Full-stack two-host teleport via `FleetService.EvacuateSession` — the
+/// teleport PRIMITIVE on the app-gRPC surface (ADR 0051). The orchestrator's
+/// teleport verb is this RPC; `EvacuateSession` pauses + flushes + snapshots
+/// the source sandbox, marks the session Evacuating, and the `evac_resumer`
+/// scanner resumes it on a PEER host (any non-source host via the standard
+/// policy — the proto's `target_host` is reserved/ignored, so unlike the old
+/// REST `/teleport` this does not pin the destination).
+///
+/// Flow: create on host A → write a UUID sentinel + sync → `EvacuateSession`
+/// → wait for Active on a peer → assert the session LEFT host A and the disk
+/// sentinel crossed byte-identical. This is the gRPC replacement for the
+/// deleted `e2e_two_host_teleport_preserves_sentinel` (which drove the removed
+/// REST route): same disk-fidelity-across-relocation guarantee, minus the
+/// destination-pinning assertion the evac primitive intentionally doesn't
+/// offer. The single-host async-accept shape stays pinned by
+/// `e2e_evac_admin_endpoint_shape` above.
+///
+/// Requires a two-host stack. On a single-host lane it skips with a warning
+/// unless `ENGRAM_EXPECT_TWO_HOSTS=1`, where <2 hosts is a hard failure.
+#[tokio::test]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a two-host stack (ENGRAM_INTEG_TWO_HOSTS=1); runs in ci.yml's test-e2e-stack teleport variant"]
+async fn e2e_two_host_evacuate_preserves_sentinel() {
+    let mut driver = Driver::from_env().await;
+    let image = Driver::image_uri();
+
+    let hosts = driver.list_host_ids().await;
+    if hosts.len() < 2 {
+        assert!(
+            !two_hosts_required(),
+            "ENGRAM_EXPECT_TWO_HOSTS is set but only {} host(s) registered — the \
+             two-host stack didn't come up (check ENGRAM_INTEG_TWO_HOSTS + the \
+             tilt-up-ci.sh >=2 host wait + NBD device split).",
+            hosts.len(),
+        );
+        eprintln!(
+            "::warning title=Evacuate e2e skipped::only {} host registered; \
+             teleport/evac relocation needs >=2. Set ENGRAM_INTEG_TWO_HOSTS=1 \
+             on the lane to exercise this.",
+            hosts.len(),
+        );
+        return;
+    }
+
+    let sid = driver.create_session_none_harness(&image).await;
+    let src = driver
+        .session_host_id(sid)
+        .await
+        .expect("Active session must have a bound host_id");
+
+    let sentinel = uuid::Uuid::new_v4().to_string();
+    let write = driver
+        .exec(
+            sid,
+            &format!("printf '%s' {sentinel} > /var/tele-sentinel.txt && sync"),
+        )
+        .await;
+    assert_eq!(
+        write.exit_status,
+        Some(0),
+        "sentinel write should succeed; stderr=<{}>",
+        write.stderr,
+    );
+
+    // EvacuateSession: async-accept, then the scanner drives Evacuating →
+    // Created → Active on a peer.
+    let resp = driver
+        .evacuate(sid)
+        .await
+        .expect("EvacuateSession must succeed on an Active session");
+    assert_eq!(
+        resp.status, "evacuating",
+        "evacuate response status must be \"evacuating\"; got {resp:?}",
+    );
+
+    // The evac_resumer drives Evacuating → Created → Active on the peer.
+    // Generous deadline: first restore on the peer may cold-fetch chunks.
+    // 180s mirrors the cold-create budget.
+    assert!(
+        driver
+            .wait_for_status(sid, "active", Duration::from_secs(180))
+            .await,
+        "session should be Active on a peer host after evacuation; \
+         last status={}",
+        driver.session_status(sid).await,
+    );
+
+    // Left the source host. EvacuateSession picks any non-source peer, so we
+    // assert the move happened (session left A) — not which peer it landed on.
+    let after = driver
+        .session_host_id(sid)
+        .await
+        .expect("resumed session must have a bound host_id");
+    assert_ne!(
+        after, src,
+        "session must leave the source host after evacuation",
+    );
+
+    // Disk data crossed the move byte-identical.
+    let readback = driver.exec(sid, "cat /var/tele-sentinel.txt").await;
+    assert_eq!(
+        readback.exit_status,
+        Some(0),
+        "sentinel readback on the destination host should succeed; stderr=<{}>",
+        readback.stderr,
+    );
+    assert_eq!(
+        readback.stdout.trim(),
+        sentinel,
+        "disk data lost across the host evacuation",
+    );
+
+    driver.delete(sid).await;
+}
