@@ -5,7 +5,7 @@
  * controlPlaneTransport (bearer header + H2 keepalives).
  *
  * Usage:
- *   import { sessions, shellRelay, secrets, images, fleet } from "./client.ts";
+ *   import { sessions, shellRelay, images, fleet } from "./client.ts";
  *   const resp = await sessions.listSessions({});
  */
 
@@ -13,7 +13,6 @@ import { createClient } from "@connectrpc/connect";
 import { controlPlaneTransport } from "./transport.ts";
 
 import { SessionService, ShellRelayService } from "../gen/engram/app/v1/session_pb.ts";
-import { SecretService } from "../gen/engram/app/v1/secret_pb.ts";
 import { ImageService } from "../gen/engram/app/v1/image_pb.ts";
 import { FleetService } from "../gen/engram/app/v1/fleet_pb.ts";
 
@@ -22,9 +21,6 @@ export const sessions = createClient(SessionService, controlPlaneTransport);
 
 /** ShellRelayService client — bidi shell relay stream. */
 export const shellRelay = createClient(ShellRelayService, controlPlaneTransport);
-
-/** SecretService client — sealed secret management. */
-export const secrets = createClient(SecretService, controlPlaneTransport);
 
 /** ImageService client — image prefetch/disable/list. */
 export const images = createClient(ImageService, controlPlaneTransport);

@@ -42,6 +42,7 @@ import { makeArtifactsRoute } from "../routes/artifacts.ts";
 import type { ArtifactsDeps } from "../routes/artifacts.ts";
 import { makeMeRoute } from "../routes/me.ts";
 import type { MeDeps } from "../routes/me.ts";
+import type { HarnessTokenStore } from "../db/harness-token.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import type { AddressInfo } from "node:net";
 
@@ -528,14 +529,35 @@ describe("Artifact bytes route", () => {
 // 10–12: /me/claude-token tests
 // ---------------------------------------------------------------------------
 
+/**
+ * In-memory fake of the orchestrator's HarnessTokenStore (ADR 0051 Drip A):
+ * the per-user Claude token now lives in the orchestrator's own store, not the
+ * coordinator's SecretService. Keeps the POST→GET(true)→DELETE→GET(false)
+ * round-trip semantics against this local store.
+ */
+function makeFakeTokenStore(): HarnessTokenStore & { store: Record<string, string> } {
+  const store: Record<string, string> = {};
+  return {
+    store,
+    async put(userId, token) {
+      store[userId] = token;
+    },
+    async get(userId) {
+      return store[userId] ?? null;
+    },
+    async has(userId) {
+      return userId in store;
+    },
+    async delete(userId) {
+      delete store[userId];
+    },
+  };
+}
+
 describe("/me/claude-token route", () => {
   test("10: POST without session → 401", async () => {
     const meRoute = makeMeRoute({
-      secrets: {
-        async putSecret() { return {}; },
-        async hasSecret() { return { exists: false }; },
-        async deleteSecret() { return {}; },
-      },
+      tokens: makeFakeTokenStore(),
       getSession: makeGetSession(null),
     });
 
@@ -564,23 +586,8 @@ describe("/me/claude-token route", () => {
   });
 
   test("11: POST/GET/DELETE round-trip — correct JSON shapes", async () => {
-    const store: Record<string, string> = {};
-    const secretsClient = {
-      async putSecret({ key, value }: { key: string; value: string }) {
-        store[key] = value;
-        return {};
-      },
-      async hasSecret({ key }: { key: string }) {
-        return { exists: key in store };
-      },
-      async deleteSecret({ key }: { key: string }) {
-        delete store[key];
-        return {};
-      },
-    };
-
     const meRoute = makeMeRoute({
-      secrets: secretsClient,
+      tokens: makeFakeTokenStore(),
       getSession: makeGetSession(MEMBER_A),
     });
 
@@ -659,23 +666,8 @@ describe("/me/claude-token route", () => {
     console.debug = capture;
 
     try {
-      const store: Record<string, string> = {};
-      const secretsClient = {
-        async putSecret({ key, value }: { key: string; value: string }) {
-          store[key] = value;
-          return {};
-        },
-        async hasSecret({ key }: { key: string }) {
-          return { exists: key in store };
-        },
-        async deleteSecret({ key }: { key: string }) {
-          delete store[key];
-          return {};
-        },
-      };
-
       const meRoute = makeMeRoute({
-        secrets: secretsClient,
+        tokens: makeFakeTokenStore(),
         getSession: makeGetSession(MEMBER_A),
       });
 

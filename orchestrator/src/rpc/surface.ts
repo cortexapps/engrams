@@ -5,7 +5,6 @@
  * the control plane. The following are intentionally absent:
  *
  *   - ShellRelayService      WS route (Task 21)
- *   - SecretService          keys come from the session, not the user surface
  *   - TaskService            native implementation (Task 19)
  *   - StreamEvents           dedicated Hono SSE route (Task 20)
  *   - GetArtifact            dedicated Hono byte-streaming route (Task 20)

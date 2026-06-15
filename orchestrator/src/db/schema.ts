@@ -143,6 +143,33 @@ export const verification = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Harness identity token (ADR 0051 Drip A)
+//
+// The orchestrator OWNS the user's harness auth token (e.g. the Claude
+// CLAUDE_CODE_OAUTH_TOKEN) — it lives here in the orchestrator's own Postgres,
+// next to the users it belongs to, replacing the coordinator's per-user sealed
+// SecretService vault. At session-create the orchestrator resolves the calling
+// user's token and passes it to the control plane via CreateSession.harness_env;
+// the coordinator persists it into session_secrets so it is replayed on resume.
+//
+// At-rest posture is the orchestrator's Postgres — the SAME store better-auth
+// already uses for OAuth access/refresh tokens (see `account` above). No KMS
+// envelope here. The token is NEVER logged.
+// ---------------------------------------------------------------------------
+
+export const userHarnessToken = pgTable("user_harness_token", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => user.id, { onDelete: "cascade" }),
+  token: text("token").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at")
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+});
+
+// ---------------------------------------------------------------------------
 // Relations (informational — drizzle does not require these for queries)
 // ---------------------------------------------------------------------------
 
