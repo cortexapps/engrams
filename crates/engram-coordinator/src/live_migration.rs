@@ -882,7 +882,6 @@ mod tests {
     fn active_session() -> Session {
         Session {
             id: SessionId::new(),
-            user_id: None,
             status: SessionState::Active,
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),

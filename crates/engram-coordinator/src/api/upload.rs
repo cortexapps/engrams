@@ -16,9 +16,8 @@
 //! ProcessBackend loopback land in later phases.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap};
-use axum::response::Response;
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
@@ -428,43 +427,6 @@ pub async fn upload_forward(
 
 // ---- trusted operator pull (any file by path) --------------------------
 
-#[derive(serde::Deserialize)]
-pub struct FromPathRequest {
-    pub path: String,
-    #[serde(default)]
-    pub caption: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-pub struct FromPathResponse {
-    pub artifact_id: String,
-    pub media_type: String,
-    pub size_bytes: u64,
-}
-
-/// `POST /sessions/:id/artifacts/from-path` — ADR 0026 trusted operator
-/// file pull. Mounted in the bearer/IAP group (NOT broker-token-authed):
-/// a trusted operator can capture **any** file in the session, with no
-/// MIME restriction (`Trust::Trusted`), same size cap + quota.
-///
-/// `ensure_active` auto-resumes a recoverable (Idle) session; the file is
-/// read out of the guest by streaming `cat` over the existing exec
-/// channel (works in-proc + split mode — no new gRPC surface), so the
-/// body never buffers host-side. A missing/unreadable path surfaces as a
-/// non-zero `cat` exit → the stream errors and the upload aborts.
-pub async fn create_from_path(
-    State(state): State<SharedState>,
-    Path(session): Path<SessionId>,
-    Json(req): Json<FromPathRequest>,
-) -> Result<Json<FromPathResponse>, ApiError> {
-    let a = create_artifact_from_path_core(&state, session, &req.path, req.caption).await?;
-    Ok(Json(FromPathResponse {
-        artifact_id: a.artifact_id,
-        media_type: a.media_type,
-        size_bytes: a.size_bytes,
-    }))
-}
-
 fn ext_from_path(path: &str) -> String {
     std::path::Path::new(path)
         .extension()
@@ -497,39 +459,6 @@ fn exec_stdout_bytestream(events: ExecEventStream) -> ByteStream {
         }
     };
     ByteStream::new(s)
-}
-
-// ---- serve (web UI) ----------------------------------------------------
-
-/// `GET /sessions/:id/artifacts/:artifact_id` — stream an artifact back
-/// to the dashboard. Mounted in the bearer-authed group (in prod the
-/// browser reaches it via the IAP cookie at the LB; nginx stamps the
-/// bearer), so artifacts are never world-readable.
-///
-/// **MIME-agnostic hardening** (applies to media + arbitrary
-/// operator-pulled types alike): the response carries the
-/// server-DETECTED `Content-Type`, `X-Content-Type-Options: nosniff`,
-/// `Content-Disposition: inline`, a `Content-Security-Policy: sandbox`
-/// (a scriptless, opaque-origin context even if the bytes are somehow an
-/// HTML document), and `no-store`. This — not the upload allowlist — is
-/// what makes serving attacker-controlled bytes to operators safe.
-pub async fn serve_artifact(
-    State(state): State<SharedState>,
-    Path((session, artifact_id)): Path<(SessionId, String)>,
-) -> Result<Response, ApiError> {
-    let (meta, stream) = get_artifact_core(&state, session, &artifact_id).await?;
-    Response::builder()
-        .header(header::CONTENT_TYPE, meta.media_type)
-        .header(header::CONTENT_LENGTH, meta.size_bytes)
-        .header("X-Content-Type-Options", "nosniff")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("inline; filename=\"{}\"", meta.file_name),
-        )
-        .header("Content-Security-Policy", "sandbox")
-        .header(header::CACHE_CONTROL, "private, no-store")
-        .body(Body::from_stream(stream))
-        .map_err(|e| ApiError::Internal(format!("build artifact response: {e}")))
 }
 
 // ----------------------------------------------------------------

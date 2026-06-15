@@ -1166,7 +1166,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1219,7 +1218,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1369,7 +1367,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1427,7 +1424,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1474,7 +1470,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1671,7 +1666,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1884,7 +1878,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2101,7 +2094,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2219,7 +2211,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2448,7 +2439,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2562,7 +2552,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2653,7 +2642,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2684,7 +2672,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2741,7 +2728,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2832,7 +2818,6 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -2899,7 +2884,6 @@ mod tests {
     fn evicting_session(id: engram_core::SessionId) -> Session {
         Session {
             id,
-            user_id: None,
             status: SessionState::Evicting,
             host_id: None,
             sandbox_id: None,
