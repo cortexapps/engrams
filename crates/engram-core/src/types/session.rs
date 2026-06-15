@@ -755,6 +755,7 @@ mod tests {
     fn session_round_trips_through_json() {
         let original = Session {
             id: SessionId::new(),
+            user_id: None,
             status: SessionState::Active,
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),
