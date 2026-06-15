@@ -251,6 +251,18 @@ bin_dir = env_or('ENGRAM_INTEG_BIN_DIR', '')
 # to ship spans elsewhere (or to '' to disable export entirely).
 otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 
+# ADR 0051 §5: the app-gRPC surface fails closed — it serves
+# `unauthenticated` until a bearer is configured. This is the
+# orchestrator's machine credential, deliberately separate from the
+# host-agents' ENGRAM_AUTH_TOKENS (different caller, different blast
+# radius). A fixed dev literal is fine here: deterministic across
+# restarts, never leaves loopback, never ships.
+app_grpc_dev_token = env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token')
+# ADR 0051 Task 14: consumed by the orchestrator resource below as CONTROL_PLANE_BEARER.
+# Both ends agree on this value — the coordinator's ENGRAM_APP_GRPC_TOKENS and
+# the orchestrator's CONTROL_PLANE_BEARER are set from the same source.
+control_plane_bearer = app_grpc_dev_token
+
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
     'ENGRAM_BIND_ADDR': '127.0.0.1:8090',
@@ -271,6 +283,10 @@ coord_env = {
     'STORAGE_EMULATOR_HOST': env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443'),
     'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
     'RUST_LOG': 'info,engram=debug',
+    # ADR 0051 §5: app-gRPC service-bearer allow-list (comma-separated
+    # to allow rotation overlap). Fail-closed surface — must be set or
+    # every orchestrator call gets `unauthenticated`.
+    'ENGRAM_APP_GRPC_TOKENS': app_grpc_dev_token,
 }
 
 # Kernel env var only applies to a real-virt backend (mode=all + vz, or
@@ -389,7 +405,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         kernel_key: kernel_path,
         'ENGRAM_SANDBOX_WORK_DIR': work_dir,
         'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
-        # ADR 0039: the Tilt dev/e2e stack doesn't bake engram-uffd-handler
+        # ADR 0051: the Tilt dev/e2e stack doesn't bake engram-uffd-handler
         # (prod's FC-host image does), and the host-agent runs under sudo
         # with a scrubbed PATH so it couldn't spawn a co-located one anyway.
         # The host-agent code default is now `uffd`, so pin `file` here to
@@ -537,7 +553,74 @@ if not skip_web:
         trigger_mode=TRIGGER_MODE_MANUAL,
         auto_init=True)
 
+# ----------------------------------------------------------------
+# Orchestrator (Bun HTTP server, ADR 0051 Task 14+).
+#
+# Runs Hono on Bun with a Connect/gRPC seam at /rpc/*. Depends on
+# postgres (drizzle migrations via orchestrator-migrate). Bun's native
+# HTTP is used; no cargo build required.
+#
+# resource_deps=['postgres', 'orchestrator-migrate'] — coordinator is
+# added in Task 17 once the control-plane transport is wired.
+#
+# CONTROL_PLANE_BEARER is wired from `control_plane_bearer` above so
+# the orchestrator and coordinator agree on the same dev token without
+# any manual coordination.
+# ----------------------------------------------------------------
+
+# Dev URL for the orchestrator's dedicated DB (ADR 0051 §10).
+orchestrator_db_url = 'postgres://engram:engram@localhost:5435/engram_orchestrator'
+
+# Task 15: one-shot migrate resource.
+#
+# Step 1 creates the database (idempotent: `|| true` swallows "already
+# exists"). Step 2 runs drizzle-kit migrate, which is also idempotent —
+# it applies only unapplied migrations. Running on every `tilt up` is
+# intentional: fresh machines get the schema automatically, and on
+# existing machines it's a no-op.
+local_resource('orchestrator-migrate',
+    cmd=(
+        'docker compose -f deploy/docker-compose.dev.yml exec -T postgres ' +
+        'createdb -U engram engram_orchestrator || true && ' +
+        'bash -c "cd orchestrator && ' +
+        'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
+        'bunx drizzle-kit migrate"'
+    ),
+    resource_deps=['postgres'],
+    labels=['setup'])
+
+local_resource('orchestrator',
+    serve_cmd=(
+        'cd orchestrator && ' +
+        'bun install --silent && ' +
+        'bun src/index.ts'
+    ),
+    serve_env={
+        'CONTROL_PLANE_BEARER': control_plane_bearer,
+        'CONTROL_PLANE_GRPC_URL': 'http://127.0.0.1:50061',
+        'TRUSTED_ORIGINS': 'http://localhost:5173',
+        'ORCHESTRATOR_PORT': '8787',
+        'ORCHESTRATOR_DATABASE_URL': orchestrator_db_url,
+        # ADR 0051 Task 16: better-auth cookie-signing secret. A fixed dev
+        # literal is fine here — deterministic across restarts, never leaves
+        # loopback, never ships. Production must rotate this via .env or a
+        # secrets manager before Phase 4 deployment.
+        'BETTER_AUTH_SECRET': env_or('BETTER_AUTH_SECRET', 'dev-better-auth-secret-32bytes!!'),
+    },
+    resource_deps=['postgres', 'orchestrator-migrate'],
+    readiness_probe=probe(
+        period_secs=30,
+        timeout_secs=2,
+        tcp_socket=tcp_socket_action(port=8787),
+    ),
+    links=[
+        link('http://127.0.0.1:8787/healthz', 'healthz'),
+    ],
+    labels=['app'],
+    trigger_mode=TRIGGER_MODE_MANUAL,
+    auto_init=True)
+
 # Resources are grouped in the Tilt UI by `labels` above:
 # infra (postgres, registry) → setup (seed-buckets) → app (coordinator,
-# web). Click any one to jump to its log stream / readiness state /
-# restart button.
+# web, orchestrator). Click any one to jump to its log stream / readiness
+# state / restart button.
