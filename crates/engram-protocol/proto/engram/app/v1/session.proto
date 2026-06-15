@@ -1,0 +1,406 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// The orchestrator-facing app contract (ADR 0051 §2.3, rev 2026-06-10).
+// The caller is a single trusted service (bearer-authed); there is no
+// per-user anything here. Attribution and authz live in the orchestrator.
+service SessionService {
+  // Returns ALL sessions. The orchestrator filters by task ownership.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+  rpc SendPrompt(SendPromptRequest) returns (SendPromptResponse);
+  rpc Interrupt(InterruptRequest) returns (InterruptResponse);
+  // Streams the event envelope itself, not a wrapped Response message.
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc StreamEvents(StreamEventsRequest) returns (stream SessionEvent);
+  // One streaming RPC; the unary HTTP route's semantics are the
+  // degenerate collected case.
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc Exec(ExecRequest) returns (stream ExecOutput);
+  rpc GetLog(GetLogRequest) returns (GetLogResponse);
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+  rpc EvictLocal(EvictLocalRequest) returns (EvictLocalResponse);
+  rpc GetCowState(GetCowStateRequest) returns (GetCowStateResponse);
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+  // STREAMING: artifacts run to 512 MiB (MAX_ARTIFACT_BYTES); a unary
+  // response would blow the 4 MiB message cap. First message = metadata.
+  rpc GetArtifact(GetArtifactRequest) returns (stream GetArtifactResponse);
+  rpc CreateArtifactFromPath(CreateArtifactFromPathRequest) returns (CreateArtifactFromPathResponse);
+}
+
+// Browser-shell relay (ADR §8), its own service: keeps the bidi
+// (browser-uncallable) method out of the UI surface and avoids colliding
+// with host_service.proto's ProxyShell.
+service ShellRelayService {
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc Relay(stream RelayShellRequest) returns (stream RelayShellResponse);
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated SessionListItem sessions = 1;
+}
+
+// A session list row — the session plus the owner's identity (ADR 0031),
+// folded in as optionals. `owner_kind` ("system" for warm-pool /
+// automated sessions, "user" or absent for human-launched) is a
+// TS-mirror-only field today — absent from the Rust wire
+// (SessionListItem), so absent is the norm.
+message SessionListItem {
+  Session session = 1;
+  optional string owner_email = 2;
+  optional string owner_name = 3;
+  optional string owner_kind = 4;
+}
+
+// Mirrors engram_core::types::Session as serialized on today's JSON wire
+// (web/src/types.ts Session). `user_id` is OMITTED — attribution leaves
+// the contract (ADR §2.1). String-literal unions stay strings:
+// status ∈ SessionState, mode ∈ {"agent","dev_vm"}. Timestamps are
+// ISO-8601 strings, as on the JSON wire.
+message Session {
+  string id = 1;
+  // engram_core SessionState, snake_case: "pending" | "created" |
+  // "guest_ready" | "active" | "idle" | "host_lost" | "evacuating" |
+  // "evicting" | "failed" | "completed" | "dead".
+  string status = 2;
+  optional string host_id = 3;
+  optional string sandbox_id = 4;
+  // Flat OCI URI (`<host>[:port]/<repo>:<tag>`) — Stage B1 wire shape.
+  string image = 5;
+  string mode = 6;
+  string created_at = 7;
+  string last_active_at = 8;
+}
+
+message CreateSessionRequest {
+  string image_uri = 1;
+  // engram_core SessionMode, snake_case: "agent" (run the image's baked
+  // harness) | "dev_vm" (no harness driven; interact via shell / exec).
+  string mode = 2;
+  optional string prompt = 3;
+  // Sealed-secret reference (SecretService key). When set and the image's
+  // builtin harness wants a token, the control plane unseals + injects it.
+  // Replaces "auto-inject the calling user's token" — there is no calling
+  // user here (ADR §2.1).
+  optional string harness_secret_id = 4;
+  // Per-request secret values keyed by env-var name. Only honored under
+  // SecretMode::Literal; broker-mode images reject overrides.
+  map<string, string> secrets = 5;
+}
+
+message CreateSessionResponse {
+  string session_id = 1;
+  string status = 2;
+  string image_version = 3;
+  // "warm" if the session was satisfied by a pre-restored warm-pool slot,
+  // "cold" if it took the full create path. (On the Rust JSON wire —
+  // api/sessions.rs CreateSessionResponse — absent from the TS mirror.)
+  string kind = 4;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message GetSessionResponse {
+  Session session = 1;
+}
+
+message DeleteSessionRequest {
+  string session_id = 1;
+}
+
+// Today's HTTP delete returns 204 No Content (idempotently, even when a
+// sibling raced us to terminal) — there is no body to mirror.
+message DeleteSessionResponse {}
+
+message SendPromptRequest {
+  string session_id = 1;
+  string text = 2;
+}
+
+message SendPromptResponse {
+  string session_id = 1;
+  // Human-readable diagnostic; not machine-parsed, not stable.
+  string note = 2;
+}
+
+message InterruptRequest {
+  string session_id = 1;
+}
+
+message InterruptResponse {
+  string session_id = 1;
+  // Human-readable diagnostic; not machine-parsed, not stable.
+  string note = 2;
+}
+
+message StreamEventsRequest {
+  string session_id = 1;
+  // Replay strictly-after this idx, then tail. UNSET = from the start
+  // (callers translate the HTTP -1 sentinel to unset; proto3 default 0
+  // would silently skip idx 0).
+  optional int64 since = 2;
+}
+
+// The typed event ENVELOPE. payload_json is NORMATIVELY the JSON object
+// today's SSE `data:` carries: the event payload with
+// _recovery_epoch/_rewound folded in via with_rewind_meta
+// (api/events.rs) — on BOTH the replay and live arms.
+message SessionEvent {
+  // optional: a broadcast-lag notification has no idx (today's SSE emits
+  // `event: lagged` with NO id: line so it never disturbs Last-Event-ID).
+  optional int64 idx = 1;
+  // The event's "type" discriminant. Special value "lagged": idx unset,
+  // payload_json = {"missed": n}.
+  string kind = 2;
+  string payload_json = 3;
+}
+
+message ExecRequest {
+  string session_id = 1;
+  // Either a single shell command (passed to `sh -c`) or an explicit
+  // argv vector. Exactly one of `command` / non-empty `argv` must be set.
+  optional string command = 2;
+  repeated string argv = 3;
+  map<string, string> env = 4;
+  optional string workdir = 5;
+  optional uint64 timeout_secs = 6;
+}
+
+// engram_core::types::ExecEvent is authoritative for the stream body:
+// stdout/stderr are intentionally bytes, not string, so non-UTF-8 output
+// (binary tools, raw pipe content) flows unmolested — callers stringify
+// lossily at the API edge. Framed like GetArtifact: the first message is
+// `started` (exec_id lives on the ExecStream metadata, not on ExecEvent);
+// the stream is terminated by exactly one `exit`.
+message ExecOutput {
+  oneof event {
+    ExecStarted started = 1; // always the first message
+    bytes stdout = 2;
+    bytes stderr = 3;
+    ExecExit exit = 4; // always the last message
+  }
+}
+
+message ExecStarted {
+  string exec_id = 1;
+}
+
+message ExecExit {
+  // Unset when the process was killed (no exit status), mirroring
+  // ExecEvent::Exit(Option<i32>).
+  optional int32 exit_status = 1;
+  // Coordinator-measured rusage attached to today's exec_completed
+  // event and the sync /exec response.
+  ExecRusage rusage = 2;
+}
+
+// engram_core::types::ExecRusage. wall_ms is coordinator-measured wall
+// time; the rest are backend-supplied and absent on backends that can't
+// capture them (the TS mirror is explicitly non-exhaustive here).
+message ExecRusage {
+  uint64 wall_ms = 1;
+  optional uint64 peak_rss_kb = 2;
+  optional uint64 user_cpu_ms = 3;
+  optional uint64 sys_cpu_ms = 4;
+}
+
+message GetLogRequest {
+  string session_id = 1;
+  // Only "conversation" (or unset, defaults to conversation) is accepted
+  // post-ADR-0005; anything else is INVALID_ARGUMENT.
+  optional string kind = 2;
+  // Cap on number of rows returned. Server defaults to 200, hard-capped
+  // at 1000 to keep responses bounded.
+  optional int64 limit = 3;
+}
+
+message GetLogResponse {
+  string session_id = 1;
+  string kind = 2;
+  repeated ConversationEntry events = 3;
+}
+
+message ConversationEntry {
+  int64 idx = 1;
+  string kind = 2;
+  // ISO-8601.
+  string at = 3;
+  // The raw session_events payload (serde_json::Value on the Rust side).
+  string payload_json = 4;
+}
+
+message SnapshotRequest {
+  string session_id = 1;
+}
+
+message SnapshotResponse {
+  string session_id = 1;
+  optional string snapshot_id = 2;
+  optional uint64 size_bytes = 3;
+  // Human-readable diagnostic; not machine-parsed, not stable.
+  string note = 4;
+}
+
+message ResumeRequest {
+  string session_id = 1;
+}
+
+// Same shape as SnapshotResponse (the HTTP resume handler reuses it);
+// a distinct type per RPC_REQUEST_RESPONSE_UNIQUE.
+message ResumeResponse {
+  string session_id = 1;
+  optional string snapshot_id = 2;
+  optional uint64 size_bytes = 3;
+  string note = 4;
+}
+
+message EvictLocalRequest {
+  string session_id = 1;
+}
+
+// Today's HTTP handler returns 202 Accepted with no body.
+message EvictLocalResponse {}
+
+message GetCowStateRequest {
+  string session_id = 1;
+}
+
+message GetCowStateResponse {
+  string session_id = 1;
+  // Unset when the session has no live sandbox (Idle, HostLost, Pending,
+  // terminal) — the disk-tier numbers don't exist.
+  optional CowStateView state = 2;
+}
+
+// Mirrors engram_coordinator::cow_state::CowStateView. One row per
+// chunk-tracked sandbox.
+message CowStateView {
+  string sandbox_id = 1;
+  optional string session_id = 2;
+  // Current disk manifest version. Ticks on every flush().
+  string disk_manifest_id = 3;
+  uint64 disk_manifest_version = 4;
+  // Dirty chunks resident in host RAM (not yet flushed to BlobStorage).
+  uint32 dirty_chunks = 5;
+  uint64 dirty_bytes = 6;
+  // ISO-8601 timestamp of the last successful flush(). Unset = never
+  // flushed since the backend was constructed.
+  optional string last_flush_at = 7;
+  // Total chunks the disk manifest references.
+  uint32 base_chunks = 8;
+  // Of base_chunks, how many are resident on this host's local NVMe
+  // cache vs. fetched on-demand from BlobStorage.
+  uint32 base_chunks_local = 9;
+  // Most recent memory manifest captured in a snapshot. Unset if the
+  // session has never been snapshotted.
+  optional string memory_manifest_id = 10;
+  optional uint64 memory_manifest_version = 11;
+  // ISO-8601 timestamp of the last successful snapshot. Unset = never
+  // snapshotted.
+  optional string last_snapshot_at = 12;
+}
+
+message ListCheckpointsRequest {
+  string session_id = 1;
+}
+
+message ListCheckpointsResponse {
+  string session_id = 1;
+  // Newest first; bounded to the forkable-history retention window
+  // (latest always kept).
+  repeated CheckpointSummary checkpoints = 2;
+}
+
+// ADR 0028 A.log: one checkpoint in a session's chain.
+message CheckpointSummary {
+  string snapshot_id = 1;
+  // ISO-8601.
+  string created_at = 2;
+  uint64 size_bytes = 3;
+  // The transcript cursor a rung-1 rewind / fork would cut at.
+  optional int64 events_cursor = 4;
+  // HEAD-verified durable in object storage (rung-1-eligible).
+  bool recoverable = 5;
+  // The newest checkpoint — the always-pinned rung-1 recovery anchor.
+  bool is_latest = 6;
+}
+
+message GetArtifactRequest {
+  string session_id = 1;
+  string artifact_id = 2;
+}
+
+message GetArtifactResponse {
+  oneof msg {
+    ArtifactMetadata metadata = 1; // always the first message
+    bytes chunk = 2;
+  }
+}
+
+message ArtifactMetadata {
+  string media_type = 1;
+  // uint64, deviating from the plan skeleton's int64: sizes are never
+  // negative, and every other size field in this file is uint64.
+  uint64 size_bytes = 2;
+  string file_name = 3;
+}
+
+// ADR 0026 trusted operator file pull: capture ANY file in the session
+// by path, no MIME restriction, same size cap + quota.
+message CreateArtifactFromPathRequest {
+  string session_id = 1;
+  string path = 2;
+  optional string caption = 3;
+}
+
+message CreateArtifactFromPathResponse {
+  string artifact_id = 1;
+  string media_type = 2;
+  uint64 size_bytes = 3;
+}
+
+// ---------------------------------------------------------------------
+// ShellRelayService messages.
+// ---------------------------------------------------------------------
+
+// Frame kinds mirror the WS frames / host ProxyShellMessage 1:1. Request
+// and response are separate types (RPC_REQUEST_RESPONSE_UNIQUE) and mark
+// directionality.
+message RelayShellRequest {
+  oneof frame {
+    ShellOpen open = 1; // first client frame: which session's shell
+    string text = 2;
+    bytes binary = 3;
+    bytes ping = 4;
+    bytes pong = 5;
+    ShellClose close = 6;
+  }
+}
+
+message RelayShellResponse {
+  oneof frame {
+    string text = 1;
+    bytes binary = 2;
+    bytes ping = 3;
+    bytes pong = 4;
+    ShellClose close = 5;
+  }
+}
+
+message ShellOpen {
+  string session_id = 1;
+}
+
+message ShellClose {
+  uint32 code = 1;
+  string reason = 2;
+}

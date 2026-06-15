@@ -46,6 +46,17 @@ hakari:
     cargo hakari generate
     cargo hakari manage-deps --yes
 
+# Regenerate the TS bindings for the app contract (ADR 0051 §7), driven
+# by buf.gen.yaml. Run after editing crates/engram-protocol/proto/engram/app/**.
+# The output dirs (web/src/gen, orchestrator/src/gen) land with their
+# consumers (ADR 0051 Tasks 4-5); until then there is nothing to generate.
+gen-proto:
+    @if [ -d crates/engram-protocol/proto/engram/app ]; then \
+        buf generate; \
+    else \
+        echo "engram/app contract not present yet (ADR 0051 Tasks 4-5) — nothing to generate"; \
+    fi
+
 # Run all tests via nextest (faster). Pass extra args after `--`.
 test *ARGS:
     cargo nextest run --workspace {{ARGS}}

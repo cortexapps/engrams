@@ -1,0 +1,325 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+import "engram/app/v1/session.proto";
+
+// Fleet, storage, and GC operations (ADR 0051 §2.3, rev 2026-06-10).
+// The caller is a single trusted service (bearer-authed); there is no
+// per-user anything here. Attribution and authz live in the orchestrator.
+//
+// INTENTIONAL DROPS: `GET /api/admin/chunk-gc/candidates` and
+// `POST /api/admin/reap-materialize-dir` get NO RPC — neither has a web
+// caller today. A later task decides keep-behind-bearer vs delete.
+service FleetService {
+  rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+  rpc GetHost(GetHostRequest) returns (GetHostResponse);
+  // ADR 0016 Phase A per-host COW diagnostic
+  // (GET /api/hosts/:id/cow-state).
+  rpc GetHostCowState(GetHostCowStateRequest) returns (GetHostCowStateResponse);
+  // Soft drain — the member-facing POST /hosts/:id/drain (status flip,
+  // the one the web calls: web/src/api.ts drainHost). The scheduler
+  // stops picking the host; in-flight sessions stay put.
+  rpc DrainHost(DrainHostRequest) returns (DrainHostResponse);
+  // ADR-0018 cordon+evacuate — POST /admin/hosts/:id/drain. Two distinct
+  // semantics today; kept distinct.
+  rpc AdminDrainHost(AdminDrainHostRequest) returns (AdminDrainHostResponse);
+  rpc CordonHost(CordonHostRequest) returns (CordonHostResponse);
+  rpc UncordonHost(UncordonHostRequest) returns (UncordonHostResponse);
+  // ADR 0029 Storage page rollup (GET /api/storage/summary).
+  rpc GetStorageSummary(GetStorageSummaryRequest) returns (GetStorageSummaryResponse);
+  // ADR 0016 Phase B explicit flush trigger
+  // (POST /api/admin/sessions/:id/flush-now).
+  rpc FlushSession(FlushSessionRequest) returns (FlushSessionResponse);
+  // ADR 0018 async evacuation (POST /api/admin/sessions/:id/evacuate).
+  rpc EvacuateSession(EvacuateSessionRequest) returns (EvacuateSessionResponse);
+  // The three GC sweeps (ADR 0016 Phase C / ADR 0035 §5 / ADR 0028
+  // addendum). Each folds today's paired /dry-run + /sweep routes into
+  // one RPC discriminated by `dry_run`.
+  rpc ChunkGc(ChunkGcRequest) returns (ChunkGcResponse);
+  rpc BundleGc(BundleGcRequest) returns (BundleGcResponse);
+  rpc SnapshotBlobGc(SnapshotBlobGcRequest) returns (SnapshotBlobGcResponse);
+}
+
+message ListHostsRequest {}
+
+message ListHostsResponse {
+  repeated HostView hosts = 1;
+}
+
+// Mirrors api/hosts.rs HostView — a Postgres host row merged with live
+// in-memory scheduler state. Capacity/utilization prefer the persisted
+// row (replica-consistent, written on every heartbeat).
+message HostView {
+  string id = 1;
+  string hostname = 2;
+  // engram_core HostStatus, as_str: "ready" | "draining" | "dead".
+  string status = 3;
+  uint64 capacity_total_mib = 4;
+  uint64 capacity_used_mib = 5;
+  uint32 running_sandboxes = 6;
+  // Live-only (not persisted) — reads 0 on a coord replica that hasn't
+  // received this host's heartbeat.
+  uint64 local_snapshots = 7;
+  // ADR 0015 M5: count of images this host has fully prefetched.
+  // Live-only, like local_snapshots. RUST-WIRE-ONLY: absent from the TS
+  // mirror (web/src/types.ts HostView) — Rust is the wire truth.
+  uint64 ready_images = 8;
+  // Manifest digests of the prefetched images, sorted for deterministic
+  // output. RUST-WIRE-ONLY, same note as ready_images.
+  repeated string ready_image_digests = 9;
+  // Observed utilization from the latest heartbeat — disk/mem in MiB,
+  // cpu as a 0–100 percentage. 0 until the host's first heartbeat after
+  // the migration; rendered as an empty bar.
+  uint64 util_disk_total_mib = 10;
+  uint64 util_disk_used_mib = 11;
+  uint64 util_mem_total_mib = 12;
+  uint64 util_mem_used_mib = 13;
+  float util_cpu_pct = 14;
+  // ISO-8601. Always present — the Rust field is a non-optional
+  // DateTime<Utc>, stamped Utc::now() at registration
+  // (api/host_http.rs) and refreshed on every heartbeat. A
+  // never-heartbeated host still carries its registration stamp.
+  string last_heartbeat_at = 15;
+}
+
+message GetHostRequest {
+  string host_id = 1;
+}
+
+// Today's HTTP route returns the bare HostView; wrapped here per the
+// entity-wrapping convention.
+message GetHostResponse {
+  HostView host = 1;
+}
+
+message GetHostCowStateRequest {
+  string host_id = 1;
+}
+
+// Mirrors api/hosts.rs HostCowStateResponse. `CowStateView` is the
+// shared diagnostic row from session.proto.
+message GetHostCowStateResponse {
+  string host_id = 1;
+  // One entry per chunk-tracked sandbox on this host. Sandboxes without
+  // a chunk view (Process backend, VZ-without-NBD) are omitted by the
+  // host-agent — they don't appear here either.
+  repeated CowStateView sessions = 2;
+}
+
+message DrainHostRequest {
+  string host_id = 1;
+}
+
+// Today's HTTP handler returns 204 No Content — there is no body to
+// mirror.
+message DrainHostResponse {}
+
+message AdminDrainHostRequest {
+  string host_id = 1;
+}
+
+// Mirrors api/admin.rs DrainHostResponse (renamed: this RPC carries the
+// admin cordon+evacuate semantics; the soft status flip above keeps the
+// plain DrainHost name). HTTP returns 202 — the evac_resumer scanner is
+// the actual deliverable.
+message AdminDrainHostResponse {
+  string host_id = 1;
+  // Session ids now marked Evacuating; the scanner resumes each on a
+  // peer host within its sweep interval.
+  repeated string evacuating = 2;
+  repeated DrainFailure failures = 3;
+}
+
+message DrainFailure {
+  string session_id = 1;
+  // Human-readable diagnostic; not machine-parsed, not stable.
+  string error = 2;
+}
+
+message CordonHostRequest {
+  string host_id = 1;
+}
+
+message CordonHostResponse {
+  string host_id = 1;
+  // Always "draining" on success (api/admin.rs CordonResponse).
+  string status = 2;
+}
+
+message UncordonHostRequest {
+  string host_id = 1;
+}
+
+// Same Rust type as CordonHostResponse (CordonResponse); a distinct
+// proto type per RPC_REQUEST_RESPONSE_UNIQUE.
+message UncordonHostResponse {
+  string host_id = 1;
+  // Always "ready" on success.
+  string status = 2;
+}
+
+message GetStorageSummaryRequest {}
+
+// Mirrors api/storage.rs StorageSummaryResponse (ADR 0029): fleet-wide
+// COW/chunk rollups + the per-sandbox durability ledger. "chunks
+// stored" and "dedup ratio" are intentionally absent — each would need
+// an O(objects) blob-store walk on a polled endpoint.
+message GetStorageSummaryResponse {
+  // `snapshots` row count (Postgres).
+  uint64 snapshots = 1;
+  // Sum of snapshots.size_bytes (Postgres).
+  uint64 snapshot_bytes = 2;
+  // Chunks parked in chunk_gc_candidates awaiting their grace window.
+  uint64 gc_pending = 3;
+  // Number of chunk-tracked sandboxes across the fleet (ledger length).
+  uint64 tracked_sandboxes = 4;
+  // Sum of dirty chunks across the ledger.
+  uint64 dirty_chunks = 5;
+  // Sum of dirty (unflushed) bytes across the ledger.
+  uint64 unflushed_bytes = 6;
+  // Mean base-chunk locality (%) over sandboxes that reference any base
+  // chunks. 0 when nothing is tracked yet.
+  uint32 avg_locality_pct = 7;
+  repeated DurabilityRow rows = 8;
+}
+
+// One per-sandbox row of the durability ledger.
+message DurabilityRow {
+  string sandbox_id = 1;
+  // Unset when the sandbox→session join failed or lagged.
+  optional string session_id = 2;
+  string host_id = 3;
+  // Dirty chunks resident in host RAM, not yet flushed to BlobStorage.
+  uint32 dirty_chunks = 4;
+  uint64 dirty_bytes = 5;
+  // Total chunks the live disk manifest references.
+  uint32 base_chunks = 6;
+  // Of base_chunks, how many are resident on the host's NVMe cache.
+  uint32 base_chunks_local = 7;
+  // ISO-8601 of the last successful flush; unset = never flushed.
+  optional string last_flush_at = 8;
+}
+
+message FlushSessionRequest {
+  string session_id = 1;
+}
+
+// Mirrors api/admin.rs FlushNowResult.
+message FlushSessionResponse {
+  // FlushNowOutcome, snake_case: "applied" (host drained dirty chunks
+  // and coord wrote the new manifest_ref) | "idle" (nothing dirty / not
+  // chunk-tracked; no PG write) | "stale" (host flushed but coord's
+  // UPDATE was guarded out — sandbox_id drifted between flush and
+  // publish).
+  string outcome = 1;
+  // New manifest version coord persisted. Unset on "idle"/"stale".
+  optional uint64 manifest_version = 2;
+}
+
+message EvacuateSessionRequest {
+  string session_id = 1;
+  // Reserved for a future operator override; carried on today's HTTP
+  // body (api/admin.rs EvacuateSessionRequest.target_host) but IGNORED
+  // by the handler — the scanner picks any non-source host via the
+  // standard policy.
+  optional string target_host = 2;
+}
+
+// Mirrors api/admin.rs EvacuateSessionResponse. HTTP returns 202; the
+// evac_resumer scanner completes the transition.
+message EvacuateSessionResponse {
+  string session_id = 1;
+  // Always "evacuating" on success — the session is paused,
+  // snapshotted, and the scanner will resume it on a peer within the
+  // next sweep interval (≤10s default). Watch the session's event
+  // stream for the Evacuating → Created → Active chain.
+  string status = 2;
+}
+
+message ChunkGcRequest {
+  // true = classify + count only, no writes (today's /dry-run route);
+  // false = full pipeline with candidate upserts + promote-pass deletes
+  // (today's /sweep route).
+  //
+  // WARNING — proto3 footgun: an UNSET dry_run is indistinguishable
+  // from false, and false means a LIVE SWEEP WITH DELETIONS. Today's
+  // HTTP makes the choice explicit via separate /dry-run and /sweep
+  // routes; this RPC does not. Callers MUST set dry_run deliberately
+  // on every call. The surface is admin-gated at the orchestrator,
+  // which bounds — but does not remove — the risk.
+  bool dry_run = 1;
+  // Override the grace period (seconds) for this sweep only. Tests use
+  // 0 so candidates promote immediately; operators typically leave
+  // unset and trust the configured default.
+  optional uint64 grace_secs = 2;
+}
+
+// Mirrors api/admin.rs ChunkGcSweepResult.
+message ChunkGcResponse {
+  // Chunks list_prefix returned under chunks/sha256/.
+  uint64 listed_chunks = 1;
+  // Subset of listed_chunks whose parse-back to ChunkHash failed
+  // (stray non-chunk keys; diagnostic).
+  uint64 malformed_keys = 2;
+  uint64 pin_set_size = 3;
+  // Unpinned chunks observed. In full mode each was upserted as a
+  // candidate; in dry-run this is what WOULD be marked.
+  uint64 candidates_marked = 4;
+  // Sweep iterations inside this call; >1 means the chunk_generation
+  // barrier triggered restarts.
+  uint32 restart_count = 5;
+  // The sweep hit max_restart_attempts and accepted the partial result.
+  bool restart_budget_exhausted = 6;
+  // Promote-pass deletions (BlobStorage + candidate table). Always 0 in
+  // dry-run.
+  uint64 promoted_deletes = 7;
+  uint64 promote_delete_errors = 8;
+  // Echoes the grace_secs used (override or config default).
+  uint64 grace_secs = 9;
+}
+
+message BundleGcRequest {
+  // See ChunkGcRequest — same dry-run/full split, and the same WARNING:
+  // unset/false = LIVE SWEEP with deletions. Set deliberately.
+  bool dry_run = 1;
+  optional uint64 grace_secs = 2;
+}
+
+// Mirrors bundle_gc.rs BundleSweepReport (ADR 0035 §5). Unlike the
+// chunk sweep it does not echo grace_secs and has no malformed /
+// restart_budget_exhausted counters — Rust is the wire truth.
+message BundleGcResponse {
+  uint64 listed = 1;
+  uint64 pin_set_size = 2;
+  uint64 candidates_marked = 3;
+  // Always 0 in dry-run.
+  uint64 promoted_deletes = 4;
+  uint64 promote_delete_errors = 5;
+  uint32 restart_count = 6;
+}
+
+message SnapshotBlobGcRequest {
+  // See ChunkGcRequest — same dry-run/full split, and the same WARNING:
+  // unset/false = LIVE SWEEP with deletions. Set deliberately.
+  bool dry_run = 1;
+  optional uint64 grace_secs = 2;
+}
+
+// Mirrors snapshot_blob_gc.rs SnapshotBlobSweepReport (ADR 0028
+// addendum).
+message SnapshotBlobGcResponse {
+  uint64 listed = 1;
+  // Keys under snapshots/ that don't match the <id>/<suffix> layout —
+  // counted, never touched.
+  uint64 malformed = 2;
+  uint64 pin_set_size = 3;
+  uint64 candidates_marked = 4;
+  // Always 0 in dry-run.
+  uint64 promoted_deletes = 5;
+  // Candidates re-pinned between marking and promotion — cleared from
+  // the table, blobs kept.
+  uint64 promote_repinned_skips = 6;
+  uint64 promote_delete_errors = 7;
+  uint32 restart_count = 8;
+}

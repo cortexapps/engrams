@@ -1,0 +1,29 @@
+# TS codegen for the ADR 0051 app contract (`just gen-proto`).
+#
+# Only `engram/app/**` is generated for TS — host_service.proto is the
+# coord↔host transport (tonic via crates/engram-protocol/build.rs) and
+# never reaches the web/orchestrator tier. The `paths` filter values are
+# cwd-relative and must include the input-directory prefix (buf v2
+# semantics). The app dir lands with Tasks 4-5; until then `buf
+# generate` produces no output (the CI drift check guards on the dir
+# existing).
+version: v2
+# Wipe the `out` dirs before generating so deleted/renamed protos don't
+# leave stale bindings behind for the drift check to miss.
+clean: true
+inputs:
+  - directory: crates/engram-protocol/proto
+    paths:
+      - crates/engram-protocol/proto/engram/app # TS needs only the app contract
+# Asymmetry is deliberate: query-es (TanStack Query hooks) is web-only —
+# the orchestrator is a server and needs plain messages/clients only.
+plugins:
+  - remote: buf.build/bufbuild/es:v2.2.5
+    out: web/src/gen
+    opt: target=ts
+  - remote: buf.build/bufbuild/es:v2.2.5
+    out: orchestrator/src/gen
+    opt: target=ts
+  - remote: buf.build/connectrpc/query-es:v2.1.0
+    out: web/src/gen
+    opt: target=ts

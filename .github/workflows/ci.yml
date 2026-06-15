@@ -454,6 +454,58 @@ jobs:
       - name: pnpm test (vitest)
         run: pnpm test
 
+  # ADR 0051 §7: buf owns crates/engram-protocol/proto. Lint gates style
+  # (legacy host_service.proto carries scoped exceptions in buf.yaml;
+  # everything new must be clean under full STANDARD); breaking gates wire
+  # compatibility against the PR base. Codegen-drift activates only once
+  # the generated TS bindings are committed (ADR 0051 Tasks 4-5) — until
+  # then this PR ships only the contract + Rust stubs.
+  buf:
+    name: buf (proto lint + breaking + codegen drift)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: bufbuild/buf-action@v1
+        with:
+          # Pin to the locally-verified buf CLI; bump deliberately. A new
+          # buf release can surface new lint rules (1.69.0 added
+          # ENUM_VALUE_PREFIX / ENUM_ZERO_VALUE_SUFFIX to STANDARD's
+          # findings on host_service.proto).
+          version: 1.69.0
+          input: crates/engram-protocol/proto
+          # host_service.proto predates `buf format`; don't gate on
+          # formatting (the action runs it by default on PRs).
+          format: false
+          # lint defaults to PR-events only — force it on so push-to-main
+          # + merge_group keep the gate. (breaking stays PR-only, vs base.)
+          lint: true
+          # The action's push step publishes to the BSR by default on push
+          # events — we don't use the BSR.
+          push: false
+          archive: false
+          # This workflow runs with `contents: read` only; the action's
+          # PR-comment step needs `pull-requests: write`.
+          pr_comment: false
+      # TS codegen drift check. Guarded on the committed output dir so it
+      # stays inert in this PR (protos + Rust stubs only) and activates
+      # once web/src/gen lands with the connect-es deps (ADR 0051 Task 4).
+      - name: Codegen drift check (buf generate)
+        run: |
+          if [ -d web/src/gen/engram/app ]; then
+            buf generate
+            # Assert porcelain-clean rather than `git diff --exit-code`:
+            # plain diff misses UNTRACKED new bindings, and `add -N` would
+            # stage (and so hide) DELETIONS that `clean: true` performs on
+            # proto removals — porcelain catches edits, adds, and deletes.
+            if [ -n "$(git status --porcelain -- web/src/gen orchestrator/src/gen)" ]; then
+              git status --porcelain -- web/src/gen orchestrator/src/gen
+              echo "generated bindings drifted — run 'just gen-proto' and commit the result"
+              exit 1
+            fi
+          else
+            echo "generated bindings not committed yet (ADR 0051 Tasks 4-5) — skipping codegen drift check"
+          fi
+
   test-firecracker:
     name: tests (firecracker, Linux + KVM)
     # Blacksmith exposes `/dev/kvm` via nested virtualization (see

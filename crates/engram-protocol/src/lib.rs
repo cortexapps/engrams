@@ -15,6 +15,7 @@
 //! payload shapes remain.
 
 pub mod admin;
+pub mod app;
 pub mod grpc;
 pub mod grpc_client;
 pub mod grpc_pool;
