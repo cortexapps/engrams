@@ -19,8 +19,8 @@
     {
       "idx": 2,
       "version": "7",
-      "when": 1781536473698,
-      "tag": "0002_harness_token",
+      "when": 1781545555595,
+      "tag": "0002_user_session_secrets",
       "breakpoints": true
     }
   ]
