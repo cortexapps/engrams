@@ -1611,12 +1611,19 @@ jobs:
       # this job was issued (the `permissions: packages: read` block
       # at the top of this job is what makes it pullable). Pipe via
       # --password-stdin so the token never lands in argv / ps.
+      #
+      # ADR 0051 Drip E: the CLI now drives the coord over app-gRPC (the
+      # REST surface is gone). ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKENS
+      # match the Tiltfile's coord_env (same endpoint + bearer the e2e tests
+      # use, 127.0.0.1:50061 + dev-app-grpc-token); the CLI normalizes the
+      # scheme-less addr and sends the first token as the bearer.
       - name: Seed GHCR credential in coord PG
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENGRAM_APP_GRPC_ADDR: http://127.0.0.1:50061
+          ENGRAM_APP_GRPC_TOKENS: dev-app-grpc-token
         run: |
           printf '%s' "$GHCR_TOKEN" | ./target/release/engram-cli \
-              --endpoint http://localhost:8090 \
               registry add \
               --host ghcr.io \
               --username "${{ github.actor }}" \
