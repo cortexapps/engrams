@@ -108,6 +108,23 @@ import { auth } from "./better-auth.ts";
 import { config } from "../config.ts";
 
 // ---------------------------------------------------------------------------
+// Public (unauthenticated) paths
+// ---------------------------------------------------------------------------
+
+/**
+ * Paths the bridge lets through WITHOUT any IAP/session check — matched
+ * exactly against the path component (query string stripped).
+ *
+ * Why: kubelet readiness probes and GCP LB health checks hit the orchestrator
+ * directly, bypassing IAP, so they carry no X-Goog-IAP-JWT-Assertion. With
+ * IAP_AUDIENCE set the bridge fails closed (401), which would mark the pod /
+ * backend perpetually unhealthy. /healthz only reports {ok, db}, so it is
+ * unauthenticated by design. Add new probe/observability paths (e.g. /readyz,
+ * /metrics) here rather than scattering inline checks.
+ */
+const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/healthz"]);
+
+// ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
 
@@ -323,15 +340,13 @@ export async function iapBridge(
   res: ServerResponse,
   next: BridgeNext,
 ): Promise<void> {
-  // HEALTH-CHECK EXEMPTION (resolves the deploy landmine in the module header):
-  // kubelet probes and GCP LB health checks hit the orchestrator directly,
-  // bypassing IAP, so they carry NO X-Goog-IAP-JWT-Assertion. With IAP_AUDIENCE
-  // set the fail-closed path below would 401 every probe → the pod never goes
-  // Ready and the backend is marked unhealthy. /healthz is unauthenticated by
-  // design (it only reports {ok, db}), so let it through before any IAP logic.
-  // Checked even when IAP is inert so the path is identical in dev and prod.
+  // PUBLIC-PATH EXEMPTION (resolves the deploy landmine in the module header):
+  // health/readiness probes bypass IAP and carry no assertion, so the
+  // fail-closed path below would 401 them → the pod never goes Ready. Let the
+  // allowlist through before any IAP logic. Checked even when IAP is inert so
+  // the path is identical in dev and prod. See PUBLIC_PATHS for the rationale.
   const path = (req.url ?? "/").split("?", 1)[0];
-  if (path === "/healthz") {
+  if (PUBLIC_PATHS.has(path)) {
     next();
     return;
   }
