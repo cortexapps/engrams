@@ -15,10 +15,11 @@
  *
  * ## Inert posture (dev / local)
  *
- * DEPLOY LANDMINE (resolve before any IAP prod deploy): GCP load-balancer
- * HEALTH CHECKS bypass IAP and carry no assertion — with IAP_AUDIENCE set,
- * /healthz would 401 and the backend gets marked unhealthy. The deploy needs
- * a health-check path exemption in this bridge (or LB-level config) first.
+ * HEALTH-CHECK EXEMPTION (resolved): GCP load-balancer health checks AND
+ * kubelet readiness probes bypass IAP and carry no assertion — with
+ * IAP_AUDIENCE set, /healthz would 401 and the backend/pod is marked
+ * unhealthy. `iapBridge` now short-circuits `/healthz` before any IAP logic
+ * (see the top of the function), so probes always reach the health route.
  *
  * When `IAP_AUDIENCE` is unset the bridge is fully inert — it returns
  * immediately without touching headers, allocating memory, or reading env.
@@ -322,6 +323,19 @@ export async function iapBridge(
   res: ServerResponse,
   next: BridgeNext,
 ): Promise<void> {
+  // HEALTH-CHECK EXEMPTION (resolves the deploy landmine in the module header):
+  // kubelet probes and GCP LB health checks hit the orchestrator directly,
+  // bypassing IAP, so they carry NO X-Goog-IAP-JWT-Assertion. With IAP_AUDIENCE
+  // set the fail-closed path below would 401 every probe → the pod never goes
+  // Ready and the backend is marked unhealthy. /healthz is unauthenticated by
+  // design (it only reports {ok, db}), so let it through before any IAP logic.
+  // Checked even when IAP is inert so the path is identical in dev and prod.
+  const path = (req.url ?? "/").split("?", 1)[0];
+  if (path === "/healthz") {
+    next();
+    return;
+  }
+
   // INERT PATH: IAP_AUDIENCE unset → bridge is fully off.
   if (!config.iapAudience) {
     next();
