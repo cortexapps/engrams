@@ -1,0 +1,69 @@
+{{- if and .Values.orchestrator.enabled .Values.orchestrator.migrations.enabled -}}
+# ADR 0051: apply the orchestrator's drizzle migrations (orchestrator/drizzle/)
+# to its OWN database (ORCHESTRATOR_DATABASE_URL — SEPARATE from the
+# coordinator's DB) BEFORE the Deployment rolls. Runs `bunx drizzle-kit migrate`
+# against drizzle.config.ts (which reads ORCHESTRATOR_DATABASE_URL). drizzle-kit
+# is a devDependency dropped by the image's `--production` install, so `bunx`
+# fetches it on demand inside the Job.
+#
+# Helm pre-install + pre-upgrade hook: it runs and must succeed before the
+# release's other resources apply, so the new orchestrator never serves against
+# an un-migrated schema. before-hook-creation deletes the prior Job so a repeat
+# upgrade doesn't collide on the immutable Job name.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "engram.orchestrator.fullname" . }}-migrate
+  labels:
+    {{- include "engram.orchestrator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.orchestrator.migrations.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "engram.orchestrator.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000           # `bun` user in the oven/bun image
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: "{{ .Values.orchestrator.image.repository }}:{{ .Values.orchestrator.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.orchestrator.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          workingDir: /app/orchestrator
+          command: ["bunx", "drizzle-kit", "migrate"]
+          env:
+            - name: ORCHESTRATOR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.databaseSecret.existingSecret }}
+                  key: {{ .Values.orchestrator.databaseSecret.urlKey }}
+            # bunx writes its on-demand drizzle-kit install under $HOME; the
+            # image FS is owned by root, so point HOME + caches at a writable
+            # emptyDir.
+            - name: HOME
+              value: /tmp
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end -}}

@@ -1,0 +1,40 @@
+{{- if and .Values.orchestrator.enabled .Values.orchestrator.ingress.enabled -}}
+# Optional public Ingress fronting the orchestrator Service. On GCP this
+# becomes a Google HTTPS LB; the IAP integration is via the
+# `cloud.google.com/backend-config` annotation on the orchestrator Service
+# (set in the values overlay) — there is no IAP-specific field on the Ingress
+# itself. Off by default: the inert ADR-0051 deploy needs no public reach.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "engram.orchestrator.fullname" . }}
+  labels:
+    {{- include "engram.orchestrator.labels" . | nindent 4 }}
+  {{- with .Values.orchestrator.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.orchestrator.ingress.className }}
+  ingressClassName: {{ .Values.orchestrator.ingress.className }}
+  {{- end }}
+  {{- with .Values.orchestrator.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.orchestrator.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ include "engram.orchestrator.fullname" $ }}
+                port:
+                  name: http
+          {{- end }}
+    {{- end }}
+{{- end -}}

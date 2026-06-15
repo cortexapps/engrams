@@ -375,3 +375,143 @@ web:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+# ─── orchestrator (ADR 0051) ──────────────────────────────────────
+#
+# The Bun + Hono orchestrator: per-user authz + a native task model in
+# FRONT of the Rust coordinator. INERT by default (`enabled: false`) —
+# this chart can deploy it with NO production traffic (the web still
+# points at the coordinator directly until a later drip). When enabled it
+# runs as its own Deployment + Service (+ optional Ingress) and talks to
+# the coordinator over gRPC/HTTP in-cluster.
+#
+# Env contract (orchestrator/src/config.ts). The orchestrator FAILS CLOSED
+# without the three REQUIRED vars, all sourced from a K8s Secret:
+#   ORCHESTRATOR_DATABASE_URL  — its OWN Postgres (a SEPARATE database from
+#                                the coordinator's; see databaseSecret below)
+#   CONTROL_PLANE_BEARER       — the coordinator app-gRPC bearer token
+#   BETTER_AUTH_SECRET         — better-auth cookie/token signing key
+orchestrator:
+  enabled: false
+
+  replicaCount: 2
+
+  image:
+    repository: ghcr.io/cortexapps/engram-orchestrator
+    tag: ""           # falls back to .Chart.AppVersion when unset
+    pullPolicy: IfNotPresent
+
+  # ORCHESTRATOR_PORT — the Bun server binds 0.0.0.0:containerPort. The
+  # orchestrator Service maps its `port` to this. Default mirrors config.ts.
+  containerPort: 8787
+
+  # ORCHESTRATOR_PUBLIC_URL — the externally-reachable base URL. Used by
+  # better-auth as `baseURL` (the session-cookie domain + the OIDC redirect
+  # callback `${publicUrl}/api/auth/oauth2/callback/<provider>`). MUST be the
+  # public https URL in any OIDC deploy, or the IdP redirect lands nowhere.
+  publicUrl: ""
+
+  # TRUSTED_ORIGINS — comma-joined here from this list; better-auth CORS /
+  # CSRF origin allowlist (the browser origins that may call the API).
+  trustedOrigins: []
+  # - https://orchestrator.example.com
+
+  # CONTROL_PLANE_{GRPC,HTTP}_URL — where the orchestrator dials the Rust
+  # coordinator. Default to the in-cluster coord Service; override only for an
+  # out-of-cluster control plane. Leave empty to auto-derive from the coord
+  # component's Service (grpc → service.port, http → service.port).
+  controlPlane:
+    grpcUrl: ""    # e.g. http://<release>-coordinator:8080
+    httpUrl: ""    # e.g. http://<release>-coordinator:8080
+
+  # The three REQUIRED env vars come from ONE Secret (keys below). The chart
+  # never inlines them. `databaseSecret.url` MUST point at a SEPARATE database
+  # (`engram_orchestrator`), NOT the coordinator's DB — the orchestrator owns
+  # its own schema (drizzle migrations under orchestrator/drizzle/).
+  databaseSecret:
+    existingSecret: engram-orchestrator-secrets
+    urlKey: ORCHESTRATOR_DATABASE_URL
+    bearerKey: CONTROL_PLANE_BEARER
+    authSecretKey: BETTER_AUTH_SECRET
+
+  # Drizzle migrations (orchestrator/drizzle/) MUST be applied to the
+  # orchestrator's database before/at deploy. We run them as a pre-install /
+  # pre-upgrade Helm Job (mirrors chart conventions: hooks, weights) that
+  # invokes `bunx drizzle-kit migrate` with ORCHESTRATOR_DATABASE_URL wired
+  # from the same Secret. Disable if you apply migrations out-of-band.
+  migrations:
+    enabled: true
+    # Job backoff before it's marked Failed (and the install/upgrade aborts).
+    backoffLimit: 3
+
+  # Human auth mode is DEPLOY-SELECTABLE, mirroring the old coordinator
+  # `auth.mode` / `oidc.*` knobs. The orchestrator supports three doors and
+  # the modes COMPOSE (config.ts): email+password is always on unless you put
+  # IAP in front; IAP and OIDC each activate only when their block is set.
+  # Env entries are emitted ONLY when the corresponding value is non-empty, so
+  # an unset block leaves that auth path fully inert.
+  #
+  #   email+password  → set NOTHING here (dev / simple deploys)
+  #   IAP             → set auth.iap.audience (GCP IAP in front of the Ingress)
+  #   OIDC            → set auth.oidc.{issuer,clientId,clientSecret} ("Sign in
+  #                     with your IdP"; yields real user names via the `profile`
+  #                     scope, which stock GCP IAP can't supply)
+  auth:
+    # IAP — GCP Identity-Aware Proxy bridge. Set `audience` to enable; the
+    # bridge is fully inert (zero header reads) when empty.
+    iap:
+      audience: ""    # /projects/<PROJECT_NUMBER>/apps/<APP_ID> (or backendServices form)
+      # Override the IAP JWKS endpoint (default in config.ts points at gstatic).
+      # Leave empty in prod.
+      jwksUrl: ""
+    # OIDC — env-driven generic OIDC provider (better-auth genericOAuth).
+    # Setting `issuer` enables it; clientId + clientSecret then become REQUIRED
+    # (partial config is a hard boot error in config.ts). The client secret
+    # comes from a Secret, never inlined.
+    oidc:
+      issuer: ""
+      clientId: ""
+      clientSecret:
+        existingSecret: ""
+        secretKey: ORCHESTRATOR_OIDC_CLIENT_SECRET
+      # Stable provider id used in the sign-in call + the callback path
+      # (`${publicUrl}/api/auth/oauth2/callback/<providerId>`). Default "sso".
+      providerId: ""
+      # Requested scopes; `profile` pulls the display name. Default in config.ts
+      # is "openid email profile". Join with spaces here.
+      scopes: ""    # e.g. "openid email profile"
+
+  service:
+    type: ClusterIP
+    port: 80
+    annotations: {}
+
+  ingress:
+    # Optional public surface for the orchestrator (the browser-native HTTP/WS
+    # legs + the auth callback). Off by default — the inert deploy needs no
+    # public reach. On GCP this provisions a Google HTTPS LB; pair with a
+    # managed cert + (for IAP) a BackendConfig pointer on `service.annotations`.
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    # - host: orchestrator.example.com
+    #   paths:
+    #     - path: /
+    #       pathType: Prefix
+    tls: []
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+  podLabels: {}
+  podAnnotations: {}
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
