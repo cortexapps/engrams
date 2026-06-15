@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { subscribeSession } from "../sse";
-import type { IndexedEvent } from "../types";
+import type { IndexedEvent } from "../lib/types";
 
 export interface UseSessionEventsOptions {
   /** Cap on retained events (most-recent first). Defaults to unlimited. */

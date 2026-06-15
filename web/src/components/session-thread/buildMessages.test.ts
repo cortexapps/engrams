@@ -5,7 +5,7 @@
 
 import { describe, expect, test } from "vitest";
 import { buildMessages, SHELL_TOOL, type RunFooter, type SystemMarker } from "./buildMessages";
-import type { IndexedEvent, SessionEvent } from "../../types";
+import type { IndexedEvent, SessionEvent } from "../../lib/types";
 
 const AT = "2026-06-02T12:00:00.000Z";
 const AT2 = "2026-06-02T12:00:18.000Z";

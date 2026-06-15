@@ -3,7 +3,28 @@ import { useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
-import { saveClaudeToken } from "../../api";
+import { API_BASE } from "../../lib/base";
+
+// ADR 0039 Task 28: POST/DELETE /api/v1/me/claude-token now routes to the
+// orchestrator (not the coordinator). Inline the thin fetch rather than
+// importing the deleted api.ts helpers.
+async function saveClaudeToken(token: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/me/claude-token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ token }),
+  });
+  if (!res.ok) throw new Error(`/me/claude-token POST → ${res.status}`);
+}
+
+async function deleteClaudeToken(): Promise<void> {
+  const res = await fetch(`${API_BASE}/me/claude-token`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error(`/me/claude-token DELETE → ${res.status}`);
+}
 import { useAuth } from "../../auth/AuthProvider";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";
@@ -22,6 +43,14 @@ export function TokensPanel() {
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
   const saved = principal.has_claude_token;
+
+  const remove = useMutation({
+    mutationFn: deleteClaudeToken,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["me"] });
+      refresh();
+    },
+  });
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -49,13 +78,25 @@ export function TokensPanel() {
               }}
             />
           ) : (
-            <Button
-              size="sm"
-              variant={saved ? "outline" : "default"}
-              onClick={() => setEditing(true)}
-            >
-              {saved ? "Replace" : "Add token"}
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                variant={saved ? "outline" : "default"}
+                onClick={() => setEditing(true)}
+              >
+                {saved ? "Replace" : "Add token"}
+              </Button>
+              {saved && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => remove.mutate()}
+                  disabled={remove.isPending}
+                >
+                  {remove.isPending ? "Removing…" : "Remove"}
+                </Button>
+              )}
+            </div>
           )}
         </CardContent>
       </Card>

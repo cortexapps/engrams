@@ -29,6 +29,7 @@ export function TabRow<T extends string>({ tabs, active, onChange, right }: TabR
             <button
               key={t.id}
               type="button"
+              data-testid={`tab-${t.id}`}
               onClick={() => onChange(t.id)}
               className={cn(
                 textVariants({ variant: "label" }),

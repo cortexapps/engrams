@@ -1,12 +1,15 @@
 import { type ComponentProps, useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useMutation } from "@connectrpc/connect-query";
+import { createConnectQueryKey } from "@connectrpc/connect-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
-import { createSession } from "../api";
 import { useAuth } from "../auth/AuthProvider";
 import { useEnabledImages } from "../hooks/useEnabledImages";
+import { createSession } from "../gen/engram/app/v1/session-SessionService_connectquery";
+import { createTask, listTasks } from "../gen/engram/app/v1/task-TaskService_connectquery";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -38,6 +41,7 @@ export function NewSessionDialog({
   onCreated,
   variant,
   className,
+  triggerTestId,
   open: openProp,
   onOpenChange,
   showTrigger = true,
@@ -47,6 +51,10 @@ export function NewSessionDialog({
    * passes `secondary` + `w-full` so it reads quietly beside the active row. */
   variant?: ComponentProps<typeof Button>["variant"];
   className?: string;
+  /** Test id for the trigger button. Pass it from at most ONE mounted instance
+   * per page (the header actions today) — a second instance with the same id
+   * breaks strict-mode getByTestId when both render (e.g. empty list + header). */
+  triggerTestId?: string;
   /** Controlled open state. Omit for the self-contained trigger usage; pass it
    * (with `showTrigger={false}`) for the global, keyboard/palette-driven mount
    * in RootLayout. */
@@ -61,6 +69,13 @@ export function NewSessionDialog({
   const { principal } = useAuth();
   const qc = useQueryClient();
   const navigate = useNavigate();
+
+  // ADR 0039 Task 23: CreateTask (chat) replaces REST createSession for agent mode.
+  // ADR 0039 Task 28: dev_vm migrated to SessionService.CreateSession (connect-query
+  // passthrough) — the REST /api/v1/sessions route is no longer reachable from the
+  // browser after the proxy flip. The proto CreateSessionRequest maps imageUri+mode.
+  const createTaskMutation = useMutation(createTask);
+  const createSessionMutation = useMutation(createSession);
 
   const form = useForm<NewSessionValues>({
     resolver: zodResolver(newSessionSchema),
@@ -86,15 +101,43 @@ export function NewSessionDialog({
   const onSubmit = async (data: NewSessionValues) => {
     if (!selected) return;
     try {
-      const res = await createSession({
-        image: selected.image_uri,
-        mode: data.mode === "dev_vm" ? "dev_vm" : undefined,
-        prompt: promptMeaningful ? data.prompt.trim() || undefined : undefined,
-      });
-      qc.invalidateQueries({ queryKey: ["sessions"] });
-      setOpen(false);
-      form.reset();
-      onCreated(res.session_id);
+      if (data.mode === "dev_vm") {
+        // dev_vm via SessionService.CreateSession (connect-query passthrough).
+        // The proto CreateSessionRequest uses imageUri (camelCase) + mode string.
+        const res = await createSessionMutation.mutateAsync({
+          imageUri: selected.image_uri,
+          mode: "dev_vm",
+        });
+        qc.invalidateQueries({
+          queryKey: createConnectQueryKey({ schema: listTasks, cardinality: "finite" }),
+        });
+        setOpen(false);
+        form.reset();
+        onCreated(res.sessionId);
+      } else {
+        // agent mode → CreateTask(type:'chat')
+        const res = await createTaskMutation.mutateAsync({
+          type: "chat",
+          imageUri: selected.image_uri,
+          prompt: promptMeaningful && data.prompt.trim() ? data.prompt.trim() : undefined,
+        });
+        // Invalidate the tasks query so the list refreshes immediately.
+        qc.invalidateQueries({
+          queryKey: createConnectQueryKey({ schema: listTasks, cardinality: "finite" }),
+        });
+        // Navigate to the session the task's primary session ref created.
+        const sessionId = res.task?.sessions[0]?.sessionId;
+        if (sessionId) {
+          // Success: close the dialog and reset before handing off.
+          setOpen(false);
+          form.reset();
+          onCreated(sessionId);
+        } else {
+          // Defensive: task created but no session id returned — keep the
+          // dialog open so the error is visible to the user.
+          form.setError("root", { message: "Task created but no session id returned." });
+        }
+      }
     } catch (e) {
       form.setError("root", { message: e instanceof Error ? e.message : String(e) });
     }
@@ -104,7 +147,7 @@ export function NewSessionDialog({
     <Dialog open={open} onOpenChange={setOpen}>
       {showTrigger && (
         <DialogTrigger asChild>
-          <Button variant={variant} className={className}>
+          <Button data-testid={triggerTestId} variant={variant} className={className}>
             New session
           </Button>
         </DialogTrigger>
@@ -145,7 +188,7 @@ export function NewSessionDialog({
                   <Field>
                     <FieldLabel htmlFor={field.name}>Image</FieldLabel>
                     <Select value={field.value} onValueChange={field.onChange}>
-                      <SelectTrigger id={field.name}>
+                      <SelectTrigger id={field.name} data-testid="image-select">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -157,7 +200,13 @@ export function NewSessionDialog({
                         ))}
                       </SelectContent>
                     </Select>
-                    <FieldDescription>
+                    {/* data-harness carries the machine-readable harness state
+                        ("" = harness-less) so tests pin it structurally
+                        instead of coupling to the prose. */}
+                    <FieldDescription
+                      data-testid="image-harness-state"
+                      data-harness={harnessName ?? ""}
+                    >
                       {harnessName
                         ? `Baked harness: ${harnessName}`
                         : "No baked harness — shell-only image"}
@@ -225,7 +274,7 @@ export function NewSessionDialog({
                   Save your Claude token
                 </Button>
               ) : (
-                <Button type="submit" disabled={!canSubmit}>
+                <Button type="submit" data-testid="start-session" disabled={!canSubmit}>
                   {form.formState.isSubmitting ? "Starting…" : "Start"}
                 </Button>
               )}

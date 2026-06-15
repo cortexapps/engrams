@@ -3,7 +3,7 @@ import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { useSessionCheckpoints } from "../hooks/useCheckpoints";
 import { fmtAgo, fmtBytes } from "../format";
-import type { CheckpointSummary } from "../types";
+import type { CheckpointSummary } from "../lib/types";
 
 // ADR 0028 A.log / Fix A: the consolidated durability view for a
 // session — the recovery ladder made legible.

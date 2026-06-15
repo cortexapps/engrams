@@ -1,62 +1,55 @@
 // Regression tests for the AddRegistryForm payload contract.
 //
-// What this catches: silent drift in the JSON shape we POST to
-// /api/registries. The Rust HTTP smoke test
-// (crates/engram-coordinator/tests/registry_smoke.rs) validates that
-// the *server* accepts a given request, but it doesn't catch a UI
-// refactor that ships e.g. `password_hash` instead of `password`,
-// or `auth_kind` at the top level instead of nested under `auth`,
-// or that submits the impersonate_sa field with an empty string
-// instead of omitting it. The contract sits between the two
-// services; both ends need a regression pin.
+// These tests verify the RPC request shape sent to ImageService.AddRegistry
+// via connect-query. A refactor that ships `password_hash` instead of
+// `password`, or collapses the oneof into a flat field, would slip past
+// the Rust integration test. The contract sits between the two services;
+// both ends need a regression pin.
 //
-// This file is *not* a substitute for end-to-end tests; it
-// deliberately mocks fetch so we can assert on the call arguments
-// without booting the coordinator.
+// The tests supply a custom connect-query transport so we can capture
+// the exact proto-shaped request objects the component sends — no
+// mocking of `fetch` required.
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "../../test-utils";
 import { RegistriesPanel } from "./RegistriesPanel";
+import { ImageService } from "../../gen/engram/app/v1/image_pb";
+import type { AddRegistryRequest } from "../../gen/engram/app/v1/image_pb";
 
-// Helper: install a route-aware fetch stub.
-//   GET /api/registries   → empty list (so the panel renders without rows)
-//   POST /api/registries  → success, captured for assertions
-//   anything else         → 500 (test fails loudly)
-//
-// Returns the spy on `fetch` so tests can read the captured POST
-// body and headers.
-function installFetchMock(): ReturnType<typeof vi.spyOn> {
-  return vi
-    .spyOn(globalThis, "fetch")
-    .mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : (input as Request).url;
-      const method = init?.method ?? "GET";
-      if (url === "/api/v1/registries" && method === "GET") {
-        return new Response(JSON.stringify({ registries: [] }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      if (url === "/api/v1/registries" && method === "POST") {
-        return new Response(
-          JSON.stringify({
-            id: "00000000-0000-0000-0000-000000000000",
-            host: "gcr.io",
-            auth_kind: "static",
-            auth_principal: "_json_key",
-          }),
-          { status: 201, headers: { "content-type": "application/json" } },
-        );
-      }
-      throw new Error(`unexpected fetch in test: ${method} ${url}`);
+/** Build a transport that records AddRegistry calls.
+ * All other RPCs fall through to the default testTransport stubs. */
+function installCapturingTransport(): {
+  transport: ReturnType<typeof createRouterTransport>;
+  calls: AddRegistryRequest[];
+} {
+  const calls: AddRegistryRequest[] = [];
+  const transport = createRouterTransport((router) => {
+    // Capture AddRegistry calls; let everything else come from testTransport defaults.
+    router.service(ImageService, {
+      listRegistries: () => ({ registries: [] }),
+      addRegistry: (req: AddRegistryRequest) => {
+        calls.push(req);
+        return {
+          id: "00000000-0000-0000-0000-000000000000",
+          host: req.host,
+          authKind: "",
+          authPrincipal: undefined,
+        };
+      },
+      deleteRegistry: () => ({}),
+      listEnabledImages: () => ({ images: [] }),
+      enableImage: () => ({ job: undefined }),
+      disableImage: () => ({}),
+      refreshImage: () => ({ job: undefined }),
+      listEnableJobs: () => ({ jobs: [] }),
+      getEnableJob: () => ({ job: undefined }),
+      retryEnableJob: () => ({ job: undefined }),
     });
+  });
+  return { transport, calls };
 }
 
 /** Open the inline AddRegistryForm. The panel renders the trigger
@@ -70,26 +63,15 @@ async function openAddForm() {
   return user;
 }
 
-/** Pull the body off the most recent POST captured by `fetch`. */
-function lastPostBody(spy: ReturnType<typeof vi.spyOn>): unknown {
-  const posts = spy.mock.calls.filter(
-    ([, init]: [unknown, RequestInit | undefined]) => init?.method === "POST",
-  );
-  expect(posts.length, "expected at least one POST").toBeGreaterThan(0);
-  const body = (posts.at(-1)![1] as RequestInit).body;
-  expect(typeof body).toBe("string");
-  return JSON.parse(body as string);
-}
-
 describe("AddRegistryForm payload contract", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
   });
 
-  test('static auth: posts {host, auth: {kind: "static", username, password}}', async () => {
-    const fetchSpy = installFetchMock();
-    renderWithProviders(<RegistriesPanel />);
+  test('static auth: sends {host, auth: {case:"static", value:{username,password}}}', async () => {
+    const { transport, calls } = installCapturingTransport();
+    renderWithProviders(<RegistriesPanel />, { transport });
 
     const user = await openAddForm();
 
@@ -102,20 +84,17 @@ describe("AddRegistryForm payload contract", () => {
     await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     await waitFor(() => {
-      expect(lastPostBody(fetchSpy)).toEqual({
-        host: "gcr.io",
-        auth: {
-          kind: "static",
-          username: "_json_key",
-          password: "hunter2",
-        },
-      });
+      expect(calls.length).toBeGreaterThan(0);
     });
+    const req = calls.at(-1)!;
+    expect(req.host).toBe("gcr.io");
+    expect(req.auth.case).toBe("static");
+    expect(req.auth.value).toMatchObject({ username: "_json_key", password: "hunter2" });
   });
 
-  test('gcp workload identity (ambient): posts {auth: {kind: "gcp_workload_identity"}} with no impersonate field', async () => {
-    const fetchSpy = installFetchMock();
-    renderWithProviders(<RegistriesPanel />);
+  test('gcp workload identity (ambient): sends {auth: {case:"gcpWorkloadIdentity"}} with no impersonate_sa', async () => {
+    const { transport, calls } = installCapturingTransport();
+    renderWithProviders(<RegistriesPanel />, { transport });
 
     const user = await openAddForm();
     await user.type(screen.getByPlaceholderText("ghcr.io"), "us-east1-docker.pkg.dev");
@@ -132,50 +111,44 @@ describe("AddRegistryForm payload contract", () => {
     await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     await waitFor(() => {
-      // The shape under `auth` must be exactly `{kind: ...}` — NO
-      // impersonate_sa key (not even with an empty string), because
-      // the server's serde decoder treats missing as "ambient" and
-      // an empty string as a malformed input.
-      expect(lastPostBody(fetchSpy)).toEqual({
-        host: "us-east1-docker.pkg.dev",
-        auth: { kind: "gcp_workload_identity" },
-      });
+      expect(calls.length).toBeGreaterThan(0);
     });
+    const req = calls.at(-1)!;
+    expect(req.host).toBe("us-east1-docker.pkg.dev");
+    expect(req.auth.case).toBe("gcpWorkloadIdentity");
+    // Ambient: impersonateSa must be absent / undefined (not empty string).
+    const val = req.auth.value as { impersonateSa?: string } | undefined;
+    expect(val?.impersonateSa ?? undefined).toBeUndefined();
   });
 
-  test("gcp workload identity with impersonation: posts impersonate_sa verbatim", async () => {
-    const fetchSpy = installFetchMock();
-    renderWithProviders(<RegistriesPanel />);
+  test("gcp workload identity with impersonation: sends impersonateSa verbatim", async () => {
+    const { transport, calls } = installCapturingTransport();
+    renderWithProviders(<RegistriesPanel />, { transport });
 
     const user = await openAddForm();
     await user.type(screen.getByPlaceholderText("ghcr.io"), "us-east1-docker.pkg.dev");
     await user.click(screen.getByRole("radio", { name: /gcp workload identity/i }));
-    // The impersonate field belongs to the GCP-WI form fragment
-    // that AnimatePresence mounts after the static fragment exits.
-    // Use findBy* so the test waits for that transition instead of
-    // racing it.
     const impersonate = await screen.findByPlaceholderText(/engram@my-project/);
     await user.type(impersonate, "engram@cortex.iam.gserviceaccount.com");
 
     await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     await waitFor(() => {
-      expect(lastPostBody(fetchSpy)).toEqual({
-        host: "us-east1-docker.pkg.dev",
-        auth: {
-          kind: "gcp_workload_identity",
-          impersonate_sa: "engram@cortex.iam.gserviceaccount.com",
-        },
-      });
+      expect(calls.length).toBeGreaterThan(0);
     });
+    const req = calls.at(-1)!;
+    expect(req.host).toBe("us-east1-docker.pkg.dev");
+    expect(req.auth.case).toBe("gcpWorkloadIdentity");
+    const val = req.auth.value as { impersonateSa?: string } | undefined;
+    expect(val?.impersonateSa).toBe("engram@cortex.iam.gserviceaccount.com");
   });
 
-  test("static missing username: rejects locally, never POSTs", async () => {
-    // The form must validate before fetch — surfacing inline errors
+  test("static missing username: rejects locally, never calls AddRegistry", async () => {
+    // The form must validate before RPC — surfacing inline errors
     // is friendlier than waiting for the server's 400 + a generic
     // "Bad request" toast.
-    const fetchSpy = installFetchMock();
-    renderWithProviders(<RegistriesPanel />);
+    const { transport, calls } = installCapturingTransport();
+    renderWithProviders(<RegistriesPanel />, { transport });
 
     const user = await openAddForm();
     await user.type(screen.getByPlaceholderText("ghcr.io"), "gcr.io");
@@ -186,16 +159,13 @@ describe("AddRegistryForm payload contract", () => {
 
     // Inline error rendered.
     await screen.findByText(/username is required/i);
-    // No POST fired.
-    const posts = fetchSpy.mock.calls.filter(
-      ([, init]: [unknown, RequestInit | undefined]) => init?.method === "POST",
-    );
-    expect(posts).toHaveLength(0);
+    // No RPC fired.
+    expect(calls).toHaveLength(0);
   });
 
-  test("static missing password: rejects locally, never POSTs", async () => {
-    const fetchSpy = installFetchMock();
-    renderWithProviders(<RegistriesPanel />);
+  test("static missing password: rejects locally, never calls AddRegistry", async () => {
+    const { transport, calls } = installCapturingTransport();
+    renderWithProviders(<RegistriesPanel />, { transport });
 
     const user = await openAddForm();
     await user.type(screen.getByPlaceholderText("ghcr.io"), "gcr.io");
@@ -205,10 +175,7 @@ describe("AddRegistryForm payload contract", () => {
     await user.click(screen.getByRole("button", { name: /^register$/i }));
 
     await screen.findByText(/password is required/i);
-    const posts = fetchSpy.mock.calls.filter(
-      ([, init]: [unknown, RequestInit | undefined]) => init?.method === "POST",
-    );
-    expect(posts).toHaveLength(0);
+    expect(calls).toHaveLength(0);
   });
 
   test("aws instance role card is rendered but not selectable", async () => {
@@ -216,8 +183,8 @@ describe("AddRegistryForm payload contract", () => {
     // We render the row so users see the road map; we *must not*
     // let them select it (clicking would set authKind to a value
     // the server's CHECK constraint rejects).
-    installFetchMock();
-    renderWithProviders(<RegistriesPanel />);
+    const { transport } = installCapturingTransport();
+    renderWithProviders(<RegistriesPanel />, { transport });
     const user = await openAddForm();
 
     const card = screen.getByRole("radio", { name: /aws instance role/i });
