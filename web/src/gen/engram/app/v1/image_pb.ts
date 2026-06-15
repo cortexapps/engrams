@@ -690,7 +690,7 @@ export const DeleteRegistryResponseSchema: GenMessage<DeleteRegistryResponse> = 
   messageDesc(file_engram_app_v1_image, 25);
 
 /**
- * Image curation + registry credentials (ADR 0039 §2.3, rev
+ * Image curation + registry credentials (ADR 0051 §2.3, rev
  * 2026-06-10). The caller is a single trusted service (bearer-authed);
  * authz lives in the orchestrator.
  *

@@ -964,7 +964,7 @@ export const SnapshotBlobGcResponseSchema: GenMessage<SnapshotBlobGcResponse> = 
   messageDesc(file_engram_app_v1_fleet, 28);
 
 /**
- * Fleet, storage, and GC operations (ADR 0039 §2.3, rev 2026-06-10).
+ * Fleet, storage, and GC operations (ADR 0051 §2.3, rev 2026-06-10).
  * The caller is a single trusted service (bearer-authed); there is no
  * per-user anything here. Attribution and authz live in the orchestrator.
  *
