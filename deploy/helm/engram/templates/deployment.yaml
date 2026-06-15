@@ -108,6 +108,10 @@ spec:
             - name: metrics
               containerPort: 9090
               protocol: TCP
+            # ADR 0051: app-gRPC surface (orchestrator + engram-cli).
+            - name: app-grpc
+              containerPort: {{ .Values.appGrpc.port }}
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: {{ include "engram.coordinator.fullname" . }}-config
@@ -123,6 +127,23 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret }}
                   key: {{ .Values.auth.secretKey }}
+            {{- end }}
+            {{- /* ADR 0051: bind app-gRPC on all interfaces (coord default is
+                   loopback) so the orchestrator (cross-pod) + engram-cli
+                   (port-forward) reach it via the Service. Bearer-gated by
+                   ENGRAM_APP_GRPC_TOKENS, defaulting to the same Secret as the
+                   REST auth tokens so the two stay in sync (override via
+                   appGrpc.tokensSecret). Empty tokens => fail closed. */}}
+            - name: ENGRAM_APP_GRPC_ADDR
+              value: "0.0.0.0:{{ .Values.appGrpc.port }}"
+            {{- $agSecret := .Values.appGrpc.tokensSecret.existingSecret | default .Values.auth.existingSecret }}
+            {{- $agKey := .Values.appGrpc.tokensSecret.secretKey | default .Values.auth.secretKey }}
+            {{- if $agSecret }}
+            - name: ENGRAM_APP_GRPC_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $agSecret }}
+                  key: {{ $agKey }}
             {{- end }}
             {{- /* ADR 0031 human authentication. `auth.mode` selects the
                    verifier (oidc | forward-auth | none=synthetic-admin).
