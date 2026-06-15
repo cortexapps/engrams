@@ -24,6 +24,16 @@ lint:
       - host_service.proto
     RPC_RESPONSE_STANDARD_NAME:
       - host_service.proto
+# TEMPORARY (ADR 0051): relaxed FILE -> WIRE for the migration's structural
+# proto removals ONLY. Drip A deletes the unreleased SecretService +
+# CreateSession.harness_secret_id before anything consumed them — a FILE-category
+# break (file + field deletion) that the stricter gate rightly blocks. WIRE still
+# protects real binary wire-compat (field type/number reuse), which is the only
+# guarantee that matters for this internal, lockstep-deployed contract during the
+# migration. FILE is the intended permanent policy and is RESTORED by the final
+# PR in the ADR 0051 stack, once these removals have landed on main (that PR's
+# `buf breaking` then compares against a main that already lacks these protos, so
+# FILE passes with nothing to flag). Do NOT treat WIRE as the standing policy.
 breaking:
   use:
-    - FILE
+    - WIRE
