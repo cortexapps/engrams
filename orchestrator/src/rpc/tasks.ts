@@ -36,7 +36,7 @@
  *   DBOS; compensating delete failure is logged but not fatal).
  *
  * Injectable deps:
- *   sessions, tokens, db are injectable for tests. The real singletons are
+ *   sessions, secrets, db are injectable for tests. The real singletons are
  *   used by default. getSession (better-auth) is also injectable.
  */
 
@@ -58,10 +58,9 @@ import { task as taskTable, taskSession as taskSessionTable } from "../db/schema
 import * as schema from "../db/schema.ts";
 import { sessions as defaultSessions } from "../control-plane/client.ts";
 import {
-  makeHarnessTokenStore,
-  CLAUDE_OAUTH_ENV_VAR,
-  type HarnessTokenStore,
-} from "../db/harness-token.ts";
+  makeUserSecretStore,
+  type UserSecretStore,
+} from "../db/user-secrets.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -96,8 +95,8 @@ export type GetSession = (
 export interface TaskDeps {
   getSession?: GetSession;
   sessions?: SessionsClient;
-  /** Per-user harness token store (ADR 0051 Drip A). */
-  tokens?: HarnessTokenStore;
+  /** Per-user KEK-sealed session secret store (ADR 0051 Drip A). */
+  secrets?: UserSecretStore;
   db?: Db;
 }
 
@@ -297,10 +296,10 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
 
   const sessionsClient: SessionsClient = deps?.sessions ?? (defaultSessions as unknown as SessionsClient);
   const getDbFn = (): Db => deps?.db ?? getDb();
-  // The token store defaults to a Drizzle store over the same DB. Resolved
+  // The secret store defaults to a Drizzle store over the same DB. Resolved
   // lazily so importing this module does not require a DB at import time.
-  const resolveTokens = (): HarnessTokenStore =>
-    deps?.tokens ?? makeHarnessTokenStore(getDbFn());
+  const resolveSecrets = (): UserSecretStore =>
+    deps?.secrets ?? makeUserSecretStore(getDbFn());
 
   router.service(TaskService, {
     // -------------------------------------------------------------------------
@@ -319,19 +318,21 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw new ConnectError("forbidden", Code.PermissionDenied);
       }
 
-      // Resolve the caller's harness token from our OWN store (ADR 0051
-      // Drip A). When present it rides CreateSession.harness_env as
-      // { CLAUDE_CODE_OAUTH_TOKEN: <token> }; the coordinator injects + persists
-      // it for resume. A lookup failure is non-fatal — no-harness images, and
-      // users who never saved a token, work fine. NEVER log the token.
+      // Resolve ALL of the caller's session secrets from our OWN store (ADR
+      // 0051 Drip A), KEK-envelope sealed at rest. The whole map rides
+      // CreateSession.harness_env (today that's just
+      // { CLAUDE_CODE_OAUTH_TOKEN: <token> }, but it generalizes to any
+      // env-var-keyed secret); the coordinator injects + persists it for resume.
+      // A lookup failure is non-fatal — no-harness images, and users who never
+      // saved a secret, work fine. An empty map is omitted. NEVER log values.
       let harnessEnv: Record<string, string> | undefined;
       try {
-        const token = await resolveTokens().get(user.id);
-        harnessEnv = token ? { [CLAUDE_OAUTH_ENV_VAR]: token } : undefined;
-      } catch (tokenErr) {
+        const all = await resolveSecrets().getAll(user.id);
+        harnessEnv = Object.keys(all).length > 0 ? all : undefined;
+      } catch (secretErr) {
         console.warn(
-          `[TaskService] createTask: harness token lookup failed for user ${user.id} — booting without harness token`,
-          tokenErr,
+          `[TaskService] createTask: session-secret lookup failed for user ${user.id} — booting without harness env`,
+          secretErr,
         );
         harnessEnv = undefined;
       }

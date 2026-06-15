@@ -27,7 +27,8 @@ import type { AddressInfo } from "node:net";
 import { buildServer } from "../server.ts";
 import { registerTasks } from "../rpc/tasks.ts";
 import type { TaskDeps, SessionsClient, Db, GetSession } from "../rpc/tasks.ts";
-import type { HarnessTokenStore } from "../db/harness-token.ts";
+import type { UserSecretStore } from "../db/user-secrets.ts";
+import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 import { checkDb, getDb } from "../db/client.ts";
@@ -124,27 +125,37 @@ function makeFakeSessions(opts: {
 }
 
 /**
- * Build a fake HarnessTokenStore (ADR 0051 Drip A). Optionally seed per-user
- * tokens; by default empty (no user has a token → no harness_env injected,
- * matching the old "hasSecret always false" behavior).
+ * Build a fake UserSecretStore (ADR 0051 Drip A). The `seed` is a convenience
+ * `{ userId: token }` map — each seeded token is stored under the Claude env-var
+ * name (CLAUDE_CODE_OAUTH_TOKEN), matching the single secret a user has today.
+ * By default empty (no user has a secret → no harness_env injected). The fake
+ * holds plaintext (the real store seals); the seam under test is createTask, not
+ * the crypto.
  */
 function makeFakeTokens(
   seed: Record<string, string> = {},
-): HarnessTokenStore & { store: Record<string, string> } {
-  const store: Record<string, string> = { ...seed };
+): UserSecretStore & { store: Record<string, Record<string, string>> } {
+  // store: userId → { envVarName → plaintext }
+  const store: Record<string, Record<string, string>> = {};
+  for (const [userId, token] of Object.entries(seed)) {
+    store[userId] = { [CLAUDE_OAUTH_ENV_VAR]: token };
+  }
   return {
     store,
-    async put(userId, token) {
-      store[userId] = token;
+    async put(userId, envVarName, plaintext) {
+      (store[userId] ??= {})[envVarName] = plaintext;
     },
-    async get(userId) {
-      return store[userId] ?? null;
+    async getAll(userId) {
+      return { ...(store[userId] ?? {}) };
     },
-    async has(userId) {
-      return userId in store;
+    async get(userId, envVarName) {
+      return store[userId]?.[envVarName] ?? null;
     },
-    async delete(userId) {
-      delete store[userId];
+    async has(userId, envVarName) {
+      return store[userId]?.[envVarName] !== undefined;
+    },
+    async delete(userId, envVarName) {
+      if (store[userId]) delete store[userId][envVarName];
     },
   };
 }
@@ -233,7 +244,7 @@ describe("TaskService — unauthenticated", () => {
     srv = await spawnServer({
       getSession: makeGetSession(null),
       sessions: fakeSessions,
-      tokens: makeFakeTokens(),
+      secrets: makeFakeTokens(),
     });
   });
 
@@ -281,7 +292,7 @@ describe("TaskService — type validation", () => {
     srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      tokens: makeFakeTokens(),
+      secrets: makeFakeTokens(),
     });
   });
 
@@ -340,7 +351,7 @@ describe("TaskService — member anti-enumeration (in-memory store)", () => {
         const srv = await spawnServer({
           getSession: makeGetSession(MEMBER_B),
           sessions: fakeSessions,
-          tokens: makeFakeTokens(),
+          secrets: makeFakeTokens(),
           db,
         });
 
@@ -384,7 +395,7 @@ describe("TaskService — member anti-enumeration (in-memory store)", () => {
         const srv = await spawnServer({
           getSession: makeGetSession(MEMBER_B),
           sessions: fakeSessions,
-          tokens: makeFakeTokens(),
+          secrets: makeFakeTokens(),
           db,
         });
 
@@ -437,7 +448,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      tokens: makeFakeTokens(),
+      secrets: makeFakeTokens(),
       db: db!,
     });
     client = makeClient(srv.serverUrl);
@@ -493,7 +504,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     const srvB = await spawnServer({
       getSession: makeGetSession(MEMBER_B),
       sessions: fakeSessions,
-      tokens: makeFakeTokens(),
+      secrets: makeFakeTokens(),
       db: db!,
     });
     try {
@@ -585,7 +596,7 @@ describe("TaskService — admin list sees all + synthetic unattributed rows", ()
       const srv = await spawnServer({
         getSession: makeGetSession(ADMIN_ID, "admin"),
         sessions: fakeSessions,
-        tokens: makeFakeTokens(),
+        secrets: makeFakeTokens(),
         db,
       });
 
@@ -645,7 +656,7 @@ describe("TaskService — member scoping: orphan sessions excluded from member L
       const srv = await spawnServer({
         getSession: makeGetSession(MEMBER_A),
         sessions: fakeSessions,
-        tokens: makeFakeTokens(),
+        secrets: makeFakeTokens(),
         db,
       });
 
@@ -704,7 +715,7 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      tokens: makeFakeTokens(),
+      secrets: makeFakeTokens(),
       db: fakeDb,
     });
 
@@ -810,7 +821,7 @@ describe("TaskService — harness_env injection from local token store", () => {
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      tokens: makeFakeTokens({ [MEMBER_A]: "sk-ant-oat01-secret" }),
+      secrets: makeFakeTokens({ [MEMBER_A]: "sk-ant-oat01-secret" }),
       db: okDb(),
     });
     try {
@@ -842,7 +853,7 @@ describe("TaskService — harness_env injection from local token store", () => {
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      tokens: makeFakeTokens(), // empty store
+      secrets: makeFakeTokens(), // empty store
       db: okDb(),
     });
     try {
@@ -914,7 +925,7 @@ describe("TaskService — session status → task status mapping", () => {
           const srv = await spawnServer({
             getSession: makeGetSession(MEMBER_A),
             sessions: fakeSessions,
-            tokens: makeFakeTokens(),
+            secrets: makeFakeTokens(),
             db,
           });
 

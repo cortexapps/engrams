@@ -2,9 +2,10 @@
  * /api/v1/me/claude-token routes (ADR 0051).
  *
  * The orchestrator OWNS the user's Claude harness token in its OWN Postgres
- * (the `user_harness_token` table) — replacing the coordinator's per-user
- * sealed SecretService vault (Drip A). At session-create the token is resolved
- * and passed to the control plane via `CreateSession.harness_env`.
+ * (the `user_session_secrets` table, KEK-envelope sealed at rest under the env
+ * var name CLAUDE_CODE_OAUTH_TOKEN) — replacing the coordinator's per-user
+ * sealed SecretService vault (Drip A). At session-create the token is opened and
+ * passed to the control plane via `CreateSession.harness_env`.
  *
  * Routes:
  *   POST   /api/v1/me/claude-token  — { token } → store.put(userId, token) → 204
@@ -24,9 +25,10 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import {
-  makeHarnessTokenStore,
-  type HarnessTokenStore,
-} from "../db/harness-token.ts";
+  makeUserSecretStore,
+  CLAUDE_OAUTH_ENV_VAR,
+  type UserSecretStore,
+} from "../db/user-secrets.ts";
 import { auth } from "../auth/better-auth.ts";
 import type { GetSession } from "./guard.ts";
 
@@ -36,7 +38,7 @@ import type { GetSession } from "./guard.ts";
 
 /** Injectable deps for the /me route. */
 export interface MeDeps {
-  tokens?: HarnessTokenStore;
+  secrets?: UserSecretStore;
   getSession?: GetSession;
 }
 
@@ -48,8 +50,8 @@ export function makeMeRoute(deps?: MeDeps): Hono {
   const app = new Hono();
   // The store is constructed lazily by default so importing this module does
   // not require ORCHESTRATOR_DATABASE_URL at import time (tests inject a fake).
-  const resolveStore = (): HarnessTokenStore =>
-    deps?.tokens ?? makeHarnessTokenStore();
+  const resolveStore = (): UserSecretStore =>
+    deps?.secrets ?? makeUserSecretStore();
 
   const resolveSession: GetSession =
     deps?.getSession ??
@@ -88,8 +90,8 @@ export function makeMeRoute(deps?: MeDeps): Hono {
       throw new HTTPException(400, { message: "token must not be empty" });
     }
 
-    // NEVER log the token.
-    await resolveStore().put(user.id, token);
+    // NEVER log the token. Stored KEK-envelope sealed under CLAUDE_CODE_OAUTH_TOKEN.
+    await resolveStore().put(user.id, CLAUDE_OAUTH_ENV_VAR, token);
 
     // Mirror coordinator: 204 No Content.
     return new Response(null, { status: 204 });
@@ -100,7 +102,7 @@ export function makeMeRoute(deps?: MeDeps): Hono {
   app.get("/api/v1/me/claude-token", async (c) => {
     const user = await requireUser(c.req.raw.headers);
 
-    const exists = await resolveStore().has(user.id);
+    const exists = await resolveStore().has(user.id, CLAUDE_OAUTH_ENV_VAR);
     return c.json({ has_claude_token: exists });
   });
 
@@ -108,7 +110,7 @@ export function makeMeRoute(deps?: MeDeps): Hono {
   app.delete("/api/v1/me/claude-token", async (c) => {
     const user = await requireUser(c.req.raw.headers);
 
-    await resolveStore().delete(user.id);
+    await resolveStore().delete(user.id, CLAUDE_OAUTH_ENV_VAR);
 
     return new Response(null, { status: 204 });
   });
