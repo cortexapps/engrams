@@ -1,12 +1,26 @@
-//! Integration test for the coordinator HTTP API.
+//! Integration test for the coordinator surface.
 //!
-//! Wires the real `axum` router against an in-memory `MetadataStore`,
-//! a `MockCloud`, a `LocalStorage` blob backend, and `ProcessBackend`
-//! (the dev-loop SandboxBackend that runs commands as host
-//! subprocesses), then drives the surface via
-//! `tower::ServiceExt::oneshot`. The goal is to lock down the public
-//! contract — status codes, JSON error envelope, the routing table —
-//! while exercising real exec round-trips end-to-end.
+//! ADR 0051 made the coordinator gRPC-only: the web-facing axum REST
+//! routes (`/sessions`, `/storage/*`, `/registries/*`, `/enabled-images`,
+//! the admin GC/flush surface, …) were deleted. Their logic now lives in
+//! `_core` fns called by the app-gRPC services in `grpc_app/*`.
+//!
+//! This file therefore exercises the surface two ways:
+//!  - the SURVIVING axum routes (healthz, the internal host→coord
+//!    ingestion routes under `/hosts/*` + `/sessions/:id/harness-events`,
+//!    the in-guest forge seam, the bearer gate on the internal router)
+//!    via `tower::ServiceExt::oneshot` against `api::router`, exactly as
+//!    before; and
+//!  - the MIGRATED session/exec/snapshot/events/storage behaviour via the
+//!    real app-gRPC server (`grpc_app::server`) driven by typed tonic
+//!    clients — the SAME `_core` fns, asserting `tonic::Code` in place of
+//!    the old HTTP status (the `into_status` mapping in `grpc_app/mod.rs`
+//!    is the reference: NotFound↔404, InvalidArgument↔400,
+//!    FailedPrecondition↔409/410, Unavailable↔503).
+//!
+//! Both surfaces share one `MockMetadataStore` + `TestFixture`, so the
+//! gRPC tests reuse the same image/host/secret seeding the axum tests
+//! always used.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,17 +31,20 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use chrono::Utc;
 use engram_cloud_mock::MockCloud;
-use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
+use engram_coordinator::{api, grpc_app, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
 use engram_core::types::{
     HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SessionId};
+use engram_protocol::app;
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
+use futures::StreamExt as _;
 use http_body_util::BodyExt;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use tonic::Code;
 use tower::ServiceExt;
 
 // ---------------------------------------------------------------------
@@ -460,6 +477,282 @@ fn build_app(meta: Arc<MockMetadataStore>) -> axum::Router {
     TestFixture::new(meta, InMemorySecretStore::new()).app
 }
 
+// ---------------------------------------------------------------------
+// app-gRPC harness (ADR 0051). The web-facing session/exec/snapshot/
+// events/storage REST routes were deleted; their `_core` fns are now
+// reachable only through the app-gRPC services. These helpers stand up
+// the real `grpc_app::server` over a `TestFixture`'s `AppState` and dial
+// it with typed tonic clients — the established pattern from
+// `tests/grpc_app.rs`.
+// ---------------------------------------------------------------------
+
+/// Token the gRPC test server is configured with (see
+/// `TestFixture::new`, which seeds `app_grpc_tokens`).
+const TEST_TOKEN: &str = "test-app-grpc-token";
+
+/// A live app-gRPC server + a connected channel. Drop / `abort()` the
+/// handle to tear the server down.
+struct GrpcHarness {
+    channel: tonic::transport::Channel,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl GrpcHarness {
+    fn session(
+        &self,
+    ) -> app::session_service_client::SessionServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            impl tonic::service::Interceptor + Clone,
+        >,
+    > {
+        app::session_service_client::SessionServiceClient::with_interceptor(
+            self.channel.clone(),
+            bearer(TEST_TOKEN),
+        )
+    }
+
+    fn fleet(
+        &self,
+    ) -> app::fleet_service_client::FleetServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            impl tonic::service::Interceptor + Clone,
+        >,
+    > {
+        app::fleet_service_client::FleetServiceClient::with_interceptor(
+            self.channel.clone(),
+            bearer(TEST_TOKEN),
+        )
+    }
+}
+
+impl Drop for GrpcHarness {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Bring up `grpc_app::server(state)` on an ephemeral port and dial it.
+async fn serve_grpc(state: Arc<AppState>) -> GrpcHarness {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+        .expect("tcp incoming from listener");
+    let handle = tokio::spawn(async move {
+        let _ = grpc_app::server(state).serve_with_incoming(incoming).await;
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint uri")
+        .connect()
+        .await
+        .expect("dial app gRPC");
+    GrpcHarness { channel, handle }
+}
+
+/// tonic interceptor stamping `Authorization: Bearer <token>` on every
+/// outbound request (mirrors `tests/grpc_app.rs::bearer`).
+#[allow(clippy::result_large_err)]
+fn bearer(
+    token: &'static str,
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
+    move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii header"),
+        );
+        Ok(req)
+    }
+}
+
+/// Convenience: stand up a gRPC harness over a default `TestFixture`
+/// (baseline images `r`, `warm/test`, `cortex/api` already seeded) +
+/// the given store. Returns the harness; the fixture's `AppState` is
+/// kept alive inside the spawned server.
+async fn grpc_fixture(meta: Arc<MockMetadataStore>) -> GrpcHarness {
+    let f = TestFixture::new(meta, InMemorySecretStore::new());
+    serve_grpc(f.state).await
+}
+
+/// Create a session over gRPC against image `{repo}:warm-bootstrap`
+/// (which the default fixture seeds) and return its id. The gRPC analog
+/// of the old `api_create_session` helper.
+async fn grpc_create_session(h: &GrpcHarness, repo: &str) -> SessionId {
+    grpc_create_image(h, &format!("{repo}:warm-bootstrap")).await
+}
+
+/// Create an agent-mode session over gRPC against a full `image_uri`
+/// (used by the manifest/secret tests, whose images carry a non-default
+/// tag the fixture seeds via `write_image`).
+async fn grpc_create_image(h: &GrpcHarness, image_uri: &str) -> SessionId {
+    let resp = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: image_uri.to_string(),
+            mode: "agent".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
+        .await
+        .expect("CreateSession must succeed in the test fixture")
+        .into_inner();
+    resp.session_id.parse().expect("session_id is a uuid")
+}
+
+/// Drive `Exec` to completion, collecting the streamed frames into
+/// `(stdout, stderr, exit_status, wall_ms)`. The gRPC analog of the old
+/// unary `/exec` round-trip.
+async fn grpc_exec(
+    h: &GrpcHarness,
+    id: SessionId,
+    req: app::ExecRequest,
+) -> Result<(String, String, i32, u64), tonic::Status> {
+    let stream = h
+        .session()
+        .exec(req_with_session(req, id))
+        .await?
+        .into_inner();
+    let frames: Vec<app::ExecOutput> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_status: i32 = 0;
+    let mut wall_ms = 0;
+    for f in frames {
+        match f.event {
+            Some(app::exec_output::Event::Stdout(b)) => stdout.extend_from_slice(&b),
+            Some(app::exec_output::Event::Stderr(b)) => stderr.extend_from_slice(&b),
+            Some(app::exec_output::Event::Exit(e)) => {
+                exit_status = e.exit_status.unwrap_or(0);
+                wall_ms = e.rusage.map(|r| r.wall_ms).unwrap_or(0);
+            }
+            Some(app::exec_output::Event::Started(_)) | None => {}
+        }
+    }
+    Ok((
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+        exit_status,
+        wall_ms,
+    ))
+}
+
+/// Drive `Exec` and return the `Status` it fails with. The error can
+/// surface either at stream-open or on the first poll (`exec_stream_core`
+/// validates the session/sandbox before producing the body), so this
+/// helper checks both.
+async fn grpc_exec_err(h: &GrpcHarness, id: SessionId, req: app::ExecRequest) -> tonic::Status {
+    match h.session().exec(req_with_session(req, id)).await {
+        Err(status) => status,
+        Ok(resp) => {
+            let mut stream = resp.into_inner();
+            loop {
+                match stream.next().await {
+                    Some(Err(status)) => return status,
+                    Some(Ok(_)) => continue,
+                    None => panic!("exec stream ended without the expected error"),
+                }
+            }
+        }
+    }
+}
+
+/// An `ExecRequest` carrying just a shell `command`, addressed to `id`.
+fn exec_command(command: &str) -> app::ExecRequest {
+    app::ExecRequest {
+        session_id: String::new(),
+        command: Some(command.to_string()),
+        argv: vec![],
+        env: HashMap::new(),
+        workdir: None,
+        timeout_secs: None,
+    }
+}
+
+/// Open `StreamEvents` for `id` (proto `since`: `None` = from the start /
+/// "all"). Returns the live stream so the caller can drain it while
+/// concurrently triggering actions, or asserts the open error.
+async fn open_events(
+    h: &GrpcHarness,
+    id: SessionId,
+    since: Option<i64>,
+) -> Result<tonic::Streaming<app::SessionEvent>, tonic::Status> {
+    h.session()
+        .stream_events(app::StreamEventsRequest {
+            session_id: id.to_string(),
+            since,
+        })
+        .await
+        .map(|r| r.into_inner())
+}
+
+/// Drain a `SessionEvent` stream for up to `budget`, returning the
+/// collected events. Stops early if the stream ends.
+async fn collect_events(
+    mut stream: tonic::Streaming<app::SessionEvent>,
+    budget: Duration,
+) -> Vec<app::SessionEvent> {
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(ev))) => events.push(ev),
+            // End-of-stream, error, or budget elapsed → done.
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        }
+    }
+    events
+}
+
+/// Snapshot `id` over gRPC (the old `POST /sessions/:id/snapshot`).
+async fn grpc_snapshot(
+    h: &GrpcHarness,
+    id: SessionId,
+) -> Result<app::SnapshotResponse, tonic::Status> {
+    h.session()
+        .snapshot(app::SnapshotRequest {
+            session_id: id.to_string(),
+        })
+        .await
+        .map(|r| r.into_inner())
+}
+
+/// Evict `id` locally over gRPC (the old `DELETE /sessions/:id/local`).
+async fn grpc_evict_local(h: &GrpcHarness, id: SessionId) -> Result<(), tonic::Status> {
+    h.session()
+        .evict_local(app::EvictLocalRequest {
+            session_id: id.to_string(),
+        })
+        .await
+        .map(|_| ())
+}
+
+/// Resume `id` over gRPC (the old `POST /sessions/:id/resume`).
+async fn grpc_resume(h: &GrpcHarness, id: SessionId) -> Result<app::ResumeResponse, tonic::Status> {
+    h.session()
+        .resume(app::ResumeRequest {
+            session_id: id.to_string(),
+        })
+        .await
+        .map(|r| r.into_inner())
+}
+
+/// Stamp the session id onto an `ExecRequest` (the routing field).
+fn req_with_session(mut req: app::ExecRequest, id: SessionId) -> app::ExecRequest {
+    req.session_id = id.to_string();
+    req
+}
+
 /// Like `build_app` but seeds the bearer-token allow-list. Used by the
 /// auth middleware tests; everything else relies on the default empty
 /// list (auth-disabled).
@@ -703,6 +996,10 @@ async fn forge_forward_runs_the_core_for_split_hosts() {
 /// `build_app` discards the handle (most tests don't care).
 struct TestFixture {
     app: axum::Router,
+    /// ADR 0051: the wired `AppState`, kept so gRPC-migrated tests can
+    /// stand up the real app-gRPC server (`grpc_app::server`) over the
+    /// same store/host/secret wiring the axum surface uses.
+    state: Arc<AppState>,
     meta: Arc<MockMetadataStore>,
     /// ADR 0015 M5: pinned to the single in-process host so test
     /// helpers can flip its `ready_images` set in lockstep with
@@ -751,6 +1048,10 @@ impl TestFixture {
         };
         let cfg = CoordinatorConfig {
             default_image_version: "warm-bootstrap".into(),
+            // ADR 0051: the gRPC-migrated tests dial `grpc_app::server`
+            // with `TEST_TOKEN`; seed the allow-list so the BearerAuth
+            // gate (fail-closed when empty) lets them through.
+            app_grpc_tokens: vec![TEST_TOKEN.to_string()],
             ..CoordinatorConfig::default()
         };
         // ADR 0015 M5: build the registry explicitly so we can keep
@@ -787,7 +1088,8 @@ impl TestFixture {
         );
         let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
         let fx = Self {
-            app: api::router(state),
+            app: api::router(state.clone()),
+            state,
             meta: meta.clone(),
             test_host_id,
         };
@@ -914,34 +1216,6 @@ fn json_request(method: Method, uri: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
-/// Hit `POST /sessions` against `app` and return the new SessionId.
-/// The router consumes itself per request, so callers need to pass a
-/// fresh clone of the router for any subsequent request. Sends the
-/// new orthogonal wire shape with an `Empty` workspace and `None`
-/// harness — any test that needs Git workspaces or an attached
-/// harness sends the request directly.
-async fn api_create_session(app: axum::Router, repo: &str) -> SessionId {
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/sessions",
-            json!({
-                "image": format!("{repo}:warm-bootstrap"),
-                "workspace": {"kind":"empty"},
-                "harness": {"kind":"none"},
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CREATED,
-        "session create must succeed in test fixture",
-    );
-    let v = body_json(resp.into_body()).await;
-    v["session_id"].as_str().unwrap().parse().unwrap()
-}
-
 /// Walk the ADR 0015 M2 legality table from the session's current
 /// state (whatever it is) to `target`. Tests in this file used to
 /// call `set_session_status(id, X)` to force a row into a given
@@ -984,21 +1258,14 @@ async fn seed_to(store: &MockMetadataStore, id: SessionId, target: SessionState)
 // Bearer-token middleware
 // ---------------------------------------------------------------------
 
-#[tokio::test]
-async fn auth_disabled_when_token_list_empty() {
-    // Default fixture path — no `Authorization` header, but auth is
-    // disabled. This is the dev-loop and existing-test default.
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(
-            Request::get("/api/v1/sessions")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-}
+// ADR 0051: `auth_disabled_when_token_list_empty` and
+// `human_routes_are_principal_authed_not_bearer_gated` targeted the
+// deleted web-facing `GET /api/v1/sessions` route. The app-gRPC surface
+// has no auth-disabled bypass and no principal layer — it is fail-closed
+// (BearerAuth). Both removed assertions are now covered by
+// `tests/grpc_app.rs::app_grpc_fails_closed_with_no_tokens_configured`
+// (empty allow-list rejects everything) and
+// `app_grpc_rejects_missing_and_wrong_bearer`.
 
 // ADR 0031: the deployment bearer no longer gates *human* routes — those are
 // authenticated by the principal layer (cookie / service-bearer / synthetic).
@@ -1078,23 +1345,6 @@ async fn auth_valid_bearer_passes_internal_gate() {
 }
 
 #[tokio::test]
-async fn human_routes_are_principal_authed_not_bearer_gated() {
-    // ADR 0031: even with deployment tokens set, a human route resolves via
-    // the principal layer. With no auth runtime wired (test default), that's
-    // the synthetic admin → 200, with or without an Authorization header.
-    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
-    let resp = app
-        .oneshot(
-            Request::get("/api/v1/sessions")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-}
-
-#[tokio::test]
 async fn auth_lets_healthz_through_without_token() {
     // Liveness probes don't carry secrets — `/healthz` must stay
     // outside the auth layer even when auth is enabled.
@@ -1120,21 +1370,24 @@ async fn healthz_returns_ok_status_and_version() {
 }
 
 #[tokio::test]
-async fn create_session_requires_image_and_workspace() {
-    // Phase 2 wire shape: `image` and `workspace` are mandatory.
-    // axum's `Json<T>` extractor surfaces missing required fields
-    // as 422 Unprocessable Entity (rather than 400) — body never
-    // reaches the handler.
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/sessions",
-            json!({"workspace": {"kind":"empty"}}),
-        ))
+async fn create_session_requires_image() {
+    // ADR 0051 (gRPC): `image_uri` is mandatory. The old axum wire shape
+    // surfaced a missing `image` as 422 (serde extractor); the proto
+    // request defaults `image_uri` to "", which the core rejects as a
+    // bad request → InvalidArgument (the gRPC analog of the 4xx).
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let err = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: String::new(),
+            mode: "agent".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        .expect_err("missing image must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 }
 
 #[tokio::test]
@@ -1159,23 +1412,22 @@ async fn create_session_dev_vm_mode_skips_harness_on_harnessed_image() {
             exec = "/this/path/does/not/exist"
         "#,
     );
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/sessions",
-            json!({
-                "image": "demo/dev-vm-from-harnessed:v1",
-                "mode": "dev_vm",
-            }),
-        ))
+    let resp = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: "demo/dev-vm-from-harnessed:v1".into(),
+            mode: "dev_vm".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["status"], "active");
-    let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
+        .expect("dev_vm create must succeed")
+        .into_inner();
+    assert_eq!(resp.status, "active");
+    let id: SessionId = resp.session_id.parse().unwrap();
     let session = store.get_session(id).await.unwrap();
     assert_eq!(
         session.mode,
@@ -1205,28 +1457,27 @@ async fn dev_vm_exec_inherits_image_env() {
             ENGRAM_TEST_IMAGE_VAR = "from-manifest"
         "#,
     );
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = post(
-        app.clone(),
-        "/api/v1/sessions",
-        json!({ "image": "demo/env-inject:v1", "mode": "dev_vm" }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let v = body_json(resp.into_body()).await;
-    let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
+    let resp = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: "demo/env-inject:v1".into(),
+            mode: "dev_vm".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
+        .await
+        .expect("dev_vm create")
+        .into_inner();
+    let id: SessionId = resp.session_id.parse().unwrap();
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({ "command": "printenv ENGRAM_TEST_IMAGE_VAR" }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
+    let (stdout, _, _, _) = grpc_exec(&h, id, exec_command("printenv ENGRAM_TEST_IMAGE_VAR"))
+        .await
+        .expect("exec must succeed");
     assert_eq!(
-        v["stdout"].as_str().unwrap_or_default().trim(),
+        stdout.trim(),
         "from-manifest",
         "dev-VM exec should inherit the image manifest's [env]",
     );
@@ -1242,25 +1493,23 @@ async fn create_session_with_explicit_image_persists_full_row() {
     let store = MockMetadataStore::arc();
     let f = TestFixture::new(store.clone(), InMemorySecretStore::new());
     f.write_image("cortex/api", "warm-pinned", r#"name = "cortex-api""#);
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/sessions",
-            json!({
-                "image": "cortex/api:warm-pinned",
-                "workspace": {"kind":"empty"},
-                "harness": {"kind":"none"},
-            }),
-        ))
+    let resp = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: "cortex/api:warm-pinned".into(),
+            mode: "agent".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["image_version"], "warm-pinned");
-    assert_eq!(v["status"], "active");
-    let id: SessionId = v["session_id"].as_str().unwrap().parse().unwrap();
+        .expect("create must succeed")
+        .into_inner();
+    assert_eq!(resp.image_version, "warm-pinned");
+    assert_eq!(resp.status, "active");
+    let id: SessionId = resp.session_id.parse().unwrap();
     let session = store.get_session(id).await.unwrap();
     assert_eq!(session.image, "cortex/api:warm-pinned");
     // ADR 0021 P1.3: a default-mode session is `Agent` (the harness,
@@ -1274,24 +1523,26 @@ async fn create_session_with_explicit_image_persists_full_row() {
 }
 
 #[tokio::test]
-async fn create_session_with_unknown_image_returns_400() {
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/sessions",
-            json!({
-                "image": "never-baked:x",
-                "workspace": {"kind":"empty"},
-            }),
-        ))
+async fn create_session_with_unknown_image_returns_invalid_argument() {
+    // ADR 0051: unenabled image → BadRequest core → InvalidArgument
+    // (the old 400). The message must still call out the unenabled image.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let err = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: "never-baked:x".into(),
+            mode: "agent".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v = body_json(resp.into_body()).await;
+        .expect_err("unenabled image must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
     assert!(
-        v["message"].as_str().unwrap().contains("not enabled"),
-        "error must call out the unenabled image: got {v}",
+        err.message().contains("not enabled"),
+        "error must call out the unenabled image: got {:?}",
+        err.message(),
     );
 }
 
@@ -1301,20 +1552,19 @@ async fn create_session_prompt_with_dev_vm_mode_is_400() {
     // dev-VM session leaves the image's baked harness undriven, so
     // there's nothing on the other end of `prompt` — reject with 400
     // rather than silently dropping the prompt.
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/sessions",
-            json!({
-                "image": "r:warm-bootstrap",
-                "mode": "dev_vm",
-                "prompt": "do the thing",
-            }),
-        ))
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let err = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: "r:warm-bootstrap".into(),
+            mode: "dev_vm".into(),
+            prompt: Some("do the thing".into()),
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        .expect_err("prompt + dev_vm must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 }
 
 // ADR 0021 P1.3 deleted `create_session_unknown_harness_name_is_400`:
@@ -1328,88 +1578,75 @@ async fn create_session_prompt_with_dev_vm_mode_is_400() {
 // path anymore.
 
 #[tokio::test]
-async fn get_session_returns_404_for_unknown_id() {
-    let app = build_app(MockMetadataStore::arc());
+async fn get_session_returns_not_found_for_unknown_id() {
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
     let unknown = SessionId::new();
-    let resp = app
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{unknown}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let err = h
+        .session()
+        .get_session(app::GetSessionRequest {
+            session_id: unknown.to_string(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["error"], "not_found");
+        .expect_err("unknown session must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
+    // The `engram-error-slug` metadata carries the slug (into_status).
+    assert_eq!(
+        err.metadata()
+            .get("engram-error-slug")
+            .map(|v| v.as_bytes()),
+        Some("not_found".as_bytes()),
+    );
 }
 
 #[tokio::test]
-async fn get_session_returns_400_for_malformed_id() {
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(
-            Request::get("/api/v1/sessions/not-a-uuid")
-                .body(Body::empty())
-                .unwrap(),
-        )
+async fn get_session_returns_invalid_argument_for_malformed_id() {
+    // ADR 0051: `parse_session_id` maps a malformed uuid to
+    // InvalidArgument (the old axum Path-deser 400).
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let err = h
+        .session()
+        .get_session(app::GetSessionRequest {
+            session_id: "not-a-uuid".into(),
+        })
         .await
-        .unwrap();
-    // axum's Path<SessionId> deserialisation fails -> 400.
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        .expect_err("malformed id must be InvalidArgument");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 }
 
 #[tokio::test]
 async fn list_sessions_returns_empty_array_when_store_is_empty() {
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(
-            Request::get("/api/v1/sessions")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let resp = h
+        .session()
+        .list_sessions(app::ListSessionsRequest::default())
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(
-        v["sessions"]
-            .as_array()
-            .expect("sessions must be an array")
-            .len(),
-        0,
-    );
+        .expect("ListSessions must succeed")
+        .into_inner();
+    assert!(resp.sessions.is_empty(), "empty store → empty list");
 }
 
 #[tokio::test]
 async fn storage_summary_zeros_on_empty_fleet() {
     // ADR 0029: with no registered hosts and an empty metadata store,
-    // the Storage surface's summary returns a well-formed all-zero
-    // shape — never `NaN`/null — so the page renders cleanly on a
-    // fresh deployment. The mock store's default `snapshot_totals` /
-    // `count_gc_candidates` supply the zeros.
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(
-            Request::get("/api/v1/storage/summary")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    // the Storage rollup (now FleetService::GetStorageSummary) returns a
+    // well-formed all-zero shape — never `NaN`/null — so the page renders
+    // cleanly on a fresh deployment. The mock store's default
+    // `snapshot_totals` / `count_gc_candidates` supply the zeros.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let s = h
+        .fleet()
+        .get_storage_summary(app::GetStorageSummaryRequest::default())
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["snapshots"], 0);
-    assert_eq!(v["snapshot_bytes"], 0);
-    assert_eq!(v["gc_pending"], 0);
-    assert_eq!(v["tracked_sandboxes"], 0);
-    assert_eq!(v["dirty_chunks"], 0);
-    assert_eq!(v["unflushed_bytes"], 0);
-    assert_eq!(v["avg_locality_pct"], 0);
-    assert_eq!(
-        v["rows"].as_array().expect("rows must be an array").len(),
-        0,
-    );
+        .expect("GetStorageSummary must succeed")
+        .into_inner();
+    assert_eq!(s.snapshots, 0);
+    assert_eq!(s.snapshot_bytes, 0);
+    assert_eq!(s.gc_pending, 0);
+    assert_eq!(s.tracked_sandboxes, 0);
+    assert_eq!(s.dirty_chunks, 0);
+    assert_eq!(s.unflushed_bytes, 0);
+    assert_eq!(s.avg_locality_pct, 0);
+    assert!(s.rows.is_empty(), "rows must be empty on a fresh fleet");
 }
 
 #[tokio::test]
@@ -1443,24 +1680,20 @@ async fn list_sessions_returns_live_rows_only() {
     let dead_id = mk(&store, "done").await;
     seed_to(&store, dead_id, SessionState::Completed).await;
 
-    let app = build_app(store);
-    // ADR 0031: list is owner-scoped; the test caller is the synthetic admin,
-    // so `scope=all` returns every session (the pre-scoping behaviour).
-    let resp = app
-        .oneshot(
-            Request::get("/api/v1/sessions?scope=all")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
+    // ADR 0051: the trusted-caller gRPC ListSessions returns ALL active
+    // sessions (the orchestrator scopes by ownership). `list_active_sessions`
+    // / `SessionState::is_live` does the live-vs-terminal filtering.
+    let resp = h
+        .session()
+        .list_sessions(app::ListSessionsRequest::default())
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    let ids: Vec<String> = v["sessions"]
-        .as_array()
-        .unwrap()
+        .expect("ListSessions")
+        .into_inner();
+    let ids: Vec<String> = resp
+        .sessions
         .iter()
-        .map(|s| s["id"].as_str().unwrap().to_string())
+        .map(|s| s.session.as_ref().unwrap().id.clone())
         .collect();
     assert!(ids.contains(&active_id.to_string()), "active row missing");
     assert!(ids.contains(&idle_id.to_string()), "idle row missing");
@@ -1489,40 +1722,34 @@ async fn list_sessions_serializes_full_session_record() {
         .await
         .unwrap();
 
-    let app = build_app(store);
-    let resp = app
-        .oneshot(
-            Request::get("/api/v1/sessions?scope=all")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
+    let resp = h
+        .session()
+        .list_sessions(app::ListSessionsRequest::default())
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    let item = &v["sessions"]
-        .as_array()
-        .expect("sessions must be an array")
+        .expect("ListSessions")
+        .into_inner();
+    let item = resp
+        .sessions
         .iter()
-        .find(|s| s["id"] == id.to_string())
+        .find(|s| s.session.as_ref().map(|x| x.id.as_str()) == Some(&id.to_string()))
         .expect("created session must be in the list");
-    // Lock the wire shape so a CLI / web client can rely on it.
-    // Stage B1: image is a flat OCI URI string. ADR 0005: workspace
-    // is gone; the bake image is the whole story.
-    assert_eq!(item["image"], "cortex/api:warm-2026-04-27");
-    assert!(
-        item.get("workspace").is_none(),
-        "ADR 0005 retired the workspace field"
-    );
-    assert!(
-        item.get("harness").is_none(),
-        "ADR 0021 P1.3 retired the per-session harness field"
-    );
-    assert_eq!(item["mode"], "dev_vm");
-    assert_eq!(item["user_id"], "user-42");
-    assert_eq!(item["status"], SessionState::Pending.as_str());
-    assert!(item["created_at"].is_string());
-    assert!(item["last_active_at"].is_string());
+    let session = item.session.as_ref().expect("session present");
+    // Lock the proto wire shape so the orchestrator can rely on it.
+    // ADR 0005: workspace gone; ADR 0021 P1.3: per-session harness gone —
+    // the proto `Session` has no such fields (the converter's exhaustive
+    // destructure is the compile-time guard). ADR 0051: `user_id` is
+    // intentionally OFF the coord contract (`session_to_proto` drops it;
+    // attribution lives in the orchestrator's task model), so it carries
+    // on the owner_email/owner_name annotation slots instead — empty here
+    // because the mock resolves no owners.
+    assert_eq!(session.image, "cortex/api:warm-2026-04-27");
+    assert_eq!(session.mode, "dev_vm");
+    assert_eq!(session.status, SessionState::Pending.as_str());
+    assert!(!session.created_at.is_empty());
+    assert!(!session.last_active_at.is_empty());
+    assert_eq!(item.owner_email, None);
+    assert_eq!(item.owner_name, None);
 }
 
 #[tokio::test]
@@ -1543,34 +1770,34 @@ async fn delete_session_marks_completed_and_returns_204() {
     // state from which Completed is reachable.
     seed_to(&store, id, SessionState::Active).await;
 
-    let app = build_app(store.clone());
-    let resp = app
-        .oneshot(
-            Request::delete(format!("/api/v1/sessions/{id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let h = serve_grpc(TestFixture::new(store.clone(), InMemorySecretStore::new()).state).await;
+    h.session()
+        .delete_session(app::DeleteSessionRequest {
+            session_id: id.to_string(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        .expect("DeleteSession must succeed (the old 204)");
 
     let after = store.get_session(id).await.unwrap();
     assert_eq!(after.status, SessionState::Completed);
 }
 
 #[tokio::test]
-async fn delete_session_404_for_unknown_id() {
-    let app = build_app(MockMetadataStore::arc());
+async fn delete_session_not_found_for_unknown_id() {
+    // ADR 0051: an unknown id surfaces NotFound from `terminate_session`'s
+    // own `get_session` (matching the get/exec contract) before any
+    // teardown — the old 404. (Idempotency applies to already-terminal
+    // rows, not to never-existed ones.)
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
     let unknown = SessionId::new();
-    let resp = app
-        .oneshot(
-            Request::delete(format!("/api/v1/sessions/{unknown}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let err = h
+        .session()
+        .delete_session(app::DeleteSessionRequest {
+            session_id: unknown.to_string(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        .expect_err("delete of an unknown session must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
 }
 
 // ---------------------------------------------------------------------
@@ -1592,86 +1819,11 @@ async fn post(app: axum::Router, uri: &str, body: Value) -> axum::http::Response
         .unwrap()
 }
 
-async fn delete(app: axum::Router, uri: &str) -> axum::http::Response<Body> {
-    app.oneshot(Request::delete(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap()
-}
-
-/// One parsed SSE message: the optional `id:`, the `event:` name, and
-/// the JSON `data:` body. `id` carries the persistent log's monotonic
-/// idx — used by EventSource clients on reconnect.
-#[derive(Debug, Clone)]
-struct SseEvent {
-    id: Option<i64>,
-    name: String,
-    data: serde_json::Value,
-}
-
-/// Drain `body` as SSE for up to `budget`. Stops early when the body
-/// ends (which is what /exec/stream does after `exit`). Used by both
-/// streaming-exec tests (where the stream terminates naturally) and
-/// /events tests (where it doesn't, and we rely on the budget).
-async fn collect_sse(body: Body, budget: Duration) -> Vec<SseEvent> {
-    use futures::StreamExt;
-
-    let mut events = Vec::new();
-    let mut buf = String::new();
-    let mut frame_stream = body.into_data_stream();
-    let deadline = tokio::time::Instant::now() + budget;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, frame_stream.next()).await {
-            Ok(Some(Ok(bytes))) => {
-                buf.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(idx) = buf.find("\n\n") {
-                    let block = buf[..idx].to_string();
-                    buf.drain(..idx + 2);
-                    if let Some(ev) = parse_sse_block(&block) {
-                        events.push(ev);
-                    }
-                }
-            }
-            // Body finished or errored — done.
-            Ok(Some(Err(_))) | Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-    events
-}
-
-fn parse_sse_block(block: &str) -> Option<SseEvent> {
-    let mut id: Option<i64> = None;
-    let mut name: Option<String> = None;
-    let mut data_lines: Vec<&str> = Vec::new();
-    for line in block.lines() {
-        // `:` is an SSE comment (axum's keep-alive uses these).
-        if line.starts_with(':') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("event:") {
-            name = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.trim_start_matches(' '));
-        } else if let Some(rest) = line.strip_prefix("id:") {
-            id = rest.trim().parse().ok();
-        }
-    }
-    let name = name?;
-    let data = data_lines.join("\n");
-    let parsed = serde_json::from_str(&data).unwrap_or(Value::String(data));
-    Some(SseEvent {
-        id,
-        name,
-        data: parsed,
-    })
-}
-
+/// Budget for draining a gRPC `StreamEvents` / exec stream that does not
+/// terminate on its own (we rely on the timeout).
 const BRIEF: Duration = Duration::from_millis(2_000);
+/// Tight budget proving streamed exec chunks arrive incrementally (before
+/// a later `sleep` in the same command would let a buffered impl coalesce).
 const STREAMING_PROOF: Duration = Duration::from_millis(450);
 
 // ---------------------------------------------------------------------
@@ -1679,59 +1831,53 @@ const STREAMING_PROOF: Duration = Duration::from_millis(450);
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn exec_stream_emits_stdout_chunks_then_exit() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+async fn exec_stream_emits_stdout_frames_then_exit() {
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec/stream"),
-        json!({"command": "printf hello"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers()
-            .get("content-type")
-            .and_then(|h| h.to_str().ok()),
-        Some("text/event-stream"),
-        "streaming endpoint must announce SSE",
-    );
+    let frames = h
+        .session()
+        .exec(req_with_session(exec_command("printf hello"), id))
+        .await
+        .expect("Exec stream must open")
+        .into_inner()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("exec frames");
 
-    let events = collect_sse(resp.into_body(), BRIEF).await;
-    let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+    // The first frame is `started`, the last is `exit`; stdout in between.
     assert!(
-        names.contains(&"stdout") && names.contains(&"exit"),
-        "stream must include at least one stdout event and a terminal exit; got {names:?}",
+        matches!(
+            frames.first().and_then(|f| f.event.as_ref()),
+            Some(app::exec_output::Event::Started(_))
+        ),
+        "stream must open with a `started` frame",
     );
-
-    // Reconstruct the stdout payload from the chunks.
-    let stdout: String = events
-        .iter()
-        .filter(|e| e.name == "stdout")
-        .map(|e| e.data["chunk"].as_str().unwrap_or("").to_string())
-        .collect();
-    assert_eq!(stdout, "hello");
-
-    let exit = events.iter().find(|e| e.name == "exit").unwrap();
-    assert_eq!(exit.data["exit_status"], 0);
+    let mut stdout = Vec::new();
+    let mut saw_exit = None;
+    for f in &frames {
+        match &f.event {
+            Some(app::exec_output::Event::Stdout(b)) => stdout.extend_from_slice(b),
+            Some(app::exec_output::Event::Exit(e)) => saw_exit = Some(*e),
+            _ => {}
+        }
+    }
+    assert_eq!(String::from_utf8_lossy(&stdout), "hello");
+    let exit = saw_exit.expect("stream must end with an exit frame");
+    assert_eq!(exit.exit_status.unwrap_or(0), 0);
 }
 
 #[tokio::test]
-async fn exec_stream_returns_404_for_unknown_session() {
-    let app = build_app(MockMetadataStore::arc());
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{}/exec/stream", SessionId::new()),
-        json!({"command": "true"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+async fn exec_stream_returns_not_found_for_unknown_session() {
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let err = grpc_exec_err(&h, SessionId::new(), exec_command("true")).await;
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
 }
 
 #[tokio::test]
-async fn exec_stream_returns_409_when_no_live_sandbox() {
+async fn exec_stream_returns_failed_precondition_when_no_live_sandbox() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
@@ -1741,165 +1887,137 @@ async fn exec_stream_returns_409_when_no_live_sandbox() {
         })
         .await
         .unwrap();
-    let app = build_app(store);
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec/stream"),
-        json!({"command": "true"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
+    let err = grpc_exec_err(&h, id, exec_command("true")).await;
+    // ADR 0051: no live sandbox → Conflict core → FailedPrecondition (409).
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 }
 
 #[tokio::test]
 async fn exec_stream_chunks_arrive_before_process_exits() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec/stream"),
-        // 500ms gap between chunks. If the API buffered to completion
-        // we'd never see chunk-1 inside the STREAMING_PROOF budget.
-        json!({"command": "printf chunk-1; sleep 0.5; printf chunk-2"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    // 500ms gap between chunks. If the surface buffered to completion we'd
+    // never see chunk-1 inside the STREAMING_PROOF budget.
+    let mut stream = h
+        .session()
+        .exec(req_with_session(
+            exec_command("printf chunk-1; sleep 0.5; printf chunk-2"),
+            id,
+        ))
+        .await
+        .expect("Exec stream")
+        .into_inner();
 
-    // Drain just long enough to catch the first chunk; the test passes
-    // if we got a stdout event with chunk-1 before the second printf.
-    let early = collect_sse(resp.into_body(), STREAMING_PROOF).await;
-    let saw_first_chunk = early
-        .iter()
-        .any(|e| e.name == "stdout" && e.data["chunk"].as_str() == Some("chunk-1"));
+    let deadline = tokio::time::Instant::now() + STREAMING_PROOF;
+    let mut saw_first_chunk = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(f))) => {
+                if let Some(app::exec_output::Event::Stdout(b)) = f.event {
+                    if b == b"chunk-1" {
+                        saw_first_chunk = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
     assert!(
         saw_first_chunk,
-        "first chunk must arrive before the second printf — buffering would delay it; got {early:?}",
+        "first chunk must arrive before the second printf — buffering would delay it",
     );
 }
 
 // ---------------------------------------------------------------------
-// /sessions/:id/events bus
+// StreamEvents bus (gRPC). The old SSE `/sessions/:id/events` route is
+// gone; the same persistent-log replay + live broadcast now flows over
+// `SessionService::StreamEvents`. The proto `SessionEvent` carries
+// `{ idx, kind, payload_json }` — the `kind` strings are unchanged
+// (state.rs `SessionEvent::kind`), and `payload_json` is the JSON-string
+// form of the old SSE `data:` body.
 // ---------------------------------------------------------------------
 
-#[tokio::test]
-async fn events_endpoint_returns_404_for_unknown_session() {
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{}/events", SessionId::new()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+/// Pull the `chunk` field out of a stdout/stderr event's `payload_json`.
+fn event_chunk(ev: &app::SessionEvent) -> String {
+    serde_json::from_str::<Value>(&ev.payload_json)
+        .ok()
+        .and_then(|v| v["chunk"].as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 #[tokio::test]
-async fn events_endpoint_announces_sse_content_type() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
-    let resp = app
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+async fn events_stream_returns_not_found_for_unknown_session() {
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    // `events_core` runs `get_session` before the stream is produced, so
+    // the NotFound surfaces at open.
+    let err = open_events(&h, SessionId::new(), None)
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers()
-            .get("content-type")
-            .and_then(|h| h.to_str().ok()),
-        Some("text/event-stream"),
-    );
+        .expect_err("unknown session must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
+}
+
+#[tokio::test]
+async fn events_stream_opens_for_known_session() {
+    // The gRPC analog of the old "announces SSE content-type" test: the
+    // stream opens cleanly for a known session (the transport framing is
+    // tonic's job now, not ours to assert).
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
+    open_events(&h, id, None)
+        .await
+        .expect("StreamEvents must open for a known session");
 }
 
 #[tokio::test]
 async fn events_subscriber_sees_snapshot_lifecycle() {
     // Subscribe first, then trigger snapshot. The subscriber must
-    // observe the snapshot_taken event (and not other unrelated events).
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+    // observe the snapshot_taken event.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    // Open the SSE subscription. axum's handler runs to completion
-    // before returning the Sse, which means by the time we have the
-    // body the broadcast subscription is already live — so triggers
-    // we send afterwards are observed.
-    let sub = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(sub.status(), StatusCode::OK);
+    let stream = open_events(&h, id, None).await.expect("open events");
+    let collector = tokio::spawn(collect_events(stream, BRIEF));
 
-    // Drive the subscriber concurrently while we trigger the snapshot.
-    let collector = tokio::spawn(async move { collect_sse(sub.into_body(), BRIEF).await });
-
-    // Tiny pause to make sure the broadcast Receiver is in receive
-    // state before we publish.
+    // Tiny pause so the broadcast Receiver is in receive state before we
+    // publish.
     tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let resp = post(app, &format!("/api/v1/sessions/{id}/snapshot"), json!({})).await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    grpc_snapshot(&h, id).await.expect("snapshot");
 
     let events = collector.await.unwrap();
-    let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     assert!(
-        names.contains(&"snapshot_taken"),
-        "subscriber must see snapshot_taken; got {names:?}",
+        kinds.contains(&"snapshot_taken"),
+        "subscriber must see snapshot_taken; got {kinds:?}",
     );
 }
 
 #[tokio::test]
-async fn events_endpoint_fans_out_to_multiple_subscribers() {
-    // Two SSE subscribers on the same session both see an action
-    // taken on it.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+async fn events_stream_fans_out_to_multiple_subscribers() {
+    // Two StreamEvents subscribers on the same session both see an action.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let sub_a = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let sub_b = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    let coll_a = tokio::spawn(async move { collect_sse(sub_a.into_body(), BRIEF).await });
-    let coll_b = tokio::spawn(async move { collect_sse(sub_b.into_body(), BRIEF).await });
+    let stream_a = open_events(&h, id, None).await.expect("open a");
+    let stream_b = open_events(&h, id, None).await.expect("open b");
+    let coll_a = tokio::spawn(collect_events(stream_a, BRIEF));
+    let coll_b = tokio::spawn(collect_events(stream_b, BRIEF));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    post(app, &format!("/api/v1/sessions/{id}/snapshot"), json!({})).await;
+    grpc_snapshot(&h, id).await.expect("snapshot");
 
     let events_a = coll_a.await.unwrap();
     let events_b = coll_b.await.unwrap();
     for events in [&events_a, &events_b] {
-        let saw_snap = events.iter().any(|e| e.name == "snapshot_taken");
         assert!(
-            saw_snap,
-            "every subscriber must see the snapshot_taken event; got {events:?}",
+            events.iter().any(|e| e.kind == "snapshot_taken"),
+            "every subscriber must see snapshot_taken; got {events:?}",
         );
     }
 }
@@ -1907,112 +2025,73 @@ async fn events_endpoint_fans_out_to_multiple_subscribers() {
 #[tokio::test]
 async fn events_subscriber_sees_evict_then_resume_lifecycle() {
     // Drive a full snapshot → evict → resume cycle and observe each
-    // lifecycle event in the bus.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+    // lifecycle event in the bus, in order.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let sub = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let collector = tokio::spawn(async move { collect_sse(sub.into_body(), BRIEF).await });
+    let stream = open_events(&h, id, None).await.expect("open events");
+    let collector = tokio::spawn(collect_events(stream, BRIEF));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
-    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
-    post(app, &format!("/api/v1/sessions/{id}/resume"), json!({})).await;
+    grpc_snapshot(&h, id).await.expect("snapshot");
+    grpc_evict_local(&h, id).await.expect("evict");
+    grpc_resume(&h, id).await.expect("resume");
 
     let events = collector.await.unwrap();
-    let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
-    // Per design: snapshot keeps Active, evict moves to Idle, resume
-    // moves back to Active.
-    let expected = ["snapshot_taken", "evicted", "resumed"];
-    for needle in expected {
+    let names: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    for needle in ["snapshot_taken", "evicted", "resumed"] {
         assert!(
             names.contains(&needle),
             "missing lifecycle event {needle:?} in {names:?}",
         );
     }
-    // Order: snapshot before evict before resume.
     let pos = |kind: &str| names.iter().position(|n| *n == kind);
     assert!(pos("snapshot_taken").unwrap() < pos("evicted").unwrap());
     assert!(pos("evicted").unwrap() < pos("resumed").unwrap());
 }
 
 #[tokio::test]
-async fn exec_via_sync_endpoint_publishes_lifecycle_to_event_bus() {
-    // Using the *sync* exec endpoint (POST /sessions/:id/exec) should
-    // still route through the event bus so a separate `/events`
-    // observer sees the exec lifecycle and stdout chunks.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+async fn exec_publishes_lifecycle_to_event_bus() {
+    // Exec over gRPC routes through the event bus so a separate
+    // StreamEvents observer sees the exec lifecycle and stdout chunks.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let sub = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let collector = tokio::spawn(async move { collect_sse(sub.into_body(), BRIEF).await });
+    let stream = open_events(&h, id, None).await.expect("open events");
+    let collector = tokio::spawn(collect_events(stream, BRIEF));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "printf wired"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    let (stdout, _, exit, _) = grpc_exec(&h, id, exec_command("printf wired"))
+        .await
+        .expect("exec");
+    assert_eq!(stdout, "wired");
+    assert_eq!(exit, 0);
 
     let events = collector.await.unwrap();
-    let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     assert!(names.contains(&"exec_started"), "got {names:?}");
     assert!(names.contains(&"stdout"), "got {names:?}");
     assert!(names.contains(&"exec_completed"), "got {names:?}");
 
-    // The stdout chunk visible to /events matches the command output.
-    let stdout: String = events
+    let bus_stdout: String = events
         .iter()
-        .filter(|e| e.name == "stdout")
-        .map(|e| e.data["chunk"].as_str().unwrap_or("").to_string())
+        .filter(|e| e.kind == "stdout")
+        .map(event_chunk)
         .collect();
-    assert_eq!(stdout, "wired");
+    assert_eq!(bus_stdout, "wired");
 }
 
 #[tokio::test]
 async fn snapshot_records_a_snapshot_and_keeps_session_active() {
     let store = MockMetadataStore::arc();
-    let app = build_app(store.clone());
-    let id = api_create_session(app.clone(), "r").await;
+    let h = grpc_fixture(store.clone()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let resp = post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    let snap_id = v["snapshot_id"]
-        .as_str()
-        .expect("snapshot_id must be present after wiring");
-    assert!(!snap_id.is_empty());
-    assert!(v["size_bytes"].is_u64());
+    let resp = grpc_snapshot(&h, id).await.expect("snapshot must succeed");
+    assert!(
+        resp.snapshot_id.is_some_and(|s| !s.is_empty()),
+        "snapshot_id must be present after wiring",
+    );
 
     // The live sandbox stays bound — snapshot is a save-point, not eviction.
     let after = store.get_session(id).await.unwrap();
@@ -2027,31 +2106,23 @@ async fn snapshot_records_a_snapshot_and_keeps_session_active() {
     assert_eq!(recorded.len(), 1);
 
     // After snapshot the live sandbox should still respond to exec.
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "printf still-alive"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], "still-alive");
+    let (stdout, _, _, _) = grpc_exec(&h, id, exec_command("printf still-alive"))
+        .await
+        .expect("exec");
+    assert_eq!(stdout, "still-alive");
 }
 
 #[tokio::test]
-async fn snapshot_returns_404_for_unknown_session() {
-    let app = build_app(MockMetadataStore::arc());
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{}/snapshot", SessionId::new()),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+async fn snapshot_returns_not_found_for_unknown_session() {
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let err = grpc_snapshot(&h, SessionId::new())
+        .await
+        .expect_err("unknown session must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
 }
 
 #[tokio::test]
-async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
+async fn snapshot_returns_failed_precondition_when_no_live_sandbox() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
@@ -2061,22 +2132,27 @@ async fn snapshot_returns_409_when_session_has_no_live_sandbox() {
         })
         .await
         .unwrap();
-    let app = build_app(store);
-    let resp = post(app, &format!("/api/v1/sessions/{id}/snapshot"), json!({})).await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
+    let err = grpc_snapshot(&h, id)
+        .await
+        .expect_err("no live sandbox must be a Conflict");
+    // ADR 0051: Conflict core → FailedPrecondition (the old 409).
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 }
 
 #[tokio::test]
 async fn evict_local_requires_a_snapshot_to_exist() {
     let store = MockMetadataStore::arc();
-    let app = build_app(store.clone());
-    let id = api_create_session(app.clone(), "r").await;
+    let h = grpc_fixture(store.clone()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    // No snapshot yet: evicting would lose state. Must 409.
-    let resp = delete(app, &format!("/api/v1/sessions/{id}/local")).await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    // No snapshot yet: evicting would lose state → Conflict (the old 409).
+    let err = grpc_evict_local(&h, id)
+        .await
+        .expect_err("evict without a snapshot must be a Conflict");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 
-    // Session must still be Active and registry still bound.
+    // Session must still be Active and the sandbox still bound.
     assert_eq!(
         store.get_session(id).await.unwrap().status,
         SessionState::Active,
@@ -2086,51 +2162,32 @@ async fn evict_local_requires_a_snapshot_to_exist() {
 #[tokio::test]
 async fn evict_local_after_snapshot_drops_sandbox_and_marks_idle() {
     let store = MockMetadataStore::arc();
-    let app = build_app(store.clone());
-    let id = api_create_session(app.clone(), "r").await;
+    let h = grpc_fixture(store.clone()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    // Snapshot first.
-    let resp = post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Evict.
-    let resp = delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
-    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    grpc_snapshot(&h, id).await.expect("snapshot");
+    grpc_evict_local(&h, id).await.expect("evict must succeed");
     assert_eq!(
         store.get_session(id).await.unwrap().status,
         SessionState::Idle,
     );
 
     // Phase 4 Track B: an exec on an Idle session transparently
-    // auto-resumes from the snapshot before routing the command.
-    // The session ends up Active again and the exec succeeds.
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "echo back"}),
-    )
-    .await;
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "auto-resume should bring the Idle session back transparently"
-    );
+    // auto-resumes from the snapshot before routing the command. The
+    // session ends up Active again and the exec succeeds.
+    let (stdout, _, _, _) = grpc_exec(&h, id, exec_command("echo back"))
+        .await
+        .expect("auto-resume should bring the Idle session back transparently");
     assert_eq!(
         store.get_session(id).await.unwrap().status,
         SessionState::Active,
         "session is Active after auto-resume",
     );
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], "back\n");
+    assert_eq!(stdout, "back\n");
 }
 
 #[tokio::test]
-async fn evict_local_409_when_session_not_active() {
+async fn evict_local_fails_precondition_when_session_not_active() {
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
@@ -2141,27 +2198,32 @@ async fn evict_local_409_when_session_not_active() {
         .await
         .unwrap();
     // Session is Pending (never created sandbox), can't evict.
-    let app = build_app(store);
-    let resp = delete(app, &format!("/api/v1/sessions/{id}/local")).await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
+    let err = grpc_evict_local(&h, id)
+        .await
+        .expect_err("non-Active session can't be evicted");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 }
 
 #[tokio::test]
-async fn resume_409_when_session_not_idle() {
+async fn resume_fails_precondition_when_session_not_idle() {
     let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+    let h = grpc_fixture(store).await;
+    let id = grpc_create_session(&h, "r").await;
     // Session is Active — resume only valid from Idle.
-    let resp = post(app, &format!("/api/v1/sessions/{id}/resume"), json!({})).await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let err = grpc_resume(&h, id)
+        .await
+        .expect_err("resume of a non-Idle session must be a Conflict");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 }
 
 #[tokio::test]
-async fn resume_410_gone_when_no_snapshot_exists() {
-    // Set up an Idle session with no SnapshotRecord. resume must
-    // return 410 Gone — the session's snapshot is invalidated and
-    // engram is a one-shot task runner. The only affordance is
-    // `engram session fork <id>` to continue from the workspace.
+async fn resume_gone_when_no_snapshot_exists() {
+    // An Idle session with no SnapshotRecord: resume must surface Gone —
+    // the session's snapshot is invalidated and engram is a one-shot task
+    // runner. ADR 0051: Gone core → FailedPrecondition, with the
+    // `snapshot_invalidated` slug riding in `engram-error-slug` metadata
+    // to distinguish it from a plain conflict (the `into_status` mapping).
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
@@ -2172,9 +2234,18 @@ async fn resume_410_gone_when_no_snapshot_exists() {
         .await
         .unwrap();
     seed_to(&store, id, SessionState::Idle).await;
-    let app = build_app(store);
-    let resp = post(app, &format!("/api/v1/sessions/{id}/resume"), json!({})).await;
-    assert_eq!(resp.status(), StatusCode::GONE);
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
+    let err = grpc_resume(&h, id)
+        .await
+        .expect_err("resume with no snapshot must be Gone");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert_eq!(
+        err.metadata()
+            .get("engram-error-slug")
+            .map(|v| v.as_bytes()),
+        Some("snapshot_invalidated".as_bytes()),
+        "Gone must carry the snapshot_invalidated slug (distinct from a plain conflict)",
+    );
 }
 
 #[tokio::test]
@@ -2184,59 +2255,33 @@ async fn snapshot_evict_resume_round_trips_workspace_state() {
     // sandbox. ProcessBackend's tarball path round-trips on-disk state;
     // memory state is by definition not preserved in dev.
     let store = MockMetadataStore::arc();
-    let app = build_app(store.clone());
-    let id = api_create_session(app.clone(), "r").await;
+    let h = grpc_fixture(store.clone()).await;
+    let id = grpc_create_session(&h, "r").await;
 
     // Write a marker file in the live sandbox.
-    let resp = post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "echo persisted > marker"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    grpc_exec(&h, id, exec_command("echo persisted > marker"))
+        .await
+        .expect("write marker");
 
-    // Snapshot.
-    let resp = post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Evict.
-    let resp = delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
-    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    grpc_snapshot(&h, id).await.expect("snapshot");
+    grpc_evict_local(&h, id).await.expect("evict");
     assert_eq!(
         store.get_session(id).await.unwrap().status,
         SessionState::Idle,
     );
 
-    // Resume from snapshot.
-    let resp = post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/resume"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    grpc_resume(&h, id).await.expect("resume must succeed");
     assert_eq!(
         store.get_session(id).await.unwrap().status,
         SessionState::Active,
     );
 
     // The marker file must still be there in the resumed sandbox.
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "cat marker"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
+    let (stdout, _, _, _) = grpc_exec(&h, id, exec_command("cat marker"))
+        .await
+        .expect("read marker");
     assert_eq!(
-        v["stdout"], "persisted\n",
+        stdout, "persisted\n",
         "resume must restore the workspace state captured by snapshot",
     );
 }
@@ -2252,17 +2297,20 @@ async fn exec_rejects_request_without_command_or_argv() {
         })
         .await
         .unwrap();
-    let app = build_app(store);
+    seed_to(&store, id, SessionState::Active).await;
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
 
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Neither command nor argv → BadRequest core → InvalidArgument.
+    let req = app::ExecRequest {
+        session_id: String::new(),
+        command: None,
+        argv: vec![],
+        env: HashMap::new(),
+        workdir: None,
+        timeout_secs: None,
+    };
+    let err = grpc_exec_err(&h, id, req).await;
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 }
 
 #[tokio::test]
@@ -2276,52 +2324,36 @@ async fn exec_rejects_empty_argv() {
         })
         .await
         .unwrap();
-    let app = build_app(store);
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            json!({"argv": []}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    seed_to(&store, id, SessionState::Active).await;
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
+    // Empty argv with no command → InvalidArgument.
+    let req = app::ExecRequest {
+        session_id: String::new(),
+        command: None,
+        argv: vec![],
+        env: HashMap::new(),
+        workdir: None,
+        timeout_secs: None,
+    };
+    let err = grpc_exec_err(&h, id, req).await;
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 }
 
 // ---------------------------------------------------------------------
-// End-to-end exec wiring (POST /sessions → registry → sandbox.exec)
-//
-// The registry is in-process state owned by AppState. Tests that need
-// create→exec to share state must reuse the *same* `axum::Router`
-// across requests (cloning the Router is fine — it shares the
-// Arc<AppState> internally).
+// End-to-end exec wiring (gRPC CreateSession → placement → sandbox.exec)
 // ---------------------------------------------------------------------
 
 #[tokio::test]
 async fn exec_round_trips_stdout_when_session_has_live_sandbox() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "cortex/api").await;
 
-    // Hit /sessions then /exec on the *same* router so the registry
-    // entry from create is visible to exec. axum's Router clones
-    // cheaply — `app.clone()` shares the SharedState (Arc<AppState>),
-    // which is exactly what we want here.
-    let id = api_create_session(app.clone(), "cortex/api").await;
-
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            json!({"command": "printf hello-engram"}),
-        ))
+    let (stdout, stderr, exit, _) = grpc_exec(&h, id, exec_command("printf hello-engram"))
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["session_id"].as_str().unwrap(), id.to_string());
-    assert_eq!(v["exit_status"], 0);
-    assert_eq!(v["stdout"], "hello-engram");
-    assert_eq!(v["stderr"], "");
+        .expect("exec");
+    assert_eq!(exit, 0);
+    assert_eq!(stdout, "hello-engram");
+    assert_eq!(stderr, "");
 }
 
 #[tokio::test]
@@ -2329,142 +2361,102 @@ async fn exec_returns_rusage_with_nonzero_wall_ms_for_slow_command() {
     // The coordinator measures wall-clock around the
     // backend.exec_stream → final Exit window. A `sleep 0.1` is short
     // enough not to slow CI but long enough that wall_ms is reliably
-    // ≥ 50ms even on a loaded runner. Backend-supplied fields
-    // (peak_rss_kb / *_cpu_ms) stay None for ProcessBackend.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+    // ≥ 50ms even on a loaded runner.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "sleep 0.1"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    let wall_ms = v["rusage"]["wall_ms"]
-        .as_u64()
-        .expect("wall_ms must be present and a u64");
+    let (_, _, _, wall_ms) = grpc_exec(&h, id, exec_command("sleep 0.1"))
+        .await
+        .expect("exec");
     assert!(
         wall_ms >= 50,
         "wall_ms ({wall_ms}) should reflect the ~100ms sleep",
     );
-    // Backend-unsupplied rusage fields are omitted via skip_serializing_if.
-    assert!(v["rusage"].get("peak_rss_kb").is_none());
-    assert!(v["rusage"].get("user_cpu_ms").is_none());
-    assert!(v["rusage"].get("sys_cpu_ms").is_none());
 }
 
 #[tokio::test]
-async fn exec_stream_includes_rusage_on_exit_event() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+async fn exec_includes_rusage_on_exit_frame() {
+    // The streamed `exit` frame carries the rusage (proto `ExecExit`).
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec/stream"),
-        json!({"command": "sleep 0.1"}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let events = collect_sse(resp.into_body(), BRIEF).await;
-    let exit = events
+    let frames = h
+        .session()
+        .exec(req_with_session(exec_command("sleep 0.1"), id))
+        .await
+        .expect("exec stream")
+        .into_inner()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("frames");
+    let exit = frames
         .iter()
-        .find(|e| e.name == "exit")
-        .expect("stream must end with an `exit` event");
-    let wall_ms = exit.data["rusage"]["wall_ms"]
-        .as_u64()
-        .expect("streaming exit payload must carry rusage.wall_ms");
+        .find_map(|f| match &f.event {
+            Some(app::exec_output::Event::Exit(e)) => Some(*e),
+            _ => None,
+        })
+        .expect("stream must end with an exit frame");
+    let wall_ms = exit
+        .rusage
+        .as_ref()
+        .map(|r| r.wall_ms)
+        .expect("exit frame must carry rusage.wall_ms");
     assert!(wall_ms >= 50, "wall_ms ({wall_ms}) should reflect ~100ms");
 }
 
 #[tokio::test]
 async fn exec_propagates_nonzero_exit_status() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
-
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            json!({"command": "exit 7"}),
-        ))
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
+    let (_, _, exit, _) = grpc_exec(&h, id, exec_command("exit 7"))
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["exit_status"], 7);
+        .expect("exec");
+    assert_eq!(exit, 7);
 }
 
 #[tokio::test]
 async fn exec_separates_stdout_and_stderr() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
-
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            // Use printf to avoid shells that auto-append trailing
-            // newlines differently on macOS vs Linux.
-            json!({"command": "printf out; printf err 1>&2"}),
-        ))
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
+    // printf avoids shell-dependent trailing-newline differences.
+    let (stdout, stderr, _, _) = grpc_exec(&h, id, exec_command("printf out; printf err 1>&2"))
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], "out");
-    assert_eq!(v["stderr"], "err");
+        .expect("exec");
+    assert_eq!(stdout, "out");
+    assert_eq!(stderr, "err");
 }
 
 #[tokio::test]
 async fn exec_with_explicit_argv_skips_shell() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
-
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            // argv path: no `sh -c` wrapper, so glob/redirect chars are
-            // literal. Verify by passing a string with shell metachars.
-            json!({"argv": ["printf", "lit*ral"]}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], "lit*ral");
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
+    // argv path: no `sh -c` wrapper, so glob/redirect chars are literal.
+    let req = app::ExecRequest {
+        session_id: String::new(),
+        command: None,
+        argv: vec!["printf".into(), "lit*ral".into()],
+        env: HashMap::new(),
+        workdir: None,
+        timeout_secs: None,
+    };
+    let (stdout, _, _, _) = grpc_exec(&h, id, req).await.expect("exec");
+    assert_eq!(stdout, "lit*ral");
 }
 
 #[tokio::test]
-async fn exec_returns_404_for_unknown_session() {
-    let app = build_app(MockMetadataStore::arc());
-    let unknown = SessionId::new();
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{unknown}/exec"),
-            json!({"command": "true"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+async fn exec_returns_not_found_for_unknown_session() {
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let err = grpc_exec_err(&h, SessionId::new(), exec_command("true")).await;
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
 }
 
 #[tokio::test]
-async fn exec_returns_409_when_session_has_no_live_sandbox() {
-    // Pre-stage the session row directly in metadata (skipping the
-    // create handler) so the registry has no binding. After ADR
-    // 0015 M2, a row in `Active` with no sandbox binding models
-    // "coord restart lost the in-memory registry"; `ensure_active`
-    // passes and the exec handler's own `registry.get` returns 409.
+async fn exec_returns_failed_precondition_when_session_has_no_live_sandbox() {
+    // A row in `Active` with no sandbox binding models "coord restart
+    // lost the routing"; `ensure_active` passes but the live-sandbox
+    // lookup yields Conflict → FailedPrecondition (the old 409).
     let store = MockMetadataStore::arc();
     let id = store
         .create_session(SessionSpec {
@@ -2475,75 +2467,48 @@ async fn exec_returns_409_when_session_has_no_live_sandbox() {
         .await
         .unwrap();
     seed_to(&store, id, SessionState::Active).await;
-    let app = build_app(store);
+    let h = serve_grpc(TestFixture::new(store, InMemorySecretStore::new()).state).await;
 
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            json!({"command": "echo hi"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let v = body_json(resp.into_body()).await;
+    let err = grpc_exec_err(&h, id, exec_command("echo hi")).await;
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
     assert!(
-        v["message"]
-            .as_str()
-            .unwrap()
-            .to_lowercase()
-            .contains("live sandbox"),
-        "error message should explain why exec can't run",
+        err.message().to_lowercase().contains("live sandbox"),
+        "error message should explain why exec can't run: {:?}",
+        err.message(),
     );
 }
 
 #[tokio::test]
-async fn delete_after_create_unbinds_registry_and_destroys_sandbox() {
+async fn delete_after_create_unbinds_and_destroys_sandbox() {
     let store = MockMetadataStore::arc();
-    let app = build_app(store.clone());
-    let id = api_create_session(app.clone(), "r").await;
+    let h = grpc_fixture(store.clone()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    // Confirm exec works while session is alive.
-    let resp = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            json!({"command": "printf alive"}),
-        ))
+    // Confirm exec works while the session is alive.
+    let (stdout, _, _, _) = grpc_exec(&h, id, exec_command("printf alive"))
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+        .expect("exec while alive");
+    assert_eq!(stdout, "alive");
 
     // Delete it.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::delete(format!("/api/v1/sessions/{id}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    h.session()
+        .delete_session(app::DeleteSessionRequest {
+            session_id: id.to_string(),
+        })
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        .expect("delete");
     assert_eq!(
         store.get_session(id).await.unwrap().status,
         SessionState::Completed
     );
 
-    // Subsequent exec must fail — the live sandbox is gone.
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/sessions/{id}/exec"),
-            json!({"command": "echo nope"}),
-        ))
-        .await
-        .unwrap();
+    // Subsequent exec must fail — the live sandbox is gone (a terminal
+    // session fails `ensure_active` → FailedPrecondition).
+    let err = grpc_exec_err(&h, id, exec_command("echo nope")).await;
     assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "exec after delete must surface the registry miss",
+        err.code(),
+        Code::FailedPrecondition,
+        "exec after delete must surface the missing sandbox: {err:?}",
     );
 }
 
@@ -2624,6 +2589,7 @@ async fn create_session_failure_returns_503_with_no_row() {
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
+        app_grpc_tokens: vec![TEST_TOKEN.to_string()],
         ..CoordinatorConfig::default()
     };
     // ADR 0047/0048: placement reads host rows + ADR 0048 queues on no
@@ -2661,27 +2627,23 @@ async fn create_session_failure_returns_503_with_no_row() {
         })
         .await
         .unwrap();
-    let app = api::router(Arc::new(AppState::new_with_registry(
-        cfg, services, registry,
-    )));
+    let state = Arc::new(AppState::new_with_registry(cfg, services, registry));
+    let h = serve_grpc(state).await;
 
-    let resp = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/sessions",
-            json!({
-                "image": "cortex/api:warm-1",
-                "workspace": {"kind":"empty"},
-                "harness": {"kind":"none"},
-            }),
-        ))
+    let err = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: "cortex/api:warm-1".into(),
+            mode: "agent".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
         .await
-        .unwrap();
-    // New contract: scheduling failures bubble as 503, no row is
-    // ever written. Caller is expected to retry. (The previous shape
-    // marked an orphan Pending→Failed row to leave audit breadcrumbs;
-    // we now keep Postgres clean and lean on coord logs for forensics.)
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        .expect_err("boot failure must surface as an error");
+    // New contract: scheduling/boot failures bubble as Unavailable (the
+    // old 503), no row is ever written. The caller is expected to retry.
+    assert_eq!(err.code(), Code::Unavailable, "{err:?}");
 
     let active = store.list_active_sessions().await.unwrap();
     assert!(active.is_empty());
@@ -2694,6 +2656,8 @@ async fn create_session_failure_returns_503_with_no_row() {
 
 #[tokio::test]
 async fn unknown_route_returns_404() {
+    // Surviving axum surface: an unknown HTTP path is still a 404 (the
+    // healthz / host-ingest / forge-seam router rejects everything else).
     let app = build_app(MockMetadataStore::arc());
     let resp = app
         .oneshot(Request::get("/nope").body(Body::empty()).unwrap())
@@ -2702,19 +2666,11 @@ async fn unknown_route_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
-async fn wrong_method_on_known_route_returns_405() {
-    let app = build_app(MockMetadataStore::arc());
-    let resp = app
-        .oneshot(
-            Request::put("/api/v1/sessions")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-}
+// ADR 0051: `wrong_method_on_known_route_returns_405` targeted the deleted
+// web-facing `/api/v1/sessions` route (PUT → 405). That route is gone from
+// the axum surface entirely; method dispatch is now tonic's job on the
+// app-gRPC services. Deleted — no surviving HTTP route has a method-mismatch
+// contract worth pinning here.
 
 // ---------------------------------------------------------------------
 // Image manifest + secret resolution + rootfs materialization
@@ -2740,33 +2696,14 @@ async fn manifest_env_lands_in_sandbox_environment() {
             ENGRAM_TEST_MARKER = "from-manifest"
         "#,
     );
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = post(
-        app.clone(),
-        "/api/v1/sessions",
-        json!({
-            "image": "cortex/api:warm-1",
-            "workspace": {"kind":"empty"},
-            "harness": {"kind":"none"},
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let id: SessionId = body_json(resp.into_body()).await["session_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let id = grpc_create_image(&h, "cortex/api:warm-1").await;
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "printf %s \"$ENGRAM_TEST_MARKER\""}),
-    )
-    .await;
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], "from-manifest");
+    let (stdout, _, _, _) = grpc_exec(&h, id, exec_command("printf %s \"$ENGRAM_TEST_MARKER\""))
+        .await
+        .expect("exec");
+    assert_eq!(stdout, "from-manifest");
 }
 
 // Stage B1 made the coordinator stateless w.r.t. image data — rootfs
@@ -2782,34 +2719,18 @@ async fn rootfs_directory_is_materialized_into_sandbox_cwd() {
     let store = MockMetadataStore::arc();
     let f = TestFixture::new(store, InMemorySecretStore::new());
     f.write_image("cortex/api", "warm-1", r#"name = "cortex-api""#);
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = post(
-        app.clone(),
-        "/api/v1/sessions",
-        json!({
-            "image": "cortex/api:warm-1",
-            "workspace": {"kind":"empty"},
-            "harness": {"kind":"none"},
-        }),
-    )
-    .await;
-    let id: SessionId = body_json(resp.into_body()).await["session_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let id = grpc_create_image(&h, "cortex/api:warm-1").await;
 
     // Files from the image's rootfs must be visible in the sandbox cwd.
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "cat README.md && cat scripts/setup.sh | head -1"}),
+    let (stdout, _, _, _) = grpc_exec(
+        &h,
+        id,
+        exec_command("cat README.md && cat scripts/setup.sh | head -1"),
     )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    let stdout = v["stdout"].as_str().unwrap();
+    .await
+    .expect("exec");
     assert!(stdout.contains("# starter"));
     assert!(stdout.contains("#!/bin/sh"));
 }
@@ -2831,33 +2752,14 @@ async fn required_secret_resolves_into_sandbox_env_in_literal_mode() {
             required = true
         "#,
     );
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = post(
-        app.clone(),
-        "/api/v1/sessions",
-        json!({
-            "image": "cortex/api:warm-1",
-            "workspace": {"kind":"empty"},
-            "harness": {"kind":"none"},
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let id: SessionId = body_json(resp.into_body()).await["session_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let id = grpc_create_image(&h, "cortex/api:warm-1").await;
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "printf %s \"$GITHUB_TOKEN\""}),
-    )
-    .await;
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], "ghp_test_value");
+    let (stdout, _, _, _) = grpc_exec(&h, id, exec_command("printf %s \"$GITHUB_TOKEN\""))
+        .await
+        .expect("exec");
+    assert_eq!(stdout, "ghp_test_value");
 }
 
 #[tokio::test]
@@ -2875,26 +2777,27 @@ async fn required_secret_missing_in_store_fails_session_create() {
             required = true
         "#,
     );
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = post(
-        app,
-        "/api/v1/sessions",
-        json!({
-            "image": "cortex/api:warm-1",
-            "workspace": {"kind":"empty"},
-            "harness": {"kind":"none"},
-        }),
-    )
-    .await;
-    // Required-but-missing secret is a 500 today (it's an
-    // operator-config issue, not a client problem). The error message
-    // must call out the secret name so logs are debuggable.
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let v = body_json(resp.into_body()).await;
+    let err = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: "cortex/api:warm-1".into(),
+            mode: "agent".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
+        .await
+        .expect_err("required-but-missing secret must fail create");
+    // Required-but-missing secret is an operator-config issue, not a
+    // client problem → Internal core → Code::Internal (the old 500). The
+    // message must call out the secret name so logs are debuggable.
+    assert_eq!(err.code(), Code::Internal, "{err:?}");
     assert!(
-        v["message"].as_str().unwrap().contains("GITHUB_TOKEN"),
-        "missing-secret error must name the secret",
+        err.message().contains("GITHUB_TOKEN"),
+        "missing-secret error must name the secret: {:?}",
+        err.message(),
     );
 }
 
@@ -2917,34 +2820,19 @@ async fn optional_secret_absence_is_silently_ok() {
             required = false
         "#,
     );
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = post(
-        app.clone(),
-        "/api/v1/sessions",
-        json!({
-            "image": "cortex/api:warm-1",
-            "workspace": {"kind":"empty"},
-            "harness": {"kind":"none"},
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let id: SessionId = body_json(resp.into_body()).await["session_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let id = grpc_create_image(&h, "cortex/api:warm-1").await;
 
     // Required is present; optional is silently absent (env var unset).
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "echo \"required=$GITHUB_TOKEN optional=${OPTIONAL_KEY-MISSING}\""}),
+    let (stdout, _, _, _) = grpc_exec(
+        &h,
+        id,
+        exec_command("echo \"required=$GITHUB_TOKEN optional=${OPTIONAL_KEY-MISSING}\""),
     )
-    .await;
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], "required=real optional=MISSING\n");
+    .await
+    .expect("exec");
+    assert_eq!(stdout, "required=real optional=MISSING\n");
 }
 
 #[tokio::test]
@@ -2973,32 +2861,13 @@ async fn broker_mode_emits_placeholders_not_real_values() {
             required = true
         "#,
     );
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
-    let resp = post(
-        app.clone(),
-        "/api/v1/sessions",
-        json!({
-            "image": "cortex/api:warm-1",
-            "workspace": {"kind":"empty"},
-            "harness": {"kind":"none"},
-        }),
-    )
-    .await;
-    let id: SessionId = body_json(resp.into_body()).await["session_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let id = grpc_create_image(&h, "cortex/api:warm-1").await;
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "printf %s \"$GITHUB_TOKEN\""}),
-    )
-    .await;
-    let v = body_json(resp.into_body()).await;
-    let observed = v["stdout"].as_str().unwrap();
+    let (observed, _, _, _) = grpc_exec(&h, id, exec_command("printf %s \"$GITHUB_TOKEN\""))
+        .await
+        .expect("exec");
     assert!(
         observed.starts_with("engram_ph_"),
         "broker mode must emit a placeholder; got {observed:?}",
@@ -3023,25 +2892,25 @@ async fn manifest_resource_hints_override_defaults() {
             vcpus = 4
         "#,
     );
-    let app = f.app;
+    let h = serve_grpc(f.state).await;
 
     // The hints flow through to the SandboxSpec the backend gets;
     // ProcessBackend doesn't enforce them, but a future Firecracker
     // backend will. Assert the session creation succeeds and reaches
     // an Active state (the hints are well-formed integers).
-    let resp = post(
-        app,
-        "/api/v1/sessions",
-        json!({
-            "image": "cortex/api:warm-1",
-            "workspace": {"kind":"empty"},
-            "harness": {"kind":"none"},
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["status"], "active");
+    let resp = h
+        .session()
+        .create_session(app::CreateSessionRequest {
+            image_uri: "cortex/api:warm-1".into(),
+            mode: "agent".into(),
+            prompt: None,
+            harness_secret_id: None,
+            secrets: HashMap::new(),
+        })
+        .await
+        .expect("create with resource hints")
+        .into_inner();
+    assert_eq!(resp.status, "active");
 }
 
 // ---------------------------------------------------------------------
@@ -3056,24 +2925,18 @@ async fn back_to_back_session_creates_succeed() {
     // pools deleted (ADR 0008) it now just sanity-checks the
     // chunked-OCI cold path doesn't deadlock on a second create.
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store, InMemorySecretStore::new());
-    let app = f.app;
+    let h = grpc_fixture(store).await;
 
-    let id_a = api_create_session(app.clone(), "warm/test").await;
-    let id_b = api_create_session(app.clone(), "warm/test").await;
+    let id_a = grpc_create_session(&h, "warm/test").await;
+    let id_b = grpc_create_session(&h, "warm/test").await;
     assert_ne!(id_a, id_b);
 
     // Both sessions should be runnable.
     for sid in [id_a, id_b] {
-        let resp = post(
-            app.clone(),
-            &format!("/api/v1/sessions/{sid}/exec"),
-            json!({"command": "printf alive"}),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp.into_body()).await;
-        assert_eq!(v["stdout"], "alive");
+        let (stdout, _, _, _) = grpc_exec(&h, sid, exec_command("printf alive"))
+            .await
+            .expect("exec");
+        assert_eq!(stdout, "alive");
     }
 }
 
@@ -3082,183 +2945,125 @@ async fn engram_session_id_is_injected_per_exec() {
     // ENGRAM_SESSION_ID must be injected at exec time, not baked in
     // at sandbox creation, so each session sees its own id.
     let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store, InMemorySecretStore::new());
-    let app = f.app;
+    let h = grpc_fixture(store).await;
 
-    let id = api_create_session(app.clone(), "warm/test").await;
+    let id = grpc_create_session(&h, "warm/test").await;
 
-    let resp = post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "printf %s \"$ENGRAM_SESSION_ID\""}),
-    )
-    .await;
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["stdout"], id.to_string());
+    let (stdout, _, _, _) = grpc_exec(&h, id, exec_command("printf %s \"$ENGRAM_SESSION_ID\""))
+        .await
+        .expect("exec");
+    assert_eq!(stdout, id.to_string());
 }
 
 // ---------------------------------------------------------------------
-// Persistent event log + late-join via ?since=N / Last-Event-ID
+// Persistent event log + late-join via StreamEvents `since` (gRPC)
+//
+// The proto `SessionEvent.idx` is the persistent log's monotonic index
+// (the old SSE `id:` field). `StreamEvents { since }` replays everything
+// with idx > since; `since = None` (proto unset) = from the start.
+//
+// The Last-Event-ID-header variants of these tests
+// (`last_event_id_header_drives_reconnect`,
+// `since_query_wins_when_higher_than_last_event_id_header`) tested the
+// deleted axum SSE handler's HTTP reconnect-header merge — a transport
+// concern with no gRPC analog. The `since` replay semantics they shared
+// are covered by `since_*` below; the header merge is dropped with the
+// SSE handler.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn every_persisted_event_carries_a_monotonic_id_on_the_wire() {
-    // Subscribe + drive a quick exec; each SSE message must have an
-    // `id:` set to the persistent log's idx, and ids must be strictly
-    // increasing within a session.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+async fn every_persisted_event_carries_a_monotonic_idx_on_the_wire() {
+    // Subscribe + drive a quick exec; each event must carry a monotonic
+    // idx, strictly increasing and unique within a session.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    let sub = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let collector = tokio::spawn(async move { collect_sse(sub.into_body(), BRIEF).await });
+    let stream = open_events(&h, id, None).await.expect("open events");
+    let collector = tokio::spawn(collect_events(stream, BRIEF));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    post(
-        app,
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "printf via-bus"}),
-    )
-    .await;
+    grpc_exec(&h, id, exec_command("printf via-bus"))
+        .await
+        .expect("exec");
 
     let events = collector.await.unwrap();
-    let ids: Vec<i64> = events.iter().filter_map(|e| e.id).collect();
+    // Lag notifications carry no idx (proto optional); filter them out.
+    let ids: Vec<i64> = events.iter().filter_map(|e| e.idx).collect();
     assert!(
         !ids.is_empty(),
-        "live events should carry id: fields; got {events:?}",
+        "live events should carry idx; got {events:?}"
     );
     let mut sorted = ids.clone();
     sorted.sort();
-    assert_eq!(ids, sorted, "ids must arrive in monotonic order");
+    assert_eq!(ids, sorted, "idx must arrive in monotonic order");
     let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
     assert_eq!(
         unique.len(),
         ids.len(),
-        "ids must be unique within a session"
+        "idx must be unique within a session"
     );
 }
 
 #[tokio::test]
-async fn since_query_replays_history_from_persistent_log() {
-    // Drive some activity, then connect to /events?since=-1 to replay
-    // everything from the start of the log. The historical events
-    // must arrive on the wire even though we connected after they
-    // were emitted — the live-only bus would have missed them, the
-    // persistent log catches them up.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+async fn since_replays_history_from_persistent_log() {
+    // Drive some activity with no subscriber, then open StreamEvents with
+    // `since = None` (from the start) to replay everything — the live-only
+    // bus would have missed it; the persistent log catches it up.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    // Generate some history while no one is subscribing.
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
-    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/resume"),
-        json!({}),
-    )
-    .await;
+    grpc_snapshot(&h, id).await.expect("snapshot");
+    grpc_evict_local(&h, id).await.expect("evict");
+    grpc_resume(&h, id).await.expect("resume");
 
-    // Now subscribe with since=-1 (start of log).
-    let sub = app
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(sub.status(), StatusCode::OK);
-
-    let events = collect_sse(sub.into_body(), Duration::from_millis(300)).await;
-    let names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
-    // We should see the full lifecycle so far: status_changed (create)
-    // + snapshot_taken + evicted + status_changed (Active->Idle) +
-    // resumed + status_changed (Idle->Active).
+    let stream = open_events(&h, id, None).await.expect("open events");
+    let events = collect_events(stream, Duration::from_millis(300)).await;
+    let names: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     for needle in ["status_changed", "snapshot_taken", "evicted", "resumed"] {
         assert!(
             names.contains(&needle),
-            "?since=-1 must replay {needle}; got {names:?}",
+            "since=start must replay {needle}; got {names:?}",
         );
     }
-    assert!(
-        events.iter().all(|e| e.id.is_some()),
-        "every replayed event must carry an id",
-    );
 }
 
 #[tokio::test]
-async fn since_query_skips_events_already_seen() {
-    // Hold a checkpoint after some activity. Reconnect with since=cp
-    // and verify we see only the events strictly after cp.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+async fn since_skips_events_already_seen() {
+    // Replay everything once to find a checkpoint idx, drive a second
+    // batch, then reconnect with `since = checkpoint` and verify only
+    // events strictly after the checkpoint come back.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    // First batch.
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
+    grpc_snapshot(&h, id).await.expect("snapshot");
 
-    // Read everything-so-far to find the checkpoint idx.
-    let baseline = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let baseline_events = collect_sse(baseline.into_body(), Duration::from_millis(300)).await;
+    let baseline = open_events(&h, id, None).await.expect("baseline open");
+    let baseline_events = collect_events(baseline, Duration::from_millis(300)).await;
     let checkpoint = baseline_events
         .iter()
-        .filter_map(|e| e.id)
+        .filter_map(|e| e.idx)
         .max()
         .expect("baseline replay produced at least one event");
 
-    // Second batch — this is what we want to see in the next replay.
-    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
+    // Second batch.
+    grpc_evict_local(&h, id).await.expect("evict");
 
-    // Reconnect with since=checkpoint. Should NOT see anything from
-    // the first batch.
-    let resume = app
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events?since={checkpoint}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let resume = open_events(&h, id, Some(checkpoint))
         .await
-        .unwrap();
-    let after = collect_sse(resume.into_body(), Duration::from_millis(300)).await;
+        .expect("resume open");
+    let after = collect_events(resume, Duration::from_millis(300)).await;
     assert!(
         !after.is_empty(),
         "reconnect at checkpoint {checkpoint} should still replay the second batch",
     );
-    for ev in &after {
-        let id = ev.id.expect("replay events carry id");
+    for ev in after.iter().filter(|e| e.idx.is_some()) {
+        let idx = ev.idx.unwrap();
         assert!(
-            id > checkpoint,
-            "since={checkpoint} must skip everything up to and including that idx; saw idx={id}",
+            idx > checkpoint,
+            "since={checkpoint} must skip everything up to and including that idx; saw idx={idx}",
         );
     }
-    let names: Vec<&str> = after.iter().map(|e| e.name.as_str()).collect();
+    let names: Vec<&str> = after.iter().map(|e| e.kind.as_str()).collect();
     assert!(
         names.contains(&"evicted"),
         "second-batch event missing: {names:?}"
@@ -3266,131 +3071,26 @@ async fn since_query_skips_events_already_seen() {
 }
 
 #[tokio::test]
-async fn last_event_id_header_drives_reconnect() {
-    // Same as the `since=` test but using the EventSource-style
-    // header. Documented spec: Browser EventSource sends the last
-    // received id back automatically on reconnect via this header.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
-
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
-    let baseline = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let baseline_events = collect_sse(baseline.into_body(), Duration::from_millis(300)).await;
-    let checkpoint = baseline_events.iter().filter_map(|e| e.id).max().unwrap();
-
-    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
-
-    let resume = app
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events"))
-                .header("last-event-id", checkpoint.to_string())
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let after = collect_sse(resume.into_body(), Duration::from_millis(300)).await;
-    for ev in &after {
-        assert!(ev.id.unwrap() > checkpoint);
-    }
-}
-
-#[tokio::test]
-async fn since_query_wins_when_higher_than_last_event_id_header() {
-    // If both ?since= and Last-Event-ID are present, we use the higher
-    // one — protects against accidental rewinds across reconnects.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
-
-    let baseline = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let baseline_events = collect_sse(baseline.into_body(), Duration::from_millis(300)).await;
-    let high = baseline_events.iter().filter_map(|e| e.id).max().unwrap();
-
-    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
-
-    // Stale header (way back), fresh query (current high water).
-    let resume = app
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events?since={high}"))
-                .header("last-event-id", "-1")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let after = collect_sse(resume.into_body(), Duration::from_millis(300)).await;
-    for ev in &after {
-        assert!(
-            ev.id.unwrap() > high,
-            "?since={high} must win over Last-Event-ID=-1",
-        );
-    }
-}
-
-#[tokio::test]
 async fn replay_then_live_seam_is_gap_free_and_dup_free() {
-    // The hard test: subscribe with ?since=N, while live events are
-    // arriving. The seam between the replayed log and the live tail
+    // The hard test: open StreamEvents with `since = None` while live
+    // events arrive. The seam between the replayed log and the live tail
     // must not duplicate or skip any idx.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
     // Drive some history.
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
+    grpc_snapshot(&h, id).await.expect("snapshot");
 
-    // Subscribe at since=-1 and concurrently drive more activity.
-    let sub = app
-        .clone()
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let collector = tokio::spawn(async move { collect_sse(sub.into_body(), BRIEF).await });
+    // Subscribe from the start and concurrently drive more activity.
+    let stream = open_events(&h, id, None).await.expect("open events");
+    let collector = tokio::spawn(collect_events(stream, BRIEF));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
-    post(app, &format!("/api/v1/sessions/{id}/resume"), json!({})).await;
+    grpc_evict_local(&h, id).await.expect("evict");
+    grpc_resume(&h, id).await.expect("resume");
 
     let events = collector.await.unwrap();
-    let ids: Vec<i64> = events.iter().filter_map(|e| e.id).collect();
+    let ids: Vec<i64> = events.iter().filter_map(|e| e.idx).collect();
     assert!(!ids.is_empty());
 
     // Strict monotonicity (no duplicates, no out-of-order).
@@ -3399,13 +3099,10 @@ async fn replay_then_live_seam_is_gap_free_and_dup_free() {
     sorted.dedup();
     assert_eq!(
         ids, sorted,
-        "ids across the replay→live seam must be strictly increasing with no duplicates",
+        "idx across the replay→live seam must be strictly increasing with no duplicates",
     );
 
-    // No gaps within the run we observe (idx may not start at 0
-    // because the test fixture's MockMetadataStore allocates idx 0
-    // for the create's status_changed event, which we DO see at
-    // since=-1).
+    // No gaps within the run we observe.
     if let (Some(first), Some(last)) = (ids.first(), ids.last()) {
         let expected_count = (last - first + 1) as usize;
         assert_eq!(
@@ -3419,48 +3116,27 @@ async fn replay_then_live_seam_is_gap_free_and_dup_free() {
 
 #[tokio::test]
 async fn persistent_log_captures_lifecycle_and_exec_kinds() {
-    // Defense in depth: drive every kind of event the coordinator
-    // emits and verify each appears in the persistent log via
-    // ?since=-1 replay. If a future change forgets to call emit() in
-    // some handler, this test catches it.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+    // Defense in depth: drive every kind of event the coordinator emits
+    // and verify each appears in the persistent log via a since=start
+    // replay. If a future change forgets to call emit() in some core, this
+    // test catches it.
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    // exec → exec_started, stdout, exec_completed
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/exec"),
-        json!({"command": "printf hi; printf err 1>&2"}),
-    )
-    .await;
-    // snapshot → snapshot_taken
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/snapshot"),
-        json!({}),
-    )
-    .await;
-    // evict → evicted + status_changed
-    delete(app.clone(), &format!("/api/v1/sessions/{id}/local")).await;
-    // resume → resumed + status_changed
-    post(
-        app.clone(),
-        &format!("/api/v1/sessions/{id}/resume"),
-        json!({}),
-    )
-    .await;
-
-    let log = app
-        .oneshot(
-            Request::get(format!("/api/v1/sessions/{id}/events?since=-1"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    // exec → exec_started, stdout, stderr, exec_completed
+    grpc_exec(&h, id, exec_command("printf hi; printf err 1>&2"))
         .await
-        .unwrap();
-    let events = collect_sse(log.into_body(), Duration::from_millis(300)).await;
-    let kinds: std::collections::HashSet<&str> = events.iter().map(|e| e.name.as_str()).collect();
+        .expect("exec");
+    // snapshot → snapshot_taken
+    grpc_snapshot(&h, id).await.expect("snapshot");
+    // evict → evicted + status_changed
+    grpc_evict_local(&h, id).await.expect("evict");
+    // resume → resumed + status_changed
+    grpc_resume(&h, id).await.expect("resume");
+
+    let log = open_events(&h, id, None).await.expect("open log");
+    let events = collect_events(log, Duration::from_millis(300)).await;
+    let kinds: std::collections::HashSet<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     for required in [
         "status_changed",
         "exec_started",
@@ -3479,172 +3155,54 @@ async fn persistent_log_captures_lifecycle_and_exec_kinds() {
 }
 
 // ---------------------------------------------------------------------
-// ADR 0005 retired the checkpoint / fork / diff / log?kind=workspace
-// endpoints along with the platform's git surface. The deleted routes
-// now return 404 because they're no longer registered.
+// GetLog kind validation (gRPC). ADR 0005 retired the checkpoint / fork /
+// diff endpoints with the platform's git surface, and ADR 0051 deleted the
+// whole web-facing session REST surface — there are no such routes (and no
+// gRPC RPCs) to 404-probe anymore. What survives is the `GetLog` kind
+// guard: only `conversation` is supported; anything else is rejected.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn deleted_git_endpoints_return_404() {
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-    let id = api_create_session(app.clone(), "r").await;
+async fn get_log_rejects_unsupported_kind() {
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let id = grpc_create_session(&h, "r").await;
 
-    for path in [
-        format!("/api/v1/sessions/{id}/checkpoint"),
-        format!("/api/v1/sessions/{id}/fork"),
-    ] {
-        let resp = post(app.clone(), &path, json!({})).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "{path} must be retired"
-        );
-    }
-
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!("/api/v1/sessions/{id}/diff"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    // The old SSE `log?kind=workspace` → 400; now GetLog kind=workspace →
+    // BadRequest core → InvalidArgument.
+    let err = h
+        .session()
+        .get_log(app::GetLogRequest {
+            session_id: id.to_string(),
+            kind: Some("workspace".into()),
+            limit: None,
+        })
         .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "diff endpoint must be retired"
-    );
+        .expect_err("unsupported log kind must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 
-    // log?kind=workspace returns 400 (the route still exists, but
-    // only kind=conversation is supported now).
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!("/api/v1/sessions/{id}/log?kind=workspace"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    // The default kind (`conversation`) is accepted.
+    h.session()
+        .get_log(app::GetLogRequest {
+            session_id: id.to_string(),
+            kind: None,
+            limit: None,
+        })
         .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "log?kind=workspace must be rejected"
-    );
+        .expect("conversation log must be accepted");
 }
 
 // ---------------------------------------------------------------------
-// ADR 0007 — POST /api/admin/reap-materialize-dir
+// ADR 0051 DELETED the two `admin_reap_materialize_dir_*` tests with no
+// replacement: the `POST /api/admin/reap-materialize-dir` route AND its
+// handler/core were removed in the gRPC-only cut, and the FleetService
+// proto deliberately ships NO RPC for it (fleet.proto: "INTENTIONAL
+// DROPS: … POST /api/admin/reap-materialize-dir get NO RPC — neither has
+// a web caller today. A later task decides keep-behind-bearer vs
+// delete."). With the production capability itself dropped, there is no
+// `_core` fn or service method left to exercise; the tests are removed
+// rather than migrated. (The underlying host-side reap still exists as
+// `HostService::ReapMaterializeDir` and is covered by host-agent tests.)
 // ---------------------------------------------------------------------
-
-#[tokio::test]
-async fn admin_reap_materialize_dir_reports_host_not_in_grpc_pool() {
-    // ADR 0013: the fanout dispatches through `state.services.host_pool`.
-    // The default TestFixture registers an in-proc ProcessBackend via
-    // `register()` but doesn't populate the pool (no HTTP /register
-    // call in tests). Hosts not in the pool surface a per-host error
-    // explaining the skip — same "graceful skip" contract as the
-    // old admin_client path, just keyed on the new pool.
-    let store = MockMetadataStore::arc();
-    let app = build_app(store);
-
-    let resp = post(app, "/api/v1/admin/reap-materialize-dir", json!({})).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["files_deleted"], 0);
-    assert_eq!(v["bytes_freed"], 0);
-    let per_host = v["per_host"]
-        .as_array()
-        .expect("per_host array must be present in coordinator mode");
-    assert!(!per_host.is_empty(), "test fixture registers one host");
-    let entry = &per_host[0];
-    assert!(entry["stats"].is_null(), "no stats when host was skipped");
-    let err = entry["error"]
-        .as_str()
-        .expect("not in gRPC pool → per-host error string");
-    assert!(
-        err.contains("not yet registered") || err.contains("gRPC pool"),
-        "error must explain the skip reason, got: {err}",
-    );
-}
-
-#[tokio::test]
-async fn admin_reap_materialize_dir_deletes_orphan_and_keeps_live() {
-    // End-to-end: stand up an app with a real `materialize_dir`,
-    // plant two `.ext4` files (one for a live manifest, one for
-    // an orphan), fire the endpoint, assert the orphan is gone.
-    // The `MockMetadataStore` doesn't override
-    // `list_live_disk_manifest_ids`, so the default Vec::new()
-    // returns the empty set — every file on disk is treated as
-    // orphan. That's fine for this test: we just need to prove
-    // the endpoint actually scans + deletes + reports stats.
-    use std::path::PathBuf;
-
-    let store = MockMetadataStore::arc();
-    let materialize_dir: PathBuf = tempfile::tempdir().expect("materialize tempdir").keep();
-
-    // Plant two ext4 files matching the `<uuid>-v<num>.ext4` shape.
-    let orphan_id = uuid::Uuid::new_v4();
-    let orphan_path = materialize_dir.join(format!("{orphan_id}-v1.ext4"));
-    std::fs::write(&orphan_path, b"orphan-bytes").unwrap();
-    let live_id = uuid::Uuid::new_v4();
-    let live_path = materialize_dir.join(format!("{live_id}-v3.ext4"));
-    std::fs::write(&live_path, b"live-bytes-larger-payload").unwrap();
-
-    let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
-    let services = Services {
-        meta: store,
-        cloud: Arc::new(MockCloud::new()),
-        host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
-            ProcessBackend::new(sandbox_dir),
-        ))),
-        secrets: Arc::new(InMemorySecretStore::new()),
-        kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
-            [0u8; 32], "test:v1",
-        )),
-        oci: std::sync::Arc::new(engram_oci::OciClient::new(std::sync::Arc::new(
-            engram_oci::AnonymousResolver,
-        ))),
-        auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
-        blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
-            std::env::temp_dir().join("engram-blobs-test"),
-        )),
-        chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
-            engram_storage_local::LocalBlobStorage::new(
-                std::env::temp_dir().join("engram-blobs-test"),
-            ),
-        )),
-        host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
-        materialize_dir: Some(materialize_dir.clone()),
-    };
-    let cfg = engram_coordinator::CoordinatorConfig::default();
-    let state = Arc::new(engram_coordinator::AppState::new(cfg, services));
-    let app = engram_coordinator::api::router(state);
-
-    // min_age_secs=0 lets the freshly-written files be deletable.
-    // Without this override the 1h default would skip them all.
-    let resp = post(
-        app,
-        "/api/v1/admin/reap-materialize-dir?min_age_secs=0",
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let v = body_json(resp.into_body()).await;
-    assert_eq!(v["files_scanned"], 2);
-    // Empty live set → both files are orphans.
-    assert_eq!(v["files_deleted"], 2, "body: {v:?}");
-    assert!(v["bytes_freed"].as_u64().unwrap() > 0);
-    assert!(!orphan_path.exists());
-    assert!(!live_path.exists());
-}
 
 // ---------------------------------------------------------------------
 // ADR 0016 Phase B: live-manifest publish HTTP round-trip
@@ -3753,21 +3311,31 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
 // pipeline and live in commit 4b's e2e test.
 // ---------------------------------------------------------------------
 
-#[tokio::test]
-async fn flush_now_returns_404_when_session_unknown() {
-    let app = build_app(MockMetadataStore::arc());
-    let unknown = SessionId::new();
-    let resp = post(
-        app,
-        &format!("/api/v1/admin/sessions/{unknown}/flush-now"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+/// Flush a session over gRPC (the old `POST /admin/sessions/:id/flush-now`,
+/// now `FleetService::FlushSession`).
+async fn grpc_flush(
+    h: &GrpcHarness,
+    id: SessionId,
+) -> Result<app::FlushSessionResponse, tonic::Status> {
+    h.fleet()
+        .flush_session(app::FlushSessionRequest {
+            session_id: id.to_string(),
+        })
+        .await
+        .map(|r| r.into_inner())
 }
 
 #[tokio::test]
-async fn flush_now_returns_409_when_session_has_no_bound_sandbox() {
+async fn flush_session_returns_not_found_when_session_unknown() {
+    let h = grpc_fixture(MockMetadataStore::arc()).await;
+    let err = grpc_flush(&h, SessionId::new())
+        .await
+        .expect_err("unknown session must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
+}
+
+#[tokio::test]
+async fn flush_session_fails_precondition_when_session_has_no_bound_sandbox() {
     let meta = MockMetadataStore::arc();
     let session_id = SessionId::new();
     {
@@ -3788,23 +3356,21 @@ async fn flush_now_returns_409_when_session_has_no_bound_sandbox() {
             },
         );
     }
-    let app = build_app(meta);
-    let resp = post(
-        app,
-        &format!("/api/v1/admin/sessions/{session_id}/flush-now"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let h = grpc_fixture(meta).await;
+    let err = grpc_flush(&h, session_id)
+        .await
+        .expect_err("no bound sandbox must be a Conflict");
+    // ADR 0051: Conflict core → FailedPrecondition (the old 409).
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
 }
 
 #[tokio::test]
-async fn flush_now_returns_idle_when_host_has_no_dirty_bytes() {
+async fn flush_session_returns_idle_when_host_has_no_dirty_bytes() {
     let meta = MockMetadataStore::arc();
     let session_id = SessionId::new();
     // Bound to a sandbox the local ProcessBackend doesn't know about
     // — `flush_sandbox`'s trait default returns Ok(None), which the
-    // endpoint maps to `outcome: idle`.
+    // core maps to `outcome: idle`.
     let sandbox_id = engram_core::SandboxId::new();
     {
         let mut sessions = meta.sessions.lock();
@@ -3824,17 +3390,11 @@ async fn flush_now_returns_idle_when_host_has_no_dirty_bytes() {
             },
         );
     }
-    let app = build_app(meta.clone());
-    let resp = post(
-        app,
-        &format!("/api/v1/admin/sessions/{session_id}/flush-now"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
-    assert_eq!(body["outcome"], "idle");
-    assert!(body.get("manifest_version").is_none() || body["manifest_version"].is_null());
+    let h = grpc_fixture(meta.clone()).await;
+    let resp = grpc_flush(&h, session_id)
+        .await
+        .expect("flush must succeed");
+    assert_eq!(resp.outcome, "idle");
     // No PG write happened — generation stayed at 0.
     assert!(meta.live_disk_manifests.lock().is_empty());
     assert_eq!(

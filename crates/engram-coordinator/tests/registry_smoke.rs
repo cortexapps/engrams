@@ -1,55 +1,46 @@
-//! HTTP smoke test for the Phase 5 registry + harness + encryption
-//! surface.
+//! app-gRPC smoke test for the registry + enabled-images + encryption
+//! surface (ADR 0051: the web-facing REST routes were deleted; the same
+//! `_core` logic now lives behind `ImageService`).
 //!
-//! Wires the real `axum` router against an in-memory `MetadataStore`
-//! and a real [`engram_crypto::CredCipher`], then drives every CLI-
-//! reachable verb through `tower::ServiceExt::oneshot`. The wire
-//! shape exercised here is exactly what `engram registry add`,
-//! `engram registry list`, etc. POST to the coordinator — the CLI is
-//! a thin wrapper over `reqwest`, so locking down this contract
-//! locks down the CLI.
+//! Stands up the real `grpc_app::server` over an in-memory `MetadataStore`
+//! and a real [`engram_crypto::CredCipher`], then drives every verb through
+//! typed tonic clients — the established pattern from `tests/grpc_app.rs`.
+//! The wire shape exercised here is exactly what the orchestrator's
+//! `ImageService` calls map to.
 //!
 //! What this catches:
-//! - Wire shape regressions on `POST /api/registries`,
-//!   `GET /api/registries`, `DELETE /api/registries/:host`
-//! - Same for `/api/harnesses`
-//! - The polymorphic `auth_kind` dispatch (static vs
-//!   gcp_workload_identity)
+//! - The `AddRegistry` / `ListRegistries` / `DeleteRegistry` round-trip
+//! - The polymorphic `auth` oneof dispatch (static vs
+//!   gcp_workload_identity vs anonymous)
 //! - Encryption-at-rest: a static-credential row's ciphertext is
-//!   genuinely sealed (not just b64'd plaintext) — and the list
-//!   endpoint never echoes any cipher material back to clients
+//!   genuinely sealed (not just b64'd plaintext) — and the list RPC
+//!   never echoes any cipher material back to clients
 //! - Validation surface: missing fields, empty strings, conflicting
-//!   auth-kind shapes
+//!   auth-kind shapes (now `InvalidArgument` in place of 400/422)
+//! - `ListEnabledImages` / `DisableImage` / `RefreshImage` validation
+//!   (the paths that don't need a live registry)
 //!
-//! What this does *not* catch (deliberately, to keep the smoke loop
-//! fast):
-//! - clap argument parsing — covered by clap's derive codegen and
-//!   the small number of CLI-side conversion fns
-//! - Real GCP token fetch — the metadata server isn't available in
-//!   CI; covered by the `engram-oci-auth` unit tests instead
-//! - Real Postgres / live registry — see `tests/ha_listener.rs` for
-//!   the existing `#[ignore]` pattern when those are wanted
+//! What this does *not* catch (deliberately): real GCP token fetch, real
+//! Postgres / live registry, the full `EnableImage` OCI pull (see the
+//! testcontainer-backed `registry_e2e.rs`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
 use engram_cloud_mock::MockCloud;
-use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
+use engram_coordinator::{grpc_app, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
 use engram_core::types::registry::{RegistryAuthSpec, RegistryCredential};
 use engram_core::types::{
     HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
+use engram_protocol::app;
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
-use http_body_util::BodyExt;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
-use tower::ServiceExt;
+use tonic::Code;
 
 // ---------------------------------------------------------------------
 // MockMetadataStore — narrower than `tests/api.rs::MockMetadataStore`,
@@ -280,10 +271,55 @@ impl MetadataStore for MockMetadataStore {
 // Fixture
 // ---------------------------------------------------------------------
 
-/// Build a router wired to an empty `MockMetadataStore` and a real
-/// `EnvVarKeyProvider` test KEK. Returns the router + a handle on
-/// the store so tests can peek at what landed.
-fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
+/// Token the gRPC test server is configured with.
+const TEST_TOKEN: &str = "test-app-grpc-token";
+
+/// A live app-gRPC server + a connected channel.
+struct GrpcHarness {
+    channel: tonic::transport::Channel,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl GrpcHarness {
+    fn image(
+        &self,
+    ) -> app::image_service_client::ImageServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            impl tonic::service::Interceptor + Clone,
+        >,
+    > {
+        app::image_service_client::ImageServiceClient::with_interceptor(
+            self.channel.clone(),
+            bearer(TEST_TOKEN),
+        )
+    }
+}
+
+impl Drop for GrpcHarness {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn bearer(
+    token: &'static str,
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
+    move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii header"),
+        );
+        Ok(req)
+    }
+}
+
+/// Build an `AppState` wired to an empty `MockMetadataStore` and a real
+/// `EnvVarKeyProvider` test KEK, stand up `grpc_app::server` over it, and
+/// dial it. Returns the harness + a handle on the store so tests can peek
+/// at what landed.
+async fn build_app() -> (GrpcHarness, Arc<MockMetadataStore>) {
     let meta = MockMetadataStore::arc();
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
     let services = Services {
@@ -313,53 +349,39 @@ fn build_app() -> (axum::Router, Arc<MockMetadataStore>) {
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
+        app_grpc_tokens: vec![TEST_TOKEN.to_string()],
         ..CoordinatorConfig::default()
     };
     let state = Arc::new(AppState::new(cfg, services));
-    (api::router(state), meta)
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+        .expect("tcp incoming");
+    let handle = tokio::spawn(async move {
+        let _ = grpc_app::server(state).serve_with_incoming(incoming).await;
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint uri")
+        .connect()
+        .await
+        .expect("dial app gRPC");
+    (GrpcHarness { channel, handle }, meta)
 }
 
-/// Issue an HTTP request against the router and return (status, JSON
-/// body). The body is parsed leniently — empty bodies (204) yield
-/// `Value::Null`. Tests that care about the boundary check status
-/// before reading the body.
-async fn send(
-    app: &axum::Router,
-    method: Method,
-    path: &str,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method(method).uri(path);
-    let body = match body {
-        Some(j) => {
-            builder = builder.header("content-type", "application/json");
-            Body::from(j.to_string())
-        }
-        None => Body::empty(),
-    };
-    let req = builder.body(body).expect("build request");
-    let resp = app.clone().oneshot(req).await.expect("router oneshot");
-    let status = resp.status();
-    let bytes = resp
-        .into_body()
-        .collect()
-        .await
-        .expect("collect body")
-        .to_bytes();
-    // Successful responses are always JSON. Error responses might be
-    // plaintext (axum's default for serde Json-extractor decode
-    // failures, for instance) — in that case we wrap the raw body
-    // string into a `Value::String` so tests can still log the
-    // response without crashing the harness.
-    let json = if bytes.is_empty() {
-        Value::Null
-    } else {
-        match serde_json::from_slice(&bytes) {
-            Ok(v) => v,
-            Err(_) => Value::String(String::from_utf8_lossy(&bytes).into_owned()),
-        }
-    };
-    (status, json)
+/// Build a proto `AddRegistryRequest` for a static credential.
+fn static_registry(host: &str, username: &str, password: &str) -> app::AddRegistryRequest {
+    app::AddRegistryRequest {
+        host: host.to_string(),
+        auth: Some(app::add_registry_request::Auth::Static(
+            app::StaticRegistryAuth {
+                username: username.to_string(),
+                password: password.to_string(),
+            },
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -368,38 +390,21 @@ async fn send(
 
 #[tokio::test]
 async fn add_static_registry_seals_password_and_returns_summary() {
-    let (app, meta) = build_app();
+    let (h, meta) = build_app().await;
 
-    let body = json!({
-        "host": "gcr.io",
-        "auth": {
-            "kind": "static",
-            "username": "_json_key",
-            "password": "hunter2",
-        }
-    });
-    let (status, resp) = send(&app, Method::POST, "/api/v1/registries", Some(body)).await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "expected 201, got {status}: {resp}"
-    );
+    let resp = h
+        .image()
+        .add_registry(static_registry("gcr.io", "_json_key", "hunter2"))
+        .await
+        .expect("AddRegistry must succeed")
+        .into_inner();
 
-    // Response carries identity but not secret material.
-    assert_eq!(resp["host"], "gcr.io");
-    assert_eq!(resp["auth_kind"], "static");
-    assert_eq!(resp["auth_principal"], "_json_key");
-    assert!(
-        resp.get("password").is_none(),
-        "response leaked password field: {resp}"
-    );
-    assert!(
-        resp.as_object()
-            .unwrap()
-            .keys()
-            .all(|k| !k.contains("ciphertext")),
-        "response leaked ciphertext-shaped field: {resp}"
-    );
+    // Response carries identity but not secret material (the proto
+    // `AddRegistryResponse` has no password/ciphertext field — the type
+    // is the redaction guard).
+    assert_eq!(resp.host, "gcr.io");
+    assert_eq!(resp.auth_kind, "static");
+    assert_eq!(resp.auth_principal.as_deref(), Some("_json_key"));
 
     // The persisted row carries the sealed envelope, not the plaintext.
     let stored = meta
@@ -434,28 +439,28 @@ async fn add_static_registry_seals_password_and_returns_summary() {
 
 #[tokio::test]
 async fn add_gcp_workload_identity_registry_persists_no_secret_material() {
-    let (app, meta) = build_app();
+    let (h, meta) = build_app().await;
 
-    let body = json!({
-        "host": "us-east1-docker.pkg.dev",
-        "auth": {
-            "kind": "gcp_workload_identity",
-            "impersonate_sa": "engram@my-project.iam.gserviceaccount.com",
-        }
-    });
-    let (status, resp) = send(&app, Method::POST, "/api/v1/registries", Some(body)).await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "expected 201, got {status}: {resp}"
-    );
+    let resp = h
+        .image()
+        .add_registry(app::AddRegistryRequest {
+            host: "us-east1-docker.pkg.dev".into(),
+            auth: Some(app::add_registry_request::Auth::GcpWorkloadIdentity(
+                app::GcpWorkloadIdentityRegistryAuth {
+                    impersonate_sa: Some("engram@my-project.iam.gserviceaccount.com".into()),
+                },
+            )),
+        })
+        .await
+        .expect("AddRegistry must succeed")
+        .into_inner();
 
-    assert_eq!(resp["auth_kind"], "gcp_workload_identity");
+    assert_eq!(resp.auth_kind, "gcp_workload_identity");
     // For cloud-IAM kinds, the principal slot carries the impersonation
     // target — the only non-secret identity-shaped value worth surfacing.
     assert_eq!(
-        resp["auth_principal"],
-        "engram@my-project.iam.gserviceaccount.com",
+        resp.auth_principal.as_deref(),
+        Some("engram@my-project.iam.gserviceaccount.com"),
     );
 
     let stored = meta
@@ -476,13 +481,18 @@ async fn add_gcp_workload_identity_registry_persists_no_secret_material() {
 
 #[tokio::test]
 async fn add_gcp_wi_without_impersonation_uses_ambient_identity() {
-    let (app, meta) = build_app();
-    let body = json!({
-        "host": "gcr.io",
-        "auth": { "kind": "gcp_workload_identity" }
-    });
-    let (status, _) = send(&app, Method::POST, "/api/v1/registries", Some(body)).await;
-    assert_eq!(status, StatusCode::CREATED);
+    let (h, meta) = build_app().await;
+    h.image()
+        .add_registry(app::AddRegistryRequest {
+            host: "gcr.io".into(),
+            auth: Some(app::add_registry_request::Auth::GcpWorkloadIdentity(
+                app::GcpWorkloadIdentityRegistryAuth {
+                    impersonate_sa: None,
+                },
+            )),
+        })
+        .await
+        .expect("AddRegistry must succeed");
 
     let stored = meta
         .registry_credential_for_host("gcr.io")
@@ -499,49 +509,42 @@ async fn add_gcp_wi_without_impersonation_uses_ambient_identity() {
 
 #[tokio::test]
 async fn list_registries_redacts_all_secret_material() {
-    let (app, _meta) = build_app();
+    let (h, _meta) = build_app().await;
     // Plant one of each kind.
-    let _ = send(
-        &app,
-        Method::POST,
-        "/api/v1/registries",
-        Some(json!({
-            "host": "gcr.io",
-            "auth": { "kind": "static", "username": "_json_key", "password": "p1" }
-        })),
-    )
-    .await;
-    let _ = send(
-        &app,
-        Method::POST,
-        "/api/v1/registries",
-        Some(json!({
-            "host": "us-east1-docker.pkg.dev",
-            "auth": { "kind": "gcp_workload_identity" }
-        })),
-    )
-    .await;
+    h.image()
+        .add_registry(static_registry("gcr.io", "_json_key", "p1"))
+        .await
+        .expect("add static");
+    h.image()
+        .add_registry(app::AddRegistryRequest {
+            host: "us-east1-docker.pkg.dev".into(),
+            auth: Some(app::add_registry_request::Auth::GcpWorkloadIdentity(
+                app::GcpWorkloadIdentityRegistryAuth {
+                    impersonate_sa: None,
+                },
+            )),
+        })
+        .await
+        .expect("add gcp-wi");
 
-    let (status, resp) = send(&app, Method::GET, "/api/v1/registries", None).await;
-    assert_eq!(status, StatusCode::OK);
-    let regs = resp["registries"].as_array().expect("registries: array");
+    let regs = h
+        .image()
+        .list_registries(app::ListRegistriesRequest::default())
+        .await
+        .expect("ListRegistries")
+        .into_inner()
+        .registries;
     assert_eq!(regs.len(), 2, "got {regs:?}");
 
-    // Every row must carry kind + host + (optional) principal, and
-    // *nothing* secret-shaped. The redaction is the load-bearing
-    // promise of this endpoint.
-    for r in regs {
-        assert!(r.get("registry_host").is_some());
-        assert!(r.get("auth_kind").is_some());
-        let s = r.to_string();
-        for forbidden in [
-            "ciphertext",
-            "wrapped_dek",
-            "nonce",
-            "password",
-            "p1",
-            "secret",
-        ] {
+    // Every row carries kind + host + (optional) principal, and *nothing*
+    // secret-shaped. The proto `RegistryCredentialSummary` has no cipher
+    // fields at all (the type is the redaction guard); we additionally
+    // assert the plaintext password never appears in the debug form.
+    for r in &regs {
+        assert!(!r.registry_host.is_empty());
+        assert!(!r.auth_kind.is_empty());
+        let s = format!("{r:?}");
+        for forbidden in ["ciphertext", "wrapped_dek", "nonce", "p1"] {
             assert!(
                 !s.contains(forbidden),
                 "list response leaked {forbidden:?}: {s}"
@@ -551,64 +554,55 @@ async fn list_registries_redacts_all_secret_material() {
 }
 
 #[tokio::test]
-async fn add_static_rejects_missing_fields() {
-    let (app, _) = build_app();
-    // Missing username.
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        "/api/v1/registries",
-        Some(json!({
-            "host": "gcr.io",
-            "auth": { "kind": "static", "password": "x" }
-        })),
-    )
-    .await;
-    // axum returns 422 for serde decode failures on the Json extractor;
-    // 400 for app-layer validation. Either is fine; we just want the
-    // request rejected before persistence.
-    assert!(
-        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
-        "expected 400 or 422, got {status}"
-    );
+async fn add_static_rejects_missing_username() {
+    let (h, _) = build_app().await;
+    // Missing username → proto default "" → `add_registry_core` rejects
+    // an empty username as a BadRequest → InvalidArgument (the old
+    // 400/422). The request is refused before persistence.
+    let err = h
+        .image()
+        .add_registry(static_registry("gcr.io", "", "x"))
+        .await
+        .expect_err("missing username must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 }
 
 #[tokio::test]
 async fn add_static_rejects_empty_password() {
-    let (app, _) = build_app();
-    let (status, resp) = send(
-        &app,
-        Method::POST,
-        "/api/v1/registries",
-        Some(json!({
-            "host": "gcr.io",
-            "auth": { "kind": "static", "username": "u", "password": "" }
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "got {status}: {resp}");
+    let (h, _) = build_app().await;
+    let err = h
+        .image()
+        .add_registry(static_registry("gcr.io", "u", ""))
+        .await
+        .expect_err("empty password must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 }
 
 #[tokio::test]
 async fn delete_registry_round_trip() {
-    let (app, _) = build_app();
-    let _ = send(
-        &app,
-        Method::POST,
-        "/api/v1/registries",
-        Some(json!({
-            "host": "gcr.io",
-            "auth": { "kind": "static", "username": "u", "password": "p" }
-        })),
-    )
-    .await;
+    let (h, _) = build_app().await;
+    h.image()
+        .add_registry(static_registry("gcr.io", "u", "p"))
+        .await
+        .expect("add");
 
-    let (status, _) = send(&app, Method::DELETE, "/api/v1/registries/gcr.io", None).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    // First delete succeeds (the old 204).
+    h.image()
+        .delete_registry(app::DeleteRegistryRequest {
+            host: "gcr.io".into(),
+        })
+        .await
+        .expect("first delete must succeed");
 
-    // Second delete = NotFound → 404.
-    let (status, _) = send(&app, Method::DELETE, "/api/v1/registries/gcr.io", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Second delete = NotFound (the old 404).
+    let err = h
+        .image()
+        .delete_registry(app::DeleteRegistryRequest {
+            host: "gcr.io".into(),
+        })
+        .await
+        .expect_err("second delete must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
 }
 
 // ---------------------------------------------------------------------
@@ -625,19 +619,12 @@ async fn upsert_replaces_in_place_for_same_host() {
     // Re-adding the same host UPDATEs rather than 409s. Models the
     // "operator pasted the wrong password, fix it by re-adding"
     // workflow without forcing a delete-then-add ritual.
-    let (app, meta) = build_app();
+    let (h, meta) = build_app().await;
     for password in ["wrong", "right"] {
-        let (status, _) = send(
-            &app,
-            Method::POST,
-            "/api/v1/registries",
-            Some(json!({
-                "host": "gcr.io",
-                "auth": { "kind": "static", "username": "u", "password": password }
-            })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED);
+        h.image()
+            .add_registry(static_registry("gcr.io", "u", password))
+            .await
+            .expect("add must succeed");
     }
     // Exactly one row, with the latest cipher fields. The mock keys
     // by host so a second insert overwrites; the production
@@ -661,7 +648,7 @@ async fn list_enabled_images_returns_seeded_rows_sorted() {
     // store directly via the trait. The list endpoint then exercises
     // the EnabledImage → EnabledImageSummary lift, including manifest
     // parsing for the `manifest_name` / `manifest_description` fields.
-    let (app, meta) = build_app();
+    let (h, meta) = build_app().await;
     let now = chrono::Utc::now();
     for (uri, name) in [
         ("ghcr.io/cortex/api:warm-1", "cortex-api"),
@@ -691,45 +678,45 @@ async fn list_enabled_images_returns_seeded_rows_sorted() {
         .unwrap();
     }
 
-    let (status, body) = send(&app, Method::GET, "/api/v1/enabled-images", None).await;
-    assert_eq!(status, StatusCode::OK);
-    let images = body["images"].as_array().expect("images array");
+    // `ImageService::ListEnabledImages` returns `EnabledImageSummary`
+    // (the EnabledImage → summary lift). The mock sorts by uri, so
+    // `cortex/api` (ghcr.io) comes first.
+    let images = h
+        .image()
+        .list_enabled_images(app::ListEnabledImagesRequest::default())
+        .await
+        .expect("ListEnabledImages")
+        .into_inner()
+        .images;
     assert_eq!(images.len(), 2);
-    // Lift surfaces the parsed manifest name/description.
-    assert_eq!(images[0]["manifest_name"], "cortex-api");
-    assert_eq!(images[0]["manifest_description"], "hello");
-    // The summary must NEVER include the raw manifest_toml — the
-    // dashboard renders from the lifted fields.
+    // Lift surfaces the parsed manifest name/description. The summary proto
+    // has no `manifest_toml` field at all (the type is the redaction guard
+    // — the dashboard renders from the lifted fields).
+    assert_eq!(images[0].manifest_name.as_deref(), Some("cortex-api"));
+    assert_eq!(images[0].manifest_description.as_deref(), Some("hello"));
+}
+
+#[tokio::test]
+async fn disable_enabled_image_not_found_when_missing() {
+    let (h, _) = build_app().await;
+    let err = h
+        .image()
+        .disable_image(app::DisableImageRequest {
+            image_uri: "ghcr.io/never/enabled:v1".into(),
+        })
+        .await
+        .expect_err("disable of an unenabled image must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
     assert!(
-        images[0].get("manifest_toml").is_none(),
-        "summary must drop manifest_toml: {}",
-        images[0]
+        err.message().contains("is not enabled"),
+        "error must call out the missing enable: got {:?}",
+        err.message(),
     );
 }
 
 #[tokio::test]
-async fn disable_enabled_image_404s_when_missing() {
-    let (app, _) = build_app();
-    let (status, body) = send(
-        &app,
-        Method::POST,
-        "/api/v1/enabled-images/disable",
-        Some(json!({ "image_uri": "ghcr.io/never/enabled:v1" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("is not enabled"),
-        "error must call out the missing enable: got {body}",
-    );
-}
-
-#[tokio::test]
-async fn disable_enabled_image_204_then_idempotent_404() {
-    let (app, meta) = build_app();
+async fn disable_enabled_image_succeeds_then_idempotent_not_found() {
+    let (h, meta) = build_app().await;
     let now = chrono::Utc::now();
     meta.upsert_enabled_image(engram_core::types::EnabledImage {
         id: uuid::Uuid::new_v4(),
@@ -754,91 +741,82 @@ async fn disable_enabled_image_204_then_idempotent_404() {
     .await
     .unwrap();
 
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        "/api/v1/enabled-images/disable",
-        Some(json!({ "image_uri": "ghcr.io/cortex/api:warm-1" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    h.image()
+        .disable_image(app::DisableImageRequest {
+            image_uri: "ghcr.io/cortex/api:warm-1".into(),
+        })
+        .await
+        .expect("first disable must succeed (the old 204)");
 
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        "/api/v1/enabled-images/disable",
-        Some(json!({ "image_uri": "ghcr.io/cortex/api:warm-1" })),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "second disable on the same URI must be a clear 404",
-    );
+    let err = h
+        .image()
+        .disable_image(app::DisableImageRequest {
+            image_uri: "ghcr.io/cortex/api:warm-1".into(),
+        })
+        .await
+        .expect_err("second disable on the same URI must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
 }
 
 #[tokio::test]
-async fn refresh_404s_when_image_was_never_enabled() {
-    // Refresh is *not* an alias for enable — we want operators to
-    // explicitly opt an image into the catalog before refreshing it.
-    let (app, _) = build_app();
-    let (status, body) = send(
-        &app,
-        Method::POST,
-        "/api/v1/enabled-images/refresh",
-        Some(json!({ "image_uri": "ghcr.io/cortex/api:never-touched" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+async fn refresh_not_found_when_image_was_never_enabled() {
+    // Refresh is *not* an alias for enable — operators must explicitly opt
+    // an image into the catalog before refreshing it.
+    let (h, _) = build_app().await;
+    let err = h
+        .image()
+        .refresh_image(app::RefreshImageRequest {
+            image_uri: "ghcr.io/cortex/api:never-touched".into(),
+        })
+        .await
+        .expect_err("refresh of an unenabled image must be NotFound");
+    assert_eq!(err.code(), Code::NotFound, "{err:?}");
     assert!(
-        body["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("is not enabled"),
-        "refresh must steer the operator to the enable path: got {body}",
+        err.message().contains("is not enabled"),
+        "refresh must steer the operator to the enable path: got {:?}",
+        err.message(),
     );
 }
 
 #[tokio::test]
 async fn enable_image_rejects_empty_uri() {
-    let (app, _) = build_app();
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        "/api/v1/enabled-images",
-        Some(json!({ "image_uri": "" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (h, _) = build_app().await;
+    let err = h
+        .image()
+        .enable_image(app::EnableImageRequest {
+            image_uri: String::new(),
+        })
+        .await
+        .expect_err("empty image_uri must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
 }
 
 #[tokio::test]
 async fn anonymous_registry_round_trips() {
-    // Stage C added `Anonymous` as a first-class auth_kind so public
-    // registries can show up in the dashboard without storing fake
-    // credentials. POST without password fields, GET sees the row,
-    // never echoes any cipher material (there is none to echo).
-    let (app, _) = build_app();
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        "/api/v1/registries",
-        Some(json!({
-            "host": "ghcr.io",
-            "auth": { "kind": "anonymous" }
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
+    // `Anonymous` is a first-class auth_kind so public registries show up
+    // in the catalog without storing fake credentials. Add without
+    // password fields, list sees the row, never echoes cipher material
+    // (there is none to echo).
+    let (h, _) = build_app().await;
+    h.image()
+        .add_registry(app::AddRegistryRequest {
+            host: "ghcr.io".into(),
+            auth: Some(app::add_registry_request::Auth::Anonymous(
+                app::AnonymousRegistryAuth {},
+            )),
+        })
+        .await
+        .expect("add anonymous must succeed");
 
-    let (status, body) = send(&app, Method::GET, "/api/v1/registries", None).await;
-    assert_eq!(status, StatusCode::OK);
-    let regs = body["registries"].as_array().unwrap();
+    let regs = h
+        .image()
+        .list_registries(app::ListRegistriesRequest::default())
+        .await
+        .expect("ListRegistries")
+        .into_inner()
+        .registries;
     assert_eq!(regs.len(), 1);
-    assert_eq!(regs[0]["registry_host"], "ghcr.io");
-    assert_eq!(regs[0]["auth_kind"], "anonymous");
-    assert!(
-        regs[0]["auth_principal"].is_null(),
-        "anonymous has no principal"
-    );
+    assert_eq!(regs[0].registry_host, "ghcr.io");
+    assert_eq!(regs[0].auth_kind, "anonymous");
+    assert_eq!(regs[0].auth_principal, None, "anonymous has no principal");
 }
