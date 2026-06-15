@@ -254,6 +254,12 @@ otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
     'ENGRAM_BIND_ADDR': '127.0.0.1:8090',
+    # App-gRPC surface (ADR 0051): the orchestrator dials this with a bearer
+    # token. The app gRPC fails CLOSED — with no token configured it rejects
+    # every RPC — so we must set a dev token here that matches the
+    # orchestrator's CONTROL_PLANE_BEARER (built from the same env_or below).
+    'ENGRAM_APP_GRPC_ADDR': env_or('ENGRAM_APP_GRPC_ADDR', '127.0.0.1:50061'),
+    'ENGRAM_APP_GRPC_TOKENS': env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token'),
     'ENGRAM_MODE': 'coordinator' if dev_split else 'all',
     'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
     'ENGRAM_SANDBOX_WORK_DIR': './var/sandboxes',
@@ -505,23 +511,96 @@ if dev_split:
         host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b)
 
 # ----------------------------------------------------------------
+# Orchestrator (Bun/Hono, ADR 0051) — the web's BFF.
+#
+# The web's vite proxy sends all /rpc + /api to the orchestrator on
+# :8787; the orchestrator owns better-auth sessions + per-user secrets
+# and proxies into the coordinator's app-gRPC (CONTROL_PLANE_GRPC_URL)
+# and REST (CONTROL_PLANE_HTTP_URL). So whenever the web runs, the
+# orchestrator must run too (same `if not skip_web` gate below).
+#
+# `orchestrator-migrate` is a one-shot: it creates the orchestrator DB
+# if the postgres volume pre-existed initdb (the docker-entrypoint
+# initdb.d script only runs on a FRESH volume) and applies the drizzle
+# migrations idempotently. The `orchestrator` serve resource depends on
+# it so the schema (incl. user_session_secrets) exists before boot.
+# ----------------------------------------------------------------
+
+orchestrator_db_url = 'postgres://engram:engram@localhost:5435/engram_orchestrator'
+
+# CONTROL_PLANE_BEARER MUST match the coordinator's accepted app-gRPC
+# token (ENGRAM_APP_GRPC_TOKENS in coord_env above), else the coord
+# fails the orchestrator's RPCs closed.
+orchestrator_env = {
+    'ORCHESTRATOR_DATABASE_URL': orchestrator_db_url,
+    'CONTROL_PLANE_BEARER': env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token'),
+    'CONTROL_PLANE_GRPC_URL': 'http://127.0.0.1:50061',
+    'CONTROL_PLANE_HTTP_URL': 'http://127.0.0.1:8090',
+    'ORCHESTRATOR_PORT': '8787',
+    'TRUSTED_ORIGINS': 'http://localhost:5173',
+    # Dev-only better-auth signing secret (≥32 chars). better-auth 1.6.16
+    # silently falls back to a publicly-known constant when unset, so the
+    # orchestrator requires it; a fixed dev literal is fine locally but
+    # MUST be rotated for any real deploy.
+    'BETTER_AUTH_SECRET': 'engram-dev-only-better-auth-secret-do-not-use-in-prod',
+    # SAME KEK the coordinator uses (coord_env above), so user_session_secrets
+    # sealed by either side are format-identical. `just bootstrap` writes it
+    # to .env at parse time (above). Required — the orchestrator refuses to
+    # boot without it, which is correct: a missing .env KEK is a real misconfig.
+    'ENGRAM_KEK_MASTER_KEY': env_or('ENGRAM_KEK_MASTER_KEY', ''),
+}
+
+skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
+
+if not skip_web:
+    # createdb returns nonzero if the DB already exists (initdb made it on a
+    # fresh volume); swallow that and let drizzle-kit migrate carry the schema.
+    local_resource('orchestrator-migrate',
+        cmd=(
+            'cd orchestrator && bun install --silent && ' +
+            '(PGPASSWORD=engram createdb -h localhost -p 5435 -U engram ' +
+            'engram_orchestrator 2>/dev/null || true) && ' +
+            'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
+            'bunx drizzle-kit migrate'
+        ),
+        resource_deps=['postgres'],
+        labels=['setup'])
+
+    local_resource('orchestrator',
+        serve_cmd='cd orchestrator && bun install --silent && bun run start',
+        serve_env=orchestrator_env,
+        resource_deps=['postgres', 'orchestrator-migrate', 'coordinator'],
+        readiness_probe=probe(
+            period_secs=30,
+            timeout_secs=2,
+            tcp_socket=tcp_socket_action(port=8787),
+        ),
+        links=[
+            link('http://127.0.0.1:8787/healthz', 'healthz'),
+        ],
+        labels=['app'],
+        trigger_mode=TRIGGER_MODE_MANUAL,
+        auto_init=True)
+
+# ----------------------------------------------------------------
 # Web SPA (vite dev server).
 #
 # Vite's HMR runs in-process — Tilt should NEVER restart this.
 # Edits to web/src/** are picked up via vite's own file watcher,
 # not via a Tilt re-run. We deliberately don't pass `deps` here.
 #
+# The vite proxy now targets the orchestrator (:8787) for /rpc + /api,
+# so the web depends on `orchestrator` (not the coordinator directly).
+#
 # Skipped when ENGRAM_SKIP_WEB is set (CI's `tilt ci` has no browser
 # to drive the SPA, and pnpm install + a vite readiness wait only slow
 # the e2e gate down). Mirrors integration-up.sh's ENGRAM_SKIP_WEB.
 # ----------------------------------------------------------------
 
-skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
-
 if not skip_web:
     local_resource('web',
         serve_cmd='cd web && pnpm install --silent && pnpm dev --strictPort',
-        resource_deps=['coordinator'],
+        resource_deps=['orchestrator'],
         # See the coordinator probe above — same loopback port-pool
         # constraint applies to vite.
         readiness_probe=probe(
@@ -538,6 +617,6 @@ if not skip_web:
         auto_init=True)
 
 # Resources are grouped in the Tilt UI by `labels` above:
-# infra (postgres, registry) → setup (seed-buckets) → app (coordinator,
-# web). Click any one to jump to its log stream / readiness state /
-# restart button.
+# infra (postgres, registry) → setup (seed-buckets, orchestrator-migrate)
+# → app (coordinator, host-agent, orchestrator, web). Click any one to
+# jump to its log stream / readiness state / restart button.
