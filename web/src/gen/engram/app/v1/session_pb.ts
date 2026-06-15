@@ -1370,7 +1370,7 @@ export const ShellCloseSchema: GenMessage<ShellClose> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_session, 44);
 
 /**
- * The orchestrator-facing app contract (ADR 0039 §2.3, rev 2026-06-10).
+ * The orchestrator-facing app contract (ADR 0051 §2.3, rev 2026-06-10).
  * The caller is a single trusted service (bearer-authed); there is no
  * per-user anything here. Attribution and authz live in the orchestrator.
  *

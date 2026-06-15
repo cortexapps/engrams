@@ -121,7 +121,7 @@ export const DeleteSecretResponseSchema: GenMessage<DeleteSecretResponse> = /*@_
   messageDesc(file_engram_app_v1_secret, 5);
 
 /**
- * KEK-sealed opaque secret store (ADR 0039 §2.3, rev 2026-06-10). Keys
+ * KEK-sealed opaque secret store (ADR 0051 §2.3, rev 2026-06-10). Keys
  * are caller-supplied and never interpreted (the orchestrator uses its
  * better-auth user ids). The caller is a single trusted service
  * (bearer-authed); there is no per-user authz here — attribution and

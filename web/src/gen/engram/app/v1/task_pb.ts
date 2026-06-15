@@ -256,7 +256,7 @@ export const DeleteTaskResponseSchema: GenMessage<DeleteTaskResponse> = /*@__PUR
   messageDesc(file_engram_app_v1_task, 9);
 
 /**
- * The application aggregate root (ADR 0039 §3, rev 2026-06-10).
+ * The application aggregate root (ADR 0051 §3, rev 2026-06-10).
  * ORCHESTRATOR-NATIVE: the
  * control plane neither implements nor knows about tasks — this file
  * lives in the same package so web gets one uniform generated API, and
