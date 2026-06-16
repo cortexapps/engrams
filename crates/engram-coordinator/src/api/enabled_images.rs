@@ -656,7 +656,21 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // bundles + ADR 0027 memory floor live inside the shared helper;
     // capture + restore MUST agree on `mem_size_mib` (FC requires it),
     // and ADR 0028's disk-only recovery boots the same shape.
-    let spec = crate::api::sessions::cold_boot_spec(&row.image_uri, manifest, None);
+    //
+    // Issue #192: pin the capture's image reference to the digest we
+    // just resolved, NOT `row.image_uri`'s (possibly mutable) tag. The
+    // host's local OCI cache is keyed on this URI string; a moving tag
+    // (`:latest`) lets a tag-keyed cache hit serve a previous bake's
+    // rootfs even though the coord materialized fresh chunks — so the
+    // recorded `manifest_digest` and the captured base-snapshot bytes
+    // disagree, and the fleet silently keeps booting the old guest. A
+    // digest-pinned reference is content-addressed and immutable, so the
+    // host pulls (and caches) exactly the resolved bake.
+    let capture_uri = engram_oci::digest_pinned_uri(
+        &row.image_uri,
+        &engram_oci::Digest256(row.manifest_digest.clone()),
+    );
+    let spec = crate::api::sessions::cold_boot_spec(&capture_uri, manifest, None);
 
     let (host_id, host) =
         crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
