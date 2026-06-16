@@ -504,10 +504,7 @@ async fn broker_token_insert_requires_session_row() {
         .await
         .expect("create session");
     let inserted = meta
-        .insert_broker_token(engram_core::types::registry::SessionBrokerToken {
-            session_id,
-            ..tok
-        })
+        .insert_broker_token(engram_core::types::registry::SessionBrokerToken { session_id, ..tok })
         .await
         .expect("insert after the session row exists");
     assert!(inserted, "first writer wins once the FK target exists");
