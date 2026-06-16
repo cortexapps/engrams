@@ -193,7 +193,7 @@ const membersRoute = createRoute({
   component: Members,
 });
 
-const routeTree = rootRoute.addChildren([
+export const routeTree = rootRoute.addChildren([
   // /login — bare page, no app chrome
   loginRoute,
   // Authenticated app shell — all authenticated routes nested here

@@ -1,23 +1,31 @@
-// Tests for router-level auth guards.
+// Router guard regression tests.
 //
-// Uses a minimal in-memory router that mirrors the loginRoute's beforeLoad
-// guard from router.tsx. If that guard is removed or its redirect target
-// changes, the "redirects authenticated user" test will fail.
+// Uses the actual routeTree from router.tsx so that removing or changing
+// loginRoute's beforeLoad will break these tests. The authenticated app
+// shell components (RootLayout, SessionsLayout) are stubbed with Outlet
+// passthroughs to avoid pulling in AuthProvider / Connect RPC hooks.
 
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
-import {
-  createMemoryHistory,
-  createRootRouteWithContext,
-  createRoute,
-  createRouter,
-  redirect,
-  RouterProvider,
-} from "@tanstack/react-router";
-import { Login } from "./pages/Login";
+import { createMemoryHistory, createRouter, RouterProvider } from "@tanstack/react-router";
 import { abilityFor } from "./lib/ability";
-import type { RouterContext } from "./router";
 import type { AuthState } from "./auth/AuthProvider";
+
+// Stub the app shell so the route tree resolves without AuthProvider or RPCs.
+// Outlet passthroughs let child routes (sessionsLayoutRoute → MySessions) render.
+vi.mock("./pages/RootLayout", async () => {
+  const { Outlet } = await import("@tanstack/react-router");
+  return { RootLayout: () => <Outlet /> };
+});
+vi.mock("./pages/sessions/SessionsLayout", async () => {
+  const { Outlet } = await import("@tanstack/react-router");
+  return { SessionsLayout: () => <Outlet /> };
+});
+vi.mock("./pages/sessions/MySessions", () => ({
+  MySessions: () => <div data-testid="sessions" />,
+}));
+
+import { routeTree } from "./router";
 
 const AUTH: AuthState = {
   principal: {
@@ -33,45 +41,21 @@ const AUTH: AuthState = {
   refresh: () => {},
 };
 
-/**
- * Minimal router starting at /login. "/" renders a sentinel <div> so tests
- * can confirm a redirect landed there without pulling in RootLayout.
- */
-function makeLoginRouter(auth: AuthState | null) {
-  const rootRoute = createRootRouteWithContext<RouterContext>()({});
-
-  const loginRoute = createRoute({
-    getParentRoute: () => rootRoute,
-    path: "/login",
-    // Mirror of appLayoutRoute's inverse: authenticated users don't belong on /login.
-    beforeLoad: ({ context }) => {
-      if (context.auth) throw redirect({ to: "/" });
-    },
-    component: Login,
-  });
-
-  const homeRoute = createRoute({
-    getParentRoute: () => rootRoute,
-    path: "/",
-    component: () => <div data-testid="home" />,
-  });
-
+function makeTestRouter(auth: AuthState | null) {
   return createRouter({
-    routeTree: rootRoute.addChildren([loginRoute, homeRoute]),
+    routeTree,
     history: createMemoryHistory({ initialEntries: ["/login"] }),
     context: { auth },
   });
 }
 
 test("renders sign-in form for unauthenticated visitor at /login", async () => {
-  render(<RouterProvider router={makeLoginRouter(null)} />);
-  // The email input is unique to the Login form — confirms the form rendered.
+  render(<RouterProvider router={makeTestRouter(null)} />);
   await screen.findByLabelText(/email/i);
 });
 
-test("redirects authenticated user away from /login to /", async () => {
-  render(<RouterProvider router={makeLoginRouter(AUTH)} />);
-  // Sentinel renders after redirect; Login form must be absent.
-  await screen.findByTestId("home");
+test("redirects authenticated user away from /login to /sessions", async () => {
+  render(<RouterProvider router={makeTestRouter(AUTH)} />);
+  await screen.findByTestId("sessions");
   expect(screen.queryByLabelText(/email/i)).toBeNull();
 });
