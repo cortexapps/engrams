@@ -809,6 +809,31 @@ impl Digest256 {
     }
 }
 
+/// Rewrite an image URI to pin it at a specific manifest `digest`,
+/// dropping any tag it carried (`<reg>/<repo>:tag` → `<reg>/<repo>@sha256:…`).
+///
+/// Issue #192: a **mutable** tag (`:latest`) is unsafe as a cache key.
+/// Anything that materialises bytes from a tag — most importantly the
+/// host's tag-keyed local OCI cache (`ImageCache`) — can serve a STALE
+/// previous bake even after the coord resolved a fresh `manifest_digest`
+/// from the registry HEAD. Pinning the reference by digest before it
+/// reaches the host makes the cache key content-addressed, so a moving
+/// tag can never produce stale layers. The digest is content-addressed,
+/// so the registry returns exactly the bytes the coord resolved.
+///
+/// Returns the original URI unchanged if it can't be parsed as an OCI
+/// reference (the caller's later pull surfaces the real error with full
+/// context) — we never want digest-pinning to be the thing that fails an
+/// otherwise-valid enable.
+pub fn digest_pinned_uri(image_uri: &str, digest: &Digest256) -> String {
+    match image_uri.parse::<Reference>() {
+        Ok(reference) => reference
+            .clone_with_digest(digest.as_str().to_string())
+            .whole(),
+        Err(_) => image_uri.to_string(),
+    }
+}
+
 /// ADR 0014 M1.11: the metadata view of an engram OCI artifact, consumed
 /// by the coord's `enable_image` materializer. The small layers (manifest
 /// / bundle / disk-bootstrap) are pulled into memory; chunk layers are
@@ -1052,6 +1077,47 @@ mod tests {
         assert_eq!(d1, d2);
         assert!(d1.0.starts_with("sha256:"));
         assert_eq!(d1.hex().len(), 64);
+    }
+
+    // A realistic, well-formed sha256 digest (64 hex chars). The OCI
+    // `Reference` parser validates the digest shape, so the tests below
+    // must use real-length digests, not toy strings.
+    const FRESH: &str = "sha256:6499e6c6abcdef0123456789abcdef0123456789abcdef0123456789abcdef01";
+    const PREV: &str = "sha256:c9a760b200000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn digest_pinned_uri_replaces_tag() {
+        // Issue #192: a mutable tag must be swapped for the resolved
+        // digest so the host's tag-keyed OCI cache can't serve stale
+        // bytes. The result drops the tag and pins by digest.
+        let d = Digest256(FRESH.to_string());
+        assert_eq!(
+            digest_pinned_uri("ghcr.io/cortexapps/engrams/demo-claude:latest", &d),
+            format!("ghcr.io/cortexapps/engrams/demo-claude@{FRESH}"),
+        );
+    }
+
+    #[test]
+    fn digest_pinned_uri_adds_digest_to_untagged() {
+        let d = Digest256(FRESH.to_string());
+        assert_eq!(
+            digest_pinned_uri("ghcr.io/cortexapps/engrams/demo-claude", &d),
+            format!("ghcr.io/cortexapps/engrams/demo-claude@{FRESH}"),
+        );
+    }
+
+    #[test]
+    fn digest_pinned_uri_overrides_existing_digest() {
+        // Already-pinned references re-pin to the freshly-resolved
+        // digest (idempotent for the common no-op refresh case).
+        let d = Digest256(FRESH.to_string());
+        assert_eq!(
+            digest_pinned_uri(
+                &format!("ghcr.io/cortexapps/engrams/demo-claude@{PREV}"),
+                &d
+            ),
+            format!("ghcr.io/cortexapps/engrams/demo-claude@{FRESH}"),
+        );
     }
 
     #[tokio::test]
