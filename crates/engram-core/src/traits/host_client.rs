@@ -26,6 +26,7 @@ use crate::error::SandboxError;
 use crate::traits::sandbox::{ForgeSink, HarnessDial, HarnessSink, UploadSink};
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
+use crate::types::image::WarmConfig;
 use crate::types::sandbox::{AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxSpec};
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
@@ -203,9 +204,13 @@ pub trait HostClient: Send + Sync {
     /// the per-image base snapshot `create_session` restores from.
     /// Default errors so mocks / non-FC hosts opt out; the local +
     /// gRPC clients delegate to the backend's `build_base_snapshot`.
+    ///
+    /// `warm` is the image's optional capture-time prewarm hook
+    /// ([`WarmConfig`]), threaded down to the backend.
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
+        _warm: Option<WarmConfig>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `build_base_snapshot`".into(),

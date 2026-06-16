@@ -789,6 +789,7 @@ jobs:
           cargo nextest run \
             -p engram-host-agent \
             --test checkpoint_chain \
+            --test warm_hook_capture \
             --test migration_source \
             --test two_host_live_teleport \
             --test two_host_drain_wave \

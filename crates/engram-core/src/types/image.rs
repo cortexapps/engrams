@@ -100,6 +100,23 @@ pub struct ImageManifest {
     /// glibc-linked (musl/alpine bases can't use it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserConfig>,
+
+    /// Optional capture-time prewarm hook. When set, base-snapshot
+    /// capture runs `[warm] command` inside the capture VM AFTER agentd
+    /// is ready and BEFORE the memory snapshot is frozen — so any
+    /// long-lived process the command leaves running (a `gradle
+    /// --daemon`, a language server, a warmed JIT) is captured live into
+    /// the base snapshot and is already running when EVERY session of
+    /// this image restores. See [`WarmConfig`].
+    ///
+    /// This is the general counterpart to the harness warm-capture: the
+    /// harness needs per-session late-bind, but a warm-hook process is
+    /// session-agnostic (shared verbatim across all restores), so there's
+    /// no restore-side wiring — it just comes back live with the snapshot.
+    /// Only consumed by `build_base_snapshot` (image enable); cold-boot
+    /// `create` ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm: Option<WarmConfig>,
 }
 
 /// Browser-tooling binding for an image (ADR 0027). Gates the opt-in
@@ -116,6 +133,69 @@ impl ImageManifest {
     /// Whether this image opted into browser tooling (`[browser] enabled`).
     pub fn browser_enabled(&self) -> bool {
         self.browser.as_ref().is_some_and(|b| b.enabled)
+    }
+}
+
+/// Capture-time prewarm hook for an image's base snapshot.
+///
+/// The `command` is run inside the capture VM (via the same `exec` path
+/// `engram exec` uses) once agentd is ready, just before the memory
+/// snapshot is frozen. It must START its long-lived process **detached**
+/// and then **exit** — e.g. `gradle --daemon help` launches the Gradle
+/// daemon as a separate process and returns; that daemon stays alive and
+/// is captured into the base snapshot, so every restored session inherits
+/// a warm, cache-hot daemon with no cold-start.
+///
+/// **Fail-loud:** a non-zero exit or a timeout aborts the capture and
+/// therefore the whole image enable. A declared warm hook that can't run
+/// is a real defect (bad command, cold cache, OOM); we never silently
+/// ship a "cold" base snapshot that claims to be warm.
+///
+/// **Hermetic requirement:** because capture must be deterministic and
+/// runs without per-session secrets, the warm command must be driven off
+/// baked, offline caches — no network. (The capture VM carries the
+/// manifest `[env]` but not the per-session `[secrets]`.)
+///
+/// **Backend note:** only meaningful for memory-snapshot backends
+/// (Firecracker). On disk-only/cold-boot capture (VZ) a live process is
+/// not part of the snapshot, so the hook is a no-op there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmConfig {
+    /// argv of the warm command (non-empty). Run inside the capture VM.
+    pub command: Vec<String>,
+
+    /// Max wall-clock for the warm command before the capture gives up
+    /// and fails (fail-loud). Defaults to [`WarmConfig::DEFAULT_TIMEOUT_SECS`].
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+
+    /// Working directory for the warm command. Defaults to the image's
+    /// `workdir` (and ultimately the sandbox default `/`) when omitted.
+    #[serde(default)]
+    pub workdir: Option<String>,
+}
+
+impl WarmConfig {
+    /// Default warm-command timeout: warming a daemon off baked caches
+    /// should be quick, but a first-run JIT/daemon spin-up can take a
+    /// while — be generous before failing the enable.
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+    /// Validate a source-authored `[warm]` table: the command must be
+    /// non-empty (an empty argv has nothing to run). Called at bake so a
+    /// malformed block fails the build up front rather than shipping an
+    /// image whose enable will abort at capture.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.command.iter().all(|a| a.trim().is_empty()) {
+            return Err("[warm] command must be a non-empty argv".into());
+        }
+        Ok(())
+    }
+
+    /// The effective timeout, applying [`Self::DEFAULT_TIMEOUT_SECS`].
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(Self::DEFAULT_TIMEOUT_SECS))
     }
 }
 
@@ -775,6 +855,96 @@ mod tests {
         "#;
         let res: Result<ImageManifest, _> = toml::from_str(src);
         assert!(res.is_err(), "typo `enviroment` must be rejected");
+    }
+
+    #[test]
+    fn manifest_parses_warm_block() {
+        // No [warm] → none, and nothing rendered out.
+        let plain: ImageManifest = toml::from_str(r#"name = "x""#).unwrap();
+        assert!(plain.warm.is_none());
+        assert!(
+            !toml::to_string(&plain).unwrap().contains("warm"),
+            "a warm-less image must not render a [warm] table"
+        );
+
+        // Full block: command + timeout + workdir.
+        let m: ImageManifest = toml::from_str(
+            r#"
+            name = "dev-brain"
+            [warm]
+            command = ["bash", "-lc", "gradle --daemon help"]
+            timeout_secs = 900
+            workdir = "/workspace/brain-backend"
+        "#,
+        )
+        .unwrap();
+        let w = m.warm.expect("warm table parsed");
+        assert_eq!(w.command, vec!["bash", "-lc", "gradle --daemon help"]);
+        assert_eq!(w.timeout_secs, Some(900));
+        assert_eq!(w.workdir.as_deref(), Some("/workspace/brain-backend"));
+        assert_eq!(w.timeout().as_secs(), 900);
+        w.validate().expect("non-empty command is valid");
+
+        // Minimal block: just a command; timeout/workdir default.
+        let min: ImageManifest = toml::from_str(
+            r#"
+            name = "x"
+            [warm]
+            command = ["/usr/local/bin/engram-warm"]
+        "#,
+        )
+        .unwrap();
+        let w = min.warm.unwrap();
+        assert!(w.timeout_secs.is_none());
+        assert!(w.workdir.is_none());
+        assert_eq!(w.timeout().as_secs(), WarmConfig::DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn warm_validate_rejects_empty_command() {
+        // Empty argv: nothing to run.
+        let empty = WarmConfig {
+            command: vec![],
+            timeout_secs: None,
+            workdir: None,
+        };
+        assert!(empty.validate().is_err(), "empty command must be rejected");
+
+        // All-whitespace argv: also nothing to run.
+        let blank = WarmConfig {
+            command: vec!["  ".into(), "\t".into()],
+            timeout_secs: None,
+            workdir: None,
+        };
+        assert!(
+            blank.validate().is_err(),
+            "all-whitespace command must be rejected"
+        );
+
+        WarmConfig {
+            command: vec!["echo".into(), "ok".into()],
+            timeout_secs: None,
+            workdir: None,
+        }
+        .validate()
+        .expect("a real command is valid");
+    }
+
+    #[test]
+    fn warm_block_rejects_unknown_field() {
+        // deny_unknown_fields guards typos in the block.
+        assert!(
+            toml::from_str::<ImageManifest>(
+                r#"
+                name = "x"
+                [warm]
+                command = ["echo"]
+                timeout = 10
+            "#
+            )
+            .is_err(),
+            "typo `timeout` (vs timeout_secs) must be rejected"
+        );
     }
 
     #[test]

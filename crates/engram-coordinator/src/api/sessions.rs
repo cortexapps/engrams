@@ -1590,6 +1590,7 @@ mod tests {
             harness: None,
             git: None,
             browser: None,
+            warm: None,
         };
 
         // Bundle: one resolved secret; the schema's allow_hosts must
@@ -1673,6 +1674,7 @@ mod tests {
             harness: None,
             git: None,
             browser: None,
+            warm: None,
         };
 
         let mut bundle_inner = HashMap::new();

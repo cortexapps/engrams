@@ -484,10 +484,20 @@ impl HostService for HostServiceImpl {
         link_remote_parent(&span, &req);
         check_wire_version(&req)?;
         async move {
-            let spec = decode_bincode(&req.into_inner().spec_bincode, "SandboxSpec")?;
+            let inner = req.into_inner();
+            let spec = decode_bincode(&inner.spec_bincode, "SandboxSpec")?;
+            // `warm_bincode` is the optional `[warm]` hook. A populated
+            // buffer is `Option<WarmConfig>` (a `None` still encodes to a
+            // 1-byte discriminant); a genuinely empty buffer (an unset
+            // proto field) is treated as `None`.
+            let warm = if inner.warm_bincode.is_empty() {
+                None
+            } else {
+                decode_bincode(&inner.warm_bincode, "Option<WarmConfig>")?
+            };
             let metadata = self
                 .inner
-                .build_base_snapshot(spec)
+                .build_base_snapshot(spec, warm)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(BuildBaseSnapshotResponse {
