@@ -512,6 +512,17 @@ orchestrator:
       # is "openid email profile". Join with spaces here.
       scopes: ""    # e.g. "openid email profile"
 
+    # Bootstrap-admin allowlist — ORCHESTRATOR_ADMIN_EMAILS. Restores the
+    # pre-ADR-0051 `auth.bootstrapAdmins` value: each email here is created
+    # with role 'admin' on first login (any door — IAP / OIDC / email+password)
+    # and an existing matching user is promoted to admin on next sign-in. This
+    # is how a fresh deploy gets a designated root/admin account without manual
+    # SQL. Comma-joined into the env; empty list -> the env is omitted and the
+    # promotion hooks are fully inert.
+    adminEmails: []
+    # - root@example.com
+    # - ops@example.com
+
   service:
     type: ClusterIP
     port: 80

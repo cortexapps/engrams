@@ -6,6 +6,8 @@
  * the operator knows exactly what to set before the process can boot.
  */
 
+import { parseAdminEmails } from "./auth/admin-allowlist.ts";
+
 export interface Config {
   /** ORCHESTRATOR_PORT — default 8787 */
   port: number;
@@ -76,6 +78,15 @@ export interface Config {
    * scope, which stock GCP IAP can't supply).
    */
   oidc: OidcConfig | undefined;
+  /**
+   * ORCHESTRATOR_ADMIN_EMAILS — comma-separated bootstrap-admin allowlist.
+   * Restores the pre-ADR-0051 `auth.bootstrapAdmins` Helm value: matching
+   * emails are created with role 'admin' (any JIT path — IAP bridge, OIDC,
+   * email/password) and an existing matching user is promoted to admin on
+   * sign-in. Normalised (trim + lowercase) at load. Empty when unset → the
+   * promotion hooks are fully inert (dev/local default).
+   */
+  adminEmails: string[];
 }
 
 /** A configured generic OIDC provider (better-auth genericOAuth). */
@@ -190,6 +201,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     };
   }
 
+  // OPTIONAL: bootstrap-admin allowlist (restores `auth.bootstrapAdmins`).
+  // Parsed + normalised (trim/lowercase/de-dup) here; empty when unset, which
+  // makes the better-auth promotion hooks fully inert. No test placeholder
+  // needed — unset is valid and means "no bootstrap admins".
+  const adminEmails = parseAdminEmails(env["ORCHESTRATOR_ADMIN_EMAILS"]);
+
   if (missing.length > 0) {
     throw new Error(
       `Orchestrator: missing required environment variable(s): ${missing.join(", ")}`,
@@ -215,6 +232,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     iapAudience,
     iapJwksUrl,
     oidc,
+    adminEmails,
   };
 }
 

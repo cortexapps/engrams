@@ -25,12 +25,69 @@
  *     check. Without this, better-auth 403s every non-GET auth route.
  */
 
-import { betterAuth } from "better-auth";
+import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { admin } from "better-auth/plugins/admin";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { getDb } from "../db/client.ts";
 import { config } from "../config.ts";
+import {
+  ADMIN_ROLE,
+  isBootstrapAdmin,
+  promotedRoleOnLogin,
+} from "./admin-allowlist.ts";
+
+// Bootstrap-admin allowlist (restores the old `auth.bootstrapAdmins` Helm
+// value via ORCHESTRATOR_ADMIN_EMAILS). When empty, both hooks below are
+// skipped entirely so there is zero per-request/per-create overhead in the
+// common (no bootstrap admins) case.
+const adminEmails = config.adminEmails;
+
+// `databaseHooks` promote allowlisted emails to admin. Defined only when the
+// allowlist is non-empty:
+//   - user.create.before: a NEW user with an allowlisted email is created with
+//     role 'admin' directly (covers IAP bridge createUser, OIDC callback, and
+//     email/password sign-up — every JIT path runs through this hook).
+//   - session.create.after: an EXISTING user signing in is promoted to admin if
+//     allowlisted and not already admin. This means adding someone to the
+//     allowlist AFTER their first login still grants admin on next sign-in,
+//     matching the pre-ADR-0051 coordinator behaviour.
+const databaseHooks: BetterAuthOptions["databaseHooks"] | undefined =
+  adminEmails.length === 0
+    ? undefined
+    : {
+        user: {
+          create: {
+            // Hook signature requires a Promise return; `async` satisfies it.
+            before(user) {
+              if (isBootstrapAdmin(user.email, adminEmails)) {
+                return Promise.resolve({ data: { ...user, role: ADMIN_ROLE } });
+              }
+              // No change → better-auth uses the original data.
+              return Promise.resolve(undefined);
+            },
+          },
+        },
+        session: {
+          create: {
+            async after(session) {
+              const userId = session.userId;
+              if (!userId) return;
+              const ctx = await auth.$context;
+              const existing = await ctx.internalAdapter.findUserById(userId);
+              if (!existing) return;
+              const next = promotedRoleOnLogin(
+                existing.email,
+                (existing as { role?: string | null }).role,
+                adminEmails,
+              );
+              if (next) {
+                await ctx.internalAdapter.updateUser(userId, { role: next });
+              }
+            },
+          },
+        },
+      };
 
 // Env-driven OIDC ("Sign in with your IdP"), restoring the old coordinator
 // `--auth-mode=oidc` parity. Added only when config.oidc is present (issuer +
@@ -90,6 +147,9 @@ export const auth = betterAuth({
   // injects a placeholder; prod/dev must set the real var). The Tiltfile
   // injects a deterministic dev literal; prod must rotate before Phase 4.
   secret: config.betterAuthSecret,
+  // Bootstrap-admin promotion (ORCHESTRATOR_ADMIN_EMAILS). Undefined → omitted
+  // entirely when the allowlist is empty (inert dev/local default).
+  ...(databaseHooks ? { databaseHooks } : {}),
   plugins: [
     admin(), // role field ('admin'|'user'), setRole/ban/list APIs → Members UI
     ...oidcPlugins, // env-driven OIDC provider (genericOAuth) when configured
