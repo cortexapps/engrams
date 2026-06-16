@@ -1,4 +1,4 @@
-{{- if .Values.orchestrator.enabled -}}
+{{- if .Values.web.enabled -}}
 {{- /*
 Non-secret orchestrator env (ADR 0051). The three REQUIRED vars
 (ORCHESTRATOR_DATABASE_URL, CONTROL_PLANE_BEARER, BETTER_AUTH_SECRET) come

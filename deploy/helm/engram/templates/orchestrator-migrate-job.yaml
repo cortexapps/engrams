@@ -1,4 +1,4 @@
-{{- if and .Values.orchestrator.enabled .Values.orchestrator.migrations.enabled -}}
+{{- if and .Values.web.enabled .Values.orchestrator.migrations.enabled -}}
 # ADR 0051: apply the orchestrator's drizzle migrations (orchestrator/drizzle/)
 # to its OWN database (ORCHESTRATOR_DATABASE_URL — SEPARATE from the
 # coordinator's DB) BEFORE the Deployment rolls. Runs `bunx drizzle-kit migrate`

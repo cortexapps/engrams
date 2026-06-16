@@ -319,17 +319,6 @@ web:
   # web Service maps its `port` to this `containerPort`.
   containerPort: 8080
 
-  # Bearer token nginx stamps onto every proxied API/SSE/WS request.
-  # The browser SPA itself never carries the token — IAP at the LB
-  # authenticates the user, then this pod (which lives behind IAP)
-  # attaches the coord-side bearer on every upstream call. The
-  # referenced secret key MUST hold a single token (not a comma list)
-  # that also appears in the coord's `ENGRAM_AUTH_TOKENS`.
-  # Leave both fields empty to disable injection (e.g. a dev deploy
-  # where the coord runs without auth).
-  coordinatorToken:
-    existingSecret: ""
-    secretKey: ENGRAM_AUTH_TOKENS
 
   service:
     type: ClusterIP
@@ -370,12 +359,15 @@ web:
 
 # ─── orchestrator (ADR 0051) ──────────────────────────────────────
 #
-# The Bun + Hono orchestrator: per-user authz + a native task model in
-# FRONT of the Rust coordinator. INERT by default (`enabled: false`) —
-# this chart can deploy it with NO production traffic (the web still
-# points at the coordinator directly until a later drip). When enabled it
-# runs as its own Deployment + Service (+ optional Ingress) and talks to
-# the coordinator over gRPC/HTTP in-cluster.
+# The Bun + Hono orchestrator: human auth + per-user authz + a native task
+# model in FRONT of the Rust coordinator. Post-ADR-0051 this is the web's ONLY
+# backend (the coordinator dropped its web-facing REST surface), and nothing
+# else consumes it — so its lifecycle is tied to `web.enabled`: it deploys
+# exactly when the web does. There is intentionally NO separate
+# `orchestrator.enabled` toggle (the only valid topologies are full-stack
+# `web.enabled: true` and coord-only/CLI `web.enabled: false`; an independent
+# toggle would only invent an always-invalid corner). The settings below are
+# the orchestrator's own config, used when `web.enabled`.
 #
 # Env contract (orchestrator/src/config.ts). The orchestrator FAILS CLOSED
 # without the three REQUIRED vars, all sourced from a K8s Secret:
@@ -384,8 +376,6 @@ web:
 #   CONTROL_PLANE_BEARER       — the coordinator app-gRPC bearer token
 #   BETTER_AUTH_SECRET         — better-auth cookie/token signing key
 orchestrator:
-  enabled: false
-
   replicaCount: 2
 
   image:
