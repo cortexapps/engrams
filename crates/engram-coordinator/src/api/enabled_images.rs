@@ -337,8 +337,8 @@ pub(crate) async fn fetch_and_seal_manifest(
 
     // ADR 0048: an enabled image MUST declare its vCPU count so
     // placement can pack against a host's CPU budget. (A stale manifest
-    // using the old `suggested_vcpus` key already fails the parse above
-    // via `deny_unknown_fields`.)
+    // using the old `suggested_vcpus` key still parses via the serde
+    // alias and maps onto `vcpus`, so it passes this check.)
     validate_enabled_manifest(&manifest, image_uri).map_err(ApiError::BadRequest)?;
 
     let now = Utc::now();
@@ -966,12 +966,14 @@ mod tests {
         let ok: ImageManifest = toml::from_str("name = \"x\"\n[resources]\nvcpus = 4\n").unwrap();
         assert!(validate_enabled_manifest(&ok, "r/x:t").is_ok());
 
-        // A stale `suggested_vcpus` key fails the PARSE (deny_unknown_fields),
-        // so it never reaches validation — proven here for completeness.
-        assert!(toml::from_str::<ImageManifest>(
-            "name = \"x\"\n[resources]\nsuggested_vcpus = 2\n"
-        )
-        .is_err());
+        // A legacy `suggested_vcpus` key parses via the serde alias and
+        // maps onto `vcpus`, so an already-baked / stale manifest enables
+        // instead of failing the parse. (ADR 0048 renamed the field but
+        // the alias keeps old artifacts working — bakes don't break.)
+        let legacy: ImageManifest =
+            toml::from_str("name = \"x\"\n[resources]\nsuggested_vcpus = 2\n").unwrap();
+        assert_eq!(legacy.resources.vcpus, Some(2));
+        assert!(validate_enabled_manifest(&legacy, "r/x:t").is_ok());
     }
 
     /// Regression guard for the OCI → BlobStorage materializer.

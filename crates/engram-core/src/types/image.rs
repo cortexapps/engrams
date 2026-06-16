@@ -380,8 +380,11 @@ pub struct ResourceHints {
     /// enable-time validation rejects an image that omits it, and
     /// placement reserves it against the host's
     /// `total_vcpus × overcommit` budget so packing has a CPU bound.
-    /// (Renamed from `suggested_vcpus`; `#[serde(deny_unknown_fields)]`
-    /// makes a stale manifest fail to parse — re-bake on the roll.)
+    /// (Renamed from `suggested_vcpus`; the `serde(alias)` keeps stale
+    /// manifests / already-baked artifacts that still use the old key
+    /// parsing so bakes and enables don't break on the roll. New
+    /// manifests should declare `vcpus`.)
+    #[serde(alias = "suggested_vcpus")]
     pub vcpus: Option<u32>,
     pub suggested_disk_gib: Option<u32>,
 }
@@ -528,6 +531,23 @@ mod tests {
         assert_eq!(m.network.allow_hosts.len(), 2);
         assert_eq!(m.resources.suggested_memory_mib, Some(4096));
         assert_eq!(m.resources.vcpus, Some(2));
+    }
+
+    #[test]
+    fn manifest_accepts_legacy_suggested_vcpus_key() {
+        // ADR 0048 renamed `suggested_vcpus` -> `vcpus`. With
+        // `deny_unknown_fields` on `ResourceHints`, an already-baked
+        // image (or consuming-repo TOML) that still uses the old key
+        // would fail the parse and break the bake/enable. The
+        // `#[serde(alias = "suggested_vcpus")]` keeps the old key
+        // deserializing into `vcpus`.
+        let src = r#"
+            name = "cortex-api"
+            [resources]
+            suggested_vcpus = 4
+        "#;
+        let m: ImageManifest = toml::from_str(src).expect("legacy key must parse");
+        assert_eq!(m.resources.vcpus, Some(4));
     }
 
     #[test]
