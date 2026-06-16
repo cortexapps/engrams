@@ -6,6 +6,11 @@ authorization, the orchestrator's own Postgres, and the generic control-plane
 passthrough) and ADR 0036 (image enablement / enable jobs). It changes the
 shape of `CreateTask` and the web "new session" flow defined there.
 
+Revised 2026-06-16: profiles carry **no `mode`** (every profile launches an
+`agent` session) and **no `sort_order`** (the picker filters by a search box
+rather than admin-curated ordering). Both are recorded as discovery decisions
+below and threaded through the body.
+
 ## Context
 
 Today a task — and therefore a session — is created from free-form inputs.
@@ -24,15 +29,14 @@ prompt field. Two problems follow:
    session here, and this is what each one is allowed to carry."
 
 We want admins to curate a small set of named, opinionated starting points — a
-**profile** — and have users simply pick one. A profile bundles the image, the
-mode, a model and environment, and an explicit decision about whether the
-user's Claude token is injected — everything *except* the task itself, which the
-user still describes at create time. The new-session flow becomes "pick a
-profile, then say what to run," not "configure the whole environment every
-time." Profiles are also the
-natural future home for capability scoping (enabling/disabling specific MCP
-servers and tools per profile) — explicitly **not** built here, but the model
-is shaped to grow into it.
+**profile** — and have users simply pick one. A profile bundles the image, a
+model and environment, and an explicit decision about whether the user's Claude
+token is injected — everything *except* the task itself, which the user still
+describes at create time. The new-session flow becomes "pick a profile, then
+say what to run," not "configure the whole environment every time." Profiles
+are also the natural future home for capability scoping (enabling/disabling
+specific MCP servers and tools per profile) — explicitly **not** built here,
+but the model is shaped to grow into it.
 
 ## Decision
 
@@ -50,10 +54,8 @@ name                text                  -- shown in the picker
 description         text                  -- shown in the picker
 icon                text                  -- a lucide icon name (the web app's icon set)
 image_id            uuid                  -- logical ref to the coordinator's enabled_images.id (§3)
-mode                text                  -- "agent" | "shell"
 include_user_tokens boolean               -- inject the user's Claude token (§5)
 env_vars            jsonb                 -- { KEY: VALUE }; admin-only; the model lives here (§5)
-sort_order          int                   -- picker ordering
 created_at          timestamptz
 updated_at          timestamptz
 deleted_at          timestamptz null      -- null = active; soft delete only (§4)
@@ -61,6 +63,14 @@ deleted_at          timestamptz null      -- null = active; soft delete only (§
 
 Deliberate omissions, each decided rather than overlooked:
 
+- **No `mode` column.** Every profile launches an `agent` session in this ADR;
+  the shell/`dev_vm` path is not curated through profiles yet. Fixing mode to
+  `agent` keeps `CreateTask` on its single existing code path and defers the
+  agent/shell split to the profile that first needs it. (§5, §7)
+- **No `sort_order` column.** The picker filters by **search** rather than
+  admin-curated ordering, so there is no order to persist. Profiles list in a
+  stable default order (by `name`); a search box handles "find the one I want"
+  at any N, and removes the reorder/drag affordance entirely. (§6)
 - **No `model` column.** The model is just one entry in `env_vars` (the harness
   reads it from the environment). A first-class column would duplicate that and
   invite a parallel plumbing path. One mechanism, not two.
@@ -79,6 +89,8 @@ Profiles are an orchestration concern: they exist only to assemble the inputs
 the orchestrator already hands to the control plane's `CreateSession`. The
 control plane has no notion of a profile and never will — it keeps taking
 `image_uri` / `mode` / `prompt` / `secrets` / `harness_env` (ADR 0051 §2.1).
+The orchestrator simply sends `mode: "agent"` for every profile-started session
+(§5).
 
 We record which profile created a session on the existing pointer table:
 
@@ -154,8 +166,8 @@ the environment server-side:
 1. Load the profile by id; reject if missing or soft-deleted.
 2. Resolve `image_id` → current `image_uri` (§3); reject if the image is no
    longer enabled (defense in depth behind the §3 restrict guard).
-3. Set the upstream `mode` from the profile (mapping below). For agent mode,
-   the request's `prompt` (the user's task) becomes the session's first prompt.
+3. Send the control plane `mode: "agent"` (profiles carry no mode yet, §1). The
+   request's `prompt` (the user's task) becomes the session's first prompt.
 4. **Assemble `harness_env`** in this precedence (lowest → highest):
    1. the user's Claude token (`CLAUDE_CODE_OAUTH_TOKEN`, resolved from the
       sealed secret store, ADR 0051 §2.3) — **only if** `include_user_tokens`
@@ -166,11 +178,11 @@ the environment server-side:
 5. Call the control plane's `CreateSession`, then write the `task` and
    `task_session` rows, recording `profile_id` on the latter.
 
-**`mode` mapping.** A profile's `mode` is `"agent"` or `"shell"` in
-product terms; the control plane's `CreateSessionRequest.mode` is
-`"agent"` or `"dev_vm"`. Profile `"shell"` maps to upstream `"dev_vm"`.
-For `shell` profiles the `prompt` is ignored (a dev VM has no agent turn);
-`include_user_tokens` governs only whether the token reaches the environment.
+**Mode is always `agent`.** Profiles do not carry a mode in this ADR (§1);
+`CreateTask` sends the control plane's `mode: "agent"` unconditionally, exactly
+as the handler does today. The shell/`dev_vm` split moves into profiles only
+when a profile needs it (§7); until then the existing direct-`CreateSession`
+dev-VM path is simply unreachable from the profile picker.
 
 **`include_user_tokens` is a capability grant, not a convenience toggle.** It
 is the admin's explicit declaration that sessions started from this profile are
@@ -213,10 +225,12 @@ carry your Claude token is useful context for choosing between profiles, not a
 secret. Non-admins thus see the full profile config *except* `env_vars`.
 
 **The picker** replaces `NewSessionDialog`'s image and mode fields; the user's
-task prompt stays. The new-session entry opens a picker of profile cards (icon,
-name, description) ordered by `sort_order`; the user picks one, types the task,
-and creates the session. There is **no escape hatch** — no free-form/custom
-image, mode, or environment that bypasses profiles. Concretely:
+task prompt stays. The new-session entry opens a picker of profiles (icon,
+name, description) with a **search box** that filters the list by
+name/description; profiles list in a stable default order (by `name`). The user
+picks one, types the task, and creates the session. There is **no escape
+hatch** — no free-form/custom image, mode, or environment that bypasses
+profiles. Concretely:
 
 - **No profiles configured:** the dialog still opens and shows a "No profiles
   configured — contact an admin" empty state. The entry point stays
@@ -235,6 +249,14 @@ Out of scope for this ADR, modeled-around but not built:
   per profile. This is the main forward-looking reason profiles exist as a
   first-class object rather than a saved form; it lands as its own ADR. The
   `env_vars` jsonb and the profile object are shaped to host it.
+- **Shell / `dev_vm` profiles.** Every profile launches an `agent` session
+  today; curating a shell profile (mapping to the control plane's `dev_vm`
+  mode) waits until there's a need. The `CreateSession` contract already
+  accepts `mode`, so this is a `mode` column on `profiles` plus a mapping step
+  in `CreateTask` when it lands — no contract change. (§1, §5)
+- **Admin-curated ordering.** Replaced by picker search; if explicit ordering
+  is wanted later it returns as a `sort_order` column plus a reorder affordance
+  on the management list. (§1, §6)
 - **Multiple user-token types.** `include_user_tokens` is a single boolean over
   "the Claude token" today; a per-token-type grant waits until a second token
   type exists.
@@ -269,6 +291,12 @@ Out of scope for this ADR, modeled-around but not built:
 - **One env mechanism for the model.** Threading the model as `env_vars` rather
   than a column means there is a single code path for "configured environment,"
   and the harness already reads its model from the environment.
+- **Agent-only keeps one code path.** Fixing mode to `agent` means `CreateTask`
+  keeps the single control-plane call it already makes; the agent/shell branch
+  is added only when a curated shell profile actually exists (§7).
+- **Search instead of curated order.** With a handful of profiles, a search box
+  finds the right one faster than maintained ordering does, and it drops a whole
+  reorder UI (drag handles, `sort_order` writes) the feature does not need yet.
 - **No escape hatch by intent.** A free-form bypass would defeat the governance
   the feature exists to create; the empty state handles the only legitimate
   "there's nothing to pick" case.
@@ -283,17 +311,19 @@ Out of scope for this ADR, modeled-around but not built:
   contract is **unchanged**.
 - **Orchestrator:** a Drizzle migration adds the `profiles` table and
   `task_session.profile_id`; `CreateTask` is rewritten to resolve a profile
-  (image resolution + `harness_env` assembly + mode mapping); a `DisableImage`
-  pre-flight guard is added to the passthrough; the CASL policy map gains the
-  five `ProfileService` methods; `ListProfiles`/`GetProfile` handlers strip
-  `env_vars` for non-admins and gate `include_archived` on admin.
+  (image resolution + `harness_env` assembly; mode stays the hardcoded
+  `agent`); a `DisableImage` pre-flight guard is added to the passthrough; the
+  five `ProfileService` methods are authorized with the same CASL machinery (as
+  native handlers, the checks live in the handlers, not the passthrough policy
+  map); `ListProfiles`/`GetProfile` handlers strip `env_vars` for non-admins
+  and gate `include_archived` on admin.
 - **Coordinator:** no changes. It keeps its own image-disable session guard;
   the profile guard sits in front of it.
-- **Web:** `NewSessionDialog` becomes a profile picker (card grid, empty state,
-  no custom option); a new admin Profiles surface provides CRUD + the Archived
-  section; the shared CASL ability file gates the admin affordances. The client
-  sends `profile_id` plus the user's `prompt` to `CreateTask` and no longer
-  assembles image or mode.
+- **Web:** `NewSessionDialog` becomes a profile picker (filterable list, empty
+  state, no custom option); a new admin Profiles surface provides CRUD + the
+  Archived section; the shared CASL ability file gates the admin affordances.
+  The client sends `profile_id` plus the user's `prompt` to `CreateTask` and no
+  longer assembles image or mode.
 - **New failure modes to surface in the UI:** "no profiles configured" (empty
   picker), "image disabled out from under a profile" (create-time rejection,
   should be rare behind the §3 guard), and "cannot disable image — N profiles
@@ -311,7 +341,7 @@ is the agreed UX/UI direction for the three web surfaces profiles touch; it
 shapes presentation only — the data model, `ProfileService` contract, and
 authorization above are fixed.
 
-Three discovery decisions correct or sharpen the body of this ADR:
+Five discovery decisions correct or sharpen the body of this ADR:
 
 - **Icons are lucide-react, not Phosphor.** The web app uses lucide everywhere
   (sidebar, buttons, every component); a second icon family would break the
@@ -321,9 +351,18 @@ Three discovery decisions correct or sharpen the body of this ADR:
   setup more than fleet operations.
 - **Profiles carry no prompt.** The prompt is removed from the profile entirely
   (2026-06-16); the task is the user's to write at create time. A profile
-  configures the *environment* (image, mode, model, env, token grant), not the
+  configures the *environment* (image, model, env, token grant), not the
   *work*. This is why §1 has no `starting_prompt` column and §5 keeps the
   user-supplied `prompt` on `CreateTaskRequest`.
+- **Profiles carry no mode — every profile is an `agent` session (2026-06-16).**
+  The agent/shell toggle is dropped from profiles for now; `CreateTask` always
+  sends `mode: "agent"`, keeping its single existing code path. The picker has
+  no mode control and the task field is always shown. Curating a shell/`dev_vm`
+  profile is deferred (§1, §7).
+- **The picker filters by search, not curated order (2026-06-16).** `sort_order`
+  is dropped: the new-session picker gets a search box that filters by
+  name/description, and profiles list in a stable default order. This also
+  removes the management-list reorder/drag affordance (§1, §6).
 
 ### 1. Feature summary
 
@@ -335,10 +374,9 @@ list.
 
 ### 2. Primary user action
 
-- **Developer (≈90% of sessions):** open new-session → scan a short list of
-  named profiles → pick one → session starts. Zero technical input.
-- **Admin:** curate that short list — create / edit / archive profiles and
-  order them.
+- **Developer (≈90% of sessions):** open new-session → search/scan a short list
+  of named profiles → pick one → session starts. Zero technical input.
+- **Admin:** curate that short list — create / edit / archive profiles.
 
 ### 3. Design direction
 
@@ -349,7 +387,8 @@ sentence: *an engineer at their desk, mid-task, picking how to launch a unit of
 agent work — and an admin, occasionally, setting the few ways that's allowed to
 happen.* Anchor references: **Linear** settings panels (dense list + side
 editor), **Vercel** project-settings env-var editor (the key/value control),
-**Raycast** command list (the picker's quiet, keyboard-first selection feel).
+**Raycast** command list (the picker's quiet, keyboard-first search + selection
+feel).
 
 ### 4. Scope
 
@@ -363,23 +402,23 @@ create/edit editor + the app-wide profile chip. Real `ProfileService` wiring
 is invoked from the header, the ⌘-palette, the sessions rail, and a keyboard
 shortcut). Its image and mode fields are replaced by a **vertical list of
 selectable profile rows** (radio-card semantics): lucide glyph · name ·
-description, with a quiet meta line (`agent · model · carries your token`),
-ordered by `sort_order`. A **task field** (the user's prompt) sits below the
-list; it is hidden for a `shell` profile, since a dev VM has no agent turn.
-Selecting a profile, then a primary lime **"Start session"**, confirms. A list
-beats a card grid here — few profiles are expected, and it avoids the
-identical-card-grid trap. There is no escape hatch for image / mode / env:
+description, with a quiet meta line (`model · carries your token`). A **search
+box** above the list filters by name/description (Raycast-style, keyboard-first);
+the list otherwise shows in a stable default order (by `name`). A **task field**
+(the user's prompt) sits below the list and is always shown — every profile is
+an agent session. Selecting a profile, then a primary lime **"Start session"**,
+confirms. A list beats a card grid here — few profiles are expected, and it
+avoids the identical-card-grid trap. There is no escape hatch for image / env:
 those are the profile's to set, not the user's.
 
 **B. Management surface** (`/settings/profiles`, admin) — added to the Settings
 second sidebar as **"Session Profiles"**, deliberately disambiguated from the
 account "Profile" page; non-admins never see it (the existing `requireAdmin`
 guard, which already redirects members to `/settings/profile`). Layout is a
-**list of profile rows**, not a data table: drag handle · glyph + name +
-description · resolved image · mode badge · model · token indicator ·
-edit/archive actions. A list rather than the tabular Members/Images panels
-because reordering (which writes `sort_order`) and the rich icon+description
-identity suit rows, and N is small — a deliberate, explained divergence. Below
+**list of profile rows**, not a data table: glyph + name + description ·
+resolved image · model · token indicator · edit/archive actions. A list rather
+than the tabular Members/Images panels because the rich icon+description
+identity suits rows, and N is small — a deliberate, explained divergence. Below
 the active list, a collapsible **"Archived"** section (read-only; restore is
 deferred per §7).
 
@@ -387,22 +426,24 @@ deferred per §7).
 admin) — a **full sub-page**, not a modal: the form is too tall for a dialog
 (icon picker + env key/value editor), and the product rule is to exhaust inline
 before reaching for a modal. Single column, grouped with the existing `Field`
-system: Identity (name, description, icon picker) → Launch (image select, mode)
-→ Environment (`include_user_tokens` switch, `env_vars` editor). There is no
-prompt field — a profile configures the environment, not the task.
+system: Identity (name, description, icon picker) → Launch (image select) →
+Environment (`include_user_tokens` switch, `env_vars` editor). There is no
+prompt field and no mode field — a profile configures the environment, not the
+task, and every profile is an agent session.
 
 ### 6. Key states
 
 - **Picker:** default (list) · empty ("No profiles configured — contact an
   admin"; the entry point stays visible, no mysteriously disabled button) ·
-  loading (row skeletons) · single-profile (still the picker) · error.
+  loading (row skeletons) · single-profile (still the picker) · search with no
+  matches · error.
 - **Management list:** default · empty ("No session profiles yet" + Create) ·
   loading · error · archived section (empty / with rows).
 - **Editor:** create vs edit · field validation (name/description required,
   image required, env-key format) · save success (toast + return to list) ·
   save failure · the rare "image no longer enabled" rejection.
 - **Profile chip (detail / rail / list):** default (glyph + name) · **details
-  on hover/focus + click** (resolved `image_uri`, mode, model, token-grant;
+  on hover/focus + click** (resolved `image_uri`, model, token-grant;
   admins also get a link to the profile) · **archived** profile
   (muted + an "archived" badge, still resolvable) · **profile-less / legacy**
   session (falls back to the image string, as today) · loading.
@@ -423,10 +464,11 @@ prompt field — a profile configures the environment, not the task.
   string into `icon`.
 - **Env editor:** repeatable KEY / VALUE rows, add/remove, with a hint that the
   model is set here — no separate model field (one mechanism, per §1).
-- **Reorder:** drag handles on the management list write `sort_order`; there is
-  no raw integer field in the form.
-- **Create flow:** new session → pick → "Start session" → navigate to the new
-  session's detail with the transcript streaming.
+- **Picker search:** a search box above the profile list filters by
+  name/description (Raycast-style, keyboard-first); there is no manual ordering
+  to curate and no reorder affordance.
+- **Create flow:** new session → search/pick → "Start session" → navigate to the
+  new session's detail with the transcript streaming.
 
 ### 8. Content requirements
 
@@ -436,8 +478,9 @@ prompt field — a profile configures the environment, not the task.
   toggle): "Sessions started from this profile may carry the user's Claude
   credentials into the sandbox. Leave off for untrusted or externally-facing
   images."
-- Picker task field placeholder (agent profiles): "Describe the task for this
-  session…" — this is the user's prompt; profiles do not set it.
+- Picker task field placeholder: "Describe the task for this session…" — this
+  is the user's prompt; profiles do not set it.
+- Picker search placeholder: "Search profiles…"
 - Buttons (verb + object): "Create profile," "Save changes," "Archive
   profile," "Start session."
 - Realistic ranges: 0 profiles (empty), 2–6 typical, ~20 max; `env_vars` 0–~15
@@ -446,10 +489,10 @@ prompt field — a profile configures the environment, not the task.
 ### 9. Backend contract assumption
 
 Session list/detail responses (`ListTasks` / `GetSession`) embed a lightweight
-resolved snapshot — `profile { id, name, icon, archived, image_uri, mode }` —
-keyed off `task_session.profile_id`, enough for the chip and its hover glance
-without an N+1. Richer admin detail comes from `GetProfile` lazily on the
-management page.
+resolved snapshot — `profile { id, name, icon, archived, image_uri }` — keyed
+off `task_session.profile_id`, enough for the chip and its hover glance without
+an N+1. Richer admin detail comes from `GetProfile` lazily on the management
+page.
 
 ### 10. Resolved
 
@@ -459,3 +502,9 @@ management page.
    the picker's task field at create time. `CreateTaskRequest` keeps the
    optional, user-supplied `prompt`, and `profiles` has no `starting_prompt`
    column.
+2. **Do profiles carry a mode? — No** (decided 2026-06-16). Every profile
+   launches an `agent` session; `CreateTask` hardcodes `mode: "agent"`. The
+   shell/`dev_vm` split is deferred to a future profile that needs it (§7).
+3. **Admin-curated ordering or search? — Search** (decided 2026-06-16). The
+   picker filters by a search box and lists in a stable default order; there is
+   no `sort_order` column and no reorder UI (§6).
