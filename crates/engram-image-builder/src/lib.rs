@@ -608,6 +608,9 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 dockerfile: dockerfile.clone(),
                 tag: docker_tag.clone(),
                 build_args: cfg.build.args.clone(),
+                // `[build] build_secrets` → BuildKit `--secret id=,env=`;
+                // values come from the bake process env, never a layer.
+                build_secrets: cfg.build.build_secrets.clone(),
             })
             .await
             .map_err(|e| BuildError::Docker(format!("build: {e}")))?;

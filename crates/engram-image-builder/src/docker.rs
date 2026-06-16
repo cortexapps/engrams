@@ -25,6 +25,16 @@ pub struct BuildArgs {
     pub dockerfile: PathBuf,
     pub tag: String,
     pub build_args: HashMap<String, String>,
+    /// BuildKit build-time secret IDs (the `[build] build_secrets` names).
+    /// Each becomes `--secret id=<name>,env=<name>`, so BuildKit reads the
+    /// value from the bake process's environment variable of the same name
+    /// and exposes it to the Dockerfile via `RUN --mount=type=secret,
+    /// id=<name>` (readable at `/run/secrets/<name>`). The value never
+    /// lands in a build-arg, an image layer, or the image history — the
+    /// leak-free way to feed a private-registry token to `pnpm install` /
+    /// `gradle assemble` during the bake. CI sets the env vars from its
+    /// secret store before invoking the bake.
+    pub build_secrets: Vec<String>,
 }
 
 /// The subset of a built image's container config the baker folds into
@@ -181,6 +191,16 @@ impl DockerRunner for DockerCli {
             .arg(&args.tag);
         for (k, v) in &args.build_args {
             cmd.arg("--build-arg").arg(format!("{k}={v}"));
+        }
+        // BuildKit build-time secrets, sourced from the bake process env
+        // (`env=<id>`). Requires the BuildKit frontend — force it on so the
+        // `--secret` flag is honored even where the daemon defaults to the
+        // legacy builder (which would silently ignore it).
+        if !args.build_secrets.is_empty() {
+            cmd.env("DOCKER_BUILDKIT", "1");
+            for id in &args.build_secrets {
+                cmd.arg("--secret").arg(format!("id={id},env={id}"));
+            }
         }
         cmd.arg(&args.context);
         // Force BuildKit's line-oriented `plain` progress so the streamed
