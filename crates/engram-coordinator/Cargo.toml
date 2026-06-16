@@ -62,6 +62,7 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tokio-tungstenite.workspace = true
 tonic.workspace = true
+tonic-reflection.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
@@ -81,5 +82,9 @@ engram-git-dev.workspace = true
 futures = { workspace = true }
 http-body-util = "0.1"
 parking_lot.workspace = true
+# Decode the app FileDescriptorSet in the reflection test (assert the
+# descriptor actually carries the app services). Test-only.
+prost.workspace = true
+prost-types.workspace = true
 reqwest.workspace = true
 tempfile = "3"

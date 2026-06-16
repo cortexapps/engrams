@@ -134,6 +134,9 @@ jsonwebtoken = "9"
 # grpc
 tonic = "0.12"
 tonic-build = "0.12"
+# gRPC server reflection for the coordinator's network-private app-gRPC
+# surface (grpcurl introspection). v0.12 matches the tonic 0.12 line.
+tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 

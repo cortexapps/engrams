@@ -115,9 +115,24 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
     // config at construction time (no hot-reload; rotation = overlap
     // both tokens, restart, drop the old one).
     let auth = Arc::new(auth::BearerAuth::new(state.cfg.app_grpc_tokens.clone()));
+
+    // gRPC server reflection (grpcurl `list` / `describe`, proto-less
+    // calls). Schema only — exposes no data and rides the SAME
+    // network-private boundary as the rest of app-gRPC (ClusterIP /
+    // port-forward only; never internet-facing). Built from the
+    // `FileDescriptorSet` that `engram-protocol`'s build.rs emits. The
+    // builder is infallible here (the descriptor bytes are baked in), but
+    // it returns a `Result`; a failure means the codegen is broken, so
+    // panic loudly at startup rather than serve a half-built surface.
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(app::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .expect("app-gRPC reflection descriptor is malformed (engram-protocol build.rs)");
+
     tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+        .add_service(reflection)
         .add_service(app::session_service_server::SessionServiceServer::new(
             AppSessionService {
                 state: state.clone(),
@@ -141,6 +156,60 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
         .add_service(app::image_service_server::ImageServiceServer::new(
             AppImageService { state, auth },
         ))
+}
+
+#[cfg(test)]
+mod reflection_tests {
+    //! The reflection service is built from the `FileDescriptorSet` that
+    //! `engram-protocol`'s build.rs emits. If that path breaks (empty
+    //! descriptor, codegen drift), `server()` would panic at startup — so
+    //! assert here, at test time, that the descriptor is non-empty and
+    //! that `tonic_reflection::server::Builder::build_v1()` accepts it.
+
+    #[test]
+    fn reflection_descriptor_is_present_and_buildable() {
+        assert!(
+            !engram_protocol::app::FILE_DESCRIPTOR_SET.is_empty(),
+            "app FILE_DESCRIPTOR_SET is empty — build.rs `file_descriptor_set_path` \
+             didn't emit the descriptor"
+        );
+        tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(engram_protocol::app::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .expect("reflection builder must accept the emitted app descriptor set");
+    }
+
+    /// The descriptor must actually carry the app services — a guard
+    /// against compiling a descriptor for the wrong/empty proto set. We
+    /// decode it and look for the service names grpcurl would `list`.
+    #[test]
+    fn reflection_descriptor_lists_the_app_services() {
+        use prost::Message;
+        let fds = prost_types::FileDescriptorSet::decode(
+            engram_protocol::app::FILE_DESCRIPTOR_SET,
+        )
+        .expect("descriptor bytes decode as a FileDescriptorSet");
+        let service_names: Vec<String> = fds
+            .file
+            .iter()
+            .flat_map(|f| {
+                let pkg = f.package.clone().unwrap_or_default();
+                f.service.iter().map(move |s| {
+                    format!("{}.{}", pkg, s.name.clone().unwrap_or_default())
+                })
+            })
+            .collect();
+        for expected in [
+            "engram.app.v1.SessionService",
+            "engram.app.v1.FleetService",
+            "engram.app.v1.ImageService",
+        ] {
+            assert!(
+                service_names.iter().any(|n| n == expected),
+                "reflection descriptor is missing {expected}; got {service_names:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +297,7 @@ mod into_status_tests {
             lost.metadata().get("engram-error-slug").unwrap().as_bytes(),
         );
     }
+
 }
 
 #[cfg(test)]
