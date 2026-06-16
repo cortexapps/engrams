@@ -56,7 +56,13 @@ spec:
             capabilities:
               drop: ["ALL"]
           workingDir: /app/orchestrator
-          command: ["bunx", "drizzle-kit", "migrate"]
+          # Programmatic drizzle-orm migrator (src/db/migrate.ts), NOT the
+          # `bunx drizzle-kit migrate` CLI: drizzle-kit is a devDependency the
+          # production image strips (`bun install --production`), so bunx would
+          # refetch it (+ esbuild) from npm on EVERY deploy, on this hook's
+          # critical path. `bun run migrate` uses the baked-in drizzle-orm + the
+          # ./drizzle SQL folder — seconds, no npm fetch.
+          command: ["bun", "run", "migrate"]
           env:
             - name: ORCHESTRATOR_DATABASE_URL
               valueFrom:
