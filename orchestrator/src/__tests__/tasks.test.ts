@@ -26,13 +26,19 @@ import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
 import { registerTasks } from "../rpc/tasks.ts";
-import type { TaskDeps, SessionsClient, Db, GetSession } from "../rpc/tasks.ts";
+import type { TaskDeps, SessionsClient, Db, GetSession, ImagesClient } from "../rpc/tasks.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
 import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
+import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
+import { makeProfileStore } from "../db/profiles.ts";
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 import { checkDb, getDb } from "../db/client.ts";
-import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
+import {
+  task as taskTable,
+  taskSession as taskSessionTable,
+  profile as profileTable,
+} from "../db/schema.ts";
 import { eq } from "drizzle-orm";
 
 // ---------------------------------------------------------------------------
@@ -160,6 +166,62 @@ function makeFakeTokens(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Fake profile store + image catalog (ADR 0052)
+// ---------------------------------------------------------------------------
+
+const PROFILE_ID = "test-profile";
+
+function makeFakeProfiles(opts?: {
+  includeUserTokens?: boolean;
+  envVars?: Record<string, string>;
+  imageId?: string;
+}): ProfileStore {
+  const row: ProfileRow = {
+    id: PROFILE_ID,
+    name: "Test",
+    description: "",
+    icon: "Bot",
+    imageId: opts?.imageId ?? "img-1",
+    includeUserTokens: opts?.includeUserTokens ?? false,
+    envVars: opts?.envVars ?? {},
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+    deletedAt: null,
+  };
+  const rows = new Map([[row.id, row]]);
+  return {
+    async list() {
+      return [...rows.values()];
+    },
+    async get(id) {
+      return rows.get(id) ?? null;
+    },
+    async getActive(id) {
+      const r = rows.get(id);
+      return r && !r.deletedAt ? r : null;
+    },
+    async getByIds(ids) {
+      return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[];
+    },
+    async create(i: ProfileInput) {
+      const r = { ...row, ...i };
+      rows.set(r.id, r);
+      return r;
+    },
+    async update() {
+      return null;
+    },
+    async softDelete() {},
+  };
+}
+
+const fakeImages = (ids = ["img-1"]): ImagesClient => ({
+  async listEnabledImages() {
+    return { images: ids.map((id) => ({ id, imageUri: `registry/${id}:latest` })) };
+  },
+});
+
 /** Build a getSession stub for the given user (or return null for anon). */
 function makeGetSession(
   userId: string | null,
@@ -169,6 +231,46 @@ function makeGetSession(
     if (!userId) return null;
     return { user: { id: userId, role, email: `${userId}@test.invalid` } };
   };
+}
+
+/**
+ * A fake DB whose write transaction is a no-op and whose subsequent read
+ * (loadTask's `.select().from(taskTable)...`) returns one minimal task row so
+ * createTask runs to completion. Drizzle's chainable builder is stubbed as a
+ * thenable: each builder method returns the same object, awaited as an array.
+ */
+function okDb(taskId = "fake-task"): Db {
+  const taskRow = {
+    id: taskId,
+    type: "chat",
+    title: null,
+    status: "open",
+    createdByUserId: MEMBER_A,
+    source: {},
+    workflowRunId: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  // First select() (task table) returns [taskRow]; subsequent selects
+  // (task_session) return []. A counter flips after the first resolve.
+  let selectCount = 0;
+  const makeSelectChain = () => {
+    const rows = selectCount++ === 0 ? [taskRow] : [];
+    const chain: Record<string, unknown> = {
+      from: () => chain,
+      where: () => chain,
+      limit: () => chain,
+      then: (resolve: (v: unknown) => unknown) => resolve(rows),
+    };
+    return chain;
+  };
+  return {
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+      const tx = { insert: () => ({ values: async () => undefined }) };
+      return fn(tx);
+    },
+    select: () => makeSelectChain(),
+  } as unknown as Db;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +347,8 @@ describe("TaskService — unauthenticated", () => {
       getSession: makeGetSession(null),
       sessions: fakeSessions,
       secrets: makeFakeTokens(),
+      profiles: makeFakeProfiles(),
+      images: fakeImages(),
     });
   });
 
@@ -253,7 +357,7 @@ describe("TaskService — unauthenticated", () => {
   test("CreateTask anon → 401 Unauthenticated", async () => {
     const client = makeClient(srv.serverUrl);
     await expectConnectError(
-      client.createTask({ type: "chat", imageUri: "registry/img:latest" }),
+      client.createTask({ type: "chat", profileId: PROFILE_ID }),
       Code.Unauthenticated,
     );
   });
@@ -293,6 +397,8 @@ describe("TaskService — type validation", () => {
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
       secrets: makeFakeTokens(),
+      profiles: makeFakeProfiles(),
+      images: fakeImages(),
     });
   });
 
@@ -301,9 +407,50 @@ describe("TaskService — type validation", () => {
   test("CreateTask type='linear_issue' → 422 InvalidArgument", async () => {
     const client = makeClient(srv.serverUrl);
     await expectConnectError(
-      client.createTask({ type: "linear_issue", imageUri: "registry/img:latest" }),
+      client.createTask({ type: "linear_issue", profileId: PROFILE_ID }),
       Code.InvalidArgument,
     );
+  });
+
+  test("CreateTask with unknown profile_id → NotFound", async () => {
+    const srv2 = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: makeFakeSessions({ existing: [] }),
+      secrets: makeFakeTokens(),
+      profiles: makeFakeProfiles(),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      await expectConnectError(
+        makeClient(srv2.serverUrl).createTask({ type: "chat", profileId: "does-not-exist" }),
+        Code.NotFound,
+      );
+    } finally {
+      await srv2.close();
+    }
+  });
+
+  test("CreateTask when the profile's image is no longer enabled → FailedPrecondition", async () => {
+    // Profile resolves fine (getActive returns it with imageId "img-1"), but the
+    // enabled-image catalog is empty, so the profile's image is not enabled →
+    // ADR 0052 §5 step 2 rejection.
+    const srv2 = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: makeFakeSessions({ existing: [] }),
+      secrets: makeFakeTokens(),
+      profiles: makeFakeProfiles(), // profile.imageId defaults to "img-1"
+      images: fakeImages([]), // empty catalog → img-1 not enabled
+      db: okDb(),
+    });
+    try {
+      await expectConnectError(
+        makeClient(srv2.serverUrl).createTask({ type: "chat", profileId: PROFILE_ID }),
+        Code.FailedPrecondition,
+      );
+    } finally {
+      await srv2.close();
+    }
   });
 });
 
@@ -352,6 +499,8 @@ describe("TaskService — member anti-enumeration (in-memory store)", () => {
           getSession: makeGetSession(MEMBER_B),
           sessions: fakeSessions,
           secrets: makeFakeTokens(),
+          profiles: makeFakeProfiles(),
+          images: fakeImages(),
           db,
         });
 
@@ -396,6 +545,8 @@ describe("TaskService — member anti-enumeration (in-memory store)", () => {
           getSession: makeGetSession(MEMBER_B),
           sessions: fakeSessions,
           secrets: makeFakeTokens(),
+          profiles: makeFakeProfiles(),
+          images: fakeImages(),
           db,
         });
 
@@ -431,6 +582,17 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
   beforeAll(async () => {
     if (!dbReachable) return;
 
+    // Seed a profile so the real createTask handler can resolve it.
+    await db!.insert(profileTable).values({
+      id: PROFILE_ID,
+      name: "CRUD",
+      description: "",
+      icon: "Bot",
+      imageId: "img-1",
+      includeUserTokens: false,
+      envVars: {},
+    });
+
     fakeSessions = makeFakeSessions({
       created: [
         {
@@ -449,6 +611,8 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
       secrets: makeFakeTokens(),
+      profiles: makeProfileStore(db!),
+      images: fakeImages(),
       db: db!,
     });
     client = makeClient(srv.serverUrl);
@@ -460,13 +624,14 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     if (createdTaskId && db) {
       await db.delete(taskTable).where(eq(taskTable.id, createdTaskId)).catch(() => {});
     }
+    await db!.delete(profileTable).where(eq(profileTable.id, PROFILE_ID)).catch(() => {});
     await srv?.close();
   });
 
   test.skipIf(!dbReachable)("CreateTask → returns task with 'working' status from session", async () => {
     const resp = await client.createTask({
       type: "chat",
-      imageUri: "registry/img:latest",
+      profileId: PROFILE_ID,
       title: "CRUD test task",
     });
 
@@ -505,6 +670,8 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
       getSession: makeGetSession(MEMBER_B),
       sessions: fakeSessions,
       secrets: makeFakeTokens(),
+      profiles: makeProfileStore(db!),
+      images: fakeImages(),
       db: db!,
     });
     try {
@@ -597,6 +764,8 @@ describe("TaskService — admin list sees all + synthetic unattributed rows", ()
         getSession: makeGetSession(ADMIN_ID, "admin"),
         sessions: fakeSessions,
         secrets: makeFakeTokens(),
+        profiles: makeFakeProfiles(),
+        images: fakeImages(),
         db,
       });
 
@@ -657,6 +826,8 @@ describe("TaskService — member scoping: orphan sessions excluded from member L
         getSession: makeGetSession(MEMBER_A),
         sessions: fakeSessions,
         secrets: makeFakeTokens(),
+        profiles: makeFakeProfiles(),
+        images: fakeImages(),
         db,
       });
 
@@ -716,6 +887,8 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
       secrets: makeFakeTokens(),
+      profiles: makeFakeProfiles(),
+      images: fakeImages(),
       db: fakeDb,
     });
 
@@ -724,7 +897,7 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
       // The request should fail (DB error → rethrown as Internal).
       let caughtErr: unknown;
       try {
-        await client.createTask({ type: "chat", imageUri: "registry/img:latest" });
+        await client.createTask({ type: "chat", profileId: PROFILE_ID });
         throw new Error("Expected createTask to throw");
       } catch (err) {
         caughtErr = err;
@@ -755,79 +928,40 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
 });
 
 // ---------------------------------------------------------------------------
-// 6b. Harness env injection (ADR 0051 Drip A)
+// 6b. Harness env injection — include_user_tokens gate + env_vars precedence
+// (ADR 0052)
 //
-// The per-user Claude token now lives in the orchestrator's own store; when
-// present it must ride CreateSession.harness_env as
-// { CLAUDE_CODE_OAUTH_TOKEN: <token> }. When absent, harness_env must be unset
-// so no-token users (and no-harness images) boot unchanged.
+// The per-user Claude token rides CreateSession.harness_env as
+// { CLAUDE_CODE_OAUTH_TOKEN: <token> } ONLY when the profile sets
+// include_user_tokens. Profile env_vars override the user token on key
+// collision. No token + no env_vars → harness_env unset.
 // ---------------------------------------------------------------------------
 
-describe("TaskService — harness_env injection from local token store", () => {
-  /**
-   * A fake DB whose write transaction is a no-op and whose subsequent read
-   * (loadTask's `.select().from(taskTable)...`) returns one minimal task row so
-   * createTask runs to completion. Drizzle's chainable builder is stubbed as a
-   * thenable: each builder method returns the same object, awaited as an array.
-   */
-  function okDb(taskId = "fake-task"): Db {
-    const taskRow = {
-      id: taskId,
-      type: "chat",
-      title: null,
-      status: "open",
-      createdByUserId: MEMBER_A,
-      source: {},
-      workflowRunId: null,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-    // First select() (task table) returns [taskRow]; subsequent selects
-    // (task_session) return []. A counter flips after the first resolve.
-    let selectCount = 0;
-    const makeSelectChain = () => {
-      const rows = selectCount++ === 0 ? [taskRow] : [];
-      const chain: Record<string, unknown> = {
-        from: () => chain,
-        where: () => chain,
-        limit: () => chain,
-        then: (resolve: (v: unknown) => unknown) => resolve(rows),
-      };
-      return chain;
-    };
-    return {
-      transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
-        const tx = { insert: () => ({ values: async () => undefined }) };
-        return fn(tx);
-      },
-      select: () => makeSelectChain(),
-    } as unknown as Db;
-  }
+function oneCreatedSession(prefix: string): FakeSession {
+  return {
+    id: `${prefix}-${Date.now()}`,
+    status: "created",
+    image: "registry/img:latest",
+    mode: "agent",
+    createdAt: new Date().toISOString(),
+    lastActiveAt: new Date().toISOString(),
+  };
+}
 
-  test("token present → harness_env carries CLAUDE_CODE_OAUTH_TOKEN", async () => {
-    const fakeSessions = makeFakeSessions({
-      created: [
-        {
-          id: `henv-${Date.now()}`,
-          status: "created",
-          image: "registry/img:latest",
-          mode: "agent",
-          createdAt: new Date().toISOString(),
-          lastActiveAt: new Date().toISOString(),
-        },
-      ],
-      existing: [],
-    });
+describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0052)", () => {
+  test("include_user_tokens=true + token present → harness_env carries the token", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-tok")], existing: [] });
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
       secrets: makeFakeTokens({ [MEMBER_A]: "sk-ant-oat01-secret" }),
+      profiles: makeFakeProfiles({ includeUserTokens: true }),
+      images: fakeImages(),
       db: okDb(),
     });
     try {
       const client = makeClient(srv.serverUrl);
-      await client.createTask({ type: "chat", imageUri: "registry/img:latest" });
-      expect(fakeSessions.createReqs).toHaveLength(1);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
       expect(fakeSessions.createReqs[0]?.harnessEnv).toEqual({
         CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-secret",
       });
@@ -836,31 +970,45 @@ describe("TaskService — harness_env injection from local token store", () => {
     }
   });
 
-  test("no token → harness_env is unset", async () => {
-    const fakeSessions = makeFakeSessions({
-      created: [
-        {
-          id: `henv-none-${Date.now()}`,
-          status: "created",
-          image: "registry/img:latest",
-          mode: "agent",
-          createdAt: new Date().toISOString(),
-          lastActiveAt: new Date().toISOString(),
-        },
-      ],
-      existing: [],
-    });
+  test("include_user_tokens=false → token NOT injected even when present", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-notok")], existing: [] });
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(), // empty store
+      secrets: makeFakeTokens({ [MEMBER_A]: "sk-ant-oat01-secret" }),
+      profiles: makeFakeProfiles({ includeUserTokens: false }),
+      images: fakeImages(),
       db: okDb(),
     });
     try {
       const client = makeClient(srv.serverUrl);
-      await client.createTask({ type: "chat", imageUri: "registry/img:latest" });
-      expect(fakeSessions.createReqs).toHaveLength(1);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
       expect(fakeSessions.createReqs[0]?.harnessEnv).toBeUndefined();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("profile env_vars override the user token key", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-override")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      secrets: makeFakeTokens({ [MEMBER_A]: "user-token" }),
+      profiles: makeFakeProfiles({
+        includeUserTokens: true,
+        envVars: { CLAUDE_CODE_OAUTH_TOKEN: "admin-token", ANTHROPIC_MODEL: "claude-opus-4-8" },
+      }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      expect(fakeSessions.createReqs[0]?.harnessEnv).toEqual({
+        CLAUDE_CODE_OAUTH_TOKEN: "admin-token",
+        ANTHROPIC_MODEL: "claude-opus-4-8",
+      });
     } finally {
       await srv.close();
     }
@@ -926,6 +1074,8 @@ describe("TaskService — session status → task status mapping", () => {
             getSession: makeGetSession(MEMBER_A),
             sessions: fakeSessions,
             secrets: makeFakeTokens(),
+            profiles: makeFakeProfiles(),
+            images: fakeImages(),
             db,
           });
 

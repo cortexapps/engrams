@@ -56,11 +56,18 @@ import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
-import { sessions as defaultSessions } from "../control-plane/client.ts";
+import { sessions as defaultSessions, images as defaultImages } from "../control-plane/client.ts";
 import {
   makeUserSecretStore,
   type UserSecretStore,
+  CLAUDE_OAUTH_ENV_VAR,
 } from "../db/user-secrets.ts";
+import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
+import type { ImagesClient } from "./profiles.ts";
+
+// Re-export ImagesClient so downstream modules (image-guard, tests) can import
+// it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
+export type { ImagesClient } from "./profiles.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -97,6 +104,10 @@ export interface TaskDeps {
   sessions?: SessionsClient;
   /** Per-user KEK-sealed session secret store (ADR 0051 Drip A). */
   secrets?: UserSecretStore;
+  /** Admin-curated session profiles (ADR 0052). */
+  profiles?: ProfileStore;
+  /** Enabled-image catalog client (ADR 0052) — resolves image_id → image_uri. */
+  images?: ImagesClient;
   db?: Db;
 }
 
@@ -300,6 +311,8 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
   // lazily so importing this module does not require a DB at import time.
   const resolveSecrets = (): UserSecretStore =>
     deps?.secrets ?? makeUserSecretStore(getDbFn());
+  const profiles: ProfileStore = deps?.profiles ?? makeProfileStore(getDbFn());
+  const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
 
   router.service(TaskService, {
     // -------------------------------------------------------------------------
@@ -309,43 +322,60 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const user = await requireUser(ctx, getSession);
       const ability = abilityFor(user);
 
-      // Only "chat" tasks exist yet.
       if (req.type !== "chat") {
         throw new ConnectError("only chat tasks exist yet", Code.InvalidArgument);
       }
-
       if (!ability.can("create", "Task")) {
         throw new ConnectError("forbidden", Code.PermissionDenied);
       }
-
-      // Resolve ALL of the caller's session secrets from our OWN store (ADR
-      // 0051 Drip A), KEK-envelope sealed at rest. The whole map rides
-      // CreateSession.harness_env (today that's just
-      // { CLAUDE_CODE_OAUTH_TOKEN: <token> }, but it generalizes to any
-      // env-var-keyed secret); the coordinator injects + persists it for resume.
-      // A lookup failure is non-fatal — no-harness images, and users who never
-      // saved a secret, work fine. An empty map is omitted. NEVER log values.
-      let harnessEnv: Record<string, string> | undefined;
-      try {
-        const all = await resolveSecrets().getAll(user.id);
-        harnessEnv = Object.keys(all).length > 0 ? all : undefined;
-      } catch (secretErr) {
-        console.warn(
-          `[TaskService] createTask: session-secret lookup failed for user ${user.id} — booting without harness env`,
-          secretErr,
-        );
-        harnessEnv = undefined;
+      if (!req.profileId) {
+        throw new ConnectError("profile_id is required", Code.InvalidArgument);
       }
 
-      // 1. Create the upstream session (control plane).
+      // 1. Load the active profile (ADR §5.1). Missing/archived → rejected.
+      const profile = await profiles.getActive(req.profileId);
+      if (!profile) {
+        throw new ConnectError("profile not found or archived", Code.NotFound);
+      }
+
+      // 2. Resolve image_id → current image_uri (ADR §5.2). Defense in depth
+      //    behind the DisableImage guard (Task 8): reject if no longer enabled.
+      const catalog = await imagesClient.listEnabledImages({});
+      const image = catalog.images.find((i) => i.id === profile.imageId);
+      if (!image) {
+        throw new ConnectError(
+          "the profile's image is no longer enabled — contact an admin",
+          Code.FailedPrecondition,
+        );
+      }
+
+      // 3. Assemble harness_env (ADR §5.4), lowest → highest precedence:
+      //    user Claude token (only if include_user_tokens) < profile env_vars.
+      //    NEVER log values.
+      const harness: Record<string, string> = {};
+      if (profile.includeUserTokens) {
+        try {
+          const userToken = await resolveSecrets().get(user.id, CLAUDE_OAUTH_ENV_VAR);
+          if (userToken) harness[CLAUDE_OAUTH_ENV_VAR] = userToken;
+        } catch (secretErr) {
+          console.warn(
+            `[TaskService] createTask: token lookup failed for user ${user.id} — booting without it`,
+            secretErr,
+          );
+        }
+      }
+      for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v; // profile overrides
+      const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
+
+      // 4. Create the upstream session. Mode is always "agent" (ADR §5).
       const created = await sessionsClient.createSession({
-        imageUri: req.imageUri,
+        imageUri: image.imageUri,
         mode: "agent",
         ...(req.prompt != null ? { prompt: req.prompt } : {}),
         ...(harnessEnv != null ? { harnessEnv } : {}),
       });
 
-      // 2. Insert task + task_session rows. Compensate on failure.
+      // 5. Insert task + task_session (recording profile_id). Compensate on failure.
       const taskId = crypto.randomUUID();
       try {
         const db = getDbFn();
@@ -362,15 +392,13 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
             taskId,
             sessionId: created.sessionId,
             role: "primary",
+            profileId: profile.id,
           });
         });
       } catch (dbErr) {
-        // Compensation: upstream session created but DB insert failed.
-        // Best-effort delete the session to avoid orphans.
         try {
           await sessionsClient.deleteSession({ sessionId: created.sessionId });
         } catch (delErr) {
-          // Log compensation failure but don't mask the original error.
           console.error(
             `[TaskService] createTask compensation: failed to delete orphan session ${created.sessionId} after DB error`,
             delErr,
@@ -379,11 +407,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw dbErr;
       }
 
-      // 3. Evict the negative-cache entry so authz/resolve.ts returns the new
-      //    owner immediately (avoids ≤5 s stale null window).
       evictOwnerCacheEntry(created.sessionId);
-
-      // 4. Return the newly created task with live session state.
       const loaded = await loadTask(taskId, getDbFn(), sessionsClient);
       return { task: loaded };
     },
