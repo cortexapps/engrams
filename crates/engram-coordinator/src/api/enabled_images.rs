@@ -744,13 +744,13 @@ pub(crate) async fn capture_and_record_base_snapshot(
 }
 
 /// ADR 0048: enable-time manifest validation. An enabled image must
-/// declare `[resources] vcpus = N` so placement can reserve CPU and pack
-/// hosts against a budget. Pure (no I/O) so it's unit-tested directly.
+/// declare `[resources] suggested_vcpus = N` so placement can reserve CPU
+/// and pack hosts against a budget. Pure (no I/O) so it's unit-tested directly.
 fn validate_enabled_manifest(manifest: &ImageManifest, image_uri: &str) -> Result<(), String> {
-    if manifest.resources.vcpus.is_none() {
+    if manifest.resources.suggested_vcpus.is_none() {
         return Err(format!(
-            "manifest.toml at `{image_uri}` must declare `[resources] vcpus = N` \
-             (ADR 0048: placement reserves CPU). Re-bake the image with a vcpus \
+            "manifest.toml at `{image_uri}` must declare `[resources] suggested_vcpus = N` \
+             (ADR 0048: placement reserves CPU). Re-bake the image with a suggested_vcpus \
              declaration and retry the enable."
         ));
     }
@@ -951,27 +951,28 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn enable_validation_requires_a_vcpus_declaration() {
+    fn enable_validation_requires_a_suggested_vcpus_declaration() {
         // No [resources] at all → rejected.
         let bare: ImageManifest = toml::from_str("name = \"x\"\n").unwrap();
         let err = validate_enabled_manifest(&bare, "r/x:t").unwrap_err();
-        assert!(err.contains("vcpus"), "error must name the field: {err}");
+        assert!(
+            err.contains("suggested_vcpus"),
+            "error must name the field: {err}"
+        );
 
-        // [resources] present but vcpus omitted → rejected.
+        // [resources] present but suggested_vcpus omitted → rejected.
         let no_vcpus: ImageManifest =
             toml::from_str("name = \"x\"\n[resources]\nsuggested_memory_mib = 2048\n").unwrap();
         assert!(validate_enabled_manifest(&no_vcpus, "r/x:t").is_err());
 
         // Declared → accepted.
-        let ok: ImageManifest = toml::from_str("name = \"x\"\n[resources]\nvcpus = 4\n").unwrap();
+        let ok: ImageManifest =
+            toml::from_str("name = \"x\"\n[resources]\nsuggested_vcpus = 4\n").unwrap();
         assert!(validate_enabled_manifest(&ok, "r/x:t").is_ok());
 
-        // A stale `suggested_vcpus` key fails the PARSE (deny_unknown_fields),
-        // so it never reaches validation — proven here for completeness.
-        assert!(toml::from_str::<ImageManifest>(
-            "name = \"x\"\n[resources]\nsuggested_vcpus = 2\n"
-        )
-        .is_err());
+        // The renamed `vcpus` key fails the PARSE (deny_unknown_fields),
+        // so it never reaches validation — only `suggested_vcpus` is valid.
+        assert!(toml::from_str::<ImageManifest>("name = \"x\"\n[resources]\nvcpus = 2\n").is_err());
     }
 
     /// Regression guard for the OCI → BlobStorage materializer.

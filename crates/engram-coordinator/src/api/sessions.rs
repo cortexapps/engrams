@@ -48,7 +48,7 @@ pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) 
 /// defensive fallback for the test / non-enabled paths, mirroring
 /// `resolved_memory_mib`. This is the budget placement reserves.
 pub(crate) fn resolved_vcpus(manifest: &engram_core::types::ImageManifest) -> u32 {
-    manifest.resources.vcpus.unwrap_or(DEFAULT_VCPUS)
+    manifest.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS)
 }
 
 /// The system's cold-boot `SandboxSpec` shape — a fresh kernel boot

@@ -3186,7 +3186,7 @@ async fn manifest_resource_hints_override_defaults() {
             name = "cortex-api"
             [resources]
             suggested_memory_mib = 8192
-            vcpus = 4
+            suggested_vcpus = 4
         "#,
     );
     let app = f.app;

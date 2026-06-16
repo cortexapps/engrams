@@ -36,10 +36,15 @@ Three placement-side gaps block that scenario:
 
 ### 1. CPU budgets: the image declares its vCPUs; placement reserves them
 
-- The manifest field is `resources.vcpus` (renamed from `suggested_vcpus` —
-  it is a declaration, not a hint) and **enable-time validation rejects an
-  image that omits it**. Existing images re-bake/re-enable on the standard
-  roll (clean break; 0 users).
+- The manifest field is `resources.suggested_vcpus` and **enable-time
+  validation rejects an image that omits it**. Existing images re-bake/re-enable
+  on the standard roll (clean break; 0 users).
+  - *Revert note:* C2 briefly renamed this field `suggested_vcpus` →
+    `vcpus`. That rename was reverted — `#[serde(deny_unknown_fields)]`
+    made every already-baked manifest TOML (which still declares
+    `suggested_vcpus`) fail to parse, breaking the bake/enable path. The
+    field stays `suggested_vcpus` and `vcpus` is now the unknown/rejected
+    key.
 - `sessions.cpu_budget_vcpus` (migration 0063) records the declared budget at
   reserve time, beside `mem_budget_mib`.
 - The host's CPU budget is `total_vcpus × ENGRAM_CPU_OVERCOMMIT` (default
@@ -183,8 +188,8 @@ rehearsal.
 - **FIFO head-of-line blocking is deliberate** — fairness + a simple
   invariant (the operator scales to fit the head). A 32 GiB head blocks
   smaller queued sessions until capacity fits it.
-- **Required `resources.vcpus` opens the standard clean-break window** until
-  images are re-baked + re-enabled.
+- **Required `resources.suggested_vcpus` opens the standard clean-break window**
+  until images are re-baked + re-enabled.
 - **Resume placement still bypasses PG reservation** (pre-existing ADR 0046
   gap). The wave's preview narrows it; routing resume through a reserve
   transaction is a named follow-up.
@@ -252,7 +257,7 @@ only consider ballooning if the knob proves insufficient.
 OSS commit chain (all on `main`, each CI-green; ADR 0047 — the stateless
 coordinator this forced — landed first):
 
-- C2 `ce5b60fd` CPU budgets (manifest `resources.vcpus` → session reserve)
+- C2 `ce5b60fd` CPU budgets (manifest `resources.suggested_vcpus` → session reserve)
 - C3 `b701e591` best-fit 2D pack placement
 - C4/C5 `20392f13`/`93d1f1f7` `SessionState::Queued` FSM + boot-pipeline extract
 - C6/C7 `0a5d18b6` queue scanner + create/resume queueing + demand fields
