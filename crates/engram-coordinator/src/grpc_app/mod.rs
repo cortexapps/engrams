@@ -185,18 +185,16 @@ mod reflection_tests {
     #[test]
     fn reflection_descriptor_lists_the_app_services() {
         use prost::Message;
-        let fds = prost_types::FileDescriptorSet::decode(
-            engram_protocol::app::FILE_DESCRIPTOR_SET,
-        )
-        .expect("descriptor bytes decode as a FileDescriptorSet");
+        let fds = prost_types::FileDescriptorSet::decode(engram_protocol::app::FILE_DESCRIPTOR_SET)
+            .expect("descriptor bytes decode as a FileDescriptorSet");
         let service_names: Vec<String> = fds
             .file
             .iter()
             .flat_map(|f| {
                 let pkg = f.package.clone().unwrap_or_default();
-                f.service.iter().map(move |s| {
-                    format!("{}.{}", pkg, s.name.clone().unwrap_or_default())
-                })
+                f.service
+                    .iter()
+                    .map(move |s| format!("{}.{}", pkg, s.name.clone().unwrap_or_default()))
             })
             .collect();
         for expected in [
