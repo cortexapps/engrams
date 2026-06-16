@@ -45,7 +45,7 @@ export const SURFACE: PassthroughSpec[] = [
   },
   {
     service: FleetService,
-    // No filter — all 13 methods forwarded.
+    // No filter — all 14 methods forwarded (incl. GetFleetDemand, ADR 0051).
   },
   {
     service: ImageService,

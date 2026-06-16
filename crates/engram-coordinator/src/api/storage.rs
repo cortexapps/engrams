@@ -20,8 +20,6 @@
 
 use std::collections::HashMap;
 
-use axum::extract::State;
-use axum::Json;
 use chrono::{DateTime, Utc};
 use engram_core::types::cow_state::unix_ms_to_dt;
 use engram_core::{HostId, SandboxId, SessionId};
@@ -69,12 +67,6 @@ pub struct StorageSummaryResponse {
     pub avg_locality_pct: u32,
     // ---- per-sandbox detail ----
     pub rows: Vec<DurabilityRow>,
-}
-
-pub async fn summary(
-    State(state): State<SharedState>,
-) -> Result<Json<StorageSummaryResponse>, ApiError> {
-    Ok(Json(storage_summary_core(&state).await?))
 }
 
 /// ADR 0051: transport-agnostic storage-summary core (gRPC

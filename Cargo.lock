@@ -915,28 +915,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "engram-auth"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "engram-core",
- "engram-crypto",
- "jsonwebtoken",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "url",
- "uuid",
- "workspace-hack",
-]
-
-[[package]]
 name = "engram-chunk-store"
 version = "0.1.0"
 dependencies = [
@@ -970,12 +948,12 @@ dependencies = [
  "engram-core",
  "engram-image-builder",
  "engram-oci",
+ "engram-protocol",
  "engram-storage-local",
- "futures",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "workspace-hack",
@@ -1038,7 +1016,6 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
- "engram-auth",
  "engram-chunk-store",
  "engram-cloud-gcp",
  "engram-cloud-mock",

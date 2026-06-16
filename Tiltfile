@@ -254,10 +254,12 @@ otel_endpoint = env_or('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')
 coord_env = {
     'DATABASE_URL': 'postgres://engram:engram@localhost:5435/engram',
     'ENGRAM_BIND_ADDR': '127.0.0.1:8090',
-    # App-gRPC surface (ADR 0051): the orchestrator dials this with a bearer
-    # token. The app gRPC fails CLOSED — with no token configured it rejects
-    # every RPC — so we must set a dev token here that matches the
-    # orchestrator's CONTROL_PLANE_BEARER (built from the same env_or below).
+    # ADR 0051: the app-gRPC surface is how the orchestrator (and the
+    # e2e_stack tests) drive the coordinator now that the web-facing REST
+    # surface is gone. Defaults match config.rs (`app_grpc_addr`); the
+    # bearer is fail-closed when `ENGRAM_APP_GRPC_TOKENS` is empty, so it
+    # must be set for any gRPC client to connect. In split mode only the
+    # coord needs these — the host-agent has no app-gRPC surface.
     'ENGRAM_APP_GRPC_ADDR': env_or('ENGRAM_APP_GRPC_ADDR', '127.0.0.1:50061'),
     'ENGRAM_APP_GRPC_TOKENS': env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token'),
     'ENGRAM_MODE': 'coordinator' if dev_split else 'all',

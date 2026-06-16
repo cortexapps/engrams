@@ -1,8 +1,5 @@
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::Json;
 use engram_core::traits::{SecretBundle, SecretContext};
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
 use engram_core::types::{ImageManifest, SecretMode, Session, SessionSpec, SessionState};
@@ -321,35 +318,10 @@ pub(crate) async fn resolve_session_env(
         }
     }
 
-    // ADR 0031: re-apply the owner's git attribution + auto-injected Claude
-    // token on resume (the per-resume harness child is a fresh process, so it
-    // needs these in its env again). Keyed on the session's stored owner;
-    // best-effort — an unparseable/legacy user_id or missing auth runtime just
-    // skips it.
-    if let (Some(rt), Some(uid_str)) = (state.auth.as_ref(), session.user_id.as_ref()) {
-        if let Ok(uuid) = uid_str.parse::<uuid::Uuid>() {
-            match rt.users.get_user(engram_core::UserId(uuid)).await {
-                Ok(user) => {
-                    let principal = user.to_principal();
-                    // Git [user] attribution is human-initiated sessions only —
-                    // the service principal's service_email isn't a valid commit
-                    // author (GitHub rejects the squash-merge).
-                    if !principal.is_service(&rt.config.service_email) {
-                        env.insert("ENGRAM_USER_EMAIL".into(), principal.email.clone());
-                        env.insert("ENGRAM_USER_NAME".into(), principal.git_name());
-                    }
-                    let harness = bundle.as_ref().and_then(|b| b.manifest.harness.as_ref());
-                    inject_user_claude_token(state, &principal, harness, session.mode, &mut env)
-                        .await;
-                }
-                Err(e) => tracing::warn!(
-                    session_id = %session.id,
-                    error = %e,
-                    "resolve_session_env: owner lookup failed; resume env omits attribution + token",
-                ),
-            }
-        }
-    }
+    // ADR 0051: the coordinator no longer resolves human identity. Per-user git
+    // attribution and the auto-injected Claude token came from `state.auth`,
+    // which is removed — the orchestrator owns identity and supplies any such
+    // env via the SecretService-injected `identity_env` at create time.
 
     (bundle, env)
 }
@@ -472,9 +444,6 @@ pub struct CreateSessionRequest {
     /// run is gone (the harness is baked at image-bake time).
     #[serde(default)]
     pub mode: SessionMode,
-    // ADR 0031: `user_id` is no longer client-supplied — the owner is stamped
-    // server-side from the authenticated principal (closes a trivial
-    // impersonation hole).
     /// Initial prompt for the agent. Only meaningful when
     /// `mode = Agent` and the image carries a `[harness]` block;
     /// the API rejects with 400 when set alongside `mode = DevVm`
@@ -499,40 +468,6 @@ pub struct CreateSessionResponse {
     /// the metrics wrapper to label `engram_session_boot_seconds`
     /// without re-running the scheduling decision.
     pub kind: &'static str,
-}
-
-// Root span of the cold-boot distributed trace (ADR 0019). Every
-// downstream gRPC call to a host inherits this span's `traceparent` via
-// `TraceparentInjector`, so the coord → host-agent → firecracker →
-// uffd-handler timeline stitches into one trace. Inert (no export) unless
-// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, but the span is always created so
-// propagation works the moment a collector is wired up.
-#[tracing::instrument(name = "session.create", skip_all)]
-pub async fn create_session(
-    state: State<SharedState>,
-    current: crate::api::principal::CurrentUser,
-    req: Json<CreateSessionRequest>,
-) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
-    let start = std::time::Instant::now();
-    let result = create_session_inner(state, current, req).await;
-    let elapsed = start.elapsed().as_secs_f64();
-    let outcome = match &result {
-        Ok(_) => "success",
-        Err(ApiError::BadRequest(_)) => "bad_request",
-        Err(ApiError::NotFound(_)) => "image_not_enabled",
-        Err(ApiError::Unavailable(_)) => "scheduling_rejected",
-        Err(_) => "internal",
-    };
-    // Read kind off the success response; on error we don't know
-    // which path was attempted (warm-lease may have errored before
-    // we knew to fall through, or the spec failed validation
-    // pre-scheduling), so label as `unknown`.
-    let kind = match &result {
-        Ok(body) => body.kind,
-        Err(_) => "unknown",
-    };
-    record_create_metrics(elapsed, outcome, kind);
-    result.map(|body| (StatusCode::CREATED, Json(body)))
 }
 
 /// Shared `engram_session_boot_seconds` + `engram_session_create_total`
@@ -564,33 +499,24 @@ fn create_outcome(result: &Result<CreateSessionResponse, ApiError>) -> &'static 
     }
 }
 
-async fn create_session_inner(
-    State(state): State<SharedState>,
-    crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
-    Json(req): Json<CreateSessionRequest>,
-) -> Result<CreateSessionResponse, ApiError> {
-    // Resolve manifest / secrets / env / harness from the request.
-    let prepared = prepare_from_request(&state, &principal, &req).await?;
-    boot_prepared(&state, prepared).await
-}
-
 /// ADR 0051: transport-agnostic create core the app-gRPC `CreateSession`
 /// RPC delegates to. The orchestrator owns auth/authz, so there is no
-/// human `Principal` here — `owner` is the durable `sessions.user_id`
-/// string (today `None`) and `identity_env` carries any harness-secret
+/// human `Principal` here — `identity_env` carries any harness-secret
 /// injection (e.g. `CLAUDE_CODE_OAUTH_TOKEN`) the SecretService resolved.
 /// Shares the SAME hardened reserve / queue / detached-boot path
-/// (`boot_prepared`) as the axum handler — only the env/owner resolution
-/// differs (no principal-driven git attribution / token).
+/// (`boot_prepared`) as the gRPC surface. The `_owner` parameter is inert
+/// (the `sessions.user_id` column was dropped in the gRPC-only cutover);
+/// it's retained on the signature so the app-gRPC `CreateSession` RPC needn't
+/// change as orchestrator attribution moves entirely into the task model.
 #[tracing::instrument(name = "session.create.grpc", skip_all)]
 pub(crate) async fn create_session_core(
     state: &SharedState,
     identity_env: HashMap<String, String>,
     req: CreateSessionRequest,
-    owner: Option<String>,
+    _owner: Option<String>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let start = std::time::Instant::now();
-    let prepared = match prepare_from_grpc(state, owner, identity_env, &req).await {
+    let prepared = match prepare_from_grpc(state, identity_env, &req).await {
         Ok(p) => p,
         Err(e) => {
             let result = Err(e);
@@ -794,56 +720,14 @@ fn resolved_budget_vcpus(inputs: &crate::session_boot::BootInputs) -> i32 {
     inputs.cpu_budget_vcpus as i32
 }
 
-/// ADR 0048 C5/C6: resolve a session's manifest / secrets / env / harness
-/// from a live create request. Mints a fresh `SessionId`. Shares
-/// [`prepare_inner`] with the queue scanner's [`prepare_from_row`] so the
-/// two paths can't drift.
-pub(crate) async fn prepare_from_request(
-    state: &SharedState,
-    principal: &engram_core::types::user::Principal,
-    req: &CreateSessionRequest,
-) -> Result<crate::session_boot::PreparedBoot, ApiError> {
-    // Strict lookup: a create may only target a LIVE enabled image
-    // (a soft-deleted image still resumes idle sessions, but can't
-    // accept new ones).
-    let enabled = state
-        .services
-        .meta
-        .get_enabled_image(&req.image)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enabled_images lookup: {e}")))?
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "image `{}` is not enabled. Operators enable images via \
-                 POST /api/enabled-images before sessions can reference them.",
-                req.image
-            ))
-        })?;
-    prepare_inner(
-        state,
-        Some(principal.user_id.to_string()),
-        Some(principal),
-        HashMap::new(),
-        &req.image,
-        req.mode,
-        req.prompt.clone(),
-        req.secrets.clone(),
-        SessionId::new(),
-        enabled,
-    )
-    .await
-}
-
-/// ADR 0051: resolve a session's boot inputs for the app-gRPC create. No
-/// human `Principal` — the orchestrator owns attribution and passes the
-/// durable `owner` (today `None`) plus an `identity_env` carrying any
-/// harness-secret injection the SecretService unsealed. Strict image
-/// lookup (a create may only target a LIVE enabled image), mirroring
-/// [`prepare_from_request`]; the only differences are owner/principal and
-/// the folded `identity_env`.
+/// ADR 0051: resolve a session's boot inputs for the app-gRPC create. The
+/// orchestrator owns auth/authz, so there is no human `Principal` — it passes
+/// an `identity_env` carrying any harness-secret injection (e.g.
+/// `CLAUDE_CODE_OAUTH_TOKEN`) the SecretService unsealed. Strict image lookup
+/// (a create may only target a LIVE enabled image). Shares [`prepare_inner`]
+/// with the queue scanner's [`prepare_from_row`] so the two paths can't drift.
 pub(crate) async fn prepare_from_grpc(
     state: &SharedState,
-    owner: Option<String>,
     identity_env: HashMap<String, String>,
     req: &CreateSessionRequest,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
@@ -862,8 +746,6 @@ pub(crate) async fn prepare_from_grpc(
         })?;
     prepare_inner(
         state,
-        owner,
-        None,
         identity_env,
         &req.image,
         req.mode,
@@ -877,16 +759,14 @@ pub(crate) async fn prepare_from_grpc(
 
 /// ADR 0048 C6: resolve the same boot inputs from a durable `queued` row,
 /// so the queue scanner can boot a session no live request is holding.
-/// The owner principal is reconstructed from `session.user_id`; secret
-/// overrides come from the sealed `session_secrets` row; the prompt from
-/// `queue_prompt`. Tolerant image lookup (the image may have been
+/// Secret overrides come from the sealed `session_secrets` row; the prompt
+/// from `queue_prompt`. Tolerant image lookup (the image may have been
 /// soft-deleted while the session waited — the lineage is still pinned).
 pub(crate) async fn prepare_from_row(
     state: &SharedState,
     session: &Session,
     prompt: Option<String>,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
-    let principal = principal_for_session(state, session).await;
     let overrides = load_session_secrets(state, session.id)
         .await
         .unwrap_or_else(|e| {
@@ -908,8 +788,6 @@ pub(crate) async fn prepare_from_row(
         })?;
     prepare_inner(
         state,
-        session.user_id.clone(),
-        principal.as_ref(),
         HashMap::new(),
         &session.image,
         session.mode,
@@ -921,46 +799,16 @@ pub(crate) async fn prepare_from_row(
     .await
 }
 
-/// Reconstruct the owning `Principal` from a session's stored `user_id`
-/// (mirrors `resolve_session_env`'s owner lookup). `None` when there's no
-/// auth runtime, the id is unparseable, or the user row is gone — callers
-/// then skip git attribution + the auto-injected Claude token, exactly as
-/// resume does.
-async fn principal_for_session(
-    state: &SharedState,
-    session: &Session,
-) -> Option<engram_core::types::user::Principal> {
-    let rt = state.auth.as_ref()?;
-    let uid = session.user_id.as_ref()?;
-    let uuid = uid.parse::<uuid::Uuid>().ok()?;
-    match rt.users.get_user(engram_core::UserId(uuid)).await {
-        Ok(user) => Some(user.to_principal()),
-        Err(e) => {
-            tracing::warn!(session_id = %session.id, error = %e,
-                "principal_for_session: owner lookup failed; boot omits attribution + token");
-            None
-        }
-    }
-}
-
-/// Shared resolution for both create entry points (ADR 0048 C5/C6). Mirrors
+/// Shared resolution for both boot entry points (ADR 0048 C5/C6). Mirrors
 /// the original create phases: harness-launchable gate → resolve secrets →
 /// build spec_env / session_env / agent / network → resolve the base
-/// snapshot + budgets. `user_id` stamps the row's owner; `principal` (when
-/// Some and non-service) drives git attribution + the Claude token.
-/// `identity_env` (ADR 0051) carries an orchestrator-resolved
-/// harness-secret injection (e.g. `CLAUDE_CODE_OAUTH_TOKEN`) that is folded
-/// into the session env on TOP of the principal block AND into
-/// `deferred_session_secrets` (so it is sealed into `session_secrets` and
-/// replayed on resume — without this, an idle-evicted gRPC session, whose
-/// `user_id` is NULL, would silently lose its token on resume). Empty for the
-/// human/queue paths (in which case behavior is unchanged), populated only on
-/// the gRPC create.
+/// snapshot + budgets. `identity_env` (ADR 0051) carries an
+/// orchestrator-resolved harness-secret injection (e.g.
+/// `CLAUDE_CODE_OAUTH_TOKEN`) folded into the session env — empty for the
+/// queue path, populated only on the gRPC create.
 #[allow(clippy::too_many_arguments)]
 async fn prepare_inner(
     state: &SharedState,
-    user_id: Option<String>,
-    principal: Option<&engram_core::types::user::Principal>,
     identity_env: HashMap<String, String>,
     image_uri: &str,
     mode: SessionMode,
@@ -1020,7 +868,6 @@ async fn prepare_inner(
     let spec = SessionSpec {
         image: image_uri.to_string(),
         mode,
-        user_id,
     };
 
     // -------- Build the sandbox env --------
@@ -1038,8 +885,8 @@ async fn prepare_inner(
     // `secret_mode`, because identity_env is the trusted orchestrator's harness
     // injection, NOT a user override. identity_env wins on key collision.
     // `deferred_session_secrets` stays `None` when the merged map is empty, so
-    // the human/REST path (empty identity_env, no Literal overrides) keeps
-    // exactly today's behavior.
+    // the queue path (empty identity_env, no Literal overrides) keeps exactly
+    // today's behavior.
     let mut deferred_map: HashMap<String, String> = HashMap::new();
     if manifest.secret_mode == engram_core::types::image::SecretMode::Literal {
         if let Some(overrides) = secret_overrides.as_ref() {
@@ -1059,26 +906,12 @@ async fn prepare_inner(
     let mut session_env = spec_env.clone();
     session_env.insert("ENGRAM_SESSION_ID".into(), session_id.to_string());
 
-    // ADR 0031: git attribution + Claude token — only for a resolved,
-    // non-service principal (mirrors create + resume).
-    if let Some(p) = principal {
-        let is_service = state
-            .auth
-            .as_ref()
-            .is_some_and(|rt| p.is_service(&rt.config.service_email));
-        if !is_service {
-            session_env.insert("ENGRAM_USER_EMAIL".into(), p.email.clone());
-            session_env.insert("ENGRAM_USER_NAME".into(), p.git_name());
-        }
-        inject_user_claude_token(state, p, manifest.harness.as_ref(), mode, &mut session_env).await;
-    }
-
     // ADR 0051: fold the orchestrator-resolved harness identity env (e.g.
-    // CLAUDE_CODE_OAUTH_TOKEN) on TOP of the principal block for the live
-    // launch, AND into the deferred map so it is sealed into `session_secrets`
-    // and replayed on resume. identity_env wins on key collision (over Literal
-    // overrides). Empty for the human/queue paths; populated only on the gRPC
-    // create where the orchestrator resolved it. NEVER log these values.
+    // CLAUDE_CODE_OAUTH_TOKEN) into the session env for the live launch, AND
+    // into the deferred map so it is sealed into `session_secrets` and
+    // replayed on resume. identity_env wins on key collision (over Literal
+    // overrides). Empty for the queue path; populated only on the gRPC create
+    // where the orchestrator resolved it. NEVER log these values.
     for (k, v) in identity_env {
         session_env.insert(k.clone(), v.clone());
         deferred_map.insert(k, v);
@@ -1166,52 +999,6 @@ pub(crate) fn base_working_set_blob_key(
         .map(|m| engram_chunk_store::working_set::TraceRef::canonical(m.manifest_id).storage_key())
 }
 
-/// ADR 0031: inject the initiating user's saved Claude Code OAuth token into
-/// the session env, but only when the resolved harness is built-in Claude and
-/// the session drives it (agent mode). Best-effort — a missing or unopenable
-/// token is logged, never fatal, so the harness can still fall back to its own
-/// login path. Shared by the create and resume paths.
-async fn inject_user_claude_token(
-    state: &SharedState,
-    principal: &engram_core::types::user::Principal,
-    harness: Option<&engram_core::types::image::HarnessManifest>,
-    mode: SessionMode,
-    session_env: &mut std::collections::HashMap<String, String>,
-) {
-    let is_builtin_claude =
-        harness.and_then(|h| h.name.as_deref()) == Some("claude") && !mode.is_dev_vm();
-    if !is_builtin_claude {
-        return;
-    }
-    let Some(rt) = state.auth.as_ref() else {
-        return;
-    };
-    let kind = engram_core::types::user::UserToken::KIND_CLAUDE_OAUTH;
-    match rt.users.get_user_token(principal.user_id, kind).await {
-        Ok(Some(tok)) => {
-            match engram_auth::open_user_token(state.services.kek.as_ref(), &tok).await {
-                Ok(plain) => {
-                    session_env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), plain);
-                }
-                Err(e) => {
-                    tracing::warn!(user_id = %principal.user_id, error = %e, "could not open saved Claude token")
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(user_id = %principal.user_id, error = %e, "could not load saved Claude token")
-        }
-    }
-}
-
-pub async fn get_session(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<Session>, ApiError> {
-    Ok(Json(get_session_core(&state, id).await?))
-}
-
 /// ADR 0051: fetch a session by id (gRPC `GetSession`). 404 on unknown id.
 pub(crate) async fn get_session_core(
     state: &SharedState,
@@ -1223,9 +1010,7 @@ pub(crate) async fn get_session_core(
 /// ADR 0051: the trusted-caller session list (gRPC `ListSessions`): ALL
 /// active sessions, no owner scoping. Owner annotation (`owner_email` /
 /// `owner_name`) is left empty — the orchestrator resolves identities from
-/// its own task model; the `sessions.user_id` column rides along on each
-/// `Session` for that join. (The axum `list_sessions` keeps its
-/// principal-scoped + admin-annotated behaviour, unchanged.)
+/// its own task model.
 pub(crate) async fn list_sessions_core(
     state: &SharedState,
 ) -> Result<ListSessionsResponse, ApiError> {
@@ -1256,90 +1041,6 @@ pub struct SessionListItem {
 #[derive(Serialize)]
 pub struct ListSessionsResponse {
     pub sessions: Vec<SessionListItem>,
-}
-
-#[derive(serde::Deserialize, Default)]
-pub struct ListSessionsParams {
-    /// `mine` (default) — the caller's own sessions. `all` — every session
-    /// (admin only); rows carry owner identity for attribution.
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-/// `GET /sessions` — owner-scoped (ADR 0031). A member sees only their own
-/// sessions; an admin sees their own (`scope=mine`, default) or everyone's
-/// (`scope=all`). Returns only live rows — terminal states and
-/// `host_lost` are excluded (what `list_active_sessions` selects).
-pub async fn list_sessions(
-    State(state): State<SharedState>,
-    crate::api::principal::CurrentUser(principal): crate::api::principal::CurrentUser,
-    axum::extract::Query(params): axum::extract::Query<ListSessionsParams>,
-) -> Result<Json<ListSessionsResponse>, ApiError> {
-    let show_all = match params.scope.as_deref().unwrap_or("mine") {
-        "all" => {
-            if !principal.is_admin() {
-                return Err(ApiError::Forbidden(
-                    "scope=all requires the admin role".into(),
-                ));
-            }
-            true
-        }
-        // "mine" or anything else → own sessions only.
-        _ => false,
-    };
-
-    let all = state.services.meta.list_active_sessions().await?;
-    let mine = principal.user_id.to_string();
-    let filtered: Vec<Session> = if show_all {
-        all
-    } else {
-        all.into_iter()
-            .filter(|s| s.user_id.as_deref() == Some(mine.as_str()))
-            .collect()
-    };
-
-    // For the All view, attach owner identity (one batch lookup → map).
-    let owners: HashMap<String, (Option<String>, String)> = if show_all {
-        match state.auth.as_ref() {
-            Some(rt) => rt
-                .users
-                .list_users()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|u| (u.id.to_string(), (u.display_name, u.email)))
-                .collect(),
-            None => HashMap::new(),
-        }
-    } else {
-        HashMap::new()
-    };
-
-    let sessions = filtered
-        .into_iter()
-        .map(|s| {
-            let (owner_name, owner_email) = s
-                .user_id
-                .as_ref()
-                .and_then(|uid| owners.get(uid))
-                .map(|(name, email)| (name.clone(), Some(email.clone())))
-                .unwrap_or((None, None));
-            SessionListItem {
-                session: s,
-                owner_email,
-                owner_name,
-            }
-        })
-        .collect();
-    Ok(Json(ListSessionsResponse { sessions }))
-}
-
-pub async fn delete_session(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<StatusCode, ApiError> {
-    delete_session_core(&state, id).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// ADR 0051: terminate a session + tear down its sandbox (gRPC

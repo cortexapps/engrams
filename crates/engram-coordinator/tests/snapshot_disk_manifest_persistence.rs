@@ -46,7 +46,6 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
         .create_session(SessionSpec {
             image: "snap-disk-manifest-test:warm-1".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create session");

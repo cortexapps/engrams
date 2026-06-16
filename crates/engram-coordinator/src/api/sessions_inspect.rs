@@ -10,31 +10,18 @@
 //! working without a 400. Any other value returns 400 — the workspace
 //! variant is gone.
 
-use axum::extract::{Path, Query, State};
-use axum::Json;
 use chrono::Utc;
 use engram_core::types::SessionState;
 use engram_core::SessionId;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+#[cfg(test)]
 use serde_json::json;
 
 use crate::cow_state::{fetch_for_host, CowStateView};
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-#[derive(Deserialize, Default)]
-pub struct LogQuery {
-    /// Only `"conversation"` (or unset, defaults to conversation) is
-    /// accepted post-ADR-0005. Anything else → 400.
-    #[serde(default)]
-    pub kind: Option<String>,
-    /// Cap on number of rows returned. Defaults to 200, hard-capped
-    /// at 1000 to keep responses bounded.
-    #[serde(default)]
-    pub limit: Option<i64>,
-}
-
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ConversationEntry {
     pub idx: i64,
     pub kind: String,
@@ -80,34 +67,6 @@ pub(crate) async fn get_log_core(
             "unknown kind `{other}` — only `conversation` is supported"
         ))),
     }
-}
-
-pub async fn log(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-    Query(params): Query<LogQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let entries = get_log_core(&state, id, params.kind, params.limit).await?;
-    Ok(Json(json!({
-        "session_id": id,
-        "kind": "conversation",
-        "events": entries,
-    })))
-}
-
-#[derive(Serialize)]
-pub struct SessionCowStateResponse {
-    pub session_id: SessionId,
-    /// Diagnostic for the session's currently-bound sandbox, or
-    /// `None` if the session has no live sandbox (Idle, HostLost,
-    /// Pending, terminal). The `tier` field on the embedded view
-    /// can still be useful for terminal/idle sessions because the
-    /// memory-tier fields project from the PG snapshot row even
-    /// when the disk-tier live data is absent. We don't bother
-    /// rendering that here for simplicity — clients see `None`
-    /// and know to read the (eventual) snapshot-row endpoint
-    /// instead.
-    pub state: Option<CowStateView>,
 }
 
 /// gRPC `GetCowState` core. `None` when the session has no live sandbox
@@ -158,21 +117,6 @@ pub(crate) async fn cow_state_core(
     )))
 }
 
-/// `GET /sessions/:id/cow-state`. ADR 0016 Phase A. Returns the
-/// per-session diagnostic projection for the currently-bound
-/// sandbox, fanned out through the per-host cache (so the web
-/// app's per-session polling doesn't storm the host).
-pub async fn cow_state(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<SessionCowStateResponse>, ApiError> {
-    let state_view = cow_state_core(&state, id).await?;
-    Ok(Json(SessionCowStateResponse {
-        session_id: id,
-        state: state_view,
-    }))
-}
-
 /// ADR 0028 A.log: one checkpoint in a session's chain — the data
 /// behind the durability timeline + the (future) fork-point picker.
 #[derive(Serialize)]
@@ -188,14 +132,6 @@ pub struct CheckpointSummary {
     /// True for the newest checkpoint — the always-pinned rung-1
     /// recovery anchor.
     pub is_latest: bool,
-}
-
-#[derive(Serialize)]
-pub struct CheckpointsResponse {
-    pub session_id: SessionId,
-    /// Newest first. The retention sweeper bounds this to the
-    /// forkable-history window (latest always kept).
-    pub checkpoints: Vec<CheckpointSummary>,
 }
 
 /// gRPC `ListCheckpoints` core. Newest-first checkpoint chain.
@@ -219,20 +155,6 @@ pub(crate) async fn checkpoints_core(
             is_latest: i == 0,
         })
         .collect())
-}
-
-/// `GET /sessions/:id/checkpoints`. ADR 0028 A.log: the session's
-/// recorded checkpoint chain (newest first) — the durability
-/// timeline's data source and the fork-point list (ADR 0022 horizon).
-pub async fn checkpoints(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<CheckpointsResponse>, ApiError> {
-    let checkpoints = checkpoints_core(&state, id).await?;
-    Ok(Json(CheckpointsResponse {
-        session_id: id,
-        checkpoints,
-    }))
 }
 
 #[cfg(test)]
@@ -299,7 +221,6 @@ mod tests {
     fn ephemeral_session(id: engram_core::SessionId) -> Session {
         Session {
             id,
-            user_id: None,
             status: SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -331,23 +252,16 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = log(
-            State(state),
-            Path(session_id),
-            Query(LogQuery {
-                kind: None, // defaults to conversation
-                limit: None,
-            }),
+        let events = get_log_core(
+            &state, session_id, None, // kind defaults to conversation
+            None, // limit defaults to 200
         )
         .await
         .expect("log conversation");
 
-        let v = resp.0;
-        assert_eq!(v["kind"], "conversation");
-        let events = v["events"].as_array().unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["kind"], "harness_run_started");
-        assert_eq!(events[1]["kind"], "harness_idle");
+        assert_eq!(events[0].kind, "harness_run_started");
+        assert_eq!(events[1].kind, "harness_idle");
     }
 
     #[tokio::test]
@@ -355,16 +269,9 @@ mod tests {
         let session_id = engram_core::SessionId::new();
         let (state, _local) = build_state_for_session(ephemeral_session(session_id));
 
-        let err = log(
-            State(state),
-            Path(session_id),
-            Query(LogQuery {
-                kind: Some("workspace".into()),
-                limit: None,
-            }),
-        )
-        .await
-        .expect_err("workspace kind retired in ADR 0005");
+        let err = get_log_core(&state, session_id, Some("workspace".into()), None)
+            .await
+            .expect_err("workspace kind retired in ADR 0005");
         assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }

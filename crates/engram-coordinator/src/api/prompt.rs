@@ -8,37 +8,11 @@
 //! Dead sessions return 410 Gone — the only affordance there is
 //! `engram session fork <id>`.
 
-use axum::extract::{Path, State};
-use axum::Json;
 use engram_core::SessionId;
 use engram_harness_proto::AgentRole;
-use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
-
-#[derive(Deserialize)]
-pub struct PromptRequest {
-    pub text: String,
-}
-
-#[derive(Serialize)]
-pub struct PromptResponse {
-    pub session_id: SessionId,
-    pub note: &'static str,
-}
-
-pub async fn prompt(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-    Json(req): Json<PromptRequest>,
-) -> Result<Json<PromptResponse>, ApiError> {
-    let note = send_prompt_core(&state, id, req.text).await?;
-    Ok(Json(PromptResponse {
-        session_id: id,
-        note,
-    }))
-}
 
 /// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`). Holds the
 /// SAME hardened auto-resume + mid-move HOLD logic as the axum `prompt`

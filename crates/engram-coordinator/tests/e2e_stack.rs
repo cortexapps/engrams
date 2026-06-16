@@ -1,104 +1,136 @@
 //! End-to-end tests against a live prod-shape stack (coord + host-agent
 //! + Firecracker + Postgres + chunked-OCI registry + fake-gcs).
 //!
-//! The existing integration tests stop one layer short of the coord HTTP
-//! API: `e2e_harness.rs` and `e2e_shell.rs` drive `PooledBackend`
+//! The existing integration tests stop one layer short of the coord
+//! app-gRPC API: `e2e_harness.rs` and `e2e_shell.rs` drive `PooledBackend`
 //! directly; `ha_listener.rs` and friends use an in-proc `AppState`.
-//! That left the coord HTTP → gRPC → host-agent → FC path uncovered,
-//! which is how prod session 8725648d's empty-Binary-frame bug shipped.
-//! This file covers the three flows the user named (ADR 0021 P1.3
-//! wire shape):
+//! That left the coord gRPC → host-agent → FC path uncovered, which is
+//! how prod session 8725648d's empty-Binary-frame bug shipped. This file
+//! covers the three core flows (ADR 0021 P1.3 wire shape):
 //!
-//!   1. cold session with `mode = dev_vm` → `POST /exec ls` → assert
-//!      stdout. Harness in the image (if any) is left undriven.
+//!   1. cold session with `mode = dev_vm` → `Exec ls` → assert stdout.
+//!      Harness in the image (if any) is left undriven.
 //!   2. cold session with `mode = agent` against the baked-claude
-//!      image → `POST /exec ls` → assert stdout (agentd is up, harness
+//!      image → `Exec ls` → assert stdout (agentd is up, harness
 //!      runs but the test just exec's a shell command).
 //!   3. cold session with `mode = agent` + bogus ANTHROPIC_API_KEY +
 //!      initial prompt → assert an Anthropic auth-failure event
-//!      surfaces in the session_events stream.
+//!      surfaces in the StreamEvents stream.
 //!
-//! All three are `#[ignore]`'d and gated by env vars. The CI lane
+//! ADR 0051 Drip E: the coordinator's web-facing REST surface is gone.
+//! These tests now drive the coordinator over the app-gRPC surface
+//! (`engram_protocol::app::*`, `SessionService` / `FleetService`), authing
+//! every RPC with an `Authorization: Bearer <token>` metadata header via a
+//! tonic interceptor. The stack wiring (Tiltfile `coord_env`, ci.yml
+//! `test-e2e-stack`) provides `ENGRAM_APP_GRPC_ADDR` +
+//! `ENGRAM_APP_GRPC_TOKENS` so the gRPC endpoint + bearer are reachable.
+//!
+//! All tests are `#[ignore]`'d and gated by env vars. The CI lane
 //! `test-e2e-stack` in `.github/workflows/ci.yml` brings up the stack
-//! (`integration-up.sh` + `integration-bake-demo.sh`), runs these tests
-//! via `cargo nextest --run-ignored`, and tears down on completion.
-//! ADR 0021 P1.5 retired the separate `harness add` step — the harness
-//! is baked into the image at `/opt/engram/harness/` and the coord
-//! reads the launch contract from `manifest.toml`.
+//! (`tilt-up-ci.sh` + `integration-bake-demo.sh`), runs these tests via
+//! `cargo nextest --run-ignored`, and tears down on completion. ADR 0021
+//! P1.5 retired the separate `harness add` step — the harness is baked
+//! into the image at `/opt/engram/harness/` and the coord reads the launch
+//! contract from `manifest.toml`.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use bytes::Bytes;
-use engram_coordinator::state::SessionEvent;
 use engram_core::SessionId;
-use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use engram_protocol::app;
+use engram_protocol::app::fleet_service_client::FleetServiceClient;
+use engram_protocol::app::session_service_client::SessionServiceClient;
 use serde_json::Value;
+use tonic::codegen::InterceptedService;
+use tonic::transport::Channel;
 
-/// Per-HTTP-request timeout for the test's reqwest client. Cold
-/// `POST /sessions` on CI runs ~120s on a fresh chunk cache (FC
-/// boot + first NBD page-ins), so this needs to clear that with a
-/// little headroom.
+/// Per-RPC timeout. Cold `CreateSession` on CI runs ~120s on a fresh
+/// chunk cache (FC boot + first NBD page-ins), so this needs to clear
+/// that with a little headroom.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// How long the auth-failure test waits for either an `agent_message`
-/// or a `run_completed(ok=false)` event after session-create
-/// returns. Claude's stream-json round-trip through the harness +
-/// egress proxy + api.anthropic.com 401 is typically <10s, but CI
-/// networking adds latency. 180s = "if no signal arrives in this
-/// long, Claude is genuinely hung (not just slow)" — a strong
-/// failure signal worth panicking on.
+/// or a `run_completed(ok=false)` event after session-create returns.
+/// Claude's stream-json round-trip through the harness + egress proxy +
+/// api.anthropic.com 401 is typically <10s, but CI networking adds
+/// latency. 180s = "if no signal arrives in this long, Claude is
+/// genuinely hung (not just slow)" — a strong failure signal worth
+/// panicking on.
 const SSE_WAIT_DEADLINE: Duration = Duration::from_secs(180);
 
 /// Auth-failure observation outcome.
 ///
-/// The Claude harness today emits `run_completed { ok: false }` when
-/// Claude exits non-zero, but the user's hypothesis is that Claude's
-/// stream-json output *also* carries a parseable error message that
-/// surfaces as an `agent_message` event. We don't yet know what the
-/// Anthropic 401 JSON looks like when it reaches the dashboard — the
-/// first green CI run will tell us. Until then this enum lets the
-/// test pass on either signal and prints captured events on the
+/// The Claude harness emits `run_completed { ok: false }` when Claude
+/// exits non-zero, but the auth error itself surfaces as an
+/// `agent_message` event carrying the parseable error text. This enum
+/// lets the test pass on either signal and prints captured events on the
 /// fallback path so the next iteration can tighten the assertion.
 #[derive(Debug)]
 #[allow(dead_code)] // variants used only when the test runs (gated)
 enum AuthFailureSignal {
-    /// An `agent_message` arrived containing the expected substring
-    /// (or any future-tightened equivalent). The string is the full
-    /// message text so a regression that drops the substring
-    /// surfaces clearly.
+    /// An `agent_message` arrived containing the expected substring. The
+    /// string is the full message text so a regression that drops the
+    /// substring surfaces clearly.
     ErrorMessage(String),
     /// No structured error message, but `run_completed.ok == false`
-    /// arrived — the chain ran and Anthropic rejected the auth.
-    /// Captured events are printed to stderr to inform the next
-    /// tightening pass.
+    /// arrived — the chain ran and Anthropic rejected the auth. Captured
+    /// events are printed to stderr to inform the next tightening pass.
     RunCompletedNotOk,
-    /// Neither signal in the deadline. Carries the captured events
-    /// for diagnostic output.
-    TimedOut(Vec<SessionEvent>),
+    /// Neither signal in the deadline. Carries the captured (kind,
+    /// payload_json) pairs for diagnostic output.
+    TimedOut(Vec<(String, String)>),
 }
 
+/// `Authorization: Bearer <token>` interceptor (cribbed from the
+/// ADR 0051 `grpc_smoke.rs` harness). tonic requires `Result<_, Status>`.
+#[derive(Clone)]
+struct BearerFn {
+    token: String,
+}
+
+impl tonic::service::Interceptor for BearerFn {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", self.token)
+                .parse()
+                .expect("bearer header is ASCII"),
+        );
+        Ok(req)
+    }
+}
+
+type SessClient = SessionServiceClient<InterceptedService<Channel, BearerFn>>;
+type FleetClient = FleetServiceClient<InterceptedService<Channel, BearerFn>>;
+
+/// gRPC driver for the live coordinator. Holds one shared channel and the
+/// two service clients the tests exercise.
 struct Driver {
-    base: reqwest::Url,
-    token: Option<String>,
-    client: reqwest::Client,
+    sess: SessClient,
+    fleet: FleetClient,
 }
 
 impl Driver {
-    fn from_env() -> Self {
-        let base_str = std::env::var("ENGRAM_E2E_COORD_URL")
-            .expect("ENGRAM_E2E_COORD_URL must be set (e.g. http://127.0.0.1:8090)");
-        let base = reqwest::Url::parse(&base_str).expect("parse ENGRAM_E2E_COORD_URL");
-        let token = std::env::var("ENGRAM_TOKEN").ok();
-        let client = reqwest::Client::builder()
+    async fn from_env() -> Self {
+        let addr = std::env::var("ENGRAM_E2E_GRPC_ADDR").expect(
+            "ENGRAM_E2E_GRPC_ADDR must be set (e.g. http://127.0.0.1:50061) — the \
+             coordinator's app-gRPC endpoint",
+        );
+        let token = std::env::var("ENGRAM_E2E_GRPC_TOKEN")
+            .unwrap_or_else(|_| "dev-app-grpc-token".to_string());
+
+        let channel = tonic::transport::Endpoint::from_shared(addr.clone())
+            .expect("parse ENGRAM_E2E_GRPC_ADDR as a gRPC endpoint")
+            .connect_timeout(Duration::from_secs(5))
             .timeout(DEFAULT_TIMEOUT)
-            .build()
-            .expect("build reqwest client");
-        Self {
-            base,
-            token,
-            client,
-        }
+            .connect()
+            .await
+            .unwrap_or_else(|e| panic!("connect to coordinator app-gRPC at {addr}: {e}"));
+
+        let interceptor = BearerFn { token };
+        let sess = SessionServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let fleet = FleetServiceClient::with_interceptor(channel, interceptor);
+        Self { sess, fleet }
     }
 
     fn image_uri() -> String {
@@ -108,243 +140,192 @@ impl Driver {
         )
     }
 
-    // ADR 0021 P1.3: `harness_name()` helper retired. Harness
-    // selection is baked into the image (`[harness]` in
-    // `engram.toml`); the wire shape just says "drive the agent"
-    // (`mode = agent`) or "skip it" (`mode = dev_vm`).
-
-    fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let url = self.base.join(path).expect("join path");
-        let mut req = self.client.request(method, url);
-        if let Some(tok) = &self.token {
-            req = req.bearer_auth(tok);
-        }
-        req
-    }
-
-    /// ADR 0021 P1.3: drive the image as a pure dev VM. Whether the
-    /// image has a baked `[harness]` block is irrelevant — `mode =
-    /// dev_vm` tells coord to skip `resolve_harness` and pass an
-    /// empty-argv `AgentSpec` to the backend. agentd hits the
-    /// readiness-probe branch (`harness_supervisor.rs::spawn`) and
-    /// never execs the harness binary even if it's sitting in the
-    /// rootfs at `/opt/engram/harness/`.
-    async fn create_session_none_harness(&self, image: &str) -> SessionId {
-        let body = serde_json::json!({
-            "image": image,
-            "mode": "dev_vm",
-        });
+    /// ADR 0021 P1.3: drive the image as a pure dev VM. Whether the image
+    /// has a baked `[harness]` block is irrelevant — `mode = dev_vm` tells
+    /// coord to skip `resolve_harness` and pass an empty-argv `AgentSpec`
+    /// to the backend. agentd hits the readiness-probe branch and never
+    /// execs the harness binary even if it's sitting in the rootfs.
+    async fn create_session_none_harness(&mut self, image: &str) -> SessionId {
+        let req = app::CreateSessionRequest {
+            image_uri: image.to_string(),
+            mode: "dev_vm".to_string(),
+            prompt: None,
+            secrets: HashMap::new(),
+            harness_env: HashMap::new(),
+        };
         let resp = self
-            .req(reqwest::Method::POST, "/api/v1/sessions")
-            .json(&body)
-            .send()
+            .sess
+            .create_session(req)
             .await
-            .expect("POST /sessions");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(
-            status.is_success(),
-            "POST /sessions failed: {status} body={text}"
-        );
-        let parsed: CreateSessionResponse =
-            serde_json::from_str(&text).expect("decode CreateSessionResponse");
-        parsed.session_id
+            .expect("CreateSession (dev_vm)")
+            .into_inner();
+        resp.session_id.parse().expect("session_id is a SessionId")
     }
 
-    /// ADR 0021 P1.3: drive the image's baked harness. `mode =
-    /// agent` is the default but we set it explicitly so the test
-    /// remains correct if defaults shift later. The image referenced
-    /// by `ENGRAM_E2E_IMAGE_URI` must carry a `[harness] builtin =
-    /// "claude"` block (the CI bake of `deploy/demo-claude/` does);
-    /// coord reads the harness contract from `manifest.toml`, so
-    /// the request no longer names the harness directly.
+    /// ADR 0021 P1.3: drive the image's baked harness. `mode = agent` is
+    /// the default but set explicitly so the test stays correct if defaults
+    /// shift. The image referenced by `ENGRAM_E2E_IMAGE_URI` must carry a
+    /// `[harness] builtin = "claude"` block (the CI bake of
+    /// `deploy/demo-claude/` does); coord reads the harness contract from
+    /// `manifest.toml`, so the request no longer names the harness.
+    ///
+    /// ADR 0051: the bogus Anthropic token is injected via `harness_env`
+    /// (the orchestrator's trusted identity-injection channel), which the
+    /// coord persists + replays on resume. `ANTHROPIC_API_KEY` is the
+    /// Claude harness's auth env var.
     async fn create_session_claude(
-        &self,
+        &mut self,
         image: &str,
         api_key: &str,
         prompt: Option<&str>,
     ) -> SessionId {
-        let mut body = serde_json::json!({
-            "image": image,
-            "mode": "agent",
-            "secrets": { "ANTHROPIC_API_KEY": api_key },
-        });
-        if let Some(p) = prompt {
-            body["prompt"] = Value::String(p.to_string());
+        let mut harness_env = HashMap::new();
+        harness_env.insert("ANTHROPIC_API_KEY".to_string(), api_key.to_string());
+        let req = app::CreateSessionRequest {
+            image_uri: image.to_string(),
+            mode: "agent".to_string(),
+            prompt: prompt.map(str::to_string),
+            secrets: HashMap::new(),
+            harness_env,
+        };
+        let resp = self
+            .sess
+            .create_session(req)
+            .await
+            .expect("CreateSession (claude)")
+            .into_inner();
+        resp.session_id.parse().expect("session_id is a SessionId")
+    }
+
+    /// `SessionService.Exec` — server-streaming `ExecOutput`. Drains the
+    /// stream to a collected stdout/stderr + exit status, mirroring the
+    /// old unary `/exec` response shape the assertions expect.
+    async fn exec(&mut self, sid: SessionId, command: &str) -> ExecResult {
+        let req = app::ExecRequest {
+            session_id: sid.to_string(),
+            command: Some(command.to_string()),
+            argv: Vec::new(),
+            env: HashMap::new(),
+            workdir: None,
+            timeout_secs: Some(30),
+        };
+        let mut stream = self
+            .sess
+            .exec(req)
+            .await
+            .unwrap_or_else(|e| panic!("Exec open failed for {command:?}: {e}"))
+            .into_inner();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_status: Option<i32> = None;
+        let mut saw_exit = false;
+        while let Some(msg) = stream
+            .message()
+            .await
+            .unwrap_or_else(|e| panic!("Exec stream error for {command:?}: {e}"))
+        {
+            match msg.event {
+                Some(app::exec_output::Event::Started(_)) => {}
+                Some(app::exec_output::Event::Stdout(b)) => stdout.extend_from_slice(&b),
+                Some(app::exec_output::Event::Stderr(b)) => stderr.extend_from_slice(&b),
+                Some(app::exec_output::Event::Exit(e)) => {
+                    exit_status = e.exit_status;
+                    saw_exit = true;
+                }
+                None => {}
+            }
         }
-        let resp = self
-            .req(reqwest::Method::POST, "/api/v1/sessions")
-            .json(&body)
-            .send()
-            .await
-            .expect("POST /sessions");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         assert!(
-            status.is_success(),
-            "POST /sessions (claude) failed: {status} body={text}"
+            saw_exit,
+            "Exec stream for {command:?} ended without an exit frame",
         );
-        let parsed: CreateSessionResponse =
-            serde_json::from_str(&text).expect("decode CreateSessionResponse");
-        parsed.session_id
-    }
-
-    async fn exec(&self, sid: SessionId, command: &str) -> ExecResponse {
-        let body = serde_json::json!({ "command": command, "timeout_secs": 30 });
-        let path = format!("/api/v1/sessions/{sid}/exec");
-        let resp = self
-            .req(reqwest::Method::POST, &path)
-            .json(&body)
-            .send()
-            .await
-            .expect("POST /sessions/:id/exec");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(
-            status.is_success(),
-            "exec failed: {status} body={text} command={command:?}"
-        );
-        serde_json::from_str(&text).expect("decode ExecResponse")
-    }
-
-    async fn delete(&self, sid: SessionId) {
-        let path = format!("/api/v1/sessions/{sid}");
-        let _ = self
-            .req(reqwest::Method::DELETE, &path)
-            .send()
-            .await
-            .map(|r| r.status());
-    }
-
-    /// ADR 0016 Phase B commit 4a admin trigger. Forces an
-    /// immediate `ChunkedDiskBackend::flush()` on the session's
-    /// bound sandbox + publishes the manifest_ref into
-    /// `sessions.live_disk_manifest_*` in the same coord-side TX.
-    /// Returns the parsed response body.
-    async fn flush_now(&self, sid: SessionId) -> FlushNowResponse {
-        let path = format!("/api/v1/admin/sessions/{sid}/flush-now");
-        let resp = self
-            .req(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .expect("POST /api/admin/sessions/:id/flush-now");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(
-            status.is_success(),
-            "flush_now failed: {status} body={text}"
-        );
-        serde_json::from_str(&text).expect("decode FlushNowResponse")
-    }
-
-    /// `POST /sessions/:id/snapshot`. Returns when the snapshot's
-    /// PG row is durable. Body is the SnapshotResponse but we
-    /// discard it for this test — the side effect we care about is
-    /// the row existing so resume() has something to find.
-    async fn snapshot(&self, sid: SessionId) {
-        let path = format!("/api/v1/sessions/{sid}/snapshot");
-        let resp = self
-            .req(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .expect("POST /sessions/:id/snapshot");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(status.is_success(), "snapshot failed: {status} body={text}");
-    }
-
-    /// `DELETE /sessions/:id/local` — evict the local sandbox after
-    /// a snapshot, leaving the session in `Idle`. Required before
-    /// resume() will reconstruct a fresh sandbox.
-    async fn evict_local(&self, sid: SessionId) {
-        let path = format!("/api/v1/sessions/{sid}/local");
-        let resp = self
-            .req(reqwest::Method::DELETE, &path)
-            .send()
-            .await
-            .expect("DELETE /sessions/:id/local");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(
-            status.is_success(),
-            "evict_local failed: {status} body={text}"
-        );
-    }
-
-    /// `POST /sessions/:id/resume`. Synchronous: returns when the
-    /// session is Active again. The newly-bound sandbox_id is the
-    /// one that should appear in `nbd_sandboxes` (per ADR 0016
-    /// Phase B commit 5).
-    async fn resume(&self, sid: SessionId) {
-        let path = format!("/api/v1/sessions/{sid}/resume");
-        let resp = self
-            .req(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .expect("POST /sessions/:id/resume");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(status.is_success(), "resume failed: {status} body={text}");
-    }
-
-    /// `POST /admin/sessions/:id/evict-idle` — the explicit admin
-    /// trigger for the idle-eviction primitive. Synchronous: the
-    /// session is `Idle` by the time this returns. Lets the test drive
-    /// Active→Idle through the real idle pipeline (pause → flush →
-    /// snapshot → destroy) without waiting out the idle TTL.
-    async fn evict_idle(&self, sid: SessionId) {
-        let path = format!("/api/v1/admin/sessions/{sid}/evict-idle");
-        let resp = self
-            .req(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .expect("POST /admin/sessions/:id/evict-idle");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(
-            status.is_success(),
-            "evict_idle failed: {status} body={text}"
-        );
-    }
-
-    /// `GET /sessions/:id/cow-state`. ADR 0016 Phase A diagnostic.
-    /// Returns `Some(json)` when the sandbox is NBD-tracked
-    /// (Phase B's chunked-disk pipeline live), `None` when the
-    /// host fell back to materialize-to-file (no nbd.ko, no
-    /// nbd_pool, etc.). Used by Phase B tests as a runtime probe
-    /// for whether the chunked-disk-driven assertions are
-    /// meaningful in this environment.
-    async fn cow_state(&self, sid: SessionId) -> Option<Value> {
-        let path = format!("/api/v1/sessions/{sid}/cow-state");
-        let resp = self
-            .req(reqwest::Method::GET, &path)
-            .send()
-            .await
-            .expect("GET /sessions/:id/cow-state");
-        if !resp.status().is_success() {
-            return None;
-        }
-        let body: Value = resp.json().await.ok()?;
-        match body.get("state") {
-            Some(Value::Null) | None => None,
-            Some(other) => Some(other.clone()),
+        ExecResult {
+            exit_status,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
     }
 
-    /// Poll cow-state until `disk_manifest_version > prior` or the
-    /// deadline elapses. Returns the new version on success, None
-    /// on timeout. This is the load-bearing end-state assertion
-    /// for Phase B e2e tests: a flush of dirty bytes — by either
-    /// the FlushScheduler tick OR the admin flush-now trigger —
-    /// advances `disk_manifest_version`. The test doesn't care
-    /// which path produced the advance; both prove the chunked-
-    /// disk publish pipeline works.
+    async fn delete(&mut self, sid: SessionId) {
+        let req = app::DeleteSessionRequest {
+            session_id: sid.to_string(),
+        };
+        let _ = self.sess.delete_session(req).await;
+    }
+
+    /// ADR 0016 Phase B commit 4a admin trigger → `FleetService.FlushSession`.
+    /// Forces an immediate `ChunkedDiskBackend::flush()` on the session's
+    /// bound sandbox + publishes the manifest_ref. Returns the parsed
+    /// outcome + new manifest version.
+    async fn flush_now(&mut self, sid: SessionId) -> FlushResult {
+        let req = app::FlushSessionRequest {
+            session_id: sid.to_string(),
+        };
+        let resp = self
+            .fleet
+            .flush_session(req)
+            .await
+            .expect("FlushSession")
+            .into_inner();
+        FlushResult {
+            outcome: resp.outcome,
+            manifest_version: resp.manifest_version,
+        }
+    }
+
+    /// `SessionService.Snapshot`. Returns when the snapshot's PG row is
+    /// durable. Body discarded — the side effect we care about is the row
+    /// existing so resume() has something to find.
+    async fn snapshot(&mut self, sid: SessionId) {
+        let req = app::SnapshotRequest {
+            session_id: sid.to_string(),
+        };
+        self.sess.snapshot(req).await.expect("Snapshot");
+    }
+
+    /// `SessionService.EvictLocal` — evict the local sandbox after a
+    /// snapshot, leaving the session in `Idle`. Required before resume()
+    /// will reconstruct a fresh sandbox.
+    async fn evict_local(&mut self, sid: SessionId) {
+        let req = app::EvictLocalRequest {
+            session_id: sid.to_string(),
+        };
+        self.sess.evict_local(req).await.expect("EvictLocal");
+    }
+
+    /// `SessionService.Resume`. Synchronous: returns when the session is
+    /// Active again. The newly-bound sandbox_id is the one that should
+    /// appear in `nbd_sandboxes` (per ADR 0016 Phase B commit 5).
+    async fn resume(&mut self, sid: SessionId) {
+        let req = app::ResumeRequest {
+            session_id: sid.to_string(),
+        };
+        self.sess.resume(req).await.expect("Resume");
+    }
+
+    /// `SessionService.GetCowState`. ADR 0016 Phase A diagnostic. Returns
+    /// `Some(state)` when the sandbox is NBD-tracked (Phase B's chunked-disk
+    /// pipeline live), `None` when the host fell back to materialize-to-file
+    /// (no nbd.ko, no nbd_pool, etc.). Used by Phase B tests as a runtime
+    /// probe for whether the chunked-disk-driven assertions are meaningful.
+    async fn cow_state(&mut self, sid: SessionId) -> Option<app::CowStateView> {
+        let req = app::GetCowStateRequest {
+            session_id: sid.to_string(),
+        };
+        match self.sess.get_cow_state(req).await {
+            Ok(resp) => resp.into_inner().state,
+            Err(_) => None,
+        }
+    }
+
+    /// Poll cow-state until `disk_manifest_version > prior` or the deadline
+    /// elapses. Returns the new version on success, None on timeout. This is
+    /// the load-bearing end-state assertion for Phase B e2e tests: a flush
+    /// of dirty bytes — by either the FlushScheduler tick OR the admin
+    /// flush trigger — advances `disk_manifest_version`.
     async fn wait_for_disk_manifest_advance(
-        &self,
+        &mut self,
         sid: SessionId,
         prior_version: u64,
         deadline: Duration,
@@ -352,10 +333,8 @@ impl Driver {
         let started = std::time::Instant::now();
         while started.elapsed() < deadline {
             if let Some(state) = self.cow_state(sid).await {
-                if let Some(v) = state.get("disk_manifest_version").and_then(Value::as_u64) {
-                    if v > prior_version {
-                        return Some(v);
-                    }
+                if state.disk_manifest_version > prior_version {
+                    return Some(state.disk_manifest_version);
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -363,98 +342,95 @@ impl Driver {
         None
     }
 
-    /// `GET /sessions/:id` → the full `Session` JSON. Black-box read:
-    /// the lifecycle tests observe `status` (snake_case `SessionState`
-    /// — "active" / "idle" / "evacuating") and `host_id` exactly as a
-    /// real client would, instead of probing internal diagnostics. A
-    /// pure read; it does not bump the session's activity clock, so
-    /// the idle-eviction test can poll it without keeping the session
-    /// warm.
-    async fn get_session(&self, sid: SessionId) -> Value {
-        let path = format!("/api/v1/sessions/{sid}");
-        let resp = self
-            .req(reqwest::Method::GET, &path)
-            .send()
+    /// `SessionService.GetSession` → the `Session` message. Black-box read:
+    /// the lifecycle tests observe `status` (snake_case `SessionState`) and
+    /// `host_id` exactly as a real client would. A pure read; it does not
+    /// bump the session's activity clock.
+    async fn get_session(&mut self, sid: SessionId) -> app::Session {
+        let req = app::GetSessionRequest {
+            session_id: sid.to_string(),
+        };
+        self.sess
+            .get_session(req)
             .await
-            .expect("GET /sessions/:id");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(
-            status.is_success(),
-            "GET /sessions/:id failed: {status} body={text}"
-        );
-        serde_json::from_str(&text).expect("decode Session json")
+            .expect("GetSession")
+            .into_inner()
+            .session
+            .expect("GetSessionResponse must carry a session")
     }
 
     /// The session's `status` string (snake_case `SessionState`).
-    async fn session_status(&self, sid: SessionId) -> String {
-        self.get_session(sid)
-            .await
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
+    async fn session_status(&mut self, sid: SessionId) -> String {
+        self.get_session(sid).await.status
     }
 
-    /// The session's bound `host_id` (`None` while Idle / unbound).
-    /// Used by the teleport test to assert the session relocated.
-    async fn session_host_id(&self, sid: SessionId) -> Option<String> {
-        self.get_session(sid)
+    /// `FleetService.EvacuateSession` — async evacuation. Returns the full
+    /// gRPC `Status` on error so the shape test can assert on the code (the
+    /// 404/409/202 distinctions the old HTTP handler returned now map to
+    /// gRPC `NotFound` / `FailedPrecondition` / `Ok`).
+    async fn evacuate(
+        &mut self,
+        sid: SessionId,
+    ) -> Result<app::EvacuateSessionResponse, tonic::Status> {
+        let req = app::EvacuateSessionRequest {
+            session_id: sid.to_string(),
+            target_host: None,
+        };
+        self.fleet
+            .evacuate_session(req)
             .await
-            .get("host_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+            .map(|r| r.into_inner())
     }
 
-    /// `GET /hosts` → the registered hosts' ids. The teleport test uses
-    /// this to discover a peer to relocate onto.
-    async fn list_host_ids(&self) -> Vec<String> {
+    /// The session's bound `host_id`, or `None` if unbound (Idle / Pending /
+    /// terminal). Used by the teleport/evac test to assert the session
+    /// relocated off the source host.
+    async fn session_host_id(&mut self, sid: SessionId) -> Option<String> {
+        self.get_session(sid).await.host_id
+    }
+
+    /// `FleetService.ListHosts` → the registered hosts' ids. The two-host
+    /// evac test uses this to size the fleet + find a peer of the source.
+    async fn list_host_ids(&mut self) -> Vec<String> {
         let resp = self
-            .req(reqwest::Method::GET, "/api/v1/hosts")
-            .send()
+            .fleet
+            .list_hosts(app::ListHostsRequest {})
             .await
-            .expect("GET /hosts");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(
-            status.is_success(),
-            "GET /hosts failed: {status} body={text}"
-        );
-        let body: Value = serde_json::from_str(&text).expect("decode ListHostsResponse");
-        body.get("hosts")
-            .and_then(Value::as_array)
-            .map(|hs| {
-                hs.iter()
-                    .filter_map(|h| h.get("id").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .expect("ListHosts")
+            .into_inner();
+        resp.hosts.into_iter().map(|h| h.id).collect()
     }
 
-    /// `POST /admin/sessions/:id/teleport` `{target_host_id}` — relocate
-    /// an Active session to a chosen host. Returns 202 (snapshot-rehome)
-    /// or 200 (live); either way the `evac_resumer` lands it on the
-    /// pinned host. Asserts only that the request was accepted; the
-    /// caller polls `wait_for_status(active)` + `session_host_id` for the
-    /// observable outcome.
-    async fn teleport(&self, sid: SessionId, target_host_id: &str) {
-        let path = format!("/api/v1/admin/sessions/{sid}/teleport");
-        let resp = self
-            .req(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({ "target_host_id": target_host_id }))
-            .send()
+    /// `FleetService.ChunkGc` with `dry_run = true`.
+    async fn chunk_gc_dry_run(&mut self, grace_secs: Option<u64>) -> app::ChunkGcResponse {
+        let req = app::ChunkGcRequest {
+            dry_run: true,
+            grace_secs,
+        };
+        self.fleet
+            .chunk_gc(req)
             .await
-            .expect("POST /admin/sessions/:id/teleport");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(status.is_success(), "teleport failed: {status} body={text}");
+            .expect("ChunkGc dry_run")
+            .into_inner()
     }
 
-    /// Poll `GET /sessions/:id` until `status == want` or the deadline
-    /// elapses. Returns true on match. Used to observe Active→Idle
-    /// (eviction) and Idle/Evacuating→Active (resume / teleport
-    /// rejoin) through the public API alone.
-    async fn wait_for_status(&self, sid: SessionId, want: &str, deadline: Duration) -> bool {
+    /// `FleetService.ChunkGc` with `dry_run = false` — the live sweep.
+    async fn chunk_gc_sweep(&mut self, grace_secs: Option<u64>) -> app::ChunkGcResponse {
+        let req = app::ChunkGcRequest {
+            dry_run: false,
+            grace_secs,
+        };
+        self.fleet
+            .chunk_gc(req)
+            .await
+            .expect("ChunkGc sweep")
+            .into_inner()
+    }
+
+    /// Poll `GetSession` until `status == want` or the deadline elapses.
+    /// Returns true on match. Used to observe Idle→Active (resume) through
+    /// the public API alone.
+    async fn wait_for_status(&mut self, sid: SessionId, want: &str, deadline: Duration) -> bool {
         let started = std::time::Instant::now();
         while started.elapsed() < deadline {
             if self.session_status(sid).await == want {
@@ -465,193 +441,128 @@ impl Driver {
         false
     }
 
-    /// Stream session_events until the deadline, watching for an
-    /// Anthropic auth-failure signal in either of the shapes
-    /// documented on `AuthFailureSignal`.
+    /// Stream session events via `SessionService.StreamEvents`, watching for
+    /// an Anthropic auth-failure signal in either of the shapes documented
+    /// on `AuthFailureSignal`.
+    ///
+    /// The gRPC `SessionEvent` envelope carries `kind` (the event
+    /// discriminant, e.g. "agent_message" / "run_completed") + `payload_json`
+    /// (the serialized event payload). We match on `kind` and pull `text` /
+    /// `ok` out of the parsed payload — the same fields the typed
+    /// `HarnessAgentMessage` / `HarnessRunCompleted` variants carry.
     async fn wait_for_anthropic_auth_failure(
-        &self,
+        &mut self,
         sid: SessionId,
         expected_substr: &str,
         deadline: Duration,
     ) -> AuthFailureSignal {
-        let path = format!("/api/v1/sessions/{sid}/events?since=-1");
-        let resp = self
-            .req(reqwest::Method::GET, &path)
-            .header("accept", "text/event-stream")
-            .send()
-            .await
-            .expect("GET /sessions/:id/events");
-        assert!(
-            resp.status().is_success(),
-            "events stream open failed: {}",
-            resp.status()
-        );
+        let req = app::StreamEventsRequest {
+            session_id: sid.to_string(),
+            since: None, // from the start
+        };
+        let mut stream = match self.sess.stream_events(req).await {
+            Ok(r) => r.into_inner(),
+            Err(e) => {
+                eprintln!("StreamEvents open failed: {e}");
+                return AuthFailureSignal::TimedOut(Vec::new());
+            }
+        };
 
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut captured: Vec<SessionEvent> = Vec::new();
+        let mut captured: Vec<(String, String)> = Vec::new();
         let started = std::time::Instant::now();
 
         loop {
-            let remaining = deadline.checked_sub(started.elapsed());
-            let Some(remaining) = remaining else {
+            let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
                 return AuthFailureSignal::TimedOut(captured);
             };
-            let next = tokio::time::timeout(remaining, stream.next()).await;
-            let chunk: Bytes = match next {
+            let next = tokio::time::timeout(remaining, stream.message()).await;
+            let ev = match next {
                 Err(_) => return AuthFailureSignal::TimedOut(captured),
-                Ok(None) => return AuthFailureSignal::TimedOut(captured),
-                Ok(Some(Err(e))) => {
-                    eprintln!("events stream IO error: {e}");
+                Ok(Ok(None)) => return AuthFailureSignal::TimedOut(captured),
+                Ok(Err(e)) => {
+                    eprintln!("StreamEvents RPC error: {e}");
                     return AuthFailureSignal::TimedOut(captured);
                 }
-                Ok(Some(Ok(c))) => c,
+                Ok(Ok(Some(ev))) => ev,
             };
-            buf.extend_from_slice(&chunk);
 
-            // SSE messages are separated by blank lines. Process every
-            // complete message in the buffer; keep the trailing
-            // fragment for the next iteration.
-            while let Some(boundary) = find_sse_boundary(&buf) {
-                let raw = std::str::from_utf8(&buf[..boundary])
-                    .expect("SSE messages are UTF-8")
-                    .to_owned();
-                buf.drain(..boundary + 2); // skip the \n\n
-
-                let Some(data) = parse_sse_data(&raw) else {
-                    // Comment line (`:keep-alive`) or non-data event —
-                    // ignored.
-                    continue;
-                };
-                let Ok(ev) = serde_json::from_str::<SessionEvent>(&data) else {
-                    // Untyped or future-variant event — record raw
-                    // and skip. We can still surface it on the
-                    // TimedOut path.
-                    continue;
-                };
-
-                // The two signals.
-                if let SessionEvent::HarnessAgentMessage { text, .. } = &ev {
+            // Signal 1: an agent_message carrying the expected text.
+            if ev.kind == "agent_message" {
+                if let Some(text) = payload_str(&ev.payload_json, "text") {
                     if text.contains(expected_substr) {
-                        return AuthFailureSignal::ErrorMessage(text.clone());
+                        return AuthFailureSignal::ErrorMessage(text);
                     }
                 }
-                if let SessionEvent::HarnessRunCompleted { ok: false, .. } = &ev {
-                    // Don't return immediately — give the stream a tiny
-                    // grace so a trailing agent_message with the error
-                    // text (if any) can land. 200ms is enough; the
-                    // harness emits run_completed AFTER it's done
-                    // forwarding agent_messages.
-                    let grace_deadline = std::time::Instant::now() + Duration::from_millis(500);
-                    captured.push(ev);
-                    while std::time::Instant::now() < grace_deadline {
-                        let chunk =
-                            tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
-                        match chunk {
-                            Ok(Some(Ok(c))) => buf.extend_from_slice(&c),
-                            _ => break,
-                        }
-                        while let Some(b) = find_sse_boundary(&buf) {
-                            let raw = std::str::from_utf8(&buf[..b]).expect("UTF-8").to_owned();
-                            buf.drain(..b + 2);
-                            if let Some(d) = parse_sse_data(&raw) {
-                                if let Ok(SessionEvent::HarnessAgentMessage { text, .. }) =
-                                    serde_json::from_str::<SessionEvent>(&d)
-                                {
+            }
+
+            // Signal 2: run_completed with ok == false. Give the stream a
+            // short grace so a trailing agent_message with the error text
+            // (if any) can land first — the harness emits run_completed
+            // AFTER forwarding agent_messages.
+            if ev.kind == "run_completed" && payload_bool(&ev.payload_json, "ok") == Some(false) {
+                captured.push((ev.kind.clone(), ev.payload_json.clone()));
+                let grace = std::time::Instant::now() + Duration::from_millis(500);
+                while std::time::Instant::now() < grace {
+                    match tokio::time::timeout(Duration::from_millis(100), stream.message()).await {
+                        Ok(Ok(Some(e2))) => {
+                            if e2.kind == "agent_message" {
+                                if let Some(text) = payload_str(&e2.payload_json, "text") {
                                     if text.contains(expected_substr) {
                                         return AuthFailureSignal::ErrorMessage(text);
                                     }
-                                    captured.push(SessionEvent::HarnessAgentMessage {
-                                        run_id: String::new(),
-                                        message_id: String::new(),
-                                        role: engram_harness_proto::AgentRole::Assistant,
-                                        text,
-                                        at: chrono::Utc::now(),
-                                    });
                                 }
                             }
+                            captured.push((e2.kind, e2.payload_json));
                         }
+                        _ => break,
                     }
-                    eprintln!(
-                        "AUTH-FAIL via run_completed(ok=false) only. Captured events:\n{captured:#?}\n\
-                         Next iteration: tighten EXPECTED_ERROR_SUBSTR based on whatever \
-                         agent_message text Anthropic returns, and collapse this branch to a \
-                         tight assert in `wait_for_anthropic_auth_failure`."
-                    );
-                    return AuthFailureSignal::RunCompletedNotOk;
                 }
-
-                captured.push(ev);
+                eprintln!(
+                    "AUTH-FAIL via run_completed(ok=false) only. Captured events:\n{captured:#?}\n\
+                     Next iteration: tighten EXPECTED_ERROR_SUBSTR based on whatever \
+                     agent_message text Anthropic returns."
+                );
+                return AuthFailureSignal::RunCompletedNotOk;
             }
+
+            captured.push((ev.kind, ev.payload_json));
         }
     }
 }
 
-/// Find the byte offset of the first SSE message-terminator (`\n\n`)
-/// in the buffer, or `None` if no complete message is buffered yet.
-fn find_sse_boundary(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+/// Pull a string field out of a `payload_json` object.
+fn payload_str(payload_json: &str, field: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload_json).ok()?;
+    v.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
-/// Pull the `data:` payload out of a raw SSE message. SSE messages can
-/// carry multiple `data:` lines (joined with `\n`), but our coord
-/// emits one per event so this is the simple case.
-fn parse_sse_data(raw: &str) -> Option<String> {
-    let mut data = String::new();
-    let mut saw = false;
-    for line in raw.lines() {
-        if let Some(rest) = line.strip_prefix("data:") {
-            if saw {
-                data.push('\n');
-            }
-            data.push_str(rest.trim_start());
-            saw = true;
-        }
-    }
-    if saw {
-        Some(data)
-    } else {
-        None
-    }
+/// Pull a bool field out of a `payload_json` object.
+fn payload_bool(payload_json: &str, field: &str) -> Option<bool> {
+    let v: Value = serde_json::from_str(payload_json).ok()?;
+    v.get(field).and_then(Value::as_bool)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct CreateSessionResponse {
-    session_id: SessionId,
-    #[allow(dead_code)]
-    status: String,
-    #[allow(dead_code)]
-    image_version: String,
-    #[allow(dead_code)]
-    kind: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct ExecResponse {
-    #[allow(dead_code)]
-    session_id: SessionId,
-    #[allow(dead_code)]
-    exec_id: String,
+/// Collected result of draining an `Exec` stream — the shape the old unary
+/// `ExecResponse` exposed to the assertions.
+struct ExecResult {
     exit_status: Option<i32>,
     stdout: String,
-    #[allow(dead_code)]
     stderr: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct FlushNowResponse {
+/// Collected result of a `FlushSession` RPC.
+#[derive(Debug)]
+struct FlushResult {
     outcome: String,
-    #[serde(default)]
     manifest_version: Option<u64>,
 }
 
 // ---------- Tests ----------
 
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a live prod-shape stack with a baked demo image"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a live prod-shape stack with a baked demo image"]
 async fn e2e_cold_session_no_harness_can_exec_ls() {
-    let driver = Driver::from_env();
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
     let sid = driver.create_session_none_harness(&image).await;
@@ -685,7 +596,7 @@ async fn e2e_cold_session_no_harness_can_exec_ls() {
 #[tokio::test]
 #[ignore = "requires the e2e-stack lane (stages the skills RO bundle at /var/lib/engram/shared)"]
 async fn e2e_session_has_mounted_skills_bundle() {
-    let driver = Driver::from_env();
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
     let sid = driver.create_session_none_harness(&image).await;
 
@@ -724,13 +635,12 @@ async fn e2e_session_has_mounted_skills_bundle() {
 }
 
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a Claude harness pack registered with the coord"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a Claude harness pack baked into the demo image"]
 async fn e2e_cold_session_claude_harness_can_exec_ls() {
-    // Raw /exec hits the sandbox directly — the Claude harness is
-    // bound but unused. Use a bogus key so a future regression that
-    // races a harness call won't burn real Anthropic budget; this
-    // test doesn't send a prompt.
-    let driver = Driver::from_env();
+    // Raw Exec hits the sandbox directly — the Claude harness is bound but
+    // unused. Use a bogus key so a future regression that races a harness
+    // call won't burn real Anthropic budget; this test doesn't send a prompt.
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
     let sid = driver
@@ -753,23 +663,22 @@ async fn e2e_cold_session_claude_harness_can_exec_ls() {
 }
 
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + Claude harness + real api.anthropic.com reachability"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + Claude harness + real api.anthropic.com reachability"]
 async fn e2e_claude_with_bogus_key_surfaces_anthropic_auth_error() {
-    // Tightened from the iteration-1 stub after run 26338080977 showed
-    // the actual shape. Claude CLI surfaces Anthropic's 401 as an
-    // assistant-role agent_message with literal text:
+    // Claude CLI surfaces Anthropic's 401 as an assistant-role
+    // agent_message with literal text:
     //
     //   "Invalid API key · Fix external API key"
     //
-    // (the `·` is a middle dot, U+00B7; we only assert on the
-    // ASCII prefix). The harness's `run_completed.ok` is actually
-    // `true` on this path because the Claude CLI process itself
-    // exited cleanly — the auth error lives entirely in the
-    // stream-json output it printed before exit. That's why this
-    // test watches `agent_message` text, not the `ok` flag.
+    // (the `·` is a middle dot, U+00B7; we only assert on the ASCII
+    // prefix). The harness's `run_completed.ok` is actually `true` on
+    // this path because the Claude CLI process itself exited cleanly —
+    // the auth error lives entirely in the stream-json output it printed
+    // before exit. That's why this test watches `agent_message` text, not
+    // the `ok` flag.
     const EXPECTED_ERROR_SUBSTR: &str = "Invalid API key";
 
-    let driver = Driver::from_env();
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
     let sid = driver
@@ -787,9 +696,8 @@ async fn e2e_claude_with_bogus_key_surfaces_anthropic_auth_error() {
             );
         }
         AuthFailureSignal::RunCompletedNotOk => {
-            // Acceptable on the first iteration: the chain ran and
-            // failed cleanly. The stderr dump from
-            // wait_for_anthropic_auth_failure tells us what to
+            // Acceptable: the chain ran and failed cleanly. The stderr
+            // dump from wait_for_anthropic_auth_failure tells us what to
             // tighten to.
         }
         AuthFailureSignal::TimedOut(events) => panic!(
@@ -800,12 +708,12 @@ async fn e2e_claude_with_bogus_key_surfaces_anthropic_auth_error() {
     driver.delete(sid).await;
 }
 
-/// Whether this environment is REQUIRED to exercise the NBD
-/// chunked-disk path. Set `ENGRAM_EXPECT_NBD=1` on runners where NBD
-/// is known-available (Blacksmith ships `CONFIG_BLK_DEV_NBD=y`
-/// built-in; the dev VM loads `nbd.ko`) so a null `cow-state` becomes
-/// a hard failure instead of a silent skip. Unset (local macOS / VZ,
-/// any NBD-less box) keeps the graceful-degrade warning path.
+/// Whether this environment is REQUIRED to exercise the NBD chunked-disk
+/// path. Set `ENGRAM_EXPECT_NBD=1` on runners where NBD is known-available
+/// (Blacksmith ships `CONFIG_BLK_DEV_NBD=y` built-in; the dev VM loads
+/// `nbd.ko`) so a null `cow-state` becomes a hard failure instead of a
+/// silent skip. Unset (local macOS / VZ, any NBD-less box) keeps the
+/// graceful-degrade warning path.
 fn nbd_required() -> bool {
     matches!(
         std::env::var("ENGRAM_EXPECT_NBD").ok().as_deref(),
@@ -813,74 +721,46 @@ fn nbd_required() -> bool {
     )
 }
 
-/// Whether this environment is REQUIRED to have ≥2 hosts (the teleport
-/// scenario). Set `ENGRAM_EXPECT_TWO_HOSTS=1` on the CI lane that boots
-/// the two-host stack (`ENGRAM_INTEG_TWO_HOSTS=1`) so a single-host
-/// environment becomes a hard failure instead of a silent skip. Unset
-/// (default single-host lane, local runs) keeps the graceful-skip path,
-/// so the test is safe to land before the lane flips to two hosts.
-fn two_hosts_required() -> bool {
-    matches!(
-        std::env::var("ENGRAM_EXPECT_TWO_HOSTS").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
-}
-
-/// ADR 0016 Phase B commit 4b: end-to-end exercise of the
-/// FlushScheduler primitive via the admin `flush-now` endpoint.
-/// Explicit-trigger counterpart to the scheduler's 30s implicit
-/// cadence; the only way to verify the chunked-disk-write →
-/// `backend.flush()` → coord `update_live_disk_manifest` → PG row
-/// round-trip in CI without sleeping a full cadence. Without this
-/// test, the prod-shape chunked-disk write path silently regresses
-/// on any change to `nbd_sandboxes` wiring or the
-/// `update_live_disk_manifest` TX shape — neither covered by the
-/// in-process unit tests.
+/// ADR 0016 Phase B commit 4b: end-to-end exercise of the FlushScheduler
+/// primitive via `FleetService.FlushSession`. Explicit-trigger counterpart
+/// to the scheduler's 30s implicit cadence; the only way to verify the
+/// chunked-disk-write → `backend.flush()` → coord `update_live_disk_manifest`
+/// → PG row round-trip in CI without sleeping a full cadence. Without this
+/// test, the prod-shape chunked-disk write path silently regresses on any
+/// change to `nbd_sandboxes` wiring or the `update_live_disk_manifest` TX
+/// shape — neither covered by the in-process unit tests.
 ///
 /// **Environment dependence** (per `[fc_tests_run_in_ci]`):
 ///
-/// The chunked-disk write assertions only fire when the host has
-/// `nbd_pool` + `chunk_store` + `chunk_cache` wired AND a
-/// chunked-OCI demo image. On Blacksmith CI runners today,
-/// `nbd.ko` isn't in the guest kernel and `integration-up.sh`'s
-/// probe falls back to materialize-to-file — `nbd_sandboxes` stays
-/// empty, `flush_sandbox` returns None for every sandbox. The test
-/// detects this via the Phase A `GET /sessions/:id/cow-state`
-/// diagnostic (null state == not chunk-tracked) and skips the
-/// applied/idle assertions with a `::warning::` so the gap is
-/// visible in every run. The endpoint-wired assertions (pre-write
-/// idle + sandbox-bound 200 OK) still fire on every environment —
-/// so a regression in the route table or the wire format still
-/// fails loud. Self-hosted dev-vm runner (or a Blacksmith NBD
-/// support request) is the documented follow-up that closes the
-/// gap and turns the warning into a hard assertion.
+/// The chunked-disk write assertions only fire when the host has `nbd_pool`
+/// + `chunk_store` + `chunk_cache` wired AND a chunked-OCI demo image. On
+/// Blacksmith CI runners today, `nbd.ko` isn't in the guest kernel and the
+/// host probe falls back to materialize-to-file — `nbd_sandboxes` stays
+/// empty, `flush_sandbox` returns None for every sandbox. The test detects
+/// this via the Phase A `GetCowState` diagnostic (null state == not
+/// chunk-tracked) and skips the applied/idle assertions with a `::warning::`
+/// so the gap is visible in every run. The always-on assertions (pre-write
+/// idle + sandbox-bound success) still fire on every environment.
 ///
 /// Test path:
 /// 1. Cold-create a session against the demo image.
 /// 2. **Always**: `flush_now` pre-write → assert `outcome=idle`.
-///    Endpoint is wired, sandbox is bound (vs 409/404), no spurious
-///    Applied from a scheduler tick.
-/// 3. Probe `cow-state`. If null → `::warning::` + return (env
-///    can't exercise chunked-disk path).
+/// 3. Probe `cow-state`. If null → `::warning::` + return.
 /// 4. dd + sync into the chunked-disk-backed rootfs.
-/// 5. `flush_now` → assert `outcome=applied`, `manifest_version > 0`.
-///    Full host → PG round-trip.
-/// 6. `flush_now` again → assert `outcome=idle` (zero-chunk
-///    short-circuit; catches regressions that'd churn
-///    `chunk_generation` on every admin call).
+/// 5. `flush_now` → assert the disk lineage advances.
+/// 6. Poll cow-state for the manifest-version advance.
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
 async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
-    let driver = Driver::from_env();
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
     let sid = driver.create_session_none_harness(&image).await;
 
-    // Step 2: pre-write flush. Environment-independent — the
-    // endpoint should always return idle when nothing's dirty,
-    // regardless of whether the host has NBD wired. 200 OK + idle
-    // here proves the route is mounted, the session-lookup works,
-    // and `flush_sandbox` returns None cleanly.
+    // Step 2: pre-write flush. Environment-independent — the endpoint
+    // should always return idle when nothing's dirty, regardless of
+    // whether the host has NBD wired. idle here proves the RPC is wired,
+    // the session-lookup works, and `flush_sandbox` returns None cleanly.
     let pre = driver.flush_now(sid).await;
     assert_eq!(
         pre.outcome, "idle",
@@ -891,13 +771,11 @@ async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
         "idle outcome must NOT carry a manifest_version; got {pre:?}",
     );
 
-    // Step 3: probe whether this environment can actually exercise
-    // the chunked-disk path. `cow-state` returns Some(...) only when
-    // the sandbox is NBD-tracked (the demo image got NBD-attached,
-    // not materialized-to-file). Where NBD is known-available
-    // (ENGRAM_EXPECT_NBD set — Blacksmith ships it built-in), a null
-    // here is a real regression and we FAIL. Elsewhere (macOS / VZ /
-    // NBD-less) we skip with a loud warning so the gap stays visible.
+    // Step 3: probe whether this environment can actually exercise the
+    // chunked-disk path. `cow-state` returns Some(...) only when the
+    // sandbox is NBD-tracked. Where NBD is known-available
+    // (ENGRAM_EXPECT_NBD set), a null here is a real regression and we
+    // FAIL. Elsewhere we skip with a loud warning.
     let cow = driver.cow_state(sid).await;
     if cow.is_none() {
         assert!(
@@ -911,33 +789,23 @@ async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
             "::warning title=Phase B flush-now e2e partial coverage::\
              cow-state returned null for session {sid} — the runner's host-agent \
              fell back to materialize-to-file (no nbd.ko / no nbd_pool wired). \
-             Pre-write flush_now=idle assertion verified the endpoint wiring, but \
-             the chunked-disk write → flush → publish round-trip can't be exercised \
-             here."
+             Pre-write flush=idle assertion verified the RPC wiring, but the \
+             chunked-disk write → flush → publish round-trip can't be exercised here."
         );
         driver.delete(sid).await;
         return;
     }
 
-    // Step 4: capture the baseline disk_manifest_version BEFORE
-    // dd. The FlushScheduler may already have ticked between
-    // create-session and now (its 30s default cadence can fire
-    // during the slow cold-create); whatever version it left
-    // behind is what we measure forward from.
-    let baseline_version = cow
-        .as_ref()
-        .and_then(|s| s.get("disk_manifest_version"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    // Step 4: capture the baseline disk_manifest_version BEFORE dd. The
+    // FlushScheduler may already have ticked between create-session and
+    // now; whatever version it left behind is what we measure forward from.
+    let baseline_version = cow.as_ref().map(|s| s.disk_manifest_version).unwrap_or(0);
 
-    // Step 5: write enough dirty bytes to materialise at least one
-    // full 16 MiB chunk in the chunked-disk dirty buffer.
-    //
-    // `/var` is writable + survives the run; demo image's workdir
-    // varies, so anchoring at `/var` is deterministic. `count=8`
-    // keeps the exec inside the default 30s timeout even on
-    // cold-cache CI runs. `/dev/zero` (not /urandom) so writes
-    // dedupe cleanly across re-runs.
+    // Step 5: write enough dirty bytes to materialise at least one full
+    // 16 MiB chunk in the chunked-disk dirty buffer. `/var` is writable +
+    // survives the run. `count=8` keeps the exec inside the default 30s
+    // timeout even on cold-cache CI runs. `/dev/zero` so writes dedupe
+    // cleanly across re-runs.
     let dd = driver
         .exec(
             sid,
@@ -950,29 +818,21 @@ async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
         "dd should succeed; stderr=<{}>",
         dd.stderr,
     );
-    // `sync` so the writes hit the chunked-disk backend rather than
-    // sitting in the guest page cache.
+    // `sync` so the writes hit the chunked-disk backend rather than sitting
+    // in the guest page cache.
     let sync = driver.exec(sid, "sync").await;
     assert_eq!(sync.exit_status, Some(0), "sync should succeed");
 
-    // Step 6: force the flush via the admin trigger — best-effort.
-    // The outcome of this specific call can be either:
-    // - `applied` if dirty chunks were resident when flush-now hit
-    //   (the deterministic admin-trigger path).
-    // - `idle` if the FlushScheduler's 30s tick already drained
-    //   the buffer between our dd+sync and this call. Either way,
-    //   step 7's end-state check still passes — Phase B's claim
-    //   is that the disk lineage advances on writes, regardless
-    //   of who drained the buffer.
+    // Step 6: force the flush via the admin trigger — best-effort. The
+    // outcome can be `applied` (dirty chunks resident) or `idle` (the
+    // FlushScheduler's 30s tick already drained the buffer). Either way,
+    // step 7's end-state check still passes — Phase B's claim is that the
+    // disk lineage advances on writes, regardless of who drained the buffer.
     let _ = driver.flush_now(sid).await;
 
-    // Step 7: end-state assertion. Poll cow-state until the disk
-    // manifest version advances past `baseline_version`. The
-    // 90-second deadline covers one full scheduler tick (30s) +
-    // generous CI slack. If we don't see an advance in that
-    // window, the chunked-disk publish pipeline is broken —
-    // neither the admin trigger nor the scheduler produced a new
-    // version after 8 MiB of writes.
+    // Step 7: end-state assertion. Poll cow-state until the disk manifest
+    // version advances past `baseline_version`. The 90-second deadline
+    // covers one full scheduler tick (30s) + generous CI slack.
     let advanced = driver
         .wait_for_disk_manifest_advance(sid, baseline_version, Duration::from_secs(90))
         .await;
@@ -990,47 +850,32 @@ async fn e2e_flush_now_applies_then_short_circuits_on_no_dirty() {
     driver.delete(sid).await;
 }
 
-/// ADR 0016 Phase B commit 5 regression: a resumed sandbox is a
-/// first-class entry in `nbd_sandboxes`, the FlushScheduler runs
-/// against it, and a subsequent flush + eviction-style snapshot
-/// succeeds.
+/// ADR 0016 Phase B commit 5 regression: a resumed sandbox is a first-class
+/// entry in `nbd_sandboxes`, the FlushScheduler runs against it, and a
+/// subsequent flush + eviction-style snapshot succeeds.
 ///
 /// Pre-commit-5 behaviour (the failure mode this test pins):
-/// - `cow-state` on the resumed session returned null (the
-///   resumed sandbox was never inserted into `nbd_sandboxes`).
-/// - A second eviction-snapshot errored with `non-canonical jail
-///   layout: rootfs canonical symlink missing` because the resume
-///   path materialized to a flat file instead of rebuilding the
-///   chunked-NBD layout the snapshot pipeline expects.
+/// - `cow-state` on the resumed session returned null (the resumed sandbox
+///   was never inserted into `nbd_sandboxes`).
+/// - A second eviction-snapshot errored with `non-canonical jail layout`
+///   because the resume path materialized to a flat file instead of
+///   rebuilding the chunked-NBD layout the snapshot pipeline expects.
 ///
-/// Post-commit-5 behaviour:
-/// - Resume rebuilds chunked-disk tracking; cow-state populates
-///   for the resumed sandbox.
-/// - The chunked-disk dirty buffer is real again — flush-now
-///   against the resumed session drains chunks just like a fresh
-///   cold-create.
-///
-/// **Environment dependence**: same cow-state-probe skip pattern
-/// as `e2e_flush_now_applies_then_short_circuits_on_no_dirty`. On
-/// Blacksmith CI without `nbd.ko`, the test runs through the
-/// flush-now + snapshot + evict + resume API surface (catches
-/// regressions in those handlers) but skips the cow-state-post-
-/// resume + flush-now-post-resume assertions with a loud warning.
-/// The full regression coverage kicks in on dev-vm / future
-/// self-hosted runner where NBD is wired.
+/// **Environment dependence**: same cow-state-probe skip pattern as
+/// `e2e_flush_now_applies_then_short_circuits_on_no_dirty`. On Blacksmith CI
+/// without `nbd.ko`, the test runs through the flush + snapshot + evict +
+/// resume RPC surface (catches regressions in those handlers) but skips the
+/// cow-state-post-resume + flush-post-resume assertions with a loud warning.
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
 async fn e2e_resume_rejoins_chunked_disk_tracking() {
-    let driver = Driver::from_env();
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
     let sid = driver.create_session_none_harness(&image).await;
 
-    // Probe FIRST — if this environment can't exercise the NBD
-    // path, every subsequent assertion below is meaningless. The
-    // pre-write idle-flush check is redundant with
-    // `e2e_flush_now_applies_then_short_circuits_on_no_dirty`,
-    // which already pins the always-on endpoint shape.
+    // Probe FIRST — if this environment can't exercise the NBD path, every
+    // subsequent assertion below is meaningless.
     let pre_cow = driver.cow_state(sid).await;
     if pre_cow.is_none() {
         assert!(
@@ -1043,17 +888,16 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
         eprintln!(
             "::warning title=Phase B resume regression partial coverage::\
              cow-state returned null for session {sid} (pre-snapshot) — runner \
-             can't exercise the NBD path. Snapshot+resume API wiring will \
-             still be exercised below; cow-state-post-resume + \
-             flush-now-post-resume assertions skipped."
+             can't exercise the NBD path. Snapshot+resume RPC wiring will still \
+             be exercised below; cow-state-post-resume + flush-post-resume \
+             assertions skipped."
         );
         driver.delete(sid).await;
         return;
     }
 
-    // Dirty the disk so the snapshot we take has a non-trivial
-    // disk_manifest the resume path can NBD-attach against. Same
-    // dd+sync shape as the flush-now test.
+    // Dirty the disk so the snapshot we take has a non-trivial disk_manifest
+    // the resume path can NBD-attach against.
     let dd = driver
         .exec(
             sid,
@@ -1069,24 +913,21 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
     let sync = driver.exec(sid, "sync").await;
     assert_eq!(sync.exit_status, Some(0), "sync should succeed");
 
-    // Best-effort flush via the admin trigger (the FlushScheduler
-    // may have already drained — same race as e2e_flush_now). The
-    // snapshot below will internally re-flush via its own
-    // backend.flush() call regardless, so the chunks ARE durable
-    // in BlobStorage by the time we evict.
+    // Best-effort flush via the admin trigger (the FlushScheduler may have
+    // already drained). The snapshot below re-flushes via its own
+    // backend.flush() regardless, so the chunks ARE durable in BlobStorage
+    // by the time we evict.
     let _ = driver.flush_now(sid).await;
 
-    // Snapshot → evict-local → resume. Equivalent to the
-    // idle-eviction → resume cycle prod exercises, minus the
-    // 30-second idle wait.
+    // Snapshot → evict-local → resume. Equivalent to the idle-eviction →
+    // resume cycle prod exercises, minus the 30-second idle wait.
     driver.snapshot(sid).await;
     driver.evict_local(sid).await;
     driver.resume(sid).await;
 
-    // **THE REGRESSION CHECK**: post-resume cow-state must be
-    // Some(...). Pre-commit-5 this returned null (Symptom 1 of the
-    // ADR's failure mode). Post-commit-5 the resumed sandbox is in
-    // `nbd_sandboxes` → diagnostic populates.
+    // **THE REGRESSION CHECK**: post-resume cow-state must be Some(...).
+    // Pre-commit-5 this returned null. Post-commit-5 the resumed sandbox is
+    // in `nbd_sandboxes` → diagnostic populates.
     let post_cow = driver.cow_state(sid).await;
     assert!(
         post_cow.is_some(),
@@ -1095,22 +936,13 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
          fallback path or the NBD attach branch silently no-op'd.",
     );
 
-    // **THE SECOND REGRESSION CHECK**: the FlushScheduler can now
-    // produce a non-trivial flush on the resumed sandbox. Pre-
-    // commit-5 the resumed sandbox had no chunked-disk dirty
-    // buffer at all (Symptom 2 — second eviction-snapshot
-    // failed). Post-commit-5 the resumed sandbox is a fresh
-    // ChunkedDiskBackend rebased on the snapshot's disk_manifest;
-    // post-resume writes go through it and the disk manifest
-    // version advances on the next flush (admin OR scheduler).
-    //
-    // Capture the post-resume baseline and write a NEW file
-    // (different from the pre-snapshot dirty.bin) so the
-    // assertion can't be satisfied by stale state.
+    // **THE SECOND REGRESSION CHECK**: the FlushScheduler can now produce a
+    // non-trivial flush on the resumed sandbox. Capture the post-resume
+    // baseline and write a NEW file so the assertion can't be satisfied by
+    // stale state.
     let post_resume_baseline = post_cow
         .as_ref()
-        .and_then(|s| s.get("disk_manifest_version"))
-        .and_then(Value::as_u64)
+        .map(|s| s.disk_manifest_version)
         .unwrap_or(0);
 
     let post_dd = driver
@@ -1132,15 +964,12 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
         "post-resume sync should succeed",
     );
 
-    // Best-effort admin trigger (same race-tolerance as
-    // e2e_flush_now_applies_then_short_circuits_on_no_dirty).
+    // Best-effort admin trigger.
     let _ = driver.flush_now(sid).await;
 
-    // End-state assertion: the resumed sandbox's disk manifest
-    // version must advance past the post-resume baseline. This is
-    // the load-bearing regression check — pre-commit-5 this would
-    // hang forever (resumed sandbox isn't in nbd_sandboxes, no
-    // backend.flush() to advance the version).
+    // End-state assertion: the resumed sandbox's disk manifest version must
+    // advance past the post-resume baseline. Pre-commit-5 this would hang
+    // forever (resumed sandbox isn't in nbd_sandboxes).
     let post_advanced = driver
         .wait_for_disk_manifest_advance(sid, post_resume_baseline, Duration::from_secs(90))
         .await;
@@ -1154,36 +983,39 @@ async fn e2e_resume_rejoins_chunked_disk_tracking() {
 }
 
 /// Lifecycle e2e: idle→active resume preserves BOTH disk and memory,
-/// proven the only way a user would see it — write through the API,
-/// run the snapshot→evict→resume cycle, read back through the API.
+/// proven the only way a user would see it — write through the API, run the
+/// snapshot→evict→resume cycle, read back through the API.
 ///
-/// Unlike `e2e_resume_rejoins_chunked_disk_tracking` (which asserts on
-/// the internal `disk_manifest_version`), this is pure black-box: it
-/// never inspects cow-state or manifest internals. Two guarantees:
+/// Pure black-box: it never inspects cow-state or manifest internals. Two
+/// guarantees:
 ///
-///   - **Disk data survives byte-identical.** A UUID sentinel written
-///     to `/var/sentinel.txt` is `cat`'d back after resume and must
-///     match. This is the user-facing "no data loss on resume" claim.
-///     It holds on any backend (NBD-attached OR materialize-to-file),
-///     so the test does NOT gate on NBD.
+///   - **Disk data survives byte-identical.** A UUID sentinel written to
+///     `/var/sentinel.txt` is `cat`'d back after resume and must match. It
+///     holds on any backend (NBD-attached OR materialize-to-file), so the
+///     test does NOT gate on NBD.
 ///   - **The kernel was memory-restored, not rebooted.**
-///     `/proc/sys/kernel/random/boot_id` is minted once per kernel
-///     boot and lives only in kernel memory — the FC memory snapshot
-///     captures it, a cold reboot regenerates it. Asserting it's
-///     unchanged across the cycle proves resume is a true warm
-///     memory-restore, not a disk-only re-boot (which would silently
-///     drop any in-memory process state a real session depends on).
+///     `/proc/sys/kernel/random/boot_id` is minted once per kernel boot and
+///     lives only in kernel memory — the FC memory snapshot captures it, a
+///     cold reboot regenerates it. Asserting it's unchanged across the cycle
+///     proves resume is a true warm memory-restore.
+///
+/// ADR 0051 note: this test (snapshot + evict-local + resume) is now the
+/// SOLE evict→resume data-preservation coverage. The former
+/// `e2e_idle_evict_then_resume_preserves_data` drove the same Active→Idle→
+/// Active cycle through the `evict-idle` admin trigger, which has NO app-gRPC
+/// analog (no EvictIdle RPC in `SessionService`). Expressed via
+/// EvictLocal+Resume it would be a byte-for-byte duplicate of this test, so
+/// it was deleted rather than ported — see the deletion note in the ADR 0051
+/// migration commit.
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
 async fn e2e_resume_preserves_disk_and_memory() {
-    let driver = Driver::from_env();
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
     let sid = driver.create_session_none_harness(&image).await;
 
-    // Disk sentinel: a fresh UUID so stale state can't satisfy the
-    // readback. `/var` is the proven-writable anchor the other tests
-    // use. sync so it reaches the disk backend, not the guest cache.
+    // Disk sentinel: a fresh UUID so stale state can't satisfy the readback.
     let disk_sentinel = uuid::Uuid::new_v4().to_string();
     let write = driver
         .exec(
@@ -1198,8 +1030,8 @@ async fn e2e_resume_preserves_disk_and_memory() {
         write.stderr,
     );
 
-    // Memory-continuity witness: the kernel's boot_id, captured BEFORE
-    // the snapshot. Survives a memory-restore; changes on a reboot.
+    // Memory-continuity witness: the kernel's boot_id, captured BEFORE the
+    // snapshot. Survives a memory-restore; changes on a reboot.
     let boot_id_before = driver
         .exec(sid, "cat /proc/sys/kernel/random/boot_id")
         .await;
@@ -1252,225 +1084,72 @@ async fn e2e_resume_preserves_disk_and_memory() {
     driver.delete(sid).await;
 }
 
-/// Lifecycle e2e: active→idle eviction via the real idle pipeline, then
-/// resume with data intact — all through the public API.
-///
-/// `e2e_resume_preserves_disk_and_memory` drives Active→Idle with the
-/// manual `snapshot` + `evict-local` handlers; this one fires the
-/// `evict-idle` admin trigger, which runs the *same* primitive the
-/// host idle-detector and the coord backstop scanner drive on a
-/// timeout (`idle_evictor::evict_idle_session`). That's the deterministic
-/// stand-in for "the session went idle" — no global TTL lowering (which
-/// would race-evict the other serial tests' sessions).
-///
-/// Asserts the observable contract: the session reaches `idle`, is
-/// resumable, and the pre-eviction disk sentinel survives byte-identical.
-#[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
-async fn e2e_idle_evict_then_resume_preserves_data() {
-    let driver = Driver::from_env();
-    let image = Driver::image_uri();
-
-    let sid = driver.create_session_none_harness(&image).await;
-
-    let sentinel = uuid::Uuid::new_v4().to_string();
-    let write = driver
-        .exec(
-            sid,
-            &format!("printf '%s' {sentinel} > /var/idle-sentinel.txt && sync"),
-        )
-        .await;
-    assert_eq!(
-        write.exit_status,
-        Some(0),
-        "sentinel write should succeed; stderr=<{}>",
-        write.stderr,
-    );
-
-    // Fire the idle-eviction primitive. Synchronous → Idle on return,
-    // but assert the observable state transition through the API.
-    driver.evict_idle(sid).await;
-    assert!(
-        driver
-            .wait_for_status(sid, "idle", Duration::from_secs(30))
-            .await,
-        "session should be Idle after evict-idle; got {}",
-        driver.session_status(sid).await,
-    );
-
-    // Resumable, and the data written before eviction is intact.
-    driver.resume(sid).await;
-    assert!(
-        driver
-            .wait_for_status(sid, "active", Duration::from_secs(30))
-            .await,
-        "session should be Active after resume",
-    );
-    let readback = driver.exec(sid, "cat /var/idle-sentinel.txt").await;
-    assert_eq!(
-        readback.exit_status,
-        Some(0),
-        "sentinel readback should succeed; stderr=<{}>",
-        readback.stderr,
-    );
-    assert_eq!(
-        readback.stdout.trim(),
-        sentinel,
-        "disk data lost across idle-evict→resume",
-    );
-
-    driver.delete(sid).await;
-}
+// ADR 0051: `e2e_idle_evict_then_resume_preserves_data` deleted. It depended
+// solely on the `evict-idle` admin trigger (the old
+// `POST /api/v1/admin/sessions/:id/evict-idle` route), which has NO app-gRPC
+// analog — `SessionService` exposes no EvictIdle RPC, and inventing one would
+// be a breaking app/v1 proto change (out of scope). The observable contract
+// it pinned (disk data survives an Active→Idle→Active cycle) is fully covered
+// by `e2e_resume_preserves_disk_and_memory` above, which drives the same
+// transition via Snapshot + EvictLocal + Resume; porting the idle test would
+// have produced a byte-for-byte duplicate.
 
 // ---------------------------------------------------------------------
-// ADR 0016 Phase C commit 6a — chunk-GC admin-endpoint e2e regression
+// ADR 0016 Phase C commit 6a — chunk-GC RPC e2e regression
 // ---------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // fields decoded for Debug output even when not asserted
-struct ChunkGcSweepResponse {
-    listed_chunks: usize,
-    pin_set_size: usize,
-    candidates_marked: usize,
-    promoted_deletes: usize,
-    promote_delete_errors: usize,
-    grace_secs: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChunkGcCandidate {
-    content_hash: String,
-    #[allow(dead_code)]
-    first_seen_at: String,
-    #[allow(dead_code)]
-    last_seen_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChunkGcCandidatesResponse {
-    candidates: Vec<ChunkGcCandidate>,
-}
-
-impl Driver {
-    async fn chunk_gc_dry_run(&self, grace_secs: Option<u64>) -> ChunkGcSweepResponse {
-        let mut path = "/api/v1/admin/chunk-gc/dry-run".to_string();
-        if let Some(g) = grace_secs {
-            path.push_str(&format!("?grace_secs={g}"));
-        }
-        let resp = self
-            .req(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .expect("POST /api/admin/chunk-gc/dry-run");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(status.is_success(), "dry-run failed: {status} body={text}");
-        serde_json::from_str(&text).expect("decode ChunkGcSweepResponse")
-    }
-
-    async fn chunk_gc_sweep(&self, grace_secs: Option<u64>) -> ChunkGcSweepResponse {
-        let mut path = "/api/v1/admin/chunk-gc/sweep".to_string();
-        if let Some(g) = grace_secs {
-            path.push_str(&format!("?grace_secs={g}"));
-        }
-        let resp = self
-            .req(reqwest::Method::POST, &path)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .expect("POST /api/admin/chunk-gc/sweep");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(status.is_success(), "sweep failed: {status} body={text}");
-        serde_json::from_str(&text).expect("decode ChunkGcSweepResponse")
-    }
-
-    async fn chunk_gc_candidates(&self) -> ChunkGcCandidatesResponse {
-        let resp = self
-            .req(reqwest::Method::GET, "/api/v1/admin/chunk-gc/candidates")
-            .send()
-            .await
-            .expect("GET /api/admin/chunk-gc/candidates");
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        assert!(
-            status.is_success(),
-            "GET candidates failed: {status} body={text}"
-        );
-        serde_json::from_str(&text).expect("decode ChunkGcCandidatesResponse")
-    }
-}
-
-/// ADR 0016 Phase C commit 6a — load-bearing regression test for the
-/// M5 failure class.
+/// ADR 0016 Phase C commit 6a — load-bearing regression test for the M5
+/// failure class.
 ///
-/// The 2026-05-23 incident this catches: the prior chunk-GC marked
-/// every chunked-disk image's chunks as candidates because its
-/// live-set query missed the `enabled_images` lineage, then
-/// silent-deleted them after a 24h grace (which itself was a no-op
-/// on GCS due to the etag-parser bug). The next session-create
-/// against any chunked image faulted with `chunk fetch: blob
-/// storage: blob not found`.
+/// The 2026-05-23 incident this catches: the prior chunk-GC marked every
+/// chunked-disk image's chunks as candidates because its live-set query
+/// missed the `enabled_images` lineage, then silent-deleted them after a 24h
+/// grace. The next session-create against any chunked image faulted with
+/// `chunk fetch: blob storage: blob not found`.
 ///
-/// This test pins that the redesigned GC does NOT repeat that
-/// failure. Flow:
+/// This test pins that the redesigned GC does NOT repeat that failure. Flow:
 ///
-/// 1. Create a none-harness session on the demo image (which is
-///    chunked-disk in CI per integration-bake-demo.sh). This proves
-///    the enabled image's chunks are materialized + reachable.
-/// 2. POST /api/admin/chunk-gc/dry-run — assert pin_set_size > 0.
-///    If the enabled-image pin-set source were broken, this would
-///    report 0 here, and step 3's sweep would proceed to delete
-///    every chunk in the bucket.
-/// 3. POST /api/admin/chunk-gc/sweep?grace_secs=0 — full sweep
-///    with grace knocked down so any orphans would promote on
-///    this single call. The load-bearing claim: this MUST NOT
-///    delete the demo image's chunks, regardless of what's in the
-///    bucket.
-/// 4. Re-exec a command on the original session — proves the
-///    sweep didn't break the session's data path. (Sandbox's
-///    chunks are paged in lazily; if the sweep wiped them, the
-///    exec would fail on next page-fault. With NBD wired, this
-///    would be `chunk fetch: blob not found`; without NBD, the
-///    rootfs is materialized eagerly so this assertion is weaker
-///    but still catches the path.)
-/// 5. Create a SECOND none-harness session on the same image —
-///    this is the strongest regression catch. Session-create
-///    materializes the rootfs anew; if the sweep deleted the
-///    image's chunks, this fails the same way the M5 incident
-///    failed.
-/// 6. GET /api/admin/chunk-gc/candidates — sanity-check the
-///    response shape (paged list, no crash on empty bucket).
-/// 7. POST /api/admin/chunk-gc/dry-run — second sweep is
-///    idempotent on a clean stack: pin set membership hasn't
-///    changed, and any candidates marked in step 3 were already
-///    promoted to deletion. Verifies the sweep is well-behaved
-///    on repeated invocation.
+/// 1. Create a none-harness session on the demo image (chunked-disk in CI).
+/// 2. `ChunkGc { dry_run: true }` — assert pin_set_size > 0.
+/// 3. `ChunkGc { dry_run: false, grace_secs: 0 }` — full sweep; must NOT
+///    delete the demo image's chunks.
+/// 4. Re-exec a command on the original session — proves the sweep didn't
+///    break the session's data path.
+/// 5. Create a SECOND none-harness session on the same image — the strongest
+///    regression catch (materializes the rootfs anew from BlobStorage).
+/// 6. `ChunkGc { dry_run: false, grace_secs: 0 }` again — idempotent on a
+///    clean stack.
 ///
-/// Environment dependence: this test does NOT skip on missing NBD.
-/// The pin-set + sweep paths run against PG + BlobStorage only;
-/// session create+exec works against either NBD-attached or
-/// materialize-to-file rootfs.
+/// ADR 0051: the old step-6 `GET /api/admin/chunk-gc/candidates` round-trip
+/// is dropped — `FleetService` intentionally exposes NO ChunkGcCandidates RPC
+/// (see fleet.proto "INTENTIONAL DROPS"). The candidate-table shape is still
+/// pinned by the `admin_chunk_gc_live_pg` unit tests in the same crate; the
+/// e2e value here is the live-image-not-deleted invariant, which the sweep
+/// assertions cover.
+///
+/// Environment dependence: this test does NOT skip on missing NBD. The
+/// pin-set + sweep paths run against PG + BlobStorage only; session
+/// create+exec works against either NBD-attached or materialize-to-file
+/// rootfs.
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
 async fn e2e_chunk_gc_sweep_does_not_delete_live_image_chunks() {
-    let driver = Driver::from_env();
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
     let sid_1 = driver.create_session_none_harness(&image).await;
 
-    // Step 2: dry-run baseline. The pin set MUST cover the demo
-    // image's chunks (enabled_images source). If this is 0, the
-    // regression has already happened by construction and step 3's
-    // sweep would wipe the bucket.
+    // Step 2: dry-run baseline. The pin set MUST cover the demo image's
+    // chunks (enabled_images source). If this is 0, the regression has
+    // already happened by construction and step 3's sweep would wipe the
+    // bucket.
     let dry = driver.chunk_gc_dry_run(Some(0)).await;
     assert!(
         dry.pin_set_size > 0,
-        "pin_set_size must be > 0 — the demo image's chunks should be \
-         pinned via enabled_images.disk_manifest_*. Got {dry:?}. \
-         A 0 here means the enabled-image pin-set source is broken; \
-         proceeding to step 3's sweep would have nuked the bucket."
+        "pin_set_size must be > 0 — the demo image's chunks should be pinned via \
+         enabled_images.disk_manifest_*. Got {dry:?}. A 0 here means the \
+         enabled-image pin-set source is broken; proceeding to step 3's sweep \
+         would have nuked the bucket."
     );
     assert_eq!(
         dry.grace_secs, 0,
@@ -1481,12 +1160,11 @@ async fn e2e_chunk_gc_sweep_does_not_delete_live_image_chunks() {
         "DryRun must promote nothing; got {dry:?}",
     );
 
-    // Capture sizes for the idempotency assertion in step 7.
     let pin_set_size_before = dry.pin_set_size;
 
-    // Step 3: full sweep with grace=0. The load-bearing call. If
-    // the enabled image's chunks aren't in the pin set, they get
-    // marked AND promoted in a single call — the M5 failure mode.
+    // Step 3: full sweep with grace=0. The load-bearing call. If the enabled
+    // image's chunks aren't in the pin set, they get marked AND promoted in
+    // a single call — the M5 failure mode.
     let swept = driver.chunk_gc_sweep(Some(0)).await;
     assert_eq!(
         swept.promote_delete_errors, 0,
@@ -1494,60 +1172,38 @@ async fn e2e_chunk_gc_sweep_does_not_delete_live_image_chunks() {
     );
     assert!(
         swept.pin_set_size >= pin_set_size_before,
-        "pin_set_size shrank between dry-run and sweep ({} → {}). \
-         Either an enabled image got disabled mid-test (unlikely on \
-         the integration stack) or the pin set has a flake.",
+        "pin_set_size shrank between dry-run and sweep ({} → {}). Either an \
+         enabled image got disabled mid-test (unlikely on the integration \
+         stack) or the pin set has a flake.",
         pin_set_size_before,
         swept.pin_set_size,
     );
 
-    // Step 4: original session's data path still works. With NBD
-    // wired, chunks lazy-fault through the pin-set survivors; without
-    // NBD, the rootfs was materialized at create time. Either way,
-    // a simple shell command should succeed if the chunks are intact.
+    // Step 4: original session's data path still works.
     let ls = driver.exec(sid_1, "ls /").await;
     assert_eq!(
         ls.exit_status,
         Some(0),
-        "post-sweep exec on original session failed — chunks may have \
-         been deleted under it. stderr=<{}>",
+        "post-sweep exec on original session failed — chunks may have been \
+         deleted under it. stderr=<{}>",
         ls.stderr,
     );
 
-    // Step 5: STRONGEST regression catch. A fresh session-create on
-    // the same image materializes the rootfs anew from BlobStorage.
-    // If the sweep deleted the image's chunks, this fails the same
-    // way the M5 incident failed in prod.
+    // Step 5: STRONGEST regression catch. A fresh session-create on the same
+    // image materializes the rootfs anew from BlobStorage.
     let sid_2 = driver.create_session_none_harness(&image).await;
     let ls_2 = driver.exec(sid_2, "ls /").await;
     assert_eq!(
         ls_2.exit_status,
         Some(0),
-        "post-sweep fresh session-create + exec failed — the sweep \
-         deleted the image's chunks under us (M5 regression). \
-         stderr=<{}>",
+        "post-sweep fresh session-create + exec failed — the sweep deleted the \
+         image's chunks under us (M5 regression). stderr=<{}>",
         ls_2.stderr,
     );
 
-    // Step 6: GET /candidates round-trip. No assertion on contents
-    // beyond response shape — other tests in the same lane (the
-    // chunk_gc_helpers_live_pg tests, the admin_chunk_gc_live_pg
-    // tests) might leave rows in the table. The point is the
-    // endpoint serves valid JSON.
-    let candidates = driver.chunk_gc_candidates().await;
-    for c in &candidates.candidates {
-        assert_eq!(
-            c.content_hash.len(),
-            64,
-            "candidate content_hash must be 64 hex chars; got {} len={}",
-            c.content_hash,
-            c.content_hash.len(),
-        );
-    }
-
-    // Step 7: idempotency on a clean stack. After step 3's promote
-    // pass deleted any orphans the candidate table had, a second
-    // sweep at grace=0 should find nothing to promote.
+    // Step 6: idempotency on a clean stack. After step 3's promote pass
+    // deleted any orphans, a second sweep at grace=0 should find nothing to
+    // promote.
     let swept_again = driver.chunk_gc_sweep(Some(0)).await;
     assert_eq!(
         swept_again.promote_delete_errors, 0,
@@ -1562,106 +1218,104 @@ async fn e2e_chunk_gc_sweep_does_not_delete_live_image_chunks() {
     driver.delete(sid_2).await;
 }
 
-/// ADR 0018 Phase C admin endpoint shape coverage.
+/// ADR 0018 Phase C RPC shape coverage.
 ///
-/// The full multi-host alive-source evac requires two host-agents in
-/// the integration stack. The current `integration-up.sh` spins up one.
-/// Until a 2-host variant lands as a follow-up, this test exercises
-/// what's reachable from a 1-host fixture:
+/// The full multi-host alive-source evac requires two host-agents. The
+/// current single-host integration stack exercises what's reachable from a
+/// 1-host fixture:
 ///
-///   - Endpoint is mounted under bearer auth.
-///   - 404 on a non-existent session id.
-///   - 409 on a session that's not yet Active (e.g. just-created,
-///     still warming).
-///   - For an Active session: returns 202 Accepted with
-///     `status="evacuating"`. The `evac_resumer` scanner (which
-///     runs in the same coord process) drives the session to
-///     Active on a peer in ≤10s.
+///   - The RPC is bound under bearer auth.
+///   - `NotFound` on a non-existent session id (the old HTTP 404).
+///   - For an Active session: returns Ok with `status="evacuating"` (the old
+///     HTTP 202). The `evac_resumer` scanner drives the session to Active on
+///     a peer in ≤10s.
 ///
 /// Pinned regressions:
-///   - Route registration in `api/mod.rs` (a typo makes every call
-///     404 instead of 200/4xx).
-///   - Pre-flight checks (404 vs 409 vs 5xx) in
-///     `admin::evacuate_session`.
-///   - The async hand-off: the handler MUST return without
-///     synchronously running the relocate (legacy commit-7 shape).
+///   - RPC registration (a wiring typo makes every call Unimplemented).
+///   - Pre-flight checks in the evacuate handler.
+///   - The async hand-off: the handler MUST return without synchronously
+///     running the relocate.
 ///
-/// The full e2e — Active session × 2 hosts × disk-preserved-on-peer
-/// — runs in the dev-vm `integration-evac-test.sh`.
+/// ADR 0051: the old test asserted a distinct HTTP 409 on a not-yet-Active
+/// session. The gRPC handler folds that into the same async accept path
+/// (mark-Evacuating + return), so this test asserts the live-session
+/// accept-and-status path; the 404→NotFound mapping is the load-bearing
+/// pre-flight check that remains.
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
 async fn e2e_evac_admin_endpoint_shape() {
-    let driver = Driver::from_env();
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
-    // Case 1: 404 on a session that doesn't exist.
+    // Case 1: NotFound on a session that doesn't exist.
     let bogus = SessionId::new();
-    let path = format!("/api/v1/admin/sessions/{bogus}/evacuate");
-    let resp = driver
-        .req(reqwest::Method::POST, &path)
-        .json(&serde_json::json!({}))
-        .send()
+    let err = driver
+        .evacuate(bogus)
         .await
-        .expect("POST evacuate on bogus session");
-    let status = resp.status();
+        .expect_err("evacuate on unknown session must error");
     assert_eq!(
-        status,
-        reqwest::StatusCode::NOT_FOUND,
-        "evacuate on unknown session should 404; got {status} body={}",
-        resp.text().await.unwrap_or_default(),
+        err.code(),
+        tonic::Code::NotFound,
+        "evacuate on unknown session should map to NotFound; got {err:?}",
     );
 
-    // Case 2: live session — async shape (commit 12). Handler must
-    // return 202 immediately after marking the session Evacuating.
-    // The scanner picks it up from there.
+    // Case 2: live session — async shape. Handler must accept immediately
+    // after marking the session Evacuating. The scanner picks it up from
+    // there.
     let sid = driver.create_session_none_harness(&image).await;
-    let path = format!("/api/v1/admin/sessions/{sid}/evacuate");
     let resp = driver
-        .req(reqwest::Method::POST, &path)
-        .json(&serde_json::json!({}))
-        .send()
+        .evacuate(sid)
         .await
-        .expect("POST evacuate on live session");
-    let status = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
+        .expect("evacuate must succeed on an Active session (async shape)");
     assert_eq!(
-        status,
-        reqwest::StatusCode::ACCEPTED,
-        "evacuate must return 202 on Active session (async shape); got {status} body={body_text}",
+        resp.status, "evacuating",
+        "evacuate response status must be \"evacuating\"; got {resp:?}",
     );
-    let body: Value = serde_json::from_str(&body_text).expect("decode EvacuateSessionResponse");
     assert_eq!(
-        body.get("status").and_then(|v| v.as_str()),
-        Some("evacuating"),
-        "202 body.status must be \"evacuating\"; got {body:?}",
-    );
-    assert!(
-        body.get("session_id").is_some(),
-        "202 body must echo session_id; got {body:?}",
+        resp.session_id,
+        sid.to_string(),
+        "evacuate response must echo session_id; got {resp:?}",
     );
 
     driver.delete(sid).await;
 }
 
-/// Full-stack 2-host teleport: relocate a live session to a chosen peer
-/// and prove its disk data crosses the move — the e2e the
-/// `e2e_evac_admin_endpoint_shape` doc calls out as "dev-vm only".
-/// Driven entirely through the public API.
+/// Whether this environment is REQUIRED to have ≥2 hosts (the teleport/evac
+/// relocation scenario). Set `ENGRAM_EXPECT_TWO_HOSTS=1` on the CI lane that
+/// boots the two-host stack (`ENGRAM_INTEG_TWO_HOSTS=1`) so a single-host
+/// regression is a hard failure rather than a silent skip. Unset → the test
+/// skips gracefully when only one host registered (the default single-host
+/// `test-e2e-stack` lane).
+fn two_hosts_required() -> bool {
+    matches!(
+        std::env::var("ENGRAM_EXPECT_TWO_HOSTS").ok().as_deref(),
+        Some("1") | Some("true"),
+    )
+}
+
+/// Full-stack two-host teleport via `FleetService.EvacuateSession` — the
+/// teleport PRIMITIVE on the app-gRPC surface (ADR 0051). The orchestrator's
+/// teleport verb is this RPC; `EvacuateSession` pauses + flushes + snapshots
+/// the source sandbox, marks the session Evacuating, and the `evac_resumer`
+/// scanner resumes it on a PEER host (any non-source host via the standard
+/// policy — the proto's `target_host` is reserved/ignored, so unlike the old
+/// REST `/teleport` this does not pin the destination).
 ///
-/// Requires the two-host stack (`ENGRAM_INTEG_TWO_HOSTS=1`, which the CI
-/// lane sets alongside `ENGRAM_EXPECT_TWO_HOSTS=1`). On a single-host
-/// environment it skips with a `::warning::` — unless
-/// `ENGRAM_EXPECT_TWO_HOSTS` is set, where <2 hosts is a hard failure.
-/// This mirrors the `nbd_required()` gate so the test is safe to land
-/// before the lane flips to two hosts.
+/// Flow: create on host A → write a UUID sentinel + sync → `EvacuateSession`
+/// → wait for Active on a peer → assert the session LEFT host A and the disk
+/// sentinel crossed byte-identical. This is the gRPC replacement for the
+/// deleted `e2e_two_host_teleport_preserves_sentinel` (which drove the removed
+/// REST route): same disk-fidelity-across-relocation guarantee, minus the
+/// destination-pinning assertion the evac primitive intentionally doesn't
+/// offer. The single-host async-accept shape stays pinned by
+/// `e2e_evac_admin_endpoint_shape` above.
 ///
-/// Flow: create on host A → write a UUID sentinel → `teleport` to host B
-/// → wait for Active → assert `host_id` is now B (the pinned target) →
-/// `cat` the sentinel back and assert byte-identical.
+/// Requires a two-host stack. On a single-host lane it skips with a warning
+/// unless `ENGRAM_EXPECT_TWO_HOSTS=1`, where <2 hosts is a hard failure.
 #[tokio::test]
-#[ignore = "requires ENGRAM_E2E_COORD_URL + a baked demo image + a 2-host stack; runs in ci.yml's test-e2e-stack lane"]
-async fn e2e_two_host_teleport_preserves_sentinel() {
-    let driver = Driver::from_env();
+#[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a two-host stack (ENGRAM_INTEG_TWO_HOSTS=1); runs in ci.yml's test-e2e-stack teleport variant"]
+async fn e2e_two_host_evacuate_preserves_sentinel() {
+    let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
     let hosts = driver.list_host_ids().await;
@@ -1674,9 +1328,9 @@ async fn e2e_two_host_teleport_preserves_sentinel() {
             hosts.len(),
         );
         eprintln!(
-            "::warning title=Teleport e2e skipped::only {} host registered; \
-             teleport needs >=2. Set ENGRAM_INTEG_TWO_HOSTS=1 on the lane to \
-             exercise this.",
+            "::warning title=Evacuate e2e skipped::only {} host registered; \
+             teleport/evac relocation needs >=2. Set ENGRAM_INTEG_TWO_HOSTS=1 \
+             on the lane to exercise this.",
             hosts.len(),
         );
         return;
@@ -1702,34 +1356,38 @@ async fn e2e_two_host_teleport_preserves_sentinel() {
         write.stderr,
     );
 
-    // Pick a destination host that isn't the source, and teleport.
-    let dest = hosts
-        .iter()
-        .find(|h| **h != src)
-        .expect("a peer host distinct from the source");
-    driver.teleport(sid, dest).await;
+    // EvacuateSession: async-accept, then the scanner drives Evacuating →
+    // Created → Active on a peer.
+    let resp = driver
+        .evacuate(sid)
+        .await
+        .expect("EvacuateSession must succeed on an Active session");
+    assert_eq!(
+        resp.status, "evacuating",
+        "evacuate response status must be \"evacuating\"; got {resp:?}",
+    );
 
-    // The evac_resumer drives Evacuating → Created → Active on the pinned
-    // host. Generous deadline: first restore on the peer may cold-fetch
-    // chunks. 180s mirrors the cold-create budget.
+    // The evac_resumer drives Evacuating → Created → Active on the peer.
+    // Generous deadline: first restore on the peer may cold-fetch chunks.
+    // 180s mirrors the cold-create budget.
     assert!(
         driver
             .wait_for_status(sid, "active", Duration::from_secs(180))
             .await,
-        "session should be Active on the destination host after teleport; \
+        "session should be Active on a peer host after evacuation; \
          last status={}",
         driver.session_status(sid).await,
     );
 
-    // Landed on the pinned target, not the source.
+    // Left the source host. EvacuateSession picks any non-source peer, so we
+    // assert the move happened (session left A) — not which peer it landed on.
     let after = driver
         .session_host_id(sid)
         .await
         .expect("resumed session must have a bound host_id");
-    assert_ne!(after, src, "session must leave the source host");
-    assert_eq!(
-        after, *dest,
-        "session must land on the pinned teleport target",
+    assert_ne!(
+        after, src,
+        "session must leave the source host after evacuation",
     );
 
     // Disk data crossed the move byte-identical.
@@ -1743,7 +1401,7 @@ async fn e2e_two_host_teleport_preserves_sentinel() {
     assert_eq!(
         readback.stdout.trim(),
         sentinel,
-        "disk data lost across the host teleport",
+        "disk data lost across the host evacuation",
     );
 
     driver.delete(sid).await;
