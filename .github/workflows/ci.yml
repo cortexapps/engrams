@@ -955,6 +955,16 @@ jobs:
   # ------------------------------------------------------------------
   bake-harness-claude-artifact:
     name: bake harness-claude artifact
+    # Consumed only by test-e2e-stack (downloads the workflow artifact) and
+    # bake-demo-image (push-to-main / dispatch) — so gate it on the union of
+    # their conditions. No point building the harness when nothing consumes it
+    # (e.g. a docs- or chart-only PR). Mirrors artifacts-e2e-stack's gating.
+    needs: detect
+    if: >-
+      needs.detect.outputs.e2e == 'true'
+      || github.event_name == 'merge_group'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
