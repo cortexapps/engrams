@@ -24,6 +24,7 @@ enum Call {
         tag: String,
         dockerfile: PathBuf,
         build_args: Vec<(String, String)>,
+        build_secrets: Vec<String>,
     },
     Create {
         tag: String,
@@ -93,6 +94,7 @@ impl DockerRunner for RecordingDocker {
             tag: args.tag,
             dockerfile: args.dockerfile,
             build_args,
+            build_secrets: args.build_secrets,
         });
         if let Some(e) = g.inject_build_err.take() {
             return Err(e);
@@ -423,6 +425,41 @@ async fn build_passes_build_args_to_docker() {
                     ("BUILD_FLAVOR".to_string(), "release".to_string()),
                     ("LANG_VERSION".to_string(), "20".to_string()),
                 ],
+            );
+        }
+        other => panic!("expected Build call first, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn build_passes_build_secrets_to_docker() {
+    // `[build] build_secrets` must reach the docker runner so it can emit
+    // BuildKit `--secret id=,env=` — the leak-free way to feed a private
+    // registry token to the bake's prewarm (e.g. `pnpm install`).
+    let src = tempfile::tempdir().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    write_source_repo(
+        src.path(),
+        r#"
+            name = "cortex-api"
+            [build]
+            build_secrets = ["GH_PACKAGES_TOKEN", "BUF_TOKEN"]
+        "#,
+    );
+    let docker = RecordingDocker::new();
+    let (cs, _csdir) = test_chunk_store();
+    let builder = Builder::new(docker.clone(), cs);
+    builder
+        .build(&req(src.path(), images.path(), "cortex/api", "warm-1"))
+        .await
+        .unwrap();
+
+    let calls = docker.calls();
+    match &calls[0] {
+        Call::Build { build_secrets, .. } => {
+            assert_eq!(
+                build_secrets,
+                &vec!["GH_PACKAGES_TOKEN".to_string(), "BUF_TOKEN".to_string()],
             );
         }
         other => panic!("expected Build call first, got {other:?}"),
