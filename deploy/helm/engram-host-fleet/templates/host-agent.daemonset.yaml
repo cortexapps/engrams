@@ -139,6 +139,25 @@ spec:
                   name: {{ .Values.coordinator.tokenSecretName }}
                   key: {{ .Values.coordinator.tokenSecretKey }}
             {{- end }}
+            {{- if eq .Values.egress.caSource "env" }}
+            # Egress CA via env (same delivery as ENGRAM_COORDINATOR_TOKEN
+            # above): the host-agent is hostNetwork, so it CANNOT read Secret
+            # Manager directly (it bypasses Workload Identity → the node SA,
+            # whose token lacks the cloud-platform scope → 403). The CA is
+            # mirrored from Secret Manager into a K8s secret and injected here.
+            # The PEMs land in ENGRAM_EGRESS_CA_{CERT,KEY}_PEM — the var names
+            # the host-agent's `env` CA source reads by default.
+            - name: ENGRAM_EGRESS_CA_CERT_PEM
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "egress.caEnvSecret is required when egress.caSource == env" .Values.egress.caEnvSecret }}
+                  key: {{ .Values.egress.caEnvCertKey }}
+            - name: ENGRAM_EGRESS_CA_KEY_PEM
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.egress.caEnvSecret }}
+                  key: {{ .Values.egress.caEnvKeyKey }}
+            {{- end }}
             {{- with .Values.hostAgent.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

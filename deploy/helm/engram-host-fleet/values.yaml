@@ -89,14 +89,29 @@ egress:
   # was retired, silently leaving prod with unfiltered guest egress;
   # this section re-wires them.
   port: 8443
-  # Where the CA material loads from. Production: gcp-secret-manager
-  # (Workload Identity on the host-agent ServiceAccount). The two
-  # secret paths below point at the existing TF-managed secrets
-  # (module.engrams.egress_ca_cert_secret_name / ..._key_secret_name).
+  # Where the CA material loads from. One of:
+  #   env                 — read the PEMs from ENGRAM_EGRESS_CA_{CERT,KEY}_PEM,
+  #                         injected by the DaemonSet from caEnvSecret (the
+  #                         coord-token delivery pattern). RECOMMENDED on GKE:
+  #                         host-agents are hostNetwork and bypass Workload
+  #                         Identity, so the direct gcp-secret-manager read 403s
+  #                         (node SA token lacks the cloud-platform scope). A
+  #                         cluster component with proper WI (ESO) syncs the CA
+  #                         from Secret Manager into the K8s secret instead.
+  #   gcp-secret-manager  — host-agent reads Secret Manager directly via WI.
+  #                         Only works where WI is honoured (NOT hostNetwork).
+  #   local-disk          — auto-generate a per-host self-signed CA. NOT for a
+  #                         migrating fleet: a session teleported to another host
+  #                         would no longer trust that host's distinct CA.
   caSource: gcp-secret-manager
-  # Fully-qualified Secret Manager resource paths
-  # (projects/<p>/secrets/<name>/versions/latest). REQUIRED when
-  # caSource == gcp-secret-manager.
+  # caSource == env: the K8s secret holding the CA PEMs (mirrored from Secret
+  # Manager by a properly-scoped component), and the keys within it. The
+  # DaemonSet injects them as ENGRAM_EGRESS_CA_CERT_PEM / _KEY_PEM.
+  caEnvSecret: ""
+  caEnvCertKey: ENGRAM_EGRESS_CA_CERT_PEM
+  caEnvKeyKey: ENGRAM_EGRESS_CA_KEY_PEM
+  # caSource == gcp-secret-manager: fully-qualified Secret Manager resource
+  # paths (projects/<p>/secrets/<name>/versions/latest).
   caGcpCertSecret: ""
   caGcpKeySecret: ""
 
