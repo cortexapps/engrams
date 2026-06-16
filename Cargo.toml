@@ -153,7 +153,7 @@ http = "1"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
 # JWT / JWKS verification for the auth seam (ADR 0031): OIDC ID-token
 # validation and the forward-auth signed-assertion (GCP IAP etc.) path.
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # grpc
 tonic = "0.12"
