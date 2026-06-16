@@ -298,6 +298,32 @@ mod into_status_tests {
         );
     }
 
+    // Regression for the enable-image incident: a registry pull / OCI
+    // auth failure surfaces from `fetch_and_seal_manifest` as
+    // `ApiError::BadRequest(<human message>)`. `into_status` MUST keep
+    // that message in `Status::message()` (so it survives the
+    // orchestrator passthrough to the browser) AND pick a meaningful,
+    // non-`Internal` code — a bare `Internal` is what collapses to an
+    // opaque "[internal] HTTP 400" in the UI. `BadRequest` →
+    // `InvalidArgument` satisfies both.
+    #[test]
+    fn registry_pull_failure_preserves_message_and_is_not_internal() {
+        use tonic::Code;
+        let msg = "registry pull for `reg.example/x:tag` failed: OCI distribution \
+                   error: response status 401 Unauthorized: Not authorized. Check \
+                   that a matching registry credential exists.";
+        let st = into_status(ApiError::BadRequest(msg.to_string()));
+        assert_eq!(
+            st.code(),
+            Code::InvalidArgument,
+            "registry-pull failures must map to a meaningful code, not Internal"
+        );
+        assert_ne!(st.code(), Code::Internal);
+        // The human-readable message must survive verbatim — this is the
+        // text the operator needs to see in the UI.
+        assert_eq!(st.message(), msg);
+        assert!(st.message().contains("Not authorized"));
+    }
 }
 
 #[cfg(test)]
