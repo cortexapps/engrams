@@ -446,3 +446,77 @@ async fn cross_replica_scheduling_pins_and_tokens() {
         .expect("get after delete")
         .is_none());
 }
+
+/// Regression (ADR 0051 git-credential injection): the per-session
+/// git/upload broker token (ADR 0047, PG-backed) FKs to `sessions.id`, so it
+/// CANNOT be minted before the session row exists. The gRPC create path used
+/// to mint it inside `prepare_inner` while building the AgentSpec — BEFORE
+/// `create_session_created` committed the row — so the insert silently
+/// FK-failed (`get_or_mint_broker_token` swallows the error to `None`) and the
+/// guest got no `ENGRAM_FORGE_TOKEN`: git failed with "could not read
+/// Username" (prod session a8395112). The in-memory mock store in
+/// `grpc_app.rs` enforces no FK and so can't catch this — it's pinned here
+/// against real Postgres. The fix defers `inject_harness_env` to
+/// `boot_on_reserved_host`, after the row materializes.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn broker_token_insert_requires_session_row() {
+    let Ok(database_url) = std::env::var("ENGRAM_TEST_DATABASE_URL") else {
+        eprintln!("skipping: ENGRAM_TEST_DATABASE_URL not set");
+        return;
+    };
+    let store = engram_postgres::PostgresStore::connect(&database_url)
+        .await
+        .expect("connect postgres");
+    store.migrate().await.expect("migrate");
+    let meta: Arc<dyn MetadataStore> = Arc::new(store);
+
+    // A broker token for a session whose row doesn't exist yet.
+    let orphan = engram_core::types::SessionId::new();
+    let tok = engram_core::types::registry::SessionBrokerToken {
+        session_id: orphan,
+        wrapped_dek: vec![1],
+        nonce: vec![0; 12],
+        ciphertext: vec![2],
+        key_id: "k".into(),
+    };
+
+    // No session row → the FK rejects the insert. This is the error the
+    // coordinator USED to swallow into a silent no-op; the store must surface
+    // it (not return Ok) so the caller can't mistake "FK failed" for "minted".
+    let res = meta.insert_broker_token(tok.clone()).await;
+    assert!(
+        res.is_err(),
+        "broker token insert must FK-fail without a session row, got {res:?}",
+    );
+    assert!(
+        meta.get_broker_token(orphan).await.expect("get").is_none(),
+        "a FK-rejected insert must leave no row",
+    );
+
+    // Once the session row exists (the order `boot_on_reserved_host` now
+    // guarantees), the same insert succeeds and round-trips.
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "ha-listener-test:broker-fk".into(),
+            mode: engram_core::types::session::SessionMode::Agent,
+        })
+        .await
+        .expect("create session");
+    let inserted = meta
+        .insert_broker_token(engram_core::types::registry::SessionBrokerToken {
+            session_id,
+            ..tok
+        })
+        .await
+        .expect("insert after the session row exists");
+    assert!(inserted, "first writer wins once the FK target exists");
+    assert!(
+        meta.get_broker_token(session_id)
+            .await
+            .expect("get")
+            .is_some(),
+        "broker token persists once minted after the session row",
+    );
+    meta.delete_broker_token(session_id).await.expect("cleanup");
+}
