@@ -150,6 +150,34 @@ E2E_PATHS = [
 ]
 
 
+# ── PR test-lane gating (ci.yml + ci-macos-vz.yml) ─────────────────────
+# These gate the CI *test* lanes (not the bake lanes above) so a change only
+# runs the lanes it can affect. Protos live in the engram-protocol crate, so a
+# proto change is already in every Rust binary's closure (→ cc, host_binaries,
+# e2e); the explicit `proto` flag is for the NON-cargo lanes (web/orchestrator
+# codegen + buf). A change to a CI workflow file or this detector itself
+# (`CI_SELF_PATHS`) forces ALL test lanes — the definition of "what runs"
+# changed, so re-run everything.
+CI_SELF_PATHS = [".github/workflows/ci.yml",
+                 ".github/workflows/ci-macos-vz.yml",
+                 ".github/scripts/detect-rebake-lanes.py"]
+PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
+WEB_PATHS = ["web/"]
+ORCH_PATHS = ["orchestrator/"]
+# A lockfile/manifest/toolchain bump recompiles the whole workspace.
+RUST_COMMON = ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]
+
+# ── per-image bake selectivity ─────────────────────────────────────────
+# The container-image matrix used to rebake ALL 5 images on any images-lane
+# change. Compute per-image (release closure per binary + that image's own
+# Dockerfile/sources) so a change scoped to one image rebakes ONLY it —
+# helm-deploy resolves each image's deployable SHA independently from GHCR, so
+# an unbaked image just keeps its previous SHA. A change to the bake workflow
+# or this detector (BAKE_ALL_PATHS) re-bakes everything (the bake logic moved).
+BAKE_ALL_PATHS = [".github/workflows/bake-images.yml",
+                  ".github/scripts/detect-rebake-lanes.py"]
+
+
 def cargo_meta():
     return json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1"]))
 
@@ -273,6 +301,46 @@ def main():
     # needlessly (safe), so this errs toward running.
     e2e = bool(cc & e2e_closure) or any_path(changed, E2E_PATHS)
 
+    # ── PR test-lane gating ────────────────────────────────────────────
+    ci_self = any_path(changed, CI_SELF_PATHS)
+    proto = any_path(changed, PROTO_PATHS)
+    # lint + tests(linux) + the two macOS lanes build/test the whole workspace:
+    # any workspace crate (cc — protos included via engram-protocol), a
+    # lockfile/toolchain bump, or a CI-definition change.
+    test_rust = ci_self or bool(cc) or any_path(changed, RUST_COMMON)
+    # musl cross-compile of the FC host binaries — same closure as host_binaries.
+    test_cross = ci_self or host_binaries
+    # Firecracker integration lane — the e2e binary closure + its inputs.
+    test_fc = ci_self or e2e
+    # web / orchestrator: their own sources or the protos they codegen from.
+    test_web = ci_self or proto or any_path(changed, WEB_PATHS)
+    test_orchestrator = ci_self or proto or any_path(changed, ORCH_PATHS)
+    # buf only lints/breaking-checks/codegen-drifts the protos.
+    test_buf = ci_self or proto
+
+    # ── per-image bake selectivity ─────────────────────────────────────
+    bake_all = any_path(changed, BAKE_ALL_PATHS)
+    coord_closure = release_closure(meta, {"engram-coordinator"})
+    ha_closure = release_closure(meta, {"engram-host-agent", "engram-uffd-handler"})
+    hop_closure = release_closure(meta, {"engram-host-operator"})
+    image_flags = {
+        # Rust images: their release closure, own Dockerfile, or a lockfile bump
+        # (migrations bake into the coord image specifically).
+        "coordinator": bake_all or bool(cc & coord_closure)
+        or any_path(changed, ["docker/coordinator.Dockerfile", "deploy/migrations/", "Cargo.lock", "Cargo.toml"]),
+        "host-agent": bake_all or bool(cc & ha_closure)
+        or any_path(changed, ["docker/host-agent.Dockerfile", "Cargo.lock", "Cargo.toml"]),
+        "host-operator": bake_all or bool(cc & hop_closure)
+        or any_path(changed, ["docker/host-operator.Dockerfile", "Cargo.lock", "Cargo.toml"]),
+        # Bun images: own sources, own Dockerfile, or the protos they codegen.
+        "web": bake_all or proto or any_path(changed, ["web/", "docker/web.Dockerfile"]),
+        "orchestrator": bake_all or proto or any_path(changed, ["orchestrator/", "docker/orchestrator.Dockerfile"]),
+    }
+    # Stable matrix order; the bake job consumes this as `fromJSON`.
+    images_matrix = [name for name in
+                     ["coordinator", "host-agent", "host-operator", "web", "orchestrator"]
+                     if image_flags[name]]
+
     print(f"changed files: {len(changed)}", file=sys.stderr)
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
     print(f"-> images={images} host_binaries={host_binaries} "
@@ -280,20 +348,37 @@ def main():
           f"tf_or_helm={tf_or_helm} bundles={bundles} dev_image={dev_image} "
           f"fc_fork={fc_fork} e2e={e2e}",
           file=sys.stderr)
+    print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
+          f"test_web={test_web} test_orchestrator={test_orchestrator} "
+          f"test_buf={test_buf} ci_self={ci_self} proto={proto}",
+          file=sys.stderr)
+    print(f"-> images_matrix={images_matrix}", file=sys.stderr)
+
+    def b(v):
+        return 'true' if v else 'false'
 
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a") as f:
-            f.write(f"images={'true' if images else 'false'}\n")
-            f.write(f"host_binaries={'true' if host_binaries else 'false'}\n")
-            f.write(f"host_base={'true' if host_base else 'false'}\n")
-            f.write(f"host_image={'true' if host_image else 'false'}\n")
-            f.write(f"cli_tools={'true' if cli_tools else 'false'}\n")
-            f.write(f"tf_or_helm={'true' if tf_or_helm else 'false'}\n")
-            f.write(f"bundles={'true' if bundles else 'false'}\n")
-            f.write(f"dev_image={'true' if dev_image else 'false'}\n")
-            f.write(f"fc_fork={'true' if fc_fork else 'false'}\n")
-            f.write(f"e2e={'true' if e2e else 'false'}\n")
+            f.write(f"images={b(images)}\n")
+            f.write(f"host_binaries={b(host_binaries)}\n")
+            f.write(f"host_base={b(host_base)}\n")
+            f.write(f"host_image={b(host_image)}\n")
+            f.write(f"cli_tools={b(cli_tools)}\n")
+            f.write(f"tf_or_helm={b(tf_or_helm)}\n")
+            f.write(f"bundles={b(bundles)}\n")
+            f.write(f"dev_image={b(dev_image)}\n")
+            f.write(f"fc_fork={b(fc_fork)}\n")
+            f.write(f"e2e={b(e2e)}\n")
+            # PR test lanes (ci.yml + ci-macos-vz.yml gate on these).
+            f.write(f"test_rust={b(test_rust)}\n")
+            f.write(f"test_cross={b(test_cross)}\n")
+            f.write(f"test_fc={b(test_fc)}\n")
+            f.write(f"test_web={b(test_web)}\n")
+            f.write(f"test_orchestrator={b(test_orchestrator)}\n")
+            f.write(f"test_buf={b(test_buf)}\n")
+            # Per-image bake matrix (JSON array → fromJSON in bake-images.yml).
+            f.write(f"images_matrix={json.dumps(images_matrix)}\n")
 
 
 if __name__ == "__main__":

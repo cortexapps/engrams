@@ -23,11 +23,12 @@ metadata:
 spec:
   # Self-clean even if helm never runs hook-succeeded/hook-failed cleanup. When a
   # deploy is CANCELLED (rapid successive merges cancel in-flight deploys), the
-  # killed helm process leaves a completed migrate Job orphaned; the next deploy's
-  # --wait + before-hook-creation then blocks (up to --timeout, ~5m) waiting for
-  # that orphan's deletion before creating the new hook. ttlSecondsAfterFinished
-  # has the Job controller auto-GC this Job 60s after it finishes regardless of
-  # helm, so no orphan survives to stall the next deploy. DO NOT remove.
+  # killed helm process can leave the completed migrate Job orphaned; the Job
+  # controller auto-GCs it 60s after it finishes regardless of helm, so no orphan
+  # survives for the next deploy's before-hook-creation to trip over. (The
+  # migrate itself is now a fast `bun run migrate` — the drizzle-orm migrator,
+  # not a cold `bunx drizzle-kit` npm fetch — so this is ordinary Job GC, no
+  # longer guarding a multi-minute stall.) DO NOT remove.
   ttlSecondsAfterFinished: 60
   backoffLimit: {{ .Values.orchestrator.migrations.backoffLimit }}
   template:
@@ -56,7 +57,13 @@ spec:
             capabilities:
               drop: ["ALL"]
           workingDir: /app/orchestrator
-          command: ["bunx", "drizzle-kit", "migrate"]
+          # Programmatic drizzle-orm migrator (src/db/migrate.ts), NOT the
+          # `bunx drizzle-kit migrate` CLI: drizzle-kit is a devDependency the
+          # production image strips (`bun install --production`), so bunx would
+          # refetch it (+ esbuild) from npm on EVERY deploy, on this hook's
+          # critical path. `bun run migrate` uses the baked-in drizzle-orm + the
+          # ./drizzle SQL folder — seconds, no npm fetch.
+          command: ["bun", "run", "migrate"]
           env:
             - name: ORCHESTRATOR_DATABASE_URL
               valueFrom:
