@@ -182,8 +182,9 @@ function buildTask(
     source: unknown;
     createdAt: Date;
   },
-  sessionRefs: Array<{ sessionId: string; role: string | null }>,
+  sessionRefs: Array<{ sessionId: string; role: string | null; profileId: string | null }>,
   sessionMap: Map<string, Session>,
+  profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>,
 ): Task {
   // Derive status from the primary session's live state (if available).
   let status = row.status;
@@ -198,10 +199,12 @@ function buildTask(
 
   const sessions: TaskSessionRef[] = sessionRefs.map((ref) => {
     const liveSession = sessionMap.get(ref.sessionId);
+    const snap = ref.profileId != null ? profileMap.get(ref.profileId) : undefined;
     return {
       sessionId: ref.sessionId,
       ...(ref.role != null ? { role: ref.role } : {}),
       ...(liveSession != null ? { session: liveSession } : {}),
+      ...(snap != null ? { profile: snap } : {}),
     } as TaskSessionRef;
   });
 
@@ -241,6 +244,27 @@ function buildUnattributedTask(sess: Session): Task {
   } as Task;
 }
 
+/** Resolve { profileId } → snapshot for the given refs (one images call + one profile query). */
+async function buildProfileMap(
+  refs: Array<{ profileId: string | null }>,
+  profiles: ProfileStore,
+  imagesClient: ImagesClient,
+): Promise<Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>> {
+  const ids = [...new Set(refs.map((r) => r.profileId).filter((x): x is string => x != null))];
+  const out = new Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>();
+  if (ids.length === 0) return out;
+  const [rows, catalog] = await Promise.all([profiles.getByIds(ids), imagesClient.listEnabledImages({})]);
+  const uriById = new Map(catalog.images.map((i) => [i.id, i.imageUri]));
+  for (const p of rows) {
+    out.set(p.id, {
+      id: p.id, name: p.name, icon: p.icon,
+      archived: p.deletedAt != null,
+      imageUri: uriById.get(p.imageId) ?? "",
+    });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Core loader
 // ---------------------------------------------------------------------------
@@ -253,6 +277,8 @@ async function loadTask(
   taskId: string,
   db: Db,
   sessionsClient: SessionsClient,
+  profiles: ProfileStore,
+  imagesClient: ImagesClient,
 ): Promise<Task> {
   const db_ = db;
 
@@ -287,7 +313,8 @@ async function loadTask(
     }
   }
 
-  return buildTask(taskRow, sessionRefRows, sessionMap);
+  const profileMap = await buildProfileMap(sessionRefRows, profiles, imagesClient);
+  return buildTask(taskRow, sessionRefRows, sessionMap, profileMap);
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +435,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       }
 
       evictOwnerCacheEntry(created.sessionId);
-      const loaded = await loadTask(taskId, getDbFn(), sessionsClient);
+      const loaded = await loadTask(taskId, getDbFn(), sessionsClient, profiles, imagesClient);
       return { task: loaded };
     },
 
@@ -426,12 +453,18 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const sessionRefRows = await db.select().from(taskSessionTable);
 
       // Group session refs by taskId.
-      const refsByTaskId = new Map<string, Array<{ sessionId: string; role: string | null }>>();
+      const refsByTaskId = new Map<
+        string,
+        Array<{ sessionId: string; role: string | null; profileId: string | null }>
+      >();
       for (const ref of sessionRefRows) {
         const existing = refsByTaskId.get(ref.taskId) ?? [];
-        existing.push({ sessionId: ref.sessionId, role: ref.role });
+        existing.push({ sessionId: ref.sessionId, role: ref.role, profileId: ref.profileId });
         refsByTaskId.set(ref.taskId, existing);
       }
+
+      // Resolve profile snapshots once for all refs (one images call + one profile query).
+      const profileMap = await buildProfileMap(sessionRefRows, profiles, imagesClient);
 
       // Collect all known sessionIds from task_session table.
       const knownSessionIds = new Set(sessionRefRows.map((r) => r.sessionId));
@@ -466,7 +499,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           continue;
         }
         const refs = refsByTaskId.get(row.id) ?? [];
-        visibleTasks.push(buildTask(row, refs, sessionMap));
+        visibleTasks.push(buildTask(row, refs, sessionMap, profileMap));
       }
 
       // For admins: surface unattributed sessions as synthetic rows.
@@ -512,7 +545,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw new ConnectError("not found", Code.NotFound);
       }
 
-      const loaded = await loadTask(req.taskId, db, sessionsClient);
+      const loaded = await loadTask(req.taskId, db, sessionsClient, profiles, imagesClient);
       return { task: loaded };
     },
 

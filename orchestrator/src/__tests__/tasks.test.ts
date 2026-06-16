@@ -665,6 +665,16 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     expect(resp.task!.sessions[0]!.sessionId).toBe(sessionId);
   });
 
+  test.skipIf(!dbReachable)("GetTask response carries the profile snapshot", async () => {
+    const resp = await client.getTask({ taskId: createdTaskId });
+    const ref = resp.task!.sessions[0]!;
+    expect(ref.profile).toBeDefined();
+    expect(ref.profile!.id).toBe(PROFILE_ID);
+    expect(ref.profile!.name).toBe("CRUD");
+    expect(ref.profile!.archived).toBe(false);
+    expect(ref.profile!.imageUri).toBe("registry/img-1:latest");
+  });
+
   test.skipIf(!dbReachable)("ListTasks scoped: MEMBER_B sees only their own tasks (empty)", async () => {
     const srvB = await spawnServer({
       getSession: makeGetSession(MEMBER_B),
