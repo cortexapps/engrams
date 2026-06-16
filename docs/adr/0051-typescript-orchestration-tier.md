@@ -1,6 +1,15 @@
 # ADR 0051: A TypeScript orchestration tier — splitting the application layer from the control plane
 
-Status: 2026-06-05 — **Proposed.** No code yet.
+Status: 2026-06-16 — **Accepted**, implemented + prod-deployed. The stacked PR
+chain landed on `main`: the app-contract protos + buf pipeline (#288); the
+coordinator's additive app-gRPC surface + the `harness_env` create-time secret
+channel (#295); the orchestrator tier image + Helm (#297); the web cutover to
+the orchestrator (#296); gRPC reflection + end-to-end error surfacing (#311);
+and the destructive flip (#298) — the coordinator drops its web-facing REST,
+human-auth, and `users` identity model to become a gRPC-only control plane
+(migration `0067`). Prod runs the three-tier stack behind GCP IAP (web →
+orchestrator → coordinator app-gRPC); human authentication and authorization
+live entirely in the orchestrator. (Original status: 2026-06-05 — Proposed.)
 Renumbered: 2026-06-14 — was ADR 0039 in the original proposal (PR #122), which
 collided with the existing `0039-retire-rolling-memfile-all-sparse-checkpoints`.
 Renumbered to **0051** (next free after 0050) for the implementation stack; all
@@ -64,7 +73,8 @@ workflows land in TS where they belong.
                                • TASKS (the app aggregate root)     • the SESSION EVENT LOG
                                • human authn (better-auth)          • gRPC host fabric / ttyd
                                • authZ (CASL + roles)               • KEK/KMS, COW, scheduler
-                               • users + roles (better-auth admin)  • sealed secret store
+                               • users + roles (better-auth admin)  • per-session sealed secrets
+                               • user secrets (user_session_secrets)• (no per-user secret store)
                                • durable state (its own Postgres)   • NO user identity at all
                                • inbound webhooks        (future)   • auth: service bearer only
                                • durable workflows — DBOS (future)  • exposes: commands + streams
@@ -104,10 +114,12 @@ There are **two contracts**, and only one is new:
   (§3).
 - **Harness management** — *which* agent runs in a session is selected from the
   session's image; prompt routing, interrupt, the in-process harness hub.
-  Harness-token injection stays here mechanically, but is driven by an
-  **explicit sealed-secret reference** passed at `CreateSession` — the control
-  plane no longer resolves "the calling user's token" because it has no notion
-  of a calling user.
+  Harness-token injection stays here mechanically, but is driven by the
+  **`harness_env` map passed at `CreateSession`** (already-resolved env values
+  such as `CLAUDE_CODE_OAUTH_TOKEN`) — the control plane no longer resolves
+  "the calling user's token" because it has no notion of a calling user. It
+  folds those values into the session's KEK-sealed `session_secrets` and
+  replays them on resume.
 - **Sandbox / microVM orchestration** — scheduling, the gRPC host fabric
   (ADR 0013), sandbox create/destroy, exec, the `ProxyShell` tunnel.
 - **Durability** — snapshot / resume / idle eviction (ADR 0034), chunked
@@ -116,11 +128,15 @@ There are **two contracts**, and only one is new:
   `idx`, recovery epochs) and the PG LISTEN/NOTIFY fan-out. The orchestrator
   *consumes* it; it does not own it.
 - **Image enablement** — OCI pulls, enable jobs, manifest caching (ADR 0036).
-- **Registries & secrets** — KEK-sealed registry creds, secret resolution, and
-  a small **sealed secret store** keyed by opaque caller-supplied ids (the
-  recast home of the Claude-token storage: the orchestrator keys entries by
-  its user ids; the control plane seals under KEK and never interprets the
-  key). KEK/KMS never leaves Rust.
+- **Registries & per-session secrets** — KEK-sealed registry creds, and the
+  session's own **`session_secrets`**: the env values handed in via
+  `harness_env` at create time, KEK-sealed per session and replayed on resume.
+  KEK/KMS never leaves Rust. (The original draft put a *user-keyed sealed-secret
+  vault* here. In the implementation the durable per-user secret store — the
+  Claude token and the like — moved entirely **up to the orchestrator**'s
+  KEK-sealed `user_session_secrets` table, which resolves them into `harness_env`
+  at create time; the control plane keeps no per-user secret state, only the
+  per-session sealed copy it needs to boot and resume.)
 - **Fleet & storage** — hosts, capacity, drain/cordon, storage rollups, GC.
 - **Artifacts** — session file artifacts (ADR 0026).
 
@@ -198,17 +214,18 @@ the name must not collide with the host-facing `ProxyShell`):
 | `ListEnableJobs` / `GetEnableJob` / `RetryEnableJob` | `/enable-jobs*` |
 | `ListRegistries` / `AddRegistry` / `DeleteRegistry` | `/registries*` |
 
-**`SecretService`** (the sealed store — replaces the storage half of
-`/me/claude-token`):
-
-| RPC | Notes |
-|-----|-------|
-| `PutSecret(key, value)` | sealed under KEK; `key` is opaque (orchestrator uses its user ids) |
-| `HasSecret(key)` / `DeleteSecret(key)` | drives the Settings UX (`has_claude_token` equivalent) |
-
-On the secret path the orchestrator is an **opaque relay** — it forwards the
-raw token straight to `PutSecret` without logging or persisting it. The
-plaintext never becomes custody the orchestrator holds.
+**Secrets — no control-plane secret service.** The original draft put a sealed
+`SecretService` (`PutSecret`/`HasSecret`/`DeleteSecret`, opaque keys) on the
+control plane and made the orchestrator an opaque relay. The implementation
+moved the **durable per-user store up to the orchestrator**: its own KEK-sealed
+`user_session_secrets` table (keyed by `(user_id, env_var_name)`), which the
+Settings UX reads/writes directly (`has_claude_token` is now an orchestrator
+query). The control plane gains no secret RPC; instead `CreateSession` carries
+a **`harness_env` map** of already-resolved env values, which the coordinator
+seals per session into `session_secrets` and replays on resume. The Claude
+token never round-trips through a coordinator secret store — the orchestrator
+resolves it at create time and the control plane only ever holds the
+per-session sealed copy it needs to boot and resume.
 
 What is **not** in this contract: users, roles, `/me`, `/auth/*` — all fully
 orchestrator-owned (§5/§6). There is no `UserService`.
@@ -590,10 +607,12 @@ shared-table coupling. Separate logical DBs even when co-located.
   full-privilege at the control plane. Keep the control plane network-private;
   keep the policy file small and tested; fail closed in the passthrough gate.
 - **Control plane changes:** expose the tonic app contract (§2.3) +
-  `ShellRelayService` + the sealed `SecretService`; authenticate via
+  `ShellRelayService`, with `CreateSession` carrying the `harness_env` secret
+  channel (sealed per session into `session_secrets`); authenticate via
   `ServiceBearer` only; **remove** `CookieSession`, `/auth/*` OIDC,
   `SyntheticAdmin`, `require_admin`/`require_session_owner`, the `users`
-  table, and `sessions.user_id`. The host-facing surface is untouched.
+  table, `sessions.user_id`, and the per-user secret store (now the
+  orchestrator's `user_session_secrets`). The host-facing surface is untouched.
 - **Web changes:** replace `api.ts`/`types.ts`/hand-parsed `sse.ts` with
   generated connect-es + connect-query clients; the primary list becomes
   tasks; login/Members move to better-auth(+admin plugin) UIs; the ability
