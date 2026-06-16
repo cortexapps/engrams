@@ -3,6 +3,7 @@ syntax = "proto3";
 package engram.app.v1;
 
 import "engram/app/v1/session.proto";
+import "engram/app/v1/profile.proto";
 
 // The application aggregate root (ADR 0051 §3, rev 2026-06-10).
 // ORCHESTRATOR-NATIVE: the
@@ -29,9 +30,17 @@ message CreateTaskRequest {
   // "chat" is the only accepted value for now;
   // linear_issue/dependabot/incident later.
   string type = 1;
-  string image_uri = 2;
+  // ADR 0052: sessions now start from a profile, not a raw image. The image
+  // is resolved server-side from the profile's image_id.
+  reserved 2;
+  reserved "image_uri";
+  // The user's task (no longer ever an admin-configured value; profiles carry
+  // no prompt — ADR §5).
   optional string prompt = 3;
   optional string title = 4;
+  // The profile the user picked (ADR §5). Required in practice; the handler
+  // rejects an empty/unknown/archived id.
+  string profile_id = 5;
 }
 
 message CreateTaskResponse {
@@ -63,6 +72,9 @@ message TaskSessionRef {
   // `optional` on a message-typed field is redundant but kept to make
   // the unset case explicit.
   optional Session session = 3;
+  // ADR 0052: resolved profile identity for the session's originating profile,
+  // for the app-wide chip (§9). Unset for legacy / profile-less sessions.
+  optional ProfileSnapshot profile = 4;
 }
 
 message ListTasksRequest {}

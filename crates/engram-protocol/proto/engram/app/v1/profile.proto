@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// Session profiles (ADR 0052) — admin-curated session starting points.
+// ORCHESTRATOR-NATIVE: the control plane neither implements nor knows about
+// profiles. This file lives in the app package so web gets one uniform
+// generated API, and it is deliberately ABSENT from crates/engram-protocol/
+// build.rs (never compiled into Rust), exactly like task.proto.
+service ProfileService {
+  // active only by default; include_archived is admin-only (ADR §4/§6).
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
+  rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
+  rpc CreateProfile(CreateProfileRequest) returns (CreateProfileResponse);
+  rpc UpdateProfile(UpdateProfileRequest) returns (UpdateProfileResponse);
+  // Soft delete — sets deleted_at (ADR §4).
+  rpc DeleteProfile(DeleteProfileRequest) returns (DeleteProfileResponse);
+}
+
+// An admin-curated bundle of session-launch inputs (ADR §1).
+message Profile {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  // A lucide-react icon name (ADR §1; the web app's icon set).
+  string icon = 4;
+  // Logical ref to the coordinator's enabled_images.id (ADR §3) — NOT a wire
+  // FK. Resolved to the live image_uri at session-create / read time.
+  string image_id = 5;
+  // Capability grant: inject the user's Claude token (ADR §5).
+  bool include_user_tokens = 6;
+  // Admin-only environment ({KEY: VALUE}); the model lives here. OMITTED
+  // (empty) for non-admin callers (ADR §6).
+  map<string, string> env_vars = 7;
+  // deleted_at IS NOT NULL (ADR §4). Archived profiles are admin-visible only.
+  bool archived = 8;
+  // ISO-8601.
+  string created_at = 9;
+  // ISO-8601.
+  string updated_at = 10;
+}
+
+// Lightweight resolved identity embedded on TaskSessionRef for the chip
+// (ADR §9). image_uri is resolved from image_id at read time.
+message ProfileSnapshot {
+  string id = 1;
+  string name = 2;
+  string icon = 3;
+  bool archived = 4;
+  string image_uri = 5;
+}
+
+message ListProfilesRequest {
+  // Admin-only; silently ignored (treated as false) for non-admin callers.
+  bool include_archived = 1;
+}
+
+message ListProfilesResponse {
+  repeated Profile profiles = 1;
+}
+
+message GetProfileRequest {
+  string id = 1;
+}
+
+message GetProfileResponse {
+  Profile profile = 1;
+}
+
+message CreateProfileRequest {
+  string name = 1;
+  string description = 2;
+  string icon = 3;
+  string image_id = 4;
+  bool include_user_tokens = 5;
+  map<string, string> env_vars = 6;
+}
+
+message CreateProfileResponse {
+  Profile profile = 1;
+}
+
+message UpdateProfileRequest {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string icon = 4;
+  string image_id = 5;
+  bool include_user_tokens = 6;
+  map<string, string> env_vars = 7;
+}
+
+message UpdateProfileResponse {
+  Profile profile = 1;
+}
+
+message DeleteProfileRequest {
+  string id = 1;
+}
+
+message DeleteProfileResponse {}
