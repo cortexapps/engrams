@@ -275,6 +275,7 @@ impl HostClient for FakeCaptureHost {
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
+        _warm: Option<engram_core::types::image::WarmConfig>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
         Ok(SnapshotMetadata {

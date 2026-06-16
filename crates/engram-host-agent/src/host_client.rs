@@ -25,6 +25,7 @@ use engram_core::error::SandboxError;
 use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend};
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
+use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::{SandboxId, SessionId};
@@ -180,8 +181,9 @@ impl HostClient for LocalHostClient {
     async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
+        warm: Option<WarmConfig>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        self.sandbox.build_base_snapshot(spec).await
+        self.sandbox.build_base_snapshot(spec, warm).await
     }
 
     async fn restore_base_for_session(

@@ -431,12 +431,20 @@ pub(crate) async fn capture_and_record_base_snapshot(
         host_id = %host_id,
         "capturing base snapshot for image enable",
     );
-    let meta = host.build_base_snapshot(spec).await.map_err(|e| {
-        ApiError::Internal(format!(
-            "base snapshot capture for `{}` failed on host {host_id}: {e}",
-            row.image_uri
-        ))
-    })?;
+    // Thread the image's optional `[warm]` hook into capture: the host
+    // runs it in the live VM before the snapshot freezes, so a warmed
+    // process (e.g. a gradle daemon) is captured into the base snapshot.
+    // A warm failure is fail-loud — it surfaces here as a capture error
+    // and aborts the enable.
+    let meta = host
+        .build_base_snapshot(spec, manifest.warm.clone())
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "base snapshot capture for `{}` failed on host {host_id}: {e}",
+                row.image_uri
+            ))
+        })?;
 
     // A base snapshot is only useful if its chunked manifests are
     // durable in BlobStorage — verify before recording, so an

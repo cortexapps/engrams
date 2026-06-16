@@ -572,6 +572,23 @@ Do **not** batch phases.
   from chunked `memory.bin` (GCS, intra-VPC), off the create path; still gate
   "host ready for scheduling" on `image_prefetch` completion.
 
+## Addendum: capture-time `[warm]` hook (2026-06-16)
+
+The base-snapshot capture (`build_base_snapshot`: boot → agentd-ready →
+`snapshot`) gained an optional, general **warm hook**. An image's
+`engram.toml` may declare `[warm] command = [...]`; capture runs it (via the
+existing `exec`) in the live VM **after** agentd-ready and **before** the
+memory snapshot freezes, so any process the command leaves running (e.g. a
+`gradle --daemon`) is captured into the base snapshot and is already alive in
+every restored session — the same "warm process in the base snapshot" idea as
+ADR 0021's warm harness, but for **session-agnostic** processes (no
+per-session late-bind, so no restore-side wiring). Fail-loud: a non-zero exit
+or timeout aborts the capture (and the enable). Threaded as an
+`Option<WarmConfig>` parameter on `build_base_snapshot` (not a `SandboxSpec`
+field — it's capture-only). See `engram_core::types::image::WarmConfig` and
+`PooledBackend::run_warm_hook`; first consumer is the `dev-brain` image
+(warming the brain-backend Gradle daemon).
+
 ## References
 
 - ADR 0019 (cold-boot measurement; the trace breakdown this builds on)
