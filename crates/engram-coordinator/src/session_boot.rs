@@ -42,10 +42,17 @@ pub(crate) struct BootInputs {
     /// resolved secrets + `ENGRAM_SESSION_ID`). Also the placeholder
     /// source for the egress policy.
     pub spec_env: HashMap<String, String>,
-    /// The resolved harness to spawn, with its per-spawn forge token
-    /// already injected. `None` for dev-VM / harness-less images — a
-    /// readiness-probe `AgentSpec` is synthesized from `session_env`.
+    /// The resolved harness to spawn. `None` for dev-VM / harness-less
+    /// images — a readiness-probe `AgentSpec` is synthesized from
+    /// `session_env`. The per-spawn forge/upload broker tokens are NOT
+    /// injected here: their PG rows FK to `sessions.id`, which doesn't
+    /// exist until `create_session_created` runs in `boot_on_reserved_host`,
+    /// so the injection is deferred to there (after the row materializes).
     pub agent: Option<AgentSpec>,
+    /// The image's `[git]` block, if any — carried so the deferred
+    /// broker-token injection (after the session row exists) can stamp the
+    /// forge owner. `None` for non-git images.
+    pub git: Option<engram_core::types::image::GitConfig>,
     /// The durable session env agentd applies to harness, `/exec`, and
     /// the shell. Used to synthesize the readiness-probe agent when
     /// `agent` is `None`.
@@ -110,7 +117,8 @@ pub(crate) async fn boot_on_reserved_host(
         spec,
         base_snapshot_id,
         spec_env,
-        agent,
+        mut agent,
+        git,
         session_env,
         secret_bundle,
         network,
@@ -197,6 +205,18 @@ pub(crate) async fn boot_on_reserved_host(
                 "session secrets persistence failed; resume will lose secrets",
             );
         }
+    }
+
+    // Inject the per-spawn forge/upload broker tokens NOW the session row
+    // exists. These mint a `session_broker_tokens` row that FKs to
+    // `sessions.id`, so doing it any earlier (e.g. while `prepare_inner`
+    // builds the AgentSpec, before the row is committed) fails the FK and is
+    // silently swallowed to a no-op — which is exactly how git credential
+    // injection broke on the gRPC create path (ADR 0051 + the ADR 0047
+    // PG-backed broker tokens). Mirrors the secret-persistence above: same
+    // row, same FK, same "after create_session_created" placement.
+    if let Some(a) = agent.as_mut() {
+        crate::api::sessions::inject_harness_env(state, session_id, git.as_ref(), &mut a.env).await;
     }
 
     // ADR 0047: the session→sandbox binding is persisted by

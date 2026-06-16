@@ -923,7 +923,14 @@ async fn prepare_inner(
         Some(deferred_map)
     };
 
-    let mut agent = resolve_harness(
+    // The forge/upload broker-token injection is NOT done here: it mints a
+    // `session_broker_tokens` row that FKs to `sessions.id`, which doesn't
+    // exist until `create_session_created` runs in `boot_on_reserved_host`.
+    // Doing it now (before the row) fails the FK and is silently swallowed —
+    // the git-credential-injection regression on the gRPC create path. The
+    // git config rides `BootInputs` so the deferred injection can stamp the
+    // forge owner once the row is live.
+    let agent = resolve_harness(
         state,
         manifest.harness.as_ref(),
         mode,
@@ -932,9 +939,6 @@ async fn prepare_inner(
         session_env.clone(),
         manifest.workdir.clone(),
     )?;
-    if let Some(a) = agent.as_mut() {
-        inject_harness_env(state, session_id, manifest.git.as_ref(), &mut a.env).await;
-    }
 
     let network = manifest.network.clone();
 
@@ -955,6 +959,7 @@ async fn prepare_inner(
             base_snapshot_id,
             spec_env,
             agent,
+            git: manifest.git.clone(),
             session_env,
             secret_bundle,
             network,
@@ -1327,6 +1332,14 @@ pub(crate) async fn inject_forge_env(
         return;
     };
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {
+        // A forge-bound image with no broker token means the in-guest
+        // gitconfig gets no credential helper and every git op fails with
+        // "could not read Username". This used to be silent (the mint FK-failed
+        // before the session row existed); it must never be quiet again.
+        tracing::error!(
+            %session_id,
+            "forge-bound session got no broker token; git credentials will be UNAVAILABLE in-guest",
+        );
         return;
     };
     env.insert("ENGRAM_FORGE_TOKEN".into(), token);
