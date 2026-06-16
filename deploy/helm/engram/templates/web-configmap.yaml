@@ -31,7 +31,13 @@ data:
     # here; the orchestrator owns auth (better-auth + the IAP bridge) and
     # holds the coordinator CONTROL_PLANE_BEARER server-side.
     upstream engram_backend {
-      server {{ include "engram.orchestrator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.orchestrator.containerPort }};
+      # The orchestrator SERVICE port (.service.port, default 80), NOT its
+      # containerPort (8787): nginx dials the ClusterIP, which listens on the
+      # service port and forwards to the pod's targetPort. Using containerPort
+      # here black-holes every /api + /rpc request (the service isn't listening
+      # on 8787) → the web spins on "authenticating…" then "cannot reach the
+      # coordinator". Matches the coordinator upstream below (.Values.service.port).
+      server {{ include "engram.orchestrator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.orchestrator.service.port }};
     }
     {{- else }}
     upstream engram_backend {
