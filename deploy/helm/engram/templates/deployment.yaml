@@ -153,10 +153,6 @@ spec:
             - name: ENGRAM_AUTH_MODE
               value: {{ .Values.auth.mode | quote }}
             {{- end }}
-            {{- if .Values.auth.bootstrapAdmins }}
-            - name: ENGRAM_BOOTSTRAP_ADMINS
-              value: {{ join "," .Values.auth.bootstrapAdmins | quote }}
-            {{- end }}
             {{- if .Values.auth.cookieSecure }}
             - name: ENGRAM_COOKIE_SECURE
               value: "true"

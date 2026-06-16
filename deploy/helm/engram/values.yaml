@@ -74,15 +74,18 @@ database:
 #   forward-auth → trust a signed JWT from an edge proxy (GCP IAP / Cloudflare
 #                  Access / oauth2-proxy); set `forwardAuth.*`
 #
-# `bootstrapAdmins` are promoted to admin on first login. NOTE: when humans use
-# forward-auth/OIDC, the web pod must NOT stamp a bearer onto browser requests
-# (set web.coordinatorToken.existingSecret: "") — otherwise the service-bearer
-# verifier short-circuits and every user resolves to the admin service principal.
+# NOTE: when humans use forward-auth/OIDC, the web pod must NOT stamp a bearer
+# onto browser requests (set web.coordinatorToken.existingSecret: "") — otherwise
+# the service-bearer verifier short-circuits and every user resolves to the admin
+# service principal.
+#
+# Bootstrap admins moved to the orchestrator post-ADR-0051: human auth lives in
+# the Bun/Hono tier now, so the designated-admin allowlist is
+# `orchestrator.auth.adminEmails` → ORCHESTRATOR_ADMIN_EMAILS, not the coord.
 auth:
   existingSecret: ""
   secretKey: ENGRAM_AUTH_TOKENS
   mode: ""
-  bootstrapAdmins: []
   # Set true in HTTPS prod (only affects the OIDC session cookie; inert in
   # forward-auth, which mints no cookie).
   cookieSecure: false
