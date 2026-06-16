@@ -31,6 +31,7 @@ import type { ConnectRouter, Transport } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 
 import { Hono } from "hono";
+import { abilityFor } from "../authz/ability.ts";
 import { buildServer } from "../server.ts";
 import { registerPassthrough } from "../rpc/passthrough.ts";
 import type { GetSession, ResolveOwner } from "../rpc/passthrough.ts";
@@ -390,5 +391,22 @@ describe("authz.matrix — fail-closed: no POLICY entry → PermissionDenied (ze
       (POLICY as Record<string, any>)[KEY] = saved;
       await orch.close();
     }
+  });
+});
+
+describe("Profile subject (ADR 0052)", () => {
+  test("member can read Profile but not manage", () => {
+    const a = abilityFor({ id: "m", role: "user" });
+    expect(a.can("read", "Profile")).toBe(true);
+    expect(a.can("manage", "Profile")).toBe(false);
+    expect(a.can("create", "Profile")).toBe(false);
+    expect(a.can("delete", "Profile")).toBe(false);
+  });
+  test("admin can manage Profile", () => {
+    const a = abilityFor({ id: "x", role: "admin" });
+    expect(a.can("read", "Profile")).toBe(true);
+    expect(a.can("manage", "Profile")).toBe(true);
+    expect(a.can("create", "Profile")).toBe(true);
+    expect(a.can("delete", "Profile")).toBe(true);
   });
 });

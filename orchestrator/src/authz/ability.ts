@@ -32,6 +32,7 @@ export type Subjects =
   | "Task"
   | "Session"
   | "EnabledImage"
+  | "Profile"
   | "Fleet"
   | "Registry"
   | "all";
@@ -74,6 +75,10 @@ export function abilityFor(user: AbilityUser): AppAbility {
 
   // Image catalog is readable by anyone.
   can("read", "EnabledImage");
+
+  // Profiles: the menu every member picks from is readable; mutations are
+  // admin-only (covered by manage("all") below). ADR 0052 §6.
+  can("read", "Profile");
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");
