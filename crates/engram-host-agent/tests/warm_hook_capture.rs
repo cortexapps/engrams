@@ -41,9 +41,10 @@ use engram_sandbox_firecracker::{
 };
 use futures::StreamExt;
 
-/// Marker the warm command leaves running; `pgrep -f` must find it in the
-/// restored session. A distinctive sleep duration so it can't collide with
-/// anything else in the guest.
+/// The long-lived process the warm command leaves running (a
+/// gradle-daemon stand-in). A distinctive sleep duration so nothing else
+/// in the guest collides. We track it by PID (recorded to a file), not by
+/// name — `debian:bookworm-slim` has no `procps`/`pgrep`.
 const WARM_SENTINEL: &str = "sleep 2147480";
 
 #[tokio::test]
@@ -53,16 +54,19 @@ async fn warm_hook_process_survives_base_snapshot() {
     let pooled = env.pooled();
     let rootfs = env.bake("engram-warm-hook-test").await;
 
-    // The warm command detaches a long-lived process (the gradle-daemon
-    // stand-in) into its own session so it outlives the exec process group,
-    // then writes a marker and exits 0. This is exactly the shape a real
-    // warm hook takes (`gradle --daemon` self-detaches the same way).
+    // The warm command backgrounds a long-lived process, records its PID +
+    // a marker, and exits 0. `nohup` keeps it alive after the exec's shell
+    // exits (it's reparented to init, not killed — agentd's exec only
+    // SIGKILLs the direct child via kill_on_drop). This is the shape a real
+    // warm hook takes (`gradle --daemon` likewise outlives the launching
+    // shell).
     let warm = WarmConfig {
         command: vec![
             "/bin/sh".into(),
             "-c".into(),
             format!(
-                "setsid sh -c 'exec {WARM_SENTINEL}' </dev/null >/dev/null 2>&1 & \
+                "nohup {WARM_SENTINEL} </dev/null >/dev/null 2>&1 & \
+                 echo $! > /dev/shm/engram-warm-pid && \
                  echo warmed > /dev/shm/engram-warm-marker"
             ),
         ],
@@ -82,15 +86,19 @@ async fn warm_hook_process_survives_base_snapshot() {
         .await
         .expect("restore from warm base snapshot");
 
-    let pids = exec(
+    // The snapshot froze the guest's process table, so the warmed PID is
+    // still valid after restore. Assert it's alive via /proc (no procps in
+    // the slim rootfs). `kill -0` is a shell builtin and needs no procps.
+    let alive = exec(
         &pooled,
         restored,
-        &format!("pgrep -f '{WARM_SENTINEL}' || echo MISSING"),
+        "PID=$(cat /dev/shm/engram-warm-pid 2>/dev/null); \
+         if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null; then echo ALIVE; else echo MISSING; fi",
     )
     .await;
     assert!(
-        pids.trim() != "MISSING" && !pids.trim().is_empty(),
-        "the warm process must be alive in the restored session, got {pids:?}"
+        alive.contains("ALIVE"),
+        "the warm process must be alive in the restored session, got {alive:?}"
     );
     let marker = exec(&pooled, restored, "cat /dev/shm/engram-warm-marker").await;
     assert_eq!(
