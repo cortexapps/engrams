@@ -38,7 +38,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod adapter {
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitCode, ExitStatus, Stdio};
     use std::sync::{Arc, Mutex};
@@ -434,6 +434,13 @@ mod adapter {
             });
         }
 
+        // ADR 0052: prompt_ids we've already accepted (started or queued).
+        // The host re-delivers un-confirmed prompts on every reattach
+        // (command-side at-least-once); this dedupes a replay of one we
+        // already have so it can't double-run. Owned here so it survives a
+        // claude respawn (a re-delivery racing the respawn is still caught).
+        let mut seen_prompt_ids: HashSet<String> = HashSet::new();
+
         // Bounded fast-crash backoff: a `claude` that dies within
         // FAST_CRASH_WINDOW of spawning is "failing to start" — back off
         // (capped) and, after MAX_FAST_CRASHES in a row, give up rather
@@ -447,7 +454,16 @@ mod adapter {
 
         loop {
             let spawned_at = Instant::now();
-            match run_claude_session(&cli, &mut cmd_rx, &reattach, &evt_tx, &mut pending).await {
+            match run_claude_session(
+                &cli,
+                &mut cmd_rx,
+                &reattach,
+                &evt_tx,
+                &mut pending,
+                &mut seen_prompt_ids,
+            )
+            .await
+            {
                 // Clean shutdown, or all command senders gone (the
                 // connection loop exited = process teardown).
                 SessionOutcome::Shutdown | SessionOutcome::ChannelClosed => {
@@ -693,6 +709,7 @@ mod adapter {
         reattach: &Arc<Notify>,
         evt_tx: &mpsc::Sender<HarnessEvent>,
         pending: &mut VecDeque<QueuedPrompt>,
+        seen_prompt_ids: &mut HashSet<String>,
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
         let argv = build_claude_argv(&resume_id);
@@ -891,7 +908,13 @@ mod adapter {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(HarnessCommand::Prompt { prompt_id, text }) => {
-                            if turn.is_none() {
+                            if !seen_prompt_ids.insert(prompt_id.clone()) {
+                                // ADR 0052: a host replay (command-side
+                                // at-least-once) of a prompt we already
+                                // started or queued — ignore so it can't
+                                // double-run.
+                                tracing::debug!(%prompt_id, "duplicate prompt (replay); ignoring");
+                            } else if turn.is_none() {
                                 // Idle: start the run immediately.
                                 if let Some(s) = stdin.as_mut() {
                                     turn = Some(
@@ -1712,6 +1735,79 @@ mod adapter {
             tokio::time::timeout(Duration::from_secs(5), engine)
                 .await
                 .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+        }
+
+        // ADR 0052: the host re-delivers un-confirmed prompts on every
+        // reattach (command-side at-least-once, the twin of the `held`
+        // event slot). A replay of a prompt the harness already accepted
+        // must be a no-op — never a second run — so the engine dedupes on
+        // prompt_id.
+        #[tokio::test]
+        async fn duplicate_prompt_replay_is_ignored() {
+            let script = write_persistent_fake_claude(&[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false}"#,
+            ])
+            .await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                None, // no initial prompt → starts Idle
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // p1 runs to completion.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "hi".into(),
+                })
+                .await
+                .unwrap();
+            let (_r1, pid1) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(pid1.as_deref(), Some("p1"));
+            expect_agent_message(&mut evt_rx, "ok").await;
+            let _ = expect_run_completed(&mut evt_rx).await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // Replay p1 (a duplicate from the host's at-least-once path),
+            // then send a fresh p2. The duplicate must NOT start a run — the
+            // next RunStarted we observe must be p2's, proving p1 was deduped.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "hi".into(),
+                })
+                .await
+                .unwrap();
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p2".into(),
+                    text: "yo".into(),
+                })
+                .await
+                .unwrap();
+            let (_r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(
+                pid2.as_deref(),
+                Some("p2"),
+                "the duplicate p1 must be ignored; the next run is p2",
+            );
+
+            // Closing the command channel ends the engine cleanly.
+            drop(cmd_tx);
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit when the command channel closes")
                 .expect("engine task should not panic");
             let _ = tokio::fs::remove_file(&script).await;
         }
