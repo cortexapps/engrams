@@ -244,6 +244,51 @@ pipe survives a UFFD restore before Track C relies on it.
     volume reasonable for v1; revisit if a long turn lags the 256-slot bus) and a
     per-chunk `at` ordering guarantee (the durable message corrects any reorder).
 
+- **2026-06-17 — Phase 3 IMPLEMENTED: `control_request` interrupt** (this PR,
+  stacked on Phase 1c). Replaces the Phase-1 stopgap interrupt — *SIGINT the whole
+  persistent process, then respawn `--resume`* — with claude's **in-band
+  `control_request`** on the held-open stdin: claude acks (`control_response`),
+  aborts the in-flight turn (surfacing as `result subtype=error_during_execution`),
+  and **stays alive**. The engine's `result` handler already had the receiving
+  branch (interrupted_run → `RunInterrupted`, process alive); Phase 3 just flips the
+  `Interrupt` command from `sigint_child` to `write_control_interrupt` + arms a
+  grace deadline.
+
+  **This is the root-cause fix for the prod interrupt bug** (session `ba3ae8d5`):
+  interrupting *with a queued message* SIGINT-killed the persistent claude, the
+  engine respawned `--resume`, and the queued message was written into that
+  freshly-respawned process — which (a) had lost conversation context ("There's no
+  prior context in this conversation") because SIGINT-mid-turn kills claude before
+  it flushes its transcript, and (b) exited immediately, which the harness — with
+  its `interrupted_run` marker reset by the respawn — misread as an abnormal crash
+  (`RunCompleted{ok:false}` → the user's "An error occurred"). With `control_request`
+  there is no teardown and no respawn: context is preserved (it never leaves
+  claude's live memory) and the queued message runs as a clean next turn on the
+  same process (`RunInterrupted` → consume-on-result → `RunStarted{prompt_id}`). The
+  consume-on-result boundary already auto-runs a queued message after a turn ends,
+  so "interrupt auto-sends the queued message" is preserved — but now cleanly.
+
+  **Reliability — SIGINT demoted to a fallback, an interrupt can never wedge.** If
+  the control frame can't be written, or isn't honored within `INTERRUPT_GRACE_SECS`
+  (= 8s; a pinned build lacking the frame), the sleeper escalates to SIGINT +
+  respawn — the old path, now a safety net rather than the default. Empirically
+  grounded: Phase 0 confirmed on the baked `claude` 2.1.179 that the
+  `control_request` interrupt acks, aborts (`error_during_execution`), and the
+  process survives to process the next message.
+
+  Crash recovery (the other half of the plan's Phase 3) was already in place from
+  Phase 1 — unexpected EOF mid-turn ⇒ `describe_abnormal_exit` System message +
+  terminal `RunCompleted{ok:false}` + auto-respawn `--resume` with a bounded
+  fast-crash counter — so Phase 3 adds only the interrupt mechanism. No wire / coord
+  / web change: `RunInterrupted` already exists and the interrupt RPC path is wired
+  end-to-end (the Phase-1c composer's Esc → `Interrupt`). Pinned by two engine tests
+  using a control-frame-aware fake claude that records its PID: a bare interrupt
+  aborts with **no respawn** (PID unchanged), and interrupt-with-a-queued-message
+  steers onto the **same** process (`RunInterrupted` → `RunStarted{p2}`, PID
+  unchanged, no crash artifact) — a direct `ba3ae8d5` regression guard.
+  - *Retires:* the SIGINT-vs-persistent-process hazard ([[project_adr0030_operator_interrupt]])
+    on the normal path — no signal racing FC suspend/resume.
+
 ## Prior art
 
 Respawn-with-resume for idle is the norm (OpenHands cold-loads `base_state.json`
