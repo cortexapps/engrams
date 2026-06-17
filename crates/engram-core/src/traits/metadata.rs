@@ -1107,23 +1107,33 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// Record a pipeline failure: bump `attempts`, store `error`,
-    /// release the claim (so any pod's next tick can retry), keep
-    /// the current state. Returns the post-bump attempt count — the
-    /// scanner flips to `failed` once it exceeds the budget.
+    /// Record a pipeline failure in ONE atomic, fenced write: bump
+    /// `attempts`, store `error`, release the claim (so any pod's next
+    /// tick can retry), and flip to `failed` iff the retry budget is
+    /// spent (`attempts + 1 >= max_attempts`) OR `force_terminal` is set
+    /// (a deterministic, non-retryable failure — e.g. a `[warm]` hook
+    /// that exits non-zero; retrying just re-loads the image for nothing).
+    /// Returns the post-bump attempt count and the RESULTING state.
+    ///
+    /// The flip MUST happen here, not in a follow-up `set_enable_job_state`:
+    /// this call releases the claim (`claimed_by → NULL`), so a separate
+    /// fenced state write would fence-miss (`claimed_by` no longer matches)
+    /// and silently fail — leaving the job non-terminal forever, re-claimed
+    /// and re-failed every tick (the runaway-attempts bug).
     ///
     /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
-    /// A stale pod's transient error must not clear the new
-    /// claimant's lease or stamp `error` on a job that pod is
-    /// actively completing. Returns [`MetaError::Conflict`] when the
-    /// lease has moved on.
+    /// A stale pod's transient error must not clear the new claimant's
+    /// lease or stamp `error` on a job that pod is actively completing.
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
     async fn record_enable_job_failure(
         &self,
         id: uuid::Uuid,
         claimant: &str,
         error: &str,
-    ) -> Result<u32, MetaError> {
-        let _ = (id, claimant, error);
+        max_attempts: u32,
+        force_terminal: bool,
+    ) -> Result<(u32, EnableJobState), MetaError> {
+        let _ = (id, claimant, error, max_attempts, force_terminal);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))

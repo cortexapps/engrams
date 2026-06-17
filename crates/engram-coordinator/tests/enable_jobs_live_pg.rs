@@ -169,25 +169,91 @@ async fn progress_state_failure_and_retry_round_trip() {
 
     // Failures bump attempts and store the error. A failure RELEASES
     // the claim (claimed_by → NULL), so re-claim before the next one —
-    // exactly what the scanner's next tick does.
-    let a1 = meta
-        .record_enable_job_failure(job.id, "pod-a", "registry 429")
+    // exactly what the scanner's next tick does. Below budget + not
+    // forced → state is unchanged (the flip happens atomically in the
+    // SAME call once the budget is spent).
+    let (a1, s1) = meta
+        .record_enable_job_failure(job.id, "pod-a", "registry 429", 5, false)
         .await
         .expect("fail 1");
     meta.claim_enable_jobs("pod-a", 300, 50)
         .await
         .expect("re-claim");
-    let a2 = meta
-        .record_enable_job_failure(job.id, "pod-a", "registry 503")
+    let (a2, s2) = meta
+        .record_enable_job_failure(job.id, "pod-a", "registry 503", 5, false)
         .await
         .expect("fail 2");
     assert_eq!((a1, a2), (1, 2));
+    assert_eq!(
+        (s1, s2),
+        (EnableJobState::Materializing, EnableJobState::Materializing)
+    );
     let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
     assert_eq!(got.attempts, 2);
     assert_eq!(got.error.as_deref(), Some("registry 503"));
-    // State unchanged by failure bookkeeping — the scanner decides
-    // when the budget is spent.
+    // State unchanged below budget — the atomic flip waits for the budget.
     assert_eq!(got.state, EnableJobState::Materializing);
+
+    // Budget exhausted on the SAME call: attempts+1 (3) >= max_attempts (3)
+    // ⇒ atomically flips to `failed`, no follow-up write. This is the
+    // runaway-attempts regression: pre-fix, the flip lived in a separate
+    // fenced set_enable_job_state that fence-missed (claim already released)
+    // and silently no-op'd, so the job never went terminal.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("re-claim for budget");
+    let (a3, s3) = meta
+        .record_enable_job_failure(job.id, "pod-a", "registry 500", 3, false)
+        .await
+        .expect("fail 3");
+    assert_eq!(a3, 3);
+    assert_eq!(
+        s3,
+        EnableJobState::Failed,
+        "budget spent must flip to failed atomically"
+    );
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.state, EnableJobState::Failed);
+    assert_eq!(got.error.as_deref(), Some("registry 500"));
+
+    // Reset to exercise the non-retryable (force_terminal) path: a single
+    // deterministic failure (e.g. a [warm] hook exit) flips to failed on
+    // the FIRST occurrence, well under budget.
+    let retried = meta
+        .retry_enable_job(job.id)
+        .await
+        .expect("retry to pending");
+    assert_eq!(retried.state, EnableJobState::Pending);
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("re-claim for force-terminal");
+    let (a_ft, s_ft) = meta
+        .record_enable_job_failure(job.id, "pod-a", "[warm] hook exited 1", 5, true)
+        .await
+        .expect("force terminal");
+    assert_eq!(a_ft, 1, "first attempt");
+    assert_eq!(
+        s_ft,
+        EnableJobState::Failed,
+        "non-retryable must bail fast on attempt 1"
+    );
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.state, EnableJobState::Failed);
+    assert_eq!(got.error.as_deref(), Some("[warm] hook exited 1"));
+
+    // Reset back to materializing for the remaining retry-state assertions
+    // below (they expect a non-terminal, claimable job).
+    let retried = meta
+        .retry_enable_job(job.id)
+        .await
+        .expect("retry to pending 2");
+    assert_eq!(retried.state, EnableJobState::Pending);
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("re-claim after reset");
+    meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Materializing)
+        .await
+        .expect("back to materializing");
 
     // Retry on a non-failed job is a Conflict.
     match meta.retry_enable_job(job.id).await {
@@ -307,7 +373,7 @@ async fn stale_claimant_writes_are_fenced_off() {
     // 3. A stale failure must not bump attempts, stamp error, or clear
     //    pod-b's claim out from under it.
     match meta
-        .record_enable_job_failure(job.id, "pod-a", "stale transient error")
+        .record_enable_job_failure(job.id, "pod-a", "stale transient error", 5, false)
         .await
     {
         Err(MetaError::Conflict(_)) => {}
