@@ -764,6 +764,16 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // an idempotent no-op (and still covers the pre-export error paths).
         let _ = self.docker.rm_container(container_id).await;
         let _ = self.docker.rmi(docker_tag).await;
+        // `rmi` drops the image reference but NOT the BuildKit cache, which
+        // holds a full ~image-sized copy of the just-built layers. For a large
+        // warm image (e.g. dev-brain: ~33 GiB tree → ~67 GiB ext4) that cache
+        // lingers on disk through the pack below — tree + ext4 + cache then
+        // overruns the CI runner with `mke2fs: No space left on device`.
+        // Prune it now so the pack's peak is just (exported tree + ext4).
+        // Best-effort: a prune failure must not fail the bake.
+        if let Err(e) = self.docker.builder_prune().await {
+            tracing::warn!(error = %e, "docker builder prune failed (non-fatal)");
+        }
 
         let dir_size = recursive_size(&rootfs_dir).await?;
 
@@ -777,6 +787,13 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
                 // diagnostics.
                 let ext4_path = image_dir.join("rootfs.ext4");
                 let ext4_size = recommended_size(dir_size);
+                tracing::info!(
+                    dir_size_bytes = dir_size,
+                    dir_size_gib = dir_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                    ext4_size_bytes = ext4_size,
+                    ext4_size_gib = ext4_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                    "sizing ext4 image from source-tree disk usage (du-style)"
+                );
                 self.packer.pack(&rootfs_dir, &ext4_path, ext4_size).await?;
                 let _ = tokio::fs::remove_dir_all(&rootfs_dir).await;
                 let on_disk = tokio::fs::metadata(&ext4_path).await?.len();
@@ -1296,7 +1313,27 @@ async fn chmod_executable(path: &Path) -> Result<(), BuildError> {
     Ok(())
 }
 
+/// Sum the *actual disk usage* (allocated 512-byte blocks, à la `du`) of every
+/// entry under `dir`, without following symlinks.
+///
+/// We size from `st_blocks`, NOT apparent file length (`meta.len()`): the
+/// brain/gradle/pnpm caches we bake into warm dev images are hundreds of
+/// thousands of tiny files, and ext4 rounds every file up to a 4 KiB block
+/// (plus a block per directory). Summing apparent lengths undercounts real
+/// block consumption by 2-4× for such trees, so `recommended_size`'s 2×
+/// headroom still undershot and `mke2fs -d` hit ENOSPC mid-populate (the
+/// dev-brain bake). Block usage captures the rounding, directory blocks, and
+/// xattr/inline overhead directly.
+///
+/// Counting is per-entry, so a hardlink (pnpm's content-addressed store links
+/// into `node_modules`) is counted once per link — an overcount, but in the
+/// safe direction (a slightly larger fs is fine; a too-small one is fatal).
+/// Not following symlinks matches `count_entries` and `mke2fs -d`, which
+/// replicates a symlink as a symlink: we count the link inode's own blocks and
+/// reach a target only if it lives in the real tree. `symlink_metadata`
+/// (lstat) also can't error on broken symlinks, unlike the old `metadata`.
 async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -1306,11 +1343,15 @@ async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
             Err(e) => return Err(e),
         };
         while let Some(entry) = entries.next_entry().await? {
-            let meta = entry.metadata().await?;
-            if meta.is_dir() {
+            // `file_type()` is readdir's d_type — it reflects the entry
+            // itself, not a symlink target, so we descend only real dirs.
+            let ft = entry.file_type().await?;
+            // lstat: count the entry's own allocated blocks (st_blocks is in
+            // 512-byte units), never the symlink target.
+            let meta = tokio::fs::symlink_metadata(entry.path()).await?;
+            total = total.saturating_add(meta.blocks().saturating_mul(512));
+            if ft.is_dir() {
                 stack.push(entry.path());
-            } else if meta.is_file() {
-                total = total.saturating_add(meta.len());
             }
         }
     }
