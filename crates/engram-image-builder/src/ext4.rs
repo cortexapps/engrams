@@ -161,8 +161,18 @@ impl Mke2fsPacker {
         // node_modules, gradle/pnpm caches — exhausts the default inode
         // count long before it runs out of blocks (`mke2fs: No space left
         // on device while populating file system`, even with the 2x size
-        // headroom). See `recommended_inodes`.
-        let num_inodes = recommended_inodes(count_entries(src_dir).await);
+        // headroom). See `recommended_inodes` — but cap it to what THIS
+        // filesystem can hold (the dst image is preallocated to its final
+        // size above): `recommended_inodes` floors at ~131072 for the
+        // multi-GiB image case, which a small fs (the 16 MiB host stub
+        // harness) can't fit, and mke2fs hard-rejects an oversized inode
+        // table ("inode_size * inodes_count too big for a filesystem with
+        // N blocks").
+        let fs_size_bytes = tokio::fs::metadata(dst_image)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let num_inodes = inode_count_for(count_entries(src_dir).await, fs_size_bytes);
         let output = tokio::process::Command::new(&self.bin)
             .arg("-t")
             .arg("ext4")
@@ -289,6 +299,27 @@ pub fn recommended_inodes(entry_count: u64) -> u64 {
     raw.saturating_add(BAND - 1) & !(BAND - 1)
 }
 
+/// The mke2fs `-N` inode count for an ext4 of `fs_size_bytes` holding
+/// `entry_count` files: the entry-driven [`recommended_inodes`] target,
+/// CAPPED to what the filesystem can physically hold.
+///
+/// `recommended_inodes` floors at ~131072 (the 128 Ki band) for the
+/// multi-GiB image case, where a 32 MiB inode table is noise. A small fs
+/// can't hold that: an inode is 256 B, and mke2fs's hard ceiling is
+/// `fs_size / inode_size` (all blocks as inode table) — e.g. the 16 MiB
+/// host stub harness tops out at 65536 inodes and mke2fs rejects the
+/// 131072 floor outright. We reserve ≤ 1/4 of the fs for inodes so blocks
+/// + journal + metadata still fit, never dropping below a small floor.
+pub fn inode_count_for(entry_count: u64, fs_size_bytes: u64) -> u64 {
+    const INODE_SIZE_B: u64 = 256;
+    let recommended = recommended_inodes(entry_count);
+    if fs_size_bytes == 0 {
+        return recommended; // size unknown — leave the recommendation as-is.
+    }
+    let cap = (fs_size_bytes / (INODE_SIZE_B * 4)).max(16);
+    recommended.min(cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +360,33 @@ mod tests {
         // A high-file-count tree (e.g. ~1M node_modules/gradle entries)
         // gets ~1.5M inodes — far above mke2fs's default of size/16KiB.
         assert!(recommended_inodes(1_000_000) >= 1_500_000);
+    }
+
+    #[test]
+    fn inode_count_for_caps_to_filesystem_capacity() {
+        const MIB: u64 = 1024 * 1024;
+        const INODE_SIZE_B: u64 = 256;
+        // The 16 MiB host stub harness: the recommended floor (131072)
+        // overruns mke2fs's fs_size/inode_size ceiling (65536) and is
+        // rejected. inode_count_for must clamp below the floor AND below
+        // the ceiling, leaving room for blocks.
+        let n = inode_count_for(0, 16 * MIB);
+        assert!(
+            n < recommended_inodes(0),
+            "tiny fs must clamp below the floor"
+        );
+        assert!(
+            n <= 16 * MIB / INODE_SIZE_B,
+            "must fit mke2fs's hard ceiling"
+        );
+        assert!(n >= 16, "still a usable minimum");
+        // A multi-GiB image: the cap doesn't bite, the recommendation wins.
+        assert_eq!(
+            inode_count_for(1_000_000, 8192 * MIB),
+            recommended_inodes(1_000_000),
+        );
+        // Unknown size (0) leaves the recommendation untouched.
+        assert_eq!(inode_count_for(50_000, 0), recommended_inodes(50_000));
     }
 
     #[test]
