@@ -245,7 +245,7 @@ function buildUnattributedTask(sess: Session): Task {
 }
 
 /** Resolve { profileId } → snapshot for the given refs (one images call + one profile query). */
-async function buildProfileMap(
+export async function buildProfileMap(
   refs: Array<{ profileId: string | null }>,
   profiles: ProfileStore,
   imagesClient: ImagesClient,
@@ -253,8 +253,16 @@ async function buildProfileMap(
   const ids = [...new Set(refs.map((r) => r.profileId).filter((x): x is string => x != null))];
   const out = new Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>();
   if (ids.length === 0) return out;
-  const [rows, catalog] = await Promise.all([profiles.getByIds(ids), imagesClient.listEnabledImages({})]);
-  const uriById = new Map(catalog.images.map((i) => [i.id, i.imageUri]));
+  // The image catalog lives on the control plane and may be transiently
+  // unavailable. Reads must stay best-effort: a catalog failure must not take
+  // down ListTasks/GetTask — the profile snapshot is still returned and only
+  // imageUri degrades to "". The profile store is the orchestrator's own DB, so
+  // its failure remains a hard error.
+  const catalogPromise = imagesClient
+    .listEnabledImages({})
+    .then((catalog) => new Map(catalog.images.map((i) => [i.id, i.imageUri])))
+    .catch(() => new Map<string, string>());
+  const [rows, uriById] = await Promise.all([profiles.getByIds(ids), catalogPromise]);
   for (const p of rows) {
     out.set(p.id, {
       id: p.id, name: p.name, icon: p.icon,

@@ -25,7 +25,7 @@ import { Hono } from "hono";
 import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
-import { registerTasks } from "../rpc/tasks.ts";
+import { registerTasks, buildProfileMap } from "../rpc/tasks.ts";
 import type { TaskDeps, SessionsClient, Db, GetSession, ImagesClient } from "../rpc/tasks.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
 import { CLAUDE_OAUTH_ENV_VAR } from "../db/user-secrets.ts";
@@ -220,6 +220,46 @@ const fakeImages = (ids = ["img-1"]): ImagesClient => ({
   async listEnabledImages() {
     return { images: ids.map((id) => ({ id, imageUri: `registry/${id}:latest` })) };
   },
+});
+
+// ---------------------------------------------------------------------------
+// buildProfileMap resilience (ADR 0052): task reads must survive an
+// unavailable image catalog. ListTasks/GetTask both join via buildProfileMap,
+// so a thrown listEnabledImages must not take down the whole read — the
+// snapshot is still returned, only imageUri falls back to "".
+// ---------------------------------------------------------------------------
+
+describe("buildProfileMap — image catalog resilience", () => {
+  test("falls back to empty imageUri when the image catalog is unavailable", async () => {
+    const failingImages: ImagesClient = {
+      async listEnabledImages() {
+        throw new Error("image catalog unavailable");
+      },
+    };
+
+    const map = await buildProfileMap(
+      [{ profileId: PROFILE_ID }],
+      makeFakeProfiles(),
+      failingImages,
+    );
+
+    const snap = map.get(PROFILE_ID);
+    expect(snap).toBeDefined();
+    expect(snap!.id).toBe(PROFILE_ID);
+    expect(snap!.name).toBe("Test");
+    expect(snap!.archived).toBe(false);
+    expect(snap!.imageUri).toBe("");
+  });
+
+  test("resolves imageUri from the catalog when it is available", async () => {
+    const map = await buildProfileMap(
+      [{ profileId: PROFILE_ID }],
+      makeFakeProfiles(),
+      fakeImages(),
+    );
+
+    expect(map.get(PROFILE_ID)!.imageUri).toBe("registry/img-1:latest");
+  });
 });
 
 /** Build a getSession stub for the given user (or return null for anon). */
