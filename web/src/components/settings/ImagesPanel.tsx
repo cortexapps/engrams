@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { toast } from "sonner";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
@@ -128,6 +129,20 @@ export function ImagesPanel() {
 function ImageRow({ row }: { row: EnabledImageSummary }) {
   const del = useDisableImage();
   const refresh = useRefreshEnabledImage();
+
+  const onDisable = async (imageUri: string) => {
+    try {
+      await del.mutateAsync({ imageUri });
+      toast.success("Image disabled");
+    } catch (e) {
+      // errorMessage() carries the orchestrator profile-guard text
+      // ("Can't disable — N profiles use this image: …", ADR §3) or the
+      // coordinator's own image_in_use text — surfaced verbatim (rawMessage,
+      // no [code] prefix).
+      toast.error(errorMessage(e));
+    }
+  };
+
   const shortDigest =
     row.manifest_digest.length > 19 ? `${row.manifest_digest.slice(0, 19)}…` : row.manifest_digest;
 
@@ -181,7 +196,7 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction onClick={() => del.mutate({ imageUri: row.image_uri })}>
+                <AlertDialogAction onClick={() => onDisable(row.image_uri)}>
                   Disable image
                 </AlertDialogAction>
               </AlertDialogFooter>

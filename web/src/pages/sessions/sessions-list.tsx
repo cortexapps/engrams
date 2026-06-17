@@ -12,9 +12,9 @@ import {
   relativeTime,
   shortId,
   statusLabel,
-  stripImageHost,
   type StatusFilter,
 } from "./session-format";
+import { ProfileChip } from "../../components/profiles/ProfileChip";
 
 // The sessions list reads as a workspace switcher, not a data grid: a flat list
 // of rich rows ordered running-first (the same order as the rail), each row a
@@ -167,9 +167,7 @@ function SessionRow({ s, showOwner }: { s: SessionListItem; showOwner: boolean }
             later); the image trails as the recessive "what kind" descriptor. */}
         <span className="flex min-w-0 flex-1 items-baseline gap-2.5">
           <span className="shrink-0 font-mono text-sm font-medium">{shortId(s.id)}</span>
-          <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-            {stripImageHost(s.image)}
-          </span>
+          <ProfileChip profile={s.profile} fallbackImage={s.image} className="text-xs" />
         </span>
         {showOwner && (
           <span className="hidden w-40 shrink-0 items-center gap-2 sm:flex">

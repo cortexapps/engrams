@@ -1,5 +1,5 @@
 import { useParams } from "@tanstack/react-router";
-import { useEffect, useState, type CSSProperties } from "react";
+import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { StatusGlyph } from "../components/Glyph";
@@ -7,25 +7,17 @@ import { SessionThread } from "../components/session-thread/SessionThread";
 import { TabRow } from "../components/TabRow";
 import { PageHeading } from "../components/page-heading";
 import { TerminalPane } from "../components/TerminalPane";
-import { SessionCowState } from "../components/CowState";
-import { DurabilityTimeline } from "../components/DurabilityTimeline";
-import { MetricRow } from "../components/MetricRow";
-import { relativeTime } from "./sessions/session-format";
-import { Sidebar, SidebarContent, SidebarProvider } from "@/components/ui/sidebar";
-import { Text } from "@/components/ui/text";
-import { Button } from "@/components/ui/button";
+import { statusLabel } from "./sessions/session-format";
+import { useTasks } from "../hooks/useTasks";
+import { ProfileChip } from "../components/profiles/ProfileChip";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { useHosts } from "../hooks/useHosts";
-import { useTeleportSession } from "../hooks/useTeleportSession";
-import { usePauseResumeSession } from "../hooks/usePauseResumeSession";
-import { useIsAdmin } from "../auth/AuthProvider";
-import type { IndexedEvent, Session } from "../lib/types";
+  DiagnosticsDrawer,
+  DurabilityReadout,
+  useDurabilitySummary,
+  type DurabilitySummary,
+} from "../components/SessionDiagnostics";
+import { Separator } from "@/components/ui/separator";
+import type { IndexedEvent, Session, ProfileSnapshotView } from "../lib/types";
 
 type ViewTab = "transcript" | "shell" | "raw";
 
@@ -38,7 +30,26 @@ const TABS = [
 export function SessionDetail() {
   const { id } = useParams({ from: "/_app/sessions/$id" });
   const { data: session } = useSession(id);
+  const { data: tasksData } = useTasks();
+  const profileSnap =
+    tasksData?.tasks.flatMap((t) => t.sessions).find((r) => r.sessionId === id)?.profile ?? null;
+  // Normalize the embedded snapshot to the UI view once. Point-in-time by
+  // design (ADR 0052) — what this session launched from, not the profile's
+  // current state.
+  const profile: ProfileSnapshotView | null = profileSnap
+    ? {
+        id: profileSnap.id,
+        name: profileSnap.name,
+        icon: profileSnap.icon,
+        archived: profileSnap.archived,
+        imageUri: profileSnap.imageUri,
+      }
+    : null;
   const { events, streamingText } = useSessionEvents(id);
+  // One poll per session, shared by React Query with the Diagnostics drawer's
+  // gauges; null until the session resolves (and whenever there's nothing
+  // calming to say).
+  const durability = useDurabilitySummary(id, session?.status);
   const [tab, setTab] = useState<ViewTab>("transcript");
   // Once the user opens the SHELL tab, keep TerminalPane mounted for
   // the lifetime of this page. Switching back to TRANSCRIPT/RAW just
@@ -50,224 +61,120 @@ export function SessionDetail() {
     if (tab === "shell") setShellEverActive(true);
   }, [tab]);
 
-  // App-like layout: the page fills the inset as a row — a content column
-  // (masthead + tabs + active tab) beside a full-height instrument rail that
-  // carries the session's metadata + durability across every tab. The rail is
-  // the shadcn Sidebar primitive (same as the /sessions + /settings section
-  // rails), wrapped in its own provider and re-toned off the dark spine onto
-  // content tokens so the dense data stays dark-on-light legible. Shown on
-  // wide screens; collapsible="none" means no toggle (and so no cmd+B clash
-  // with the primary spine's provider).
   return (
-    // Nested inside SessionsLayout's provider (the persistent sessions rail),
-    // so we fill the section's height rather than the viewport — `min-h-0
-    // flex-1` overrides the provider's built-in `min-h-svh`. `--sidebar-width`
-    // here scopes the RIGHT metadata rail; the left rail uses the layout's.
-    <SidebarProvider
-      defaultOpen
-      className="min-h-0 flex-1 overflow-hidden"
-      style={{ "--sidebar-width": "18rem" } as CSSProperties}
-    >
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <div className="shrink-0 px-6 pt-6">
-          {/* No `← back` link — the persistent sessions rail (left) keeps the
-              full list in view and highlights this session, so location is
-              never lost (ADR 0029). The masthead is the shared PageHeading:
-              `session` eyebrow over the mono session id. */}
-          <PageHeading eyebrow="session" title={id} titleVariant="mono" />
+    // The work surface IS the page — no standing instrument rail. A developer
+    // glances at status, the profile this launched from, and a calm "is my work
+    // safe" telltale, all in the masthead. The operator/forensic detail (COW
+    // gauges, the recovery ladder, admin teleport/pause) lives one click away in
+    // the Diagnostics drawer, which also gives phones this data for the first
+    // time (the old rail was desktop-only). (ADR 0052 follow-up)
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="shrink-0 px-6 pt-6">
+        {/* No `← back` link — the persistent sessions rail (left) keeps the full
+            list in view and highlights this session (ADR 0029). Diagnostics
+            opens from the masthead actions, on the title's baseline. */}
+        <PageHeading
+          eyebrow="session"
+          title={id}
+          titleVariant="mono"
+          showRule={false}
+          actions={
+            session && (
+              <DiagnosticsDrawer session={session} sessionId={id} eventCount={events.length} />
+            )
+          }
+        />
 
-          <div className="mt-4">
-            <TabRow tabs={TABS} active={tab} onChange={setTab} />
-          </div>
-        </div>
+        {session && <SessionVitals session={session} profile={profile} durability={durability} />}
 
-        <div className="min-h-0 flex-1 overflow-hidden">
-          {tab === "transcript" && (
-            <SessionThread
-              sessionId={id}
-              events={events}
-              status={session?.status}
-              streamingText={streamingText}
-            />
-          )}
-
-          {/* Mount TerminalPane once and keep it mounted across tab
-              switches. Display:none preserves canvas + WS + ghostty-web
-              WASM grid; remounting would restart bash and (because
-              ghostty-web's render loop has cross-mount quirks) ghost the
-              previous session's output into the fresh canvas. */}
-          {shellEverActive && (
-            <div className="h-full" style={{ display: tab === "shell" ? "block" : "none" }}>
-              <TerminalPane sessionId={id} />
-            </div>
-          )}
-
-          {tab === "raw" && <RawEvents events={events} />}
+        <div className="mt-5">
+          <TabRow tabs={TABS} active={tab} onChange={setTab} />
         </div>
       </div>
 
-      {session && (
-        <Sidebar
-          side="right"
-          collapsible="none"
-          className="hidden border-l md:flex [--sidebar:var(--card)] [--sidebar-foreground:var(--card-foreground)] [--sidebar-border:var(--border)]"
-        >
-          <SidebarContent className="gap-0 px-5 py-6">
-            <SessionMeta session={session} eventCount={events.length} sessionId={id} />
-          </SidebarContent>
-        </Sidebar>
-      )}
-    </SidebarProvider>
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {tab === "transcript" && (
+          <SessionThread
+            sessionId={id}
+            events={events}
+            status={session?.status}
+            streamingText={streamingText}
+          />
+        )}
+
+        {/* Mount TerminalPane once and keep it mounted across tab switches.
+            Display:none preserves canvas + WS + ghostty-web WASM grid;
+            remounting would restart bash and (because ghostty-web's render loop
+            has cross-mount quirks) ghost the previous session's output into the
+            fresh canvas. */}
+        {shellEverActive && (
+          <div className="h-full" style={{ display: tab === "shell" ? "block" : "none" }}>
+            <TerminalPane sessionId={id} />
+          </div>
+        )}
+
+        {tab === "raw" && <RawEvents events={events} />}
+      </div>
+    </div>
   );
 }
 
-function SessionMeta({
+// The masthead vitals strip — the only session metadata a developer needs at a
+// glance: lifecycle status (glyph + word), the profile this launched from
+// (ADR 0052, the dense inline chip with its image on hover), and the calm
+// durability telltale. Items render only when present and are divided by a
+// hairline Separator, so the strip never trails a dangling divider.
+function SessionVitals({
   session,
-  eventCount,
-  sessionId,
+  profile,
+  durability,
 }: {
   session: Session;
-  eventCount: number;
-  sessionId: string;
+  profile: ProfileSnapshotView | null;
+  durability: DurabilitySummary | null;
 }) {
-  return (
-    <div className="space-y-5">
-      <div className="flex items-center gap-2">
-        <StatusGlyph status={session.status} />
-        <span data-testid="session-status" className="text-sm font-medium text-foreground">
-          {session.status.replace(/_/g, " ")}
+  const items: { key: string; node: ReactNode }[] = [
+    {
+      key: "status",
+      node: (
+        <span className="inline-flex items-center gap-1.5">
+          <StatusGlyph status={session.status} />
+          <span data-testid="session-status" className="font-medium text-foreground">
+            {statusLabel(session.status)}
+          </span>
         </span>
-      </div>
-
-      <dl className="space-y-2.5 text-sm">
-        <div>
-          <dt className="text-muted-foreground">image</dt>
-          <dd className="mt-0.5 font-mono text-[0.8rem] break-all text-foreground">
-            {session.image}
-          </dd>
-        </div>
-        <MetricRow label="created" value={`${relativeTime(session.created_at)} ago`} />
-        {/* The count gets its own element: e2e polls Number(textContent) of
-            exactly this span — tagging surrounding prose would yield NaN. */}
-        <MetricRow label="events" value={<span data-testid="event-count">{eventCount}</span>} />
-      </dl>
-
-      {/* ADR 0016 Phase A + ADR 0028 A.log: per-session durability — "is my
-          work durable yet" (CowState) and "what coherent points can I
-          recover/fork to" (the checkpoint chain), visible across every tab. */}
-      <div className="border-t pt-4">
-        <Text variant="label" tone="muted" className="mb-2.5 block text-[0.65rem]">
-          durability
-        </Text>
-        <SessionCowState sessionId={sessionId} />
-        <div className="mt-3">
-          <DurabilityTimeline sessionId={sessionId} />
-        </div>
-      </div>
-
-      {/* ADR 0045 Phase F: live-migration test surface — relocate this
-          session to a chosen host. Admin-only, Active-only. */}
-      <TeleportControl session={session} />
-
-      {/* ADR 0045 Phase F: freeze/flush test surface — pause/unfreeze the
-          microVM in place. Admin-only, Active-only. */}
-      <PauseResumeControl session={session} />
-    </div>
-  );
-}
-
-// ADR 0045 Phase F: teleport (live-migrate) an Active session onto a chosen
-// host. Today the verb rides the snapshot-rehome evac pipeline (a brief
-// pause); ADR 0045 Phase C swaps it to post-copy live migration under the
-// same control. Renders nothing unless the viewer is an admin and the
-// session is Active (the only relocatable state).
-function TeleportControl({ session }: { session: Session }) {
-  const isAdmin = useIsAdmin();
-  const { data: hosts } = useHosts();
-  const teleport = useTeleportSession(session.id);
-  const [target, setTarget] = useState<string>("");
-
-  if (!isAdmin || session.status !== "active") return null;
-
-  const candidates = (hosts ?? []).filter((h) => h.status === "ready" && h.id !== session.host_id);
+      ),
+    },
+    ...(profile
+      ? [
+          {
+            key: "profile",
+            node: (
+              <ProfileChip
+                profile={profile}
+                fallbackImage={session.image}
+                disclosure="tooltip"
+                className="max-w-full text-foreground"
+              />
+            ),
+          },
+        ]
+      : []),
+    ...(durability
+      ? [{ key: "durability", node: <DurabilityReadout summary={durability} /> }]
+      : []),
+  ];
 
   return (
-    <div className="border-t pt-4">
-      <Text variant="label" tone="muted" className="mb-2.5 block text-[0.65rem]">
-        teleport
-      </Text>
-      {candidates.length === 0 ? (
-        <Text tone="muted" className="text-xs">
-          no other ready host available
-        </Text>
-      ) : (
-        <div className="space-y-2">
-          <Select value={target} onValueChange={setTarget}>
-            <SelectTrigger className="h-8 text-xs">
-              <SelectValue placeholder="destination host…" />
-            </SelectTrigger>
-            <SelectContent>
-              {candidates.map((h) => {
-                const freeGib = ((h.capacity_total_mib - h.capacity_used_mib) / 1024).toFixed(1);
-                const label = h.hostname || h.id.slice(0, 8);
-                return (
-                  <SelectItem key={h.id} value={h.id} className="text-xs">
-                    {label} · {freeGib} GiB free · {h.running_sandboxes} vm
-                  </SelectItem>
-                );
-              })}
-            </SelectContent>
-          </Select>
-          <Button
-            size="sm"
-            variant="secondary"
-            className="w-full"
-            disabled={!target || teleport.isPending}
-            onClick={() => teleport.mutate(target)}
-          >
-            {teleport.isPending ? "teleporting…" : "Teleport"}
-          </Button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ADR 0045 Phase F: freeze / unfreeze this session's microVM in place — the
-// admin affordance to drive + observe the pause/flush path. Does not change
-// session state (the row stays `active`), so both buttons are always offered;
-// the operator picks. Admin-only, Active-only.
-function PauseResumeControl({ session }: { session: Session }) {
-  const isAdmin = useIsAdmin();
-  const { pause, resume } = usePauseResumeSession(session.id);
-
-  if (!isAdmin || session.status !== "active") return null;
-
-  return (
-    <div className="border-t pt-4">
-      <Text variant="label" tone="muted" className="mb-2.5 block text-[0.65rem]">
-        freeze
-      </Text>
-      <div className="flex gap-2">
-        <Button
-          size="sm"
-          variant="secondary"
-          className="flex-1"
-          disabled={pause.isPending}
-          onClick={() => pause.mutate()}
-        >
-          {pause.isPending ? "pausing…" : "Pause"}
-        </Button>
-        <Button
-          size="sm"
-          variant="secondary"
-          className="flex-1"
-          disabled={resume.isPending}
-          onClick={() => resume.mutate()}
-        >
-          {resume.isPending ? "resuming…" : "Resume"}
-        </Button>
-      </div>
+    <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-sm text-muted-foreground">
+      {items.map((item, i) => (
+        <Fragment key={item.key}>
+          {i > 0 && (
+            <Separator orientation="vertical" className="data-[orientation=vertical]:h-4" />
+          )}
+          {item.node}
+        </Fragment>
+      ))}
     </div>
   );
 }

@@ -24,9 +24,12 @@ const textVariants = cva("", {
       display:
         "font-display text-3xl leading-tight font-semibold tracking-tight text-balance [font-stretch:108%]",
       // The masthead title when the page's subject IS machine data (a session
-      // id, a digest): display SIZE carried in the mono lab-readout voice, so
-      // the frame stays the same as `display` but the typography stays honest.
-      displayMono: "font-mono text-2xl leading-tight tracking-tight",
+      // id, a digest): the mono lab-readout voice. NOT tracking-tight — negative
+      // spacing on a long hex id runs the glyphs together (worse on the dark
+      // ground); monospace wants its native advance, so tracking stays normal
+      // and the size sits a notch below `display` so a 36-char id reads as a
+      // legible title, not a cramped wall.
+      displayMono: "font-mono text-xl leading-tight tracking-normal",
       heading: "font-display text-lg leading-snug font-semibold tracking-tight",
       body: "text-sm leading-relaxed",
       // Instrument label / eyebrow / table header / tab. Callers set color via

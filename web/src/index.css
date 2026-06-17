@@ -240,6 +240,16 @@
   ::-webkit-scrollbar-thumb:hover {
     background-color: color-mix(in oklch, var(--primary) 80%, var(--foreground));
   }
+
+  /* The Sheet (radix Dialog) slide/fade is the one animated surface several
+     features share — the Diagnostics drawer and the mobile nav. Honour
+     prefers-reduced-motion: appear/leave instantly rather than slide in. */
+  @media (prefers-reduced-motion: reduce) {
+    [data-slot="sheet-content"],
+    [data-slot="sheet-overlay"] {
+      animation: none !important;
+    }
+  }
 }
 
 @utility bg-carbon-fade {

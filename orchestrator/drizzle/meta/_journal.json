@@ -22,6 +22,13 @@
       "when": 1781545555595,
       "tag": "0002_user_session_secrets",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1781651154410,
+      "tag": "0003_session_profiles",
+      "breakpoints": true
     }
   ]
 }

@@ -19,6 +19,7 @@ export function PageHeading({
   description,
   actions,
   titleVariant = "display",
+  showRule = true,
   className,
 }: {
   title: ReactNode;
@@ -26,16 +27,24 @@ export function PageHeading({
   description?: ReactNode;
   actions?: ReactNode;
   titleVariant?: "display" | "mono";
+  /** The closing hairline + lime index-tab under the header band. On by
+   * default; pass `false` when the next element already owns a rule (e.g. a tab
+   * row) so the masthead doesn't stack two lines a few pixels apart and strand
+   * whatever sits between them. */
+  showRule?: boolean;
   className?: string;
 }) {
   return (
     <div
       className={cn(
-        "relative flex flex-wrap items-end justify-between gap-x-6 gap-y-3 border-b pb-4",
+        "relative flex flex-wrap items-end justify-between gap-x-6 gap-y-3",
+        showRule && "border-b pb-4",
         className,
       )}
     >
-      <span aria-hidden className="absolute -bottom-px left-0 h-0.5 w-10 bg-primary" />
+      {showRule && (
+        <span aria-hidden className="absolute -bottom-px left-0 h-0.5 w-10 bg-primary" />
+      )}
       <div className="space-y-1">
         {eyebrow && (
           <Text variant="label" tone="muted">

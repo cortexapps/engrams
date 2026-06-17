@@ -16,7 +16,7 @@
 
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
 import { checkDb, getDb } from "../db/client.ts";
-import { task, taskSession } from "../db/schema.ts";
+import { task, taskSession, profile } from "../db/schema.ts";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { buildServer } from "../server.ts";
@@ -181,6 +181,74 @@ describe("healthz with live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body).toEqual({ ok: true, db: true });
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Session profiles (ADR 0052)
+//
+// Round-trips the orchestrator-only `profile` table and the nullable
+// `task_session.profile_id` intra-DB FK that records which profile started a
+// session. Exercises both the table (incl. jsonb env_vars + boolean +
+// null deleted_at defaults) and the FK column.
+// ---------------------------------------------------------------------------
+
+describe("profile table (ADR 0052)", () => {
+  test.skipIf(!dbReachable)(
+    "insert profile + task_session.profile_id round-trips",
+    async () => {
+      const db = getDb();
+      const pid = `profile-rt-${Date.now()}`;
+      const tid = `profile-rt-task-${Date.now()}`;
+      const sid = `profile-rt-sess-${Date.now()}`;
+      try {
+        await db.insert(profile).values({
+          id: pid,
+          name: "Round-trip",
+          description: "d",
+          icon: "Bot",
+          imageId: "img-logical-id",
+          includeUserTokens: true,
+          envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
+        });
+        await db.insert(task).values({
+          id: tid,
+          type: "chat",
+          status: "open",
+          createdByUserId: "u",
+          source: {},
+        });
+        await db.insert(taskSession).values({
+          taskId: tid,
+          sessionId: sid,
+          role: "primary",
+          profileId: pid,
+        });
+
+        const rows = await db
+          .select()
+          .from(profile)
+          .where(eq(profile.id, pid));
+        expect(rows[0]!.includeUserTokens).toBe(true);
+        expect(rows[0]!.envVars).toEqual({ ANTHROPIC_MODEL: "claude-opus-4-8" });
+        expect(rows[0]!.deletedAt).toBeNull();
+
+        const refs = await db
+          .select()
+          .from(taskSession)
+          .where(eq(taskSession.taskId, tid));
+        expect(refs[0]!.profileId).toBe(pid);
+      } finally {
+        await db
+          .delete(task)
+          .where(eq(task.id, tid))
+          .catch(() => {});
+        await db
+          .delete(profile)
+          .where(eq(profile.id, pid))
+          .catch(() => {});
+      }
     },
   );
 });
