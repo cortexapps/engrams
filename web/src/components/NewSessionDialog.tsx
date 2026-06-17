@@ -1,15 +1,10 @@
-import { type ComponentProps, useEffect, useState } from "react";
+import { type ComponentProps, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useMutation } from "@connectrpc/connect-query";
-import { createConnectQueryKey } from "@connectrpc/connect-query";
-import { Link, useNavigate } from "@tanstack/react-router";
-import { zodResolver } from "@hookform/resolvers/zod";
-import { Controller, useForm } from "react-hook-form";
-import * as z from "zod";
-import { useAuth } from "../auth/AuthProvider";
-import { useEnabledImages } from "../hooks/useEnabledImages";
-import { createSession } from "../gen/engram/app/v1/session-SessionService_connectquery";
+import { useMutation, createConnectQueryKey } from "@connectrpc/connect-query";
+import { useForm } from "react-hook-form";
 import { createTask, listTasks } from "../gen/engram/app/v1/task-TaskService_connectquery";
+import { useProfiles } from "../hooks/useProfiles";
+import { ProfileIcon } from "./profiles/ProfileIcon";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -20,22 +15,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-
-const newSessionSchema = z.object({
-  image: z.string().min(1, "Select an image"),
-  mode: z.enum(["agent", "dev_vm"]),
-  prompt: z.string(),
-});
-type NewSessionValues = z.infer<typeof newSessionSchema>;
+import { cn } from "@/lib/utils";
 
 export function NewSessionDialog({
   onCreated,
@@ -47,8 +30,6 @@ export function NewSessionDialog({
   showTrigger = true,
 }: {
   onCreated: (id: string) => void;
-  /** Trigger styling. Defaults to the primary (lime) button; the sessions rail
-   * passes `secondary` + `w-full` so it reads quietly beside the active row. */
   variant?: ComponentProps<typeof Button>["variant"];
   className?: string;
   /** Test id for the trigger button. Pass it from at most ONE mounted instance
@@ -65,78 +46,46 @@ export function NewSessionDialog({
   const [internalOpen, setInternalOpen] = useState(false);
   const open = openProp ?? internalOpen;
   const setOpen = onOpenChange ?? setInternalOpen;
-  const { data: images, isLoading } = useEnabledImages(true);
-  const { principal } = useAuth();
+
+  const { data, isPending } = useProfiles(false);
+  const profiles = data?.profiles ?? [];
   const qc = useQueryClient();
-  const navigate = useNavigate();
-
-  // ADR 0051 Task 23: CreateTask (chat) replaces REST createSession for agent mode.
-  // ADR 0051 Task 28: dev_vm migrated to SessionService.CreateSession (connect-query
-  // passthrough) — the REST /api/v1/sessions route is no longer reachable from the
-  // browser after the proxy flip. The proto CreateSessionRequest maps imageUri+mode.
   const createTaskMutation = useMutation(createTask);
-  const createSessionMutation = useMutation(createSession);
 
-  const form = useForm<NewSessionValues>({
-    resolver: zodResolver(newSessionSchema),
-    defaultValues: { image: "", mode: "agent", prompt: "" },
-  });
-  const selectedUri = form.watch("image");
-  const mode = form.watch("mode");
+  const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const form = useForm<{ prompt: string }>({ defaultValues: { prompt: "" } });
 
-  const selected = images?.find((i) => i.image_uri === selectedUri);
-  useEffect(() => {
-    if (!selectedUri && images && images.length > 0) {
-      form.setValue("image", images[0].image_uri);
-    }
-  }, [images, selectedUri, form]);
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return profiles;
+    return profiles.filter(
+      (p) => p.name.toLowerCase().includes(q) || p.description.toLowerCase().includes(q),
+    );
+  }, [profiles, search]);
 
-  const harnessName = selected?.harness_name ?? null;
-  const hasHarness = harnessName !== null;
-  const isClaude = harnessName === "claude";
-  const promptMeaningful = hasHarness && mode === "agent";
-  const needsToken = isClaude && mode === "agent" && !principal.has_claude_token;
-  const canSubmit = !!selected && !form.formState.isSubmitting && !needsToken;
+  const selected = profiles.find((p) => p.id === selectedId) ?? null;
 
-  const onSubmit = async (data: NewSessionValues) => {
+  const onSubmit = async (values: { prompt: string }) => {
     if (!selected) return;
     try {
-      if (data.mode === "dev_vm") {
-        // dev_vm via SessionService.CreateSession (connect-query passthrough).
-        // The proto CreateSessionRequest uses imageUri (camelCase) + mode string.
-        const res = await createSessionMutation.mutateAsync({
-          imageUri: selected.image_uri,
-          mode: "dev_vm",
-        });
-        qc.invalidateQueries({
-          queryKey: createConnectQueryKey({ schema: listTasks, cardinality: "finite" }),
-        });
+      const res = await createTaskMutation.mutateAsync({
+        type: "chat",
+        profileId: selected.id,
+        prompt: values.prompt.trim() ? values.prompt.trim() : undefined,
+      });
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({ schema: listTasks, cardinality: "finite" }),
+      });
+      const sessionId = res.task?.sessions[0]?.sessionId;
+      if (sessionId) {
         setOpen(false);
         form.reset();
-        onCreated(res.sessionId);
+        setSelectedId(null);
+        setSearch("");
+        onCreated(sessionId);
       } else {
-        // agent mode → CreateTask(type:'chat')
-        const res = await createTaskMutation.mutateAsync({
-          type: "chat",
-          imageUri: selected.image_uri,
-          prompt: promptMeaningful && data.prompt.trim() ? data.prompt.trim() : undefined,
-        });
-        // Invalidate the tasks query so the list refreshes immediately.
-        qc.invalidateQueries({
-          queryKey: createConnectQueryKey({ schema: listTasks, cardinality: "finite" }),
-        });
-        // Navigate to the session the task's primary session ref created.
-        const sessionId = res.task?.sessions[0]?.sessionId;
-        if (sessionId) {
-          // Success: close the dialog and reset before handing off.
-          setOpen(false);
-          form.reset();
-          onCreated(sessionId);
-        } else {
-          // Defensive: task created but no session id returned — keep the
-          // dialog open so the error is visible to the user.
-          form.setError("root", { message: "Task created but no session id returned." });
-        }
+        form.setError("root", { message: "Task created but no session id returned." });
       }
     } catch (e) {
       form.setError("root", { message: e instanceof Error ? e.message : String(e) });
@@ -155,129 +104,90 @@ export function NewSessionDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>New session</DialogTitle>
-          <DialogDescription>Launch a bounded unit of agent work.</DialogDescription>
+          <DialogDescription>Pick a profile, then say what to run.</DialogDescription>
         </DialogHeader>
 
-        {isLoading && <p className="text-sm text-muted-foreground">Loading images…</p>}
-        {images && images.length === 0 && (
+        {isPending && <p className="text-sm text-muted-foreground">Loading profiles…</p>}
+
+        {!isPending && profiles.length === 0 && (
           <p className="text-sm text-muted-foreground">
-            {principal.role === "admin" ? (
-              <>
-                No images enabled yet. Enable one in{" "}
-                <Link
-                  to="/operator/images"
-                  className="underline underline-offset-4 hover:text-foreground"
-                >
-                  Operator → Images
-                </Link>{" "}
-                before launching a session.
-              </>
-            ) : (
-              "No images enabled yet. Ask an admin to enable one before you can launch a session."
-            )}
+            No profiles configured — contact an admin to set one up.
           </p>
         )}
 
-        {images && images.length > 0 && (
+        {!isPending && profiles.length > 0 && (
           <form onSubmit={form.handleSubmit(onSubmit)}>
             <FieldGroup>
-              <Controller
-                name="image"
-                control={form.control}
-                render={({ field }) => (
-                  <Field>
-                    <FieldLabel htmlFor={field.name}>Image</FieldLabel>
-                    <Select value={field.value} onValueChange={field.onChange}>
-                      <SelectTrigger id={field.name} data-testid="image-select">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {images.map((i) => (
-                          <SelectItem key={i.image_uri} value={i.image_uri}>
-                            {i.image_uri}
-                            {i.manifest_name ? ` — ${i.manifest_name}` : ""}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    {/* data-harness carries the machine-readable harness state
-                        ("" = harness-less) so tests pin it structurally
-                        instead of coupling to the prose. */}
-                    <FieldDescription
-                      data-testid="image-harness-state"
-                      data-harness={harnessName ?? ""}
-                    >
-                      {harnessName
-                        ? `Baked harness: ${harnessName}`
-                        : "No baked harness — shell-only image"}
-                    </FieldDescription>
-                  </Field>
-                )}
+              <Input
+                placeholder="Search profiles…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                autoFocus
               />
 
-              <Controller
-                name="mode"
-                control={form.control}
-                render={({ field }) => (
-                  <Field>
-                    <FieldLabel htmlFor={field.name}>Mode</FieldLabel>
-                    <Select value={field.value} onValueChange={field.onChange}>
-                      <SelectTrigger id={field.name}>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="agent">agent — drive the baked harness</SelectItem>
-                        <SelectItem value="dev_vm">dev VM — shell-only</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </Field>
+              <div
+                className="flex max-h-72 flex-col gap-2 overflow-y-auto"
+                role="radiogroup"
+                aria-label="Profiles"
+              >
+                {filtered.length === 0 && (
+                  <p className="px-1 py-4 text-center text-sm text-muted-foreground">No matches.</p>
                 )}
-              />
+                {filtered.map((p) => (
+                  <button
+                    type="button"
+                    key={p.id}
+                    role="radio"
+                    aria-checked={selectedId === p.id}
+                    data-testid={`profile-row-${p.id}`}
+                    onClick={() => setSelectedId(p.id)}
+                    className={cn(
+                      "flex items-start gap-3 rounded-md border p-3 text-left transition-colors",
+                      selectedId === p.id
+                        ? "border-primary bg-accent"
+                        : "border-border hover:bg-accent/50",
+                    )}
+                  >
+                    <ProfileIcon
+                      name={p.icon}
+                      className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+                    />
+                    <span className="min-w-0">
+                      <span className="block font-medium">{p.name}</span>
+                      <span className="block truncate text-sm text-muted-foreground">
+                        {p.description}
+                      </span>
+                      {p.includeUserTokens && (
+                        <span className="mt-1 block text-xs text-muted-foreground">
+                          carries your token
+                        </span>
+                      )}
+                    </span>
+                  </button>
+                ))}
+              </div>
 
-              {promptMeaningful && (
-                <Controller
-                  name="prompt"
-                  control={form.control}
-                  render={({ field }) => (
-                    <Field>
-                      <FieldLabel htmlFor={field.name}>Prompt</FieldLabel>
-                      <Textarea
-                        {...field}
-                        id={field.name}
-                        rows={2}
-                        placeholder="optional opening prompt"
-                      />
-                    </Field>
-                  )}
+              <Field>
+                <FieldLabel htmlFor="prompt">Task</FieldLabel>
+                <Textarea
+                  id="prompt"
+                  rows={2}
+                  placeholder="Describe the task for this session…"
+                  {...form.register("prompt")}
                 />
-              )}
+              </Field>
 
-              {needsToken && (
-                <FieldDescription>
-                  This image runs built-in Claude, which uses your saved token — you don’t have one
-                  yet.
-                </FieldDescription>
-              )}
               {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
             </FieldGroup>
 
             <DialogFooter className="mt-4">
-              {needsToken ? (
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={() => {
-                    setOpen(false);
-                    navigate({ to: "/settings/tokens" });
-                  }}
-                >
-                  Save your Claude token
-                </Button>
-              ) : (
-                <Button type="submit" data-testid="start-session" disabled={!canSubmit}>
-                  {form.formState.isSubmitting ? "Starting…" : "Start"}
-                </Button>
-              )}
+              <Button
+                type="submit"
+                data-testid="start-session"
+                disabled={!selected || form.formState.isSubmitting}
+              >
+                {form.formState.isSubmitting ? "Starting…" : "Start session"}
+              </Button>
             </DialogFooter>
           </form>
         )}
