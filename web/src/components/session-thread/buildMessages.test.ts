@@ -465,3 +465,70 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
     expect(queued.metadata?.custom?.pending).toBe(true);
   });
 });
+
+describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
+  test("prompt_queued enters the queue; run_started{prompt_id} consumes it", () => {
+    expect(
+      buildMessages(
+        indexed([{ type: "prompt_queued", prompt_id: "p1", summary: "do the thing", at: AT }]),
+        SID,
+      ).queue,
+    ).toEqual([{ promptId: "p1", summary: "do the thing" }]);
+
+    expect(
+      buildMessages(
+        indexed([
+          { type: "prompt_queued", prompt_id: "p1", summary: "do the thing", at: AT },
+          { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT2 },
+        ]),
+        SID,
+      ).queue,
+    ).toEqual([]);
+  });
+
+  test("prompt_edited updates the queued summary", () => {
+    expect(
+      buildMessages(
+        indexed([
+          { type: "prompt_queued", prompt_id: "p1", summary: "v1", at: AT },
+          { type: "prompt_edited", prompt_id: "p1", summary: "v2", at: AT2 },
+        ]),
+        SID,
+      ).queue,
+    ).toEqual([{ promptId: "p1", summary: "v2" }]);
+  });
+
+  test("prompt_dequeued removes the entry AND drops its greyed bubble from the thread", () => {
+    const result = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "hi",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "prompt_queued", prompt_id: "p1", summary: "hi", at: AT },
+        { type: "prompt_dequeued", prompt_id: "p1", at: AT2 },
+      ]),
+      SID,
+    );
+    expect(result.queue).toEqual([]);
+    // Pulled back into the composer / cancelled → no longer in the conversation.
+    expect(real(result.messages).some((m) => m.id === "p1")).toBe(false);
+  });
+
+  test("multiple queued prompts stay oldest→newest (↑ recalls the newest)", () => {
+    expect(
+      buildMessages(
+        indexed([
+          { type: "prompt_queued", prompt_id: "p1", summary: "first", at: AT },
+          { type: "prompt_queued", prompt_id: "p2", summary: "second", at: AT2 },
+        ]),
+        SID,
+      ).queue.map((q) => q.promptId),
+    ).toEqual(["p1", "p2"]);
+  });
+});

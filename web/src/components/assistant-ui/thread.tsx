@@ -15,6 +15,8 @@ import {
   MessagePrimitive,
   ThreadPrimitive,
   useAuiState,
+  useComposer,
+  useComposerRuntime,
 } from "@assistant-ui/react";
 import type { ToolCallMessagePartComponent } from "@assistant-ui/react";
 import {
@@ -31,6 +33,7 @@ import { SystemMessage } from "@/components/session-thread/SystemMessage";
 import { RunFooter } from "@/components/session-thread/RunFooter";
 import { SHELL_TOOL } from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
+import { useQueuedRecall } from "@/components/session-thread/queued-recall";
 import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
@@ -96,7 +99,10 @@ const ThreadMessage: FC = () => {
   }
   if (pending) {
     return (
-      <div className="opacity-50 transition-opacity" title="Pending — not yet in the conversation log">
+      <div
+        className="opacity-50 transition-opacity"
+        title="Pending — not yet in the conversation log"
+      >
         {inner}
       </div>
     );
@@ -263,6 +269,14 @@ const Composer: FC = () => {
   const banner = status ? COMPOSER_BANNER[status] : undefined;
   const hint = status ? COMPOSER_HINT[status] : undefined;
 
+  // ADR 0052: ↑ in an EMPTY composer pulls the most-recent still-queued
+  // message back out of the queue and into the textarea for editing — exactly
+  // "press up to edit queued messages". `recall()` dequeues it (so it can't be
+  // claimed while you edit); re-sending re-queues it, abandoning it cancels it.
+  const { canRecall, recall } = useQueuedRecall();
+  const composer = useComposerRuntime();
+  const isEmpty = useComposer((c) => c.text.trim().length === 0);
+
   if (banner) {
     return (
       <div className="rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground italic">
@@ -283,10 +297,33 @@ const Composer: FC = () => {
           className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/80"
           rows={1}
           aria-label="Message input"
+          onKeyDown={(e) => {
+            // Plain ↑ on an empty composer recalls the newest queued message.
+            // Any modifier or existing text falls through to normal caret nav.
+            if (
+              e.key === "ArrowUp" &&
+              !e.shiftKey &&
+              !e.metaKey &&
+              !e.ctrlKey &&
+              !e.altKey &&
+              canRecall &&
+              isEmpty
+            ) {
+              const text = recall();
+              if (text != null) {
+                e.preventDefault();
+                composer.setText(text);
+              }
+            }
+          }}
         />
         <ComposerAction />
       </div>
-      {hint && <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">{hint}</p>}
+      {canRecall && isEmpty ? (
+        <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">↑ to edit queued message</p>
+      ) : (
+        hint && <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">{hint}</p>
+      )}
     </ComposerPrimitive.Root>
   );
 };
