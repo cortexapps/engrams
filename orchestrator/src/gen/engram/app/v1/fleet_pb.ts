@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/fleet.proto.
  */
 export const file_engram_app_v1_fleet: GenFile = /*@__PURE__*/
-  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IvcCCghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhcKD2xvY2FsX3NuYXBzaG90cxgHIAEoBBIUCgxyZWFkeV9pbWFnZXMYCCABKAQSGwoTcmVhZHlfaW1hZ2VfZGlnZXN0cxgJIAMoCRIbChN1dGlsX2Rpc2tfdG90YWxfbWliGAogASgEEhoKEnV0aWxfZGlza191c2VkX21pYhgLIAEoBBIaChJ1dGlsX21lbV90b3RhbF9taWIYDCABKAQSGQoRdXRpbF9tZW1fdXNlZF9taWIYDSABKAQSFAoMdXRpbF9jcHVfcGN0GA4gASgCEhkKEWxhc3RfaGVhcnRiZWF0X2F0GA8gASgJIiEKDkdldEhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiOAoPR2V0SG9zdFJlc3BvbnNlEiUKBGhvc3QYASABKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IikKFkdldEhvc3RDb3dTdGF0ZVJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSJZChdHZXRIb3N0Q293U3RhdGVSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEi0KCHNlc3Npb25zGAIgAygLMhsuZW5ncmFtLmFwcC52MS5Db3dTdGF0ZVZpZXciIwoQRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIhMKEURyYWluSG9zdFJlc3BvbnNlIigKFUFkbWluRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJImwKFkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRISCgpldmFjdWF0aW5nGAIgAygJEi0KCGZhaWx1cmVzGAMgAygLMhsuZW5ncmFtLmFwcC52MS5EcmFpbkZhaWx1cmUiMQoMRHJhaW5GYWlsdXJlEhIKCnNlc3Npb25faWQYASABKAkSDQoFZXJyb3IYAiABKAkiJAoRQ29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI1ChJDb3Jkb25Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiJgoTVW5jb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIjcKFFVuY29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIhoKGEdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdCLqAQoZR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRIRCglzbmFwc2hvdHMYASABKAQSFgoOc25hcHNob3RfYnl0ZXMYAiABKAQSEgoKZ2NfcGVuZGluZxgDIAEoBBIZChF0cmFja2VkX3NhbmRib3hlcxgEIAEoBBIUCgxkaXJ0eV9jaHVua3MYBSABKAQSFwoPdW5mbHVzaGVkX2J5dGVzGAYgASgEEhgKEGF2Z19sb2NhbGl0eV9wY3QYByABKA0SKgoEcm93cxgIIAMoCzIcLmVuZ3JhbS5hcHAudjEuRHVyYWJpbGl0eVJvdyLlAQoNRHVyYWJpbGl0eVJvdxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIPCgdob3N0X2lkGAMgASgJEhQKDGRpcnR5X2NodW5rcxgEIAEoDRITCgtkaXJ0eV9ieXRlcxgFIAEoBBITCgtiYXNlX2NodW5rcxgGIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgHIAEoDRIaCg1sYXN0X2ZsdXNoX2F0GAggASgJSAGIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXQiKQoTRmx1c2hTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIlsKFEZsdXNoU2Vzc2lvblJlc3BvbnNlEg8KB291dGNvbWUYASABKAkSHQoQbWFuaWZlc3RfdmVyc2lvbhgCIAEoBEgAiAEBQhMKEV9tYW5pZmVzdF92ZXJzaW9uIlYKFkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgt0YXJnZXRfaG9zdBgCIAEoCUgAiAEBQg4KDF90YXJnZXRfaG9zdCI9ChdFdmFjdWF0ZVNlc3Npb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSIXChVHZXRGbGVldERlbWFuZFJlcXVlc3Qi8QEKFkdldEZsZWV0RGVtYW5kUmVzcG9uc2USEwoLcmVhZHlfaG9zdHMYASABKA0SGQoRc2NoZWR1bGFibGVfaG9zdHMYAiABKA0SEAoIZnJlZV9taWIYAyABKAQSEQoJdG90YWxfbWliGAQgASgEEhIKCmZyZWVfdmNwdXMYBSABKAQSEwoLdG90YWxfdmNwdXMYBiABKAQSFgoOY29yZG9uZWRfaG9zdHMYByABKA0SFwoPcXVldWVkX3Nlc3Npb25zGAggASgEEhIKCnF1ZXVlZF9taWIYCSABKAQSFAoMcXVldWVkX3ZjcHVzGAogASgEIkkKDkNodW5rR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIvcBCg9DaHVua0djUmVzcG9uc2USFQoNbGlzdGVkX2NodW5rcxgBIAEoBBIWCg5tYWxmb3JtZWRfa2V5cxgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSFQoNcmVzdGFydF9jb3VudBgFIAEoDRIgChhyZXN0YXJ0X2J1ZGdldF9leGhhdXN0ZWQYBiABKAgSGAoQcHJvbW90ZWRfZGVsZXRlcxgHIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYCCABKAQSEgoKZ3JhY2Vfc2VjcxgJIAEoBCJKCg9CdW5kbGVHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3MiowEKEEJ1bmRsZUdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhQKDHBpbl9zZXRfc2l6ZRgCIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgDIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAQgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgFIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAYgASgNIlAKFVNuYXBzaG90QmxvYkdjUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyLcAQoWU25hcHNob3RCbG9iR2NSZXNwb25zZRIOCgZsaXN0ZWQYASABKAQSEQoJbWFsZm9ybWVkGAIgASgEEhQKDHBpbl9zZXRfc2l6ZRgDIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgEIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAUgASgEEh4KFnByb21vdGVfcmVwaW5uZWRfc2tpcHMYBiABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAcgASgEEhUKDXJlc3RhcnRfY291bnQYCCABKA0y3QkKDEZsZWV0U2VydmljZRJOCglMaXN0SG9zdHMSHy5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1Jlc3BvbnNlEkgKB0dldEhvc3QSHS5lbmdyYW0uYXBwLnYxLkdldEhvc3RSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRIb3N0UmVzcG9uc2USYAoPR2V0SG9zdENvd1N0YXRlEiUuZW5ncmFtLmFwcC52MS5HZXRIb3N0Q293U3RhdGVSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5HZXRIb3N0Q293U3RhdGVSZXNwb25zZRJOCglEcmFpbkhvc3QSHy5lbmdyYW0uYXBwLnYxLkRyYWluSG9zdFJlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkRyYWluSG9zdFJlc3BvbnNlEl0KDkFkbWluRHJhaW5Ib3N0EiQuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USUQoKQ29yZG9uSG9zdBIgLmVuZ3JhbS5hcHAudjEuQ29yZG9uSG9zdFJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXNwb25zZRJXCgxVbmNvcmRvbkhvc3QSIi5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlc3BvbnNlEmYKEUdldFN0b3JhZ2VTdW1tYXJ5EicuZW5ncmFtLmFwcC52MS5HZXRTdG9yYWdlU3VtbWFyeVJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLkdldFN0b3JhZ2VTdW1tYXJ5UmVzcG9uc2USVwoMRmx1c2hTZXNzaW9uEiIuZW5ncmFtLmFwcC52MS5GbHVzaFNlc3Npb25SZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5GbHVzaFNlc3Npb25SZXNwb25zZRJgCg9FdmFjdWF0ZVNlc3Npb24SJS5lbmdyYW0uYXBwLnYxLkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkV2YWN1YXRlU2Vzc2lvblJlc3BvbnNlEkgKB0NodW5rR2MSHS5lbmdyYW0uYXBwLnYxLkNodW5rR2NSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5DaHVua0djUmVzcG9uc2USSwoIQnVuZGxlR2MSHi5lbmdyYW0uYXBwLnYxLkJ1bmRsZUdjUmVxdWVzdBofLmVuZ3JhbS5hcHAudjEuQnVuZGxlR2NSZXNwb25zZRJdCg5TbmFwc2hvdEJsb2JHYxIkLmVuZ3JhbS5hcHAudjEuU25hcHNob3RCbG9iR2NSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5TbmFwc2hvdEJsb2JHY1Jlc3BvbnNlEl0KDkdldEZsZWV0RGVtYW5kEiQuZW5ncmFtLmFwcC52MS5HZXRGbGVldERlbWFuZFJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkdldEZsZWV0RGVtYW5kUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_session]);
+  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IqUECghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhcKD2xvY2FsX3NuYXBzaG90cxgHIAEoBBIUCgxyZWFkeV9pbWFnZXMYCCABKAQSGwoTcmVhZHlfaW1hZ2VfZGlnZXN0cxgJIAMoCRIbChN1dGlsX2Rpc2tfdG90YWxfbWliGAogASgEEhoKEnV0aWxfZGlza191c2VkX21pYhgLIAEoBBIaChJ1dGlsX21lbV90b3RhbF9taWIYDCABKAQSGQoRdXRpbF9tZW1fdXNlZF9taWIYDSABKAQSFAoMdXRpbF9jcHVfcGN0GA4gASgCEhkKEWxhc3RfaGVhcnRiZWF0X2F0GA8gASgJEhAKCGNvcmRvbmVkGBAgASgIEhcKD2FsbG9jYXRhYmxlX21pYhgRIAEoBBIUCgxyZXNlcnZlZF9taWIYEiABKAQSEAoIZnJlZV9taWIYEyABKAQSEwoLdG90YWxfdmNwdXMYFCABKA0SGAoQY3B1X2J1ZGdldF92Y3B1cxgVIAEoBBIWCg5yZXNlcnZlZF92Y3B1cxgWIAEoBBISCgpmcmVlX3ZjcHVzGBcgASgEIiEKDkdldEhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiOAoPR2V0SG9zdFJlc3BvbnNlEiUKBGhvc3QYASABKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IikKFkdldEhvc3RDb3dTdGF0ZVJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSJZChdHZXRIb3N0Q293U3RhdGVSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEi0KCHNlc3Npb25zGAIgAygLMhsuZW5ncmFtLmFwcC52MS5Db3dTdGF0ZVZpZXciIwoQRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIhMKEURyYWluSG9zdFJlc3BvbnNlIigKFUFkbWluRHJhaW5Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJImwKFkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRISCgpldmFjdWF0aW5nGAIgAygJEi0KCGZhaWx1cmVzGAMgAygLMhsuZW5ncmFtLmFwcC52MS5EcmFpbkZhaWx1cmUiMQoMRHJhaW5GYWlsdXJlEhIKCnNlc3Npb25faWQYASABKAkSDQoFZXJyb3IYAiABKAkiJAoRQ29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI1ChJDb3Jkb25Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiJgoTVW5jb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIjcKFFVuY29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIiQKEURlbGV0ZUhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiFAoSRGVsZXRlSG9zdFJlc3BvbnNlIhoKGEdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdCLqAQoZR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRIRCglzbmFwc2hvdHMYASABKAQSFgoOc25hcHNob3RfYnl0ZXMYAiABKAQSEgoKZ2NfcGVuZGluZxgDIAEoBBIZChF0cmFja2VkX3NhbmRib3hlcxgEIAEoBBIUCgxkaXJ0eV9jaHVua3MYBSABKAQSFwoPdW5mbHVzaGVkX2J5dGVzGAYgASgEEhgKEGF2Z19sb2NhbGl0eV9wY3QYByABKA0SKgoEcm93cxgIIAMoCzIcLmVuZ3JhbS5hcHAudjEuRHVyYWJpbGl0eVJvdyLlAQoNRHVyYWJpbGl0eVJvdxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIPCgdob3N0X2lkGAMgASgJEhQKDGRpcnR5X2NodW5rcxgEIAEoDRITCgtkaXJ0eV9ieXRlcxgFIAEoBBITCgtiYXNlX2NodW5rcxgGIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgHIAEoDRIaCg1sYXN0X2ZsdXNoX2F0GAggASgJSAGIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXQiKQoTRmx1c2hTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIlsKFEZsdXNoU2Vzc2lvblJlc3BvbnNlEg8KB291dGNvbWUYASABKAkSHQoQbWFuaWZlc3RfdmVyc2lvbhgCIAEoBEgAiAEBQhMKEV9tYW5pZmVzdF92ZXJzaW9uIlYKFkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgt0YXJnZXRfaG9zdBgCIAEoCUgAiAEBQg4KDF90YXJnZXRfaG9zdCI9ChdFdmFjdWF0ZVNlc3Npb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSIXChVHZXRGbGVldERlbWFuZFJlcXVlc3Qi8QEKFkdldEZsZWV0RGVtYW5kUmVzcG9uc2USEwoLcmVhZHlfaG9zdHMYASABKA0SGQoRc2NoZWR1bGFibGVfaG9zdHMYAiABKA0SEAoIZnJlZV9taWIYAyABKAQSEQoJdG90YWxfbWliGAQgASgEEhIKCmZyZWVfdmNwdXMYBSABKAQSEwoLdG90YWxfdmNwdXMYBiABKAQSFgoOY29yZG9uZWRfaG9zdHMYByABKA0SFwoPcXVldWVkX3Nlc3Npb25zGAggASgEEhIKCnF1ZXVlZF9taWIYCSABKAQSFAoMcXVldWVkX3ZjcHVzGAogASgEIkkKDkNodW5rR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIvcBCg9DaHVua0djUmVzcG9uc2USFQoNbGlzdGVkX2NodW5rcxgBIAEoBBIWCg5tYWxmb3JtZWRfa2V5cxgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSFQoNcmVzdGFydF9jb3VudBgFIAEoDRIgChhyZXN0YXJ0X2J1ZGdldF9leGhhdXN0ZWQYBiABKAgSGAoQcHJvbW90ZWRfZGVsZXRlcxgHIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYCCABKAQSEgoKZ3JhY2Vfc2VjcxgJIAEoBCJKCg9CdW5kbGVHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3MiowEKEEJ1bmRsZUdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhQKDHBpbl9zZXRfc2l6ZRgCIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgDIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAQgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgFIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAYgASgNIlAKFVNuYXBzaG90QmxvYkdjUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyLcAQoWU25hcHNob3RCbG9iR2NSZXNwb25zZRIOCgZsaXN0ZWQYASABKAQSEQoJbWFsZm9ybWVkGAIgASgEEhQKDHBpbl9zZXRfc2l6ZRgDIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgEIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAUgASgEEh4KFnByb21vdGVfcmVwaW5uZWRfc2tpcHMYBiABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAcgASgEEhUKDXJlc3RhcnRfY291bnQYCCABKA0ysAoKDEZsZWV0U2VydmljZRJOCglMaXN0SG9zdHMSHy5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1Jlc3BvbnNlEkgKB0dldEhvc3QSHS5lbmdyYW0uYXBwLnYxLkdldEhvc3RSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRIb3N0UmVzcG9uc2USYAoPR2V0SG9zdENvd1N0YXRlEiUuZW5ncmFtLmFwcC52MS5HZXRIb3N0Q293U3RhdGVSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5HZXRIb3N0Q293U3RhdGVSZXNwb25zZRJOCglEcmFpbkhvc3QSHy5lbmdyYW0uYXBwLnYxLkRyYWluSG9zdFJlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkRyYWluSG9zdFJlc3BvbnNlEl0KDkFkbWluRHJhaW5Ib3N0EiQuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkFkbWluRHJhaW5Ib3N0UmVzcG9uc2USUQoKQ29yZG9uSG9zdBIgLmVuZ3JhbS5hcHAudjEuQ29yZG9uSG9zdFJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXNwb25zZRJXCgxVbmNvcmRvbkhvc3QSIi5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlc3BvbnNlElEKCkRlbGV0ZUhvc3QSIC5lbmdyYW0uYXBwLnYxLkRlbGV0ZUhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5EZWxldGVIb3N0UmVzcG9uc2USZgoRR2V0U3RvcmFnZVN1bW1hcnkSJy5lbmdyYW0uYXBwLnYxLkdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRJXCgxGbHVzaFNlc3Npb24SIi5lbmdyYW0uYXBwLnYxLkZsdXNoU2Vzc2lvblJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkZsdXNoU2Vzc2lvblJlc3BvbnNlEmAKD0V2YWN1YXRlU2Vzc2lvbhIlLmVuZ3JhbS5hcHAudjEuRXZhY3VhdGVTZXNzaW9uUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuRXZhY3VhdGVTZXNzaW9uUmVzcG9uc2USSAoHQ2h1bmtHYxIdLmVuZ3JhbS5hcHAudjEuQ2h1bmtHY1JlcXVlc3QaHi5lbmdyYW0uYXBwLnYxLkNodW5rR2NSZXNwb25zZRJLCghCdW5kbGVHYxIeLmVuZ3JhbS5hcHAudjEuQnVuZGxlR2NSZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5CdW5kbGVHY1Jlc3BvbnNlEl0KDlNuYXBzaG90QmxvYkdjEiQuZW5ncmFtLmFwcC52MS5TbmFwc2hvdEJsb2JHY1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLlNuYXBzaG90QmxvYkdjUmVzcG9uc2USXQoOR2V0RmxlZXREZW1hbmQSJC5lbmdyYW0uYXBwLnYxLkdldEZsZWV0RGVtYW5kUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuR2V0RmxlZXREZW1hbmRSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session]);
 
 /**
  * @generated from message engram.app.v1.ListHostsRequest
@@ -147,6 +147,52 @@ export type HostView = Message<"engram.app.v1.HostView"> & {
    * @generated from field: string last_heartbeat_at = 15;
    */
   lastHeartbeatAt: string;
+
+  /**
+   * ADR 0048 scheduler budget fields — mirror api/hosts.rs HostView. These
+   * were added to the Rust HostView but never to this proto; the scale-down
+   * wave's victim selection + 2D capacity guard (engram-host-operator) read
+   * them, so they must ride the wire. `cordoned` is the durable
+   * operator-owned bit (hosts.cordoned), distinct from `status`.
+   *
+   * @generated from field: bool cordoned = 16;
+   */
+  cordoned: boolean;
+
+  /**
+   * @generated from field: uint64 allocatable_mib = 17;
+   */
+  allocatableMib: bigint;
+
+  /**
+   * @generated from field: uint64 reserved_mib = 18;
+   */
+  reservedMib: bigint;
+
+  /**
+   * @generated from field: uint64 free_mib = 19;
+   */
+  freeMib: bigint;
+
+  /**
+   * @generated from field: uint32 total_vcpus = 20;
+   */
+  totalVcpus: number;
+
+  /**
+   * @generated from field: uint64 cpu_budget_vcpus = 21;
+   */
+  cpuBudgetVcpus: bigint;
+
+  /**
+   * @generated from field: uint64 reserved_vcpus = 22;
+   */
+  reservedVcpus: bigint;
+
+  /**
+   * @generated from field: uint64 free_vcpus = 23;
+   */
+  freeVcpus: bigint;
 };
 
 /**
@@ -434,6 +480,40 @@ export const UncordonHostResponseSchema: GenMessage<UncordonHostResponse> = /*@_
   messageDesc(file_engram_app_v1_fleet, 15);
 
 /**
+ * @generated from message engram.app.v1.DeleteHostRequest
+ */
+export type DeleteHostRequest = Message<"engram.app.v1.DeleteHostRequest"> & {
+  /**
+   * @generated from field: string host_id = 1;
+   */
+  hostId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.DeleteHostRequest.
+ * Use `create(DeleteHostRequestSchema)` to create a new message.
+ */
+export const DeleteHostRequestSchema: GenMessage<DeleteHostRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 16);
+
+/**
+ * Mirrors the old `DELETE /api/admin/hosts/:id` (204 No Content) — the
+ * host row is deregistered. No body to carry; faithfully matches the prior
+ * REST handler (success on Deleted, FAILED_PRECONDITION on SessionsBound).
+ *
+ * @generated from message engram.app.v1.DeleteHostResponse
+ */
+export type DeleteHostResponse = Message<"engram.app.v1.DeleteHostResponse"> & {
+};
+
+/**
+ * Describes the message engram.app.v1.DeleteHostResponse.
+ * Use `create(DeleteHostResponseSchema)` to create a new message.
+ */
+export const DeleteHostResponseSchema: GenMessage<DeleteHostResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 17);
+
+/**
  * @generated from message engram.app.v1.GetStorageSummaryRequest
  */
 export type GetStorageSummaryRequest = Message<"engram.app.v1.GetStorageSummaryRequest"> & {
@@ -444,7 +524,7 @@ export type GetStorageSummaryRequest = Message<"engram.app.v1.GetStorageSummaryR
  * Use `create(GetStorageSummaryRequestSchema)` to create a new message.
  */
 export const GetStorageSummaryRequestSchema: GenMessage<GetStorageSummaryRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 16);
+  messageDesc(file_engram_app_v1_fleet, 18);
 
 /**
  * Mirrors api/storage.rs StorageSummaryResponse (ADR 0029): fleet-wide
@@ -516,7 +596,7 @@ export type GetStorageSummaryResponse = Message<"engram.app.v1.GetStorageSummary
  * Use `create(GetStorageSummaryResponseSchema)` to create a new message.
  */
 export const GetStorageSummaryResponseSchema: GenMessage<GetStorageSummaryResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 17);
+  messageDesc(file_engram_app_v1_fleet, 19);
 
 /**
  * One per-sandbox row of the durability ledger.
@@ -580,7 +660,7 @@ export type DurabilityRow = Message<"engram.app.v1.DurabilityRow"> & {
  * Use `create(DurabilityRowSchema)` to create a new message.
  */
 export const DurabilityRowSchema: GenMessage<DurabilityRow> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 18);
+  messageDesc(file_engram_app_v1_fleet, 20);
 
 /**
  * @generated from message engram.app.v1.FlushSessionRequest
@@ -597,7 +677,7 @@ export type FlushSessionRequest = Message<"engram.app.v1.FlushSessionRequest"> &
  * Use `create(FlushSessionRequestSchema)` to create a new message.
  */
 export const FlushSessionRequestSchema: GenMessage<FlushSessionRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 19);
+  messageDesc(file_engram_app_v1_fleet, 21);
 
 /**
  * Mirrors api/admin.rs FlushNowResult.
@@ -629,7 +709,7 @@ export type FlushSessionResponse = Message<"engram.app.v1.FlushSessionResponse">
  * Use `create(FlushSessionResponseSchema)` to create a new message.
  */
 export const FlushSessionResponseSchema: GenMessage<FlushSessionResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 20);
+  messageDesc(file_engram_app_v1_fleet, 22);
 
 /**
  * @generated from message engram.app.v1.EvacuateSessionRequest
@@ -656,7 +736,7 @@ export type EvacuateSessionRequest = Message<"engram.app.v1.EvacuateSessionReque
  * Use `create(EvacuateSessionRequestSchema)` to create a new message.
  */
 export const EvacuateSessionRequestSchema: GenMessage<EvacuateSessionRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 21);
+  messageDesc(file_engram_app_v1_fleet, 23);
 
 /**
  * Mirrors api/admin.rs EvacuateSessionResponse. HTTP returns 202; the
@@ -686,7 +766,7 @@ export type EvacuateSessionResponse = Message<"engram.app.v1.EvacuateSessionResp
  * Use `create(EvacuateSessionResponseSchema)` to create a new message.
  */
 export const EvacuateSessionResponseSchema: GenMessage<EvacuateSessionResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 22);
+  messageDesc(file_engram_app_v1_fleet, 24);
 
 /**
  * @generated from message engram.app.v1.GetFleetDemandRequest
@@ -699,7 +779,7 @@ export type GetFleetDemandRequest = Message<"engram.app.v1.GetFleetDemandRequest
  * Use `create(GetFleetDemandRequestSchema)` to create a new message.
  */
 export const GetFleetDemandRequestSchema: GenMessage<GetFleetDemandRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 23);
+  messageDesc(file_engram_app_v1_fleet, 25);
 
 /**
  * Mirrors api/admin.rs FleetDemandResponse (ADR 0044 K4 / 0047 / 0048). The
@@ -784,7 +864,7 @@ export type GetFleetDemandResponse = Message<"engram.app.v1.GetFleetDemandRespon
  * Use `create(GetFleetDemandResponseSchema)` to create a new message.
  */
 export const GetFleetDemandResponseSchema: GenMessage<GetFleetDemandResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 24);
+  messageDesc(file_engram_app_v1_fleet, 26);
 
 /**
  * @generated from message engram.app.v1.ChunkGcRequest
@@ -821,7 +901,7 @@ export type ChunkGcRequest = Message<"engram.app.v1.ChunkGcRequest"> & {
  * Use `create(ChunkGcRequestSchema)` to create a new message.
  */
 export const ChunkGcRequestSchema: GenMessage<ChunkGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 25);
+  messageDesc(file_engram_app_v1_fleet, 27);
 
 /**
  * Mirrors api/admin.rs ChunkGcSweepResult.
@@ -898,7 +978,7 @@ export type ChunkGcResponse = Message<"engram.app.v1.ChunkGcResponse"> & {
  * Use `create(ChunkGcResponseSchema)` to create a new message.
  */
 export const ChunkGcResponseSchema: GenMessage<ChunkGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 26);
+  messageDesc(file_engram_app_v1_fleet, 28);
 
 /**
  * @generated from message engram.app.v1.BundleGcRequest
@@ -923,7 +1003,7 @@ export type BundleGcRequest = Message<"engram.app.v1.BundleGcRequest"> & {
  * Use `create(BundleGcRequestSchema)` to create a new message.
  */
 export const BundleGcRequestSchema: GenMessage<BundleGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 27);
+  messageDesc(file_engram_app_v1_fleet, 29);
 
 /**
  * Mirrors bundle_gc.rs BundleSweepReport (ADR 0035 §5). Unlike the
@@ -971,7 +1051,7 @@ export type BundleGcResponse = Message<"engram.app.v1.BundleGcResponse"> & {
  * Use `create(BundleGcResponseSchema)` to create a new message.
  */
 export const BundleGcResponseSchema: GenMessage<BundleGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 28);
+  messageDesc(file_engram_app_v1_fleet, 30);
 
 /**
  * @generated from message engram.app.v1.SnapshotBlobGcRequest
@@ -996,7 +1076,7 @@ export type SnapshotBlobGcRequest = Message<"engram.app.v1.SnapshotBlobGcRequest
  * Use `create(SnapshotBlobGcRequestSchema)` to create a new message.
  */
 export const SnapshotBlobGcRequestSchema: GenMessage<SnapshotBlobGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 29);
+  messageDesc(file_engram_app_v1_fleet, 31);
 
 /**
  * Mirrors snapshot_blob_gc.rs SnapshotBlobSweepReport (ADR 0028
@@ -1059,7 +1139,7 @@ export type SnapshotBlobGcResponse = Message<"engram.app.v1.SnapshotBlobGcRespon
  * Use `create(SnapshotBlobGcResponseSchema)` to create a new message.
  */
 export const SnapshotBlobGcResponseSchema: GenMessage<SnapshotBlobGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 30);
+  messageDesc(file_engram_app_v1_fleet, 32);
 
 /**
  * Fleet, storage, and GC operations (ADR 0051 §2.3, rev 2026-06-10).
@@ -1138,6 +1218,19 @@ export const FleetService: GenService<{
     methodKind: "unary";
     input: typeof UncordonHostRequestSchema;
     output: typeof UncordonHostResponseSchema;
+  },
+  /**
+   * ADR 0048 deregister — was DELETE /api/admin/hosts/:id (dropped in the
+   * ADR 0051 gRPC-only migration but never re-added here, stranding the
+   * operator's scale-down wave). FAILED_PRECONDITION if any session is
+   * still bound (drain first); idempotent-success if already gone.
+   *
+   * @generated from rpc engram.app.v1.FleetService.DeleteHost
+   */
+  deleteHost: {
+    methodKind: "unary";
+    input: typeof DeleteHostRequestSchema;
+    output: typeof DeleteHostResponseSchema;
   },
   /**
    * ADR 0029 Storage page rollup (GET /api/storage/summary).
