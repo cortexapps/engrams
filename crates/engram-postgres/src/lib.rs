@@ -3283,32 +3283,50 @@ impl MetadataStore for PostgresStore {
         id: Uuid,
         claimant: &str,
         error: &str,
-    ) -> Result<u32, MetaError> {
-        // Release the claim so ANY pod's next tick can retry — the
-        // failing pod holds no special ownership of the retry. Fenced
-        // by `claimed_by` (#232): a stale pod's transient error must
-        // not clear a peer's lease or stamp `error` on a job that
-        // peer is actively completing.
-        let attempts: Option<i32> = sqlx::query_scalar(
+        max_attempts: u32,
+        force_terminal: bool,
+    ) -> Result<(u32, EnableJobState), MetaError> {
+        // ONE atomic, fenced write: bump attempts, store error, release
+        // the claim, and flip to `failed` in the SAME statement iff the
+        // budget is spent OR the failure is non-retryable. Doing the flip
+        // here (not a follow-up set_enable_job_state) is load-bearing —
+        // this write nulls `claimed_by`, so a separate fenced flip would
+        // fence-miss and silently fail, leaving the job non-terminal to be
+        // re-claimed and re-failed forever (the runaway-attempts bug).
+        //
+        // The CASE reads the pre-bump `attempts`, so `attempts + 1` is the
+        // post-bump count on both lines. Fenced by `claimed_by` (#232): a
+        // stale pod's transient error must not clear a peer's lease or stamp
+        // `error` on a job that peer is actively completing.
+        let row: Option<(i32, String)> = sqlx::query_as(
             r#"
             UPDATE enable_jobs
                SET attempts = attempts + 1,
                    error = $3,
+                   state = CASE
+                             WHEN $5 OR attempts + 1 >= $4 THEN 'failed'
+                             ELSE state
+                           END,
                    claimed_by = NULL,
                    claimed_at = NULL,
                    updated_at = NOW()
              WHERE id = $1 AND claimed_by = $2
-            RETURNING attempts
+            RETURNING attempts, state
             "#,
         )
         .bind(id)
         .bind(claimant)
         .bind(error)
+        .bind(max_attempts as i32)
+        .bind(force_terminal)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        match attempts {
-            Some(a) => Ok(a.max(0) as u32),
+        match row {
+            Some((attempts, state)) => {
+                let state = row::parse_enable_job_state(&state)?;
+                Ok((attempts.max(0) as u32, state))
+            }
             None => Err(self.enable_job_fence_miss(id, claimant).await),
         }
     }

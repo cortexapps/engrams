@@ -169,24 +169,33 @@ async fn progress_state_failure_and_retry_round_trip() {
 
     // Failures bump attempts and store the error. A failure RELEASES
     // the claim (claimed_by → NULL), so re-claim before the next one —
-    // exactly what the scanner's next tick does.
-    let a1 = meta
-        .record_enable_job_failure(job.id, "pod-a", "registry 429")
+    // exactly what the scanner's next tick does. Below budget + not
+    // forced → state is unchanged (the flip happens atomically in the
+    // SAME call once the budget is spent).
+    let (a1, s1) = meta
+        .record_enable_job_failure(job.id, "pod-a", "registry 429", 5, false)
         .await
         .expect("fail 1");
     meta.claim_enable_jobs("pod-a", 300, 50)
         .await
         .expect("re-claim");
-    let a2 = meta
-        .record_enable_job_failure(job.id, "pod-a", "registry 503")
+    let (a2, s2) = meta
+        .record_enable_job_failure(job.id, "pod-a", "registry 503", 5, false)
         .await
         .expect("fail 2");
     assert_eq!((a1, a2), (1, 2));
+    assert_eq!(
+        (s1, s2),
+        (EnableJobState::Materializing, EnableJobState::Materializing)
+    );
     let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
     assert_eq!(got.attempts, 2);
     assert_eq!(got.error.as_deref(), Some("registry 503"));
-    // State unchanged by failure bookkeeping — the scanner decides
-    // when the budget is spent.
+    // State unchanged below budget — the atomic flip waits for the budget.
+    // (Budget-exhaustion + force-terminal flips are covered with fresh jobs
+    // in `failure_flips_failed_atomically_at_budget_and_on_force_terminal`,
+    // so this test's downstream retry-state assertions run on a job whose
+    // error/state history isn't perturbed.)
     assert_eq!(got.state, EnableJobState::Materializing);
 
     // Retry on a non-failed job is a Conflict.
@@ -224,6 +233,83 @@ async fn progress_state_failure_and_retry_round_trip() {
     meta.set_enable_job_state(job.id, "pod-a", EnableJobState::Failed)
         .await
         .expect("park");
+}
+
+/// 1a + 1b regression: a failure flips to `failed` ATOMICALLY — in the SAME
+/// fenced write that bumps `attempts` and releases the claim — when the budget
+/// is spent (`attempts + 1 >= max_attempts`) or the failure is non-retryable
+/// (`force_terminal`).
+///
+/// Pre-fix the flip lived in a SEPARATE `set_enable_job_state(Failed)` that ran
+/// after `record_enable_job_failure` had already nulled `claimed_by`; that write
+/// fence-missed and silently no-op'd, so the job never went terminal — it was
+/// re-claimed and re-failed every tick, blowing past `max_attempts` (the 550+
+/// runaway that bricked the fleet).
+#[tokio::test]
+#[ignore]
+async fn failure_flips_failed_atomically_at_budget_and_on_force_terminal() {
+    let Some(meta) = connect().await else { return };
+
+    // --- Budget path (1a): max_attempts = 2. ---
+    let uri = unique_uri("budget");
+    let job = meta
+        .create_or_get_enable_job(&uri, None)
+        .await
+        .expect("create");
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim");
+    let (a1, s1) = meta
+        .record_enable_job_failure(job.id, "pod-a", "transient 1", 2, false)
+        .await
+        .expect("fail 1");
+    assert_eq!(a1, 1);
+    assert_ne!(
+        s1,
+        EnableJobState::Failed,
+        "first of 2 attempts must stay non-terminal"
+    );
+    // The failure released the claim — re-claim like the scanner's next tick.
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("re-claim");
+    let (a2, s2) = meta
+        .record_enable_job_failure(job.id, "pod-a", "transient 2", 2, false)
+        .await
+        .expect("fail 2");
+    assert_eq!(a2, 2);
+    assert_eq!(
+        s2,
+        EnableJobState::Failed,
+        "budget spent must flip to failed in the SAME call"
+    );
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.state, EnableJobState::Failed);
+    assert_eq!(got.error.as_deref(), Some("transient 2"));
+
+    // --- Force-terminal path (1b): a deterministic failure (e.g. a [warm]
+    //     hook non-zero exit) bails on attempt 1, well under a generous budget. ---
+    let uri2 = unique_uri("force-terminal");
+    let job2 = meta
+        .create_or_get_enable_job(&uri2, None)
+        .await
+        .expect("create 2");
+    meta.claim_enable_jobs("pod-a", 300, 50)
+        .await
+        .expect("claim 2");
+    let (a, s) = meta
+        .record_enable_job_failure(job2.id, "pod-a", "[warm] hook exited 1", 5, true)
+        .await
+        .expect("force terminal");
+    assert_eq!(a, 1, "first attempt");
+    assert_eq!(
+        s,
+        EnableJobState::Failed,
+        "non-retryable must bail fast on attempt 1, not burn the budget"
+    );
+    let got2 = meta.get_enable_job(job2.id).await.unwrap().unwrap();
+    assert_eq!(got2.state, EnableJobState::Failed);
+    assert_eq!(got2.error.as_deref(), Some("[warm] hook exited 1"));
 }
 
 /// Issue #232 regression: enable-job lease fencing token.
@@ -307,7 +393,7 @@ async fn stale_claimant_writes_are_fenced_off() {
     // 3. A stale failure must not bump attempts, stamp error, or clear
     //    pod-b's claim out from under it.
     match meta
-        .record_enable_job_failure(job.id, "pod-a", "stale transient error")
+        .record_enable_job_failure(job.id, "pod-a", "stale transient error", 5, false)
         .await
     {
         Err(MetaError::Conflict(_)) => {}

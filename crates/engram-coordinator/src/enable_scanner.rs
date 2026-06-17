@@ -141,35 +141,41 @@ pub(crate) async fn run_once(
                 // actively completing. Do nothing; the peer drives it.
                 tracing::warn!(%job_id, reason = %msg, "enable job lease lost; abandoning to peer");
             }
-            Err(AdvanceError::Pipeline(e)) => {
-                // Per-job failure: bump attempts + store the error; flip
-                // to failed once the budget is spent. Keep sweeping —
-                // one wedged job must not stall the queue. These writes
-                // are themselves fenced: a Conflict means the lease went
-                // away between the failure and now, so we likewise drop.
-                let msg = e.to_string();
-                tracing::warn!(%job_id, error = %msg, "enable job pipeline failed");
+            Err(e @ (AdvanceError::Pipeline(_) | AdvanceError::NonRetryable(_))) => {
+                // Per-job failure: ONE atomic, fenced write bumps attempts,
+                // stores the error, releases the claim, AND flips to `failed`
+                // if the budget is spent (transient) or the failure is
+                // non-retryable (deterministic — bail fast). Keep sweeping;
+                // one wedged job must not stall the queue. A Conflict means
+                // the lease went away between the failure and now, so we drop.
+                let force_terminal = matches!(e, AdvanceError::NonRetryable(_));
+                let msg = match &e {
+                    AdvanceError::Pipeline(inner) | AdvanceError::NonRetryable(inner) => {
+                        inner.to_string()
+                    }
+                    AdvanceError::LeaseLost(_) => unreachable!("guarded by the outer pattern"),
+                };
+                tracing::warn!(%job_id, error = %msg, non_retryable = force_terminal, "enable job pipeline failed");
                 match state
                     .services
                     .meta
-                    .record_enable_job_failure(job_id, &claimant, &msg)
+                    .record_enable_job_failure(
+                        job_id,
+                        &claimant,
+                        &msg,
+                        cfg.max_attempts,
+                        force_terminal,
+                    )
                     .await
                 {
-                    Ok(attempts) if attempts >= cfg.max_attempts => {
+                    Ok((attempts, EnableJobState::Failed)) => {
                         tracing::warn!(
                             %job_id,
                             attempts,
                             max_attempts = cfg.max_attempts,
-                            "enable job budget exhausted; marking failed",
+                            non_retryable = force_terminal,
+                            "enable job marked failed",
                         );
-                        if let Err(e2) = state
-                            .services
-                            .meta
-                            .set_enable_job_state(job_id, &claimant, EnableJobState::Failed)
-                            .await
-                        {
-                            tracing::warn!(%job_id, error = %e2, "failed to mark enable job failed");
-                        }
                     }
                     Ok(_) => {}
                     Err(MetaError::Conflict(msg)) => {
@@ -191,9 +197,16 @@ enum AdvanceError {
     /// expired and a peer re-claimed the job. The worker must abandon
     /// the job WITHOUT any further state writes (#232).
     LeaseLost(String),
-    /// A genuine pipeline error (registry/GCS/capture). Eligible for the
-    /// attempts-budget failure path.
+    /// A transient pipeline error (registry/GCS, or a `NoCapacity` from
+    /// the capture host picker). Eligible for the attempts-budget retry
+    /// path — it may clear on its own next tick.
     Pipeline(Box<dyn std::error::Error + Send + Sync>),
+    /// A DETERMINISTIC failure that retrying cannot fix — most importantly
+    /// a `[warm]` hook that exits non-zero. Bail fast: fail the job on the
+    /// first occurrence instead of re-loading + re-capturing the image
+    /// `max_attempts` times for nothing. The operator can `RetryEnableJob`
+    /// after fixing the image.
+    NonRetryable(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<MetaError> for AdvanceError {
@@ -202,6 +215,17 @@ impl From<MetaError> for AdvanceError {
             MetaError::Conflict(msg) => AdvanceError::LeaseLost(msg),
             other => AdvanceError::Pipeline(Box::new(other)),
         }
+    }
+}
+
+/// Classify a base-snapshot capture failure. `ApiError::Unavailable` is the
+/// capture-host picker's `NoCapacity` — transient, retry. Everything else
+/// from capture (`ApiError::Internal`: a `[warm]` hook non-zero exit, a
+/// snapshot that failed HEAD-verify, …) is deterministic — bail fast.
+fn classify_capture_error(e: crate::error::ApiError) -> AdvanceError {
+    match e {
+        crate::error::ApiError::Unavailable(_) => AdvanceError::Pipeline(Box::new(e)),
+        other => AdvanceError::NonRetryable(Box::new(other)),
     }
 }
 
@@ -306,7 +330,7 @@ async fn advance_one(
     let (base_snapshot_id, base_snapshot_disk_manifest, base_snapshot_memory_manifest) =
         capture_and_record_base_snapshot(state, &row, &manifest)
             .await
-            .map_err(|e| AdvanceError::Pipeline(Box::new(e)))?;
+            .map_err(classify_capture_error)?;
     row.base_snapshot_id = Some(base_snapshot_id);
     row.base_snapshot_disk_manifest = Some(base_snapshot_disk_manifest);
     // `None` for cold-boot backends (VZ) — no memory snapshot to stamp.
@@ -353,7 +377,7 @@ mod tests {
     fn lease_conflict_maps_to_lease_lost_not_pipeline() {
         match AdvanceError::from(MetaError::Conflict("lease lost: held by pod-b".into())) {
             AdvanceError::LeaseLost(msg) => assert!(msg.contains("pod-b")),
-            AdvanceError::Pipeline(_) => {
+            AdvanceError::Pipeline(_) | AdvanceError::NonRetryable(_) => {
                 panic!("a lost-lease Conflict must NOT enter the failure-budget path")
             }
         }
@@ -368,10 +392,30 @@ mod tests {
         ] {
             match AdvanceError::from(e) {
                 AdvanceError::Pipeline(_) => {}
-                AdvanceError::LeaseLost(_) => {
+                AdvanceError::LeaseLost(_) | AdvanceError::NonRetryable(_) => {
                     panic!("only a Conflict should abandon; other errors retry via the budget")
                 }
             }
+        }
+    }
+
+    // 1b: a capture failure must be classified so a transient NoCapacity
+    // retries but a deterministic warm-hook/capture failure bails fast.
+    #[test]
+    fn capture_no_capacity_is_retryable_but_internal_is_not() {
+        // `ApiError::Unavailable` == the capture-host picker's NoCapacity.
+        match classify_capture_error(crate::error::ApiError::Unavailable(
+            "no host available (NoCapacity)".into(),
+        )) {
+            AdvanceError::Pipeline(_) => {}
+            _ => panic!("NoCapacity is transient — it must retry via the budget"),
+        }
+        // `ApiError::Internal` == a [warm] hook non-zero exit / verify-fail.
+        match classify_capture_error(crate::error::ApiError::Internal(
+            "[warm] hook exited with status Some(1)".into(),
+        )) {
+            AdvanceError::NonRetryable(_) => {}
+            _ => panic!("a deterministic capture failure must bail fast, not retry"),
         }
     }
 }
