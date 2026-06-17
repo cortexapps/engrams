@@ -5769,6 +5769,11 @@ impl SandboxBackend for PooledBackend {
         // in the rootfs of the image being captured, so the snapshot
         // is already complete without any second virtio-blk drive.
 
+        // The manifest `[env]` (JAVA_HOME, PATH, …) the `[warm]` hook needs.
+        // Captured before `spec` is moved into `create`; bound onto the
+        // capture VM below so the hook runs with the image's environment.
+        let session_env = spec.env.clone();
+
         // Boot the capture VM (opens the cold_boot operation scope on Linux).
         let id = self.create(spec).await?;
 
@@ -5783,6 +5788,17 @@ impl SandboxBackend for PooledBackend {
                 Err(SandboxError::InvalidSpec(_)) => {}
                 Err(e) => return Err(e),
             }
+            // Bind the manifest `[env]` onto the capture VM's agentd BEFORE
+            // the warm hook — mirroring `restore_base_for_session`. The hook
+            // execs with an otherwise-empty env (`run_warm_hook` passes
+            // `env: Default::default()`), so without this it runs with no
+            // `JAVA_HOME`/PATH and a gradle/node warmup fails fast (the
+            // dev-brain `[warm]` hook exited 1 in ~40 ms for exactly this).
+            // Applied unconditionally (when non-empty) so the captured
+            // snapshot also carries the image env, not just the hook.
+            if !session_env.is_empty() {
+                self.inner.merge_session_env(id, session_env).await?;
+            }
             // Capture-time prewarm hook (image `[warm]`): run the warm
             // command in the live VM BEFORE the snapshot, so a process it
             // leaves running (e.g. a `gradle --daemon`) is frozen into the
@@ -5793,8 +5809,9 @@ impl SandboxBackend for PooledBackend {
             // FAIL-LOUD: a non-zero exit or timeout aborts the capture
             // (and thus the enable) — we never ship a "cold" base snapshot
             // that a `[warm]` hook claimed to warm. The warm command must
-            // be hermetic (baked offline caches, no network); the capture
-            // VM has the manifest `[env]` but no per-session secrets.
+            // be hermetic (baked offline caches, no network); the capture VM
+            // now has the manifest `[env]` (bound above) but no per-session
+            // secrets.
             if let Some(warm) = warm {
                 self.run_warm_hook(id, &warm).await?;
             }
