@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AssistantRuntimeProvider,
   useExternalStoreRuntime,
@@ -51,10 +51,48 @@ const SEND_BLOCKED: ReadonlySet<SessionState> = new Set<SessionState>([
 ]);
 
 export function SessionThread({ sessionId, events, status }: SessionThreadProps) {
-  const { messages, isRunning } = useMemo(
+  const { messages: serverMessages, isRunning } = useMemo(
     () => buildMessages(events, sessionId, status),
     [events, sessionId, status],
   );
+
+  // Phase 1b: optimistic prompts. A prompt the user just submitted is held
+  // here (keyed by its client-minted prompt_id) and rendered as a greyed
+  // "pending" bubble, so the message is NEVER lost in the window between
+  // pressing Enter and the server's authoritative `role:user` echo landing
+  // over SSE. When that echo (same prompt_id) arrives, the optimistic entry
+  // is pruned and `buildMessages` renders the echo with the SAME id — so it
+  // transitions in place (no duplicate, no flicker), staying greyed until
+  // its run_started{prompt_id} consumes it.
+  const [pending, setPending] = useState<{ promptId: string; text: string }[]>([]);
+
+  const echoedPromptIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const { event } of events) {
+      if (event.type === "agent_message" && event.role === "user" && event.prompt_id) {
+        s.add(event.prompt_id);
+      }
+    }
+    return s;
+  }, [events]);
+
+  // Drop optimistic entries the server has now echoed (the authoritative
+  // message took over rendering).
+  useEffect(() => {
+    setPending((p) => p.filter((e) => !echoedPromptIds.has(e.promptId)));
+  }, [echoedPromptIds]);
+
+  const messages = useMemo(() => {
+    const optimistic: ThreadMessageLike[] = pending
+      .filter((e) => !echoedPromptIds.has(e.promptId))
+      .map((e) => ({
+        role: "user",
+        id: e.promptId,
+        content: [{ type: "text", text: e.text }],
+        metadata: { custom: { pending: true } },
+      }));
+    return optimistic.length ? [...serverMessages, ...optimistic] : serverMessages;
+  }, [serverMessages, pending, echoedPromptIds]);
 
   // ADR 0051 Task 24: sendPrompt + interrupt move to the connect-query
   // useMutation so they flow via the gated passthrough (/rpc/…) rather than
@@ -72,7 +110,18 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
     convertMessage: (m: ThreadMessageLike) => m,
     onNew: async (message) => {
       const text = appendText(message);
-      if (text) await sendPromptMutation.mutateAsync({ sessionId, text });
+      if (!text) return;
+      // Mint the prompt_id client-side so the optimistic bubble and the
+      // server echo share an identity (dedup + in-place transition).
+      const promptId = crypto.randomUUID();
+      setPending((p) => [...p, { promptId, text }]);
+      try {
+        await sendPromptMutation.mutateAsync({ sessionId, text, promptId });
+      } catch (err) {
+        // Send failed: drop the optimistic bubble so it isn't stuck greyed.
+        setPending((p) => p.filter((e) => e.promptId !== promptId));
+        console.warn("sendPrompt failed", err);
+      }
     },
     onCancel: async () => {
       // Nothing to interrupt once the session is idle/terminal (e.g. it was

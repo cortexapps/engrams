@@ -57,6 +57,11 @@ export type SessionEvent =
       type: "run_started";
       run_id: string;
       prompt_summary: string | null;
+      // Phase 1b: client-minted id of the prompt that started this run.
+      // The "queued prompt consumed" signal — a greyed/pending user
+      // bubble with this prompt_id transitions to solid (ungreys) here.
+      // Optional: events persisted before Phase 1b omit it.
+      prompt_id?: string | null;
       at: string;
     }
   | {
@@ -65,6 +70,10 @@ export type SessionEvent =
       message_id: string;
       role: AgentRole;
       text: string;
+      // Phase 1b: set on the coord's `role:user` echo to the client
+      // prompt_id, so the optimistic bubble dedupes against it. Null for
+      // assistant/system messages; absent on events persisted pre-Phase-1b.
+      prompt_id?: string | null;
       at: string;
     }
   | {
@@ -91,6 +100,12 @@ export type SessionEvent =
   // transcript renders an "interrupted" receipt and the run closes.
   | { type: "run_interrupted"; run_id: string; at: string }
   | { type: "harness_idle"; at: string }
+  // Phase 1b (ADR 0052): a prompt arrived mid-run and was queued
+  // (type-ahead / steering). Rendered as a greyed, editable composer
+  // item keyed on prompt_id until run_started{prompt_id} consumes it.
+  | { type: "prompt_queued"; prompt_id: string; summary: string | null; at: string }
+  | { type: "prompt_edited"; prompt_id: string; summary: string | null; at: string }
+  | { type: "prompt_dequeued"; prompt_id: string; at: string }
   | {
       type: "pull_request_opened";
       url: string;
