@@ -75,7 +75,7 @@ impl HostClient for FakeHost {
     }
     async fn bind_session(&self, _: SessionId, _: SandboxId) {}
     async fn unbind_session(&self, _: SessionId) {}
-    async fn send_prompt(&self, _: SandboxId, _: String) -> Result<(), SandboxError> {
+    async fn send_prompt(&self, _: SandboxId, _: String, _: String) -> Result<(), SandboxError> {
         unreachable!()
     }
     async fn acquire_shell(&self, _: SandboxId) -> Result<(), SandboxError> {

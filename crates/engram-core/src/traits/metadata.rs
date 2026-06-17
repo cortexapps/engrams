@@ -34,6 +34,27 @@ pub enum DisableEnabledImageOutcome {
     Blocked(Vec<(SessionId, String)>),
 }
 
+/// Track A: an `Active` session the desync watchdog flagged as wedged —
+/// the harness event stream desynced from the run state machine, leaving
+/// the session stuck without reaching a clean idle resting state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesyncedSession {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
+    /// The kind of the latest (non-rewound) event the session is stuck on.
+    pub latest_kind: String,
+    /// Which signature tripped: `"orphan_after_close"` (a run-scoped event
+    /// with no open run — the `bf3dbbcb` shape) or `"stuck_open_run"` (a
+    /// `run_started` that produced zero events since).
+    pub signature: String,
+    /// The session's `last_event_at` (COALESCEd to `created_at`). The
+    /// watchdog escalates from re-handshake to eviction once this ages past
+    /// the escalate TTL: a successful re-handshake re-emits `Idle`, bumping
+    /// this and dropping the session out of the flagged set, so a still-old
+    /// value means the nudges aren't taking.
+    pub last_event_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
 /// we can support SQLite for embedded deployments later.
 #[async_trait]
@@ -1086,23 +1107,33 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// Record a pipeline failure: bump `attempts`, store `error`,
-    /// release the claim (so any pod's next tick can retry), keep
-    /// the current state. Returns the post-bump attempt count — the
-    /// scanner flips to `failed` once it exceeds the budget.
+    /// Record a pipeline failure in ONE atomic, fenced write: bump
+    /// `attempts`, store `error`, release the claim (so any pod's next
+    /// tick can retry), and flip to `failed` iff the retry budget is
+    /// spent (`attempts + 1 >= max_attempts`) OR `force_terminal` is set
+    /// (a deterministic, non-retryable failure — e.g. a `[warm]` hook
+    /// that exits non-zero; retrying just re-loads the image for nothing).
+    /// Returns the post-bump attempt count and the RESULTING state.
+    ///
+    /// The flip MUST happen here, not in a follow-up `set_enable_job_state`:
+    /// this call releases the claim (`claimed_by → NULL`), so a separate
+    /// fenced state write would fence-miss (`claimed_by` no longer matches)
+    /// and silently fail — leaving the job non-terminal forever, re-claimed
+    /// and re-failed every tick (the runaway-attempts bug).
     ///
     /// Fenced by `claimant` — see [`Self::update_enable_job_progress`].
-    /// A stale pod's transient error must not clear the new
-    /// claimant's lease or stamp `error` on a job that pod is
-    /// actively completing. Returns [`MetaError::Conflict`] when the
-    /// lease has moved on.
+    /// A stale pod's transient error must not clear the new claimant's
+    /// lease or stamp `error` on a job that pod is actively completing.
+    /// Returns [`MetaError::Conflict`] when the lease has moved on.
     async fn record_enable_job_failure(
         &self,
         id: uuid::Uuid,
         claimant: &str,
         error: &str,
-    ) -> Result<u32, MetaError> {
-        let _ = (id, claimant, error);
+        max_attempts: u32,
+        force_terminal: bool,
+    ) -> Result<(u32, EnableJobState), MetaError> {
+        let _ = (id, claimant, error, max_attempts, force_terminal);
         Err(MetaError::Migration(
             "enable jobs unsupported by this store".into(),
         ))
@@ -1543,6 +1574,26 @@ pub trait MetadataStore: Send + Sync {
         &self,
         _idle_for_secs: i64,
     ) -> Result<Vec<(SessionId, SandboxId, chrono::DateTime<chrono::Utc>)>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Track A: `Active` sessions with a bound sandbox that the desync
+    /// watchdog flags as wedged. Two signatures the idle backstop is blind
+    /// to (it keys only off event *silence* — `MAX(created_at)`):
+    /// - `orphan_after_close`: the latest event is a run-scoped event
+    ///   (`agent_message` / `tool_call_*`) but no run is open — an event
+    ///   arrived after the run closed (the `bf3dbbcb` incident shape).
+    /// - `stuck_open_run`: a `run_started` is the latest event — the run
+    ///   opened and produced zero events since.
+    ///
+    /// Both gated on `last_event_at` older than `stuck_for_secs` (so a
+    /// healthy in-progress run, which keeps emitting, is never flagged).
+    /// The watchdog re-handshakes the flagged sessions. Default empty for
+    /// non-PG mocks.
+    async fn list_active_sessions_desynced(
+        &self,
+        _stuck_for_secs: i64,
+    ) -> Result<Vec<DesyncedSession>, MetaError> {
         Ok(Vec::new())
     }
 

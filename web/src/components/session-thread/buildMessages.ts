@@ -98,11 +98,23 @@ export interface RunFooter {
   endAt: string;
 }
 
+/** A prompt the harness has queued (type-ahead) and not yet consumed. */
+export interface QueuedPrompt {
+  promptId: string;
+  /** The wire `summary` (first ~1 KB of the prompt) — recall display fallback
+   *  when the full client-side text isn't available (refresh / other client). */
+  summary: string;
+}
+
 export interface BuildMessagesResult {
   messages: ThreadMessageLike[];
   /** Flows to `thread.isRunning` — drives the composer send/stop toggle
    *  and the trailing working indicator. */
   isRunning: boolean;
+  /** ADR 0052: prompts queued mid-turn (type-ahead) and not yet consumed,
+   *  oldest→newest. Drives the composer's ↑-to-edit recall + cancel. Rebuilt
+   *  purely from session events, so it survives refresh / multi-client. */
+  queue: QueuedPrompt[];
 }
 
 // ---- internal mutable drafts (assignable to ThreadMessageLike) --------
@@ -161,13 +173,26 @@ export function buildMessages(
   sessionId: string,
   status?: SessionState,
 ): BuildMessagesResult {
-  const out: Draft[] = [];
+  let out: Draft[] = [];
 
   // The assistant message currently accumulating this run's parts, or null
   // between runs / after a harness marker breaks the flow.
   let active: Draft | null = null;
   const openTools = new Map<string, ToolPart>(); // tool_call_id → part
   const openExecs = new Map<string, ToolPart>(); // exec_id → part
+  // Phase 1b: user-turn drafts keyed by prompt_id. A user message is
+  // rendered "pending" (greyed) from the moment its `role:user` echo
+  // lands until its `run_started{prompt_id}` consumes it — covering both
+  // the send→echo gap and a type-ahead message that's still queued.
+  const userDraftByPromptId = new Map<string, Draft>();
+
+  // ADR 0052: the harness-owned queue, mirrored from events. prompt_id →
+  // summary, insertion-ordered (oldest→newest). Entries leave on
+  // run_started (consumed), prompt_dequeued, or are updated by prompt_edited.
+  const queued = new Map<string, string>();
+  // prompt_ids whose greyed user bubble was pulled out of the thread by a
+  // dequeue (recalled to the composer / cancelled) — filtered from `out`.
+  const dequeuedPromptIds = new Set<string>();
 
   // Is a run in flight (run_started seen, no run_completed/_interrupted yet)?
   let runOpen = false;
@@ -230,18 +255,35 @@ export function buildMessages(
             createdAt: new Date(ev.at),
           });
         }
+        // Phase 1b: the prompt that started this run is now consumed —
+        // un-grey its pending user bubble (optimistic/queued → solid).
+        if (ev.prompt_id) {
+          const d = userDraftByPromptId.get(ev.prompt_id);
+          if (d?.metadata?.custom) delete d.metadata.custom.pending;
+          userDraftByPromptId.delete(ev.prompt_id);
+          queued.delete(ev.prompt_id); // consumed → leaves the queue
+        }
         break;
       }
 
       case "agent_message": {
         if (ev.role === "user") {
           active = null;
-          out.push({
+          // Phase 1b: a `prompt_id` ties this echo to the optimistic
+          // bubble (dedup, same id) and marks it "pending" (greyed) until
+          // its run_started consumes it. Echoes without a prompt_id (e.g.
+          // the env-seeded initial prompt) render solid as before.
+          const draft: Draft = {
             role: "user",
             content: [{ type: "text", text: ev.text }],
-            id: `m:${idx}`,
+            id: ev.prompt_id ?? `m:${idx}`,
             createdAt: new Date(ev.at),
-          });
+          };
+          if (ev.prompt_id) {
+            draft.metadata = { custom: { pending: true } };
+            userDraftByPromptId.set(ev.prompt_id, draft);
+          }
+          out.push(draft);
         } else if (ev.role === "system") {
           pushSystem(`m:${idx}`, ev.text, { kind: "note", role: ev.role, at: ev.at });
         } else {
@@ -410,6 +452,27 @@ export function buildMessages(
         active = null;
         break;
 
+      // ADR 0052: the harness-owned queue, reflected up. A mid-turn prompt is
+      // PromptQueued (then optionally PromptEdited), and leaves on
+      // PromptDequeued (pulled back / cancelled) or when run_started consumes
+      // it (above). The greyed user bubble is driven by the echo + run_started;
+      // these maintain the recall/cancel queue.
+      case "prompt_queued": {
+        queued.set(ev.prompt_id, ev.summary ?? "");
+        break;
+      }
+      case "prompt_edited": {
+        if (queued.has(ev.prompt_id)) queued.set(ev.prompt_id, ev.summary ?? "");
+        break;
+      }
+      case "prompt_dequeued": {
+        queued.delete(ev.prompt_id);
+        // The greyed bubble (keyed by prompt_id) leaves the thread — it's back
+        // in the composer being edited, or cancelled.
+        dequeuedPromptIds.add(ev.prompt_id);
+        break;
+      }
+
       default:
         // status_changed, evicted, checkpoint_* — not surfaced; the RAW
         // tab shows them.
@@ -425,6 +488,12 @@ export function buildMessages(
       for (let i = lenBefore; i < out.length; i++) markRewound(out[i]!);
       if (active) markRewound(active);
     }
+  }
+
+  // ADR 0052: drop greyed bubbles pulled out of the thread by a dequeue
+  // (recalled to the composer / cancelled). Their id IS the prompt_id.
+  if (dequeuedPromptIds.size) {
+    out = out.filter((d) => !dequeuedPromptIds.has(d.id));
   }
 
   // Bug fix (mid-turn eviction): the session's authoritative status wins over
@@ -457,7 +526,12 @@ export function buildMessages(
     }
   }
 
-  return { messages: out as ThreadMessageLike[], isRunning };
+  const queue: QueuedPrompt[] = [...queued].map(([promptId, summary]) => ({
+    promptId,
+    summary,
+  }));
+
+  return { messages: out as ThreadMessageLike[], isRunning, queue };
 }
 
 // Walk back from the tail (skipping durability markers, which don't imply

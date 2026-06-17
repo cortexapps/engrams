@@ -854,6 +854,7 @@ async fn create_session_unknown_image_is_invalid_argument() {
             prompt: None,
             harness_env: HashMap::new(),
             secrets: HashMap::new(),
+            prompt_id: None,
         })
         .await
         .expect_err("non-enabled image must error");

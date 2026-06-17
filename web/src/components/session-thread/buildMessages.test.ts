@@ -416,3 +416,119 @@ describe("buildMessages — isRunning", () => {
     expect(last.status).toEqual({ type: "running" });
   });
 });
+
+describe("buildMessages — Phase 1b queued/optimistic greying", () => {
+  test("a user echo with a prompt_id is keyed by it and ungreys once its run_started consumes it", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "do it",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const user = real(messages).find((m) => m.role === "user")!;
+    // Keyed by prompt_id so the optimistic bubble dedupes against it in place.
+    expect(user.id).toBe("p1");
+    // Consumed by run_started{p1} → solid (no longer greyed).
+    expect(user.metadata?.custom?.pending).toBeUndefined();
+  });
+
+  test("a still-queued user echo (no run_started yet) stays pending/greyed", () => {
+    const { messages } = buildMessages(
+      indexed([
+        // A run is in flight; a type-ahead prompt is echoed but not yet consumed.
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u2",
+          role: "user",
+          text: "and then deploy",
+          prompt_id: "p2",
+          at: AT2,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+    const queued = messages.find((m) => m.id === "p2")!;
+    expect(queued.metadata?.custom?.pending).toBe(true);
+  });
+});
+
+describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
+  test("prompt_queued enters the queue; run_started{prompt_id} consumes it", () => {
+    expect(
+      buildMessages(
+        indexed([{ type: "prompt_queued", prompt_id: "p1", summary: "do the thing", at: AT }]),
+        SID,
+      ).queue,
+    ).toEqual([{ promptId: "p1", summary: "do the thing" }]);
+
+    expect(
+      buildMessages(
+        indexed([
+          { type: "prompt_queued", prompt_id: "p1", summary: "do the thing", at: AT },
+          { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT2 },
+        ]),
+        SID,
+      ).queue,
+    ).toEqual([]);
+  });
+
+  test("prompt_edited updates the queued summary", () => {
+    expect(
+      buildMessages(
+        indexed([
+          { type: "prompt_queued", prompt_id: "p1", summary: "v1", at: AT },
+          { type: "prompt_edited", prompt_id: "p1", summary: "v2", at: AT2 },
+        ]),
+        SID,
+      ).queue,
+    ).toEqual([{ promptId: "p1", summary: "v2" }]);
+  });
+
+  test("prompt_dequeued removes the entry AND drops its greyed bubble from the thread", () => {
+    const result = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "hi",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "prompt_queued", prompt_id: "p1", summary: "hi", at: AT },
+        { type: "prompt_dequeued", prompt_id: "p1", at: AT2 },
+      ]),
+      SID,
+    );
+    expect(result.queue).toEqual([]);
+    // Pulled back into the composer / cancelled → no longer in the conversation.
+    expect(real(result.messages).some((m) => m.id === "p1")).toBe(false);
+  });
+
+  test("multiple queued prompts stay oldest→newest (↑ recalls the newest)", () => {
+    expect(
+      buildMessages(
+        indexed([
+          { type: "prompt_queued", prompt_id: "p1", summary: "first", at: AT },
+          { type: "prompt_queued", prompt_id: "p2", summary: "second", at: AT2 },
+        ]),
+        SID,
+      ).queue.map((q) => q.promptId),
+    ).toEqual(["p1", "p2"]);
+  });
+});

@@ -724,6 +724,15 @@ jobs:
           SHA: ${{ github.sha }}
           BAKED: ${{ needs.bake.result == 'success' }}
           CONTAINERS_CHANGED: ${{ needs.detect.outputs.images }}
+          # The per-lane bake matrix — exactly which container images THIS run
+          # built (JSON array, e.g. ["coordinator","web"]; ["host-agent"] for a
+          # host-agent-only commit). engrams-internal's helm-deploy reads
+          # client_payload.images to resolve each image's tag INDEPENDENTLY
+          # (CHART_REF if baked here, else its last build), so an unchanged image
+          # is never pinned to a sibling's SHA — the #334 break, where a
+          # host-agent-only commit fired engrams-changed (host-agent ∈ images)
+          # and pinned orchestrator to a SHA with no orchestrator image.
+          CONTAINERS_MATRIX: ${{ needs.detect.outputs.images_matrix }}
           HOST_BINARIES_CHANGED: ${{ needs.detect.outputs.host_binaries }}
           HOST_BASE_CHANGED: ${{ needs.detect.outputs.host_base }}
           TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
@@ -738,8 +747,8 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               https://api.github.com/repos/cortexapps/engrams-internal/dispatches \
-              -d "{\"event_type\":\"$event_type\",\"client_payload\":{\"engrams_ref\":\"$SHA\",\"baked\":$BAKED}}"
-            echo "Dispatched $event_type -> cortexapps/engrams-internal @ $SHA (baked=$BAKED)"
+              -d "{\"event_type\":\"$event_type\",\"client_payload\":{\"engrams_ref\":\"$SHA\",\"baked\":$BAKED,\"images\":$CONTAINERS_MATRIX}}"
+            echo "Dispatched $event_type -> cortexapps/engrams-internal @ $SHA (baked=$BAKED, images=$CONTAINERS_MATRIX)"
           }
           if [[ "$CONTAINERS_CHANGED" == "true" ]]; then
             fire engrams-changed

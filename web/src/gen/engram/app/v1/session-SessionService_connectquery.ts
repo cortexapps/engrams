@@ -37,6 +37,20 @@ export const sendPrompt = SessionService.method.sendPrompt;
 export const interrupt = SessionService.method.interrupt;
 
 /**
+ * Phase 1b (ADR 0052): mutate a still-queued (type-ahead) prompt by its
+ * client-minted prompt_id, before the harness consumes it. No-op once
+ * consumed (the harness is the single writer).
+ *
+ * @generated from rpc engram.app.v1.SessionService.EditQueuedPrompt
+ */
+export const editQueuedPrompt = SessionService.method.editQueuedPrompt;
+
+/**
+ * @generated from rpc engram.app.v1.SessionService.DequeueQueuedPrompt
+ */
+export const dequeueQueuedPrompt = SessionService.method.dequeueQueuedPrompt;
+
+/**
  * @generated from rpc engram.app.v1.SessionService.GetLog
  */
 export const getLog = SessionService.method.getLog;
