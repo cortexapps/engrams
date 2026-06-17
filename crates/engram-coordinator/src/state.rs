@@ -327,20 +327,16 @@ impl SessionEvent {
             }
             HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted { run_id, at },
             HarnessEvent::Idle => Self::HarnessIdle { at },
-            HarnessEvent::PromptQueued { prompt_id, summary } => {
-                Self::HarnessPromptQueued {
-                    prompt_id,
-                    summary,
-                    at,
-                }
-            }
-            HarnessEvent::PromptEdited { prompt_id, summary } => {
-                Self::HarnessPromptEdited {
-                    prompt_id,
-                    summary,
-                    at,
-                }
-            }
+            HarnessEvent::PromptQueued { prompt_id, summary } => Self::HarnessPromptQueued {
+                prompt_id,
+                summary,
+                at,
+            },
+            HarnessEvent::PromptEdited { prompt_id, summary } => Self::HarnessPromptEdited {
+                prompt_id,
+                summary,
+                at,
+            },
             HarnessEvent::PromptDequeued { prompt_id } => {
                 Self::HarnessPromptDequeued { prompt_id, at }
             }

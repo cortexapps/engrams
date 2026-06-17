@@ -802,7 +802,10 @@ mod tests {
             "prompt_edited"
         );
         assert_eq!(
-            HarnessEvent::PromptDequeued { prompt_id: "p".into() }.kind(),
+            HarnessEvent::PromptDequeued {
+                prompt_id: "p".into()
+            }
+            .kind(),
             "prompt_dequeued"
         );
         assert_eq!(HarnessEvent::Idle.kind(), "harness_idle");

@@ -261,7 +261,11 @@ fn harness_command_golden_and_variant_indices() {
     assert_variant_index(&HarnessCommand::Interrupt, 3, "HarnessCommand::Interrupt");
     // Track A appended Rehandshake (4); Phase 1b appends the queue
     // mutations (5,6) — existing indices never shift.
-    assert_variant_index(&HarnessCommand::Rehandshake, 4, "HarnessCommand::Rehandshake");
+    assert_variant_index(
+        &HarnessCommand::Rehandshake,
+        4,
+        "HarnessCommand::Rehandshake",
+    );
     assert_variant_index(&cmd_edit_queued(), 5, "HarnessCommand::EditQueued");
     assert_variant_index(&cmd_dequeue_queued(), 6, "HarnessCommand::DequeueQueued");
 }

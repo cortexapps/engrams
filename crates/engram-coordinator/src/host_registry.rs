@@ -730,7 +730,9 @@ impl HostClient for HostRegistry {
         text: String,
     ) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.edit_queued_prompt(sandbox_id, prompt_id, text).await
+        backend
+            .edit_queued_prompt(sandbox_id, prompt_id, text)
+            .await
     }
 
     async fn dequeue_queued_prompt(

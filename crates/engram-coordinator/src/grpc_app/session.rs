@@ -136,10 +136,9 @@ impl app::session_service_server::SessionService for AppSessionService {
         self.auth.check(&req)?;
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
-        let note =
-            crate::api::prompt::dequeue_queued_prompt_core(&self.state, id, r.prompt_id)
-                .await
-                .map_err(into_status)?;
+        let note = crate::api::prompt::dequeue_queued_prompt_core(&self.state, id, r.prompt_id)
+            .await
+            .map_err(into_status)?;
         Ok(Response::new(app::DequeueQueuedPromptResponse {
             session_id: id.to_string(),
             note: note.to_string(),
