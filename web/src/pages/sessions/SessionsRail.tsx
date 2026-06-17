@@ -20,8 +20,9 @@ import {
   SidebarMenuItem,
   SidebarMenuSkeleton,
 } from "@/components/ui/sidebar";
-import { relativeTime, shortId, stripImageHost } from "./session-format";
+import { relativeTime, shortId } from "./session-format";
 import { useRailSessions } from "./useRailSessions";
+import { ProfileChip } from "../../components/profiles/ProfileChip";
 
 // The persistent sessions rail: a live switcher between recent sessions that
 // stays mounted across the list views AND the transcript (the rail is the
@@ -105,9 +106,12 @@ export function SessionsRail() {
                             <span className="truncate font-mono text-[0.8rem] leading-tight">
                               {shortId(r.id)}
                             </span>
-                            <span className="truncate text-[0.7rem] leading-tight text-sidebar-foreground/70">
-                              {stripImageHost(r.image)}
-                            </span>
+                            <ProfileChip
+                              profile={r.profile}
+                              fallbackImage={r.image}
+                              disclosure="tooltip"
+                              className="text-[0.7rem] leading-tight text-sidebar-foreground/70"
+                            />
                           </span>
                           {/* Trailing slot crossfades the relative time with the
                               ⌥-jump number while the modifier is held. Stretches

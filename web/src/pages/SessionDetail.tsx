@@ -11,6 +11,8 @@ import { SessionCowState } from "../components/CowState";
 import { DurabilityTimeline } from "../components/DurabilityTimeline";
 import { MetricRow } from "../components/MetricRow";
 import { relativeTime } from "./sessions/session-format";
+import { useTasks } from "../hooks/useTasks";
+import { ProfileChip } from "../components/profiles/ProfileChip";
 import { Sidebar, SidebarContent, SidebarProvider } from "@/components/ui/sidebar";
 import { Text } from "@/components/ui/text";
 import { Button } from "@/components/ui/button";
@@ -38,6 +40,9 @@ const TABS = [
 export function SessionDetail() {
   const { id } = useParams({ from: "/_app/sessions/$id" });
   const { data: session } = useSession(id);
+  const { data: tasksData } = useTasks();
+  const profileSnap =
+    tasksData?.tasks.flatMap((t) => t.sessions).find((r) => r.sessionId === id)?.profile ?? null;
   const events = useSessionEvents(id);
   const [tab, setTab] = useState<ViewTab>("transcript");
   // Once the user opens the SHELL tab, keep TerminalPane mounted for
@@ -75,6 +80,24 @@ export function SessionDetail() {
               never lost (ADR 0029). The masthead is the shared PageHeading:
               `session` eyebrow over the mono session id. */}
           <PageHeading eyebrow="session" title={id} titleVariant="mono" />
+
+          <div className="mt-2">
+            <ProfileChip
+              profile={
+                profileSnap
+                  ? {
+                      id: profileSnap.id,
+                      name: profileSnap.name,
+                      icon: profileSnap.icon,
+                      archived: profileSnap.archived,
+                      imageUri: profileSnap.imageUri,
+                    }
+                  : null
+              }
+              fallbackImage={session?.image}
+              disclosure="hovercard"
+            />
+          </div>
 
           <div className="mt-4">
             <TabRow tabs={TABS} active={tab} onChange={setTab} />
