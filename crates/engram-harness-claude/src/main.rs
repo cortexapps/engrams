@@ -463,10 +463,8 @@ mod adapter {
                             );
                             return ExitCode::from(1);
                         }
-                        let backoff = std::cmp::min(
-                            MAX_RESPAWN_BACKOFF_SECS,
-                            1u64 << fast_crashes.min(4),
-                        );
+                        let backoff =
+                            std::cmp::min(MAX_RESPAWN_BACKOFF_SECS, 1u64 << fast_crashes.min(4));
                         tracing::warn!(
                             fast_crashes,
                             backoff_secs = backoff,
@@ -680,7 +678,11 @@ mod adapter {
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
         let argv = build_claude_argv(&resume_id);
-        tracing::info!(?argv, resume = resume_id.is_some(), "spawning persistent claude");
+        tracing::info!(
+            ?argv,
+            resume = resume_id.is_some(),
+            "spawning persistent claude"
+        );
 
         let claude_bin: &str = cli
             .claude_bin
@@ -977,14 +979,7 @@ mod adapter {
                 emit(evt_tx, HarnessEvent::Idle).await;
             } else if shutting_down {
                 // Grace expired mid-turn before claude could drain.
-                emit(
-                    evt_tx,
-                    HarnessEvent::RunCompleted {
-                        run_id,
-                        ok: false,
-                    },
-                )
-                .await;
+                emit(evt_tx, HarnessEvent::RunCompleted { run_id, ok: false }).await;
             } else {
                 // Unexpected crash mid-turn. Surface the durable artifact
                 // (bracketed by the run's RunStarted), close the run, and
@@ -1001,14 +996,7 @@ mod adapter {
                     },
                 )
                 .await;
-                emit(
-                    evt_tx,
-                    HarnessEvent::RunCompleted {
-                        run_id,
-                        ok: false,
-                    },
-                )
-                .await;
+                emit(evt_tx, HarnessEvent::RunCompleted { run_id, ok: false }).await;
                 emit(evt_tx, HarnessEvent::Idle).await;
             }
         } else {
