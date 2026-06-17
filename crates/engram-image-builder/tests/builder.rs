@@ -151,6 +151,13 @@ impl DockerRunner for RecordingDocker {
         Ok(())
     }
 
+    async fn builder_prune(&self) -> Result<(), DockerError> {
+        // Not recorded as a `Call` (same rationale as inspect_config): it's a
+        // best-effort disk reclaim, not part of the asserted build/create/
+        // export/rm/rmi orchestration order.
+        Ok(())
+    }
+
     async fn inspect_config(&self, _id: &str) -> Result<DockerImageConfig, DockerError> {
         // Intentionally not recorded as a `Call` so existing
         // orchestration-order assertions (build/create/export/rm/rmi)

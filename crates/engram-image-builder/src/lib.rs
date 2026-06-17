@@ -764,6 +764,16 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // an idempotent no-op (and still covers the pre-export error paths).
         let _ = self.docker.rm_container(container_id).await;
         let _ = self.docker.rmi(docker_tag).await;
+        // `rmi` drops the image reference but NOT the BuildKit cache, which
+        // holds a full ~image-sized copy of the just-built layers. For a large
+        // warm image (e.g. dev-brain: ~33 GiB tree → ~67 GiB ext4) that cache
+        // lingers on disk through the pack below — tree + ext4 + cache then
+        // overruns the CI runner with `mke2fs: No space left on device`.
+        // Prune it now so the pack's peak is just (exported tree + ext4).
+        // Best-effort: a prune failure must not fail the bake.
+        if let Err(e) = self.docker.builder_prune().await {
+            tracing::warn!(error = %e, "docker builder prune failed (non-fatal)");
+        }
 
         let dir_size = recursive_size(&rootfs_dir).await?;
 
