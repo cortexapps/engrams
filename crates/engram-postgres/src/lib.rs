@@ -1523,7 +1523,7 @@ impl MetadataStore for PostgresStore {
                    AND e.kind IN ('run_started', 'run_completed', 'run_interrupted')
                  ORDER BY e.session_id, e.idx DESC
             )
-            SELECT a.id, a.sandbox_id, l.kind AS latest_kind,
+            SELECT a.id, a.sandbox_id, a.le AS last_event_at, l.kind AS latest_kind,
                    CASE WHEN l.kind = 'run_started'
                         THEN 'stuck_open_run'
                         ELSE 'orphan_after_close'
@@ -1557,11 +1557,15 @@ impl MetadataStore for PostgresStore {
             let signature: String = r
                 .try_get("signature")
                 .map_err(|e| MetaError::Serialization(format!("desync signature: {e}")))?;
+            let last_event_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("last_event_at")
+                .map_err(|e| MetaError::Serialization(format!("desync last_event_at: {e}")))?;
             out.push(engram_core::traits::metadata::DesyncedSession {
                 session_id: SessionId::from(id),
                 sandbox_id: SandboxId::from(sandbox),
                 latest_kind,
                 signature,
+                last_event_at,
             });
         }
         Ok(out)

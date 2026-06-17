@@ -47,6 +47,12 @@ pub struct DesyncedSession {
     /// with no open run — the `bf3dbbcb` shape) or `"stuck_open_run"` (a
     /// `run_started` that produced zero events since).
     pub signature: String,
+    /// The session's `last_event_at` (COALESCEd to `created_at`). The
+    /// watchdog escalates from re-handshake to eviction once this ages past
+    /// the escalate TTL: a successful re-handshake re-emits `Idle`, bumping
+    /// this and dropping the session out of the flagged set, so a still-old
+    /// value means the nudges aren't taking.
+    pub last_event_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so

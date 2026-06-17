@@ -275,8 +275,8 @@ pub async fn run_with_registry_and_local(
     // Track A: harness-desync watchdog. Catches the wedge class the
     // silence-only backstop misses — a harness whose event stream desynced
     // from the run state machine (a run-scoped event with no open run, or a
-    // stuck-open run). Detection-only today; the non-destructive
-    // re-handshake recovery lands in a follow-up commit.
+    // stuck-open run) — and recovers it with a non-destructive harness
+    // re-handshake, escalating to the eviction lane if the nudges don't take.
     let _desync_watchdog =
         desync_watchdog::spawn(desync_watchdog::WatchdogConfig::from_env(), state.clone());
 

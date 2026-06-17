@@ -154,6 +154,14 @@ pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
 /// (ADR 0052) removes the inference that causes it.
 pub const HARNESS_DESYNC_DETECTED_TOTAL: &str = "engram_harness_desync_detected_total";
 
+/// Counter (Track A). Non-destructive harness re-handshakes the desync
+/// watchdog issued to resync a wedged session. A successful one re-emits
+/// `Idle` and the session drops out of the flagged set; a session that
+/// keeps getting re-handshaked (its `last_event_at` never advances) is
+/// escalated to the eviction lane (counted under
+/// `engram_eviction_nominated_total{source="desync_watchdog"}`).
+pub const HARNESS_REHANDSHAKE_TOTAL: &str = "engram_harness_rehandshake_total";
+
 /// Counter (ADR 0034). Eviction scanner gave up after the retry
 /// budget (20 attempts ≈ 3 min) and fell the session back to
 /// HostLost. Should be ~0 — alarm-worthy if rising: it means the
