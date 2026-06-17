@@ -96,6 +96,12 @@ pub enum SessionEvent {
         message_id: String,
         role: engram_harness_proto::AgentRole,
         text: String,
+        /// Phase 1b: set on the coord-emitted USER echo to the client's
+        /// `prompt_id`, so the web dedupes its optimistic bubble against
+        /// this event (the double-render fix). `None` for assistant/system
+        /// messages the harness emits. `#[serde(default)]` for back-compat.
+        #[serde(default)]
+        prompt_id: Option<String>,
         at: DateTime<Utc>,
     },
     HarnessToolCallStarted {
@@ -283,6 +289,9 @@ impl SessionEvent {
                 message_id,
                 role,
                 text,
+                // Harness-emitted messages are assistant/system; the user
+                // echo (which carries a prompt_id) is emitted by the coord.
+                prompt_id: None,
                 at,
             },
             HarnessEvent::ToolCallStarted {

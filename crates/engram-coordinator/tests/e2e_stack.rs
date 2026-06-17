@@ -152,6 +152,7 @@ impl Driver {
             prompt: None,
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
+            prompt_id: None,
         };
         let resp = self
             .sess
@@ -187,6 +188,7 @@ impl Driver {
             prompt: prompt.map(str::to_string),
             secrets: HashMap::new(),
             harness_env,
+            prompt_id: None,
         };
         let resp = self
             .sess

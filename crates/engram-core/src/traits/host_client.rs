@@ -283,6 +283,32 @@ pub trait HostClient: Send + Sync {
         text: String,
     ) -> Result<(), SandboxError>;
 
+    /// Phase 1b: edit a still-queued type-ahead prompt on the attached
+    /// harness by its `prompt_id`, before the harness consumes it. No-op
+    /// once consumed (the harness is the single writer). Default is a
+    /// no-op for impls without a real harness (test fakes); the
+    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
+    async fn edit_queued_prompt(
+        &self,
+        _sandbox_id: SandboxId,
+        _prompt_id: String,
+        _text: String,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// Phase 1b: remove a still-queued type-ahead prompt by its
+    /// `prompt_id` (the user pulled it back to the composer or cancelled),
+    /// before consumption. No-op once consumed. Default no-op for test
+    /// fakes; the real impls override it.
+    async fn dequeue_queued_prompt(
+        &self,
+        _sandbox_id: SandboxId,
+        _prompt_id: String,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0030: operator interrupt — stop the in-flight run on the
     /// attached harness for `sandbox_id` while keeping the session
     /// alive. The harness SIGINTs its current child and returns to Idle;

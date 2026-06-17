@@ -238,6 +238,29 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
+    async fn edit_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+        text: String,
+    ) -> Result<(), SandboxError> {
+        self.harness_hub
+            .edit_queued_prompt(sandbox_id, prompt_id, text)
+            .await
+            .map_err(harness_err_to_sandbox)
+    }
+
+    async fn dequeue_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+    ) -> Result<(), SandboxError> {
+        self.harness_hub
+            .dequeue_queued_prompt(sandbox_id, prompt_id)
+            .await
+            .map_err(harness_err_to_sandbox)
+    }
+
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.harness_hub
             .interrupt(sandbox_id)

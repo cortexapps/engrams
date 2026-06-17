@@ -119,6 +119,11 @@ pub(crate) fn create_request_from_proto(
         prompt,
         harness_env: _, // Handled at RPC layer (folded into identity_env).
         secrets,
+        // Phase 1b: the initial prompt's client prompt_id. The create path
+        // delivers the initial prompt via send_prompt (which mints one when
+        // empty), so threading the client id for the FIRST message is a
+        // deferred refinement; acknowledge the drop here.
+        prompt_id: _,
     } = r;
     let mode = match mode.as_str() {
         "" | "agent" => SessionMode::Agent,

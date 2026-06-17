@@ -521,6 +521,51 @@ impl HarnessHub {
         Ok(())
     }
 
+    /// Phase 1b: forward a queue-mutation command (Edit/Dequeue) to the
+    /// attached harness. Unlike `send_prompt` it neither waits/retries for
+    /// attach nor clears `last_idle_at` — the target prompt was already
+    /// queued (so the harness is attached); if it isn't, the prompt is
+    /// gone and `NotAttached` is the correct answer.
+    async fn send_queue_command(
+        &self,
+        sandbox_id: SandboxId,
+        cmd: HarnessCommand,
+    ) -> Result<(), HarnessError> {
+        let cmd_tx = self
+            .inner
+            .connections
+            .lock()
+            .get(&sandbox_id)
+            .map(|h| h.cmd_tx.clone())
+            .ok_or(HarnessError::NotAttached)?;
+        cmd_tx
+            .send(HarnessFrame::Command(cmd))
+            .await
+            .map_err(|_| HarnessError::WriterClosed)?;
+        Ok(())
+    }
+
+    /// Phase 1b: edit a still-queued type-ahead prompt by its `prompt_id`.
+    pub async fn edit_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+        text: String,
+    ) -> Result<(), HarnessError> {
+        self.send_queue_command(sandbox_id, HarnessCommand::EditQueued { prompt_id, text })
+            .await
+    }
+
+    /// Phase 1b: remove a still-queued type-ahead prompt by its `prompt_id`.
+    pub async fn dequeue_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+    ) -> Result<(), HarnessError> {
+        self.send_queue_command(sandbox_id, HarnessCommand::DequeueQueued { prompt_id })
+            .await
+    }
+
     /// Number of currently-attached harnesses. Diagnostic / test helper.
     pub fn attached_count(&self) -> usize {
         self.inner.connections.lock().len()
