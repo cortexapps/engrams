@@ -240,6 +240,15 @@ pub enum HarnessCommand {
     /// if no run is in flight. NOT a process kill — unlike `Shutdown`,
     /// the adapter does not exit.
     Interrupt,
+    /// Track A: non-destructive re-handshake. The adapter drops its
+    /// current host connection and immediately re-dials, re-running the
+    /// attach handshake (which re-emits `Idle` when idle) — the same
+    /// effect as the SIGUSR1 reconnect nudge, but in-band over the live
+    /// command channel. Used by the coordinator's desync watchdog to
+    /// resync a session whose event stream desynced from the run state
+    /// machine, WITHOUT touching the running agent: it never reaches the
+    /// engine, only the connection layer.
+    Rehandshake,
 }
 
 /// Why the host is asking for a checkpoint. Logged in `session_events`

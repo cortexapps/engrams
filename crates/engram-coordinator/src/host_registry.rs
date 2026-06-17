@@ -723,6 +723,11 @@ impl HostClient for HostRegistry {
         backend.interrupt(sandbox_id).await
     }
 
+    async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend.rehandshake(sandbox_id).await
+    }
+
     async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.pause(sandbox_id).await

@@ -148,6 +148,13 @@ where
                     // to interrupt. A real adapter stops its current
                     // run and emits RunInterrupted + Idle.
                 }
+                Ok(HarnessFrame::Command(HarnessCommand::Rehandshake)) => {
+                    // Track A: drop this connection so the host's
+                    // reconnect path re-dials. The noop test driver has a
+                    // single connection, so end the reader (the real
+                    // adapter re-dials in-process and re-emits Idle).
+                    return;
+                }
                 Ok(HarnessFrame::Event(_)) => {
                     // Host shouldn't send Events; ignore.
                 }

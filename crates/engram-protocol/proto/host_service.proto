@@ -97,6 +97,12 @@ service HostService {
   // attached harness (it SIGINTs its current `claude` child and
   // returns to Idle); the session stays alive and resumable.
   rpc InterruptHarness(InterruptHarnessRequest) returns (Empty);
+  // Track A: non-destructive re-handshake. Tell the attached harness to
+  // drop + re-dial its connection so the re-attach re-emits Idle,
+  // resyncing a session whose event stream desynced from the run state
+  // machine. The running agent is untouched. Driven by the coordinator's
+  // desync watchdog.
+  rpc RehandshakeHarness(RehandshakeHarnessRequest) returns (Empty);
 
   // StartAgent bundles SessionEgressPolicy inline so the host
   // applies the policy to its egress proxy registry *before*
@@ -403,6 +409,10 @@ message SendHarnessPromptRequest {
 }
 
 message InterruptHarnessRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+}
+
+message RehandshakeHarnessRequest {
   bytes sandbox_id = 1; // 16-byte UUID
 }
 

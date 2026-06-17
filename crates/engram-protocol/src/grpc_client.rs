@@ -34,8 +34,9 @@ use crate::grpc::{
     CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
     MigrationExportRef, MigrationFetchRequest, MigrationItem, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
-    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, StartAgentRequest, UnbindHarnessSessionRequest,
+    ReapMaterializeDirRequest, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -625,6 +626,18 @@ impl GrpcHostClient {
         self.inner
             .clone()
             .interrupt_harness(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    pub async fn rehandshake_harness(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        let req = RehandshakeHarnessRequest {
+            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+        };
+        self.inner
+            .clone()
+            .rehandshake_harness(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -1236,6 +1249,10 @@ impl HostClient for GrpcHostClient {
 
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.interrupt_harness(sandbox_id).await
+    }
+
+    async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        self.rehandshake_harness(sandbox_id).await
     }
 
     async fn pause(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
