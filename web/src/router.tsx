@@ -38,6 +38,8 @@ import { ImagesPanel } from "./components/settings/ImagesPanel";
 import { ProfilePanel } from "./components/settings/ProfilePanel";
 import { RegistriesPanel } from "./components/settings/RegistriesPanel";
 import { TokensPanel } from "./components/settings/TokensPanel";
+import { SessionProfiles } from "./pages/settings/SessionProfiles";
+import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -185,6 +187,24 @@ const membersRoute = createRoute({
   beforeLoad: requireAdmin,
   component: Members,
 });
+const profilesRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "profiles",
+  beforeLoad: requireAdmin,
+  component: SessionProfiles,
+});
+const profilesNewRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "profiles/new",
+  beforeLoad: requireAdmin,
+  component: () => <SessionProfileEditor mode="create" />,
+});
+const profileEditRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "profiles/$id",
+  beforeLoad: requireAdmin,
+  component: () => <SessionProfileEditor mode="edit" />,
+});
 
 const routeTree = rootRoute.addChildren([
   // /login — bare page, no app chrome
@@ -200,7 +220,15 @@ const routeTree = rootRoute.addChildren([
       operatorImagesRoute,
       operatorRegistriesRoute,
     ]),
-    settingsLayoutRoute.addChildren([settingsIndexRoute, profileRoute, tokensRoute, membersRoute]),
+    settingsLayoutRoute.addChildren([
+      settingsIndexRoute,
+      profileRoute,
+      tokensRoute,
+      membersRoute,
+      profilesRoute,
+      profilesNewRoute,
+      profileEditRoute,
+    ]),
   ]),
 ]);
 
