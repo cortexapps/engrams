@@ -6,13 +6,15 @@ import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegen
 import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv1";
 import type { Session } from "./session_pb";
 import { file_engram_app_v1_session } from "./session_pb";
+import type { ProfileSnapshot } from "./profile_pb";
+import { file_engram_app_v1_profile } from "./profile_pb";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file engram/app/v1/task.proto.
  */
 export const file_engram_app_v1_task: GenFile = /*@__PURE__*/
-  fileDesc("ChhlbmdyYW0vYXBwL3YxL3Rhc2sucHJvdG8SDWVuZ3JhbS5hcHAudjEicgoRQ3JlYXRlVGFza1JlcXVlc3QSDAoEdHlwZRgBIAEoCRIRCglpbWFnZV91cmkYAiABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESEgoFdGl0bGUYBCABKAlIAYgBAUIJCgdfcHJvbXB0QggKBl90aXRsZSI3ChJDcmVhdGVUYXNrUmVzcG9uc2USIQoEdGFzaxgBIAEoCzITLmVuZ3JhbS5hcHAudjEuVGFzayLgAQoEVGFzaxIKCgJpZBgBIAEoCRIMCgR0eXBlGAIgASgJEhIKBXRpdGxlGAMgASgJSACIAQESDgoGc3RhdHVzGAQgASgJEh8KEmNyZWF0ZWRfYnlfdXNlcl9pZBgFIAEoCUgBiAEBEhMKC3NvdXJjZV9qc29uGAYgASgJEi8KCHNlc3Npb25zGAcgAygLMh0uZW5ncmFtLmFwcC52MS5UYXNrU2Vzc2lvblJlZhISCgpjcmVhdGVkX2F0GAggASgJQggKBl90aXRsZUIVChNfY3JlYXRlZF9ieV91c2VyX2lkInoKDlRhc2tTZXNzaW9uUmVmEhIKCnNlc3Npb25faWQYASABKAkSEQoEcm9sZRgCIAEoCUgAiAEBEiwKB3Nlc3Npb24YAyABKAsyFi5lbmdyYW0uYXBwLnYxLlNlc3Npb25IAYgBAUIHCgVfcm9sZUIKCghfc2Vzc2lvbiISChBMaXN0VGFza3NSZXF1ZXN0IjcKEUxpc3RUYXNrc1Jlc3BvbnNlEiIKBXRhc2tzGAEgAygLMhMuZW5ncmFtLmFwcC52MS5UYXNrIiEKDkdldFRhc2tSZXF1ZXN0Eg8KB3Rhc2tfaWQYASABKAkiNAoPR2V0VGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2siJAoRRGVsZXRlVGFza1JlcXVlc3QSDwoHdGFza19pZBgBIAEoCSIUChJEZWxldGVUYXNrUmVzcG9uc2UyzQIKC1Rhc2tTZXJ2aWNlElEKCkNyZWF0ZVRhc2sSIC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVRhc2tSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5DcmVhdGVUYXNrUmVzcG9uc2USTgoJTGlzdFRhc2tzEh8uZW5ncmFtLmFwcC52MS5MaXN0VGFza3NSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5MaXN0VGFza3NSZXNwb25zZRJICgdHZXRUYXNrEh0uZW5ncmFtLmFwcC52MS5HZXRUYXNrUmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuR2V0VGFza1Jlc3BvbnNlElEKCkRlbGV0ZVRhc2sSIC5lbmdyYW0uYXBwLnYxLkRlbGV0ZVRhc2tSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5EZWxldGVUYXNrUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_session]);
+  fileDesc("ChhlbmdyYW0vYXBwL3YxL3Rhc2sucHJvdG8SDWVuZ3JhbS5hcHAudjEihAEKEUNyZWF0ZVRhc2tSZXF1ZXN0EgwKBHR5cGUYASABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESEgoFdGl0bGUYBCABKAlIAYgBARISCgpwcm9maWxlX2lkGAUgASgJQgkKB19wcm9tcHRCCAoGX3RpdGxlSgQIAhADUglpbWFnZV91cmkiNwoSQ3JlYXRlVGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2si4AEKBFRhc2sSCgoCaWQYASABKAkSDAoEdHlwZRgCIAEoCRISCgV0aXRsZRgDIAEoCUgAiAEBEg4KBnN0YXR1cxgEIAEoCRIfChJjcmVhdGVkX2J5X3VzZXJfaWQYBSABKAlIAYgBARITCgtzb3VyY2VfanNvbhgGIAEoCRIvCghzZXNzaW9ucxgHIAMoCzIdLmVuZ3JhbS5hcHAudjEuVGFza1Nlc3Npb25SZWYSEgoKY3JlYXRlZF9hdBgIIAEoCUIICgZfdGl0bGVCFQoTX2NyZWF0ZWRfYnlfdXNlcl9pZCK8AQoOVGFza1Nlc3Npb25SZWYSEgoKc2Vzc2lvbl9pZBgBIAEoCRIRCgRyb2xlGAIgASgJSACIAQESLAoHc2Vzc2lvbhgDIAEoCzIWLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkgBiAEBEjQKB3Byb2ZpbGUYBCABKAsyHi5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTbmFwc2hvdEgCiAEBQgcKBV9yb2xlQgoKCF9zZXNzaW9uQgoKCF9wcm9maWxlIhIKEExpc3RUYXNrc1JlcXVlc3QiNwoRTGlzdFRhc2tzUmVzcG9uc2USIgoFdGFza3MYASADKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2siIQoOR2V0VGFza1JlcXVlc3QSDwoHdGFza19pZBgBIAEoCSI0Cg9HZXRUYXNrUmVzcG9uc2USIQoEdGFzaxgBIAEoCzITLmVuZ3JhbS5hcHAudjEuVGFzayIkChFEZWxldGVUYXNrUmVxdWVzdBIPCgd0YXNrX2lkGAEgASgJIhQKEkRlbGV0ZVRhc2tSZXNwb25zZTLNAgoLVGFza1NlcnZpY2USUQoKQ3JlYXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuQ3JlYXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkNyZWF0ZVRhc2tSZXNwb25zZRJOCglMaXN0VGFza3MSHy5lbmdyYW0uYXBwLnYxLkxpc3RUYXNrc1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RUYXNrc1Jlc3BvbnNlEkgKB0dldFRhc2sSHS5lbmdyYW0uYXBwLnYxLkdldFRhc2tSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRUYXNrUmVzcG9uc2USUQoKRGVsZXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuRGVsZXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkRlbGV0ZVRhc2tSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session, file_engram_app_v1_profile]);
 
 /**
  * @generated from message engram.app.v1.CreateTaskRequest
@@ -27,11 +29,9 @@ export type CreateTaskRequest = Message<"engram.app.v1.CreateTaskRequest"> & {
   type: string;
 
   /**
-   * @generated from field: string image_uri = 2;
-   */
-  imageUri: string;
-
-  /**
+   * The user's task (no longer ever an admin-configured value; profiles carry
+   * no prompt — ADR §5).
+   *
    * @generated from field: optional string prompt = 3;
    */
   prompt?: string;
@@ -40,6 +40,14 @@ export type CreateTaskRequest = Message<"engram.app.v1.CreateTaskRequest"> & {
    * @generated from field: optional string title = 4;
    */
   title?: string;
+
+  /**
+   * The profile the user picked (ADR §5). Required in practice; the handler
+   * rejects an empty/unknown/archived id.
+   *
+   * @generated from field: string profile_id = 5;
+   */
+  profileId: string;
 };
 
 /**
@@ -152,6 +160,14 @@ export type TaskSessionRef = Message<"engram.app.v1.TaskSessionRef"> & {
    * @generated from field: optional engram.app.v1.Session session = 3;
    */
   session?: Session;
+
+  /**
+   * ADR 0052: resolved profile identity for the session's originating profile,
+   * for the app-wide chip (§9). Unset for legacy / profile-less sessions.
+   *
+   * @generated from field: optional engram.app.v1.ProfileSnapshot profile = 4;
+   */
+  profile?: ProfileSnapshot;
 };
 
 /**

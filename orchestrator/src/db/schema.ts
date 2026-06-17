@@ -50,6 +50,10 @@ export const taskSession = pgTable(
       .references(() => task.id, { onDelete: "cascade" }),
     sessionId: text("session_id").notNull(), // control-plane session id
     role: text("role"), // nullable until multi-session types exist
+    // ADR 0052: which profile started this session. Real intra-DB FK (§2).
+    // Nullable for pre-feature / out-of-band sessions. Profiles are only ever
+    // soft-deleted, so the target always exists; ON DELETE is moot.
+    profileId: text("profile_id").references(() => profile.id),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -57,6 +61,31 @@ export const taskSession = pgTable(
     index("task_session_session_idx").on(t.sessionId), // the authz join (ADR §6) hits this
   ],
 );
+
+// ---------------------------------------------------------------------------
+// Session profiles (ADR 0052)
+//
+// Admin-curated session starting points. Orchestrator-only data — the control
+// plane never learns about profiles. `image_id` is a LOGICAL ref to the
+// coordinator's enabled_images.id (not a DB FK — different tier, ADR §3);
+// integrity is enforced in application code. Soft delete only (deleted_at).
+// ---------------------------------------------------------------------------
+
+export const profile = pgTable("profile", {
+  id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  icon: text("icon").notNull().default("Bot"), // lucide icon name
+  imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
+  includeUserTokens: boolean("include_user_tokens").notNull().default(false),
+  envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at")
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+  deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
+});
 
 // ---------------------------------------------------------------------------
 // better-auth core tables + admin plugin fields (Task 16)

@@ -6,6 +6,7 @@ import { CommandMenu } from "../keyboard/CommandMenu";
 import { ShortcutsHelp } from "../keyboard/ShortcutsHelp";
 import { useKeyboardUi } from "../keyboard/store";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { Toaster } from "@/components/ui/sonner";
 
 // The app shell: the primary destinations rail + the active surface. Section
 // layouts (/sessions, /settings) render their own second sidebar INTO this
@@ -39,6 +40,7 @@ export function RootLayout() {
       <KeyboardShortcuts />
       <CommandMenu />
       <ShortcutsHelp />
+      <Toaster />
       <NewSessionDialog
         showTrigger={false}
         open={newSessionOpen}

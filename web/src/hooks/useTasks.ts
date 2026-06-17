@@ -16,6 +16,7 @@ import { authClient } from "../lib/auth-client";
 export function taskToSessionListItem(task: Task): SessionListItem {
   const ref = task.sessions[0];
   const sess = ref?.session;
+  const snap = ref?.profile;
   // Unattributed rows: id starts with 'unattributed-'; the session id is the
   // stable identifier. Fall back to task.id when there's no session ref yet.
   const id = ref?.sessionId ?? task.id;
@@ -35,6 +36,15 @@ export function taskToSessionListItem(task: Task): SessionListItem {
     owner_email: null,
     owner_name: null,
     owner_kind: null,
+    profile: snap
+      ? {
+          id: snap.id,
+          name: snap.name,
+          icon: snap.icon,
+          archived: snap.archived,
+          imageUri: snap.imageUri,
+        }
+      : null,
   };
 }
 

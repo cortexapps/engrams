@@ -56,11 +56,18 @@ import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
-import { sessions as defaultSessions } from "../control-plane/client.ts";
+import { sessions as defaultSessions, images as defaultImages } from "../control-plane/client.ts";
 import {
   makeUserSecretStore,
   type UserSecretStore,
+  CLAUDE_OAUTH_ENV_VAR,
 } from "../db/user-secrets.ts";
+import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
+import type { ImagesClient } from "./profiles.ts";
+
+// Re-export ImagesClient so downstream modules (image-guard, tests) can import
+// it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
+export type { ImagesClient } from "./profiles.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -97,6 +104,10 @@ export interface TaskDeps {
   sessions?: SessionsClient;
   /** Per-user KEK-sealed session secret store (ADR 0051 Drip A). */
   secrets?: UserSecretStore;
+  /** Admin-curated session profiles (ADR 0052). */
+  profiles?: ProfileStore;
+  /** Enabled-image catalog client (ADR 0052) — resolves image_id → image_uri. */
+  images?: ImagesClient;
   db?: Db;
 }
 
@@ -171,8 +182,9 @@ function buildTask(
     source: unknown;
     createdAt: Date;
   },
-  sessionRefs: Array<{ sessionId: string; role: string | null }>,
+  sessionRefs: Array<{ sessionId: string; role: string | null; profileId: string | null }>,
   sessionMap: Map<string, Session>,
+  profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>,
 ): Task {
   // Derive status from the primary session's live state (if available).
   let status = row.status;
@@ -187,10 +199,12 @@ function buildTask(
 
   const sessions: TaskSessionRef[] = sessionRefs.map((ref) => {
     const liveSession = sessionMap.get(ref.sessionId);
+    const snap = ref.profileId != null ? profileMap.get(ref.profileId) : undefined;
     return {
       sessionId: ref.sessionId,
       ...(ref.role != null ? { role: ref.role } : {}),
       ...(liveSession != null ? { session: liveSession } : {}),
+      ...(snap != null ? { profile: snap } : {}),
     } as TaskSessionRef;
   });
 
@@ -230,6 +244,35 @@ function buildUnattributedTask(sess: Session): Task {
   } as Task;
 }
 
+/** Resolve { profileId } → snapshot for the given refs (one images call + one profile query). */
+export async function buildProfileMap(
+  refs: Array<{ profileId: string | null }>,
+  profiles: ProfileStore,
+  imagesClient: ImagesClient,
+): Promise<Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>> {
+  const ids = [...new Set(refs.map((r) => r.profileId).filter((x): x is string => x != null))];
+  const out = new Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string }>();
+  if (ids.length === 0) return out;
+  // The image catalog lives on the control plane and may be transiently
+  // unavailable. Reads must stay best-effort: a catalog failure must not take
+  // down ListTasks/GetTask — the profile snapshot is still returned and only
+  // imageUri degrades to "". The profile store is the orchestrator's own DB, so
+  // its failure remains a hard error.
+  const catalogPromise = imagesClient
+    .listEnabledImages({})
+    .then((catalog) => new Map(catalog.images.map((i) => [i.id, i.imageUri])))
+    .catch(() => new Map<string, string>());
+  const [rows, uriById] = await Promise.all([profiles.getByIds(ids), catalogPromise]);
+  for (const p of rows) {
+    out.set(p.id, {
+      id: p.id, name: p.name, icon: p.icon,
+      archived: p.deletedAt != null,
+      imageUri: uriById.get(p.imageId) ?? "",
+    });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Core loader
 // ---------------------------------------------------------------------------
@@ -242,6 +285,8 @@ async function loadTask(
   taskId: string,
   db: Db,
   sessionsClient: SessionsClient,
+  profiles: ProfileStore,
+  imagesClient: ImagesClient,
 ): Promise<Task> {
   const db_ = db;
 
@@ -276,7 +321,8 @@ async function loadTask(
     }
   }
 
-  return buildTask(taskRow, sessionRefRows, sessionMap);
+  const profileMap = await buildProfileMap(sessionRefRows, profiles, imagesClient);
+  return buildTask(taskRow, sessionRefRows, sessionMap, profileMap);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +346,8 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
   // lazily so importing this module does not require a DB at import time.
   const resolveSecrets = (): UserSecretStore =>
     deps?.secrets ?? makeUserSecretStore(getDbFn());
+  const profiles: ProfileStore = deps?.profiles ?? makeProfileStore(getDbFn());
+  const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
 
   router.service(TaskService, {
     // -------------------------------------------------------------------------
@@ -309,43 +357,60 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const user = await requireUser(ctx, getSession);
       const ability = abilityFor(user);
 
-      // Only "chat" tasks exist yet.
       if (req.type !== "chat") {
         throw new ConnectError("only chat tasks exist yet", Code.InvalidArgument);
       }
-
       if (!ability.can("create", "Task")) {
         throw new ConnectError("forbidden", Code.PermissionDenied);
       }
-
-      // Resolve ALL of the caller's session secrets from our OWN store (ADR
-      // 0051 Drip A), KEK-envelope sealed at rest. The whole map rides
-      // CreateSession.harness_env (today that's just
-      // { CLAUDE_CODE_OAUTH_TOKEN: <token> }, but it generalizes to any
-      // env-var-keyed secret); the coordinator injects + persists it for resume.
-      // A lookup failure is non-fatal — no-harness images, and users who never
-      // saved a secret, work fine. An empty map is omitted. NEVER log values.
-      let harnessEnv: Record<string, string> | undefined;
-      try {
-        const all = await resolveSecrets().getAll(user.id);
-        harnessEnv = Object.keys(all).length > 0 ? all : undefined;
-      } catch (secretErr) {
-        console.warn(
-          `[TaskService] createTask: session-secret lookup failed for user ${user.id} — booting without harness env`,
-          secretErr,
-        );
-        harnessEnv = undefined;
+      if (!req.profileId) {
+        throw new ConnectError("profile_id is required", Code.InvalidArgument);
       }
 
-      // 1. Create the upstream session (control plane).
+      // 1. Load the active profile (ADR §5.1). Missing/archived → rejected.
+      const profile = await profiles.getActive(req.profileId);
+      if (!profile) {
+        throw new ConnectError("profile not found or archived", Code.NotFound);
+      }
+
+      // 2. Resolve image_id → current image_uri (ADR §5.2). Defense in depth
+      //    behind the DisableImage guard (Task 8): reject if no longer enabled.
+      const catalog = await imagesClient.listEnabledImages({});
+      const image = catalog.images.find((i) => i.id === profile.imageId);
+      if (!image) {
+        throw new ConnectError(
+          "the profile's image is no longer enabled — contact an admin",
+          Code.FailedPrecondition,
+        );
+      }
+
+      // 3. Assemble harness_env (ADR §5.4), lowest → highest precedence:
+      //    user Claude token (only if include_user_tokens) < profile env_vars.
+      //    NEVER log values.
+      const harness: Record<string, string> = {};
+      if (profile.includeUserTokens) {
+        try {
+          const userToken = await resolveSecrets().get(user.id, CLAUDE_OAUTH_ENV_VAR);
+          if (userToken) harness[CLAUDE_OAUTH_ENV_VAR] = userToken;
+        } catch (secretErr) {
+          console.warn(
+            `[TaskService] createTask: token lookup failed for user ${user.id} — booting without it`,
+            secretErr,
+          );
+        }
+      }
+      for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v; // profile overrides
+      const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
+
+      // 4. Create the upstream session. Mode is always "agent" (ADR §5).
       const created = await sessionsClient.createSession({
-        imageUri: req.imageUri,
+        imageUri: image.imageUri,
         mode: "agent",
         ...(req.prompt != null ? { prompt: req.prompt } : {}),
         ...(harnessEnv != null ? { harnessEnv } : {}),
       });
 
-      // 2. Insert task + task_session rows. Compensate on failure.
+      // 5. Insert task + task_session (recording profile_id). Compensate on failure.
       const taskId = crypto.randomUUID();
       try {
         const db = getDbFn();
@@ -362,15 +427,13 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
             taskId,
             sessionId: created.sessionId,
             role: "primary",
+            profileId: profile.id,
           });
         });
       } catch (dbErr) {
-        // Compensation: upstream session created but DB insert failed.
-        // Best-effort delete the session to avoid orphans.
         try {
           await sessionsClient.deleteSession({ sessionId: created.sessionId });
         } catch (delErr) {
-          // Log compensation failure but don't mask the original error.
           console.error(
             `[TaskService] createTask compensation: failed to delete orphan session ${created.sessionId} after DB error`,
             delErr,
@@ -379,12 +442,8 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw dbErr;
       }
 
-      // 3. Evict the negative-cache entry so authz/resolve.ts returns the new
-      //    owner immediately (avoids ≤5 s stale null window).
       evictOwnerCacheEntry(created.sessionId);
-
-      // 4. Return the newly created task with live session state.
-      const loaded = await loadTask(taskId, getDbFn(), sessionsClient);
+      const loaded = await loadTask(taskId, getDbFn(), sessionsClient, profiles, imagesClient);
       return { task: loaded };
     },
 
@@ -402,12 +461,18 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const sessionRefRows = await db.select().from(taskSessionTable);
 
       // Group session refs by taskId.
-      const refsByTaskId = new Map<string, Array<{ sessionId: string; role: string | null }>>();
+      const refsByTaskId = new Map<
+        string,
+        Array<{ sessionId: string; role: string | null; profileId: string | null }>
+      >();
       for (const ref of sessionRefRows) {
         const existing = refsByTaskId.get(ref.taskId) ?? [];
-        existing.push({ sessionId: ref.sessionId, role: ref.role });
+        existing.push({ sessionId: ref.sessionId, role: ref.role, profileId: ref.profileId });
         refsByTaskId.set(ref.taskId, existing);
       }
+
+      // Resolve profile snapshots once for all refs (one images call + one profile query).
+      const profileMap = await buildProfileMap(sessionRefRows, profiles, imagesClient);
 
       // Collect all known sessionIds from task_session table.
       const knownSessionIds = new Set(sessionRefRows.map((r) => r.sessionId));
@@ -442,7 +507,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           continue;
         }
         const refs = refsByTaskId.get(row.id) ?? [];
-        visibleTasks.push(buildTask(row, refs, sessionMap));
+        visibleTasks.push(buildTask(row, refs, sessionMap, profileMap));
       }
 
       // For admins: surface unattributed sessions as synthetic rows.
@@ -488,7 +553,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         throw new ConnectError("not found", Code.NotFound);
       }
 
-      const loaded = await loadTask(req.taskId, db, sessionsClient);
+      const loaded = await loadTask(req.taskId, db, sessionsClient, profiles, imagesClient);
       return { task: loaded };
     },
 

@@ -12,7 +12,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRouterTransport } from "@connectrpc/connect";
+import { ConnectError, Code, createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "../../test-utils";
 import { ImagesPanel } from "./ImagesPanel";
 import { ImageService } from "../../gen/engram/app/v1/image_pb";
@@ -65,6 +65,7 @@ interface Captures {
 function installCapturingTransport(
   initialImages: ProtoEnabledImageSummary[] = [],
   initialJobs: ProtoEnableJob[] = [],
+  disableError?: unknown,
 ): { transport: ReturnType<typeof createRouterTransport>; captures: Captures } {
   const captures: Captures = { enableCalls: [], disableCalls: [], refreshCalls: [] };
   const transport = createRouterTransport((router) => {
@@ -77,6 +78,7 @@ function installCapturingTransport(
       },
       disableImage: (req: DisableImageRequest) => {
         captures.disableCalls.push(req);
+        if (disableError) throw disableError;
         return {};
       },
       refreshImage: (req: RefreshImageRequest) => {
@@ -175,5 +177,24 @@ describe("ImagesPanel RPC contract", () => {
       const matches = screen.getAllByText("ghcr.io/cortex/api:warm-1");
       expect(matches).toHaveLength(1);
     });
+  });
+
+  test("disable rejection surfaces the failed_precondition message inline", async () => {
+    const { transport } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [],
+      new ConnectError(
+        "Can't disable — 1 profile uses this image: Backend",
+        Code.FailedPrecondition,
+      ),
+    );
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    const user = userEvent.setup();
+    await screen.findByText("ghcr.io/cortex/api:warm-1");
+    await user.click(screen.getByRole("button", { name: /^disable$/i }));
+    await user.click(await screen.findByRole("button", { name: /disable image/i }));
+
+    expect(await screen.findByText(/1 profile uses this image/i)).toBeTruthy();
   });
 });

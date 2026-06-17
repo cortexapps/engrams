@@ -59,6 +59,10 @@ export type GetSession = (
  */
 export type ResolveOwner = (sessionId: string) => Promise<string | null>;
 
+/** Optional per-method pre-flight, keyed by policyKey ("ImageService.DisableImage").
+ *  Runs AFTER the authz gate and BEFORE the upstream forward. Throws to block. */
+export type Preflight = (req: unknown, ctx: HandlerContext) => Promise<void>;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -137,6 +141,8 @@ function upstreamHeaders(inbound: Headers): Headers {
  * @param upstream      The control-plane Transport to forward calls to.
  * @param getSession    Optional override for better-auth session resolution.
  * @param resolveOwner  Optional override for session-owner DB lookup (tests).
+ * @param preflight     Optional per-method pre-flight hooks, keyed by policyKey.
+ *                      Each runs after the authz gate and before the forward.
  */
 export function registerPassthrough(
   router: ConnectRouter,
@@ -144,6 +150,7 @@ export function registerPassthrough(
   upstream: Transport,
   getSession?: GetSession,
   resolveOwner?: ResolveOwner,
+  preflight?: Record<string, Preflight>,
 ): void {
   const resolveSession: GetSession =
     getSession ??
@@ -169,6 +176,11 @@ export function registerPassthrough(
         continue;
       }
 
+      // Per-method policy key (e.g. "ImageService.DisableImage"). Hoisted out
+      // of the gate closure so the unary handler can use it to look up an
+      // optional pre-flight hook.
+      const key = policyKey(service.typeName, m);
+
       /**
        * Authz gate — runs before any upstream call.
        * Throws a ConnectError on failure.
@@ -181,7 +193,6 @@ export function registerPassthrough(
         }
 
         // 2. Look up policy (fail-closed: no entry → denied).
-        const key = policyKey(service.typeName, m);
         const entry = POLICY[key];
         if (!entry) {
           throw new ConnectError(
@@ -239,6 +250,8 @@ export function registerPassthrough(
       if (m.methodKind === "unary") {
         impl[m.localName] = async (req: unknown, ctx: HandlerContext) => {
           await gate(req, ctx);
+          const pf = preflight?.[key];
+          if (pf) await pf(req, ctx);
           const res = await upstream.unary(
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             m as any,

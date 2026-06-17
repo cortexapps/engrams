@@ -1,4 +1,4 @@
-import { KeyRound, Users, UserCircle } from "lucide-react";
+import { KeyRound, Users, UserCircle, IdCard } from "lucide-react";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { useAbility } from "../../auth/AuthProvider";
 import {
@@ -21,7 +21,10 @@ const MINE: NavItem[] = [
   { to: "/settings/profile", label: "Profile", icon: UserCircle },
   { to: "/settings/tokens", label: "Tokens", icon: KeyRound },
 ];
-const ORG: NavItem[] = [{ to: "/settings/members", label: "Members", icon: Users }];
+const ORG: NavItem[] = [
+  { to: "/settings/members", label: "Members", icon: Users },
+  { to: "/settings/profiles", label: "Session Profiles", icon: IdCard },
+];
 
 export function SettingsLayout() {
   const ability = useAbility();

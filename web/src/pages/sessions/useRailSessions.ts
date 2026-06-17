@@ -1,7 +1,7 @@
 import { useRouterState } from "@tanstack/react-router";
 import { useSession } from "../../hooks/useSessions";
 import { useTasksAsSessionList } from "../../hooks/useTasks";
-import type { Session, SessionListItem, SessionState } from "../../lib/types";
+import type { Session, SessionListItem, SessionState, ProfileSnapshotView } from "../../lib/types";
 import { compareSessions } from "./session-format";
 
 // The ordered, capped, open-session-pinned list that backs BOTH the sessions
@@ -30,18 +30,21 @@ export interface RailRow {
   status: SessionState;
   image: string;
   at: string;
+  profile?: ProfileSnapshotView | null;
 }
 const fromListItem = (s: SessionListItem): RailRow => ({
   id: s.id,
   status: s.status,
   image: s.image,
   at: s.last_active_at,
+  profile: s.profile,
 });
 const fromSession = (s: Session): RailRow => ({
   id: s.id,
   status: s.status,
   image: s.image,
   at: s.created_at,
+  profile: null,
 });
 
 // Stable order so the 1s refetch never reorders rows under the cursor: by
