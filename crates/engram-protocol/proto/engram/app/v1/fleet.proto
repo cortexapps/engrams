@@ -26,6 +26,11 @@ service FleetService {
   rpc AdminDrainHost(AdminDrainHostRequest) returns (AdminDrainHostResponse);
   rpc CordonHost(CordonHostRequest) returns (CordonHostResponse);
   rpc UncordonHost(UncordonHostRequest) returns (UncordonHostResponse);
+  // ADR 0048 deregister — was DELETE /api/admin/hosts/:id (dropped in the
+  // ADR 0051 gRPC-only migration but never re-added here, stranding the
+  // operator's scale-down wave). FAILED_PRECONDITION if any session is
+  // still bound (drain first); idempotent-success if already gone.
+  rpc DeleteHost(DeleteHostRequest) returns (DeleteHostResponse);
   // ADR 0029 Storage page rollup (GET /api/storage/summary).
   rpc GetStorageSummary(GetStorageSummaryRequest) returns (GetStorageSummaryResponse);
   // ADR 0016 Phase B explicit flush trigger
@@ -86,6 +91,19 @@ message HostView {
   // (api/host_http.rs) and refreshed on every heartbeat. A
   // never-heartbeated host still carries its registration stamp.
   string last_heartbeat_at = 15;
+  // ADR 0048 scheduler budget fields — mirror api/hosts.rs HostView. These
+  // were added to the Rust HostView but never to this proto; the scale-down
+  // wave's victim selection + 2D capacity guard (engram-host-operator) read
+  // them, so they must ride the wire. `cordoned` is the durable
+  // operator-owned bit (hosts.cordoned), distinct from `status`.
+  bool cordoned = 16;
+  uint64 allocatable_mib = 17;
+  uint64 reserved_mib = 18;
+  uint64 free_mib = 19;
+  uint32 total_vcpus = 20;
+  uint64 cpu_budget_vcpus = 21;
+  uint64 reserved_vcpus = 22;
+  uint64 free_vcpus = 23;
 }
 
 message GetHostRequest {
@@ -163,6 +181,15 @@ message UncordonHostResponse {
   // Always "ready" on success.
   string status = 2;
 }
+
+message DeleteHostRequest {
+  string host_id = 1;
+}
+
+// Mirrors the old `DELETE /api/admin/hosts/:id` (204 No Content) — the
+// host row is deregistered. No body to carry; faithfully matches the prior
+// REST handler (success on Deleted, FAILED_PRECONDITION on SessionsBound).
+message DeleteHostResponse {}
 
 message GetStorageSummaryRequest {}
 

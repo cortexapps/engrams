@@ -10,13 +10,15 @@ use std::fmt;
 pub enum OperatorError {
     /// Kubernetes API error (get/list/patch/delete, or client setup).
     Kube(kube::Error),
-    /// Transport-level failure talking to the coordinator admin API.
-    Http(reqwest::Error),
-    /// The coordinator admin API returned a non-success status.
-    Coord {
+    /// A coordinator `FleetService` gRPC call failed (transport flake or a
+    /// non-OK status). `op` is the logical operation (cordon/drain/…) for
+    /// diagnostics — preserves the old per-op error label.
+    Rpc {
         op: &'static str,
-        status: u16,
-        body: String,
+        // Boxed: `tonic::Status` is ~192 bytes; unboxed it bloats every
+        // `Result<_, OperatorError>` in the reconcile loop
+        // (clippy::result_large_err).
+        status: Box<tonic::Status>,
     },
     /// A drain did not reach `running_sandboxes == 0` within the budget;
     /// the roll is aborted and the pod left in place.
@@ -35,10 +37,7 @@ impl fmt::Display for OperatorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Kube(e) => write!(f, "kubernetes api error: {e}"),
-            Self::Http(e) => write!(f, "coordinator http error: {e}"),
-            Self::Coord { op, status, body } => {
-                write!(f, "coordinator {op} returned {status}: {body}")
-            }
+            Self::Rpc { op, status } => write!(f, "coordinator {op} failed: {status}"),
             Self::DrainTimeout { host_id, remaining } => write!(
                 f,
                 "drain of host {host_id} timed out with {remaining} sandbox(es) still running"
@@ -57,7 +56,7 @@ impl std::error::Error for OperatorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Kube(e) => Some(e),
-            Self::Http(e) => Some(e),
+            Self::Rpc { status, .. } => Some(status.as_ref()),
             Self::Cloud(e) => Some(e),
             _ => None,
         }
@@ -67,12 +66,6 @@ impl std::error::Error for OperatorError {
 impl From<kube::Error> for OperatorError {
     fn from(e: kube::Error) -> Self {
         Self::Kube(e)
-    }
-}
-
-impl From<reqwest::Error> for OperatorError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Http(e)
     }
 }
 

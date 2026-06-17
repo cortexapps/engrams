@@ -693,15 +693,32 @@ pub async fn reattach(
             ConnectMode::Reconfigure,
         )
         .await?;
-        // An adopted socket stays open (the kernel holds its dup);
-        // a rejected one EOFs the serve loop near-instantly.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        if !handle
-            .serve_task
-            .as_ref()
-            .map(|t| t.is_finished())
-            .unwrap_or(true)
-        {
+        // An adopted socket stays open (the kernel holds its dup); a
+        // rejected one (kernel-swallowed ENOSPC) EOFs the serve loop. The
+        // EOF is near-instant in the KERNEL, but observing the serve task
+        // FINISH is subject to runtime scheduling jitter — a single short
+        // check raced it under load: a rejection whose EOF surfaced after
+        // the window read as a FALSE "adopted", `reattach` returned Ok, and
+        // the guest's parked I/O never resumed (flaky
+        // survivor_reconfigure_resumes_parked_io; in prod, a hung guest).
+        // Poll for the rejection EOF over a generous window — retry the
+        // moment it finishes, declare adoption only if it stays alive.
+        const ADOPT_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
+        let confirm_deadline = std::time::Instant::now() + ADOPT_CONFIRM;
+        let mut rejected = false;
+        while std::time::Instant::now() < confirm_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if handle
+                .serve_task
+                .as_ref()
+                .map(|t| t.is_finished())
+                .unwrap_or(true)
+            {
+                rejected = true;
+                break;
+            }
+        }
+        if !rejected {
             if attempt > 1 {
                 tracing::info!(
                     device = %nbd_device.display(),

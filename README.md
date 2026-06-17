@@ -300,21 +300,16 @@ just smoke-create
 End-to-end exec round-trip:
 
 ```bash
-# The HTTP API lives under /api/v1 (ADR 0031). Enable an image first
-# (one-time; replace with your bake's URI — e.g. localhost:5001/demo-claude:warm-1):
-curl -X POST http://localhost:8090/api/v1/enabled-images \
-  -H 'content-type: application/json' \
-  -d '{"image_uri":"localhost:5001/cortex/api:warm-1"}'
+# The control plane is app-gRPC (ADR 0051); drive it with the `engram` CLI.
+# Enable an image first (one-time; replace with your bake's URI —
+# e.g. localhost:5001/demo-claude:warm-1):
+engram image enable --uri localhost:5001/cortex/api:warm-1
 
-SID=$(curl -s -X POST http://localhost:8090/api/v1/sessions \
-  -H 'content-type: application/json' \
-  -d '{"image":"localhost:5001/cortex/api:warm-1"}' | jq -r .session_id)
+SID=$(engram session create --image localhost:5001/cortex/api:warm-1)
 
-curl -s -X POST "http://localhost:8090/api/v1/sessions/$SID/exec" \
-  -H 'content-type: application/json' \
-  -d '{"command":"uname -a && echo \"session=$ENGRAM_SESSION_ID\""}' | jq
+engram session exec "$SID" 'uname -a && echo "session=$ENGRAM_SESSION_ID"'
 
-curl -X DELETE "http://localhost:8090/api/v1/sessions/$SID"
+engram session delete "$SID"
 ```
 
 You'll see real `uname` output and the session id env var injected by the coordinator.
@@ -475,16 +470,14 @@ For ADR 0007 chunked storage, the bake also emits a `bundle.json` sidecar pointi
 Then create a session against it (the coordinator picks up the new tag automatically):
 
 ```bash
-SID=$(curl -s -X POST http://localhost:8090/api/v1/sessions \
-  -H 'content-type: application/json' \
-  -d '{"repo":"cortex/api","branch":"main"}' | jq -r .session_id)
+SID=$(engram session create --image localhost:5001/cortex/api:warm-1)
 ```
 
 Requires Docker on the host. Compatible with Docker Desktop, OrbStack, Colima, and Podman with the docker-compat shim. See `DESIGN.md` for the full image / secret model.
 
 ## CLI
 
-The `engram` CLI talks to the coordinator's HTTP API. `--json` on any read command emits raw JSON for piping into `jq` / scripts.
+The `engram` CLI talks to the coordinator's app-gRPC control plane (ADR 0051). `--json` on any read command emits raw JSON for piping into `jq` / scripts.
 
 ```bash
 engram session list                                   # active sessions, table view

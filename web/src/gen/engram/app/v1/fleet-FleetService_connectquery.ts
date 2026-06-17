@@ -50,6 +50,16 @@ export const cordonHost = FleetService.method.cordonHost;
 export const uncordonHost = FleetService.method.uncordonHost;
 
 /**
+ * ADR 0048 deregister — was DELETE /api/admin/hosts/:id (dropped in the
+ * ADR 0051 gRPC-only migration but never re-added here, stranding the
+ * operator's scale-down wave). FAILED_PRECONDITION if any session is
+ * still bound (drain first); idempotent-success if already gone.
+ *
+ * @generated from rpc engram.app.v1.FleetService.DeleteHost
+ */
+export const deleteHost = FleetService.method.deleteHost;
+
+/**
  * ADR 0029 Storage page rollup (GET /api/storage/summary).
  *
  * @generated from rpc engram.app.v1.FleetService.GetStorageSummary
