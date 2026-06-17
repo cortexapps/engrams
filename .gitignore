@@ -42,3 +42,6 @@ result-*
 settings.local.json
 .playwright-mcp/
 scratch/
+node_modules
+docs/superpowers/**
+.impeccable
