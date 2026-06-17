@@ -65,6 +65,14 @@ mod adapter {
     pub const MAX_ARGS_SUMMARY_BYTES: usize = 1024;
     pub const MAX_RESULT_SUMMARY_BYTES: usize = 4096;
     pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
+    /// Phase 1c: per-chunk cap for live `AgentMessageChunk` token deltas.
+    /// The underlying SSE `text_delta`s are token-batched (tens of bytes
+    /// typically), so this only bounds a pathological delta. Kept well
+    /// under Postgres' 8000-byte `NOTIFY` payload ceiling (the coordinator
+    /// fans chunks cross-replica via `pg_notify`) with room for the JSON
+    /// envelope; a clipped chunk is harmless — the durable `AgentMessage`
+    /// carries the full text.
+    pub const MAX_CHUNK_BYTES: usize = 6 * 1024;
 
     /// Abnormal-exit diagnostics: how much of `claude`'s stderr to retain
     /// for the crash artifact. Bounded so a chatty child can't grow the
@@ -662,6 +670,12 @@ mod adapter {
         /// Wall-clock cap for THIS turn (`max_run_secs`); on expiry we
         /// kill the process (heavy backstop, default 24h) and respawn.
         deadline: Instant,
+        /// Phase 1c: the id of the assistant message currently streaming
+        /// (captured from the partial-stream `message_start`), so token
+        /// chunks (`AgentMessageChunk`) carry the SAME `message_id` the
+        /// terminal `AgentMessage` will use — the UI keys the live bubble
+        /// on it and reconciles in place when the durable message lands.
+        current_message_id: Option<String>,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -884,6 +898,7 @@ mod adapter {
                                     &t.run_id,
                                     &mut t.tool_calls,
                                     cli.max_tool_calls,
+                                    &mut t.current_message_id,
                                 ) {
                                     for ev in translated {
                                         emit(evt_tx, ev).await;
@@ -893,9 +908,17 @@ mod adapter {
                                 // A line outside any turn (e.g. claude's
                                 // init banner before the first prompt):
                                 // parse only for the session-id capture
-                                // side effect; emit nothing.
+                                // side effect; emit nothing. No turn ⇒ no
+                                // chunks to stream, so the message-id sink is
+                                // a throwaway.
                                 let mut sink = 0u32;
-                                let _ = translate_jsonl(&line, "", &mut sink, cli.max_tool_calls);
+                                let _ = translate_jsonl(
+                                    &line,
+                                    "",
+                                    &mut sink,
+                                    cli.max_tool_calls,
+                                    &mut None,
+                                );
                             }
                         }
                         Ok(None) => break, // stdout EOF: claude is exiting
@@ -1150,6 +1173,7 @@ mod adapter {
             run_id,
             tool_calls: 0,
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
+            current_message_id: None,
         }
     }
 
@@ -1182,6 +1206,13 @@ mod adapter {
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
+            // Phase 1c: stream the assistant's token deltas as
+            // `stream_event`/`content_block_delta` lines (in addition to
+            // the complete `assistant` message at block end), so the
+            // engine can forward them as ephemeral `AgentMessageChunk`s
+            // for live-typing. The complete message is still emitted and
+            // remains the durable record.
+            "--include-partial-messages".into(),
             // No human in the VM to approve tool calls; `--print`
             // aborts with exit 1 the first time a tool needs
             // approval otherwise. The VM itself is the safety
@@ -1306,11 +1337,56 @@ mod adapter {
         run_id: &str,
         tool_calls: &mut u32,
         max_tool_calls: u32,
+        // Phase 1c: the streaming message id, tracked across lines within a
+        // turn (set by `stream_event`/`message_start`) so token chunks carry
+        // the same id as the terminal `assistant` message.
+        current_message_id: &mut Option<String>,
     ) -> Option<Vec<HarnessEvent>> {
         let v: Value = serde_json::from_str(line).ok()?;
         let ty = v.get("type")?.as_str()?;
         let mut out: Vec<HarnessEvent> = Vec::new();
         match ty {
+            "stream_event" => {
+                // Phase 1c: partial-message streaming (`--include-partial-
+                // messages`). `message_start` carries the assistant message
+                // id — the SAME id the terminal `assistant` line will use —
+                // so we stash it and chunks correlate to the durable message.
+                // A `content_block_delta` with a `text_delta` is one live
+                // token chunk → emit an EPHEMERAL `AgentMessageChunk`.
+                // Everything else (block start/stop, message delta/stop,
+                // tool-input deltas) is ignored here: the durable
+                // `assistant`/`user` lines carry the authoritative content.
+                let event = v.get("event")?;
+                match event.get("type").and_then(|s| s.as_str()).unwrap_or("") {
+                    "message_start" => {
+                        if let Some(id) = event
+                            .get("message")
+                            .and_then(|m| m.get("id"))
+                            .and_then(|s| s.as_str())
+                        {
+                            *current_message_id = Some(id.to_string());
+                        }
+                    }
+                    "content_block_delta" => {
+                        if let Some(delta) = event.get("delta") {
+                            if delta.get("type").and_then(|s| s.as_str()) == Some("text_delta") {
+                                if let Some(chunk) = delta.get("text").and_then(|s| s.as_str()) {
+                                    if !chunk.is_empty() {
+                                        out.push(HarnessEvent::AgentMessageChunk {
+                                            run_id: run_id.to_string(),
+                                            message_id: current_message_id
+                                                .clone()
+                                                .unwrap_or_else(|| "msg-?".to_string()),
+                                            chunk: truncate_str(chunk, MAX_CHUNK_BYTES),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             "system" => {
                 let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
                 if subtype == "init" {
@@ -1898,10 +1974,10 @@ mod tests {
         let init = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
         let asst = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"hi there"}]}}"#;
         let mut tc = 0u32;
-        let evs = translate_jsonl(init, "run-1", &mut tc, 50).unwrap();
+        let evs = translate_jsonl(init, "run-1", &mut tc, 50, &mut None).unwrap();
         assert!(evs.is_empty(), "init emits no HarnessEvent");
 
-        let evs = translate_jsonl(asst, "run-1", &mut tc, 50).unwrap();
+        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None).unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::AgentMessage { text, run_id, .. } => {
@@ -1913,17 +1989,75 @@ mod tests {
     }
 
     #[test]
+    fn stream_event_text_deltas_become_chunks_keyed_on_message_id() {
+        // Phase 1c: partial-message streaming. `message_start` captures the
+        // assistant message id; each `content_block_delta`/`text_delta`
+        // becomes an `AgentMessageChunk` carrying that id — the SAME id the
+        // terminal `assistant` message uses, so the UI reconciles in place.
+        let msg_start =
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_42"}}}"#;
+        let block_start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#;
+        let d1 = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}}"#;
+        let d2 = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}}"#;
+        let complete = r#"{"type":"assistant","message":{"id":"msg_42","content":[{"type":"text","text":"hello"}]}}"#;
+
+        let mut tc = 0u32;
+        let mut mid: Option<String> = None;
+
+        // message_start: no event, but the id is now tracked.
+        assert!(translate_jsonl(msg_start, "run-9", &mut tc, 50, &mut mid)
+            .unwrap()
+            .is_empty());
+        assert_eq!(mid.as_deref(), Some("msg_42"));
+
+        // content_block_start: no chunk (empty text), no event.
+        assert!(translate_jsonl(block_start, "run-9", &mut tc, 50, &mut mid)
+            .unwrap()
+            .is_empty());
+
+        for (line, want) in [(d1, "hel"), (d2, "lo")] {
+            let evs = translate_jsonl(line, "run-9", &mut tc, 50, &mut mid).unwrap();
+            assert_eq!(evs.len(), 1);
+            match &evs[0] {
+                HarnessEvent::AgentMessageChunk {
+                    run_id,
+                    message_id,
+                    chunk,
+                } => {
+                    assert_eq!(run_id, "run-9");
+                    assert_eq!(message_id, "msg_42", "chunk shares the terminal message id");
+                    assert_eq!(chunk, want);
+                }
+                other => panic!("expected AgentMessageChunk, got {other:?}"),
+            }
+        }
+
+        // The terminal `assistant` message uses the SAME id — the durable
+        // record that supersedes the chunks downstream.
+        let evs = translate_jsonl(complete, "run-9", &mut tc, 50, &mut mid).unwrap();
+        match &evs[0] {
+            HarnessEvent::AgentMessage {
+                message_id, text, ..
+            } => {
+                assert_eq!(message_id, "msg_42");
+                assert_eq!(text, "hello");
+            }
+            other => panic!("expected AgentMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn translates_tool_use_and_tool_result_pair() {
         let asst = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls /workspace"}}]}}"#;
         let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1.txt\nfile2.py","is_error":false}]}}"#;
 
         let mut tc = 0u32;
-        let evs = translate_jsonl(asst, "run-1", &mut tc, 50).unwrap();
+        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None).unwrap();
         assert_eq!(evs.len(), 1);
         assert!(matches!(evs[0], HarnessEvent::ToolCallStarted { .. }));
         assert_eq!(tc, 1);
 
-        let evs = translate_jsonl(user, "run-1", &mut tc, 50).unwrap();
+        let evs = translate_jsonl(user, "run-1", &mut tc, 50, &mut None).unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::ToolCallCompleted {

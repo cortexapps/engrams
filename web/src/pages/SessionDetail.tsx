@@ -25,7 +25,7 @@ import { useHosts } from "../hooks/useHosts";
 import { useTeleportSession } from "../hooks/useTeleportSession";
 import { usePauseResumeSession } from "../hooks/usePauseResumeSession";
 import { useIsAdmin } from "../auth/AuthProvider";
-import type { Session } from "../lib/types";
+import type { IndexedEvent, Session } from "../lib/types";
 
 type ViewTab = "transcript" | "shell" | "raw";
 
@@ -38,7 +38,7 @@ const TABS = [
 export function SessionDetail() {
   const { id } = useParams({ from: "/_app/sessions/$id" });
   const { data: session } = useSession(id);
-  const events = useSessionEvents(id);
+  const { events, streamingText } = useSessionEvents(id);
   const [tab, setTab] = useState<ViewTab>("transcript");
   // Once the user opens the SHELL tab, keep TerminalPane mounted for
   // the lifetime of this page. Switching back to TRANSCRIPT/RAW just
@@ -83,7 +83,12 @@ export function SessionDetail() {
 
         <div className="min-h-0 flex-1 overflow-hidden">
           {tab === "transcript" && (
-            <SessionThread sessionId={id} events={events} status={session?.status} />
+            <SessionThread
+              sessionId={id}
+              events={events}
+              status={session?.status}
+              streamingText={streamingText}
+            />
           )}
 
           {/* Mount TerminalPane once and keep it mounted across tab
@@ -267,7 +272,7 @@ function PauseResumeControl({ session }: { session: Session }) {
   );
 }
 
-function RawEvents({ events }: { events: ReturnType<typeof useSessionEvents> }) {
+function RawEvents({ events }: { events: IndexedEvent[] }) {
   return (
     <div className="h-full space-y-0.5 overflow-auto px-6 py-4 font-mono text-[0.74rem] text-muted-foreground">
       {events.map((e) => (

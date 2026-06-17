@@ -102,10 +102,13 @@ pub enum HarnessFrame {
 /// - Tool call events carry small structured `args_summary` /
 ///   `result_summary` strings (≤ a few KB), not the agent's native
 ///   bytes. Slack / web UIs render them straight.
-/// - `AgentMessage` is the assistant's text response between tool
-///   calls (or a system message). v1 ships per-final-message —
-///   adapters consolidate streaming responses before emitting.
-///   `AgentMessageChunk` for live-typing UIs is a future variant.
+/// - `AgentMessage` is the assistant's **complete** text response
+///   between tool calls (or a system message) — the durable record,
+///   persisted to `session_events`. `AgentMessageChunk` carries the
+///   incremental token deltas of that same message for live-typing UIs
+///   (ADR 0052 Phase 1c); it is EPHEMERAL — streamed live, never
+///   persisted — and is always superseded by the `AgentMessage` (same
+///   `message_id`) that follows.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HarnessEvent {
     /// New agent run started (typically: user prompt arrived). The
@@ -203,6 +206,27 @@ pub enum HarnessEvent {
     /// consumption (via `HarnessCommand::DequeueQueued`) — the user
     /// pulled it back into the composer to edit, or cancelled it.
     PromptDequeued { prompt_id: String },
+    // ── Phase 1c: live token streaming (ADR 0052). APPENDED after
+    //    `PromptDequeued` so existing bincode variant indices never
+    //    shift (… PromptDequeued=9, AgentMessageChunk=10) — see
+    //    tests/wire_golden.rs.
+    /// An incremental token delta of the in-flight assistant message —
+    /// the live-typing payload. EPHEMERAL by contract: the adapter
+    /// streams it to live subscribers but NEVER persists it, and always
+    /// follows the message with a complete [`AgentMessage`] carrying the
+    /// same `message_id`, which is the durable record and supersedes all
+    /// of this message's chunks. `chunk` is the raw text delta (≤ a few
+    /// KB; the underlying SSE chunks are already token-batched). A
+    /// consumer that misses chunks (lag, a reconnect, a replica hop)
+    /// loses only animation — the final `AgentMessage` makes it whole.
+    AgentMessageChunk {
+        run_id: String,
+        /// The agent's message id (Claude's `message.id`) — the SAME id
+        /// the terminal `AgentMessage` carries, so a UI keys the live
+        /// bubble on it and the final message reconciles in place.
+        message_id: String,
+        chunk: String,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -233,6 +257,7 @@ impl HarnessEvent {
             Self::PromptQueued { .. } => "prompt_queued",
             Self::PromptEdited { .. } => "prompt_edited",
             Self::PromptDequeued { .. } => "prompt_dequeued",
+            Self::AgentMessageChunk { .. } => "agent_message_chunk",
             Self::Idle => "harness_idle",
         }
     }

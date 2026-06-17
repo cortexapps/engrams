@@ -136,6 +136,13 @@ fn ev_agent_message() -> HarnessEvent {
         text: "hello".into(),
     }
 }
+fn ev_agent_message_chunk() -> HarnessEvent {
+    HarnessEvent::AgentMessageChunk {
+        run_id: "r1".into(),
+        message_id: "m1".into(),
+        chunk: "hel".into(),
+    }
+}
 fn ev_tool_call_started() -> HarnessEvent {
     HarnessEvent::ToolCallStarted {
         run_id: "r1".into(),
@@ -217,6 +224,7 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_prompt_queued", &ev_prompt_queued());
     assert_golden("event_prompt_edited", &ev_prompt_edited());
     assert_golden("event_prompt_dequeued", &ev_prompt_dequeued());
+    assert_golden("event_agent_message_chunk", &ev_agent_message_chunk());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -233,6 +241,11 @@ fn harness_event_golden_and_variant_indices() {
     assert_variant_index(&ev_prompt_queued(), 7, "HarnessEvent::PromptQueued");
     assert_variant_index(&ev_prompt_edited(), 8, "HarnessEvent::PromptEdited");
     assert_variant_index(&ev_prompt_dequeued(), 9, "HarnessEvent::PromptDequeued");
+    assert_variant_index(
+        &ev_agent_message_chunk(),
+        10,
+        "HarnessEvent::AgentMessageChunk",
+    );
 }
 
 #[test]
@@ -429,6 +442,7 @@ fn regen_golden() {
     write("event_prompt_queued", &ev_prompt_queued());
     write("event_prompt_edited", &ev_prompt_edited());
     write("event_prompt_dequeued", &ev_prompt_dequeued());
+    write("event_agent_message_chunk", &ev_agent_message_chunk());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);

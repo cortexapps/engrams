@@ -187,6 +187,63 @@ pipe survives a UFFD restore before Track C relies on it.
     the coordinator replaying un-consumed prompts on respawn (the ADR's stated
     "queue survives eviction") remains the broader resilience item.
 
+- **2026-06-17 — Phase 1c IMPLEMENTED: live token streaming** (this PR). Until now
+  the persistent engine emitted only the *complete* `assistant` message per block,
+  so a pure-prose turn (e.g. "count 1→60") showed a spinner until the whole answer
+  landed. Phase 1c streams the tokens, unlocked directly by the persistent engine
+  and the `--include-partial-messages` CLI flag (confirmed on the baked `claude`
+  2.1.179: `stream_event`/`content_block_delta`/`text_delta` lines arrive *before*
+  the complete `assistant`, and `message_start.event.message.id` == that message's
+  id — so chunks key onto the same `message_id`).
+
+  **Two tracks, kept strictly separate (the design-of-record).** The complete
+  `AgentMessage` stays the **durable** record (persisted to `session_events`, the
+  authority). The token deltas are a new **ephemeral** `HarnessEvent::AgentMessageChunk`
+  (appended at bincode idx 10 — `wire_golden` pins no shift): streamed live, **never
+  persisted, no `idx`**. We deliberately do NOT write a row per token — that would
+  put hundreds of PG inserts on the hot path and flood the durable log (rejected
+  against the "event log is the authority / latency non-negotiable" rule).
+
+  **Cross-replica without per-token DB load.** Prod runs 2 coordinator replicas
+  with no session affinity, so same-replica-local-bus streaming would animate only
+  ~50% of sessions. Chunks fan out on a **dedicated `session_event_deltas` NOTIFY
+  channel** carrying the full event inline (vs. the persisted-row channel's
+  `{session_id, idx}` + re-fetch). The producing replica does NOT publish locally —
+  the NOTIFY echo (every replica `LISTEN`s it, including the producer) is the single
+  delivery path, so a client on a replica without the harness connection still
+  streams. Rate is bounded by the chunk rate (the API already token-batches);
+  payloads are clamped (harness `MAX_CHUNK_BYTES` = 6 KiB) under PG's 8 KB NOTIFY
+  ceiling, with a defensive skip if exceeded. On the SSE/gRPC merge, ephemeral
+  events bypass the replay high-water gate and frame with `idx=None` (the same path
+  the `Lagged` sentinel already proves end-to-end → orchestrator forwards it with no
+  `id:` line, no change needed there).
+
+  **Merge-safety: the durable record ALWAYS wins** (the load-bearing invariant — it
+  must not break when pods cycle mid-message). The web keeps chunks in a live
+  **overlay** (`useSessionEvents`, `Map<message_id → text>` → `streamingText`),
+  STRICTLY OUT of the durable `events` array. `buildMessages` appends the overlay
+  tail to the in-flight assistant turn (gated on `runOpen`), but: the terminal
+  durable `agent_message` **prunes the overlay for its `message_id`** (flushed in
+  the same update as the event append, so no frame shows both); a `run_completed`/
+  `run_interrupted` **clears the overlay** (covers a crashed turn that streamed
+  partials but produced no final message — the `ba3ae8d5` crash class); a finalized
+  id **drops late/out-of-order stragglers**; reconnect/session-switch **resets** it
+  (chunks are never replayed). So under a replica cycle (harness re-dials, durable
+  events ride the at-least-once `held` slot; deltas resume from the new replica) or
+  a web reconnect (overlay resets, replay rebuilds durable), the worst case is lost
+  *animation*, never a wrong or doubled transcript. Pinned by web tests
+  (`buildMessages` tail/supersede/`runOpen`-gate + `useSessionEvents`
+  accumulate/supersede/straggler-drop/terminal-clear/dedup) and coordinator framing
+  tests (ephemeral → `idx=None`).
+  - *No wire/coord change reaches the durable path:* `AgentMessageChunk` is
+    additive; the sink branches on `kind == "agent_message_chunk"` → `notify_session_delta`
+    and returns before any append; `IndexedEvent` gains an `ephemeral` flag (default
+    false). Harness-side it's `--include-partial-messages` + a `stream_event` arm in
+    `translate_jsonl` tracking `current_message_id`.
+  - *Deferred:* harness-side time-coalescing of chunks (the API's batching keeps
+    volume reasonable for v1; revisit if a long turn lags the 256-slot bus) and a
+    per-chunk `at` ordering guarantee (the durable message corrects any reorder).
+
 ## Prior art
 
 Respawn-with-resume for idle is the norm (OpenHands cold-loads `base_state.json`

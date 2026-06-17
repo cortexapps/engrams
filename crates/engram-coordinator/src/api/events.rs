@@ -100,10 +100,15 @@ pub(crate) fn merged_event_stream(
     let replay = futures::stream::iter(replayed.into_iter().map(MergedEvent::Replay));
 
     // Live segment: drop events we already replayed (idx <= high water)
-    // so the seam between the two is gap-free and dup-free.
+    // so the seam between the two is gap-free and dup-free. Phase 1c:
+    // EPHEMERAL events (live token chunks) were never in the replay log
+    // and carry no real `idx`, so they bypass the high-water gate and
+    // always pass through.
     let live_stream = BroadcastStream::new(live).filter_map(move |recv| async move {
         match recv {
-            Ok(indexed) if indexed.idx > replay_high_water => Some(MergedEvent::Live(indexed)),
+            Ok(indexed) if indexed.ephemeral || indexed.idx > replay_high_water => {
+                Some(MergedEvent::Live(indexed))
+            }
             Ok(_) => None,
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                 Some(MergedEvent::Lagged(n))
@@ -139,11 +144,15 @@ pub(crate) fn merged_to_parts(ev: MergedEvent) -> (Option<i64>, String, String) 
             // epoch" from that and live events ride along as not-rewound.
             let payload = serde_json::to_value(&indexed.event).unwrap_or(serde_json::Value::Null);
             let payload_json = with_rewind_meta(payload, 0, false);
-            (
-                Some(indexed.idx),
-                indexed.event.kind().to_string(),
-                payload_json,
-            )
+            // Phase 1c: ephemeral chunks carry NO `idx` on the wire, so a
+            // client never advances its `Last-Event-ID` cursor past them
+            // (they were never persisted and won't be replayed on reconnect).
+            let idx = if indexed.ephemeral {
+                None
+            } else {
+                Some(indexed.idx)
+            };
+            (idx, indexed.event.kind().to_string(), payload_json)
         }
         MergedEvent::Lagged(n) => (None, "lagged".to_string(), format!(r#"{{"missed":{n}}}"#)),
     }
@@ -158,4 +167,45 @@ fn with_rewind_meta(mut payload: serde_json::Value, recovery_epoch: i64, rewound
         map.insert("_rewound".into(), rewound.into());
     }
     payload.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{IndexedEvent, SessionEvent};
+    use chrono::Utc;
+
+    fn chunk_event() -> SessionEvent {
+        SessionEvent::HarnessAgentMessageChunk {
+            run_id: "r1".into(),
+            message_id: "m1".into(),
+            chunk: "hi".into(),
+            at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn ephemeral_live_event_frames_with_no_idx() {
+        // Phase 1c: an ephemeral chunk MUST surface with idx=None so it never
+        // advances a client's Last-Event-ID cursor (it was never persisted and
+        // won't be replayed on reconnect).
+        let (idx, kind, _payload) = merged_to_parts(MergedEvent::Live(IndexedEvent {
+            idx: 0,
+            event: chunk_event(),
+            ephemeral: true,
+        }));
+        assert_eq!(idx, None);
+        assert_eq!(kind, "agent_message_chunk");
+    }
+
+    #[test]
+    fn durable_live_event_keeps_its_idx() {
+        // A normal persisted event still carries its real idx on the wire.
+        let (idx, _kind, _payload) = merged_to_parts(MergedEvent::Live(IndexedEvent {
+            idx: 7,
+            event: SessionEvent::HarnessIdle { at: Utc::now() },
+            ephemeral: false,
+        }));
+        assert_eq!(idx, Some(7));
+    }
 }

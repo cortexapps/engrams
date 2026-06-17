@@ -172,6 +172,12 @@ export function buildMessages(
   events: IndexedEvent[],
   sessionId: string,
   status?: SessionState,
+  // Phase 1c: the live token tail (ephemeral `agent_message_chunk` deltas
+  // for the in-flight assistant message, NOT in `events`). Appended to the
+  // active assistant turn so tokens render as they stream; the terminal
+  // durable `agent_message` supersedes it (the hook empties it the instant
+  // that lands, so re-running yields identical text — no double-render).
+  streamingText = "",
 ): BuildMessagesResult {
   let out: Draft[] = [];
 
@@ -512,6 +518,20 @@ export function buildMessages(
       }
     }
     runOpen = false;
+  }
+
+  // Phase 1c: render the live token tail. Only while a run is genuinely open
+  // (so a stale tail can't resurrect a finished turn); append it to the
+  // active assistant message — creating one if the run just opened with no
+  // parts yet — so it also serves as the working indicator. When the durable
+  // `agent_message` lands the hook empties `streamingText`, and this turn's
+  // text comes wholly from the coalesced durable event instead: same text,
+  // same positional assistant bubble, no flash.
+  if (streamingText && runOpen) {
+    const a = ensureAssistant();
+    const last = a.content[a.content.length - 1];
+    if (last && last.type === "text") last.text += streamingText;
+    else a.content.push({ type: "text", text: streamingText });
   }
 
   const isRunning = !sessionInactive && (runOpen || tailAwaiting(out));

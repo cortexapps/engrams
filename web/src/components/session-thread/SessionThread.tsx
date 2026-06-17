@@ -43,6 +43,12 @@ export interface SessionThreadProps {
   events: IndexedEvent[];
   /** Drives whether the composer can send (terminal states block it). */
   status: SessionState | undefined;
+  /**
+   * Phase 1c: the live token tail (ephemeral `agent_message_chunk` deltas),
+   * from `useSessionEvents`. Rendered into the in-flight assistant turn so
+   * tokens stream as they arrive; superseded by the durable `agent_message`.
+   */
+  streamingText?: string;
 }
 
 const SEND_BLOCKED: ReadonlySet<SessionState> = new Set<SessionState>([
@@ -52,12 +58,20 @@ const SEND_BLOCKED: ReadonlySet<SessionState> = new Set<SessionState>([
   "host_lost",
 ]);
 
-export function SessionThread({ sessionId, events, status }: SessionThreadProps) {
+export function SessionThread({
+  sessionId,
+  events,
+  status,
+  streamingText = "",
+}: SessionThreadProps) {
   const {
     messages: serverMessages,
     isRunning,
     queue,
-  } = useMemo(() => buildMessages(events, sessionId, status), [events, sessionId, status]);
+  } = useMemo(
+    () => buildMessages(events, sessionId, status, streamingText),
+    [events, sessionId, status, streamingText],
+  );
 
   // Phase 1b: optimistic prompts. A prompt the user just submitted is held
   // here (keyed by its client-minted prompt_id) and rendered as a greyed
