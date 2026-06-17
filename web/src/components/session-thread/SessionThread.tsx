@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AssistantRuntimeProvider,
   useExternalStoreRuntime,
@@ -11,9 +11,11 @@ import { useMutation } from "@connectrpc/connect-query";
 import {
   sendPrompt as sendPromptMethod,
   interrupt as interruptMethod,
+  dequeueQueuedPrompt as dequeueQueuedPromptMethod,
 } from "../../gen/engram/app/v1/session-SessionService_connectquery";
 import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
+import { QueuedRecallContext } from "./queued-recall";
 import type { IndexedEvent, SessionState } from "../../lib/types";
 
 // The transcript tab, on assistant-ui. The session's SSE event stream is the
@@ -51,10 +53,11 @@ const SEND_BLOCKED: ReadonlySet<SessionState> = new Set<SessionState>([
 ]);
 
 export function SessionThread({ sessionId, events, status }: SessionThreadProps) {
-  const { messages: serverMessages, isRunning } = useMemo(
-    () => buildMessages(events, sessionId, status),
-    [events, sessionId, status],
-  );
+  const {
+    messages: serverMessages,
+    isRunning,
+    queue,
+  } = useMemo(() => buildMessages(events, sessionId, status), [events, sessionId, status]);
 
   // Phase 1b: optimistic prompts. A prompt the user just submitted is held
   // here (keyed by its client-minted prompt_id) and rendered as a greyed
@@ -65,6 +68,12 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
   // transitions in place (no duplicate, no flicker), staying greyed until
   // its run_started{prompt_id} consumes it.
   const [pending, setPending] = useState<{ promptId: string; text: string }[]>([]);
+
+  // ADR 0052: full prompt text by prompt_id, retained for the session so the
+  // ↑-recall can repopulate the composer with the COMPLETE text even after the
+  // optimistic `pending` entry is pruned on echo (the wire `prompt_queued`
+  // summary is truncated to ~1 KB). Bounded — one short entry per prompt sent.
+  const sentTextRef = useRef(new Map<string, string>());
 
   const echoedPromptIds = useMemo(() => {
     const s = new Set<string>();
@@ -102,6 +111,22 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
   // there's no query to invalidate here).
   const sendPromptMutation = useMutation(sendPromptMethod);
   const interruptMutation = useMutation(interruptMethod);
+  const dequeueQueuedMutation = useMutation(dequeueQueuedPromptMethod);
+
+  // ADR 0052: ↑-in-empty-composer recall. Pull the most-recent still-queued
+  // prompt OUT of the queue (DequeueQueued, so it can't be claimed mid-edit)
+  // and hand its text back to the composer. Full text from `sentTextRef` when
+  // this client sent it; otherwise the (possibly-truncated) wire summary.
+  const recallQueued = useCallback((): string | null => {
+    if (queue.length === 0) return null;
+    const last = queue[queue.length - 1]!;
+    const text = sentTextRef.current.get(last.promptId) ?? last.summary;
+    setPending((p) => p.filter((e) => e.promptId !== last.promptId));
+    dequeueQueuedMutation
+      .mutateAsync({ sessionId, promptId: last.promptId })
+      .catch((err) => console.warn("dequeueQueuedPrompt failed", err));
+    return text;
+  }, [queue, sessionId, dequeueQueuedMutation]);
 
   const runtime = useExternalStoreRuntime({
     messages,
@@ -115,6 +140,7 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
       // server echo share an identity (dedup + in-place transition).
       const promptId = crypto.randomUUID();
       setPending((p) => [...p, { promptId, text }]);
+      sentTextRef.current.set(promptId, text);
       try {
         await sendPromptMutation.mutateAsync({ sessionId, text, promptId });
       } catch (err) {
@@ -141,9 +167,11 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <SessionStatusContext.Provider value={status}>
-        <TooltipProvider>
-          <Thread />
-        </TooltipProvider>
+        <QueuedRecallContext.Provider value={{ canRecall: queue.length > 0, recall: recallQueued }}>
+          <TooltipProvider>
+            <Thread />
+          </TooltipProvider>
+        </QueuedRecallContext.Provider>
       </SessionStatusContext.Provider>
     </AssistantRuntimeProvider>
   );
