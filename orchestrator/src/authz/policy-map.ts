@@ -132,6 +132,7 @@ export const POLICY: Record<string, PolicyEntry> = {
   "FleetService.AdminDrainHost": { action: "manage", subject: "all" },
   "FleetService.CordonHost": { action: "manage", subject: "all" },
   "FleetService.UncordonHost": { action: "manage", subject: "all" },
+  "FleetService.DeleteHost": { action: "manage", subject: "all" },
   "FleetService.GetStorageSummary": { action: "manage", subject: "all" },
   "FleetService.FlushSession": { action: "manage", subject: "all" },
   "FleetService.EvacuateSession": { action: "manage", subject: "all" },
