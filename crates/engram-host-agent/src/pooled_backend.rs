@@ -647,11 +647,24 @@ impl PooledBackend {
     /// returns `Err` — `build_base_snapshot` propagates it, aborting the
     /// capture and the enable. We never ship a base snapshot that a
     /// `[warm]` hook claimed to warm but didn't.
-    async fn run_warm_hook(&self, id: SandboxId, warm: &WarmConfig) -> Result<(), SandboxError> {
+    async fn run_warm_hook(
+        &self,
+        id: SandboxId,
+        warm: &WarmConfig,
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<(), SandboxError> {
+        // The capture VM's agentd holds NO durable session env: a capture VM
+        // never gets a session bind, and `merge_session_env` is a no-op on FC
+        // (the guest is already running from the snapshot, so its env can't be
+        // rewritten host-side). So the manifest `[env]` must ride in the
+        // ExecRequest — agentd layers `req.env` onto the exec'd child
+        // (handler.rs), giving the hook JAVA_HOME/PATH/etc. Without it a
+        // gradle/node warmup fails fast (the dev-brain hook exited 1 in ~40 ms
+        // with no JAVA_HOME).
         let req = ExecRequest {
             command: warm.command.clone(),
             stdin: None,
-            env: Default::default(),
+            env: env.clone(),
             workdir: warm.workdir.clone(),
             timeout: Some(warm.timeout()),
         };
@@ -5769,6 +5782,11 @@ impl SandboxBackend for PooledBackend {
         // in the rootfs of the image being captured, so the snapshot
         // is already complete without any second virtio-blk drive.
 
+        // The manifest `[env]` (JAVA_HOME, PATH, …) the `[warm]` hook needs.
+        // Captured before `spec` is moved into `create`; passed to the warm
+        // hook below as its exec env so it runs with the image's environment.
+        let session_env = spec.env.clone();
+
         // Boot the capture VM (opens the cold_boot operation scope on Linux).
         let id = self.create(spec).await?;
 
@@ -5793,10 +5811,12 @@ impl SandboxBackend for PooledBackend {
             // FAIL-LOUD: a non-zero exit or timeout aborts the capture
             // (and thus the enable) — we never ship a "cold" base snapshot
             // that a `[warm]` hook claimed to warm. The warm command must
-            // be hermetic (baked offline caches, no network); the capture
-            // VM has the manifest `[env]` but no per-session secrets.
+            // be hermetic (baked offline caches, no network) and runs with
+            // the manifest `[env]` (passed through as the hook's exec env —
+            // the capture VM's agentd has no durable session env) but no
+            // per-session secrets.
             if let Some(warm) = warm {
-                self.run_warm_hook(id, &warm).await?;
+                self.run_warm_hook(id, &warm, &session_env).await?;
             }
             // Close the cold-boot window (mirrors `start_agent`) before the
             // snapshot flush opens its own `snapshot` operation scope.
