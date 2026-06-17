@@ -174,6 +174,29 @@ struct HubInner {
     /// on uniqueness + the `connections` mutex serializing the compare,
     /// not on cross-thread happens-before of the counter itself.
     next_gen: AtomicU64,
+    /// ADR 0052: per-sandbox prompts that were forwarded to a harness
+    /// connection but not yet *confirmed received* (no `RunStarted{prompt_id}`
+    /// / `PromptQueued`/`PromptEdited`/`PromptDequeued` for them yet). The
+    /// host→harness command channel is otherwise fire-and-forget — a prompt
+    /// buffered into a connection that then bounces (checkpoint / live move /
+    /// idle-evict / SIGUSR1 reconnect) dies with it, wedging the session with
+    /// a forever-greyed bubble (prod `8c165749`). This is the command-side
+    /// twin of the harness's `held` event slot: every fresh connection
+    /// REPLAYS these on attach, and a confirming event CLEARS them. The
+    /// harness dedupes by `prompt_id`, so a replay of an already-processed
+    /// prompt (its confirmation lost in the same bounce) is a no-op.
+    ///
+    /// **Leaf lock** — never held while acquiring another `HubInner` mutex
+    /// (record/clear/replay each take it alone), so it's outside the
+    /// `last_event_at → last_idle_at → connections` order (issue #217).
+    undelivered_prompts: Mutex<HashMap<SandboxId, Vec<UndeliveredPrompt>>>,
+}
+
+/// A prompt forwarded to the harness but not yet confirmed received.
+#[derive(Clone)]
+struct UndeliveredPrompt {
+    prompt_id: String,
+    text: String,
 }
 
 struct ConnectionHandle {
@@ -223,6 +246,7 @@ impl HarnessHub {
                 session_to_sandbox: Mutex::new(HashMap::new()),
                 shell_attached: Mutex::new(HashMap::new()),
                 eviction_inflight: Mutex::new(HashMap::new()),
+                undelivered_prompts: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(0),
             }),
         }
@@ -297,7 +321,14 @@ impl HarnessHub {
     /// can't accidentally attach to a freshly-created replacement
     /// sandbox.
     pub fn unbind_session(&self, session_id: SessionId) {
-        self.inner.session_to_sandbox.lock().remove(&session_id);
+        let sandbox_id = self.inner.session_to_sandbox.lock().remove(&session_id);
+        // ADR 0052: a torn-down session can't re-attach, so drop any
+        // un-confirmed prompts we were holding to replay — avoids leaking
+        // the buffer (sandbox_ids are unique, so they'd never be re-delivered
+        // to a replacement anyway).
+        if let Some(sandbox_id) = sandbox_id {
+            self.inner.undelivered_prompts.lock().remove(&sandbox_id);
+        }
     }
 
     /// Accept an anonymous connection from a harness — used by the
@@ -511,6 +542,20 @@ impl HarnessHub {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         };
+        // ADR 0052: remember this prompt as un-confirmed until the harness
+        // emits a RunStarted/PromptQueued/… for it. If the connection we're
+        // about to write to bounces before the harness processes the frame,
+        // the next attach replays it (see `replay_undelivered`) — without
+        // this the prompt is lost and the session wedges (prod `8c165749`).
+        self.inner
+            .undelivered_prompts
+            .lock()
+            .entry(sandbox_id)
+            .or_default()
+            .push(UndeliveredPrompt {
+                prompt_id: prompt_id.clone(),
+                text: text.clone(),
+            });
         cmd_tx
             .send(HarnessFrame::Command(HarnessCommand::Prompt {
                 prompt_id,
@@ -831,7 +876,7 @@ async fn drive_attached<R, W>(
     // only when it still owns the live entry.
     let my_generation = inner.next_gen.fetch_add(1, Ordering::Relaxed);
     let handle = ConnectionHandle {
-        cmd_tx,
+        cmd_tx: cmd_tx.clone(),
         pending_checkpoint: Mutex::new(None),
         session_id: attach.session_id,
         generation: my_generation,
@@ -859,6 +904,44 @@ async fn drive_attached<R, W>(
     inner.last_event_at.lock().insert(sandbox_id, now);
 
     let writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
+
+    // ADR 0052: replay un-confirmed prompts onto this fresh connection
+    // (command-side at-least-once — the twin of the harness's `held` event
+    // slot). A prompt buffered into a connection that bounced before the
+    // harness processed it would otherwise be lost (prod `8c165749`); here
+    // every (re)attach re-delivers it until a confirming event retires it.
+    // The harness dedupes by `prompt_id`, so replaying an already-processed
+    // prompt is a no-op. We then DROP our sender clone so the writer task
+    // can still observe "all senders gone" at teardown.
+    {
+        let pending = inner
+            .undelivered_prompts
+            .lock()
+            .get(&sandbox_id)
+            .cloned()
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            tracing::debug!(
+                sandbox_id = %sandbox_id,
+                count = pending.len(),
+                "replaying un-confirmed prompts onto fresh harness connection",
+            );
+        }
+        for p in pending {
+            if cmd_tx
+                .send(HarnessFrame::Command(HarnessCommand::Prompt {
+                    prompt_id: p.prompt_id,
+                    text: p.text,
+                }))
+                .await
+                .is_err()
+            {
+                break; // writer already gone — next attach will retry
+            }
+        }
+    }
+    drop(cmd_tx);
+
     let reader_outcome = reader_loop(reader, &inner, attach.session_id, sandbox_id).await;
     // Issue #218: guarded teardown. Only remove the per-sandbox entries
     // if the live `connections` registration is STILL ours — i.e. no
@@ -896,6 +979,23 @@ async fn drive_attached<R, W>(
     }
 }
 
+/// The `prompt_id` a harness event confirms the harness has received, if
+/// any (ADR 0052 — drives `undelivered_prompts` retirement). `RunStarted`
+/// confirms only when it carries a `prompt_id` (the env-seeded initial
+/// prompt has none and was never tracked).
+fn confirmed_prompt_id(ev: &HarnessEvent) -> Option<&str> {
+    match ev {
+        HarnessEvent::RunStarted {
+            prompt_id: Some(id),
+            ..
+        } => Some(id.as_str()),
+        HarnessEvent::PromptQueued { prompt_id, .. }
+        | HarnessEvent::PromptEdited { prompt_id, .. }
+        | HarnessEvent::PromptDequeued { prompt_id } => Some(prompt_id.as_str()),
+        _ => None,
+    }
+}
+
 async fn reader_loop<R>(
     mut reader: R,
     hub: &HubInner,
@@ -929,6 +1029,19 @@ where
                     }
                     _ => {
                         hub.last_idle_at.lock().remove(&sandbox_id);
+                    }
+                }
+                // ADR 0052: a RunStarted/PromptQueued/PromptEdited/
+                // PromptDequeued for a prompt means the harness HAS it —
+                // retire it from the un-delivered replay set so a later
+                // reattach won't re-send it.
+                if let Some(confirmed) = confirmed_prompt_id(&ev) {
+                    let mut undelivered = hub.undelivered_prompts.lock();
+                    if let Some(v) = undelivered.get_mut(&sandbox_id) {
+                        v.retain(|p| p.prompt_id != confirmed);
+                        if v.is_empty() {
+                            undelivered.remove(&sandbox_id);
+                        }
                     }
                 }
                 let fut = (hub.event_sink)(session_id, sandbox_id, ev);

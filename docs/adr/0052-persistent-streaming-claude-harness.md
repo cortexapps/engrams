@@ -161,6 +161,32 @@ pipe survives a UFFD restore before Track C relies on it.
     `prompt_id` through `CreateSession` (the web loads the first view from server
     events, so there's no optimistic first-bubble to dedupe).
 
+- **2026-06-17 — Phase 1b follow-up: command-side at-least-once** (this PR).
+  Prod session `8c165749` wedged — the user's 2nd prompt ("Hi") never started a
+  run and its bubble stayed greyed forever. Root cause: the host→harness
+  **command** channel was fire-and-forget, unlike the at-least-once *event*
+  channel (`held`). `send_prompt` buffered the `Prompt` into the live
+  connection's writer and returned `Ok` (the coord then emitted the durable user
+  echo), but if that connection bounced before the harness processed the frame —
+  routine in this system: checkpoints, live moves, idle-evict, the SIGUSR1
+  reconnect nudge — the prompt died with the connection and was never
+  re-delivered. The initial prompt is env-seeded, so "Hi" was the *first* prompt
+  ever to cross the wire as a command — which is exactly why turn 1 worked and
+  turn 2 wedged. (Ruled out: a version skew — turn-1 events carrying the
+  Phase-1b `prompt_id` decoded fine host-side; and a deterministic per-prompt
+  break — `wire_golden` pins the `Prompt` round-trip green.) **Fix:** the hub
+  holds un-confirmed prompts per sandbox and **replays them on every (re)attach**
+  (the command-side twin of `held`), clearing each when its
+  `RunStarted{prompt_id}` / `PromptQueued` / … confirmation arrives; the harness
+  **dedupes by `prompt_id`**, so a replay of an already-processed prompt is a
+  no-op. No wire change. Reproduced + regression-pinned by a host-agent
+  integration test (`harness_command_redelivery`) and a harness engine unit test
+  (`duplicate_prompt_replay_is_ignored`).
+  - *Durable follow-up:* a host-held buffer dies with the host, so this covers a
+    same-host connection bounce (the prod case) but not a full eviction/resume —
+    the coordinator replaying un-consumed prompts on respawn (the ADR's stated
+    "queue survives eviction") remains the broader resilience item.
+
 ## Prior art
 
 Respawn-with-resume for idle is the norm (OpenHands cold-loads `base_state.json`
