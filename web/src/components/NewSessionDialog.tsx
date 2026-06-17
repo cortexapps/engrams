@@ -1,7 +1,8 @@
-import { type ComponentProps, useMemo, useState } from "react";
+import { type ComponentProps, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useMutation, createConnectQueryKey } from "@connectrpc/connect-query";
 import { useForm } from "react-hook-form";
+import { Check, KeyRound } from "lucide-react";
 import { createTask, listTasks } from "../gen/engram/app/v1/task-TaskService_connectquery";
 import { useProfiles } from "../hooks/useProfiles";
 import { ProfileIcon } from "./profiles/ProfileIcon";
@@ -15,10 +16,16 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { cn } from "@/lib/utils";
 
 export function NewSessionDialog({
   onCreated,
@@ -47,22 +54,13 @@ export function NewSessionDialog({
   const open = openProp ?? internalOpen;
   const setOpen = onOpenChange ?? setInternalOpen;
 
-  const { data, isPending } = useProfiles(false);
+  const { data, isPending, error, refetch } = useProfiles(false);
   const profiles = data?.profiles ?? [];
   const qc = useQueryClient();
   const createTaskMutation = useMutation(createTask);
 
-  const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const form = useForm<{ prompt: string }>({ defaultValues: { prompt: "" } });
-
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return profiles;
-    return profiles.filter(
-      (p) => p.name.toLowerCase().includes(q) || p.description.toLowerCase().includes(q),
-    );
-  }, [profiles, search]);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
 
@@ -82,7 +80,6 @@ export function NewSessionDialog({
         setOpen(false);
         form.reset();
         setSelectedId(null);
-        setSearch("");
         onCreated(sessionId);
       } else {
         form.setError("root", { message: "Task created but no session id returned." });
@@ -109,63 +106,66 @@ export function NewSessionDialog({
 
         {isPending && <p className="text-sm text-muted-foreground">Loading profiles…</p>}
 
-        {!isPending && profiles.length === 0 && (
+        {!isPending && error && (
+          <div className="flex flex-col items-start gap-2 py-2">
+            <p className="text-sm text-destructive">Couldn’t load profiles.</p>
+            <Button type="button" variant="outline" size="sm" onClick={() => refetch?.()}>
+              Retry
+            </Button>
+          </div>
+        )}
+
+        {!isPending && !error && profiles.length === 0 && (
           <p className="text-sm text-muted-foreground">
             No profiles configured — contact an admin to set one up.
           </p>
         )}
 
-        {!isPending && profiles.length > 0 && (
+        {!isPending && !error && profiles.length > 0 && (
           <form onSubmit={form.handleSubmit(onSubmit)}>
             <FieldGroup>
-              <Input
-                placeholder="Search profiles…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                autoFocus
-              />
-
-              <div
-                className="flex max-h-72 flex-col gap-2 overflow-y-auto"
-                role="radiogroup"
-                aria-label="Profiles"
-              >
-                {filtered.length === 0 && (
-                  <p className="px-1 py-4 text-center text-sm text-muted-foreground">No matches.</p>
-                )}
-                {filtered.map((p) => (
-                  <button
-                    type="button"
-                    key={p.id}
-                    role="radio"
-                    aria-checked={selectedId === p.id}
-                    data-testid={`profile-row-${p.id}`}
-                    onClick={() => setSelectedId(p.id)}
-                    className={cn(
-                      "flex items-start gap-3 rounded-md border p-3 text-left transition-colors",
-                      selectedId === p.id
-                        ? "border-primary bg-accent"
-                        : "border-border hover:bg-accent/50",
-                    )}
-                  >
-                    <ProfileIcon
-                      name={p.icon}
-                      className="mt-0.5 size-5 shrink-0 text-muted-foreground"
-                    />
-                    <span className="min-w-0">
-                      <span className="block font-medium">{p.name}</span>
-                      <span className="block truncate text-sm text-muted-foreground">
-                        {p.description}
-                      </span>
-                      {p.includeUserTokens && (
-                        <span className="mt-1 block text-xs text-muted-foreground">
-                          carries your token
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                ))}
-              </div>
+              {/* cmdk drives the picker: one tab stop, type-to-filter, ↑/↓ to
+                  move the cursor, Enter to choose the highlighted profile. The
+                  list is a real listbox/option tree (not a hand-rolled
+                  radiogroup), so the keyboard + screen-reader contract is the
+                  one cmdk ships across the app (⌘K, the icon picker). */}
+              <Command loop label="Profiles" className="rounded-md border">
+                <CommandInput placeholder="Search profiles…" autoFocus />
+                <CommandList className="max-h-64">
+                  <CommandEmpty>No matches.</CommandEmpty>
+                  <CommandGroup>
+                    {profiles.map((p) => {
+                      const isChosen = selectedId === p.id;
+                      return (
+                        <CommandItem
+                          key={p.id}
+                          value={`${p.name} ${p.description}`}
+                          data-testid={`profile-row-${p.id}`}
+                          onSelect={() => setSelectedId(p.id)}
+                          className="items-start gap-3 py-2.5"
+                        >
+                          <ProfileIcon
+                            name={p.icon}
+                            className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+                          />
+                          <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                            <span className="font-medium text-foreground">
+                              {p.name}
+                              {isChosen && <span className="sr-only"> (selected)</span>}
+                            </span>
+                            <span className="truncate text-sm text-muted-foreground">
+                              {p.description}
+                            </span>
+                          </span>
+                          {isChosen && (
+                            <Check aria-hidden className="mt-0.5 size-4 shrink-0 text-foreground" />
+                          )}
+                        </CommandItem>
+                      );
+                    })}
+                  </CommandGroup>
+                </CommandList>
+              </Command>
 
               <Field>
                 <FieldLabel htmlFor="prompt">Task</FieldLabel>
@@ -176,6 +176,16 @@ export function NewSessionDialog({
                   {...form.register("prompt")}
                 />
               </Field>
+
+              {/* The credential risk, reinforced where it's assumed: the
+                  developer launching the session, not just the admin editing
+                  the profile. */}
+              {selected?.includeUserTokens && (
+                <p className="flex items-center gap-1.5 text-sm text-foreground">
+                  <KeyRound className="size-3.5 shrink-0 text-instrument-caution" />
+                  This profile carries your Claude token into the sandbox.
+                </p>
+              )}
 
               {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
             </FieldGroup>

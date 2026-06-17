@@ -1,6 +1,8 @@
+import { ChevronRight } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 import { ProfileIcon } from "./ProfileIcon";
 import type { ProfileSnapshotView } from "@/lib/types";
 
@@ -25,10 +27,12 @@ function Details({ p }: { p: ProfileSnapshotView }) {
 }
 
 /**
- * App-wide profile identity chip (ADR §7). `disclosure="tooltip"` for dense link
- * rows (rail/list); `disclosure="hovercard"` for the detail header. Falls back to
- * the image string for legacy / profile-less sessions. The tooltip branch carries
- * its own TooltipProvider so the chip is safe to render outside the sidebar.
+ * App-wide profile identity chip (ADR §7). `disclosure="tooltip"` is the dense
+ * inline chip for link rows (rail/list); `disclosure="hovercard"` is a
+ * self-contained card-button (icon + name, a trailing chevron) that reveals the
+ * resolved image + details on hover/focus — used in the session-detail rail.
+ * Falls back to the image string for legacy / profile-less sessions. The tooltip
+ * branch carries its own TooltipProvider so the chip is safe outside the sidebar.
  */
 export function ProfileChip({
   profile,
@@ -53,7 +57,7 @@ export function ProfileChip({
 
   const label = (
     <span className={`inline-flex min-w-0 items-center gap-1.5 ${className ?? ""}`}>
-      <ProfileIcon name={profile.icon} className="size-3.5 shrink-0 text-muted-foreground" />
+      <ProfileIcon name={profile.icon} className="size-3 shrink-0 text-muted-foreground" />
       <span className="truncate">{profile.name}</span>
       {profile.archived && (
         <Badge variant="secondary" className="px-1 py-0 text-[10px]">
@@ -67,8 +71,26 @@ export function ProfileChip({
     return (
       <HoverCard openDelay={100}>
         <HoverCardTrigger asChild>
-          <button type="button" className="text-left">
-            {label}
+          <button
+            type="button"
+            className={cn(
+              "group flex w-full items-center gap-2 rounded-md border bg-card px-3 py-2 text-left text-sm transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none motion-reduce:transition-none",
+              className,
+            )}
+          >
+            <ProfileIcon name={profile.icon} className="size-4 shrink-0 text-muted-foreground" />
+            <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+              {profile.name}
+            </span>
+            {profile.archived && (
+              <Badge variant="secondary" className="shrink-0">
+                archived
+              </Badge>
+            )}
+            <ChevronRight
+              aria-hidden
+              className="size-4 shrink-0 text-muted-foreground/60 transition-transform group-hover:translate-x-0.5 motion-reduce:transition-none"
+            />
           </button>
         </HoverCardTrigger>
         <HoverCardContent align="start">

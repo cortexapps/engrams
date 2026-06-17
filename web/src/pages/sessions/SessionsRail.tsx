@@ -1,5 +1,5 @@
 import type { CSSProperties } from "react";
-import { Layers, ListChecks } from "lucide-react";
+import { Layers, ListChecks, TriangleAlert } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
 import { StatusGlyph } from "../../components/Glyph";
@@ -85,7 +85,13 @@ export function SessionsRail() {
                   </SidebarMenuItem>
                 ))
               ) : error ? (
-                <p className="px-2 py-1.5 text-xs text-destructive">Couldn’t load sessions.</p>
+                // Destructive red is ~1.5:1 on the deep-green rail (invisible in
+                // light mode); carry the error on legible sage ink + an alert
+                // glyph instead — glyph + word, the product's status grammar.
+                <p className="flex items-center gap-1.5 px-2 py-1.5 text-xs text-sidebar-foreground">
+                  <TriangleAlert className="size-3.5 shrink-0" />
+                  Couldn’t load sessions.
+                </p>
               ) : rows.length === 0 ? (
                 <p className="px-2 py-2 text-xs text-sidebar-foreground/70">No sessions yet.</p>
               ) : (

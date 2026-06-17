@@ -1,4 +1,4 @@
-import { KeyRound, Users, UserCircle, Layers } from "lucide-react";
+import { KeyRound, Users, UserCircle, IdCard } from "lucide-react";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { useAbility } from "../../auth/AuthProvider";
 import {
@@ -23,7 +23,7 @@ const MINE: NavItem[] = [
 ];
 const ORG: NavItem[] = [
   { to: "/settings/members", label: "Members", icon: Users },
-  { to: "/settings/profiles", label: "Session Profiles", icon: Layers },
+  { to: "/settings/profiles", label: "Session Profiles", icon: IdCard },
 ];
 
 export function SettingsLayout() {

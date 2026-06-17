@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { toast } from "sonner";
-import { Layers, Pencil, Archive } from "lucide-react";
+import { IdCard, Pencil, Archive } from "lucide-react";
 import { useProfiles, useDeleteProfile } from "../../hooks/useProfiles";
 import { ProfileIcon } from "../../components/profiles/ProfileIcon";
 import { Button } from "@/components/ui/button";
@@ -96,10 +96,10 @@ export function SessionProfiles() {
   };
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-6">
+    <div className="flex flex-col gap-6">
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Layers className="size-5" />
+          <IdCard className="size-5" />
           <h1 className="text-lg font-semibold">Session Profiles</h1>
         </div>
         <Button asChild>

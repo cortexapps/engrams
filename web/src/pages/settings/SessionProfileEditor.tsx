@@ -106,7 +106,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const busy = form.formState.isSubmitting || create.isPending || update.isPending;
 
   return (
-    <form onSubmit={form.handleSubmit(onSubmit)} className="mx-auto flex max-w-2xl flex-col gap-6">
+    <form onSubmit={form.handleSubmit(onSubmit)} className="flex max-w-2xl flex-col gap-6">
       <h1 className="text-lg font-semibold">{mode === "edit" ? "Edit profile" : "New profile"}</h1>
 
       <FieldSet>
@@ -190,8 +190,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 <div>
                   <FieldLabel htmlFor="includeUserTokens">Include user tokens</FieldLabel>
                   <FieldDescription>
-                    Sessions started from this profile may carry the user's Claude credentials into
-                    the sandbox. Leave off for untrusted or externally-facing images.
+                    Sessions started from this profile may carry the user's Claude token into the
+                    sandbox. Leave off for untrusted or externally-facing images.
                   </FieldDescription>
                 </div>
               </Field>

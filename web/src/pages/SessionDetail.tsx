@@ -10,7 +10,7 @@ import { TerminalPane } from "../components/TerminalPane";
 import { SessionCowState } from "../components/CowState";
 import { DurabilityTimeline } from "../components/DurabilityTimeline";
 import { MetricRow } from "../components/MetricRow";
-import { relativeTime } from "./sessions/session-format";
+import { relativeTime, statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
 import { ProfileChip } from "../components/profiles/ProfileChip";
 import { Sidebar, SidebarContent, SidebarProvider } from "@/components/ui/sidebar";
@@ -27,7 +27,7 @@ import { useHosts } from "../hooks/useHosts";
 import { useTeleportSession } from "../hooks/useTeleportSession";
 import { usePauseResumeSession } from "../hooks/usePauseResumeSession";
 import { useIsAdmin } from "../auth/AuthProvider";
-import type { Session } from "../lib/types";
+import type { Session, ProfileSnapshotView } from "../lib/types";
 
 type ViewTab = "transcript" | "shell" | "raw";
 
@@ -43,6 +43,18 @@ export function SessionDetail() {
   const { data: tasksData } = useTasks();
   const profileSnap =
     tasksData?.tasks.flatMap((t) => t.sessions).find((r) => r.sessionId === id)?.profile ?? null;
+  // Normalize the embedded snapshot to the UI view once; the masthead chip and
+  // the metadata rail both read it. Point-in-time by design (ADR 0052) — what
+  // this session launched from, not the profile's current state.
+  const profile: ProfileSnapshotView | null = profileSnap
+    ? {
+        id: profileSnap.id,
+        name: profileSnap.name,
+        icon: profileSnap.icon,
+        archived: profileSnap.archived,
+        imageUri: profileSnap.imageUri,
+      }
+    : null;
   const events = useSessionEvents(id);
   const [tab, setTab] = useState<ViewTab>("transcript");
   // Once the user opens the SHELL tab, keep TerminalPane mounted for
@@ -81,24 +93,6 @@ export function SessionDetail() {
               `session` eyebrow over the mono session id. */}
           <PageHeading eyebrow="session" title={id} titleVariant="mono" />
 
-          <div className="mt-2">
-            <ProfileChip
-              profile={
-                profileSnap
-                  ? {
-                      id: profileSnap.id,
-                      name: profileSnap.name,
-                      icon: profileSnap.icon,
-                      archived: profileSnap.archived,
-                      imageUri: profileSnap.imageUri,
-                    }
-                  : null
-              }
-              fallbackImage={session?.image}
-              disclosure="hovercard"
-            />
-          </div>
-
           <div className="mt-4">
             <TabRow tabs={TABS} active={tab} onChange={setTab} />
           </div>
@@ -131,7 +125,12 @@ export function SessionDetail() {
           className="hidden border-l md:flex [--sidebar:var(--card)] [--sidebar-foreground:var(--card-foreground)] [--sidebar-border:var(--border)]"
         >
           <SidebarContent className="gap-0 px-5 py-6">
-            <SessionMeta session={session} eventCount={events.length} sessionId={id} />
+            <SessionMeta
+              session={session}
+              profile={profile}
+              eventCount={events.length}
+              sessionId={id}
+            />
           </SidebarContent>
         </Sidebar>
       )}
@@ -141,10 +140,12 @@ export function SessionDetail() {
 
 function SessionMeta({
   session,
+  profile,
   eventCount,
   sessionId,
 }: {
   session: Session;
+  profile: ProfileSnapshotView | null;
   eventCount: number;
   sessionId: string;
 }) {
@@ -153,17 +154,25 @@ function SessionMeta({
       <div className="flex items-center gap-2">
         <StatusGlyph status={session.status} />
         <span data-testid="session-status" className="text-sm font-medium text-foreground">
-          {session.status.replace(/_/g, " ")}
+          {statusLabel(session.status)}
         </span>
       </div>
 
+      {/* The profile this session launched from (ADR 0052): a self-contained
+          card-button whose hovercard reveals the resolved image + details on
+          hover/focus — no "profile" header, the card IS the affordance. Legacy /
+          profile-less sessions fall back to a labelled image row below. */}
+      {profile && <ProfileChip profile={profile} disclosure="hovercard" />}
+
       <dl className="space-y-2.5 text-sm">
-        <div>
-          <dt className="text-muted-foreground">image</dt>
-          <dd className="mt-0.5 font-mono text-[0.8rem] break-all text-foreground">
-            {session.image}
-          </dd>
-        </div>
+        {!profile && (
+          <div>
+            <dt className="text-muted-foreground">image</dt>
+            <dd className="mt-0.5 font-mono text-[0.8rem] break-all text-foreground">
+              {session.image}
+            </dd>
+          </div>
+        )}
         <MetricRow label="created" value={`${relativeTime(session.created_at)} ago`} />
         {/* The count gets its own element: e2e polls Number(textContent) of
             exactly this span — tagging surrounding prose would yield NaN. */}
