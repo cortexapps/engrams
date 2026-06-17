@@ -1,8 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
-import { screen } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { renderWithProviders } from "../../test-utils";
 import { SessionProfiles } from "./SessionProfiles";
 
+const del = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 vi.mock("../../hooks/useProfiles", () => ({
   useProfiles: (includeArchived: boolean) => ({
     data: {
@@ -34,8 +36,12 @@ vi.mock("../../hooks/useProfiles", () => ({
     },
     isPending: false,
   }),
-  useDeleteProfile: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useDeleteProfile: () => ({ mutateAsync: del, isPending: false }),
 }));
+
+beforeEach(() => {
+  del.mockClear();
+});
 
 describe("SessionProfiles list", () => {
   it("renders active profiles with a create affordance", async () => {
@@ -43,5 +49,14 @@ describe("SessionProfiles list", () => {
     expect(await screen.findByText("Backend")).toBeTruthy();
     expect(screen.getByText("carries your token")).toBeTruthy();
     expect(screen.getByRole("link", { name: /create profile/i })).toBeTruthy();
+  });
+
+  it("archives an active profile via the confirm dialog", async () => {
+    renderWithProviders(<SessionProfiles />);
+    const user = userEvent.setup();
+    await screen.findByText("Backend");
+    await user.click(screen.getByRole("button", { name: /^archive$/i }));
+    await user.click(await screen.findByRole("button", { name: /archive profile/i }));
+    await waitFor(() => expect(del).toHaveBeenCalledWith({ id: "p1" }));
   });
 });
