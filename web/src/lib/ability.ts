@@ -20,7 +20,14 @@ import { AbilityBuilder, createMongoAbility, type MongoAbility } from "@casl/abi
 
 export type Actions = "create" | "read" | "prompt" | "shell" | "delete" | "manage";
 
-export type Subjects = "Task" | "Session" | "EnabledImage" | "Fleet" | "Registry" | "all";
+export type Subjects =
+  | "Task"
+  | "Session"
+  | "EnabledImage"
+  | "Profile"
+  | "Fleet"
+  | "Registry"
+  | "all";
 
 // Typed subject shapes — used with CASL's `subject()` helper.
 export type TaskSubject = { createdByUserId: string | null };
@@ -60,6 +67,10 @@ export function abilityFor(user: AbilityUser): AppAbility {
 
   // Image catalog is readable by anyone.
   can("read", "EnabledImage");
+
+  // Profiles: every member reads the picker menu; mutations are admin-only
+  // (manage("all")). ADR 0052 §6.
+  can("read", "Profile");
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");
