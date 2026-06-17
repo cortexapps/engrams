@@ -1102,12 +1102,19 @@ mod adapter {
         // a UI that drew a greyed type-ahead item with this id moves it
         // into the conversation now. `None` for the env-seeded initial
         // prompt (which never went through the editable queue).
+        //
+        // `prompt_summary` is deliberately `None`: the coordinator emits the
+        // user turn as a `role:user` agent_message (carrying `prompt_id`),
+        // which is the single authoritative source of the user bubble. If we
+        // ALSO put the text on `RunStarted`, the web renders the prompt twice
+        // (the `rs:idx` + `m:idx` double-render). The web correlates the queue
+        // lifecycle via `prompt_id`, not via this summary.
         emit(
             evt_tx,
             HarnessEvent::RunStarted {
                 run_id: run_id.clone(),
                 prompt_id,
-                prompt_summary: Some(truncate_str(text, MAX_ARGS_SUMMARY_BYTES)),
+                prompt_summary: None,
             },
         )
         .await;
