@@ -23,8 +23,11 @@
  *       b. Promote via docker compose exec psql (Bun.spawn; idempotent).
  *       c. Fresh sign-in → admin cookie.
  *       d. Admin ListHosts → 200 with hosts array.
- *   8.  Task lifecycle (native TaskService — Task 19):
- *       8. CreateTask(chat, no-harness image) → task returned with live session state
+ *      7b. Admin CreateProfile (ADR 0052): wrap a no-harness enabled image in a
+ *          profile the member tests launch from (tasks start from a profile, not
+ *          a raw image). Cleaned up in afterAll.
+ *   8.  Task lifecycle (native TaskService — Task 19; ADR 0052 profiles):
+ *       8. CreateTask(chat, profile_id) → task returned with live session state
  *       9. ListTasks → task visible with session; GetTask → task returned
  *      10. DeleteTask → ListTasks empty (member's view of created task)
  *   11–13. SSE + token (Task 20):
@@ -36,7 +39,7 @@
  * passes 0 failures even without the stack running).
  */
 
-import { expect, test, describe, beforeAll } from "bun:test";
+import { expect, test, describe, afterAll } from "bun:test";
 // ws is used for test 14b because Bun's native WebSocket strips the Cookie
 // header from HTTP upgrade requests; the ws npm package sends it correctly.
 import WsClient from "ws";
@@ -142,6 +145,24 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
 
   // Cookie captured during the provisioning test and shared with the matrix tests.
   let memberCookie = "";
+
+  // Admin cookie (set in test 7) + the profile created from it (test 7b).
+  // ADR 0052: tasks now start from an admin-curated profile, not a raw image,
+  // so the member task tests below launch from `smokeProfileId`.
+  let adminCookie = "";
+  let smokeProfileId = "";
+
+  // Clean up the ephemeral profile created in test 7b (admin-only delete).
+  afterAll(async () => {
+    if (SMOKE && smokeProfileId && adminCookie) {
+      await rpc(
+        "engram.app.v1.ProfileService",
+        "DeleteProfile",
+        { id: smokeProfileId },
+        adminCookie,
+      );
+    }
+  });
 
   test.skipIf(!SMOKE)(
     "2/10 provision fresh MEMBER user and capture session cookie",
@@ -281,7 +302,7 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
         body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASS }),
       });
       expect(signInRes.status).toBe(200);
-      const adminCookie = extractSessionCookie(signInRes);
+      adminCookie = extractSessionCookie(signInRes);
 
       // d. Admin ListHosts → 200 with hosts array.
       const res = await rpc(
@@ -300,39 +321,76 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   );
 
   // -------------------------------------------------------------------------
-  // 8–10. Task lifecycle — native TaskService (Task 19)
+  // 7b. Create a session profile (ADR 0052) — admin-only.
   //
-  // Uses the member account provisioned in test 2 (memberCookie).
-  // Picks the first no-harness image from ListEnabledImages (harnessName null/
-  // absent). The created task id is shared across tests 8–10.
+  // Tasks now start from an admin-curated profile, not a raw image. Wrap the
+  // first no-harness enabled image in a profile; the member task tests below
+  // launch from it. Uses the admin cookie from test 7. Deleted in afterAll.
+  // -------------------------------------------------------------------------
+  test.skipIf(!SMOKE)(
+    "7b/ admin CreateProfile (no-harness image) → profile with id",
+    async () => {
+      expect(adminCookie).toBeTruthy(); // test 7 must have run
+
+      // Pick a no-harness enabled image (admin view) to back the profile.
+      const imagesRes = await rpc(
+        "engram.app.v1.ImageService",
+        "ListEnabledImages",
+        {},
+        adminCookie,
+      );
+      expect(imagesRes.status).toBe(200);
+      const imagesBody = (await imagesRes.json()) as {
+        images?: Array<{ id?: string; imageUri?: string; harnessName?: string }>;
+      };
+      const noHarnessImage = (imagesBody.images ?? []).find((img) => !img.harnessName);
+      if (!noHarnessImage?.id) {
+        throw new Error(
+          "No no-harness image found in ListEnabledImages — bake/enable one first " +
+            "(deploy/dev/integration-session.sh)",
+        );
+      }
+
+      const createRes = await rpc(
+        "engram.app.v1.ProfileService",
+        "CreateProfile",
+        {
+          name: `smoke-profile-${Date.now()}`,
+          description: "ephemeral smoke profile",
+          icon: "box",
+          imageId: noHarnessImage.id,
+          includeUserTokens: false,
+          envVars: {},
+        },
+        adminCookie,
+      );
+      expect(createRes.status).toBe(200);
+      const createBody = (await createRes.json()) as { profile?: { id?: string } };
+      smokeProfileId = createBody.profile?.id ?? "";
+      expect(smokeProfileId).toBeTruthy();
+      console.log(`Smoke 7b PASS: created profile ${smokeProfileId}`);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 8–10. Task lifecycle — native TaskService (Task 19; ADR 0052 profiles)
+  //
+  // Uses the member account provisioned in test 2 (memberCookie) and the
+  // profile created in test 7b (smokeProfileId). The created task id is shared
+  // across tests 8–10.
   // -------------------------------------------------------------------------
 
   let smokeTaskId = "";
 
   test.skipIf(!SMOKE)(
-    "8/10 member CreateTask(chat, no-harness image) → task with live session state",
+    "8/10 member CreateTask(chat, from profile) → task with live session state",
     async () => {
-      // Pick a no-harness image.
-      const imagesRes = await rpc(
-        "engram.app.v1.ImageService",
-        "ListEnabledImages",
-        {},
-        memberCookie,
-      );
-      expect(imagesRes.status).toBe(200);
-      const imagesBody = (await imagesRes.json()) as { images?: Array<{ imageUri?: string; harnessName?: string }> };
-      const images = imagesBody.images ?? [];
-      const noHarnessImage = images.find((img) => !img.harnessName);
-      if (!noHarnessImage?.imageUri) {
-        throw new Error(
-          "No no-harness image found in ListEnabledImages — stack may not have images enabled",
-        );
-      }
+      expect(smokeProfileId).toBeTruthy(); // test 7b must have created it
 
       const createRes = await rpc(
         "engram.app.v1.TaskService",
         "CreateTask",
-        { type: "chat", imageUri: noHarnessImage.imageUri, title: "Smoke task" },
+        { type: "chat", profileId: smokeProfileId, title: "Smoke task" },
         memberCookie,
       );
       expect(createRes.status).toBe(200);
@@ -433,27 +491,14 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
     async () => {
       // Test 10 DELETED smokeTaskId (and its session) — the SSE checks need a
       // live session, so provision a fresh task here; test 12 cleans it up.
-      const imagesRes = await rpc(
-        "engram.app.v1.ImageService",
-        "ListEnabledImages",
-        {},
-        memberCookie,
-      );
-      expect(imagesRes.status).toBe(200);
-      const imagesBody = (await imagesRes.json()) as {
-        images?: Array<{ imageUri?: string; harnessName?: string }>;
-      };
-      const noHarnessImage = (imagesBody.images ?? []).find(
-        (img) => !img.harnessName,
-      );
-      expect(noHarnessImage?.imageUri).toBeTruthy();
+      expect(smokeProfileId).toBeTruthy();
 
       const createRes = await rpc(
         "engram.app.v1.TaskService",
         "CreateTask",
         {
           type: "chat",
-          imageUri: noHarnessImage!.imageUri,
+          profileId: smokeProfileId,
           title: "Smoke SSE task",
         },
         memberCookie,
@@ -686,20 +731,16 @@ describe("orchestrator live smoke (SMOKE=1 to enable)", () => {
   test.skipIf(!SMOKE)(
     "14b/14b shell WS member → terminal responds with 'hi'",
     async () => {
-      // Create a task for a live session.
-      const imagesRes = await rpc("engram.app.v1.ImageService", "ListEnabledImages", {}, memberCookie);
-      expect(imagesRes.status).toBe(200);
-      const imagesBody = (await imagesRes.json()) as { images?: Array<{ imageUri?: string; harnessName?: string }> };
-      const noHarnessImage = (imagesBody.images ?? []).find((img) => !img.harnessName);
-      if (!noHarnessImage?.imageUri) {
-        console.log("Smoke 14b SKIP: no no-harness image available");
+      // Create a task for a live session (ADR 0052: from the smoke profile).
+      if (!smokeProfileId) {
+        console.log("Smoke 14b SKIP: no smoke profile available");
         return;
       }
 
       const createRes = await rpc(
         "engram.app.v1.TaskService",
         "CreateTask",
-        { type: "chat", imageUri: noHarnessImage.imageUri, title: "Smoke shell task" },
+        { type: "chat", profileId: smokeProfileId, title: "Smoke shell task" },
         memberCookie,
       );
       expect(createRes.status).toBe(200);
