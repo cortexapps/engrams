@@ -58,22 +58,15 @@ spec:
             - name: http
               containerPort: {{ .Values.web.containerPort }}
               protocol: TCP
-          {{- if .Values.web.coordinatorToken.existingSecret }}
-          # Bearer token injected into proxied requests by the nginx
-          # config (see web-configmap.yaml). The nginx-alpine entrypoint
-          # runs envsubst on /etc/nginx/templates/*.template at start;
-          # FILTER scopes substitution to our `ENGRAM_*` vars so the
-          # template's `$http_upgrade` / `$host` nginx variables aren't
-          # touched.
           env:
-            - name: ENGRAM_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.web.coordinatorToken.existingSecret }}
-                  key: {{ .Values.web.coordinatorToken.secretKey }}
+            # The nginx-alpine entrypoint runs envsubst over the mounted
+            # default.conf.template at start. Scope it to `ENGRAM_*` (a set
+            # that is now empty post-ADR-0051) so it stays a no-op and never
+            # touches the template's nginx variables (`$host`, `$http_upgrade`,
+            # …). ADR 0051 dropped the coord bearer the web used to stamp; the
+            # orchestrator authenticates the user and holds the bearer itself.
             - name: NGINX_ENVSUBST_FILTER
               value: "^ENGRAM_"
-          {{- end }}
           volumeMounts:
             - name: nginx-config
               mountPath: /etc/nginx/templates/default.conf.template

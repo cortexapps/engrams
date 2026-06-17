@@ -22,9 +22,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // task.proto is deliberately absent: orchestrator-native (ADR §3).
     ];
     let includes = ["proto"];
+    // Emit a serialized FileDescriptorSet covering the compiled protos so
+    // the coordinator can stand up tonic-reflection on its app-gRPC server
+    // (grpcurl `list`/`describe`/proto-less calls against the
+    // network-private control plane — schema only, no data). The bytes are
+    // loaded back via `include_bytes!` in `src/app.rs`.
+    let descriptor_path =
+        std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("engram_app_descriptor.bin");
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        .file_descriptor_set_path(&descriptor_path)
         // The default 4 MiB inbound message cap is fine for unary
         // payloads (SandboxSpec, SnapshotMetadata are well under
         // that). `ReapMaterializeDir` ships a vec of UUIDs that can

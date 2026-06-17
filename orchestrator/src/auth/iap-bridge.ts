@@ -15,10 +15,11 @@
  *
  * ## Inert posture (dev / local)
  *
- * DEPLOY LANDMINE (resolve before any IAP prod deploy): GCP load-balancer
- * HEALTH CHECKS bypass IAP and carry no assertion — with IAP_AUDIENCE set,
- * /healthz would 401 and the backend gets marked unhealthy. The deploy needs
- * a health-check path exemption in this bridge (or LB-level config) first.
+ * HEALTH-CHECK EXEMPTION (resolved): GCP load-balancer health checks AND
+ * kubelet readiness probes bypass IAP and carry no assertion — with
+ * IAP_AUDIENCE set, /healthz would 401 and the backend/pod is marked
+ * unhealthy. `iapBridge` now short-circuits `/healthz` before any IAP logic
+ * (see the top of the function), so probes always reach the health route.
  *
  * When `IAP_AUDIENCE` is unset the bridge is fully inert — it returns
  * immediately without touching headers, allocating memory, or reading env.
@@ -105,6 +106,23 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import { auth } from "./better-auth.ts";
 import { config } from "../config.ts";
+
+// ---------------------------------------------------------------------------
+// Public (unauthenticated) paths
+// ---------------------------------------------------------------------------
+
+/**
+ * Paths the bridge lets through WITHOUT any IAP/session check — matched
+ * exactly against the path component (query string stripped).
+ *
+ * Why: kubelet readiness probes and GCP LB health checks hit the orchestrator
+ * directly, bypassing IAP, so they carry no X-Goog-IAP-JWT-Assertion. With
+ * IAP_AUDIENCE set the bridge fails closed (401), which would mark the pod /
+ * backend perpetually unhealthy. /healthz only reports {ok, db}, so it is
+ * unauthenticated by design. Add new probe/observability paths (e.g. /readyz,
+ * /metrics) here rather than scattering inline checks.
+ */
+const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/healthz"]);
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -322,6 +340,17 @@ export async function iapBridge(
   res: ServerResponse,
   next: BridgeNext,
 ): Promise<void> {
+  // PUBLIC-PATH EXEMPTION (resolves the deploy landmine in the module header):
+  // health/readiness probes bypass IAP and carry no assertion, so the
+  // fail-closed path below would 401 them → the pod never goes Ready. Let the
+  // allowlist through before any IAP logic. Checked even when IAP is inert so
+  // the path is identical in dev and prod. See PUBLIC_PATHS for the rationale.
+  const path = (req.url ?? "/").split("?", 1)[0];
+  if (PUBLIC_PATHS.has(path)) {
+    next();
+    return;
+  }
+
   // INERT PATH: IAP_AUDIENCE unset → bridge is fully off.
   if (!config.iapAudience) {
     next();

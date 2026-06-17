@@ -39,6 +39,11 @@ service FleetService {
   rpc ChunkGc(ChunkGcRequest) returns (ChunkGcResponse);
   rpc BundleGc(BundleGcRequest) returns (BundleGcResponse);
   rpc SnapshotBlobGc(SnapshotBlobGcRequest) returns (SnapshotBlobGcResponse);
+  // ADR 0044 K4 / ADR 0047-0048: the node-pool autoscaler's demand signal
+  // (was GET /api/admin/fleet/demand). Counts, headroom (both dims), the
+  // cordoned footprint, and the queue all come from PG so every coordinator
+  // replica reports identical demand.
+  rpc GetFleetDemand(GetFleetDemandRequest) returns (GetFleetDemandResponse);
 }
 
 message ListHostsRequest {}
@@ -235,6 +240,36 @@ message EvacuateSessionResponse {
   // next sweep interval (≤10s default). Watch the session's event
   // stream for the Evacuating → Created → Active chain.
   string status = 2;
+}
+
+message GetFleetDemandRequest {}
+
+// Mirrors api/admin.rs FleetDemandResponse (ADR 0044 K4 / 0047 / 0048). The
+// autoscaler's input. Every field is PG-derived so replicas agree.
+message GetFleetDemandResponse {
+  // Hosts with a live heartbeat.
+  uint32 ready_hosts = 1;
+  // Non-draining hosts the scheduler can place on.
+  uint32 schedulable_hosts = 2;
+  // ADR 0046: Σ max(0, allocatable_mib − reserved) over schedulable hosts —
+  // the host-measured headroom (nets out the daemon/OS/chunk-cache/mlock
+  // baseline), the autoscaler's true demand signal.
+  uint64 free_mib = 3;
+  // Σ allocatable_mib over schedulable hosts — lets the caller derive the
+  // average per-host capacity (how much one node adds).
+  uint64 total_mib = 4;
+  // ADR 0048: Σ spare vCPU (Σ cpu_budget − reserved) over schedulable hosts,
+  // and the total CPU budget — the CPU dimension of scale-up.
+  uint64 free_vcpus = 5;
+  uint64 total_vcpus = 6;
+  // ADR 0048: hosts cordoned for scale-down (operator visibility; the wave
+  // driver also reads this to know its in-flight footprint).
+  uint32 cordoned_hosts = 7;
+  // ADR 0048: the queue. `queued_*` is the demand the operator scales UP to
+  // fit; scale-DOWN is hard-gated on `queued_sessions == 0`.
+  uint64 queued_sessions = 8;
+  uint64 queued_mib = 9;
+  uint64 queued_vcpus = 10;
 }
 
 message ChunkGcRequest {

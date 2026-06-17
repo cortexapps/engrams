@@ -57,6 +57,18 @@ export const resume = SessionService.method.resume;
 export const evictLocal = SessionService.method.evictLocal;
 
 /**
+ * ADR 0051: the explicit admin trigger for the idle-eviction primitive
+ * (was POST /api/admin/sessions/:id/evict-idle). Fires the SAME pipeline
+ * (idle_evictor::evict_idle_session) the host-side idle detector + the
+ * coord idle-detect backstop drive on a timeout, so it is a faithful
+ * stand-in for "the session went idle" WITHOUT waiting out (or lowering)
+ * the idle TTL. Synchronous: the session is Idle by the time this returns.
+ *
+ * @generated from rpc engram.app.v1.SessionService.EvictIdle
+ */
+export const evictIdle = SessionService.method.evictIdle;
+
+/**
  * @generated from rpc engram.app.v1.SessionService.GetCowState
  */
 export const getCowState = SessionService.method.getCowState;

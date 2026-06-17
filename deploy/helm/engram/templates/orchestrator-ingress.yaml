@@ -1,4 +1,4 @@
-{{- if and .Values.orchestrator.enabled .Values.orchestrator.ingress.enabled -}}
+{{- if and .Values.web.enabled .Values.orchestrator.ingress.enabled -}}
 # Optional public Ingress fronting the orchestrator Service. On GCP this
 # becomes a Google HTTPS LB; the IAP integration is via the
 # `cloud.google.com/backend-config` annotation on the orchestrator Service

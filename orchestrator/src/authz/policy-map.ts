@@ -91,6 +91,7 @@ export const POLICY: Record<string, PolicyEntry> = {
   // Admin-only SessionService methods
   "SessionService.Snapshot": { action: "manage", subject: "all" },
   "SessionService.EvictLocal": { action: "manage", subject: "all" },
+  "SessionService.EvictIdle": { action: "manage", subject: "all" }, // explicit idle-evict trigger (ADR 0051)
   "SessionService.ListSessions": { action: "manage", subject: "all" }, // raw admin view
   "SessionService.CreateSession": { action: "manage", subject: "all" }, // UI uses CreateTask
   "SessionService.CreateArtifactFromPath": { action: "manage", subject: "all" },
@@ -125,6 +126,7 @@ export const POLICY: Record<string, PolicyEntry> = {
   "FleetService.ChunkGc": { action: "manage", subject: "all" },
   "FleetService.BundleGc": { action: "manage", subject: "all" },
   "FleetService.SnapshotBlobGc": { action: "manage", subject: "all" },
+  "FleetService.GetFleetDemand": { action: "manage", subject: "all" }, // autoscaler demand signal (ADR 0051)
 };
 
 /**

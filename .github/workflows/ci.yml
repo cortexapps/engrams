@@ -129,6 +129,15 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       e2e: ${{ steps.lanes.outputs.e2e }}
+      # PR test lanes — each gates the matching job below. A CI-workflow or
+      # detector change sets all of these (see detect-rebake-lanes.py), so a
+      # change to how CI runs re-runs everything.
+      test_rust: ${{ steps.lanes.outputs.test_rust }}
+      test_cross: ${{ steps.lanes.outputs.test_cross }}
+      test_fc: ${{ steps.lanes.outputs.test_fc }}
+      test_web: ${{ steps.lanes.outputs.test_web }}
+      test_orchestrator: ${{ steps.lanes.outputs.test_orchestrator }}
+      test_buf: ${{ steps.lanes.outputs.test_buf }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -139,8 +148,8 @@ jobs:
         id: lanes
         run: |
           # PRs diff against the base SHA (an ancestor of the checked-out
-          # merge commit under fetch-depth:0). Other events fall back to
-          # HEAD^! — irrelevant since their e2e `if:` runs unconditionally.
+          # merge commit under fetch-depth:0). Other events (merge_group,
+          # push) fall back to HEAD^! — the squashed change set of the commit.
           BASE=""
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
@@ -149,6 +158,8 @@ jobs:
 
   lint:
     name: fmt + clippy + check
+    needs: detect
+    if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
@@ -223,6 +234,8 @@ jobs:
 
   test-linux:
     name: tests (linux)
+    needs: detect
+    if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     services:
       postgres:
@@ -331,7 +344,6 @@ jobs:
             --test snapshot_blob_gc_live_pg \
             --test admin_chunk_gc_live_pg \
             --test admin_evac_live_pg \
-            --test users_live_pg \
             --test eviction_live_pg \
             --test checkpoint_reconcile_live_pg \
             --test enable_jobs_live_pg \
@@ -347,6 +359,8 @@ jobs:
 
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
+    needs: detect
+    if: needs.detect.outputs.test_cross == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
@@ -420,6 +434,8 @@ jobs:
 
   web:
     name: web (pnpm)
+    needs: detect
+    if: needs.detect.outputs.test_web == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     defaults:
       run:
@@ -459,6 +475,8 @@ jobs:
   # coordinator). Inert until the tier is wired to traffic.
   orchestrator:
     name: orchestrator (bun)
+    needs: detect
+    if: needs.detect.outputs.test_orchestrator == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     defaults:
       run:
@@ -488,6 +506,8 @@ jobs:
   # then this PR ships only the contract + Rust stubs.
   buf:
     name: buf (proto lint + breaking + codegen drift)
+    needs: detect
+    if: needs.detect.outputs.test_buf == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v6
@@ -534,6 +554,8 @@ jobs:
 
   test-firecracker:
     name: tests (firecracker, Linux + KVM)
+    needs: detect
+    if: needs.detect.outputs.test_fc == 'true'
     # Blacksmith exposes `/dev/kvm` via nested virtualization (see
     # https://docs.blacksmith.sh/blacksmith-runners/overview). Mirrors
     # the dev-vm bootstrap (engram-dev) — the canonical Linux + KVM
@@ -767,6 +789,7 @@ jobs:
           cargo nextest run \
             -p engram-host-agent \
             --test checkpoint_chain \
+            --test warm_hook_capture \
             --test migration_source \
             --test two_host_live_teleport \
             --test two_host_drain_wave \
@@ -933,6 +956,16 @@ jobs:
   # ------------------------------------------------------------------
   bake-harness-claude-artifact:
     name: bake harness-claude artifact
+    # Consumed only by test-e2e-stack (downloads the workflow artifact) and
+    # bake-demo-image (push-to-main / dispatch) — so gate it on the union of
+    # their conditions. No point building the harness when nothing consumes it
+    # (e.g. a docs- or chart-only PR). Mirrors artifacts-e2e-stack's gating.
+    needs: detect
+    if: >-
+      needs.detect.outputs.e2e == 'true'
+      || github.event_name == 'merge_group'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
@@ -1368,18 +1401,24 @@ jobs:
   # flaky `proxy_e2e` doesn't suppress e2e-stack signal.
   # ------------------------------------------------------------------
   test-e2e-stack:
-    name: e2e stack ${{ matrix.variant }} (coord HTTP → gRPC → FC)
-    # Two variants of the same prod-shape stack (egress proxy on for
-    # both — the proven config):
-    #   - suite: single host. Runs every e2e_stack test EXCEPT the
-    #     teleport one (incl. the egress-dependent claude auth test,
-    #     which a single host serves reliably).
-    #   - teleport: two hosts (host-a + host-b). Runs ONLY the teleport
-    #     test, hard-asserting >=2 hosts. The egress-dependent claude
-    #     test is NOT run here — two FC host-agents sharing one runner
-    #     with egress on destabilizes that test specifically (the claude
-    #     session can land on host-b and emit no events); the teleport
-    #     test uses mode=dev_vm and doesn't touch egress, so it's stable.
+    name: e2e stack ${{ matrix.variant }} (coord app-gRPC → FC)
+    # Two variants of the same prod-shape stack (egress proxy on — the proven
+    # config), driven over the coordinator's app-gRPC surface (ADR 0051 Drip E
+    # removed the web-facing REST surface the suite used to drive):
+    #   - suite: single host. Runs every e2e_stack test EXCEPT the two-host
+    #     evacuation test (incl. the egress-dependent claude auth test, which
+    #     a single host serves reliably).
+    #   - teleport: two hosts (host-a + host-b). Runs ONLY the two-host
+    #     evacuation test, which drives `FleetService.EvacuateSession` (the
+    #     teleport primitive on the app-gRPC surface, ADR 0051) and asserts the
+    #     session relocates off the source host with its disk byte-identical.
+    #
+    # ADR 0051 restored this two-host coverage as
+    # `e2e_two_host_evacuate_preserves_sentinel` (replacing the deleted REST
+    # `e2e_two_host_teleport_preserves_sentinel` — there is no Teleport RPC, so
+    # EvacuateSession is the gRPC teleport primitive; it relocates to any peer
+    # rather than a pinned host).
+    #
     # e2e stack is not a required check, so the matrix-suffixed job names
     # don't affect branch protection.
     strategy:
@@ -1389,11 +1428,11 @@ jobs:
           - variant: suite
             two_hosts: ""
             expect_two_hosts: ""
-            nextest_filter: "not test(e2e_two_host_teleport_preserves_sentinel)"
+            nextest_filter: "test(/e2e_/) - test(e2e_two_host_evacuate_preserves_sentinel)"
           - variant: teleport
             two_hosts: "1"
             expect_two_hosts: "1"
-            nextest_filter: "test(e2e_two_host_teleport_preserves_sentinel)"
+            nextest_filter: "test(e2e_two_host_evacuate_preserves_sentinel)"
     # Gate (e2e is not required → a skip can't block merge): run on any
     # e2e-relevant change, and always on merge_group + push-to-main.
     if: >-
@@ -1606,12 +1645,19 @@ jobs:
       # this job was issued (the `permissions: packages: read` block
       # at the top of this job is what makes it pullable). Pipe via
       # --password-stdin so the token never lands in argv / ps.
+      #
+      # ADR 0051 Drip E: the CLI now drives the coord over app-gRPC (the
+      # REST surface is gone). ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKENS
+      # match the Tiltfile's coord_env (same endpoint + bearer the e2e tests
+      # use, 127.0.0.1:50061 + dev-app-grpc-token); the CLI normalizes the
+      # scheme-less addr and sends the first token as the bearer.
       - name: Seed GHCR credential in coord PG
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENGRAM_APP_GRPC_ADDR: http://127.0.0.1:50061
+          ENGRAM_APP_GRPC_TOKENS: dev-app-grpc-token
         run: |
           printf '%s' "$GHCR_TOKEN" | ./target/release/engram-cli \
-              --endpoint http://localhost:8090 \
               registry add \
               --host ghcr.io \
               --username "${{ github.actor }}" \
@@ -1697,7 +1743,13 @@ jobs:
 
       - name: Run e2e_stack tests
         env:
-          ENGRAM_E2E_COORD_URL: http://127.0.0.1:8090
+          # ADR 0051 Drip E: the coordinator's web-facing REST surface is
+          # gone; e2e_stack now drives the coord over app-gRPC. These match
+          # the Tiltfile's coord_env (ENGRAM_APP_GRPC_ADDR /
+          # ENGRAM_APP_GRPC_TOKENS). The address needs the http:// scheme so
+          # tonic's Endpoint::from_shared parses it.
+          ENGRAM_E2E_GRPC_ADDR: http://127.0.0.1:50061
+          ENGRAM_E2E_GRPC_TOKEN: dev-app-grpc-token
           # ENGRAM_E2E_IMAGE_URI set via $GITHUB_ENV in the bake step;
           # points at the just-baked `demo-claude` image whose
           # manifest.toml carries the resolved Claude harness contract.
@@ -1709,12 +1761,14 @@ jobs:
           # regression, not the old "no nbd.ko" environment gap, so the
           # Phase B chunked-disk tests fail loud instead of skipping.
           ENGRAM_EXPECT_NBD: "1"
-          # suite: "" → teleport test self-skips (and is filtered out
-          # below anyway). teleport: "1" → the teleport test hard-asserts
-          # >=2 hosts instead of skipping.
+          # suite: "" → the two-host evac test self-skips (and is filtered out
+          # below anyway). teleport: "1" → the evac test hard-asserts that >=2
+          # hosts registered (a single-host regression fails loud instead of
+          # silently skipping).
           ENGRAM_EXPECT_TWO_HOSTS: "${{ matrix.expect_two_hosts }}"
-          # Per-variant nextest filterset: suite runs everything except
-          # the teleport test; teleport runs only it.
+          # Per-variant nextest filterset: suite runs everything except the
+          # two-host evac test; teleport runs only it (ADR 0051 restored the
+          # split when EvacuateSession became the gRPC teleport primitive).
           E2E_NEXTEST_FILTER: "${{ matrix.nextest_filter }}"
         run: |
           cargo nextest run \
@@ -1742,3 +1796,47 @@ jobs:
           # reference predated ADR 0025 owning the kernel.)
           export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux"
           bash deploy/dev/tilt-down-ci.sh || true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # The SINGLE required status check for this workflow. Because the test
+  # lanes above are path-gated (and so legitimately `skipped` on changes
+  # that can't affect them), they must NOT be required individually — a
+  # skipped required check would never report and would wedge the merge
+  # queue. Instead this gate ALWAYS runs, depends on every lane, and is the
+  # one required check: it passes iff each lane either succeeded or was
+  # skipped, and fails on any `failure`/`cancelled`. (The expensive e2e +
+  # bake jobs are intentionally NOT depended on here — they're non-required.)
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - detect
+      - lint
+      - test-linux
+      - cross-musl-linux
+      - web
+      - orchestrator
+      - buf
+      - test-firecracker
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Check lane results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          # Per-lane result table. `skipped` is OK (path filter didn't match);
+          # fail only on `failure`/`cancelled`.
+          echo "$NEEDS_JSON" | jq -r '
+            to_entries
+            | sort_by(.key)
+            | (["LANE","RESULT"], ["----","------"], (.[] | [.key, .value.result]))
+            | @tsv' | column -t -s "$(printf '\t')"
+          failed=$(echo "$NEEDS_JSON" | jq -r '
+            [to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key]
+            | join(", ")')
+          if [ -n "$failed" ]; then
+            echo "::error::CI Gate failed — non-passing lanes: $failed"
+            exit 1
+          fi
+          echo "CI Gate passed."

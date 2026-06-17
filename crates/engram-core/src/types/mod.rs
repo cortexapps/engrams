@@ -14,7 +14,6 @@ pub mod sandbox;
 pub mod session;
 pub mod shell;
 pub mod snapshot;
-pub mod user;
 
 pub use cow_state::*;
 pub use egress::*;
@@ -29,4 +28,3 @@ pub use sandbox::*;
 pub use session::*;
 pub use shell::*;
 pub use snapshot::*;
-pub use user::*;

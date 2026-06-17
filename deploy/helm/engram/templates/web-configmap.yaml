@@ -25,19 +25,19 @@ data:
       ''      '';
     }
 
-    {{- if .Values.orchestrator.enabled }}
     # ADR 0051: the web is backed by the orchestrator (Bun/Hono), which
     # fronts the coordinator's app-gRPC. All /api + /rpc traffic proxies
     # here; the orchestrator owns auth (better-auth + the IAP bridge) and
     # holds the coordinator CONTROL_PLANE_BEARER server-side.
     upstream engram_backend {
-      server {{ include "engram.orchestrator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.orchestrator.containerPort }};
+      # The orchestrator SERVICE port (.service.port, default 80), NOT its
+      # containerPort (8787): nginx dials the ClusterIP, which listens on the
+      # service port and forwards to the pod's targetPort. Using containerPort
+      # here black-holes every /api + /rpc request (the service isn't listening
+      # on 8787) → the web spins on "authenticating…" then "cannot reach the
+      # coordinator".
+      server {{ include "engram.orchestrator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.orchestrator.service.port }};
     }
-    {{- else }}
-    upstream engram_backend {
-      server {{ include "engram.coordinator.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }};
-    }
-    {{- end }}
 
     server {
       listen {{ .Values.web.containerPort }};
@@ -52,7 +52,6 @@ data:
         return 200 "ok\n";
       }
 
-      {{- if .Values.orchestrator.enabled }}
       # ADR 0051: /rpc (Connect/gRPC-web) and /api (better-auth /api/auth,
       # the /api/v1 legs, SSE events, the shell WebSocket) both proxy to
       # the orchestrator. The IAP assertion the public LB forwards is
@@ -86,29 +85,6 @@ data:
         proxy_buffering off;
         proxy_read_timeout 3600s;
       }
-      {{- else }}
-      # Legacy (pre-ADR-0051): the entire coord HTTP surface (REST + SSE +
-      # the /shell WebSocket) lives under /api/v1, so this prefix match
-      # claims it and nothing else. Matched BEFORE `location /` (longer
-      # prefix wins). Bearer auth: the browser carries the IAP cookie but
-      # no coord bearer; we stamp it here from an env var rendered by the
-      # nginx-alpine envsubst entrypoint (see web-deployment.yaml).
-      location /api/ {
-        proxy_pass http://engram_backend;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        {{- if .Values.web.coordinatorToken.existingSecret }}
-        proxy_set_header Authorization "Bearer {{`${ENGRAM_API_TOKEN}`}}";
-        {{- end }}
-        proxy_buffering off;
-        proxy_read_timeout 3600s;
-      }
-      {{- end }}
 
       # SPA: every path the /api/ proxy didn't claim falls through to
       # index.html so client-side routing handles it — crucially a

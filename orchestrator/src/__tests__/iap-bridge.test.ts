@@ -141,6 +141,7 @@ function deactivateIap(): void {
 function makeReqRes(options: {
   iapJwt?: string;
   cookie?: string;
+  url?: string;
 }): {
   req: IncomingMessage;
   res: ServerResponse & { _status?: number; _headers?: Record<string, string>; _body?: string };
@@ -151,11 +152,13 @@ function makeReqRes(options: {
   if (options.iapJwt) headers["x-goog-iap-jwt-assertion"] = options.iapJwt;
   if (options.cookie) headers["cookie"] = options.cookie;
 
-  // Minimal IncomingMessage stand-in.
+  // Minimal IncomingMessage stand-in. Defaults to a NON-exempt path so the
+  // bridge actually runs — /healthz is short-circuited (see the exemption
+  // test below), which would mask the 401/cookie assertions these tests make.
   const req = {
     headers,
     method: "GET",
-    url: "/healthz",
+    url: options.url ?? "/api/protected",
   } as unknown as IncomingMessage;
 
   let _status = 200;
@@ -292,6 +295,31 @@ describe("IAP bridge — missing/invalid assertion → 401", () => {
     expect(nextCalled).toBe(false);
     expect(statusCode()).toBe(401);
   });
+
+  // Health-check exemption: kubelet probes / GCP LB health checks bypass IAP
+  // and carry no assertion. With IAP active, /healthz must STILL pass through
+  // (next() called, no 401, no cookie) or the pod never goes Ready.
+  test("/healthz bypasses the bridge even with no assertion (IAP active)", async () => {
+    let nextCalled = false;
+    const { req, res, statusCode, getSetCookie } = makeReqRes({ url: "/healthz" });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+    expect(statusCode()).toBe(200);
+    expect(getSetCookie()).toBeUndefined();
+  });
+
+  test("/healthz?probe=1 (query string) is still exempt", async () => {
+    let nextCalled = false;
+    const { req, res } = makeReqRes({ url: "/healthz?probe=1" });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -310,6 +338,10 @@ describe("IAP bridge — valid JWT → user + session (DB-gated)", () => {
     const app = new Hono();
     app.route("/", health);
     app.route("/", authRoute);
+    // Non-exempt path that passes through the bridge (unlike /healthz, which
+    // the bridge now short-circuits) so these tests can observe the
+    // bridge-issued session cookie on a 200 response.
+    app.get("/api/whoami", (c) => c.json({ ok: true }));
     app.notFound((c) => c.json({ error: "not found" }, 404));
     srv = buildServer(app);
 
@@ -336,7 +368,7 @@ describe("IAP bridge — valid JWT → user + session (DB-gated)", () => {
       const email = `iap-${Date.now()}@example.com`;
       const jwt = await signIapJwt(email);
 
-      const res = await fetch(`${baseUrl}/healthz`, {
+      const res = await fetch(`${baseUrl}/api/whoami`, {
         headers: {
           "x-goog-iap-jwt-assertion": jwt,
           origin: "http://localhost:5173",
@@ -376,7 +408,7 @@ describe("IAP bridge — valid JWT → user + session (DB-gated)", () => {
       const jwt = await signIapJwt(email);
 
       // First request — creates the user.
-      const res1 = await fetch(`${baseUrl}/healthz`, {
+      const res1 = await fetch(`${baseUrl}/api/whoami`, {
         headers: {
           "x-goog-iap-jwt-assertion": jwt,
           origin: "http://localhost:5173",
@@ -385,7 +417,7 @@ describe("IAP bridge — valid JWT → user + session (DB-gated)", () => {
       expect(res1.status).toBe(200);
 
       // Second request with same JWT — must NOT fail (idempotent).
-      const res2 = await fetch(`${baseUrl}/healthz`, {
+      const res2 = await fetch(`${baseUrl}/api/whoami`, {
         headers: {
           "x-goog-iap-jwt-assertion": jwt,
           origin: "http://localhost:5173",
@@ -418,6 +450,10 @@ describe("IAP bridge — user-switch re-bridges (DB-gated)", () => {
     const app = new Hono();
     app.route("/", health);
     app.route("/", authRoute);
+    // Non-exempt path that passes through the bridge (unlike /healthz, which
+    // the bridge now short-circuits) so these tests can observe the
+    // bridge-issued session cookie on a 200 response.
+    app.get("/api/whoami", (c) => c.json({ ok: true }));
     app.notFound((c) => c.json({ error: "not found" }, 404));
     srv = buildServer(app);
 
@@ -446,7 +482,7 @@ describe("IAP bridge — user-switch re-bridges (DB-gated)", () => {
 
       // Create session for user A.
       const jwtA = await signIapJwt(emailA);
-      const resA = await fetch(`${baseUrl}/healthz`, {
+      const resA = await fetch(`${baseUrl}/api/whoami`, {
         headers: {
           "x-goog-iap-jwt-assertion": jwtA,
           origin: "http://localhost:5173",
@@ -460,7 +496,7 @@ describe("IAP bridge — user-switch re-bridges (DB-gated)", () => {
 
       // Send a request with user A's cookie but user B's IAP JWT.
       const jwtB = await signIapJwt(emailB);
-      const resBridge = await fetch(`${baseUrl}/healthz`, {
+      const resBridge = await fetch(`${baseUrl}/api/whoami`, {
         headers: {
           "x-goog-iap-jwt-assertion": jwtB,
           cookie: cookiesA,
@@ -523,6 +559,10 @@ describe("IAP bridge — existing-cookie fast path", () => {
     const app = new Hono();
     app.route("/", health);
     app.route("/", authRoute);
+    // Non-exempt path that passes through the bridge (unlike /healthz, which
+    // the bridge now short-circuits) so these tests can observe the
+    // bridge-issued session cookie on a 200 response.
+    app.get("/api/whoami", (c) => c.json({ ok: true }));
     app.notFound((c) => c.json({ error: "not found" }, 404));
     srv = buildServer(app);
 
@@ -550,7 +590,7 @@ describe("IAP bridge — existing-cookie fast path", () => {
       const jwt = await signIapJwt(email);
 
       // Step 1: First request — bridge creates session, sets cookie.
-      const res1 = await fetch(`${baseUrl}/healthz`, {
+      const res1 = await fetch(`${baseUrl}/api/whoami`, {
         headers: {
           "x-goog-iap-jwt-assertion": jwt,
           origin: "http://localhost:5173",
@@ -566,7 +606,7 @@ describe("IAP bridge — existing-cookie fast path", () => {
       // Should hit the fast path (cookie valid, same email, skip full verify).
       // We send a validly-signed JWT (same email) — the observable is that
       // it returns 200 WITHOUT issuing a new cookie (fast path skips session creation).
-      const res2 = await fetch(`${baseUrl}/healthz`, {
+      const res2 = await fetch(`${baseUrl}/api/whoami`, {
         headers: {
           "x-goog-iap-jwt-assertion": jwt,
           cookie: sessionCookie,

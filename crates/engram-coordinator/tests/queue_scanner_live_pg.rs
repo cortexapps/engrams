@@ -32,7 +32,6 @@ fn spec() -> SessionSpec {
     SessionSpec {
         image: format!("localhost:5001/queue-test:{}", uuid::Uuid::new_v4()),
         mode: SessionMode::Agent,
-        user_id: None,
     }
 }
 

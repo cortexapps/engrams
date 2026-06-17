@@ -318,4 +318,24 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             result,
         )))
     }
+
+    async fn get_fleet_demand(
+        &self,
+        req: Request<app::GetFleetDemandRequest>,
+    ) -> Result<Response<app::GetFleetDemandResponse>, Status> {
+        self.auth.check(&req)?;
+        let d = crate::api::admin::fleet_demand_core(&self.state).await;
+        Ok(Response::new(app::GetFleetDemandResponse {
+            ready_hosts: d.ready_hosts,
+            schedulable_hosts: d.schedulable_hosts,
+            free_mib: d.free_mib,
+            total_mib: d.total_mib,
+            free_vcpus: d.free_vcpus,
+            total_vcpus: d.total_vcpus,
+            cordoned_hosts: d.cordoned_hosts,
+            queued_sessions: d.queued_sessions,
+            queued_mib: d.queued_mib,
+            queued_vcpus: d.queued_vcpus,
+        }))
+    }
 }

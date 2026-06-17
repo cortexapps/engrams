@@ -27,7 +27,7 @@ export function ProfilePanel() {
     : ["The Operator section (fleet, storage, images, registries): admin only"];
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="space-y-6">
       <PageHeading title="Profile" />
 
       <Card>

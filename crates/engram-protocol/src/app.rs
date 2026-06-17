@@ -17,3 +17,12 @@
 #![allow(clippy::derive_partial_eq_without_eq)]
 #![allow(clippy::large_enum_variant)]
 tonic::include_proto!("engram.app.v1");
+
+/// Serialized `FileDescriptorSet` for the app protos, emitted by
+/// `build.rs` (`file_descriptor_set_path`). Fed to
+/// `tonic_reflection::server::Builder::register_encoded_file_descriptor_set`
+/// so the coordinator's network-private app-gRPC server answers gRPC
+/// reflection (grpcurl `list` / `describe`, proto-less calls). Schema
+/// only — exposes no data.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/engram_app_descriptor.bin"));

@@ -65,8 +65,14 @@ data:
   {{- if not .Values.egress.caGcpKeySecret }}
   {{- fail "egress.caGcpKeySecret is required when egress.caSource == gcp-secret-manager (issue #240)" }}
   {{- end }}
-  # Secret Manager RESOURCE PATHS (not the secret values) — the
-  # host-agent's Workload Identity SA reads them at boot.
+  # Secret Manager RESOURCE PATHS (not the secret values) — read at boot.
+  # NOTE: this path needs a cloud-platform-scoped token; a hostNetwork
+  # host-agent bypasses Workload Identity and runs as the scope-limited node
+  # SA, so it 403s. Prefer caSource: env on GKE hostNetwork fleets.
   ENGRAM_EGRESS_CA_GCP_CERT_SECRET: {{ .Values.egress.caGcpCertSecret | quote }}
   ENGRAM_EGRESS_CA_GCP_KEY_SECRET: {{ .Values.egress.caGcpKeySecret | quote }}
+  {{- else if eq .Values.egress.caSource "env" }}
+  {{- if not .Values.egress.caEnvSecret }}
+  {{- fail "egress.caEnvSecret is required when egress.caSource == env (the K8s secret holding the CA PEMs, injected as ENGRAM_EGRESS_CA_{CERT,KEY}_PEM by the DaemonSet)" }}
+  {{- end }}
   {{- end }}

@@ -349,6 +349,14 @@ message BuildBaseSnapshotRequest {
   // block now lives in the rootfs, so the snapshot captures it
   // directly — no separate stub-harness drive to swap.
   bytes spec_bincode = 1;
+  // bincode-encoded `Option<engram_core::types::image::WarmConfig>` — the
+  // image's optional capture-time `[warm]` hook. When `Some`, the host
+  // runs it in the live VM (via exec) after agentd-ready and before the
+  // snapshot freezes, so a long-lived process it spawns (e.g. a gradle
+  // daemon) is captured into the base snapshot. Empty/absent on older
+  // callers decodes to `None` (coord+host roll together, so this is just
+  // additive). A warm failure is fail-loud — it aborts the capture.
+  bytes warm_bincode = 2;
 }
 message BuildBaseSnapshotResponse {
   // bincode-encoded `engram_core::types::snapshot::SnapshotMetadata`.

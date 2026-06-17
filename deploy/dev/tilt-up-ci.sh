@@ -61,15 +61,29 @@ case "${ENGRAM_INTEG_TWO_HOSTS:-}" in
     1 | true | yes) want_hosts=2 ;;
     *) want_hosts=1 ;;
 esac
+# ADR 0051: the web-facing REST `/api/v1/hosts` list is gone — query host
+# registration over the coordinator's app-gRPC via engram-cli (the surface the
+# whole stack uses now). Endpoint + bearer default to the Tiltfile's coord
+# app-gRPC; the workflow may override via ENGRAM_APP_GRPC_ADDR/TOKENS.
+ENGRAM_CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
+export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
+export ENGRAM_APP_GRPC_TOKENS="${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}"
+host_count() {
+    # `--json hosts list` => {"hosts":[{"hostname":...},...]}; count via the
+    # same `"hostname"` marker the old REST poll used. Trailing `|| true` so a
+    # transient gRPC error (app-gRPC still warming) yields 0, not a `set -e`
+    # abort under pipefail.
+    "$ENGRAM_CLI" --json hosts list 2>/dev/null \
+        | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ' || true
+}
+
 echo "==> waiting for host registration (want >= $want_hosts)"
 for _ in $(seq 1 180); do
-    n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
-        | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
+    n=$(host_count)
     [ "${n:-0}" -ge "$want_hosts" ] && break
     sleep 1
 done
-n=$(curl -fsS http://127.0.0.1:8090/api/v1/hosts 2>/dev/null \
-    | { grep -o '"hostname"' || true; } | wc -l | tr -d ' ')
+n=$(host_count)
 if [ "${n:-0}" -lt "$want_hosts" ]; then
     echo "ERROR: expected >= $want_hosts host-agent(s), got ${n:-0}" >&2
     tail -80 "$LOG" >&2 || true
