@@ -19,6 +19,7 @@ pub mod chunk_gc;
 pub mod config;
 pub mod cow_state;
 pub mod dead_host;
+pub mod desync_watchdog;
 pub mod enable_scanner;
 pub mod error;
 pub mod evac_resumer;
@@ -270,6 +271,14 @@ pub async fn run_with_registry_and_local(
         idle_detect_backstop::BackstopConfig::from_env(),
         state.clone(),
     );
+
+    // Track A: harness-desync watchdog. Catches the wedge class the
+    // silence-only backstop misses — a harness whose event stream desynced
+    // from the run state machine (a run-scoped event with no open run, or a
+    // stuck-open run). Detection-only today; the non-destructive
+    // re-handshake recovery lands in a follow-up commit.
+    let _desync_watchdog =
+        desync_watchdog::spawn(desync_watchdog::WatchdogConfig::from_env(), state.clone());
 
     // Phase 4 Track D: preemption best-effort drain. Subscribes to
     // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE

@@ -145,6 +145,15 @@ pub const EVICTION_PIPELINE_SECONDS: &str = "engram_eviction_pipeline_seconds";
 /// means hosts are going blind to running sandboxes).
 pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
 
+/// Counter (Track A). Active sessions the desync watchdog flagged as
+/// wedged — the harness event stream desynced from the run state machine.
+/// Label: `signature` = `orphan_after_close` (a run-scoped event with no
+/// open run, the `bf3dbbcb` shape) or `stuck_open_run` (a `run_started`
+/// with zero progress). Should be ~0; a sustained nonzero rate means
+/// harnesses are desyncing — alarm-worthy until the streaming rewrite
+/// (ADR 0052) removes the inference that causes it.
+pub const HARNESS_DESYNC_DETECTED_TOTAL: &str = "engram_harness_desync_detected_total";
+
 /// Counter (ADR 0034). Eviction scanner gave up after the retry
 /// budget (20 attempts ≈ 3 min) and fell the session back to
 /// HostLost. Should be ~0 — alarm-worthy if rising: it means the

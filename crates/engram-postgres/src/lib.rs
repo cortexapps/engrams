@@ -1482,6 +1482,91 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    async fn list_active_sessions_desynced(
+        &self,
+        stuck_for_secs: i64,
+    ) -> Result<Vec<engram_core::traits::metadata::DesyncedSession>, MetaError> {
+        // Track A: two desync signatures the idle backstop (silence-only)
+        // misses. Per Active+bound session, find the latest non-rewound
+        // event overall and the latest run-lifecycle event, then classify:
+        //   - stuck_open_run:    latest event IS a `run_started` (the run
+        //                        opened and emitted nothing since).
+        //   - orphan_after_close: latest event is a run-scoped event but
+        //                        the most recent run-lifecycle event is NOT
+        //                        a `run_started` — i.e. an event landed
+        //                        after the run closed, with no open run
+        //                        (the `bf3dbbcb` shape).
+        // A healthy in-progress run is excluded: its latest run-lifecycle
+        // event is `run_started`, so an `agent_message`/`tool_call_*` tail
+        // pairs to an OPEN run and is not orphaned. The `last_event_at`
+        // floor ensures we only fire once the session has been wedged for
+        // the TTL (a live run keeps bumping last_event_at).
+        let rows = sqlx::query(
+            r#"
+            WITH active AS (
+                SELECT id, sandbox_id, COALESCE(last_event_at, created_at) AS le
+                  FROM sessions
+                 WHERE status = 'active' AND sandbox_id IS NOT NULL
+            ),
+            latest AS (
+                SELECT DISTINCT ON (e.session_id) e.session_id, e.kind
+                  FROM session_events e
+                  JOIN active a ON a.id = e.session_id
+                 WHERE e.rewound_at IS NULL
+                 ORDER BY e.session_id, e.idx DESC
+            ),
+            latest_run AS (
+                SELECT DISTINCT ON (e.session_id) e.session_id, e.kind
+                  FROM session_events e
+                  JOIN active a ON a.id = e.session_id
+                 WHERE e.rewound_at IS NULL
+                   AND e.kind IN ('run_started', 'run_completed', 'run_interrupted')
+                 ORDER BY e.session_id, e.idx DESC
+            )
+            SELECT a.id, a.sandbox_id, l.kind AS latest_kind,
+                   CASE WHEN l.kind = 'run_started'
+                        THEN 'stuck_open_run'
+                        ELSE 'orphan_after_close'
+                   END AS signature
+              FROM active a
+              JOIN latest l ON l.session_id = a.id
+              LEFT JOIN latest_run lr ON lr.session_id = a.id
+             WHERE a.le < NOW() - ($1::bigint * INTERVAL '1 second')
+               AND (
+                     l.kind = 'run_started'
+                  OR (l.kind IN ('agent_message', 'tool_call_started', 'tool_call_completed')
+                      AND COALESCE(lr.kind, '') <> 'run_started')
+                   )
+            "#,
+        )
+        .bind(stuck_for_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let id: uuid::Uuid = r
+                .try_get("id")
+                .map_err(|e| MetaError::Serialization(format!("desync id: {e}")))?;
+            let sandbox: uuid::Uuid = r
+                .try_get("sandbox_id")
+                .map_err(|e| MetaError::Serialization(format!("desync sandbox_id: {e}")))?;
+            let latest_kind: String = r
+                .try_get("latest_kind")
+                .map_err(|e| MetaError::Serialization(format!("desync latest_kind: {e}")))?;
+            let signature: String = r
+                .try_get("signature")
+                .map_err(|e| MetaError::Serialization(format!("desync signature: {e}")))?;
+            out.push(engram_core::traits::metadata::DesyncedSession {
+                session_id: SessionId::from(id),
+                sandbox_id: SandboxId::from(sandbox),
+                latest_kind,
+                signature,
+            });
+        }
+        Ok(out)
+    }
+
     async fn rebind_session(
         &self,
         id: SessionId,

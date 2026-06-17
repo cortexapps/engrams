@@ -894,6 +894,11 @@ pub(crate) mod tests {
         /// Issue #214: tracks the set-at timestamp alongside the pin so
         /// the aged-pin scanner test can backdate one deterministically.
         pub(crate) teleport_targets: PlMutex<TeleportPinMap>,
+        /// Track A: desync-watchdog tests set this directly; the
+        /// `list_active_sessions_desynced` override returns it verbatim
+        /// (the SQL signature classification is integration-tested, not
+        /// re-derived in the mock).
+        pub(crate) desynced: PlMutex<Vec<engram_core::traits::metadata::DesyncedSession>>,
     }
 
     /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
@@ -961,6 +966,7 @@ pub(crate) mod tests {
                 evac_attempts: PlMutex::new(std::collections::HashMap::new()),
                 evict_attempts: PlMutex::new(std::collections::HashMap::new()),
                 teleport_targets: PlMutex::new(std::collections::HashMap::new()),
+                desynced: PlMutex::new(Vec::new()),
             }
         }
     }
@@ -1464,6 +1470,20 @@ pub(crate) mod tests {
             } else {
                 Ok(Vec::new())
             }
+        }
+
+        async fn list_active_sessions_desynced(
+            &self,
+            _stuck_for_secs: i64,
+        ) -> Result<Vec<engram_core::traits::metadata::DesyncedSession>, MetaError> {
+            // Only Active sessions are candidates (mirrors the PG WHERE).
+            if !matches!(
+                self.session.lock().status,
+                engram_core::types::SessionState::Active
+            ) {
+                return Ok(Vec::new());
+            }
+            Ok(self.desynced.lock().clone())
         }
     }
 
