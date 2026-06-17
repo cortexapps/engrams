@@ -6,21 +6,27 @@
 //! supervisor after the host pushes a `SpawnHarness` request
 //! describing this binary.
 //!
-//! Strategy: child-per-prompt. Per `Prompt` command, spawn `claude
-//! --print --output-format stream-json --dangerously-skip-permissions
-//! [--resume <claude_id>] "<text>"`, parse stdout JSONL line-by-line,
-//! translate to `HarnessEvent`s, child exits, await next prompt.
+//! Strategy: a single **persistent streaming** `claude` process per
+//! session. The wrapper spawns `claude --print --input-format
+//! stream-json --output-format stream-json --verbose
+//! --dangerously-skip-permissions [--resume <claude_id>]` ONCE, holds
+//! its stdin open, and writes one newline-delimited `user` message per
+//! prompt. Turn boundaries come from claude's explicit `result` line on
+//! the stream — NOT from process EOF — so a clean turn-end and a crash
+//! are now unambiguous (EOF mid-turn = a real crash, auto-recovered by
+//! respawning `--resume`). This is the root-cause fix for the
+//! child-per-prompt EOF-inference wedge (ADR 0052).
 //!
 //! `--dangerously-skip-permissions` is mandatory: there's no human in
 //! the VM to answer permission prompts, and `--print` mode aborts
 //! with exit 1 the first time a tool needs approval otherwise. The
 //! sandbox is the safety boundary, not Claude's per-tool consent.
 //!
-//! The first run captures Claude's auto-generated session id and
-//! stashes it in `/workspace/.engram/claude-session-id` so
-//! follow-ups can `--resume` into the same conversation. Lost on
-//! cold death (Dead status); a forked session gets a fresh
-//! Claude conversation.
+//! Each turn's `system`/`init` line carries Claude's session id, which
+//! we stash in `/workspace/.engram/claude-session-id` so a respawn
+//! (idle-resume or crash recovery) can `--resume` into the same
+//! conversation. Lost on cold death (Dead status); a forked session
+//! gets a fresh Claude conversation.
 
 // Cross-platform stub — vsock dialing is Linux-only, and the
 // adapter only ships inside FC rootfs / Linux ProcessBackend.
@@ -47,7 +53,7 @@ mod adapter {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use serde_json::Value;
-    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::process::Command;
     use tokio::sync::{mpsc, Notify};
     use tokio::time::{timeout, Instant};
@@ -395,11 +401,12 @@ mod adapter {
         }
     }
 
-    /// The long-lived run engine. Owns the `claude` child and the
-    /// idle/running state; spawned once and never torn down by a
-    /// connection drop. Reads host commands off the long-lived
-    /// `cmd_rx`, emits events into `evt_tx`, and re-announces `Idle`
-    /// on `reattach` only while idle.
+    /// The long-lived run engine. Owns the persistent `claude` process
+    /// and the pending-prompt queue; spawned once and never torn down by
+    /// a connection drop. Each iteration runs ONE `claude` process
+    /// (`run_claude_session`); on an unexpected death it respawns with
+    /// `--resume` (bounded fast-crash backoff). A clean `Shutdown` or a
+    /// closed command channel exits the engine.
     ///
     /// Because `cmd_rx`'s senders outlive any single connection, a
     /// dropped link never closes it — so the engine never sees a
@@ -414,69 +421,63 @@ mod adapter {
         evt_tx: mpsc::Sender<HarnessEvent>,
         initial_prompt: Option<String>,
     ) -> ExitCode {
-        let mut pending_prompt = initial_prompt;
+        // The pending queue is owned here so it survives a respawn: a
+        // prompt queued mid-turn (type-ahead) or one that hadn't started
+        // when claude crashed isn't lost across the process restart.
+        // Phase 1b turns this into the user-visible editable queue.
+        let mut pending: VecDeque<String> = VecDeque::new();
+        if let Some(p) = initial_prompt {
+            pending.push_back(p);
+        }
+
+        // Bounded fast-crash backoff: a `claude` that dies within
+        // FAST_CRASH_WINDOW of spawning is "failing to start" — back off
+        // (capped) and, after MAX_FAST_CRASHES in a row, give up rather
+        // than hot-loop spawns. A process that ran longer than the window
+        // resets the counter (a healthy long session that later crashes
+        // respawns immediately).
+        const FAST_CRASH_WINDOW: Duration = Duration::from_secs(10);
+        const MAX_FAST_CRASHES: u32 = 5;
+        const MAX_RESPAWN_BACKOFF_SECS: u64 = 10;
+        let mut fast_crashes: u32 = 0;
+
         loop {
-            // Resolve the next prompt to run: a queued/initial one, or
-            // wait (idle) for the host to send one.
-            let text = match pending_prompt.take() {
-                Some(t) => t,
-                None => {
-                    // Entering idle: announce it so the host's soft TTL
-                    // arms for a genuinely-idle session.
-                    emit(&evt_tx, HarnessEvent::Idle).await;
-                    loop {
-                        tokio::select! {
-                            cmd = cmd_rx.recv() => match cmd {
-                                Some(HarnessCommand::Prompt { text }) => break text,
-                                Some(HarnessCommand::Shutdown { .. }) => {
-                                    tracing::info!("shutdown received while idle; exiting");
-                                    return ExitCode::SUCCESS;
-                                }
-                                // No child to stop; nothing to flush.
-                                Some(HarnessCommand::Interrupt) => {
-                                    tracing::debug!("interrupt while idle; nothing to stop");
-                                }
-                                // Intercepted at the connection layer
-                                // (`forward_commands`) and never forwarded
-                                // here; arm exists only for exhaustiveness.
-                                Some(HarnessCommand::Rehandshake) => {}
-                                Some(HarnessCommand::Checkpoint { .. }) => {}
-                                // All senders gone = the connection loop
-                                // exited = process teardown.
-                                None => return ExitCode::SUCCESS,
-                            },
-                            // A fresh connection attached while we're
-                            // idle: re-announce so the host (whose hub
-                            // state may be freshly rebuilt) re-arms the
-                            // soft TTL. A reattach while RUNNING is not
-                            // observed here — so it emits no `Idle`.
-                            _ = reattach.notified() => {
-                                emit(&evt_tx, HarnessEvent::Idle).await;
-                            }
+            let spawned_at = Instant::now();
+            match run_claude_session(&cli, &mut cmd_rx, &reattach, &evt_tx, &mut pending).await {
+                // Clean shutdown, or all command senders gone (the
+                // connection loop exited = process teardown).
+                SessionOutcome::Shutdown | SessionOutcome::ChannelClosed => {
+                    return ExitCode::SUCCESS;
+                }
+                // claude died unexpectedly (crash / interrupt / per-turn
+                // timeout) or couldn't be spawned. Any in-flight run's
+                // terminal event was already emitted by the session.
+                // Respawn with `--resume`, backing off on fast crashes.
+                SessionOutcome::Respawn | SessionOutcome::SpawnFailed => {
+                    if spawned_at.elapsed() < FAST_CRASH_WINDOW {
+                        fast_crashes += 1;
+                        if fast_crashes > MAX_FAST_CRASHES {
+                            tracing::error!(
+                                fast_crashes,
+                                "claude keeps dying on startup; giving up — agentd will decide"
+                            );
+                            return ExitCode::from(1);
                         }
+                        let backoff = std::cmp::min(
+                            MAX_RESPAWN_BACKOFF_SECS,
+                            1u64 << fast_crashes.min(4),
+                        );
+                        tracing::warn!(
+                            fast_crashes,
+                            backoff_secs = backoff,
+                            "fast claude death; backing off before respawn"
+                        );
+                        tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    } else {
+                        fast_crashes = 0;
                     }
+                    // loop → respawn with --resume
                 }
-            };
-
-            let outcome = run_one_claude_prompt(&cli, &evt_tx, &text, &mut cmd_rx).await;
-
-            // Close the run: RunInterrupted for an operator stop,
-            // RunCompleted otherwise. The next loop iteration emits the
-            // trailing `Idle` (when there's no queued prompt) — so a
-            // queued prompt runs back-to-back with no idle gap.
-            let run_id = outcome.run_id.clone().unwrap_or_else(|| "unknown".into());
-            let end_event = if outcome.interrupted {
-                HarnessEvent::RunInterrupted { run_id }
-            } else {
-                HarnessEvent::RunCompleted {
-                    run_id,
-                    ok: outcome.ok,
-                }
-            };
-            emit(&evt_tx, end_event).await;
-
-            if let Some(queued) = outcome.queued_prompt {
-                pending_prompt = Some(queued);
             }
         }
     }
@@ -614,15 +615,35 @@ mod adapter {
         }
     }
 
-    #[derive(Default)]
-    struct RunOutcome {
-        ok: bool,
-        run_id: Option<String>,
-        queued_prompt: Option<String>,
-        /// The run was stopped by an operator `HarnessCommand::Interrupt`
-        /// (we SIGINT'd the child). The caller emits `RunInterrupted`
-        /// rather than `RunCompleted` for this.
-        interrupted: bool,
+    /// Outcome of one persistent `claude` process's life, as seen by the
+    /// outer `run_engine` loop. The terminal `HarnessEvent` for any
+    /// in-flight run is emitted by `run_claude_session` itself (so it's
+    /// always paired with its `RunStarted`); this enum only tells the
+    /// engine whether to exit or respawn.
+    enum SessionOutcome {
+        /// A `Shutdown` command drained claude cleanly (stdin closed,
+        /// final `result` flushed, process exited). Exit the engine.
+        Shutdown,
+        /// All command senders dropped (connection loop exited = process
+        /// teardown). Exit the engine.
+        ChannelClosed,
+        /// claude died unexpectedly (crash, operator interrupt, or a
+        /// per-turn timeout). Respawn with `--resume`.
+        Respawn,
+        /// claude could not be spawned at all. Back off and retry.
+        SpawnFailed,
+    }
+
+    /// The single in-flight turn, owned by the session loop. `run_id` is
+    /// minted on prompt-accept — BEFORE any claude output — so no event
+    /// can be emitted without a valid `run_id`. The bare-event desync
+    /// that wedged `bf3dbbcb` is therefore impossible by construction.
+    struct TurnState {
+        run_id: String,
+        tool_calls: u32,
+        /// Wall-clock cap for THIS turn (`max_run_secs`); on expiry we
+        /// kill the process (heavy backstop, default 24h) and respawn.
+        deadline: Instant,
     }
 
     /// SIGINT a running `claude` child — the graceful "stop the current
@@ -638,15 +659,28 @@ mod adapter {
         }
     }
 
-    async fn run_one_claude_prompt(
+    /// Run ONE persistent `claude` process: spawn it, hold its stdin
+    /// open, drive turns from the host's `Prompt` commands, and stream
+    /// every JSONL line back as `HarnessEvent`s. Returns when the process
+    /// exits (cleanly via `Shutdown`, or unexpectedly = crash/interrupt)
+    /// or the command channel closes. The outer `run_engine` loop maps
+    /// the returned `SessionOutcome` to exit-vs-respawn.
+    ///
+    /// Turn boundaries are read off claude's explicit `result` line — NOT
+    /// process EOF — so a clean turn-end and a crash are unambiguous. The
+    /// in-flight turn's terminal event is always emitted here (paired
+    /// with the `RunStarted` we synthesized on prompt-accept), even when
+    /// the process dies mid-turn.
+    async fn run_claude_session(
         cli: &Cli,
-        evt_tx: &mpsc::Sender<HarnessEvent>,
-        text: &str,
         cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
-    ) -> RunOutcome {
+        reattach: &Arc<Notify>,
+        evt_tx: &mpsc::Sender<HarnessEvent>,
+        pending: &mut VecDeque<String>,
+    ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
-        let argv = build_claude_argv(&resume_id, text);
-        tracing::info!(?argv, "spawning claude");
+        let argv = build_claude_argv(&resume_id);
+        tracing::info!(?argv, resume = resume_id.is_some(), "spawning persistent claude");
 
         let claude_bin: &str = cli
             .claude_bin
@@ -670,7 +704,10 @@ mod adapter {
             .env("BASH_MAX_TIMEOUT_MS", "7200000")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .env("IS_SANDBOX", "1")
-            .stdin(Stdio::null())
+            // Held open for the whole session: we write one newline-
+            // delimited `user` message per prompt and close it (drop) to
+            // signal a clean drain on Shutdown.
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Pipe stderr (was `inherit`) so we can retain a tail for the
             // abnormal-exit diagnostic below. The historical wedge risk —
@@ -687,30 +724,27 @@ mod adapter {
         {
             Ok(c) => c,
             Err(e) => {
+                // No run is in flight, so we deliberately do NOT emit a
+                // bare AgentMessage (that would be exactly the run_id-less
+                // desync this rewrite eliminates). The outer loop backs
+                // off and retries; a hard failure trips the fast-crash
+                // budget and exits the engine.
                 tracing::error!(error = %e, bin = %claude_bin, "spawn claude failed");
-                emit(
-                    evt_tx,
-                    HarnessEvent::AgentMessage {
-                        run_id: "spawn-failed".into(),
-                        message_id: format!("spawn-{}", uuid::Uuid::new_v4()),
-                        role: AgentRole::System,
-                        text: format!("failed to spawn `{claude_bin}`: {e}"),
-                    },
-                )
-                .await;
-                return RunOutcome::default();
+                return SessionOutcome::SpawnFailed;
             }
         };
 
-        let stdout = child.stdout.take().unwrap();
+        // `stdin` is an Option so Shutdown can DROP it (closing the FD =
+        // EOF for claude) while everything else keeps borrowing the child.
+        let mut stdin: Option<tokio::process::ChildStdin> =
+            Some(child.stdin.take().expect("piped stdin"));
+        let stdout = child.stdout.take().expect("piped stdout");
         let mut lines = BufReader::new(stdout).lines();
 
-        // Drain claude's stderr into a bounded rolling tail. The task
-        // always reads the pipe (no wedge) and re-echoes each line to our
-        // own stderr so it still lands in the in-guest harness log. On an
-        // abnormal exit we attach this tail to a System message so the
-        // failure cause survives VM teardown (the harness log does not).
-        let stderr = child.stderr.take().unwrap();
+        // Drain claude's stderr into a bounded rolling tail (see the
+        // spawn comment). On an abnormal exit we attach this tail to a
+        // System message so the failure cause survives VM teardown.
+        let stderr = child.stderr.take().expect("piped stderr");
         let stderr_task: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
             let mut tail: VecDeque<String> = VecDeque::with_capacity(MAX_STDERR_TAIL_LINES + 1);
             let mut elines = BufReader::new(stderr).lines();
@@ -724,55 +758,107 @@ mod adapter {
             tail.into_iter().collect()
         });
 
-        let deadline = Instant::now() + Duration::from_secs(cli.max_run_secs);
-        let mut tool_calls = 0u32;
-        let mut run_id: Option<String> = None;
-        let mut queued_prompt: Option<String> = None;
-        let mut ok = true;
-        let mut interrupted = false;
-        // The terminal `result` line claude emits at the end of every
-        // completed turn (success OR a handled error like our e2e 401).
-        // Its ABSENCE at stdout EOF is the crash signature — claude died
-        // mid-turn before reporting a result.
-        let mut result_marker: Option<ResultMarker> = None;
+        let mut turn: Option<TurnState> = None;
+        let mut shutting_down = false;
+        let mut shutdown_deadline: Option<Instant> = None;
+        // Set when an operator Interrupt SIGINT'd the child mid-turn; the
+        // reap path closes that run as `RunInterrupted` (not a crash).
+        let mut interrupted_run: Option<String> = None;
+
+        // Kick off the first queued prompt (an initial prompt, or a queue
+        // that survived a respawn) with no leading Idle; otherwise
+        // announce Idle so the host's soft TTL arms.
+        match pending.pop_front() {
+            Some(text) => {
+                if let Some(s) = stdin.as_mut() {
+                    turn = Some(start_turn(evt_tx, s, cli, &text).await);
+                }
+            }
+            None => emit(evt_tx, HarnessEvent::Idle).await,
+        }
 
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!("max_run_secs elapsed; SIGTERM-ing claude");
-                ok = false;
-                let _ = child.start_kill();
-                break;
-            }
+            // The relevant deadline this iteration: the in-flight turn's
+            // wall-clock cap and/or the shutdown grace window, whichever
+            // is sooner. `None` → park forever (idle, no shutdown).
+            let next_deadline = [turn.as_ref().map(|t| t.deadline), shutdown_deadline]
+                .into_iter()
+                .flatten()
+                .min();
+            let sleeper = async {
+                match next_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(sleeper);
 
             tokio::select! {
-                res = timeout(remaining, lines.next_line()) => {
-                    match res {
-                        Ok(Ok(Some(line))) => {
-                            if result_marker.is_none() {
-                                result_marker = detect_result_marker(&line);
-                            }
-                            if let Some(translated) = translate_jsonl(
-                                &line,
-                                &mut run_id,
-                                &mut tool_calls,
-                                cli.max_tool_calls,
-                            ) {
-                                for ev in translated {
-                                    emit(evt_tx, ev).await;
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            if let Some(marker) = detect_result_marker(&line) {
+                                // Explicit turn-end. Close the in-flight
+                                // run, then run the next queued prompt
+                                // back-to-back (no Idle gap) or announce Idle.
+                                if let Some(t) = turn.take() {
+                                    let run_id = t.run_id;
+                                    tracing::info!(
+                                        %run_id,
+                                        subtype = %marker.subtype,
+                                        is_error = marker.is_error,
+                                        "turn result"
+                                    );
+                                    if interrupted_run.as_deref() == Some(run_id.as_str()) {
+                                        // control_request-style abort that
+                                        // surfaced as a result (Phase 3);
+                                        // the process is still alive.
+                                        interrupted_run = None;
+                                        emit(evt_tx, HarnessEvent::RunInterrupted { run_id }).await;
+                                    } else {
+                                        emit(
+                                            evt_tx,
+                                            HarnessEvent::RunCompleted {
+                                                run_id,
+                                                ok: !marker.is_error,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                    match pending.pop_front() {
+                                        Some(next) => {
+                                            if let Some(s) = stdin.as_mut() {
+                                                turn = Some(start_turn(evt_tx, s, cli, &next).await);
+                                            }
+                                        }
+                                        None => emit(evt_tx, HarnessEvent::Idle).await,
+                                    }
+                                } else {
+                                    tracing::warn!("result line with no in-flight turn; ignoring");
                                 }
+                            } else if let Some(t) = turn.as_mut() {
+                                if let Some(translated) = translate_jsonl(
+                                    &line,
+                                    &t.run_id,
+                                    &mut t.tool_calls,
+                                    cli.max_tool_calls,
+                                ) {
+                                    for ev in translated {
+                                        emit(evt_tx, ev).await;
+                                    }
+                                }
+                            } else {
+                                // A line outside any turn (e.g. claude's
+                                // init banner before the first prompt):
+                                // parse only for the session-id capture
+                                // side effect; emit nothing.
+                                let mut sink = 0u32;
+                                let _ = translate_jsonl(&line, "", &mut sink, cli.max_tool_calls);
                             }
                         }
-                        Ok(Ok(None)) => break, // EOF
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "stdout read error");
-                            ok = false;
-                            break;
-                        }
-                        Err(_) => {
-                            tracing::warn!("max_run_secs elapsed; SIGTERM-ing claude");
-                            ok = false;
-                            let _ = child.start_kill();
+                        Ok(None) => break, // stdout EOF: claude is exiting
+                        Err(e) => {
+                            tracing::warn!(error = %e, "claude stdout read error");
                             break;
                         }
                     }
@@ -780,50 +866,83 @@ mod adapter {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(HarnessCommand::Prompt { text }) => {
-                            if queued_prompt.is_none() {
-                                queued_prompt = Some(text);
+                            if turn.is_none() {
+                                if let Some(s) = stdin.as_mut() {
+                                    turn = Some(start_turn(evt_tx, s, cli, &text).await);
+                                }
                             } else {
-                                tracing::warn!("dropping prompt — one already queued");
+                                // Type-ahead: a prompt arriving mid-turn
+                                // queues for the turn boundary (consumed on
+                                // the next `result`). Phase 1b makes this
+                                // the user-visible editable queue.
+                                pending.push_back(text);
                             }
                         }
-                        Some(HarnessCommand::Shutdown { .. }) => {
-                            tracing::info!("shutdown mid-run; SIGTERM-ing claude");
-                            let _ = child.start_kill();
-                            ok = false;
-                            break;
-                        }
                         Some(HarnessCommand::Interrupt) => {
-                            // Operator stop: SIGINT the current claude
-                            // child (graceful — it flushes its
-                            // conversation file per message, so the
-                            // session stays cleanly --resume-able). We
-                            // break and let the bounded reap below
-                            // escalate to SIGKILL if it doesn't go. The
-                            // run closes as RunInterrupted, NOT a kill —
-                            // the adapter stays attached for the next
-                            // prompt.
-                            tracing::info!("interrupt mid-run; SIGINT-ing claude");
-                            sigint_child(&child);
-                            ok = false;
-                            interrupted = true;
-                            break;
+                            if let Some(t) = turn.as_ref() {
+                                // Phase 1: SIGINT the persistent child to
+                                // abort the turn. claude exits; the reap
+                                // path emits RunInterrupted and the engine
+                                // respawns `--resume`. Phase 3 upgrades
+                                // this to an in-band control_request that
+                                // leaves the process alive (no respawn).
+                                tracing::info!(run_id = %t.run_id, "interrupt mid-turn; SIGINT-ing claude");
+                                interrupted_run = Some(t.run_id.clone());
+                                sigint_child(&child);
+                            } else {
+                                tracing::debug!("interrupt while idle; nothing to stop");
+                            }
                         }
-                        // Intercepted at the connection layer; never
-                        // forwarded here. Arm for exhaustiveness only.
+                        Some(HarnessCommand::Shutdown { grace_secs }) => {
+                            // Clean shutdown: close claude's stdin so it
+                            // drains the in-flight turn, emits its final
+                            // `result`, and exits 0. Bound by grace_secs;
+                            // on expiry the deadline arm kills it.
+                            tracing::info!(grace_secs, "shutdown; closing claude stdin to drain");
+                            shutting_down = true;
+                            shutdown_deadline =
+                                Some(Instant::now() + Duration::from_secs(grace_secs as u64));
+                            stdin = None;
+                        }
+                        Some(HarnessCommand::Checkpoint { .. }) => {
+                            // claude flushes its transcript per-message
+                            // synchronously; nothing to force here.
+                        }
+                        // Track A (ADR 0034): a re-handshake is intercepted
+                        // at the connection layer (`forward_commands` drops
+                        // the link to force a re-dial) and never forwarded
+                        // to the engine. This arm exists only for
+                        // exhaustiveness over `HarnessCommand`.
                         Some(HarnessCommand::Rehandshake) => {}
-                        Some(HarnessCommand::Checkpoint { .. }) => {}
-                        None => break,
+                        // All command senders gone = the connection loop
+                        // exited = process teardown.
+                        None => return SessionOutcome::ChannelClosed,
                     }
+                }
+                // A fresh connection attached: re-announce `Idle` iff idle
+                // so the host re-arms its soft TTL. A mid-turn reattach
+                // emits none.
+                _ = reattach.notified() => {
+                    if turn.is_none() {
+                        emit(evt_tx, HarnessEvent::Idle).await;
+                    }
+                }
+                _ = &mut sleeper => {
+                    if shutting_down {
+                        tracing::warn!("shutdown grace elapsed; killing claude");
+                    } else {
+                        tracing::warn!("max_run_secs elapsed; killing claude");
+                    }
+                    let _ = child.start_kill();
+                    break;
                 }
             }
         }
 
-        // Bounded reap. Capture the child's ExitStatus (the signal/code
-        // is the crash signal — SIGKILL ≈ OOM-killer, SIGSEGV ≈ crash)
-        // instead of discarding it. The SIGINT (interrupt), SIGKILL
-        // (shutdown / max_run_secs), or EOF paths should all let the
-        // child exit promptly. If a signalled child doesn't go within the
-        // grace window, escalate to SIGKILL so we never wedge the loop.
+        // Bounded reap. Capture the ExitStatus (the signal/code is the
+        // crash signal — SIGKILL ≈ OOM-killer, SIGSEGV ≈ crash). All exit
+        // paths (clean drain, SIGINT, kill, EOF) should let the child go
+        // promptly; if a signalled child lingers, escalate to SIGKILL.
         let exit_status: Option<ExitStatus> =
             match timeout(Duration::from_secs(5), child.wait()).await {
                 Ok(Ok(status)) => Some(status),
@@ -838,68 +957,131 @@ mod adapter {
                 }
             };
 
-        // Collect the stderr tail. The drain task ends when the child
-        // closes stderr (the reap above just ensured that for a normal
-        // exit); bound the wait so a still-running child on the grace
-        // path can't hang us.
+        // Collect the stderr tail (drain task ends when the child closes
+        // stderr; the reap above just ensured that). Bound the wait.
         let stderr_tail: Vec<String> = match timeout(Duration::from_secs(2), stderr_task).await {
             Ok(Ok(tail)) => tail,
             _ => Vec::new(),
         };
 
-        // Abnormal exit detection. `ok` is still true ONLY on the clean
-        // stdout-EOF path — every path where WE stopped the child
-        // (shutdown / max_run_secs / interrupt / read error) set
-        // ok=false. So `ok && result_marker.is_none()` means claude
-        // EOF'd on its own WITHOUT emitting its terminal `result` line:
-        // it died mid-turn. Surface the cause (exit signal + stderr tail)
-        // as a System message so it persists into session_events, which
-        // outlives the VM (and its in-guest harness log) on eviction.
-        //
-        // Gating on the missing `result` line — NOT on a non-zero exit
-        // code — is deliberate: the e2e bogus-token test makes claude
-        // 401 and exit non-zero, but claude DOES emit a `result` line
-        // first, so this stays silent there and the test's terminal
-        // AgentMessage remains the 401.
-        if ok && result_marker.is_none() {
-            ok = false;
-            let detail = describe_abnormal_exit(exit_status, &stderr_tail);
-            tracing::error!(detail, "claude exited abnormally mid-turn");
-            emit(
-                evt_tx,
-                HarnessEvent::AgentMessage {
-                    run_id: run_id.clone().unwrap_or_else(|| "abnormal-exit".into()),
-                    message_id: format!("abnormal-{}", uuid::Uuid::new_v4()),
-                    role: AgentRole::System,
-                    text: detail,
-                },
-            )
-            .await;
+        // Close out any turn that was still in flight when the process
+        // died — always paired with the `RunStarted` we already emitted,
+        // so the run never dangles open (the wedge we're eliminating).
+        if let Some(t) = turn.take() {
+            let run_id = t.run_id;
+            if interrupted_run.as_deref() == Some(run_id.as_str()) {
+                // Operator interrupt: the SIGINT tore the process down
+                // mid-turn. Report it as interrupted (not a crash) and let
+                // the engine respawn `--resume` for the next prompt.
+                emit(evt_tx, HarnessEvent::RunInterrupted { run_id }).await;
+                emit(evt_tx, HarnessEvent::Idle).await;
+            } else if shutting_down {
+                // Grace expired mid-turn before claude could drain.
+                emit(
+                    evt_tx,
+                    HarnessEvent::RunCompleted {
+                        run_id,
+                        ok: false,
+                    },
+                )
+                .await;
+            } else {
+                // Unexpected crash mid-turn. Surface the durable artifact
+                // (bracketed by the run's RunStarted), close the run, and
+                // go Idle; the engine respawns `--resume`.
+                let detail = describe_abnormal_exit(exit_status, &stderr_tail);
+                tracing::error!(detail, "claude crashed mid-turn");
+                emit(
+                    evt_tx,
+                    HarnessEvent::AgentMessage {
+                        run_id: run_id.clone(),
+                        message_id: format!("abnormal-{}", uuid::Uuid::new_v4()),
+                        role: AgentRole::System,
+                        text: detail,
+                    },
+                )
+                .await;
+                emit(
+                    evt_tx,
+                    HarnessEvent::RunCompleted {
+                        run_id,
+                        ok: false,
+                    },
+                )
+                .await;
+                emit(evt_tx, HarnessEvent::Idle).await;
+            }
         } else {
-            // Read the result fields explicitly (not via Debug) so they
-            // count as live for the dead_code lint, and so the log
-            // distinguishes a clean `success` from a handled-error result
-            // (`error_max_turns`, an API error claude surfaced, …).
             tracing::info!(
                 status = ?exit_status,
-                result_subtype = result_marker.as_ref().map(|m| m.subtype.as_str()),
-                result_is_error = result_marker.as_ref().map(|m| m.is_error),
-                ok,
-                "claude run ended",
+                shutting_down,
+                "claude process ended (no in-flight turn)"
             );
         }
 
-        RunOutcome {
-            ok,
-            run_id,
-            queued_prompt,
-            interrupted,
+        if shutting_down {
+            SessionOutcome::Shutdown
+        } else {
+            SessionOutcome::Respawn
         }
     }
 
-    fn build_claude_argv(resume_id: &Option<String>, text: &str) -> Vec<String> {
+    /// Start a turn: mint the `run_id`, emit `RunStarted` (BEFORE any
+    /// claude output, so the run owns its id), and write the prompt as a
+    /// newline-delimited `user` message to claude's held-open stdin.
+    async fn start_turn(
+        evt_tx: &mpsc::Sender<HarnessEvent>,
+        stdin: &mut tokio::process::ChildStdin,
+        cli: &Cli,
+        text: &str,
+    ) -> TurnState {
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        emit(
+            evt_tx,
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                prompt_summary: Some(truncate_str(text, MAX_ARGS_SUMMARY_BYTES)),
+            },
+        )
+        .await;
+        if let Err(e) = write_user_message(stdin, text).await {
+            // The only way this fails is claude's stdin already gone (it
+            // died); the stdout-EOF reap path will close this run.
+            tracing::warn!(error = %e, "writing prompt to claude stdin failed");
+        }
+        TurnState {
+            run_id,
+            tool_calls: 0,
+            deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
+        }
+    }
+
+    /// Write one prompt to claude's stdin as a stream-json `user` message.
+    /// `serde_json` handles all escaping.
+    async fn write_user_message(
+        stdin: &mut tokio::process::ChildStdin,
+        text: &str,
+    ) -> std::io::Result<()> {
+        let msg = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": text },
+        });
+        let mut line = serde_json::to_string(&msg).expect("serialize user message");
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await
+    }
+
+    /// Build the argv for the persistent streaming `claude`. `--input-
+    /// format stream-json` holds stdin open for newline-delimited `user`
+    /// messages (one per turn); `--output-format stream-json --verbose`
+    /// gives us the per-turn `result` terminator on stdout. No trailing
+    /// prompt arg — prompts are written to stdin via `write_user_message`.
+    fn build_claude_argv(resume_id: &Option<String>) -> Vec<String> {
         let mut argv = vec![
             "--print".to_string(),
+            "--input-format".into(),
+            "stream-json".into(),
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
@@ -913,7 +1095,6 @@ mod adapter {
             argv.push("--resume".into());
             argv.push(id.clone());
         }
-        argv.push(text.to_string());
         argv
     }
 
@@ -1016,12 +1197,16 @@ mod adapter {
     }
 
     /// Translate one JSONL line from Claude's `--output-format
-    /// stream-json` into zero or more HarnessEvents. Tracks the
-    /// run_id captured from `system.init` and the per-run
-    /// tool-call count.
+    /// stream-json` into zero or more HarnessEvents, tagging them with
+    /// the caller-owned `run_id` (minted on prompt-accept). The
+    /// `system`/`init` line — re-emitted per turn in streaming mode — is
+    /// NOT turned into a `RunStarted` here (the session loop owns run
+    /// lifecycle); it only captures claude's session id for `--resume`.
+    /// The terminal `result` line is handled by the session loop via
+    /// `detect_result_marker`, so it's a no-op here.
     pub fn translate_jsonl(
         line: &str,
-        run_id: &mut Option<String>,
+        run_id: &str,
         tool_calls: &mut u32,
         max_tool_calls: u32,
     ) -> Option<Vec<HarnessEvent>> {
@@ -1032,34 +1217,23 @@ mod adapter {
             "system" => {
                 let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
                 if subtype == "init" {
-                    let session_id = v
+                    // Capture + persist claude's session id so a respawn
+                    // can `--resume` the same conversation. Fire-and-forget
+                    // the disk write only when a tokio runtime is present
+                    // (sync unit tests call this outside one).
+                    if let Some(sid) = v
                         .get("session_id")
                         .and_then(|s| s.as_str())
-                        .map(str::to_string);
-                    let rid = session_id
-                        .clone()
-                        .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
-                    *run_id = Some(rid.clone());
-                    if let Some(sid) = session_id {
-                        // `translate_jsonl` is sync and is called from
-                        // unit tests outside any tokio runtime. Only
-                        // fire-and-forget the disk write when a runtime
-                        // is actually available; in tests this becomes
-                        // a no-op rather than panicking, and we don't
-                        // accidentally write to `/workspace/.engram` on
-                        // the test host.
+                        .map(str::to_string)
+                    {
                         if let Ok(handle) = tokio::runtime::Handle::try_current() {
                             handle.spawn(async move { write_claude_session_id(&sid).await });
                         }
                     }
-                    out.push(HarnessEvent::RunStarted {
-                        run_id: rid,
-                        prompt_summary: None,
-                    });
                 }
             }
             "assistant" => {
-                let rid = run_id.clone().unwrap_or_default();
+                let rid = run_id.to_string();
                 let msg = v.get("message")?;
                 let msg_id = msg
                     .get("id")
@@ -1119,7 +1293,7 @@ mod adapter {
                 }
             }
             "user" => {
-                let rid = run_id.clone().unwrap_or_default();
+                let rid = run_id.to_string();
                 let msg = v.get("message")?;
                 if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
                     for b in blocks {
@@ -1159,8 +1333,8 @@ mod adapter {
                 }
             }
             "result" => {
-                // Outer loop emits RunCompleted from claude's exit
-                // status; the result event is informational.
+                // The session loop closes the turn on this line via
+                // `detect_result_marker`; nothing to translate here.
             }
             _ => {}
         }
@@ -1255,19 +1429,53 @@ mod adapter {
             );
         }
 
-        async fn write_fake_claude(lines: &[&str]) -> String {
+        /// A persistent fake `claude`: emits an `init` banner once, then
+        /// blocks reading newline-delimited stdin (our `user` messages),
+        /// emitting `per_turn` lines for each one (one turn per prompt).
+        /// Exits when stdin closes — mirroring claude draining on a clean
+        /// Shutdown (stdin drop = EOF).
+        async fn write_persistent_fake_claude(per_turn: &[&str]) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
                 std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
             let mut body = String::from("#!/bin/sh\n");
-            for l in lines {
-                body.push_str(&format!("printf '%s\\n' '{l}'\n"));
+            // init has no session_id, so the engine's session-id persist
+            // (which would touch /workspace) stays a no-op in the test.
+            body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
+            body.push_str("while IFS= read -r _line; do\n");
+            for l in per_turn {
+                body.push_str(&format!("  printf '%s\\n' '{l}'\n"));
             }
+            body.push_str("done\n");
             tokio::fs::write(&path, body).await.unwrap();
             let mut perms = std::fs::metadata(&path).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&path, perms).unwrap();
             path.to_string_lossy().into_owned()
+        }
+
+        async fn expect_run_started(rx: &mut mpsc::Receiver<HarnessEvent>) -> String {
+            match rx.recv().await {
+                Some(HarnessEvent::RunStarted { run_id, .. }) => run_id,
+                other => panic!("expected RunStarted, got {other:?}"),
+            }
+        }
+
+        async fn expect_run_completed(rx: &mut mpsc::Receiver<HarnessEvent>) -> String {
+            match rx.recv().await {
+                Some(HarnessEvent::RunCompleted { run_id, ok }) => {
+                    assert!(ok, "expected a clean RunCompleted");
+                    run_id
+                }
+                other => panic!("expected RunCompleted, got {other:?}"),
+            }
+        }
+
+        async fn expect_agent_message(rx: &mut mpsc::Receiver<HarnessEvent>, want: &str) {
+            match rx.recv().await {
+                Some(HarnessEvent::AgentMessage { text, .. }) => assert_eq!(text, want),
+                other => panic!("expected AgentMessage, got {other:?}"),
+            }
         }
 
         fn test_cli(claude_bin: String) -> Cli {
@@ -1282,13 +1490,14 @@ mod adapter {
             }
         }
 
-        // End-to-end (minus real claude): the engine runs the initial
-        // prompt, emits the run's events, then a trailing `Idle`; a
-        // reattach while idle re-announces `Idle`; Shutdown exits.
+        // The core Phase-1 contract: TWO prompts over ONE persistent
+        // process, each turn cleanly bracketed by RunStarted→…→
+        // RunCompleted→Idle with a DISTINCT run_id (no inference from
+        // EOF). A reattach while idle re-announces Idle; Shutdown drains
+        // the process and the engine exits.
         #[tokio::test]
-        async fn engine_runs_prompt_then_idle_and_reannounces_on_reattach() {
-            let script = write_fake_claude(&[
-                r#"{"type":"system","subtype":"init"}"#,
+        async fn engine_runs_two_prompts_over_one_process() {
+            let script = write_persistent_fake_claude(&[
                 r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hello"}]}}"#,
                 r#"{"type":"result","subtype":"success","is_error":false}"#,
             ])
@@ -1302,36 +1511,46 @@ mod adapter {
                 cmd_rx,
                 reattach.clone(),
                 evt_tx,
-                Some("do it".into()),
+                Some("first".into()),
             ));
 
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::RunStarted { .. })
-            ));
-            match evt_rx.recv().await {
-                Some(HarnessEvent::AgentMessage { text, .. }) => assert_eq!(text, "hello"),
-                other => panic!("expected AgentMessage, got {other:?}"),
-            }
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::RunCompleted { ok: true, .. })
-            ));
+            // Turn 1 (the initial prompt): RunStarted, AgentMessage,
+            // RunCompleted, Idle — the run_id shared start-to-end.
+            let r1 = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "hello").await;
+            let c1 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(r1, c1, "RunStarted and RunCompleted share the run_id");
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // Turn 2 over the SAME process — a fresh, distinct run_id.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    text: "second".into(),
+                })
+                .await
+                .unwrap();
+            let r2 = expect_run_started(&mut evt_rx).await;
+            assert_ne!(r1, r2, "each turn gets a fresh run_id");
+            expect_agent_message(&mut evt_rx, "hello").await;
+            let c2 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(r2, c2);
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
 
             // A reconnect while idle re-announces Idle so the host's soft
-            // TTL re-arms; a mid-run reattach (covered implicitly above)
-            // emits none.
+            // TTL re-arms; a mid-run reattach emits none.
             reattach.notify_one();
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
 
+            // Shutdown closes claude's stdin; the fake drains and exits,
+            // and the engine returns.
             cmd_tx
-                .send(HarnessCommand::Shutdown { grace_secs: 0 })
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
                 .await
                 .unwrap();
-            let _ = tokio::time::timeout(Duration::from_secs(5), engine)
+            tokio::time::timeout(Duration::from_secs(5), engine)
                 .await
-                .expect("engine should exit on shutdown");
+                .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
             let _ = tokio::fs::remove_file(&script).await;
         }
     }
@@ -1349,39 +1568,39 @@ mod tests {
     use engram_harness_proto::HarnessEvent;
 
     #[test]
-    fn translates_system_init_and_assistant_text() {
+    fn system_init_emits_nothing_and_assistant_text_carries_run_id() {
+        // `system`/`init` no longer synthesizes RunStarted (the session
+        // loop owns run lifecycle) — it yields no events. Assistant text
+        // is tagged with the caller-provided run_id.
         let init = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
         let asst = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"hi there"}]}}"#;
-        let mut run_id = None;
         let mut tc = 0u32;
-        let evs = translate_jsonl(init, &mut run_id, &mut tc, 50).unwrap();
-        assert_eq!(run_id.as_deref(), Some("abc-123"));
-        assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], HarnessEvent::RunStarted { .. }));
+        let evs = translate_jsonl(init, "run-1", &mut tc, 50).unwrap();
+        assert!(evs.is_empty(), "init emits no HarnessEvent");
 
-        let evs = translate_jsonl(asst, &mut run_id, &mut tc, 50).unwrap();
+        let evs = translate_jsonl(asst, "run-1", &mut tc, 50).unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            HarnessEvent::AgentMessage { text, .. } => assert_eq!(text, "hi there"),
+            HarnessEvent::AgentMessage { text, run_id, .. } => {
+                assert_eq!(text, "hi there");
+                assert_eq!(run_id, "run-1");
+            }
             other => panic!("expected AgentMessage, got {other:?}"),
         }
     }
 
     #[test]
     fn translates_tool_use_and_tool_result_pair() {
-        let init = r#"{"type":"system","subtype":"init","session_id":"x"}"#;
         let asst = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls /workspace"}}]}}"#;
         let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1.txt\nfile2.py","is_error":false}]}}"#;
 
-        let mut run_id = None;
         let mut tc = 0u32;
-        translate_jsonl(init, &mut run_id, &mut tc, 50);
-        let evs = translate_jsonl(asst, &mut run_id, &mut tc, 50).unwrap();
+        let evs = translate_jsonl(asst, "run-1", &mut tc, 50).unwrap();
         assert_eq!(evs.len(), 1);
         assert!(matches!(evs[0], HarnessEvent::ToolCallStarted { .. }));
         assert_eq!(tc, 1);
 
-        let evs = translate_jsonl(user, &mut run_id, &mut tc, 50).unwrap();
+        let evs = translate_jsonl(user, "run-1", &mut tc, 50).unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::ToolCallCompleted {
