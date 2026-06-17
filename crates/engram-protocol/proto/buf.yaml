@@ -1,7 +1,9 @@
-# buf owns this proto tree (ADR 0051 §7): `buf lint` gates style,
-# `buf breaking` gates wire compatibility against main (enforced in
-# CI via bufbuild/buf-action's PR-base behavior), and the repo-root
-# buf.gen.yaml drives TS codegen (`just gen-proto`).
+# buf owns this proto tree (ADR 0051 §7): `buf lint` GATES style (a lint
+# failure fails CI), `buf breaking` is ADVISORY — it checks wire
+# compatibility against the PR base and CI surfaces a detected break as a
+# warning + PR comment rather than a hard failure (see the `buf` job in
+# .github/workflows/ci.yml) — and the repo-root buf.gen.yaml drives TS
+# codegen (`just gen-proto`).
 #
 # host_service.proto predates buf — it was authored for tonic-build
 # (ADR 0013) and fails six STANDARD rules. Those exceptions are
@@ -25,11 +27,10 @@ lint:
     RPC_RESPONSE_STANDARD_NAME:
       - host_service.proto
 # FILE is the standing policy: the strictest `buf breaking` category, it
-# blocks any structural change to a released proto (field/file deletion,
-# renames) on top of wire-compat. The ADR 0051 migration's one-time
-# structural removals (SecretService + CreateSession.harness_secret_id)
-# have landed on the base, so this PR's protos are unchanged and FILE
-# passes with nothing to flag.
+# flags any structural change to a released proto (field/file deletion,
+# renames) on top of wire-compat. Detection is advisory in CI (warning +
+# PR comment, not a hard gate — see the `buf` job in ci.yml), so FILE's
+# strictness keeps the signal high without blocking deliberate breaks.
 breaking:
   use:
     - FILE

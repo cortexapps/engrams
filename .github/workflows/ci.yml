@@ -498,10 +498,13 @@ jobs:
       - name: bun test
         run: bun test
 
-  # ADR 0051 §7: buf owns crates/engram-protocol/proto. Lint gates style
-  # (legacy host_service.proto carries scoped exceptions in buf.yaml;
-  # everything new must be clean under full STANDARD); breaking gates wire
-  # compatibility against the PR base. Codegen-drift activates only once
+  # ADR 0051 §7: buf owns crates/engram-protocol/proto. Lint GATES style —
+  # legacy host_service.proto carries scoped exceptions in buf.yaml;
+  # everything new must be clean under full STANDARD, and a lint failure
+  # fails this job. Breaking-change detection is ADVISORY: it runs against
+  # the PR base, but a detected break does NOT fail the job — it surfaces
+  # as a `::warning::` plus a detailed PR comment so a reviewer can confirm
+  # the wire-compat impact is intended. Codegen-drift activates only once
   # the generated TS bindings are committed (ADR 0051 Tasks 4-5) — until
   # then this PR ships only the contract + Rust stubs.
   buf:
@@ -509,9 +512,19 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_buf == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    # The breaking step posts a PR comment via the action's pr_comment;
+    # that needs pull-requests: write (the workflow default is read-only).
+    # This job doesn't pull from GHCR, so it drops the top-level
+    # `packages: read` — job-level permissions replace, not merge.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
-      - uses: bufbuild/buf-action@v1
+      # Lint (fatal). Split from breaking because a single buf-action run
+      # can't make one check fatal and another advisory.
+      - name: buf lint (fatal)
+        uses: bufbuild/buf-action@v1
         with:
           # Pin to the locally-verified buf CLI; bump deliberately. A new
           # buf release can surface new lint rules (1.69.0 added
@@ -523,15 +536,40 @@ jobs:
           # formatting (the action runs it by default on PRs).
           format: false
           # lint defaults to PR-events only — force it on so push-to-main
-          # + merge_group keep the gate. (breaking stays PR-only, vs base.)
+          # + merge_group keep the gate.
           lint: true
+          breaking: false
           # The action's push step publishes to the BSR by default on push
           # events — we don't use the BSR.
           push: false
           archive: false
-          # This workflow runs with `contents: read` only; the action's
-          # PR-comment step needs `pull-requests: write`.
           pr_comment: false
+      # Breaking (advisory). PR-only: the comparison base and the PR comment
+      # only make sense on pull_request events. continue-on-error keeps a
+      # detected break from failing the job — buf-action posts the PR
+      # comment BEFORE it sets its failure status, so the comment still
+      # lands. The next step turns that swallowed failure into a warning.
+      - name: buf breaking (advisory — warns + comments, never fails)
+        id: breaking
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: bufbuild/buf-action@v1
+        with:
+          version: 1.69.0
+          input: crates/engram-protocol/proto
+          format: false
+          lint: false
+          breaking: true
+          push: false
+          archive: false
+          # Post/update a single comment keyed by <workflow>:<job> with the
+          # breaking-change details (needs pull-requests: write above;
+          # silently skipped on fork PRs where the token is read-only).
+          pr_comment: true
+      - name: Flag breaking changes as a warning
+        if: github.event_name == 'pull_request' && steps.breaking.outcome == 'failure'
+        run: |
+          echo "::warning title=Proto breaking change detected::buf found a wire-incompatible change to crates/engram-protocol/proto against the PR base. This is non-blocking — see the buf comment on the PR for details. Confirm the break is intended before merging."
       # TS codegen drift check. Guarded on the committed output dir so it
       # stays inert in this PR (protos + Rust stubs only) and activates
       # once web/src/gen lands with the connect-es deps (ADR 0051 Task 4).
