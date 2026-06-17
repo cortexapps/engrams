@@ -9,10 +9,25 @@ import type { IndexedEvent, SessionEventKind } from "./lib/types";
 // and the `Last-Event-ID` header, so an explicit `?since` never goes
 // backward across a reconnect.
 
+/** Phase 1c: one live token delta of the in-flight assistant message. */
+export interface SessionDelta {
+  runId: string;
+  messageId: string;
+  chunk: string;
+}
+
 export interface SseHandlers {
   onEvent: (e: IndexedEvent) => void;
   onError?: (err: Event) => void;
   onLagged?: (missed: number) => void;
+  /**
+   * Phase 1c: an EPHEMERAL token chunk (`agent_message_chunk`). Delivered
+   * on a SEPARATE path from `onEvent` because these frames carry NO `idx`
+   * (they are never persisted, so `parseOrchestratorFrame` — which drops
+   * idx-less frames — must not see them, and they must never enter the
+   * durable event array nor disturb the reconnect cursor).
+   */
+  onDelta?: (d: SessionDelta) => void;
 }
 
 /**
@@ -70,6 +85,30 @@ export function subscribeSession(sessionId: string, handlers: SseHandlers, since
       if (indexed) handlers.onEvent(indexed);
     });
   }
+
+  // Phase 1c: ephemeral token chunks. Like `lagged`, these arrive with no
+  // SSE `id:` line (idx is null) and are handled OUT of the generic event
+  // path — they're a live-only overlay, never durable events. We parse the
+  // two-level envelope directly and hand the chunk to `onDelta`.
+  es.addEventListener("agent_message_chunk", (ev) => {
+    try {
+      const envelope = JSON.parse((ev as MessageEvent).data) as {
+        idx: number | null;
+        kind: string;
+        payload_json: string;
+      };
+      const p = JSON.parse(envelope.payload_json) as {
+        run_id: string;
+        message_id: string;
+        chunk: string;
+      };
+      if (typeof p.message_id === "string" && typeof p.chunk === "string") {
+        handlers.onDelta?.({ runId: p.run_id, messageId: p.message_id, chunk: p.chunk });
+      }
+    } catch {
+      /* ignore malformed chunk frame — the durable message will still land */
+    }
+  });
 
   // The orchestrator surfaces broadcast lag as an `event: lagged` frame
   // with no SSE `id:` line (so it never disturbs Last-Event-ID / reconnect

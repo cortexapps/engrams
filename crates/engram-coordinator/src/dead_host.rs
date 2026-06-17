@@ -83,7 +83,14 @@ async fn emit_status_changed(
     };
     match meta.append_session_event(session_id, kind, payload).await {
         Ok(idx) => {
-            events.publish(session_id, IndexedEvent { idx, event });
+            events.publish(
+                session_id,
+                IndexedEvent {
+                    idx,
+                    event,
+                    ephemeral: false,
+                },
+            );
         }
         Err(e) => {
             tracing::warn!(error = %e, %session_id, "persist StatusChanged failed");

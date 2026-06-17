@@ -76,6 +76,18 @@ export type SessionEvent =
       prompt_id?: string | null;
       at: string;
     }
+  // Phase 1c (ADR 0052): one live token delta of the in-flight assistant
+  // message. EPHEMERAL — streamed over SSE with NO `idx` (never persisted,
+  // never replayed on reconnect); the web accumulates it into a live
+  // overlay keyed on `message_id` and the terminal `agent_message` (same
+  // id) supersedes it. Routed via `onDelta`, NOT the durable event array.
+  | {
+      type: "agent_message_chunk";
+      run_id: string;
+      message_id: string;
+      chunk: string;
+      at: string;
+    }
   | {
       type: "tool_call_started";
       run_id: string;

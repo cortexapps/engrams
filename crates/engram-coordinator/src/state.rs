@@ -157,6 +157,19 @@ pub enum SessionEvent {
         prompt_id: String,
         at: DateTime<Utc>,
     },
+    /// Phase 1c (ADR 0052): one live token delta of the in-flight
+    /// assistant message. EPHEMERAL — fanned out to live SSE subscribers
+    /// only (never appended to `session_events`); the terminal
+    /// `HarnessAgentMessage` with the same `message_id` is the durable
+    /// record and supersedes every chunk. Carried cross-replica inline on
+    /// the `session_event_deltas` NOTIFY channel (NOT the persisted-row
+    /// path), so a replica without the harness connection still streams.
+    HarnessAgentMessageChunk {
+        run_id: String,
+        message_id: String,
+        chunk: String,
+        at: DateTime<Utc>,
+    },
     /// ADR 0023: the agent opened a change request (PR/MR) via the
     /// in-session forge seam. Surfaces the title + URL to the web UI /
     /// SSE subscribers so the session's output artifact is visible (the
@@ -258,6 +271,7 @@ impl SessionEvent {
             Self::HarnessPromptQueued { .. } => "prompt_queued",
             Self::HarnessPromptEdited { .. } => "prompt_edited",
             Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
+            Self::HarnessAgentMessageChunk { .. } => "agent_message_chunk",
             Self::PullRequestOpened { .. } => "pull_request_opened",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
@@ -340,6 +354,16 @@ impl SessionEvent {
             HarnessEvent::PromptDequeued { prompt_id } => {
                 Self::HarnessPromptDequeued { prompt_id, at }
             }
+            HarnessEvent::AgentMessageChunk {
+                run_id,
+                message_id,
+                chunk,
+            } => Self::HarnessAgentMessageChunk {
+                run_id,
+                message_id,
+                chunk,
+                at,
+            },
         }
     }
 }
@@ -352,6 +376,13 @@ impl SessionEvent {
 pub struct IndexedEvent {
     pub idx: i64,
     pub event: SessionEvent,
+    /// Phase 1c: this event is EPHEMERAL — a live-only token chunk that
+    /// was never persisted to `session_events`, so `idx` is meaningless
+    /// (set to 0). The SSE/gRPC merge passes it through unconditionally
+    /// (it can't have been replayed) and frames it with NO `idx`, so it
+    /// never advances a client's `Last-Event-ID` cursor. Always `false`
+    /// for the durable, persisted events that carry a real `idx`.
+    pub ephemeral: bool,
 }
 
 /// Per-session in-memory event broadcast.
@@ -616,7 +647,14 @@ impl AppState {
             .meta
             .append_session_event(session, kind, payload)
             .await?;
-        self.events.publish(session, IndexedEvent { idx, event });
+        self.events.publish(
+            session,
+            IndexedEvent {
+                idx,
+                event,
+                ephemeral: false,
+            },
+        );
         Ok(idx)
     }
 }
@@ -717,6 +755,29 @@ fn harness_event_sink(
                     return;
                 }
             };
+
+            // Phase 1c: token chunks are EPHEMERAL — they are NEVER appended
+            // to `session_events`. Fan them out cross-replica on the dedicated
+            // `session_event_deltas` NOTIFY channel; every replica's
+            // pg_listener re-broadcasts to its local bus, so a client on a
+            // replica WITHOUT the harness connection still streams. The
+            // producing replica also LISTENs that channel, so the NOTIFY echo
+            // is the single delivery path — we do NOT publish locally here
+            // (that would double-emit to this replica's own subscribers).
+            // Best-effort: a dropped NOTIFY costs only animation, never
+            // correctness — the durable `agent_message` (same message_id) is
+            // the authoritative record and supersedes every chunk.
+            if kind == "agent_message_chunk" {
+                if let Err(e) = meta.notify_session_delta(session_id, &payload).await {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        error = %e,
+                        "notify_session_delta failed; dropping ephemeral chunk",
+                    );
+                }
+                return;
+            }
+
             match meta.append_session_event(session_id, kind, payload).await {
                 Ok(idx) => {
                     last_kind.insert(session_id, kind);
@@ -725,6 +786,7 @@ fn harness_event_sink(
                         IndexedEvent {
                             idx,
                             event: session_event,
+                            ephemeral: false,
                         },
                     );
                 }
@@ -806,7 +868,11 @@ pub(crate) mod tests {
     }
 
     fn indexed(idx: i64, event: SessionEvent) -> IndexedEvent {
-        IndexedEvent { idx, event }
+        IndexedEvent {
+            idx,
+            event,
+            ephemeral: false,
+        }
     }
 
     #[tokio::test]

@@ -2517,6 +2517,40 @@ impl MetadataStore for PostgresStore {
         Ok(idx)
     }
 
+    async fn notify_session_delta(
+        &self,
+        session_id: SessionId,
+        payload: &serde_json::Value,
+    ) -> Result<(), MetaError> {
+        // Phase 1c: fan one EPHEMERAL token chunk out cross-replica. Unlike
+        // `append_session_event`, there is NO row and NO idx — the full
+        // event rides inline so every replica's `PgListener` re-broadcasts
+        // it to its local SSE bus without a fetch. A bare `pg_notify`
+        // commits immediately (its own autocommit unit).
+        let body =
+            serde_json::json!({ "session_id": session_id.as_uuid().to_string(), "event": payload })
+                .to_string();
+        // Postgres caps a NOTIFY payload at 8000 bytes. The harness clamps
+        // chunks (MAX_CHUNK_BYTES = 6 KiB) so the envelope fits with margin;
+        // guard defensively anyway — an oversize chunk is simply not
+        // streamed, and the durable terminal `agent_message` still carries
+        // the full text, so the transcript is never wrong.
+        if body.len() > 7800 {
+            tracing::debug!(
+                session_id = %session_id,
+                len = body.len(),
+                "session delta exceeds NOTIFY payload limit; skipping live stream",
+            );
+            return Ok(());
+        }
+        sqlx::query("SELECT pg_notify('session_event_deltas', $1)")
+            .bind(body)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn list_session_events_since(
         &self,
         session_id: SessionId,

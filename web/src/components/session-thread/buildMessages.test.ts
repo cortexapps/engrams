@@ -532,3 +532,111 @@ describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
     ).toEqual(["p1", "p2"]);
   });
 });
+
+describe("buildMessages — Phase 1c live token streaming", () => {
+  const asstOf = (messages: ReturnType<typeof buildMessages>["messages"]) =>
+    real(messages).find((m) => m.role === "assistant");
+
+  test("streamingText renders into the in-flight assistant turn while a run is open", () => {
+    const { messages, isRunning } = buildMessages(
+      indexed([{ type: "run_started", run_id: "r1", prompt_summary: null, at: AT }]),
+      SID,
+      undefined,
+      "hello wor",
+    );
+    expect(isRunning).toBe(true);
+    const a = asstOf(messages);
+    expect(a?.content).toEqual([{ type: "text", text: "hello wor" }]);
+    expect(a?.status?.type).toBe("running");
+  });
+
+  test("the durable agent_message supersedes the tail — no double-render", () => {
+    // The hook empties streamingText the instant the durable message lands,
+    // so buildMessages sees the durable event + an EMPTY tail; the rendered
+    // text comes wholly from the durable event (never doubled).
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "hello world",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT },
+      ]),
+      SID,
+      undefined,
+      "",
+    );
+    expect(asstOf(messages)?.content).toEqual([{ type: "text", text: "hello world" }]);
+  });
+
+  test("a stale tail does NOT resurrect a finished run (gated on runOpen)", () => {
+    // Crash/teleport edge: even if a straggler tail were handed in after the
+    // run closed, it must not append — the run is done.
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "done",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT },
+      ]),
+      SID,
+      undefined,
+      "ghost tokens",
+    );
+    expect(asstOf(messages)?.content).toEqual([{ type: "text", text: "done" }]);
+  });
+
+  test("tail appends after durable text + a tool boundary in the same run", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "block one",
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "Read",
+          args_summary: null,
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "Read",
+          ok: true,
+          duration_ms: 5,
+          result_summary: null,
+          at: AT,
+        },
+      ]),
+      SID,
+      undefined,
+      "block two streaming",
+    );
+    const content = asstOf(messages)?.content;
+    const textParts = (Array.isArray(content) ? content : [])
+      .filter((p) => p.type === "text")
+      .map((p) => (p as { text: string }).text);
+    expect(textParts).toContain("block one");
+    expect(textParts).toContain("block two streaming");
+  });
+});

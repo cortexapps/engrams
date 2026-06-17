@@ -844,6 +844,26 @@ pub trait MetadataStore: Send + Sync {
         payload: serde_json::Value,
     ) -> Result<i64, MetaError>;
 
+    /// Phase 1c (ADR 0052): fan out one EPHEMERAL session event (a live
+    /// token chunk) to all coordinator replicas via
+    /// `NOTIFY session_event_deltas`. Unlike [`append_session_event`],
+    /// this NEITHER persists a row NOR allocates an `idx` — the full event
+    /// rides inline in the notification payload so every replica's
+    /// `pg_listener` can re-broadcast it to its local SSE bus without a DB
+    /// fetch. `payload` is the serialized [`SessionEvent`]. Best-effort by
+    /// contract: a dropped notification costs only live animation, never
+    /// correctness (the durable terminal message is the record).
+    ///
+    /// Default no-op so non-Postgres / mock stores simply don't stream;
+    /// only [`PostgresStore`](../../../engram_postgres) overrides it.
+    async fn notify_session_delta(
+        &self,
+        _session_id: SessionId,
+        _payload: &serde_json::Value,
+    ) -> Result<(), MetaError> {
+        Ok(())
+    }
+
     /// Return events with `idx > since`, in idx order, capped at
     /// `limit`. Used by `GET /sessions/:id/events?since=N` (and by
     /// EventSource auto-reconnect via `Last-Event-ID`) to replay the

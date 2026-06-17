@@ -30,6 +30,16 @@ struct NotifyPayload {
     idx: i64,
 }
 
+/// Phase 1c: the `session_event_deltas` NOTIFY payload. Unlike
+/// `session_events` (which carries only `{session_id, idx}` and has the
+/// listener re-fetch the row), an ephemeral token chunk is NEVER persisted,
+/// so its full [`SessionEvent`] rides inline — there is no row to fetch.
+#[derive(Debug, Deserialize)]
+struct DeltaNotifyPayload {
+    session_id: String,
+    event: SessionEvent,
+}
+
 /// Spawn the listener task. Returns immediately; the task runs until
 /// the connection drops, at which point it logs and exits. A future
 /// follow-up wraps this in an exp-backoff supervisor; for 3c the
@@ -56,8 +66,9 @@ async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
+    listener.listen("session_event_deltas").await?;
     listener.listen("host_dead").await?;
-    tracing::info!("pg_listener subscribed to session_events + host_dead");
+    tracing::info!("pg_listener subscribed to session_events + session_event_deltas + host_dead");
 
     loop {
         let notification = listener.recv().await?;
@@ -80,6 +91,38 @@ async fn run(
                             "malformed host_dead notification; skipping",
                         );
                     }
+                }
+                continue;
+            }
+            "session_event_deltas" => {
+                // Phase 1c: an EPHEMERAL token chunk. The full event rides
+                // inline (no persisted row to fetch); decode it and publish
+                // straight to the local bus marked ephemeral. This arm fires
+                // on EVERY replica including the producer — it is the single
+                // delivery path for chunks, so a client on a replica without
+                // the harness connection still streams.
+                match serde_json::from_str::<DeltaNotifyPayload>(notification.payload()) {
+                    Ok(p) => match p.session_id.parse::<SessionId>() {
+                        Ok(session_id) => {
+                            events.publish(
+                                session_id,
+                                IndexedEvent {
+                                    idx: 0,
+                                    event: p.event,
+                                    ephemeral: true,
+                                },
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            session_id = %p.session_id,
+                            "delta notification has bad uuid; skipping",
+                        ),
+                    },
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "malformed session_event_deltas notification; skipping",
+                    ),
                 }
                 continue;
             }
@@ -178,6 +221,7 @@ async fn run(
             IndexedEvent {
                 idx: row.idx,
                 event,
+                ephemeral: false,
             },
         );
     }

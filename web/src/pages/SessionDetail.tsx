@@ -17,7 +17,7 @@ import {
   type DurabilitySummary,
 } from "../components/SessionDiagnostics";
 import { Separator } from "@/components/ui/separator";
-import type { Session, ProfileSnapshotView } from "../lib/types";
+import type { IndexedEvent, Session, ProfileSnapshotView } from "../lib/types";
 
 type ViewTab = "transcript" | "shell" | "raw";
 
@@ -45,7 +45,7 @@ export function SessionDetail() {
         imageUri: profileSnap.imageUri,
       }
     : null;
-  const events = useSessionEvents(id);
+  const { events, streamingText } = useSessionEvents(id);
   // One poll per session, shared by React Query with the Diagnostics drawer's
   // gauges; null until the session resolves (and whenever there's nothing
   // calming to say).
@@ -94,7 +94,12 @@ export function SessionDetail() {
 
       <div className="min-h-0 flex-1 overflow-hidden">
         {tab === "transcript" && (
-          <SessionThread sessionId={id} events={events} status={session?.status} />
+          <SessionThread
+            sessionId={id}
+            events={events}
+            status={session?.status}
+            streamingText={streamingText}
+          />
         )}
 
         {/* Mount TerminalPane once and keep it mounted across tab switches.
@@ -174,7 +179,7 @@ function SessionVitals({
   );
 }
 
-function RawEvents({ events }: { events: ReturnType<typeof useSessionEvents> }) {
+function RawEvents({ events }: { events: IndexedEvent[] }) {
   return (
     <div className="h-full space-y-0.5 overflow-auto px-6 py-4 font-mono text-[0.74rem] text-muted-foreground">
       {events.map((e) => (
