@@ -33,7 +33,7 @@ import { SystemMessage } from "@/components/session-thread/SystemMessage";
 import { RunFooter } from "@/components/session-thread/RunFooter";
 import { SHELL_TOOL } from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
-import { useQueuedRecall } from "@/components/session-thread/queued-recall";
+import { useComposerActions } from "@/components/session-thread/composer-actions";
 import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
@@ -269,13 +269,16 @@ const Composer: FC = () => {
   const banner = status ? COMPOSER_BANNER[status] : undefined;
   const hint = status ? COMPOSER_HINT[status] : undefined;
 
-  // ADR 0052: ↑ in an EMPTY composer pulls the most-recent still-queued
-  // message back out of the queue and into the textarea for editing — exactly
-  // "press up to edit queued messages". `recall()` dequeues it (so it can't be
-  // claimed while you edit); re-sending re-queues it, abandoning it cancels it.
-  const { canRecall, recall } = useQueuedRecall();
+  // ADR 0052: the composer drives submit/interrupt itself (via
+  // ComposerActionsContext), NOT assistant-ui's run-gated Send/Cancel — so a
+  // prompt can be ENQUEUED while a run is in flight (type-ahead), ⌘↵ works
+  // mid-run, and Esc interrupts. `submitMode="none"` disables the primitive's
+  // own keyboard submit so plain Enter stays a newline and our keydown owns ⌘↵.
+  const { submit, interrupt, sendBlocked, canRecall, recall } = useComposerActions();
+  const isRunning = useAuiState((s) => s.thread.isRunning);
   const composer = useComposerRuntime();
-  const isEmpty = useComposer((c) => c.text.trim().length === 0);
+  const text = useComposer((c) => c.text);
+  const isEmpty = text.trim().length === 0;
 
   if (banner) {
     return (
@@ -285,19 +288,48 @@ const Composer: FC = () => {
     );
   }
 
+  // While a run is in flight, "esc to interrupt" is ALWAYS shown (the user
+  // asked to keep that affordance regardless of text). ↑-recall is offered
+  // only on an empty composer with something still queued. Both can coexist.
+  const hints: string[] = [];
+  if (canRecall && isEmpty) hints.push("↑ to edit queued message");
+  if (isRunning) hints.push("esc to interrupt");
+  const hintLine = hints.length ? hints.join(" · ") : hint;
+
   return (
     <ComposerPrimitive.Root className="relative flex w-full flex-col">
       <div className="flex w-full items-end gap-2 rounded-2xl border bg-background p-2 transition-shadow focus-within:ring-2 focus-within:ring-ring/20">
         <ComposerPrimitive.Input
-          // Enter inserts a newline; ⌘/Ctrl+Enter submits. This is a
-          // writing surface (multi-line prompts to a coding agent), not a
-          // chat one-liner, so newline is the cheap key.
-          submitMode="ctrlEnter"
+          // Enter inserts a newline; ⌘/Ctrl+Enter submits. This is a writing
+          // surface (multi-line prompts to a coding agent), not a chat
+          // one-liner, so newline is the cheap key. submitMode="none" leaves
+          // submit entirely to our keydown so it isn't run-gated.
+          submitMode="none"
           placeholder="Reply to the session…   (⌘↵ to send)"
           className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/80"
           rows={1}
           aria-label="Message input"
           onKeyDown={(e) => {
+            // ⌘/Ctrl+↵ submits. Idle → starts a run; mid-run → the harness
+            // queues it (type-ahead). Driven here, not by the primitive, so it
+            // works while a run is in flight.
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              const t = text.trim();
+              if (t && !sendBlocked) {
+                submit(t);
+                composer.setText("");
+              }
+              return;
+            }
+            // Esc interrupts the in-flight run, regardless of composer text. A
+            // queued message (if any) then auto-runs next per the harness's
+            // consume-on-result.
+            if (e.key === "Escape" && isRunning) {
+              e.preventDefault();
+              interrupt();
+              return;
+            }
             // Plain ↑ on an empty composer recalls the newest queued message.
             // Any modifier or existing text falls through to normal caret nav.
             if (
@@ -309,61 +341,70 @@ const Composer: FC = () => {
               canRecall &&
               isEmpty
             ) {
-              const text = recall();
-              if (text != null) {
+              const recalled = recall();
+              if (recalled != null) {
                 e.preventDefault();
-                composer.setText(text);
+                composer.setText(recalled);
               }
             }
           }}
         />
         <ComposerAction />
       </div>
-      {canRecall && isEmpty ? (
-        <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">↑ to edit queued message</p>
-      ) : (
-        hint && <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">{hint}</p>
-      )}
+      {hintLine && <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">{hintLine}</p>}
     </ComposerPrimitive.Root>
   );
 };
 
 const ComposerAction: FC = () => {
+  const { submit, interrupt, sendBlocked } = useComposerActions();
+  const isRunning = useAuiState((s) => s.thread.isRunning);
+  const composer = useComposerRuntime();
+  const text = useComposer((c) => c.text);
+  const isEmpty = text.trim().length === 0;
+
+  // Mouse-only users keep their Stop button: while a run is in flight AND the
+  // composer is empty, show Stop. The instant the user types (intent = queue a
+  // message), it flips to the ⌘↵ Send/Queue button; clearing the text flips it
+  // back. (The "esc to interrupt" hint stays up the whole time regardless.)
+  if (isRunning && isEmpty) {
+    return (
+      <TooltipIconButton
+        tooltip="Stop"
+        side="bottom"
+        type="button"
+        variant="default"
+        size="icon"
+        className="size-8 rounded-full"
+        aria-label="Stop the run"
+        onClick={() => interrupt()}
+      >
+        <SquareIcon className="size-3 fill-current" />
+      </TooltipIconButton>
+    );
+  }
+
   return (
-    <>
-      <AuiIf condition={(s) => !s.thread.isRunning}>
-        <ComposerPrimitive.Send asChild>
-          <TooltipIconButton
-            tooltip="Send (⌘↵)"
-            side="bottom"
-            type="button"
-            variant="default"
-            size="icon"
-            className="h-8 w-auto gap-0.5 rounded-full px-3 font-mono text-xs"
-            aria-label="Send message"
-          >
-            <span aria-hidden className="leading-none">
-              ⌘
-            </span>
-            <CornerDownLeftIcon className="size-3.5" />
-          </TooltipIconButton>
-        </ComposerPrimitive.Send>
-      </AuiIf>
-      <AuiIf condition={(s) => s.thread.isRunning}>
-        <ComposerPrimitive.Cancel asChild>
-          <TooltipIconButton
-            tooltip="Stop"
-            side="bottom"
-            type="button"
-            variant="default"
-            size="icon"
-            className="size-8 rounded-full"
-            aria-label="Stop the run"
-          >
-            <SquareIcon className="size-3 fill-current" />
-          </TooltipIconButton>
-        </ComposerPrimitive.Cancel>
-      </AuiIf>
-    </>
+    <TooltipIconButton
+      tooltip={isRunning ? "Queue (⌘↵)" : "Send (⌘↵)"}
+      side="bottom"
+      type="button"
+      variant="default"
+      size="icon"
+      className="h-8 w-auto gap-0.5 rounded-full px-3 font-mono text-xs"
+      aria-label={isRunning ? "Queue message" : "Send message"}
+      disabled={isEmpty || sendBlocked}
+      onClick={() => {
+        const t = text.trim();
+        if (!t || sendBlocked) return;
+        submit(t);
+        composer.setText("");
+      }}
+    >
+      <span aria-hidden className="leading-none">
+        ⌘
+      </span>
+      <CornerDownLeftIcon className="size-3.5" />
+    </TooltipIconButton>
   );
 };
