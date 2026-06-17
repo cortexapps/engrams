@@ -156,6 +156,13 @@ impl Mke2fsPacker {
     /// the failure path in tmp-file cleanup without duplicating
     /// argument construction.
     async fn run_mke2fs(&self, src_dir: &Path, dst_image: &Path) -> Result<(), Ext4Error> {
+        // Provision the inode table from the actual entry count, not
+        // mke2fs's default (size / 16 KiB). A tree of many tiny files —
+        // node_modules, gradle/pnpm caches — exhausts the default inode
+        // count long before it runs out of blocks (`mke2fs: No space left
+        // on device while populating file system`, even with the 2x size
+        // headroom). See `recommended_inodes`.
+        let num_inodes = recommended_inodes(count_entries(src_dir).await);
         let output = tokio::process::Command::new(&self.bin)
             .arg("-t")
             .arg("ext4")
@@ -167,6 +174,10 @@ impl Mke2fsPacker {
             .arg(DETERMINISTIC_FS_UUID)
             .arg("-E")
             .arg(format!("hash_seed={DETERMINISTIC_HASH_SEED}"))
+            // Explicit inode count (deterministic: derived from the entry
+            // count, quantized — see recommended_inodes).
+            .arg("-N")
+            .arg(num_inodes.to_string())
             .env("SOURCE_DATE_EPOCH", DETERMINISTIC_EPOCH)
             .arg("-d")
             .arg(src_dir)
@@ -234,6 +245,50 @@ pub fn recommended_size(dir_size_bytes: u64) -> u64 {
     raw.saturating_add(align - 1) & !(align - 1)
 }
 
+/// Count filesystem entries (regular files, dirs, symlinks — one inode
+/// each) under `dir`. Does NOT follow symlinks: `mke2fs -d` replicates a
+/// symlink as a symlink (one inode), and not following also avoids walking
+/// symlink farms (pnpm `node_modules`) or cycles. Used to size the inode
+/// table via [`recommended_inodes`].
+async fn count_entries(dir: &Path) -> u64 {
+    let mut n = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&d).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            n = n.saturating_add(1);
+            // `file_type()` reflects the entry itself (readdir d_type),
+            // NOT the symlink target — so we only descend into real dirs.
+            if let Ok(ft) = entry.file_type().await {
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Inodes to provision for a tree of `entry_count` entries. mke2fs's
+/// default inode count is `fs_size / 16 KiB`, which a tree of many tiny
+/// files (node_modules, gradle/pnpm caches) blows past — it runs out of
+/// inodes long before blocks. Size from the real entry count instead:
+/// the entries + 50% headroom (root-fs writes at runtime — /tmp, logs,
+/// the warm gradle daemon's scratch) + a floor, then quantized to a
+/// coarse band so small source-tree drift doesn't re-roll the fs geometry
+/// (same determinism rationale as [`recommended_size`]'s COARSE banding).
+pub fn recommended_inodes(entry_count: u64) -> u64 {
+    let raw = entry_count.saturating_mul(3) / 2 + 100_000;
+    // 128 Ki bands. An inode is 256 B, so a band is ~32 MiB of inode
+    // table — negligible against the multi-GiB images this matters for,
+    // and it keeps `-N` stable until the entry count crosses a band edge.
+    const BAND: u64 = 128 * 1024;
+    raw.saturating_add(BAND - 1) & !(BAND - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +311,24 @@ mod tests {
     fn recommended_size_handles_zero() {
         // Empty dir still gets a 128 MiB image rather than 0.
         assert_eq!(recommended_size(0), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn recommended_inodes_covers_count_plus_headroom_and_quantizes() {
+        const BAND: u64 = 128 * 1024;
+        // Always a multiple of the band, and strictly above the entry
+        // count (so every entry gets an inode, with headroom to spare).
+        for count in [0u64, 1, 50_000, 300_000, 1_000_000, 5_000_000] {
+            let n = recommended_inodes(count);
+            assert_eq!(n % BAND, 0, "must be band-aligned for count {count}");
+            assert!(n > count, "{n} inodes must exceed {count} entries");
+            assert!(n >= count + count / 2, "must include ~50% headroom");
+        }
+        // Small trees still get a usable floor (~100k → 128 Ki band).
+        assert_eq!(recommended_inodes(0), BAND);
+        // A high-file-count tree (e.g. ~1M node_modules/gradle entries)
+        // gets ~1.5M inodes — far above mke2fs's default of size/16KiB.
+        assert!(recommended_inodes(1_000_000) >= 1_500_000);
     }
 
     #[test]
