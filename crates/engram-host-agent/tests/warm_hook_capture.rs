@@ -114,13 +114,14 @@ async fn warm_hook_process_survives_base_snapshot() {
 #[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
 async fn warm_hook_sees_manifest_env() {
     // Regression: the capture-time `[warm]` hook must run with the image's
-    // manifest `[env]` (e.g. JAVA_HOME), exactly like /exec and restored
-    // sessions. `run_warm_hook` execs with an empty `ExecRequest.env`, so
-    // before `build_base_snapshot` bound `spec.env` onto the capture VM's
-    // agentd, the hook ran with NO environment — a real `gradle`/`node`
-    // warmup that reads JAVA_HOME failed fast (dev-brain: exit 1 in ~40 ms).
-    // Here the hook EXIGES a manifest var and exits non-zero if it's absent,
-    // so a regressed env-binding fails the capture (fail-loud) instead of
+    // manifest `[env]` (e.g. JAVA_HOME), like /exec and restored sessions.
+    // The capture VM's agentd has NO durable session env (no session bind;
+    // `merge_session_env` is a no-op on FC), so `build_base_snapshot` passes
+    // the manifest `[env]` through as the hook's `ExecRequest.env`. Before
+    // that, the hook ran with no environment — a real `gradle`/`node` warmup
+    // that reads JAVA_HOME failed fast (dev-brain: exit 1 in ~40 ms). Here the
+    // hook requires a manifest var and exits non-zero if it's absent, so a
+    // regressed env pass-through fails the capture (fail-loud) instead of
     // silently shipping a cold snapshot.
     let Some(env) = TestEnv::gate() else { return };
     let pooled = env.pooled();
