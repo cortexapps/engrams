@@ -269,11 +269,45 @@ pub trait HostClient: Send + Sync {
     async fn unbind_session(&self, session_id: SessionId);
 
     /// Forward a user prompt to the attached harness for `sandbox_id`.
-    /// `SandboxError::NotFound` if no harness is bound (call
-    /// `ensure_active` upstream to auto-resume). Other errors come from
-    /// the underlying writer dropping or the harness disconnecting
-    /// mid-send.
-    async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError>;
+    /// `prompt_id` is the client/coord-minted id that correlates this
+    /// prompt with its eventual `RunStarted{prompt_id}` (and, if queued
+    /// behind an in-flight run, the `PromptQueued`/`PromptEdited`/
+    /// `PromptDequeued` events). `SandboxError::NotFound` if no harness is
+    /// bound (call `ensure_active` upstream to auto-resume). Other errors
+    /// come from the underlying writer dropping or the harness
+    /// disconnecting mid-send.
+    async fn send_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+        text: String,
+    ) -> Result<(), SandboxError>;
+
+    /// Phase 1b: edit a still-queued type-ahead prompt on the attached
+    /// harness by its `prompt_id`, before the harness consumes it. No-op
+    /// once consumed (the harness is the single writer). Default is a
+    /// no-op for impls without a real harness (test fakes); the
+    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
+    async fn edit_queued_prompt(
+        &self,
+        _sandbox_id: SandboxId,
+        _prompt_id: String,
+        _text: String,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// Phase 1b: remove a still-queued type-ahead prompt by its
+    /// `prompt_id` (the user pulled it back to the composer or cancelled),
+    /// before consumption. No-op once consumed. Default no-op for test
+    /// fakes; the real impls override it.
+    async fn dequeue_queued_prompt(
+        &self,
+        _sandbox_id: SandboxId,
+        _prompt_id: String,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
 
     /// ADR 0030: operator interrupt — stop the in-flight run on the
     /// attached harness for `sandbox_id` while keeping the session
@@ -283,6 +317,17 @@ pub trait HostClient: Send + Sync {
     /// no-op for impls without a real harness (test fakes); the
     /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
     async fn interrupt(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// Track A: non-destructive harness re-handshake — tell the attached
+    /// harness for `sandbox_id` to drop + re-dial its host connection so
+    /// the re-attach re-emits `Idle`, resyncing a session whose event
+    /// stream desynced from the run state machine. The running agent is
+    /// untouched. Used by the coordinator's desync watchdog. `NotFound`
+    /// if no harness is bound. Default no-op for harness-less fakes; the
+    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
+    async fn rehandshake(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
         Ok(())
     }
 

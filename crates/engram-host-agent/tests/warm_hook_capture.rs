@@ -112,6 +112,60 @@ async fn warm_hook_process_survives_base_snapshot() {
 
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
+async fn warm_hook_sees_manifest_env() {
+    // Regression: the capture-time `[warm]` hook must run with the image's
+    // manifest `[env]` (e.g. JAVA_HOME), like /exec and restored sessions.
+    // The capture VM's agentd has NO durable session env (no session bind;
+    // `merge_session_env` is a no-op on FC), so `build_base_snapshot` passes
+    // the manifest `[env]` through as the hook's `ExecRequest.env`. Before
+    // that, the hook ran with no environment — a real `gradle`/`node` warmup
+    // that reads JAVA_HOME failed fast (dev-brain: exit 1 in ~40 ms). Here the
+    // hook requires a manifest var and exits non-zero if it's absent, so a
+    // regressed env pass-through fails the capture (fail-loud) instead of
+    // silently shipping a cold snapshot.
+    let Some(env) = TestEnv::gate() else { return };
+    let pooled = env.pooled();
+    let rootfs = env.bake("engram-warm-hook-env-test").await;
+
+    let warm = WarmConfig {
+        command: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            // Mirrors how `./gradlew` depends on JAVA_HOME: the hook is
+            // useless without the manifest env, so make that explicit.
+            "[ \"$ENGRAM_WARM_ENV_PROBE\" = present ] || exit 9; \
+             echo \"$ENGRAM_WARM_ENV_PROBE\" > /dev/shm/engram-warm-env"
+                .into(),
+        ],
+        timeout_secs: Some(60),
+        workdir: None,
+    };
+
+    // The probe rides the manifest `[env]` (SandboxSpec.env) — the same
+    // channel JAVA_HOME/PATH travel on for a real image.
+    let mut spec = env.spec(&rootfs);
+    spec.env
+        .insert("ENGRAM_WARM_ENV_PROBE".into(), "present".into());
+
+    let meta = pooled
+        .build_base_snapshot(spec, Some(warm))
+        .await
+        .expect("warm hook must see the manifest [env]; capture should succeed");
+
+    // Confirm the value the hook observed was the manifest one (not a stray
+    // default), surviving into a restored session.
+    let restored = pooled.restore_fresh(meta).await.expect("restore");
+    let seen = exec(&pooled, restored, "cat /dev/shm/engram-warm-env").await;
+    assert_eq!(
+        seen.trim(),
+        "present",
+        "the warm hook must observe the manifest [env] value"
+    );
+    pooled.destroy(restored).await.expect("destroy restored");
+}
+
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
 async fn warm_hook_nonzero_exit_fails_capture() {
     let Some(env) = TestEnv::gate() else { return };
     let pooled = env.pooled();

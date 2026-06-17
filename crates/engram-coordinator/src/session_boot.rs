@@ -326,6 +326,11 @@ pub(crate) async fn boot_on_reserved_host(
                     message_id: format!("user-{}", uuid::Uuid::new_v4()),
                     role: engram_harness_proto::AgentRole::User,
                     text: text.to_string(),
+                    // Initial-prompt client id threading is deferred (see
+                    // create_request_from_proto); the web loads the session
+                    // view from server events, so there's no optimistic
+                    // first-bubble to dedupe against.
+                    prompt_id: None,
                     at: chrono::Utc::now(),
                 },
             )

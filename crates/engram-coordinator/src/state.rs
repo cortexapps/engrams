@@ -82,6 +82,13 @@ pub enum SessionEvent {
     HarnessRunStarted {
         run_id: String,
         prompt_summary: Option<String>,
+        /// Phase 1b: client-minted id of the prompt that started this run
+        /// — the "queued prompt consumed" signal the web uses to move a
+        /// greyed type-ahead item into the conversation. `None` for the
+        /// env-seeded initial prompt. `#[serde(default)]` so events
+        /// persisted before this field decode as `None`.
+        #[serde(default)]
+        prompt_id: Option<String>,
         at: DateTime<Utc>,
     },
     HarnessAgentMessage {
@@ -89,6 +96,12 @@ pub enum SessionEvent {
         message_id: String,
         role: engram_harness_proto::AgentRole,
         text: String,
+        /// Phase 1b: set on the coord-emitted USER echo to the client's
+        /// `prompt_id`, so the web dedupes its optimistic bubble against
+        /// this event (the double-render fix). `None` for assistant/system
+        /// messages the harness emits. `#[serde(default)]` for back-compat.
+        #[serde(default)]
+        prompt_id: Option<String>,
         at: DateTime<Utc>,
     },
     HarnessToolCallStarted {
@@ -121,6 +134,27 @@ pub enum SessionEvent {
         at: DateTime<Utc>,
     },
     HarnessIdle {
+        at: DateTime<Utc>,
+    },
+    /// Phase 1b: a prompt arrived while a run was in flight and was
+    /// queued (type-ahead / steering). The harness owns the queue; the
+    /// web renders this as a greyed, editable composer item keyed on
+    /// `prompt_id` until `HarnessRunStarted{prompt_id}` consumes it.
+    HarnessPromptQueued {
+        prompt_id: String,
+        summary: Option<String>,
+        at: DateTime<Utc>,
+    },
+    /// Phase 1b: a still-queued prompt's text was edited before consumption.
+    HarnessPromptEdited {
+        prompt_id: String,
+        summary: Option<String>,
+        at: DateTime<Utc>,
+    },
+    /// Phase 1b: a still-queued prompt was removed before consumption
+    /// (pulled back to the composer or cancelled).
+    HarnessPromptDequeued {
+        prompt_id: String,
         at: DateTime<Utc>,
     },
     /// ADR 0023: the agent opened a change request (PR/MR) via the
@@ -221,6 +255,9 @@ impl SessionEvent {
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessIdle { .. } => "harness_idle",
+            Self::HarnessPromptQueued { .. } => "prompt_queued",
+            Self::HarnessPromptEdited { .. } => "prompt_edited",
+            Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
             Self::PullRequestOpened { .. } => "pull_request_opened",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
@@ -235,9 +272,11 @@ impl SessionEvent {
             HarnessEvent::RunStarted {
                 run_id,
                 prompt_summary,
+                prompt_id,
             } => Self::HarnessRunStarted {
                 run_id,
                 prompt_summary,
+                prompt_id,
                 at,
             },
             HarnessEvent::AgentMessage {
@@ -250,6 +289,9 @@ impl SessionEvent {
                 message_id,
                 role,
                 text,
+                // Harness-emitted messages are assistant/system; the user
+                // echo (which carries a prompt_id) is emitted by the coord.
+                prompt_id: None,
                 at,
             },
             HarnessEvent::ToolCallStarted {
@@ -285,6 +327,19 @@ impl SessionEvent {
             }
             HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted { run_id, at },
             HarnessEvent::Idle => Self::HarnessIdle { at },
+            HarnessEvent::PromptQueued { prompt_id, summary } => Self::HarnessPromptQueued {
+                prompt_id,
+                summary,
+                at,
+            },
+            HarnessEvent::PromptEdited { prompt_id, summary } => Self::HarnessPromptEdited {
+                prompt_id,
+                summary,
+                at,
+            },
+            HarnessEvent::PromptDequeued { prompt_id } => {
+                Self::HarnessPromptDequeued { prompt_id, at }
+            }
         }
     }
 }
@@ -894,6 +949,11 @@ pub(crate) mod tests {
         /// Issue #214: tracks the set-at timestamp alongside the pin so
         /// the aged-pin scanner test can backdate one deterministically.
         pub(crate) teleport_targets: PlMutex<TeleportPinMap>,
+        /// Track A: desync-watchdog tests set this directly; the
+        /// `list_active_sessions_desynced` override returns it verbatim
+        /// (the SQL signature classification is integration-tested, not
+        /// re-derived in the mock).
+        pub(crate) desynced: PlMutex<Vec<engram_core::traits::metadata::DesyncedSession>>,
     }
 
     /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
@@ -961,6 +1021,7 @@ pub(crate) mod tests {
                 evac_attempts: PlMutex::new(std::collections::HashMap::new()),
                 evict_attempts: PlMutex::new(std::collections::HashMap::new()),
                 teleport_targets: PlMutex::new(std::collections::HashMap::new()),
+                desynced: PlMutex::new(Vec::new()),
             }
         }
     }
@@ -1465,6 +1526,20 @@ pub(crate) mod tests {
                 Ok(Vec::new())
             }
         }
+
+        async fn list_active_sessions_desynced(
+            &self,
+            _stuck_for_secs: i64,
+        ) -> Result<Vec<engram_core::traits::metadata::DesyncedSession>, MetaError> {
+            // Only Active sessions are candidates (mirrors the PG WHERE).
+            if !matches!(
+                self.session.lock().status,
+                engram_core::types::SessionState::Active
+            ) {
+                return Ok(Vec::new());
+            }
+            Ok(self.desynced.lock().clone())
+        }
     }
 
     #[tokio::test]
@@ -1511,6 +1586,7 @@ pub(crate) mod tests {
             HarnessEvent::RunStarted {
                 run_id: "run-1".into(),
                 prompt_summary: None,
+                prompt_id: None,
             },
         )
         .await;

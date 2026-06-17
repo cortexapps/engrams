@@ -72,9 +72,16 @@ const createRootRoute = createRootRouteWithContext<RouterContext>();
 const rootRoute = createRootRoute();
 
 // /login — unauthenticated entry point; no app chrome.
+// beforeLoad: redirect already-authenticated users (e.g. after IAP sets a
+// session cookie and the browser returns to /login) straight to the app.
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/login",
+  beforeLoad: ({ context }) => {
+    if (context.auth) {
+      throw redirect({ to: "/" });
+    }
+  },
   component: Login,
 });
 
@@ -206,7 +213,7 @@ const profileEditRoute = createRoute({
   component: () => <SessionProfileEditor mode="edit" />,
 });
 
-const routeTree = rootRoute.addChildren([
+export const routeTree = rootRoute.addChildren([
   // /login — bare page, no app chrome
   loginRoute,
   // Authenticated app shell — all authenticated routes nested here

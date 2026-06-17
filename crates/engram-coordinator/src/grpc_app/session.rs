@@ -103,10 +103,43 @@ impl app::session_service_server::SessionService for AppSessionService {
         self.auth.check(&req)?;
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
-        let note = crate::api::prompt::send_prompt_core(&self.state, id, r.text)
+        let note = crate::api::prompt::send_prompt_core(&self.state, id, r.prompt_id, r.text)
             .await
             .map_err(into_status)?;
         Ok(Response::new(app::SendPromptResponse {
+            session_id: id.to_string(),
+            note: note.to_string(),
+        }))
+    }
+
+    async fn edit_queued_prompt(
+        &self,
+        req: Request<app::EditQueuedPromptRequest>,
+    ) -> Result<Response<app::EditQueuedPromptResponse>, Status> {
+        self.auth.check(&req)?;
+        let r = req.into_inner();
+        let id = parse_session_id(&r.session_id)?;
+        let note =
+            crate::api::prompt::edit_queued_prompt_core(&self.state, id, r.prompt_id, r.text)
+                .await
+                .map_err(into_status)?;
+        Ok(Response::new(app::EditQueuedPromptResponse {
+            session_id: id.to_string(),
+            note: note.to_string(),
+        }))
+    }
+
+    async fn dequeue_queued_prompt(
+        &self,
+        req: Request<app::DequeueQueuedPromptRequest>,
+    ) -> Result<Response<app::DequeueQueuedPromptResponse>, Status> {
+        self.auth.check(&req)?;
+        let r = req.into_inner();
+        let id = parse_session_id(&r.session_id)?;
+        let note = crate::api::prompt::dequeue_queued_prompt_core(&self.state, id, r.prompt_id)
+            .await
+            .map_err(into_status)?;
+        Ok(Response::new(app::DequeueQueuedPromptResponse {
             session_id: id.to_string(),
             note: note.to_string(),
         }))
@@ -485,6 +518,7 @@ mod tests {
                 "tok-abc-123".to_string(),
             )]),
             secrets: std::collections::HashMap::new(),
+            prompt_id: None,
         };
         let api =
             super::super::convert::create_request_from_proto(r).expect("converter must succeed");
@@ -510,6 +544,7 @@ mod tests {
                 ("OTHER".to_string(), "v".to_string()),
             ]),
             secrets: std::collections::HashMap::new(),
+            prompt_id: None,
         };
         // Same expression the RPC handler uses.
         let identity_env: std::collections::HashMap<String, String> =

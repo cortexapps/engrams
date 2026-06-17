@@ -115,6 +115,7 @@ where
         &HarnessFrame::Event(HarnessEvent::RunStarted {
             run_id: run_id.clone(),
             prompt_summary: Some("noop run".into()),
+            prompt_id: None,
         }),
     )
     .await
@@ -147,6 +148,18 @@ where
                     // Noop has no in-flight child to SIGINT — nothing
                     // to interrupt. A real adapter stops its current
                     // run and emits RunInterrupted + Idle.
+                }
+                Ok(HarnessFrame::Command(HarnessCommand::Rehandshake)) => {
+                    // Track A: drop this connection so the host's
+                    // reconnect path re-dials. The noop test driver has a
+                    // single connection, so end the reader (the real
+                    // adapter re-dials in-process and re-emits Idle).
+                    return;
+                }
+                Ok(HarnessFrame::Command(HarnessCommand::EditQueued { .. }))
+                | Ok(HarnessFrame::Command(HarnessCommand::DequeueQueued { .. })) => {
+                    // Phase 1b queue mutations. Noop has a fixed run shape
+                    // and never queues, so there's nothing to edit/cancel.
                 }
                 Ok(HarnessFrame::Event(_)) => {
                     // Host shouldn't send Events; ignore.

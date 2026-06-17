@@ -489,6 +489,7 @@ mod tests {
         async fn send_prompt(
             &self,
             _sandbox_id: SandboxId,
+            _prompt_id: String,
             _text: String,
         ) -> Result<(), SandboxError> {
             unimplemented!()

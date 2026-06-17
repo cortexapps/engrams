@@ -1482,6 +1482,95 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    async fn list_active_sessions_desynced(
+        &self,
+        stuck_for_secs: i64,
+    ) -> Result<Vec<engram_core::traits::metadata::DesyncedSession>, MetaError> {
+        // Track A: two desync signatures the idle backstop (silence-only)
+        // misses. Per Active+bound session, find the latest non-rewound
+        // event overall and the latest run-lifecycle event, then classify:
+        //   - stuck_open_run:    latest event IS a `run_started` (the run
+        //                        opened and emitted nothing since).
+        //   - orphan_after_close: latest event is a run-scoped event but
+        //                        the most recent run-lifecycle event is NOT
+        //                        a `run_started` — i.e. an event landed
+        //                        after the run closed, with no open run
+        //                        (the `bf3dbbcb` shape).
+        // A healthy in-progress run is excluded: its latest run-lifecycle
+        // event is `run_started`, so an `agent_message`/`tool_call_*` tail
+        // pairs to an OPEN run and is not orphaned. The `last_event_at`
+        // floor ensures we only fire once the session has been wedged for
+        // the TTL (a live run keeps bumping last_event_at).
+        let rows = sqlx::query(
+            r#"
+            WITH active AS (
+                SELECT id, sandbox_id, COALESCE(last_event_at, created_at) AS le
+                  FROM sessions
+                 WHERE status = 'active' AND sandbox_id IS NOT NULL
+            ),
+            latest AS (
+                SELECT DISTINCT ON (e.session_id) e.session_id, e.kind
+                  FROM session_events e
+                  JOIN active a ON a.id = e.session_id
+                 WHERE e.rewound_at IS NULL
+                 ORDER BY e.session_id, e.idx DESC
+            ),
+            latest_run AS (
+                SELECT DISTINCT ON (e.session_id) e.session_id, e.kind
+                  FROM session_events e
+                  JOIN active a ON a.id = e.session_id
+                 WHERE e.rewound_at IS NULL
+                   AND e.kind IN ('run_started', 'run_completed', 'run_interrupted')
+                 ORDER BY e.session_id, e.idx DESC
+            )
+            SELECT a.id, a.sandbox_id, a.le AS last_event_at, l.kind AS latest_kind,
+                   CASE WHEN l.kind = 'run_started'
+                        THEN 'stuck_open_run'
+                        ELSE 'orphan_after_close'
+                   END AS signature
+              FROM active a
+              JOIN latest l ON l.session_id = a.id
+              LEFT JOIN latest_run lr ON lr.session_id = a.id
+             WHERE a.le < NOW() - ($1::bigint * INTERVAL '1 second')
+               AND (
+                     l.kind = 'run_started'
+                  OR (l.kind IN ('agent_message', 'tool_call_started', 'tool_call_completed')
+                      AND COALESCE(lr.kind, '') <> 'run_started')
+                   )
+            "#,
+        )
+        .bind(stuck_for_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let id: uuid::Uuid = r
+                .try_get("id")
+                .map_err(|e| MetaError::Serialization(format!("desync id: {e}")))?;
+            let sandbox: uuid::Uuid = r
+                .try_get("sandbox_id")
+                .map_err(|e| MetaError::Serialization(format!("desync sandbox_id: {e}")))?;
+            let latest_kind: String = r
+                .try_get("latest_kind")
+                .map_err(|e| MetaError::Serialization(format!("desync latest_kind: {e}")))?;
+            let signature: String = r
+                .try_get("signature")
+                .map_err(|e| MetaError::Serialization(format!("desync signature: {e}")))?;
+            let last_event_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("last_event_at")
+                .map_err(|e| MetaError::Serialization(format!("desync last_event_at: {e}")))?;
+            out.push(engram_core::traits::metadata::DesyncedSession {
+                session_id: SessionId::from(id),
+                sandbox_id: SandboxId::from(sandbox),
+                latest_kind,
+                signature,
+                last_event_at,
+            });
+        }
+        Ok(out)
+    }
+
     async fn rebind_session(
         &self,
         id: SessionId,
@@ -2396,7 +2485,11 @@ impl MetadataStore for PostgresStore {
             WITH next AS (
                 UPDATE sessions
                    SET next_event_idx = next_event_idx + 1,
-                       updated_at = NOW()
+                       updated_at = NOW(),
+                       -- Track A: honest activity clock, bumped on every
+                       -- event append (unlike last_active_at, which only
+                       -- moves on state transitions).
+                       last_event_at = NOW()
                  WHERE id = $1
              RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
             ),
@@ -3190,32 +3283,50 @@ impl MetadataStore for PostgresStore {
         id: Uuid,
         claimant: &str,
         error: &str,
-    ) -> Result<u32, MetaError> {
-        // Release the claim so ANY pod's next tick can retry — the
-        // failing pod holds no special ownership of the retry. Fenced
-        // by `claimed_by` (#232): a stale pod's transient error must
-        // not clear a peer's lease or stamp `error` on a job that
-        // peer is actively completing.
-        let attempts: Option<i32> = sqlx::query_scalar(
+        max_attempts: u32,
+        force_terminal: bool,
+    ) -> Result<(u32, EnableJobState), MetaError> {
+        // ONE atomic, fenced write: bump attempts, store error, release
+        // the claim, and flip to `failed` in the SAME statement iff the
+        // budget is spent OR the failure is non-retryable. Doing the flip
+        // here (not a follow-up set_enable_job_state) is load-bearing —
+        // this write nulls `claimed_by`, so a separate fenced flip would
+        // fence-miss and silently fail, leaving the job non-terminal to be
+        // re-claimed and re-failed forever (the runaway-attempts bug).
+        //
+        // The CASE reads the pre-bump `attempts`, so `attempts + 1` is the
+        // post-bump count on both lines. Fenced by `claimed_by` (#232): a
+        // stale pod's transient error must not clear a peer's lease or stamp
+        // `error` on a job that peer is actively completing.
+        let row: Option<(i32, String)> = sqlx::query_as(
             r#"
             UPDATE enable_jobs
                SET attempts = attempts + 1,
                    error = $3,
+                   state = CASE
+                             WHEN $5 OR attempts + 1 >= $4 THEN 'failed'
+                             ELSE state
+                           END,
                    claimed_by = NULL,
                    claimed_at = NULL,
                    updated_at = NOW()
              WHERE id = $1 AND claimed_by = $2
-            RETURNING attempts
+            RETURNING attempts, state
             "#,
         )
         .bind(id)
         .bind(claimant)
         .bind(error)
+        .bind(max_attempts as i32)
+        .bind(force_terminal)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        match attempts {
-            Some(a) => Ok(a.max(0) as u32),
+        match row {
+            Some((attempts, state)) => {
+                let state = row::parse_enable_job_state(&state)?;
+                Ok((attempts.max(0) as u32, state))
+            }
             None => Err(self.enable_job_fence_miss(id, claimant).await),
         }
     }

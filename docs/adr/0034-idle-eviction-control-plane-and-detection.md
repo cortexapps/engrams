@@ -284,3 +284,59 @@ expiring around midday 2026-06-04 (the same 401 the e2e harness
 round-trip then started hitting). Surfacing that exit reason as a durable
 event is deferred to the in-flight Claude-harness rework rather than
 landing here; this ADR's fix is the durability changes only.
+
+## Addendum (Track A, 2026-06-16): harness-desync watchdog + re-handshake
+
+Incident `bf3dbbcb` exposed a wedge class the two detectors above miss. A
+warm-reattached session (ADR 0037) desynced: after a periodic checkpoint it
+emitted a bare `agent_message` with **no enclosing `run_started` and no
+`run_completed`**, then went silent. The VM was healthy (still
+checkpointing, ttyd spawned) — only the coordinator-visible run state was
+stuck. The host-side hub never nominated it (the harness was attached and
+emitting), and the L3 backstop keys off event *silence* (`MAX(created_at)`),
+so it would only reap it 30 min after the last event — and a desync that
+keeps *trickling* events defeats it outright. `last_active_at` (state-
+transition-only) had frozen at the resume instant, so the operator-facing
+liveness signal lied. Root cause is the same inference defect this ADR's
+tail already names: the child-per-prompt harness infers run boundaries from
+stdout EOF, so a desync/crash is indistinguishable from a clean turn-end.
+The proper fix is the streaming-harness rewrite (**ADR 0052**); this Track A
+is the server-side safety net that makes the class self-heal regardless.
+
+Three pieces (all PG-derived, so they survive a coord restart and are
+operator-visible — no per-pod in-memory counters):
+
+1. **`sessions.last_event_at`** (migration 0068), bumped on every
+   `append_session_event` in the same atomic CTE that allocates the event
+   idx. An honest activity clock independent of the state machine, and the
+   substrate the watchdog ages off.
+
+2. **The desync watchdog** (`desync_watchdog.rs`,
+   `MetadataStore::list_active_sessions_desynced`). A scanner that flags two
+   *shapes* the silence detector can't see: `orphan_after_close` (the latest
+   event is a run-scoped event but no run is open — the `bf3dbbcb` shape) and
+   `stuck_open_run` (a `run_started` with zero events since). A healthy
+   in-progress run is excluded (its tail pairs to an open `run_started`, and
+   `last_event_at` keeps advancing). Detection is metric + WARN only — the
+   watchdog never writes to `session_events`, because a coord-emitted marker
+   would bump `last_event_at` and mask both its own re-detection and the
+   backstop.
+
+3. **Non-destructive recovery via re-handshake.** Because the watchdog only
+   fires on sessions with a *live* vsock connection, recovery is an in-band
+   `HarnessCommand::Rehandshake` (`HostClient::rehandshake`): the harness
+   drops + re-dials and re-emits `Idle` — the SIGUSR1 nudge's twin, but over
+   the live command channel, no agentd/guest plumbing. It cannot kill a live
+   run, so the watchdog fires on a short 5-min TTL (vs. the backstop's 30).
+   Escalation needs no strike column: a working nudge re-emits `Idle`, which
+   bumps `last_event_at` and drops the session out of the flagged set; a
+   session whose `last_event_at` stays older than the escalate TTL (15 min)
+   is where the nudges aren't taking, and it falls through to this ADR's
+   proven eviction → resume lane (`eviction_nominated{source=
+   desync_watchdog}`).
+
+Commits: `last_event_at` liveness; watchdog detection; in-band re-handshake
+chain; recovery + escalation. Metrics: `engram_harness_desync_detected_total`
+{signature}, `engram_harness_rehandshake_total`. Pre-rewrite this is the
+recovery; post-ADR-0052 the desync rate should fall to ~0 and the watchdog
+becomes a pure backstop.

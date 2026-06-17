@@ -25,13 +25,15 @@ use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
     BuildBaseSnapshotResponse, CowStateAllResponse, CowStateResponse, CreateSandboxRequest,
-    CreateSandboxResponse, DrainOutcomeResponse, Empty, ExecExit, ExecFrame, ExecStartRequest,
-    GuestIpResponse, InterruptHarnessRequest, ListSandboxesResponse, MigrationCaptureResponse,
-    MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
-    PostCopyCaptureResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotBeginResponse, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    CreateSandboxResponse, DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse,
+    EditHarnessQueuedPromptRequest, Empty, ExecExit, ExecFrame, ExecStartRequest, GuestIpResponse,
+    InterruptHarnessRequest, ListSandboxesResponse, MigrationCaptureResponse, MigrationExportRef,
+    MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse, PostCopyCaptureResponse,
+    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
+    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -567,7 +569,33 @@ impl HostService for HostServiceImpl {
         let r = req.into_inner();
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         self.inner
-            .send_prompt(sandbox_id, r.text)
+            .send_prompt(sandbox_id, r.prompt_id, r.text)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn edit_harness_queued_prompt(
+        &self,
+        req: Request<EditHarnessQueuedPromptRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        self.inner
+            .edit_queued_prompt(sandbox_id, r.prompt_id, r.text)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn dequeue_harness_queued_prompt(
+        &self,
+        req: Request<DequeueHarnessQueuedPromptRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        self.inner
+            .dequeue_queued_prompt(sandbox_id, r.prompt_id)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
@@ -581,6 +609,19 @@ impl HostService for HostServiceImpl {
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         self.inner
             .interrupt(sandbox_id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn rehandshake_harness(
+        &self,
+        req: Request<RehandshakeHarnessRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        self.inner
+            .rehandshake(sandbox_id)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
