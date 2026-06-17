@@ -436,6 +436,10 @@ mod adapter {
                                 Some(HarnessCommand::Interrupt) => {
                                     tracing::debug!("interrupt while idle; nothing to stop");
                                 }
+                                // Intercepted at the connection layer
+                                // (`forward_commands`) and never forwarded
+                                // here; arm exists only for exhaustiveness.
+                                Some(HarnessCommand::Rehandshake) => {}
                                 Some(HarnessCommand::Checkpoint { .. }) => {}
                                 // All senders gone = the connection loop
                                 // exited = process teardown.
@@ -546,6 +550,15 @@ mod adapter {
     {
         loop {
             match read_msg::<_, HarnessFrame>(reader).await {
+                // Track A: a re-handshake is handled entirely at the
+                // connection layer — drop the link so the outer loop
+                // re-dials and the re-attach re-emits `Idle`. It is never
+                // forwarded to the engine (the running agent is untouched).
+                // This is the in-band twin of the SIGUSR1 reconnect nudge.
+                Ok(HarnessFrame::Command(HarnessCommand::Rehandshake)) => {
+                    tracing::info!("rehandshake command; dropping the connection and re-dialing");
+                    return "rehandshake";
+                }
                 Ok(HarnessFrame::Command(c)) => {
                     if cmd_tx.send(c).await.is_err() {
                         return "engine_gone";
@@ -795,6 +808,9 @@ mod adapter {
                             interrupted = true;
                             break;
                         }
+                        // Intercepted at the connection layer; never
+                        // forwarded here. Arm for exhaustiveness only.
+                        Some(HarnessCommand::Rehandshake) => {}
                         Some(HarnessCommand::Checkpoint { .. }) => {}
                         None => break,
                     }

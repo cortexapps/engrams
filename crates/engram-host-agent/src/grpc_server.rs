@@ -30,8 +30,9 @@ use engram_protocol::grpc::{
     MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
     PostCopyCaptureResponse, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
     ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotBeginResponse, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -571,6 +572,19 @@ impl HostService for HostServiceImpl {
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         self.inner
             .interrupt(sandbox_id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn rehandshake_harness(
+        &self,
+        req: Request<RehandshakeHarnessRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        self.inner
+            .rehandshake(sandbox_id)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

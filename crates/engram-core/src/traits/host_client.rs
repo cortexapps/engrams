@@ -281,6 +281,17 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
+    /// Track A: non-destructive harness re-handshake — tell the attached
+    /// harness for `sandbox_id` to drop + re-dial its host connection so
+    /// the re-attach re-emits `Idle`, resyncing a session whose event
+    /// stream desynced from the run state machine. The running agent is
+    /// untouched. Used by the coordinator's desync watchdog. `NotFound`
+    /// if no harness is bound. Default no-op for harness-less fakes; the
+    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
+    async fn rehandshake(&self, _sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0045 Phase F: freeze the running microVM for `sandbox_id`
     /// *in place* — pause its vCPUs without snapshotting, destroying, or
     /// changing session state. An admin affordance to drive + observe

@@ -437,6 +437,28 @@ impl HarnessHub {
         Ok(())
     }
 
+    /// Track A: tell the attached harness to drop its connection and
+    /// re-dial in-band (the SIGUSR1 nudge's twin). The re-attach re-emits
+    /// `Idle` when idle, resyncing a session whose event stream desynced
+    /// from the run state machine — without touching the running agent.
+    /// `NotAttached` if no harness is bound. No ack: the fresh attach (and
+    /// its re-emitted `Idle`) flowing back up is the signal of completion.
+    pub async fn rehandshake(&self, sandbox_id: SandboxId) -> Result<(), HarnessError> {
+        let cmd_tx = {
+            let conns = self.inner.connections.lock();
+            conns
+                .get(&sandbox_id)
+                .ok_or(HarnessError::NotAttached)?
+                .cmd_tx
+                .clone()
+        };
+        cmd_tx
+            .send(HarnessFrame::Command(HarnessCommand::Rehandshake))
+            .await
+            .map_err(|_| HarnessError::WriterClosed)?;
+        Ok(())
+    }
+
     /// Push a prompt to the running adapter. Adapter starts a
     /// fresh run (or queues if a run is in flight). Atomically
     /// clears `last_idle_at` so the soft idle-eviction TTL doesn't
@@ -1207,6 +1229,55 @@ mod tests {
         let (sink, _) = collecting_sink();
         let hub = HarnessHub::new(sink);
         let err = hub.interrupt(SandboxId::new()).await.unwrap_err();
+        assert!(matches!(err, HarnessError::NotAttached));
+    }
+
+    #[tokio::test]
+    async fn rehandshake_command_reaches_harness() {
+        // Track A: hub.rehandshake() must deliver a
+        // HarnessCommand::Rehandshake to the attached harness (which drops
+        // + re-dials in-band, re-emitting Idle). The connection-layer
+        // drop/re-dial leaf is exercised by the engram-harness-claude
+        // forward_commands path.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        let harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            let frame: HarnessFrame = read_msg(&mut hr).await.unwrap();
+            matches!(frame, HarnessFrame::Command(HarnessCommand::Rehandshake))
+        });
+
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "harness should attach within the 1s deadline"
+        );
+
+        hub.rehandshake(sandbox_id).await.expect("rehandshake");
+        let received = harness_task.await.unwrap();
+        assert!(received, "harness should receive a Rehandshake frame");
+    }
+
+    #[tokio::test]
+    async fn rehandshake_returns_not_attached_for_unknown_sandbox() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let err = hub.rehandshake(SandboxId::new()).await.unwrap_err();
         assert!(matches!(err, HarnessError::NotAttached));
     }
 
