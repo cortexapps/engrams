@@ -125,6 +125,42 @@ pipe survives a UFFD restore before Track C relies on it.
   recovery. **Phase 4** — warm mid-turn teleport (gated on Phase 0); its merge
   flips this ADR to **Accepted**.
 
+## Progress (bookend updates)
+
+- **2026-06-17 — Phase 1 SHIPPED + prod-validated** (PR #327). The streaming
+  engine rewrite merged and was validated end-to-end in prod against
+  `demo-claude`: the in-guest harness log shows `spawning persistent claude
+  argv=[… --input-format stream-json …]` (one persistent process, no
+  per-prompt respawn), and two prompts over that one process produced two
+  distinct `run-<uuid>` runs, each cleanly bracketed `run_started → … →
+  run_completed → harness_idle`, with context continuity (4 → 40). Resume path:
+  `RefreshImage` (gRPC) re-captures the base snapshot from the re-baked image.
+  - *Divergence found:* the prompt-after-idle path still hits the pre-existing
+    "sandbox not found" / frozen-`last_active_at` idle-eviction desync (filed
+    as issue #329) — NOT a Phase-1 regression (the harness was provably alive);
+    it's exactly the class Track A backstops and Phase 2 addresses.
+  - *Regression fixed:* Phase 1 had set `RunStarted.prompt_summary = Some(text)`,
+    which the web renders as a user turn IN ADDITION to the coord's `role:user`
+    echo → every prompt double-rendered. Restored `prompt_summary = None` (the
+    coord echo is the single authoritative user turn).
+
+- **2026-06-17 — Phase 1b IMPLEMENTED** (this PR). Harness-owned queue, reflected
+  up the existing channel: `HarnessCommand` gains `EditQueued`/`DequeueQueued` +
+  a `prompt_id` on `Prompt`; `HarnessEvent` gains `PromptQueued`/`PromptEdited`/
+  `PromptDequeued` + a `prompt_id` on `RunStarted` (all APPEND-ONLY — the bincode
+  `wire_golden.rs` corpus enforces no variant-index shift). The harness queues a
+  mid-turn prompt (stays editable), consumes it at the turn's `result`, and the
+  consuming `RunStarted{prompt_id}` is the web's "consumed" signal. Down-path
+  RPCs (`EditQueuedPrompt`/`DequeueQueuedPrompt`) thread coord→host→hub; the
+  client `prompt_id` threads through `SendPrompt` and tags the coord user-echo so
+  the web dedupes. Web: a submitted prompt shows an immediate **greyed optimistic
+  bubble** (keyed by `prompt_id`) that transitions in place to the authoritative
+  echo and stays greyed until consumed — never "lost" in the send→echo gap.
+  - *Deferred within the phase:* the editable-queue UI affordance (edit/cancel a
+    greyed item via the new RPCs — backend ready) and threading the initial-prompt
+    `prompt_id` through `CreateSession` (the web loads the first view from server
+    events, so there's no optimistic first-bubble to dedupe).
+
 ## Prior art
 
 Respawn-with-resume for idle is the norm (OpenHands cold-loads `base_state.json`
