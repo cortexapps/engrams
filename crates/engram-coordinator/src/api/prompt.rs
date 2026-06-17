@@ -102,10 +102,15 @@ pub(crate) async fn send_prompt_core(
     })?;
 
     let prompt_text = text;
+    // Phase 1b: every prompt carries a `prompt_id` correlating it with its
+    // `RunStarted{prompt_id}` (and, if queued, the PromptQueued/Edited/
+    // Dequeued events). The client mints this for dedup/steering; until the
+    // app RPC threads a client id we mint one here so the wire is uniform.
+    let prompt_id = uuid::Uuid::new_v4().to_string();
     state
         .services
         .host
-        .send_prompt(sandbox_id, prompt_text.clone())
+        .send_prompt(sandbox_id, prompt_id, prompt_text.clone())
         .await
         .map_err(|e| ApiError::Internal(format!("forward prompt to harness: {e}")))?;
 

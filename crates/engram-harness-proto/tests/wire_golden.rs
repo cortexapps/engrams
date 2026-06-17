@@ -108,6 +108,24 @@ fn ev_run_started() -> HarnessEvent {
     HarnessEvent::RunStarted {
         run_id: "r1".into(),
         prompt_summary: Some("fix the test".into()),
+        prompt_id: Some("p1".into()),
+    }
+}
+fn ev_prompt_queued() -> HarnessEvent {
+    HarnessEvent::PromptQueued {
+        prompt_id: "p1".into(),
+        summary: Some("and then deploy".into()),
+    }
+}
+fn ev_prompt_edited() -> HarnessEvent {
+    HarnessEvent::PromptEdited {
+        prompt_id: "p1".into(),
+        summary: Some("and then deploy to staging".into()),
+    }
+}
+fn ev_prompt_dequeued() -> HarnessEvent {
+    HarnessEvent::PromptDequeued {
+        prompt_id: "p1".into(),
     }
 }
 fn ev_agent_message() -> HarnessEvent {
@@ -159,6 +177,18 @@ fn cmd_shutdown() -> HarnessCommand {
 fn cmd_prompt() -> HarnessCommand {
     HarnessCommand::Prompt {
         text: "do the thing".into(),
+        prompt_id: "p1".into(),
+    }
+}
+fn cmd_edit_queued() -> HarnessCommand {
+    HarnessCommand::EditQueued {
+        prompt_id: "p1".into(),
+        text: "do the thing, carefully".into(),
+    }
+}
+fn cmd_dequeue_queued() -> HarnessCommand {
+    HarnessCommand::DequeueQueued {
+        prompt_id: "p1".into(),
     }
 }
 
@@ -184,6 +214,9 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_run_completed", &ev_run_completed());
     assert_golden("event_run_interrupted", &ev_run_interrupted());
     assert_golden("event_idle", &HarnessEvent::Idle);
+    assert_golden("event_prompt_queued", &ev_prompt_queued());
+    assert_golden("event_prompt_edited", &ev_prompt_edited());
+    assert_golden("event_prompt_dequeued", &ev_prompt_dequeued());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -196,6 +229,10 @@ fn harness_event_golden_and_variant_indices() {
     assert_variant_index(&ev_run_completed(), 4, "HarnessEvent::RunCompleted");
     assert_variant_index(&ev_run_interrupted(), 5, "HarnessEvent::RunInterrupted");
     assert_variant_index(&HarnessEvent::Idle, 6, "HarnessEvent::Idle");
+    // Phase 1b queue events — APPENDED after Idle (7,8,9).
+    assert_variant_index(&ev_prompt_queued(), 7, "HarnessEvent::PromptQueued");
+    assert_variant_index(&ev_prompt_edited(), 8, "HarnessEvent::PromptEdited");
+    assert_variant_index(&ev_prompt_dequeued(), 9, "HarnessEvent::PromptDequeued");
 }
 
 #[test]
@@ -214,11 +251,19 @@ fn harness_command_golden_and_variant_indices() {
     assert_golden("command_shutdown", &cmd_shutdown());
     assert_golden("command_prompt", &cmd_prompt());
     assert_golden("command_interrupt", &HarnessCommand::Interrupt);
+    assert_golden("command_rehandshake", &HarnessCommand::Rehandshake);
+    assert_golden("command_edit_queued", &cmd_edit_queued());
+    assert_golden("command_dequeue_queued", &cmd_dequeue_queued());
 
     assert_variant_index(&cmd_checkpoint(), 0, "HarnessCommand::Checkpoint");
     assert_variant_index(&cmd_shutdown(), 1, "HarnessCommand::Shutdown");
     assert_variant_index(&cmd_prompt(), 2, "HarnessCommand::Prompt");
     assert_variant_index(&HarnessCommand::Interrupt, 3, "HarnessCommand::Interrupt");
+    // Track A appended Rehandshake (4); Phase 1b appends the queue
+    // mutations (5,6) — existing indices never shift.
+    assert_variant_index(&HarnessCommand::Rehandshake, 4, "HarnessCommand::Rehandshake");
+    assert_variant_index(&cmd_edit_queued(), 5, "HarnessCommand::EditQueued");
+    assert_variant_index(&cmd_dequeue_queued(), 6, "HarnessCommand::DequeueQueued");
 }
 
 #[test]
@@ -377,6 +422,9 @@ fn regen_golden() {
     write("event_run_completed", &ev_run_completed());
     write("event_run_interrupted", &ev_run_interrupted());
     write("event_idle", &HarnessEvent::Idle);
+    write("event_prompt_queued", &ev_prompt_queued());
+    write("event_prompt_edited", &ev_prompt_edited());
+    write("event_prompt_dequeued", &ev_prompt_dequeued());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);
@@ -386,6 +434,9 @@ fn regen_golden() {
     write("command_shutdown", &cmd_shutdown());
     write("command_prompt", &cmd_prompt());
     write("command_interrupt", &HarnessCommand::Interrupt);
+    write("command_rehandshake", &HarnessCommand::Rehandshake);
+    write("command_edit_queued", &cmd_edit_queued());
+    write("command_dequeue_queued", &cmd_dequeue_queued());
 
     write("checkpoint_reason_idle", &CheckpointReason::Idle);
     write("checkpoint_reason_preempt", &CheckpointReason::Preempt);

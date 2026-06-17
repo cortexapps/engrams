@@ -269,11 +269,19 @@ pub trait HostClient: Send + Sync {
     async fn unbind_session(&self, session_id: SessionId);
 
     /// Forward a user prompt to the attached harness for `sandbox_id`.
-    /// `SandboxError::NotFound` if no harness is bound (call
-    /// `ensure_active` upstream to auto-resume). Other errors come from
-    /// the underlying writer dropping or the harness disconnecting
-    /// mid-send.
-    async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError>;
+    /// `prompt_id` is the client/coord-minted id that correlates this
+    /// prompt with its eventual `RunStarted{prompt_id}` (and, if queued
+    /// behind an in-flight run, the `PromptQueued`/`PromptEdited`/
+    /// `PromptDequeued` events). `SandboxError::NotFound` if no harness is
+    /// bound (call `ensure_active` upstream to auto-resume). Other errors
+    /// come from the underlying writer dropping or the harness
+    /// disconnecting mid-send.
+    async fn send_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+        text: String,
+    ) -> Result<(), SandboxError>;
 
     /// ADR 0030: operator interrupt — stop the in-flight run on the
     /// attached harness for `sandbox_id` while keeping the session

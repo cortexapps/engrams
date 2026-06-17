@@ -1642,9 +1642,10 @@ mod tests {
             async fn send_prompt(
                 &self,
                 sandbox_id: engram_core::SandboxId,
+                prompt_id: String,
                 text: String,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, text).await
+                self.inner.send_prompt(sandbox_id, prompt_id, text).await
             }
             async fn acquire_shell(
                 &self,
@@ -1857,9 +1858,10 @@ mod tests {
             async fn send_prompt(
                 &self,
                 sandbox_id: engram_core::SandboxId,
+                prompt_id: String,
                 text: String,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, text).await
+                self.inner.send_prompt(sandbox_id, prompt_id, text).await
             }
             async fn acquire_shell(
                 &self,
@@ -2073,9 +2075,10 @@ mod tests {
             async fn send_prompt(
                 &self,
                 sandbox_id: engram_core::SandboxId,
+                prompt_id: String,
                 text: String,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, text).await
+                self.inner.send_prompt(sandbox_id, prompt_id, text).await
             }
             async fn acquire_shell(
                 &self,
@@ -2418,9 +2421,10 @@ mod tests {
             async fn send_prompt(
                 &self,
                 sandbox_id: engram_core::SandboxId,
+                prompt_id: String,
                 text: String,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, text).await
+                self.inner.send_prompt(sandbox_id, prompt_id, text).await
             }
             async fn acquire_shell(
                 &self,
