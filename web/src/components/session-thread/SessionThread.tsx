@@ -15,7 +15,7 @@ import {
 } from "../../gen/engram/app/v1/session-SessionService_connectquery";
 import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
-import { QueuedRecallContext } from "./queued-recall";
+import { ComposerActionsContext } from "./composer-actions";
 import type { IndexedEvent, SessionState } from "../../lib/types";
 
 // The transcript tab, on assistant-ui. The session's SSE event stream is the
@@ -128,50 +128,66 @@ export function SessionThread({ sessionId, events, status }: SessionThreadProps)
     return text;
   }, [queue, sessionId, dequeueQueuedMutation]);
 
+  // ADR 0052: submit a prompt. Idle → starts a run; mid-run → the harness
+  // QUEUES it (type-ahead). We drive this ourselves (not assistant-ui's
+  // run-gated send) so the composer can enqueue while a run is in flight. The
+  // optimistic bubble (keyed by the client-minted prompt_id) covers the gap
+  // until the server's role:user echo lands with the same id.
+  const submit = useCallback(
+    (raw: string) => {
+      const text = raw.trim();
+      if (!text) return;
+      const promptId = crypto.randomUUID();
+      setPending((p) => [...p, { promptId, text }]);
+      sentTextRef.current.set(promptId, text);
+      sendPromptMutation.mutateAsync({ sessionId, text, promptId }).catch((err) => {
+        // Send failed: drop the optimistic bubble so it isn't stuck greyed.
+        setPending((p) => p.filter((e) => e.promptId !== promptId));
+        console.warn("sendPrompt failed", err);
+      });
+    },
+    [sessionId, sendPromptMutation],
+  );
+
+  // ADR 0052/0030: interrupt the in-flight run (Esc / the Stop button). No-op
+  // once idle/terminal — the endpoint would 409 on the unbound sandbox. The
+  // run_interrupted event arrives over SSE and closes the run; a queued
+  // message (if any) then runs next per the harness's consume-on-result.
+  const interrupt = useCallback(() => {
+    if (status && INACTIVE_STATUSES.has(status)) return;
+    interruptMutation
+      .mutateAsync({ sessionId })
+      .catch((err) => console.warn("interrupt failed", err));
+  }, [sessionId, status, interruptMutation]);
+
   const runtime = useExternalStoreRuntime({
     messages,
     isRunning,
     isSendDisabled: status ? SEND_BLOCKED.has(status) : false,
     convertMessage: (m: ThreadMessageLike) => m,
-    onNew: async (message) => {
-      const text = appendText(message);
-      if (!text) return;
-      // Mint the prompt_id client-side so the optimistic bubble and the
-      // server echo share an identity (dedup + in-place transition).
-      const promptId = crypto.randomUUID();
-      setPending((p) => [...p, { promptId, text }]);
-      sentTextRef.current.set(promptId, text);
-      try {
-        await sendPromptMutation.mutateAsync({ sessionId, text, promptId });
-      } catch (err) {
-        // Send failed: drop the optimistic bubble so it isn't stuck greyed.
-        setPending((p) => p.filter((e) => e.promptId !== promptId));
-        console.warn("sendPrompt failed", err);
-      }
-    },
-    onCancel: async () => {
-      // Nothing to interrupt once the session is idle/terminal (e.g. it was
-      // idle-evicted mid-run) — the interrupt endpoint would 409 on the
-      // already-unbound sandbox. No-op so the Stop control is honestly inert.
-      if (status && INACTIVE_STATUSES.has(status)) return;
-      // The run_interrupted event arrives over SSE and closes the run. A
-      // 409 (no live sandbox) is still benign — the run may have just ended.
-      try {
-        await interruptMutation.mutateAsync({ sessionId });
-      } catch (err) {
-        console.warn("interrupt failed", err);
-      }
-    },
+    // The composer drives submit/interrupt through ComposerActionsContext (so
+    // it can enqueue mid-run); these adapters keep any assistant-ui-internal
+    // submit/cancel path consistent with our own.
+    onNew: async (message) => submit(appendText(message)),
+    onCancel: async () => interrupt(),
   });
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <SessionStatusContext.Provider value={status}>
-        <QueuedRecallContext.Provider value={{ canRecall: queue.length > 0, recall: recallQueued }}>
+        <ComposerActionsContext.Provider
+          value={{
+            submit,
+            interrupt,
+            sendBlocked: status ? SEND_BLOCKED.has(status) : false,
+            canRecall: queue.length > 0,
+            recall: recallQueued,
+          }}
+        >
           <TooltipProvider>
             <Thread />
           </TooltipProvider>
-        </QueuedRecallContext.Provider>
+        </ComposerActionsContext.Provider>
       </SessionStatusContext.Provider>
     </AssistantRuntimeProvider>
   );
