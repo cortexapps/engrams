@@ -630,8 +630,12 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         //    or fails. We don't surface cleanup errors; the bake's
         //    outcome is what matters.
         let outcome = self
-            .build_after_container(req, &cfg, &image_dir, &container_id)
+            .build_after_container(req, &cfg, &image_dir, &container_id, &docker_tag)
             .await;
+        // Cleanup: `build_after_container` already frees the image+container
+        // on its success path (after export, before the ext4 pack — see
+        // there). This trailing pass covers the error paths and is an
+        // idempotent no-op on success.
         let _ = self.docker.rm_container(&container_id).await;
         let _ = self.docker.rmi(&docker_tag).await;
 
@@ -655,6 +659,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         cfg: &EngramRepoConfig,
         image_dir: &Path,
         container_id: &str,
+        docker_tag: &str,
     ) -> Result<BuildOutcome, BuildError> {
         tokio::fs::create_dir_all(image_dir).await?;
         let rootfs_dir = image_dir.join("rootfs");
@@ -746,6 +751,19 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         let manifest_path = image_dir.join("manifest.toml");
         let manifest_str = render_manifest_value(&effective_manifest)?;
         tokio::fs::write(&manifest_path, manifest_str).await?;
+
+        // Free the docker image + container NOW. The rootfs is fully
+        // exported to `rootfs_dir` and the last image read (inspect_config
+        // above) is done, so nothing below — recursive_size, the ext4
+        // pack, chunking — needs them. This is load-bearing for large warm
+        // images: otherwise the ext4 pack runs with the image's layers
+        // (~1x), the exported tree (~1x), AND the ext4 (~1x) all on disk at
+        // once (~3x the image size), which overruns a CI runner with
+        // `mke2fs: No space left on device`. Freeing here drops the pack's
+        // peak to ~2x (tree + ext4). The caller's trailing cleanup is then
+        // an idempotent no-op (and still covers the pre-export error paths).
+        let _ = self.docker.rm_container(container_id).await;
+        let _ = self.docker.rmi(docker_tag).await;
 
         let dir_size = recursive_size(&rootfs_dir).await?;
 
