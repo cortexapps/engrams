@@ -470,6 +470,7 @@ impl HarnessHub {
     pub async fn send_prompt(
         &self,
         sandbox_id: SandboxId,
+        prompt_id: String,
         text: String,
     ) -> Result<(), HarnessError> {
         // Look up the connection, retrying briefly if it isn't there
@@ -511,10 +512,58 @@ impl HarnessHub {
             }
         };
         cmd_tx
-            .send(HarnessFrame::Command(HarnessCommand::Prompt { text }))
+            .send(HarnessFrame::Command(HarnessCommand::Prompt {
+                prompt_id,
+                text,
+            }))
             .await
             .map_err(|_| HarnessError::WriterClosed)?;
         Ok(())
+    }
+
+    /// Phase 1b: forward a queue-mutation command (Edit/Dequeue) to the
+    /// attached harness. Unlike `send_prompt` it neither waits/retries for
+    /// attach nor clears `last_idle_at` — the target prompt was already
+    /// queued (so the harness is attached); if it isn't, the prompt is
+    /// gone and `NotAttached` is the correct answer.
+    async fn send_queue_command(
+        &self,
+        sandbox_id: SandboxId,
+        cmd: HarnessCommand,
+    ) -> Result<(), HarnessError> {
+        let cmd_tx = self
+            .inner
+            .connections
+            .lock()
+            .get(&sandbox_id)
+            .map(|h| h.cmd_tx.clone())
+            .ok_or(HarnessError::NotAttached)?;
+        cmd_tx
+            .send(HarnessFrame::Command(cmd))
+            .await
+            .map_err(|_| HarnessError::WriterClosed)?;
+        Ok(())
+    }
+
+    /// Phase 1b: edit a still-queued type-ahead prompt by its `prompt_id`.
+    pub async fn edit_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+        text: String,
+    ) -> Result<(), HarnessError> {
+        self.send_queue_command(sandbox_id, HarnessCommand::EditQueued { prompt_id, text })
+            .await
+    }
+
+    /// Phase 1b: remove a still-queued type-ahead prompt by its `prompt_id`.
+    pub async fn dequeue_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+    ) -> Result<(), HarnessError> {
+        self.send_queue_command(sandbox_id, HarnessCommand::DequeueQueued { prompt_id })
+            .await
     }
 
     /// Number of currently-attached harnesses. Diagnostic / test helper.
@@ -1956,7 +2005,9 @@ mod tests {
             for i in 0..ITERS {
                 // Ignore the result: WriterClosed at teardown is fine —
                 // we only care that the call returns at all (no wedge).
-                let _ = hub_prompt.send_prompt(sandbox_id, format!("p{i}")).await;
+                let _ = hub_prompt
+                    .send_prompt(sandbox_id, format!("pid{i}"), format!("p{i}"))
+                    .await;
             }
         });
 
@@ -2110,15 +2161,16 @@ mod tests {
         // to B's harness end. Before the fix the teardown dropped B's
         // cmd_tx, which made B's writer_loop exit and close the write
         // half — so this send would fail / never arrive.
-        hub.send_prompt(sandbox_id, "hello-B".into())
+        hub.send_prompt(sandbox_id, "pid-B".into(), "hello-B".into())
             .await
             .expect("send_prompt must reach B's live writer");
         let frame: HarnessFrame = read_msg(&mut b_r)
             .await
             .expect("B should receive the prompt");
         match frame {
-            HarnessFrame::Command(HarnessCommand::Prompt { text }) => {
+            HarnessFrame::Command(HarnessCommand::Prompt { text, prompt_id }) => {
                 assert_eq!(text, "hello-B");
+                assert_eq!(prompt_id, "pid-B");
             }
             other => panic!("expected a Prompt frame at B, got {other:?}"),
         }

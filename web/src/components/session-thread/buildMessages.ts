@@ -168,6 +168,11 @@ export function buildMessages(
   let active: Draft | null = null;
   const openTools = new Map<string, ToolPart>(); // tool_call_id → part
   const openExecs = new Map<string, ToolPart>(); // exec_id → part
+  // Phase 1b: user-turn drafts keyed by prompt_id. A user message is
+  // rendered "pending" (greyed) from the moment its `role:user` echo
+  // lands until its `run_started{prompt_id}` consumes it — covering both
+  // the send→echo gap and a type-ahead message that's still queued.
+  const userDraftByPromptId = new Map<string, Draft>();
 
   // Is a run in flight (run_started seen, no run_completed/_interrupted yet)?
   let runOpen = false;
@@ -230,18 +235,34 @@ export function buildMessages(
             createdAt: new Date(ev.at),
           });
         }
+        // Phase 1b: the prompt that started this run is now consumed —
+        // un-grey its pending user bubble (optimistic/queued → solid).
+        if (ev.prompt_id) {
+          const d = userDraftByPromptId.get(ev.prompt_id);
+          if (d?.metadata?.custom) delete d.metadata.custom.pending;
+          userDraftByPromptId.delete(ev.prompt_id);
+        }
         break;
       }
 
       case "agent_message": {
         if (ev.role === "user") {
           active = null;
-          out.push({
+          // Phase 1b: a `prompt_id` ties this echo to the optimistic
+          // bubble (dedup, same id) and marks it "pending" (greyed) until
+          // its run_started consumes it. Echoes without a prompt_id (e.g.
+          // the env-seeded initial prompt) render solid as before.
+          const draft: Draft = {
             role: "user",
             content: [{ type: "text", text: ev.text }],
-            id: `m:${idx}`,
+            id: ev.prompt_id ?? `m:${idx}`,
             createdAt: new Date(ev.at),
-          });
+          };
+          if (ev.prompt_id) {
+            draft.metadata = { custom: { pending: true } };
+            userDraftByPromptId.set(ev.prompt_id, draft);
+          }
+          out.push(draft);
         } else if (ev.role === "system") {
           pushSystem(`m:${idx}`, ev.text, { kind: "note", role: ev.role, at: ev.at });
         } else {
@@ -412,7 +433,10 @@ export function buildMessages(
 
       default:
         // status_changed, evicted, checkpoint_* — not surfaced; the RAW
-        // tab shows them.
+        // tab shows them. Phase 1b prompt_queued/_edited/_dequeued also
+        // land here: the greyed→solid lifecycle is driven by the user echo
+        // + run_started (above), so these are informational until the
+        // editable-queue affordance (edit/cancel a queued item) ships.
         break;
     }
 

@@ -21,11 +21,21 @@ use crate::state::{SessionEvent, SharedState};
 pub(crate) async fn send_prompt_core(
     state: &SharedState,
     id: SessionId,
+    prompt_id: String,
     text: String,
 ) -> Result<&'static str, ApiError> {
     if text.is_empty() {
         return Err(ApiError::BadRequest("`text` is required".into()));
     }
+    // Phase 1b: the client (web) mints `prompt_id` so it can correlate its
+    // optimistic bubble with the server echo + `RunStarted{prompt_id}`
+    // (this is what dedupes the double-render). Mint one if a non-web
+    // caller left it empty, so the wire is always uniform.
+    let prompt_id = if prompt_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        prompt_id
+    };
 
     // Auto-resume Idle sessions via the FC snapshot path. Dead
     // sessions surface 410 Gone here (ensure_active → resume_session
@@ -105,7 +115,7 @@ pub(crate) async fn send_prompt_core(
     state
         .services
         .host
-        .send_prompt(sandbox_id, prompt_text.clone())
+        .send_prompt(sandbox_id, prompt_id.clone(), prompt_text.clone())
         .await
         .map_err(|e| ApiError::Internal(format!("forward prompt to harness: {e}")))?;
 
@@ -125,6 +135,10 @@ pub(crate) async fn send_prompt_core(
                 message_id: format!("user-{}", uuid::Uuid::new_v4()),
                 role: AgentRole::User,
                 text: prompt_text,
+                // Phase 1b: tag the user-echo with the client prompt_id so
+                // the web dedupes its optimistic bubble against this event
+                // (the double-render fix) instead of rendering both.
+                prompt_id: Some(prompt_id),
                 at: chrono::Utc::now(),
             },
         )
@@ -134,4 +148,56 @@ pub(crate) async fn send_prompt_core(
     }
 
     Ok("prompt forwarded")
+}
+
+/// Phase 1b: edit a still-queued type-ahead prompt by its `prompt_id`,
+/// before the harness consumes it. The hold/auto-resume logic of
+/// `send_prompt_core` is unnecessary here — the prompt was only queued
+/// while a run is in flight, so the session is Active and attached.
+pub(crate) async fn edit_queued_prompt_core(
+    state: &SharedState,
+    id: SessionId,
+    prompt_id: String,
+    text: String,
+) -> Result<&'static str, ApiError> {
+    if prompt_id.is_empty() {
+        return Err(ApiError::BadRequest("`prompt_id` is required".into()));
+    }
+    if text.is_empty() {
+        return Err(ApiError::BadRequest("`text` is required".into()));
+    }
+    let sandbox_id = state
+        .resolve_sandbox(id)
+        .await
+        .ok_or_else(|| ApiError::Conflict("session has no live sandbox".into()))?;
+    state
+        .services
+        .host
+        .edit_queued_prompt(sandbox_id, prompt_id, text)
+        .await
+        .map_err(|e| ApiError::Internal(format!("edit queued prompt: {e}")))?;
+    Ok("queued prompt edited")
+}
+
+/// Phase 1b: remove a still-queued type-ahead prompt by its `prompt_id`
+/// (the user pulled it back to the composer or cancelled it).
+pub(crate) async fn dequeue_queued_prompt_core(
+    state: &SharedState,
+    id: SessionId,
+    prompt_id: String,
+) -> Result<&'static str, ApiError> {
+    if prompt_id.is_empty() {
+        return Err(ApiError::BadRequest("`prompt_id` is required".into()));
+    }
+    let sandbox_id = state
+        .resolve_sandbox(id)
+        .await
+        .ok_or_else(|| ApiError::Conflict("session has no live sandbox".into()))?;
+    state
+        .services
+        .host
+        .dequeue_queued_prompt(sandbox_id, prompt_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("dequeue queued prompt: {e}")))?;
+    Ok("queued prompt dequeued")
 }

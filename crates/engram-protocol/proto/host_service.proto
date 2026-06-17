@@ -93,6 +93,11 @@ service HostService {
   rpc BindHarnessSession(BindHarnessSessionRequest) returns (Empty);
   rpc UnbindHarnessSession(UnbindHarnessSessionRequest) returns (Empty);
   rpc SendHarnessPrompt(SendHarnessPromptRequest) returns (Empty);
+  // Phase 1b (ADR 0052): mutate a still-queued type-ahead prompt on the
+  // attached harness by its prompt_id. No-op once the harness has
+  // consumed it (single writer).
+  rpc EditHarnessQueuedPrompt(EditHarnessQueuedPromptRequest) returns (Empty);
+  rpc DequeueHarnessQueuedPrompt(DequeueHarnessQueuedPromptRequest) returns (Empty);
   // ADR 0030: operator interrupt. Stop the in-flight run on the
   // attached harness (it SIGINTs its current `claude` child and
   // returns to Idle); the session stays alive and resumable.
@@ -406,6 +411,20 @@ message UnbindHarnessSessionRequest {
 message SendHarnessPromptRequest {
   bytes sandbox_id = 1; // 16-byte UUID
   string text = 2;
+  // Phase 1b: client/coord-minted id correlating this prompt with its
+  // RunStarted{prompt_id} and (while queued) PromptQueued/Edited/Dequeued.
+  string prompt_id = 3;
+}
+
+message EditHarnessQueuedPromptRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  string prompt_id = 2;
+  string text = 3;
+}
+
+message DequeueHarnessQueuedPromptRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  string prompt_id = 2;
 }
 
 message InterruptHarnessRequest {

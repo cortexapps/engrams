@@ -71,6 +71,11 @@ const ThreadMessage: FC = () => {
   // ADR 0028 A.log: messages tombstoned by a rung-1 rewind stay viewable but
   // greyed behind a left rule — the recovery is honest, not a silent deletion.
   const rewound = useAuiState((s) => s.message.metadata.custom?.rewound === true);
+  // Phase 1b: an optimistic / still-queued user prompt — greyed until the
+  // server consumes it (its run_started lands). It's never "lost" between
+  // pressing Enter and landing authoritatively in the conversation log;
+  // it shows here greyed and transitions in place to solid on consumption.
+  const pending = useAuiState((s) => s.message.metadata.custom?.pending === true);
   const inner =
     role === "system" ? (
       <SystemMessage />
@@ -85,6 +90,13 @@ const ThreadMessage: FC = () => {
         className="border-l-2 border-muted-foreground/40 pl-3 opacity-45"
         title="Rolled back by a checkpoint recovery"
       >
+        {inner}
+      </div>
+    );
+  }
+  if (pending) {
+    return (
+      <div className="opacity-50 transition-opacity" title="Pending — not yet in the conversation log">
         {inner}
       </div>
     );

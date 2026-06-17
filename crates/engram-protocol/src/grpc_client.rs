@@ -31,12 +31,12 @@ use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     ApplyEgressPolicyRequest, BindHarnessSessionRequest, BuildBaseSnapshotRequest,
-    CreateSandboxRequest, Empty, ExecStartRequest, GuestIpResponse, InterruptHarnessRequest,
-    MigrationExportRef, MigrationFetchRequest, MigrationItem, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
-    ReapMaterializeDirRequest, RehandshakeHarnessRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    CreateSandboxRequest, DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty,
+    ExecStartRequest, GuestIpResponse, InterruptHarnessRequest, MigrationExportRef,
+    MigrationFetchRequest, MigrationItem, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
+    ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    RehandshakeHarnessRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
@@ -605,15 +605,53 @@ impl GrpcHostClient {
     pub async fn send_harness_prompt(
         &self,
         sandbox_id: SandboxId,
+        prompt_id: String,
         text: String,
     ) -> Result<(), SandboxError> {
         let req = SendHarnessPromptRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             text,
+            prompt_id,
         };
         self.inner
             .clone()
             .send_harness_prompt(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    pub async fn edit_harness_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+        text: String,
+    ) -> Result<(), SandboxError> {
+        let req = EditHarnessQueuedPromptRequest {
+            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            prompt_id,
+            text,
+        };
+        self.inner
+            .clone()
+            .edit_harness_queued_prompt(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
+    }
+
+    pub async fn dequeue_harness_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+    ) -> Result<(), SandboxError> {
+        let req = DequeueHarnessQueuedPromptRequest {
+            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            prompt_id,
+        };
+        self.inner
+            .clone()
+            .dequeue_harness_queued_prompt(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -1243,8 +1281,32 @@ impl HostClient for GrpcHostClient {
         }
     }
 
-    async fn send_prompt(&self, sandbox_id: SandboxId, text: String) -> Result<(), SandboxError> {
-        self.send_harness_prompt(sandbox_id, text).await
+    async fn send_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+        text: String,
+    ) -> Result<(), SandboxError> {
+        self.send_harness_prompt(sandbox_id, prompt_id, text).await
+    }
+
+    async fn edit_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+        text: String,
+    ) -> Result<(), SandboxError> {
+        self.edit_harness_queued_prompt(sandbox_id, prompt_id, text)
+            .await
+    }
+
+    async fn dequeue_queued_prompt(
+        &self,
+        sandbox_id: SandboxId,
+        prompt_id: String,
+    ) -> Result<(), SandboxError> {
+        self.dequeue_harness_queued_prompt(sandbox_id, prompt_id)
+            .await
     }
 
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {

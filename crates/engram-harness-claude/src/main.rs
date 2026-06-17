@@ -424,10 +424,14 @@ mod adapter {
         // The pending queue is owned here so it survives a respawn: a
         // prompt queued mid-turn (type-ahead) or one that hadn't started
         // when claude crashed isn't lost across the process restart.
-        // Phase 1b turns this into the user-visible editable queue.
-        let mut pending: VecDeque<String> = VecDeque::new();
+        // Phase 1b: this IS the user-visible editable queue — each entry
+        // carries its `prompt_id` (the env-seeded initial prompt has none).
+        let mut pending: VecDeque<QueuedPrompt> = VecDeque::new();
         if let Some(p) = initial_prompt {
-            pending.push_back(p);
+            pending.push_back(QueuedPrompt {
+                prompt_id: None,
+                text: p,
+            });
         }
 
         // Bounded fast-crash backoff: a `claude` that dies within
@@ -644,6 +648,20 @@ mod adapter {
         deadline: Instant,
     }
 
+    /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
+    /// / steering). The harness is the single-writer owner: it buffers
+    /// these in memory and writes one to claude's stdin only at the
+    /// consumption boundary (the running turn's `result`). `prompt_id` is
+    /// `Some` for prompts delivered via `HarnessCommand::Prompt` (carrying
+    /// a client/coord-minted id used to correlate the queue events and the
+    /// eventual `RunStarted{prompt_id}`); `None` only for the env-seeded
+    /// initial prompt, which is consumed immediately and never actually
+    /// waits in the queue.
+    struct QueuedPrompt {
+        prompt_id: Option<String>,
+        text: String,
+    }
+
     /// SIGINT a running `claude` child — the graceful "stop the current
     /// turn" signal (mirrors a Ctrl-C / ESC). Claude flushes its
     /// conversation file per message synchronously, so the session stays
@@ -674,7 +692,7 @@ mod adapter {
         cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
         reattach: &Arc<Notify>,
         evt_tx: &mpsc::Sender<HarnessEvent>,
-        pending: &mut VecDeque<String>,
+        pending: &mut VecDeque<QueuedPrompt>,
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
         let argv = build_claude_argv(&resume_id);
@@ -771,9 +789,9 @@ mod adapter {
         // that survived a respawn) with no leading Idle; otherwise
         // announce Idle so the host's soft TTL arms.
         match pending.pop_front() {
-            Some(text) => {
+            Some(qp) => {
                 if let Some(s) = stdin.as_mut() {
-                    turn = Some(start_turn(evt_tx, s, cli, &text).await);
+                    turn = Some(start_turn(evt_tx, s, cli, qp.prompt_id, &qp.text).await);
                 }
             }
             None => emit(evt_tx, HarnessEvent::Idle).await,
@@ -828,9 +846,14 @@ mod adapter {
                                         .await;
                                     }
                                     match pending.pop_front() {
-                                        Some(next) => {
+                                        Some(qp) => {
                                             if let Some(s) = stdin.as_mut() {
-                                                turn = Some(start_turn(evt_tx, s, cli, &next).await);
+                                                turn = Some(
+                                                    start_turn(
+                                                        evt_tx, s, cli, qp.prompt_id, &qp.text,
+                                                    )
+                                                    .await,
+                                                );
                                             }
                                         }
                                         None => emit(evt_tx, HarnessEvent::Idle).await,
@@ -867,17 +890,67 @@ mod adapter {
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(HarnessCommand::Prompt { text }) => {
+                        Some(HarnessCommand::Prompt { prompt_id, text }) => {
                             if turn.is_none() {
+                                // Idle: start the run immediately.
                                 if let Some(s) = stdin.as_mut() {
-                                    turn = Some(start_turn(evt_tx, s, cli, &text).await);
+                                    turn = Some(
+                                        start_turn(evt_tx, s, cli, Some(prompt_id), &text).await,
+                                    );
                                 }
                             } else {
-                                // Type-ahead: a prompt arriving mid-turn
-                                // queues for the turn boundary (consumed on
-                                // the next `result`). Phase 1b makes this
-                                // the user-visible editable queue.
-                                pending.push_back(text);
+                                // Type-ahead: a prompt arriving mid-turn is
+                                // QUEUED (not written to claude yet, so it
+                                // stays editable). The harness owns the
+                                // queue; `PromptQueued` reflects it up so the
+                                // web renders a greyed/editable composer item.
+                                emit(
+                                    evt_tx,
+                                    HarnessEvent::PromptQueued {
+                                        prompt_id: prompt_id.clone(),
+                                        summary: Some(truncate_str(&text, MAX_ARGS_SUMMARY_BYTES)),
+                                    },
+                                )
+                                .await;
+                                pending.push_back(QueuedPrompt {
+                                    prompt_id: Some(prompt_id),
+                                    text,
+                                });
+                            }
+                        }
+                        Some(HarnessCommand::EditQueued { prompt_id, text }) => {
+                            // Single-writer: mutate only while still queued
+                            // (not yet consumed). A consumed prompt already
+                            // emitted `RunStarted{prompt_id}`, which won.
+                            let summary = Some(truncate_str(&text, MAX_ARGS_SUMMARY_BYTES));
+                            let found = match pending
+                                .iter_mut()
+                                .find(|q| q.prompt_id.as_deref() == Some(prompt_id.as_str()))
+                            {
+                                Some(qp) => {
+                                    qp.text = text;
+                                    true
+                                }
+                                None => false,
+                            };
+                            if found {
+                                emit(
+                                    evt_tx,
+                                    HarnessEvent::PromptEdited { prompt_id, summary },
+                                )
+                                .await;
+                            } else {
+                                tracing::debug!(%prompt_id, "edit for a non-queued prompt; ignoring");
+                            }
+                        }
+                        Some(HarnessCommand::DequeueQueued { prompt_id }) => {
+                            let before = pending.len();
+                            pending
+                                .retain(|q| q.prompt_id.as_deref() != Some(prompt_id.as_str()));
+                            if pending.len() != before {
+                                emit(evt_tx, HarnessEvent::PromptDequeued { prompt_id }).await;
+                            } else {
+                                tracing::debug!(%prompt_id, "dequeue for a non-queued prompt; ignoring");
                             }
                         }
                         Some(HarnessCommand::Interrupt) => {
@@ -1021,14 +1094,27 @@ mod adapter {
         evt_tx: &mpsc::Sender<HarnessEvent>,
         stdin: &mut tokio::process::ChildStdin,
         cli: &Cli,
+        prompt_id: Option<String>,
         text: &str,
     ) -> TurnState {
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        // `RunStarted{prompt_id}` is the "queued prompt consumed" signal:
+        // a UI that drew a greyed type-ahead item with this id moves it
+        // into the conversation now. `None` for the env-seeded initial
+        // prompt (which never went through the editable queue).
+        //
+        // `prompt_summary` is deliberately `None`: the coordinator emits the
+        // user turn as a `role:user` agent_message (carrying `prompt_id`),
+        // which is the single authoritative source of the user bubble. If we
+        // ALSO put the text on `RunStarted`, the web renders the prompt twice
+        // (the `rs:idx` + `m:idx` double-render). The web correlates the queue
+        // lifecycle via `prompt_id`, not via this summary.
         emit(
             evt_tx,
             HarnessEvent::RunStarted {
                 run_id: run_id.clone(),
-                prompt_summary: Some(truncate_str(text, MAX_ARGS_SUMMARY_BYTES)),
+                prompt_id,
+                prompt_summary: None,
             },
         )
         .await;
@@ -1478,6 +1564,158 @@ mod adapter {
             }
         }
 
+        /// Like `write_persistent_fake_claude`, but sleeps `sleep_ms`
+        /// before emitting each turn's lines — so a turn stays IN FLIGHT
+        /// long enough for the test to inject type-ahead/queue commands
+        /// before the `result` arrives.
+        async fn write_slow_fake_claude(per_turn: &[&str], sleep_ms: u64) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let secs = format!("{}.{:03}", sleep_ms / 1000, sleep_ms % 1000);
+            let mut body = String::from("#!/bin/sh\n");
+            body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
+            body.push_str("while IFS= read -r _line; do\n");
+            body.push_str(&format!("  sleep {secs}\n"));
+            for l in per_turn {
+                body.push_str(&format!("  printf '%s\\n' '{l}'\n"));
+            }
+            body.push_str("done\n");
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        async fn expect_run_started_id(
+            rx: &mut mpsc::Receiver<HarnessEvent>,
+        ) -> (String, Option<String>) {
+            match rx.recv().await {
+                Some(HarnessEvent::RunStarted {
+                    run_id, prompt_id, ..
+                }) => (run_id, prompt_id),
+                other => panic!("expected RunStarted, got {other:?}"),
+            }
+        }
+
+        // Phase 1b: a prompt arriving mid-turn is QUEUED (PromptQueued),
+        // stays editable (PromptEdited) / cancellable (PromptDequeued)
+        // until the turn's `result` consumes the next queued prompt —
+        // whose `RunStarted` carries that prompt_id. A Dequeue after
+        // consumption is a no-op (single-writer).
+        #[tokio::test]
+        async fn queue_holds_edits_and_consumes_type_ahead() {
+            // Each turn: sleep, then one assistant line + result.
+            let script = write_slow_fake_claude(
+                &[
+                    r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"ok"}]}}"#,
+                    r#"{"type":"result","subtype":"success","is_error":false}"#,
+                ],
+                300,
+            )
+            .await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(16);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                Some("first".into()),
+            ));
+
+            // Turn 1 (env-seeded initial prompt → no prompt_id). It is now
+            // in flight (the fake sleeps 300ms before its result).
+            let (r1, pid1) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(pid1, None, "initial prompt has no prompt_id");
+
+            // Queue p2, edit it, queue p3, then cancel p3 — all while turn
+            // 1 is still sleeping. None of these are written to claude yet.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p2".into(),
+                    text: "second".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+            ));
+            cmd_tx
+                .send(HarnessCommand::EditQueued {
+                    prompt_id: "p2".into(),
+                    text: "second-edited".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptEdited { prompt_id, .. }) if prompt_id == "p2"
+            ));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p3".into(),
+                    text: "third".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p3"
+            ));
+            cmd_tx
+                .send(HarnessCommand::DequeueQueued {
+                    prompt_id: "p3".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptDequeued { prompt_id }) if prompt_id == "p3"
+            ));
+
+            // Turn 1 completes; p2 (edited) is consumed back-to-back as a
+            // new run carrying prompt_id "p2".
+            expect_agent_message(&mut evt_rx, "ok").await;
+            let c1 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(r1, c1);
+            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            assert_ne!(r1, r2);
+            assert_eq!(pid2.as_deref(), Some("p2"), "consumed queued prompt id");
+            expect_agent_message(&mut evt_rx, "ok").await;
+            let c2 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(r2, c2);
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // A dequeue for an already-consumed prompt is a silent no-op,
+            // then shutdown. The next (and only) thing on the event channel
+            // is its CLOSE as the engine exits — NOT a spurious
+            // PromptDequeued for the consumed p2.
+            cmd_tx
+                .send(HarnessCommand::DequeueQueued {
+                    prompt_id: "p2".into(),
+                })
+                .await
+                .unwrap();
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            match evt_rx.recv().await {
+                None => {} // channel closed = engine exited cleanly, no stray event
+                Some(ev) => panic!("unexpected event after a consumed-prompt dequeue: {ev:?}"),
+            }
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+        }
+
         // The core Phase-1 contract: TWO prompts over ONE persistent
         // process, each turn cleanly bracketed by RunStarted→…→
         // RunCompleted→Idle with a DISTINCT run_id (no inference from
@@ -1513,6 +1751,7 @@ mod adapter {
             // Turn 2 over the SAME process — a fresh, distinct run_id.
             cmd_tx
                 .send(HarnessCommand::Prompt {
+                    prompt_id: "p-second".into(),
                     text: "second".into(),
                 })
                 .await

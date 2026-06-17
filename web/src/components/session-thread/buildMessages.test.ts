@@ -416,3 +416,52 @@ describe("buildMessages — isRunning", () => {
     expect(last.status).toEqual({ type: "running" });
   });
 });
+
+describe("buildMessages — Phase 1b queued/optimistic greying", () => {
+  test("a user echo with a prompt_id is keyed by it and ungreys once its run_started consumes it", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "do it",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const user = real(messages).find((m) => m.role === "user")!;
+    // Keyed by prompt_id so the optimistic bubble dedupes against it in place.
+    expect(user.id).toBe("p1");
+    // Consumed by run_started{p1} → solid (no longer greyed).
+    expect(user.metadata?.custom?.pending).toBeUndefined();
+  });
+
+  test("a still-queued user echo (no run_started yet) stays pending/greyed", () => {
+    const { messages } = buildMessages(
+      indexed([
+        // A run is in flight; a type-ahead prompt is echoed but not yet consumed.
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u2",
+          role: "user",
+          text: "and then deploy",
+          prompt_id: "p2",
+          at: AT2,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+    const queued = messages.find((m) => m.id === "p2")!;
+    expect(queued.metadata?.custom?.pending).toBe(true);
+  });
+});

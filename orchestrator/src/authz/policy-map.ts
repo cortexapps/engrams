@@ -58,6 +58,18 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
+  // Phase 1b (ADR 0052): mutating a still-queued prompt is the same
+  // owner-scoped "prompt" capability as sending one.
+  "SessionService.EditQueuedPrompt": {
+    action: "prompt",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
+  "SessionService.DequeueQueuedPrompt": {
+    action: "prompt",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
   "SessionService.Interrupt": {
     action: "prompt",
     subject: "Session",

@@ -788,6 +788,8 @@ async fn session_create(
         prompt: prompt.map(str::to_string),
         secrets: HashMap::new(),
         harness_env: HashMap::new(),
+        // Admin CLI doesn't correlate optimistic UI; let the coord mint.
+        prompt_id: None,
     };
     let resp = c.sess.create_session(req).await?.into_inner();
     if json {
@@ -1077,6 +1079,8 @@ async fn session_prompt(c: &mut Clients, id: &str, text: &str, json: bool) -> Re
         .send_prompt(app::SendPromptRequest {
             session_id: id.to_string(),
             text: text.to_string(),
+            // Empty → coord mints one (admin CLI has no optimistic UI to correlate).
+            prompt_id: String::new(),
         })
         .await?
         .into_inner();

@@ -13,6 +13,11 @@ service SessionService {
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
   rpc SendPrompt(SendPromptRequest) returns (SendPromptResponse);
   rpc Interrupt(InterruptRequest) returns (InterruptResponse);
+  // Phase 1b (ADR 0052): mutate a still-queued (type-ahead) prompt by its
+  // client-minted prompt_id, before the harness consumes it. No-op once
+  // consumed (the harness is the single writer).
+  rpc EditQueuedPrompt(EditQueuedPromptRequest) returns (EditQueuedPromptResponse);
+  rpc DequeueQueuedPrompt(DequeueQueuedPromptRequest) returns (DequeueQueuedPromptResponse);
   // Streams the event envelope itself, not a wrapped Response message.
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc StreamEvents(StreamEventsRequest) returns (stream SessionEvent);
@@ -93,6 +98,10 @@ message CreateSessionRequest {
   string mode = 2;
   optional string prompt = 3;
   reserved 4; // was harness_secret_id (SecretService); removed in ADR 0051 Drip A.
+  // Phase 1b: client-minted id for the initial `prompt`, so the web can
+  // correlate its optimistic bubble with the server echo + RunStarted.
+  // Ignored when `prompt` is unset; the coord mints one if absent.
+  optional string prompt_id = 7;
   // Per-request secret values keyed by env-var name. Only honored under
   // SecretMode::Literal; broker-mode images reject overrides.
   map<string, string> secrets = 5;
@@ -136,6 +145,10 @@ message DeleteSessionResponse {}
 message SendPromptRequest {
   string session_id = 1;
   string text = 2;
+  // Phase 1b: client-minted id correlating this prompt with its
+  // RunStarted{prompt_id} and (if queued) PromptQueued/Edited/Dequeued.
+  // The coord mints one if empty (back-compat / non-web callers).
+  string prompt_id = 3;
 }
 
 message SendPromptResponse {
@@ -151,6 +164,27 @@ message InterruptRequest {
 message InterruptResponse {
   string session_id = 1;
   // Human-readable diagnostic; not machine-parsed, not stable.
+  string note = 2;
+}
+
+message EditQueuedPromptRequest {
+  string session_id = 1;
+  string prompt_id = 2;
+  string text = 3;
+}
+
+message EditQueuedPromptResponse {
+  string session_id = 1;
+  string note = 2;
+}
+
+message DequeueQueuedPromptRequest {
+  string session_id = 1;
+  string prompt_id = 2;
+}
+
+message DequeueQueuedPromptResponse {
+  string session_id = 1;
   string note = 2;
 }
 

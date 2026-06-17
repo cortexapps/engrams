@@ -112,9 +112,20 @@ pub enum HarnessEvent {
     /// harness assigns `run_id`; subsequent events in this run carry
     /// the same `run_id`. `prompt_summary` is the first ~1 KB of
     /// the prompt for Slack/UI rendering.
+    ///
+    /// `prompt_id` is the client-minted id of the prompt that started
+    /// this run (the id carried on `HarnessCommand::Prompt`). It is the
+    /// **"queued prompt consumed" signal**: a UI that rendered a greyed
+    /// type-ahead composer item with this id moves it into the
+    /// conversation when this event arrives. `None` only for the
+    /// env-seeded initial prompt (cold fresh-exec), which never went
+    /// through the editable queue.
     RunStarted {
         run_id: String,
         prompt_summary: Option<String>,
+        // APPENDED (trailing) for Phase 1b — keeps the struct's field
+        // order stable for older baked harnesses; see wire_golden.rs.
+        prompt_id: Option<String>,
     },
     /// Assistant / user / system text emitted by the agent. v1 is
     /// per-final-message: streaming agents (Claude, OpenCode)
@@ -168,6 +179,30 @@ pub enum HarnessEvent {
     /// between) just resets the soft timer, which is fine but
     /// wasteful — don't do it.
     Idle,
+    // ── Phase 1b: queued/steered prompts (ADR 0052). APPENDED after
+    //    `Idle` so existing bincode variant indices (RunStarted=0 …
+    //    Idle=6) never shift — see tests/wire_golden.rs.
+    /// A prompt arrived while a run was in flight and was QUEUED (not
+    /// yet consumed) — type-ahead / steering. The harness is the
+    /// single-writer owner of the queue; it holds the prompt in memory
+    /// and writes it to the agent only at the consumption boundary
+    /// (the running turn's end, or right after an interrupt). The web
+    /// renders this as a greyed, **editable** composer item keyed on
+    /// `prompt_id`; `summary` is the first ~1 KB for rendering.
+    PromptQueued {
+        prompt_id: String,
+        summary: Option<String>,
+    },
+    /// A still-queued prompt's text was edited before consumption (via
+    /// `HarnessCommand::EditQueued`). Carries the new `summary`.
+    PromptEdited {
+        prompt_id: String,
+        summary: Option<String>,
+    },
+    /// A still-queued prompt was removed from the queue before
+    /// consumption (via `HarnessCommand::DequeueQueued`) — the user
+    /// pulled it back into the composer to edit, or cancelled it.
+    PromptDequeued { prompt_id: String },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -195,6 +230,9 @@ impl HarnessEvent {
             Self::ToolCallCompleted { .. } => "tool_call_completed",
             Self::RunCompleted { .. } => "run_completed",
             Self::RunInterrupted { .. } => "run_interrupted",
+            Self::PromptQueued { .. } => "prompt_queued",
+            Self::PromptEdited { .. } => "prompt_edited",
+            Self::PromptDequeued { .. } => "prompt_dequeued",
             Self::Idle => "harness_idle",
         }
     }
@@ -225,13 +263,17 @@ pub enum HarnessCommand {
     /// translates this into the right signal sequence for its agent
     /// (SIGINT then SIGKILL for Claude Code; whatever for others).
     Shutdown { grace_secs: u32 },
-    /// User prompt for the agent — the next run's input. The adapter
-    /// either starts a fresh run (if currently Idle) or queues this
-    /// for after the in-flight run's `Idle`. Each adapter's
-    /// strategy: Claude spawns `claude --resume <id> --print "<text>"`;
-    /// OpenCode POSTs to its server. Engram is opaque to the agent's
+    /// User prompt for the agent — the next run's input. `prompt_id` is
+    /// a client-minted id (the coordinator mints one if the client
+    /// didn't) that correlates this prompt with its eventual
+    /// `RunStarted{prompt_id}` and, while queued, with
+    /// `PromptQueued`/`PromptEdited`/`PromptDequeued`. The adapter either
+    /// starts a run immediately (if Idle) or, if a run is in flight,
+    /// QUEUES it (type-ahead) and emits `PromptQueued` — the harness is
+    /// the single-writer owner of that queue and writes it to the agent
+    /// only at the consumption boundary. Engram is opaque to the agent's
     /// internal session shape — `text` is just plumbed through.
-    Prompt { text: String },
+    Prompt { text: String, prompt_id: String },
     /// ADR 0030: operator interrupt — stop the in-flight run but keep
     /// the session alive. The adapter SIGINTs its current child (for
     /// Claude: the per-prompt `claude` process), emits
@@ -249,6 +291,19 @@ pub enum HarnessCommand {
     /// machine, WITHOUT touching the running agent: it never reaches the
     /// engine, only the connection layer.
     Rehandshake,
+    // ── Phase 1b: queue mutation (ADR 0052). APPENDED after `Rehandshake`
+    //    so existing variant indices (Checkpoint=0 … Rehandshake=4) never
+    //    shift — see tests/wire_golden.rs.
+    /// Edit the text of a still-queued prompt (by its `prompt_id`),
+    /// before it is consumed. No-op if already consumed: the harness is
+    /// the single writer, so the `RunStarted{prompt_id}` that consumed
+    /// it already won. Emits `HarnessEvent::PromptEdited` on success.
+    EditQueued { prompt_id: String, text: String },
+    /// Remove a still-queued prompt from the queue (by its `prompt_id`)
+    /// before consumption — the user pulled it back into the composer or
+    /// cancelled it. No-op if already consumed. Emits
+    /// `HarnessEvent::PromptDequeued` on success.
+    DequeueQueued { prompt_id: String },
 }
 
 /// Why the host is asking for a checkpoint. Logged in `session_events`
@@ -515,7 +570,19 @@ mod tests {
     fn event_variants_round_trip() {
         round_trip(HarnessFrame::Event(HarnessEvent::RunStarted {
             run_id: "r1".into(),
+            prompt_id: Some("p1".into()),
             prompt_summary: Some("fix the test".into()),
+        }));
+        round_trip(HarnessFrame::Event(HarnessEvent::PromptQueued {
+            prompt_id: "p2".into(),
+            summary: Some("and then deploy".into()),
+        }));
+        round_trip(HarnessFrame::Event(HarnessEvent::PromptEdited {
+            prompt_id: "p2".into(),
+            summary: Some("and then deploy to staging".into()),
+        }));
+        round_trip(HarnessFrame::Event(HarnessEvent::PromptDequeued {
+            prompt_id: "p2".into(),
         }));
         round_trip(HarnessFrame::Event(HarnessEvent::ToolCallStarted {
             run_id: "r1".into(),
@@ -559,9 +626,18 @@ mod tests {
             grace_secs: 5,
         }));
         round_trip(HarnessFrame::Command(HarnessCommand::Prompt {
+            prompt_id: "p1".into(),
             text: "do the thing".into(),
         }));
+        round_trip(HarnessFrame::Command(HarnessCommand::EditQueued {
+            prompt_id: "p1".into(),
+            text: "do the thing, carefully".into(),
+        }));
+        round_trip(HarnessFrame::Command(HarnessCommand::DequeueQueued {
+            prompt_id: "p1".into(),
+        }));
         round_trip(HarnessFrame::Command(HarnessCommand::Interrupt));
+        round_trip(HarnessFrame::Command(HarnessCommand::Rehandshake));
     }
 
     #[test]
@@ -659,6 +735,7 @@ mod tests {
         assert_eq!(
             HarnessEvent::RunStarted {
                 run_id: "x".into(),
+                prompt_id: None,
                 prompt_summary: None,
             }
             .kind(),
@@ -708,6 +785,29 @@ mod tests {
             HarnessEvent::RunInterrupted { run_id: "x".into() }.kind(),
             "run_interrupted"
         );
+        assert_eq!(
+            HarnessEvent::PromptQueued {
+                prompt_id: "p".into(),
+                summary: None,
+            }
+            .kind(),
+            "prompt_queued"
+        );
+        assert_eq!(
+            HarnessEvent::PromptEdited {
+                prompt_id: "p".into(),
+                summary: None,
+            }
+            .kind(),
+            "prompt_edited"
+        );
+        assert_eq!(
+            HarnessEvent::PromptDequeued {
+                prompt_id: "p".into()
+            }
+            .kind(),
+            "prompt_dequeued"
+        );
         assert_eq!(HarnessEvent::Idle.kind(), "harness_idle");
     }
 
@@ -717,6 +817,7 @@ mod tests {
         assert_eq!(
             HarnessEvent::RunStarted {
                 run_id: "x".into(),
+                prompt_id: None,
                 prompt_summary: None,
             }
             .tool_call_id(),
