@@ -58,8 +58,33 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
+  # Path-gate the (expensive) macOS lanes on the shared Rust detector — these
+  # build/test the whole workspace, so they only need to run when Rust changed.
+  # Runs on Linux (the detector needs `cargo metadata`, not macOS). Mirrors
+  # ci.yml's detect job; only the `test_rust` lane is consumed here.
+  detect:
+    name: detect changed lanes
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      test_rust: ${{ steps.lanes.outputs.test_rust }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Detect changed lanes
+        id: lanes
+        run: |
+          BASE=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          fi
+          python3 .github/scripts/detect-rebake-lanes.py --base "$BASE" --head HEAD
+
   vz:
     name: engram-sandbox-vz unit tests
+    needs: detect
+    if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-6vcpu-macos-15  # arm64, has Xcode CLT pre-installed
     steps:
       - uses: actions/checkout@v6
@@ -134,6 +159,8 @@ jobs:
 
   test-macos:
     name: workspace tests (macOS arm64, excl. sandbox-vz)
+    needs: detect
+    if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v6
@@ -154,3 +181,35 @@ jobs:
       - name: cargo nextest run --workspace --exclude engram-sandbox-vz
         if: always()
         run: cargo nextest run --workspace --exclude engram-sandbox-vz --no-fail-fast
+
+  # The SINGLE required status check for this workflow (same pattern as ci.yml's
+  # CI Gate). The macOS lanes are path-gated and so legitimately `skipped` on
+  # non-Rust changes; this always-running gate is the one required check, passing
+  # iff each lane succeeded or was skipped.
+  ci-macos-gate:
+    name: CI (macOS) Gate
+    if: always()
+    needs:
+      - detect
+      - vz
+      - test-macos
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Check lane results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS_JSON" | jq -r '
+            to_entries
+            | sort_by(.key)
+            | (["LANE","RESULT"], ["----","------"], (.[] | [.key, .value.result]))
+            | @tsv' | column -t -s "$(printf '\t')"
+          failed=$(echo "$NEEDS_JSON" | jq -r '
+            [to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key]
+            | join(", ")')
+          if [ -n "$failed" ]; then
+            echo "::error::CI (macOS) Gate failed — non-passing lanes: $failed"
+            exit 1
+          fi
+          echo "CI (macOS) Gate passed."

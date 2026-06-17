@@ -1,4 +1,4 @@
-{{- if .Values.orchestrator.enabled -}}
+{{- if .Values.web.enabled -}}
 # ClusterIP Service for the orchestrator pod. When the orchestrator Ingress
 # (orchestrator-ingress.yaml) is enabled it targets this Service; the Service
 # has no externally reachable address on its own. The

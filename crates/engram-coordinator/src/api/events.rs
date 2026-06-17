@@ -17,94 +17,13 @@
 //! captured by the bus subscription; we de-dupe by tracking the
 //! highest replayed idx and skipping live events at or below it.
 
-use std::convert::Infallible;
-use std::time::Duration;
-
-use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use engram_core::SessionId;
 use futures::stream::{Stream, StreamExt};
-use serde::Deserialize;
 
 use crate::error::ApiError;
 use crate::state::{IndexedEvent, SharedState};
 
 const REPLAY_LIMIT: i64 = 1000;
-
-#[derive(Deserialize)]
-pub struct EventsQuery {
-    /// Replay events with `idx > since`. Combine with `Last-Event-ID`
-    /// header (EventSource auto-reconnect) — the larger of the two
-    /// wins so an explicit query never goes backward across reconnect.
-    pub since: Option<i64>,
-}
-
-pub async fn events(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-    Query(query): Query<EventsQuery>,
-    headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    // Pick the higher of explicit query and Last-Event-ID — explicit
-    // query wins ties. Default of -1 means "from the start of the log."
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok());
-    let since = match (query.since, last_event_id) {
-        (Some(q), Some(h)) => q.max(h),
-        (Some(q), None) => q,
-        (None, Some(h)) => h,
-        (None, None) => -1,
-    };
-
-    // Shared transport-agnostic core: existence check → subscribe FIRST
-    // → replay (ADR 0051). The same `events_core` backs the app-gRPC
-    // `StreamEvents` RPC.
-    let (replayed, live_rx) = events_core(&state, id, Some(since)).await?;
-
-    // ADR 0050 B: end the stream when the coordinator begins graceful
-    // shutdown so this long-lived SSE connection doesn't block hyper's
-    // drain (tokio-rs/axum#2673). The browser EventSource auto-reconnects
-    // to a healthy replica and resumes from the PG log via Last-Event-ID,
-    // so the close is lossless. Fires immediately if shutdown is already
-    // underway (don't open a new stream on a draining pod).
-    let mut shutdown_rx = state.subscribe_shutdown();
-    let shutdown = async move {
-        // Resolve ONLY on a genuine shutdown trigger (value → true). On
-        // sender-drop `wait_for` returns Err — that's the owning AppState
-        // being torn down (process teardown in prod, a fixture drop in
-        // tests), NOT a shutdown; park so we never force-end a live
-        // stream on it (the stream ends naturally when its source closes).
-        if shutdown_rx
-            .wait_for(|shutting_down| *shutting_down)
-            .await
-            .is_err()
-        {
-            std::future::pending::<()>().await;
-        }
-    };
-
-    // Frame the shared replay→live merge as SSE messages. `merged_to_parts`
-    // produces the same `(idx, kind, payload_json)` parts the gRPC handler
-    // uses, so the wire data is byte-identical across transports.
-    let stream = merged_event_stream(replayed, live_rx, Some(since))
-        .map(|ev| {
-            let (idx, kind, payload_json) = merged_to_parts(ev);
-            let mut e = Event::default().event(kind).data(payload_json);
-            if let Some(idx) = idx {
-                e = e.id(idx.to_string());
-            }
-            Ok::<Event, Infallible>(e)
-        })
-        .take_until(shutdown);
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
-}
 
 /// ADR 0051: the sequencing-sensitive core (existence check → subscribe
 /// FIRST → replay) shared by the axum SSE handler above and the app-gRPC

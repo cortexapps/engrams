@@ -528,9 +528,11 @@ impl GrpcHostClient {
     pub async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
+        warm: Option<engram_core::types::image::WarmConfig>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         let req = BuildBaseSnapshotRequest {
             spec_bincode: encode_bincode(&spec, "SandboxSpec")?,
+            warm_bincode: encode_bincode(&warm, "Option<WarmConfig>")?,
         };
         let resp = self
             .inner
@@ -1186,8 +1188,9 @@ impl HostClient for GrpcHostClient {
     async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
+        warm: Option<engram_core::types::image::WarmConfig>,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        Self::build_base_snapshot(self, spec).await
+        Self::build_base_snapshot(self, spec, warm).await
     }
 
     async fn restore_base_for_session(

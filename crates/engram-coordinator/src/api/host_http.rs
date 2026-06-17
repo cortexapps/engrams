@@ -997,7 +997,6 @@ mod tests {
     ) -> Session {
         Session {
             id,
-            user_id: None,
             status,
             host_id: None,
             sandbox_id: Some(sandbox),

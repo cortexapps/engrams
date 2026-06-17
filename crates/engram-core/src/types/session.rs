@@ -466,14 +466,12 @@ pub struct SessionSpec {
     pub image: ImageRef,
     #[serde(default)]
     pub mode: SessionMode,
-    pub user_id: Option<String>,
 }
 
 /// A persisted session row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
-    pub user_id: Option<String>,
     pub status: SessionState,
     pub host_id: Option<HostId>,
     /// In-memory `SandboxId` of the live sandbox serving this
@@ -749,7 +747,6 @@ mod tests {
     fn session_round_trips_through_json() {
         let original = Session {
             id: SessionId::new(),
-            user_id: Some("u1".into()),
             status: SessionState::Active,
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),

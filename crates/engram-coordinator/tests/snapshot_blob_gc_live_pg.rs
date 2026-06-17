@@ -55,7 +55,6 @@ async fn seed_session(meta: &Arc<dyn MetadataStore>) -> SessionId {
     meta.create_session(SessionSpec {
         image: "localhost:5001/snapshot-blob-gc:test".into(),
         mode: SessionMode::Agent,
-        user_id: None,
     })
     .await
     .expect("create session")

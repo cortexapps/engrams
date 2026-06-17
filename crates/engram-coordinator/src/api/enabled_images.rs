@@ -38,269 +38,13 @@
 //! would have to encode. POSTing the URI in the body keeps both ends
 //! simple and avoids the bikeshed.
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::Json;
 use chrono::Utc;
 use engram_core::types::snapshot::SnapshotRecord;
-use engram_core::types::{EnabledImage, EnabledImageSummary, ImageManifest};
-use engram_core::MetaError;
-use serde::{Deserialize, Serialize};
+use engram_core::types::{EnabledImage, ImageManifest};
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
-
-#[derive(Deserialize)]
-pub struct EnableImageRequest {
-    /// Full OCI URI: `<host>[/path]/<repo>:<tag>`. The host portion
-    /// must match a row in `registry_credentials` for non-anonymous
-    /// pulls; missing rows fall through to anonymous (works for
-    /// public registries and `localhost:5001`).
-    pub image_uri: String,
-}
-
-#[derive(Deserialize)]
-pub struct ImageUriRequest {
-    pub image_uri: String,
-}
-
-#[derive(Serialize)]
-pub struct ListEnabledImagesResponse {
-    pub images: Vec<EnabledImageSummary>,
-}
-
-/// ADR 0036: enabling is asynchronous. The handler validates the URI
-/// with a cheap metadata pull (KBs — manifest layer descriptors, no
-/// chunk bytes), records an `enable_jobs` row, and returns **202**
-/// with the job. The coordinator's [`crate::enable_scanner`] drives
-/// the heavy pipeline (chunk materialize → capture-VM boot +
-/// snapshot → enabled_images upsert) off the request path — the old
-/// synchronous shape took minutes for a 10 GB image and was killed
-/// by the external LB at ~30 s.
-///
-/// Re-POSTing while a job is in flight returns the existing job
-/// (resume/no-op, enforced by a partial unique index).
-pub async fn enable_image(
-    State(state): State<SharedState>,
-    Json(req): Json<EnableImageRequest>,
-) -> Result<impl axum::response::IntoResponse, ApiError> {
-    if req.image_uri.trim().is_empty() {
-        return Err(ApiError::BadRequest("image_uri must not be empty".into()));
-    }
-
-    // Cheap validation pull: bad URI / missing credential / malformed
-    // manifest fail synchronously with a 4xx — the operator gets
-    // immediate feedback rather than a job that fails on first tick.
-    let (_row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
-
-    let job = state
-        .services
-        .meta
-        .create_or_get_enable_job(&req.image_uri, Some(artifacts.manifest_digest.as_str()))
-        .await?;
-
-    tracing::info!(
-        image_uri = %req.image_uri,
-        job_id = %job.id,
-        state = job.state.as_str(),
-        "enable job recorded; scanner will drive the pipeline",
-    );
-    Ok((
-        StatusCode::ACCEPTED,
-        [(
-            axum::http::header::LOCATION,
-            format!("/api/v1/enable-jobs/{}", job.id),
-        )],
-        Json(job),
-    ))
-}
-
-/// `GET /api/v1/enable-jobs/:id` — poll an enable job. The
-/// `chunks_done/chunks_total` counters are the progress bar.
-pub async fn get_enable_job(
-    State(state): State<SharedState>,
-    axum::extract::Path(id): axum::extract::Path<Uuid>,
-) -> Result<Json<engram_core::types::EnableJob>, ApiError> {
-    let job = state
-        .services
-        .meta
-        .get_enable_job(id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("enable job {id} not found")))?;
-    Ok(Json(job))
-}
-
-#[derive(Serialize)]
-pub struct ListEnableJobsResponse {
-    pub jobs: Vec<engram_core::types::EnableJob>,
-}
-
-/// `GET /api/v1/enable-jobs` — recent jobs, newest first. The
-/// dashboard's images panel reads this so an in-flight enable
-/// survives a page reload.
-pub async fn list_enable_jobs(
-    State(state): State<SharedState>,
-) -> Result<Json<ListEnableJobsResponse>, ApiError> {
-    let jobs = state.services.meta.list_enable_jobs(50).await?;
-    Ok(Json(ListEnableJobsResponse { jobs }))
-}
-
-/// `POST /api/v1/enable-jobs/:id/retry` (admin) — re-queue a
-/// `failed` job to `pending`. The explicit trigger pairing for the
-/// scanner's implicit retry budget.
-pub async fn retry_enable_job(
-    State(state): State<SharedState>,
-    axum::extract::Path(id): axum::extract::Path<Uuid>,
-) -> Result<Json<engram_core::types::EnableJob>, ApiError> {
-    let job = state
-        .services
-        .meta
-        .retry_enable_job(id)
-        .await
-        .map_err(|e| match e {
-            MetaError::NotFound => ApiError::NotFound(format!("enable job {id} not found")),
-            MetaError::Conflict(msg) => ApiError::Conflict(msg),
-            other => other.into(),
-        })?;
-    tracing::info!(job_id = %id, image_uri = %job.image_uri, "enable job re-queued by admin");
-    Ok(Json(job))
-}
-
-pub async fn list_enabled_images(
-    State(state): State<SharedState>,
-) -> Result<Json<ListEnabledImagesResponse>, ApiError> {
-    let rows = state.services.meta.list_enabled_images().await?;
-    let images = rows.into_iter().map(EnabledImageSummary::from).collect();
-    Ok(Json(ListEnabledImagesResponse { images }))
-}
-
-/// ADR 0036: refresh is asynchronous too — it runs the identical
-/// pipeline (the enabled_images upsert preserves `id`/`created_at`
-/// via ON CONFLICT, so "refresh" and "enable" converge). The only
-/// difference is the guard: the URI must already be enabled, so an
-/// operator can't accidentally enable something via /refresh that
-/// they didn't enable via the auditable POST path.
-pub async fn refresh_enabled_image(
-    State(state): State<SharedState>,
-    Json(req): Json<ImageUriRequest>,
-) -> Result<impl axum::response::IntoResponse, ApiError> {
-    if req.image_uri.trim().is_empty() {
-        return Err(ApiError::BadRequest("image_uri must not be empty".into()));
-    }
-
-    state
-        .services
-        .meta
-        .get_enabled_image(&req.image_uri)
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "image `{}` is not enabled; call POST /api/enabled-images first",
-                req.image_uri
-            ))
-        })?;
-
-    let (_row, _manifest, artifacts) = fetch_and_seal_manifest(&state, &req.image_uri).await?;
-    let job = state
-        .services
-        .meta
-        .create_or_get_enable_job(&req.image_uri, Some(artifacts.manifest_digest.as_str()))
-        .await?;
-    tracing::info!(
-        image_uri = %req.image_uri,
-        job_id = %job.id,
-        "refresh recorded as enable job",
-    );
-    Ok((
-        StatusCode::ACCEPTED,
-        [(
-            axum::http::header::LOCATION,
-            format!("/api/v1/enable-jobs/{}", job.id),
-        )],
-        Json(job),
-    ))
-}
-
-/// ADR 0021 P1.8: response body for a refused disable.
-///
-/// 409 Conflict + this JSON, so the operator sees exactly which
-/// sessions are pinning the image. Sessions in `{pending, created,
-/// active, evacuating}` block; sessions in `{idle, completed, dead,
-/// failed}` don't (idle resumes against the soft-deleted row, the
-/// others are terminal).
-#[derive(Serialize)]
-pub struct DisableBlockedResponse {
-    pub error: &'static str,
-    pub message: String,
-    pub blocking_sessions: Vec<BlockingSession>,
-}
-
-#[derive(Serialize)]
-pub struct BlockingSession {
-    pub session_id: Uuid,
-    pub status: String,
-}
-
-pub async fn disable_enabled_image(
-    State(state): State<SharedState>,
-    Json(req): Json<ImageUriRequest>,
-) -> Result<axum::response::Response, ApiError> {
-    use axum::response::IntoResponse;
-    use engram_core::traits::DisableEnabledImageOutcome as Outcome;
-
-    let outcome = state
-        .services
-        .meta
-        .soft_delete_enabled_image(&req.image_uri)
-        .await
-        .map_err(|e| match e {
-            MetaError::NotFound => {
-                ApiError::NotFound(format!("image `{}` is not enabled", req.image_uri))
-            }
-            other => other.into(),
-        })?;
-
-    match outcome {
-        Outcome::Disabled | Outcome::AlreadyDisabled => {
-            // Both are no-error for the caller. AlreadyDisabled
-            // keeps the endpoint idempotent for retries — the
-            // operator who clicked "Disable" twice gets the same
-            // 204 either way. Distinguishing would only be useful
-            // for telemetry, which we already get from the
-            // outcome metric below.
-            tracing::info!(
-                image_uri = %req.image_uri,
-                already_disabled = matches!(outcome, Outcome::AlreadyDisabled),
-                "enabled_image soft-deleted",
-            );
-            Ok(StatusCode::NO_CONTENT.into_response())
-        }
-        Outcome::Blocked(sessions) => {
-            // Refuse with 409 + the offending sessions. The list
-            // is bounded to the first 16 by the PG query so the
-            // response stays small even when many sessions
-            // reference the image.
-            let n = sessions.len();
-            let body = DisableBlockedResponse {
-                error: "image_in_use",
-                message: format!(
-                    "Cannot disable image `{}`: {n} session(s) reference it. \
-                     Wait for them to go idle, or force-stop them, then retry.",
-                    req.image_uri,
-                ),
-                blocking_sessions: sessions
-                    .into_iter()
-                    .map(|(id, status)| BlockingSession {
-                        session_id: id.as_uuid(),
-                        status,
-                    })
-                    .collect(),
-            };
-            Ok((StatusCode::CONFLICT, Json(body)).into_response())
-        }
-    }
-}
 
 /// Pull the full engram OCI artifact at `image_uri` and validate it.
 /// Returns the `EnabledImage` row ready to upsert, the parsed
@@ -656,7 +400,21 @@ pub(crate) async fn capture_and_record_base_snapshot(
     // bundles + ADR 0027 memory floor live inside the shared helper;
     // capture + restore MUST agree on `mem_size_mib` (FC requires it),
     // and ADR 0028's disk-only recovery boots the same shape.
-    let spec = crate::api::sessions::cold_boot_spec(&row.image_uri, manifest, None);
+    //
+    // Issue #192: pin the capture's image reference to the digest we
+    // just resolved, NOT `row.image_uri`'s (possibly mutable) tag. The
+    // host's local OCI cache is keyed on this URI string; a moving tag
+    // (`:latest`) lets a tag-keyed cache hit serve a previous bake's
+    // rootfs even though the coord materialized fresh chunks — so the
+    // recorded `manifest_digest` and the captured base-snapshot bytes
+    // disagree, and the fleet silently keeps booting the old guest. A
+    // digest-pinned reference is content-addressed and immutable, so the
+    // host pulls (and caches) exactly the resolved bake.
+    let capture_uri = engram_oci::digest_pinned_uri(
+        &row.image_uri,
+        &engram_oci::Digest256(row.manifest_digest.clone()),
+    );
+    let spec = crate::api::sessions::cold_boot_spec(&capture_uri, manifest, None);
 
     let (host_id, host) =
         crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
@@ -673,12 +431,20 @@ pub(crate) async fn capture_and_record_base_snapshot(
         host_id = %host_id,
         "capturing base snapshot for image enable",
     );
-    let meta = host.build_base_snapshot(spec).await.map_err(|e| {
-        ApiError::Internal(format!(
-            "base snapshot capture for `{}` failed on host {host_id}: {e}",
-            row.image_uri
-        ))
-    })?;
+    // Thread the image's optional `[warm]` hook into capture: the host
+    // runs it in the live VM before the snapshot freezes, so a warmed
+    // process (e.g. a gradle daemon) is captured into the base snapshot.
+    // A warm failure is fail-loud — it surfaces here as a capture error
+    // and aborts the enable.
+    let meta = host
+        .build_base_snapshot(spec, manifest.warm.clone())
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "base snapshot capture for `{}` failed on host {host_id}: {e}",
+                row.image_uri
+            ))
+        })?;
 
     // A base snapshot is only useful if its chunked manifests are
     // durable in BlobStorage — verify before recording, so an
@@ -744,13 +510,13 @@ pub(crate) async fn capture_and_record_base_snapshot(
 }
 
 /// ADR 0048: enable-time manifest validation. An enabled image must
-/// declare `[resources] vcpus = N` so placement can reserve CPU and pack
-/// hosts against a budget. Pure (no I/O) so it's unit-tested directly.
+/// declare `[resources] suggested_vcpus = N` so placement can reserve CPU
+/// and pack hosts against a budget. Pure (no I/O) so it's unit-tested directly.
 fn validate_enabled_manifest(manifest: &ImageManifest, image_uri: &str) -> Result<(), String> {
-    if manifest.resources.vcpus.is_none() {
+    if manifest.resources.suggested_vcpus.is_none() {
         return Err(format!(
-            "manifest.toml at `{image_uri}` must declare `[resources] vcpus = N` \
-             (ADR 0048: placement reserves CPU). Re-bake the image with a vcpus \
+            "manifest.toml at `{image_uri}` must declare `[resources] suggested_vcpus = N` \
+             (ADR 0048: placement reserves CPU). Re-bake the image with a suggested_vcpus \
              declaration and retry the enable."
         ));
     }
@@ -951,27 +717,28 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn enable_validation_requires_a_vcpus_declaration() {
+    fn enable_validation_requires_a_suggested_vcpus_declaration() {
         // No [resources] at all → rejected.
         let bare: ImageManifest = toml::from_str("name = \"x\"\n").unwrap();
         let err = validate_enabled_manifest(&bare, "r/x:t").unwrap_err();
-        assert!(err.contains("vcpus"), "error must name the field: {err}");
+        assert!(
+            err.contains("suggested_vcpus"),
+            "error must name the field: {err}"
+        );
 
-        // [resources] present but vcpus omitted → rejected.
+        // [resources] present but suggested_vcpus omitted → rejected.
         let no_vcpus: ImageManifest =
             toml::from_str("name = \"x\"\n[resources]\nsuggested_memory_mib = 2048\n").unwrap();
         assert!(validate_enabled_manifest(&no_vcpus, "r/x:t").is_err());
 
         // Declared → accepted.
-        let ok: ImageManifest = toml::from_str("name = \"x\"\n[resources]\nvcpus = 4\n").unwrap();
+        let ok: ImageManifest =
+            toml::from_str("name = \"x\"\n[resources]\nsuggested_vcpus = 4\n").unwrap();
         assert!(validate_enabled_manifest(&ok, "r/x:t").is_ok());
 
-        // A stale `suggested_vcpus` key fails the PARSE (deny_unknown_fields),
-        // so it never reaches validation — proven here for completeness.
-        assert!(toml::from_str::<ImageManifest>(
-            "name = \"x\"\n[resources]\nsuggested_vcpus = 2\n"
-        )
-        .is_err());
+        // The renamed `vcpus` key fails the PARSE (deny_unknown_fields),
+        // so it never reaches validation — only `suggested_vcpus` is valid.
+        assert!(toml::from_str::<ImageManifest>("name = \"x\"\n[resources]\nvcpus = 2\n").is_err());
     }
 
     /// Regression guard for the OCI → BlobStorage materializer.

@@ -14,30 +14,10 @@
 //! (harness → host → `SessionEvent::from_harness` → SSE), not from this
 //! handler.
 
-use axum::extract::{Path, State};
-use axum::Json;
 use engram_core::SessionId;
-use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
-
-#[derive(Serialize)]
-pub struct InterruptResponse {
-    pub session_id: SessionId,
-    pub note: &'static str,
-}
-
-pub async fn interrupt(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<InterruptResponse>, ApiError> {
-    let note = interrupt_core(&state, id).await?;
-    Ok(Json(InterruptResponse {
-        session_id: id,
-        note,
-    }))
-}
 
 /// ADR 0051: transport-agnostic interrupt — the app-gRPC `Interrupt` RPC
 /// delegates here; the axum `interrupt` keeps its JSON wrapper. No

@@ -1,4 +1,4 @@
-{{- if .Values.orchestrator.enabled -}}
+{{- if .Values.web.enabled -}}
 {{- /*
 Non-secret orchestrator env (ADR 0051). The three REQUIRED vars
 (ORCHESTRATOR_DATABASE_URL, CONTROL_PLANE_BEARER, BETTER_AUTH_SECRET) come
@@ -50,5 +50,8 @@ data:
   {{- end }}
   {{- with .Values.orchestrator.auth.oidc.scopes }}
   ORCHESTRATOR_OIDC_SCOPES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.orchestrator.auth.adminEmails }}
+  ORCHESTRATOR_ADMIN_EMAILS: {{ join "," . | quote }}
   {{- end }}
 {{- end -}}

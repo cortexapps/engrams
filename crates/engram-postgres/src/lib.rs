@@ -9,13 +9,12 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore, UserStore, WebSessionStore};
-use engram_core::types::user::{Role, RoleSource, User, UserToken, WebSession};
+use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore};
 use engram_core::types::{
     ArtifactRow, EnableJob, EnableJobState, EnabledImage, HostRecord, HostStatus, PersistedEvent,
     RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
 };
-use engram_core::{HostId, MetaError, SandboxId, SessionId, UserId};
+use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use row::col_err;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
@@ -357,14 +356,13 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, user_id, status, host_id,
+                (id, status, host_id,
                  image_uri, mode,
                  created_at, last_active_at)
-            VALUES ($1, $2, $3, NULL, $4, $5, $6, $6)
+            VALUES ($1, $2, NULL, $3, $4, $5, $5)
             "#,
         )
         .bind(id)
-        .bind(spec.user_id.as_deref())
         .bind(SessionState::Pending.as_str())
         .bind(&spec.image)
         .bind(mode_text)
@@ -389,10 +387,10 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, user_id, status, host_id, sandbox_id,
+                (id, status, host_id, sandbox_id,
                  image_uri, mode,
                  created_at, last_active_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
             ON CONFLICT (id) DO UPDATE SET
                 status         = EXCLUDED.status,
                 sandbox_id     = EXCLUDED.sandbox_id,
@@ -401,7 +399,6 @@ impl MetadataStore for PostgresStore {
             "#,
         )
         .bind(session_id.as_uuid())
-        .bind(spec.user_id.as_deref())
         .bind(SessionState::Created.as_str())
         .bind(host_id.as_uuid())
         .bind(sandbox_id.as_uuid())
@@ -524,14 +521,13 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, user_id, status, host_id, sandbox_id,
+                (id, status, host_id, sandbox_id,
                  image_uri, mode, mem_budget_mib, cpu_budget_vcpus,
                  created_at, last_active_at)
-            VALUES ($1, $2, 'pending', $3, NULL, $4, $5, $6, $7, $8, $8)
+            VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $7)
             "#,
         )
         .bind(session_id.as_uuid())
-        .bind(spec.user_id.as_deref())
         .bind(picked)
         .bind(&spec.image)
         .bind(spec.mode.as_str())
@@ -707,15 +703,14 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO sessions
-                (id, user_id, status, host_id, sandbox_id, image_uri, mode,
+                (id, status, host_id, sandbox_id, image_uri, mode,
                  mem_budget_mib, cpu_budget_vcpus,
                  queued_at, queue_origin, queue_prompt,
                  created_at, last_active_at)
-            VALUES ($1, $2, 'queued', NULL, NULL, $3, $4, $5, $6, $7, 'create', $8, $7, $7)
+            VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, 'create', $7, $6, $6)
             "#,
         )
         .bind(id.as_uuid())
-        .bind(spec.user_id.as_deref())
         .bind(&spec.image)
         .bind(spec.mode.as_str())
         .bind(mem_budget_mib)
@@ -751,7 +746,7 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Vec<engram_core::types::session::QueuedSession>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id, image_uri, mode,
+            SELECT id, status, host_id, sandbox_id, image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
                    COALESCE(mem_budget_mib, 0)::BIGINT AS mem_budget_mib,
@@ -987,7 +982,7 @@ impl MetadataStore for PostgresStore {
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
+            SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
@@ -1048,7 +1043,7 @@ impl MetadataStore for PostgresStore {
         // running (prod session 5cfb90b8, 2026-06-03).
         let rows = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
+            SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version
@@ -1345,7 +1340,7 @@ impl MetadataStore for PostgresStore {
     async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
+            SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
@@ -1398,7 +1393,7 @@ impl MetadataStore for PostgresStore {
     async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, user_id, status, host_id, sandbox_id,
+            SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
@@ -3968,251 +3963,5 @@ impl MetadataStore for PostgresStore {
             .await
             .map_err(db_err)?;
         Ok(count.max(0) as u64)
-    }
-}
-
-/// All `users` columns, in a single place so every SELECT projects exactly
-/// what [`row::user_from_row`] expects.
-const USER_COLS: &str =
-    "id, email, display_name, role, role_source, active, groups, created_at, updated_at";
-
-#[async_trait]
-impl UserStore for PostgresStore {
-    async fn upsert_user_by_email(
-        &self,
-        email: &str,
-        display_name: Option<&str>,
-        default_role: Role,
-        default_role_source: RoleSource,
-    ) -> Result<User, MetaError> {
-        // JIT upsert: insert with the caller's defaults on first sight; on a
-        // returning login only refresh display_name + updated_at. The role is
-        // NEVER rewritten here, so a manual promotion/demotion survives every
-        // subsequent login. COALESCE keeps a login that carries no display
-        // name from wiping an existing one.
-        let row = sqlx::query(&format!(
-            r#"
-            INSERT INTO users (id, email, display_name, role, role_source, active, groups, created_at)
-            VALUES ($1, $2, $3, $4, $5, TRUE, '[]'::jsonb, NOW())
-            ON CONFLICT (email) DO UPDATE SET
-                display_name = COALESCE(EXCLUDED.display_name, users.display_name),
-                updated_at   = NOW()
-            RETURNING {USER_COLS}
-            "#
-        ))
-        .bind(Uuid::new_v4())
-        .bind(email)
-        .bind(display_name)
-        .bind(default_role.as_str())
-        .bind(default_role_source.as_str())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db_err)?;
-        row::user_from_row(&row)
-    }
-
-    async fn get_user(&self, id: UserId) -> Result<User, MetaError> {
-        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE id = $1"))
-            .bind(id.as_uuid())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
-        row.ok_or(MetaError::NotFound)
-            .and_then(|r| row::user_from_row(&r))
-    }
-
-    async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, MetaError> {
-        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE email = $1"))
-            .bind(email)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
-        row.map(|r| row::user_from_row(&r)).transpose()
-    }
-
-    async fn list_users(&self) -> Result<Vec<User>, MetaError> {
-        let rows = sqlx::query(&format!("SELECT {USER_COLS} FROM users ORDER BY email"))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db_err)?;
-        rows.iter().map(row::user_from_row).collect()
-    }
-
-    async fn set_user_role(
-        &self,
-        id: UserId,
-        role: Role,
-        source: RoleSource,
-    ) -> Result<User, MetaError> {
-        let row = sqlx::query(&format!(
-            r#"
-            UPDATE users SET role = $2, role_source = $3, updated_at = NOW()
-            WHERE id = $1
-            RETURNING {USER_COLS}
-            "#
-        ))
-        .bind(id.as_uuid())
-        .bind(role.as_str())
-        .bind(source.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        row.ok_or(MetaError::NotFound)
-            .and_then(|r| row::user_from_row(&r))
-    }
-
-    async fn set_user_active(&self, id: UserId, active: bool) -> Result<User, MetaError> {
-        let row = sqlx::query(&format!(
-            r#"
-            UPDATE users SET active = $2, updated_at = NOW()
-            WHERE id = $1
-            RETURNING {USER_COLS}
-            "#
-        ))
-        .bind(id.as_uuid())
-        .bind(active)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        row.ok_or(MetaError::NotFound)
-            .and_then(|r| row::user_from_row(&r))
-    }
-
-    async fn upsert_user_token(&self, token: UserToken) -> Result<(), MetaError> {
-        sqlx::query(
-            r#"
-            INSERT INTO user_tokens
-                (user_id, kind, wrapped_dek, nonce, ciphertext, key_id, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (user_id, kind) DO UPDATE SET
-                wrapped_dek = EXCLUDED.wrapped_dek,
-                nonce       = EXCLUDED.nonce,
-                ciphertext  = EXCLUDED.ciphertext,
-                key_id      = EXCLUDED.key_id,
-                updated_at  = NOW()
-            "#,
-        )
-        .bind(token.user_id.as_uuid())
-        .bind(&token.kind)
-        .bind(&token.wrapped_dek)
-        .bind(&token.nonce)
-        .bind(&token.ciphertext)
-        .bind(&token.key_id)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn get_user_token(
-        &self,
-        user_id: UserId,
-        kind: &str,
-    ) -> Result<Option<UserToken>, MetaError> {
-        let row = sqlx::query(
-            r#"
-            SELECT user_id, kind, wrapped_dek, nonce, ciphertext, key_id, created_at, updated_at
-            FROM user_tokens
-            WHERE user_id = $1 AND kind = $2
-            "#,
-        )
-        .bind(user_id.as_uuid())
-        .bind(kind)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        row.map(|r| row::user_token_from_row(&r)).transpose()
-    }
-
-    async fn delete_user_token(&self, user_id: UserId, kind: &str) -> Result<(), MetaError> {
-        // Idempotent: a missing row is fine (user never saved one).
-        sqlx::query("DELETE FROM user_tokens WHERE user_id = $1 AND kind = $2")
-            .bind(user_id.as_uuid())
-            .bind(kind)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl WebSessionStore for PostgresStore {
-    async fn create_web_session(&self, session: WebSession) -> Result<(), MetaError> {
-        sqlx::query(
-            r#"
-            INSERT INTO web_sessions
-                (token_hash, user_id, created_at, expires_at, last_seen_at)
-            VALUES ($1, $2, $3, $4, $5)
-            "#,
-        )
-        .bind(&session.token_hash)
-        .bind(session.user_id.as_uuid())
-        .bind(session.created_at)
-        .bind(session.expires_at)
-        .bind(session.last_seen_at)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn lookup_web_session(
-        &self,
-        token_hash: &[u8],
-    ) -> Result<Option<(WebSession, User)>, MetaError> {
-        // Reject expired cookies in the query; reject inactive users in Rust
-        // after the user fetch (so a deprovisioned user can't ride a live
-        // cookie). Two reads keep the SQL — and the column aliasing — simple;
-        // this runs once per authenticated request.
-        let row = sqlx::query(
-            r#"
-            SELECT token_hash, user_id, created_at, expires_at, last_seen_at
-            FROM web_sessions
-            WHERE token_hash = $1 AND expires_at > NOW()
-            "#,
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let ws = row::web_session_from_row(&row)?;
-        match self.get_user(ws.user_id).await {
-            Ok(user) if user.active => Ok(Some((ws, user))),
-            // User deactivated (deprovisioned) or vanished → treat the cookie
-            // as invalid.
-            Ok(_) | Err(MetaError::NotFound) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn revoke_web_session(&self, token_hash: &[u8]) -> Result<(), MetaError> {
-        // Idempotent: revoking an already-gone session is not an error.
-        sqlx::query("DELETE FROM web_sessions WHERE token_hash = $1")
-            .bind(token_hash)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn revoke_all_for_user(&self, user_id: UserId) -> Result<(), MetaError> {
-        sqlx::query("DELETE FROM web_sessions WHERE user_id = $1")
-            .bind(user_id.as_uuid())
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn sweep_expired(&self) -> Result<u64, MetaError> {
-        let res = sqlx::query("DELETE FROM web_sessions WHERE expires_at <= NOW()")
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(res.rows_affected())
     }
 }

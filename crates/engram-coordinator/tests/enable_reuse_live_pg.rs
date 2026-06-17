@@ -275,6 +275,7 @@ impl HostClient for FakeCaptureHost {
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
+        _warm: Option<engram_core::types::image::WarmConfig>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.captures.fetch_add(1, Ordering::SeqCst);
         Ok(SnapshotMetadata {
@@ -365,9 +366,9 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
 
     // Unique manifest.toml per run so reuse can't match residue from
     // prior runs against the shared dev/CI database. ADR 0048: an
-    // enabled image must declare `[resources] vcpus`.
+    // enabled image must declare `[resources] suggested_vcpus`.
     let manifest_toml = format!(
-        "name = \"reuse-fixture-{}\"\n[resources]\nvcpus = 2\n",
+        "name = \"reuse-fixture-{}\"\n[resources]\nsuggested_vcpus = 2\n",
         Uuid::new_v4()
     );
     let bundle_json = serde_json::json!({

@@ -10,6 +10,7 @@ use crate::error::SandboxError;
 use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::ids::SandboxId;
+use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxSpec,
 };
@@ -485,9 +486,16 @@ pub trait SandboxBackend: Send + Sync {
     /// Implemented on `PooledBackend` (which owns the chunk-store +
     /// state/sidecar upload that make the snapshot portable). Default
     /// errors so non-pooled backends opt out cleanly.
+    ///
+    /// `warm` is the image's optional capture-time prewarm hook
+    /// ([`WarmConfig`]): when `Some`, the backend runs it (via `exec`)
+    /// after agentd-ready and before the snapshot freezes, so a
+    /// long-lived process it spawns is captured live. A warm failure is
+    /// fail-loud — it aborts the capture (and the enable).
     async fn build_base_snapshot(
         &self,
         _spec: SandboxSpec,
+        _warm: Option<WarmConfig>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `build_base_snapshot` (needs the pooled chunk-store wrapper)".into(),

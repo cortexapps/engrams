@@ -49,6 +49,11 @@ jobs:
       cancel-in-progress: true
     outputs:
       images: ${{ steps.lanes.outputs.images }}
+      # The exact subset of container images to (re)bake — a JSON array like
+      # ["orchestrator"]. Drives the per-image matrix below so a change scoped
+      # to one image rebakes only it (helm-deploy resolves each image's SHA
+      # independently, so an unbaked image keeps its previous tag).
+      images_matrix: ${{ steps.lanes.outputs.images_matrix }}
       host_binaries: ${{ steps.lanes.outputs.host_binaries }}
       host_base: ${{ steps.lanes.outputs.host_base }}
       host_image: ${{ steps.lanes.outputs.host_image }}
@@ -89,7 +94,10 @@ jobs:
 
   bake:
     needs: detect
-    if: needs.detect.outputs.images == 'true' || github.event_name == 'workflow_dispatch'
+    # Run iff at least one image is in scope (per-image detection), or a manual
+    # dispatch (which bakes the full set). An empty matrix → job skipped; the
+    # `notify` job's `always()` still fires the deploy for the host/bundle lanes.
+    if: needs.detect.outputs.images_matrix != '[]' || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     # Per-IMAGE concurrency: a following SHA cancels only the same image's
@@ -104,7 +112,9 @@ jobs:
       # Surface every image's failure independently — easier to debug.
       fail-fast: false
       matrix:
-        image: [coordinator, host-agent, host-operator, web, orchestrator]
+        # Only the affected images (from the detector), EXCEPT a manual dispatch
+        # bakes all five. `if:` above guarantees this is never the empty array.
+        image: ${{ (github.event_name == 'workflow_dispatch' && fromJSON('["coordinator","host-agent","host-operator","web","orchestrator"]')) || fromJSON(needs.detect.outputs.images_matrix) }}
 
     steps:
       - uses: actions/checkout@v6

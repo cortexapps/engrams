@@ -11,6 +11,7 @@ import {
 } from "../../hooks/useEnabledImages";
 import { isJobActive, useEnableJobs, useRetryEnableJob } from "../../hooks/useEnableJobs";
 import type { EnableJob, EnabledImageSummary } from "../../lib/types";
+import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../page-heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -89,7 +90,9 @@ export function ImagesPanel() {
       )}
 
       {error && (
-        <p className="text-sm text-destructive">could not load enabled images — {String(error)}</p>
+        <p className="text-sm text-destructive">
+          could not load enabled images — {errorMessage(error)}
+        </p>
       )}
 
       {isLoading ? (
@@ -132,10 +135,11 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
       await del.mutateAsync({ imageUri });
       toast.success("Image disabled");
     } catch (e) {
-      // ConnectError.message carries the orchestrator profile-guard text
+      // errorMessage() carries the orchestrator profile-guard text
       // ("Can't disable — N profiles use this image: …", ADR §3) or the
-      // coordinator's own image_in_use text — surface it verbatim.
-      toast.error(e instanceof Error ? e.message : "Failed to disable image");
+      // coordinator's own image_in_use text — surfaced verbatim (rawMessage,
+      // no [code] prefix).
+      toast.error(errorMessage(e));
     }
   };
 
@@ -201,12 +205,12 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
         </div>
         {refresh.error && (
           <p className="mt-1 text-right text-xs text-destructive">
-            could not refresh — {String(refresh.error)}
+            could not refresh — {errorMessage(refresh.error)}
           </p>
         )}
         {del.error && (
           <p className="mt-1 text-right text-xs text-destructive">
-            could not disable — {del.error instanceof Error ? del.error.message : String(del.error)}
+            could not disable — {errorMessage(del.error)}
           </p>
         )}
       </TableCell>
@@ -233,7 +237,9 @@ function EnableImageDialog() {
       form.reset();
       setOpen(false);
     } catch (err) {
-      form.setError("root", { message: String(err) });
+      // Surface the coordinator's real message (e.g. a registry-auth
+      // failure) instead of an opaque `[internal] HTTP 400`.
+      form.setError("root", { message: errorMessage(err) });
     }
   };
 

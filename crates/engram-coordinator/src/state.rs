@@ -422,15 +422,11 @@ pub struct AppState {
     /// endpoints then 501). Kept here rather than on `Services` so the
     /// many test `Services` literals don't need touching.
     pub forge: Option<Arc<dyn engram_core::traits::GitForge>>,
-    /// ADR 0031: the authentication runtime — verifier chain (cookie /
-    /// service-bearer / forward-auth / synthetic), the OIDC authenticator
-    /// for `/auth/*`, the user + web-session stores, and the auth config.
-    /// Set on `main`'s run path via `run_with_registry_and_local`; `None`
-    /// in tests, where the principal layer injects a synthetic admin so the
-    /// suite runs authed-as-admin with zero changes. Kept here (not on
-    /// `Services`) for the same reason as `forge` — the many test `Services`
-    /// literals don't need touching.
-    pub auth: Option<Arc<crate::api::principal::AuthRuntime>>,
+    // ADR 0051: the per-user auth runtime (`auth: Option<Arc<AuthRuntime>>`)
+    // is removed. The coordinator no longer resolves human principals — the
+    // orchestrator owns auth/authz and calls the coordinator over the trusted
+    // app-gRPC surface. Session attribution lives in the orchestrator's task
+    // model, not a coordinator-side `sessions.user_id` column.
     /// ADR 0050 B: graceful-shutdown fanout. Flipped to `true` once
     /// `run`'s SIGTERM/ctrl-c handler fires, BEFORE axum starts draining
     /// connections. Long-lived response handlers (SSE `/events`,
@@ -484,7 +480,6 @@ impl AppState {
             pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
             forge: None,
-            auth: None,
             shutdown_tx: tokio::sync::watch::channel(false).0,
         }
     }
@@ -1481,7 +1476,6 @@ pub(crate) mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: engram_core::types::SessionState::Active,
             host_id: None,
             sandbox_id: None,
@@ -1542,7 +1536,6 @@ pub(crate) mod tests {
         let session_id = engram_core::SessionId::new();
         let session = Session {
             id: session_id,
-            user_id: None,
             status: engram_core::types::SessionState::Active,
             host_id: None,
             sandbox_id,

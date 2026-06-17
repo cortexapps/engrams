@@ -89,3 +89,13 @@ export const bundleGc = FleetService.method.bundleGc;
  * @generated from rpc engram.app.v1.FleetService.SnapshotBlobGc
  */
 export const snapshotBlobGc = FleetService.method.snapshotBlobGc;
+
+/**
+ * ADR 0044 K4 / ADR 0047-0048: the node-pool autoscaler's demand signal
+ * (was GET /api/admin/fleet/demand). Counts, headroom (both dims), the
+ * cordoned footprint, and the queue all come from PG so every coordinator
+ * replica reports identical demand.
+ *
+ * @generated from rpc engram.app.v1.FleetService.GetFleetDemand
+ */
+export const getFleetDemand = FleetService.method.getFleetDemand;

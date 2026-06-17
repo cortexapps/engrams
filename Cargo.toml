@@ -37,7 +37,6 @@ members = [
     "crates/engram-storage-local",
     "crates/engram-storage-s3",
     "crates/engram-storage-gcs",
-    "crates/engram-auth",
     "workspace-hack",
 ]
 
@@ -93,7 +92,6 @@ engram-egress-proxy = { path = "crates/engram-egress-proxy" }
 engram-crypto = { path = "crates/engram-crypto" }
 engram-oci = { path = "crates/engram-oci" }
 engram-oci-auth = { path = "crates/engram-oci-auth" }
-engram-auth = { path = "crates/engram-auth" }
 engram-storage-local = { path = "crates/engram-storage-local" }
 engram-storage-s3 = { path = "crates/engram-storage-s3" }
 engram-storage-gcs = { path = "crates/engram-storage-gcs" }
@@ -134,6 +132,9 @@ jsonwebtoken = "9"
 # grpc
 tonic = "0.12"
 tonic-build = "0.12"
+# gRPC server reflection for the coordinator's network-private app-gRPC
+# surface (grpcurl introspection). v0.12 matches the tonic 0.12 line.
+tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 

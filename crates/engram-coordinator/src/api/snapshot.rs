@@ -17,9 +17,6 @@
 
 use std::time::Duration;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::Json;
 use chrono::Utc;
 use engram_core::traits::storage::BlobStorage;
 use engram_core::types::manifest::ManifestRef;
@@ -134,17 +131,6 @@ async fn acquire_session_lease(
     Err(ApiError::Conflict(format!(
         "session {id} is busy (mid-snapshot, mid-resume, or mid-eviction); retry shortly",
     )))
-}
-
-/// Thin axum wrapper over [`snapshot_core`] — the HTTP transport for
-/// the manual snapshot endpoint. All the hardened lease / detach /
-/// CAS logic lives in the transport-agnostic core so the gRPC
-/// `SessionService::snapshot` can share it verbatim.
-pub async fn snapshot(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
-    Ok(Json(snapshot_core(&state, id).await?))
 }
 
 /// ADR 0051: transport-agnostic snapshot core (gRPC `Snapshot` + axum
@@ -316,15 +302,6 @@ pub(crate) async fn snapshot_core(
     handle.await.map_err(|join_err| {
         ApiError::Internal(format!("snapshot pipeline task panicked: {join_err}"))
     })?
-}
-
-/// Thin axum wrapper over [`resume_core`] — the HTTP transport for the
-/// manual resume endpoint.
-pub async fn resume(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
-    Ok(Json(resume_core(&state, id).await?))
 }
 
 /// ADR 0051: transport-agnostic resume core (gRPC `Resume` + axum
@@ -1606,17 +1583,6 @@ pub(crate) async fn bind_session_routing(
     state.services.host.bind_session(id, sandbox_id).await;
 }
 
-/// Thin axum wrapper over [`evict_local_core`] — the HTTP transport for
-/// the manual evict endpoint. Returns `202 Accepted` once the detached
-/// teardown task lands the session at `Idle`.
-pub async fn evict_local(
-    State(state): State<SharedState>,
-    Path(id): Path<SessionId>,
-) -> Result<StatusCode, ApiError> {
-    evict_local_core(&state, id).await?;
-    Ok(StatusCode::ACCEPTED)
-}
-
 /// ADR 0051: transport-agnostic evict core (gRPC `EvictLocal` + axum
 /// `/local`). Body moved verbatim from the legacy axum `evict_local`
 /// handler — every lease-fence, under-lease status re-read (CAS guard),
@@ -2222,7 +2188,6 @@ mod evicting_gate_tests {
     fn evicting_session(id: SessionId) -> Session {
         Session {
             id,
-            user_id: None,
             status: SessionState::Evicting,
             host_id: None,
             sandbox_id: Some(SandboxId::new()),
@@ -2352,7 +2317,7 @@ mod evicting_gate_tests {
         let id = SessionId::new();
         let (state, _local) = build_state_for_session(evicting_session(id));
 
-        let err = match resume(State(state.clone()), Path(id)).await {
+        let err = match resume_core(&state, id).await {
             Err(e) => e,
             Ok(_) => panic!("Evicting must not resume"),
         };
@@ -2378,10 +2343,9 @@ mod evicting_gate_tests {
             .sandbox_id
             .unwrap();
 
-        let code = crate::api::sessions::delete_session(State(state.clone()), Path(id))
+        crate::api::sessions::delete_session_core(&state, id)
             .await
             .expect("delete mid-eviction");
-        assert_eq!(code, StatusCode::NO_CONTENT);
         let after = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(after.status, SessionState::Completed);
 
@@ -2464,7 +2428,6 @@ mod evicting_gate_tests {
     ) -> Session {
         Session {
             id,
-            user_id: None,
             // Idle, but still carrying a host + sandbox binding — the
             // residue of a prior resume that restored a VM and bound it
             // (`bind_resumed_session` writes host then sandbox) and then

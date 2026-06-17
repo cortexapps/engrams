@@ -53,7 +53,7 @@ export function TokensPanel() {
   });
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="space-y-6">
       <PageHeading title="Tokens" />
       <Card>
         <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">

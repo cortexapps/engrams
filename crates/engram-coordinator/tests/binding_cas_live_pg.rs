@@ -85,7 +85,6 @@ async fn seed_idle_unbound(meta: &Arc<dyn MetadataStore>) -> SessionId {
         .create_session(SessionSpec {
             image: "localhost:5001/demo:binding-cas-test".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create");
@@ -187,7 +186,6 @@ async fn guarded_clear_does_not_null_a_fresh_rebind() {
         .create_session(SessionSpec {
             image: "localhost:5001/demo:binding-cas-test".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create");
@@ -230,7 +228,6 @@ async fn guarded_clear_fires_on_the_matching_sandbox() {
         .create_session(SessionSpec {
             image: "localhost:5001/demo:binding-cas-test".into(),
             mode: SessionMode::Agent,
-            user_id: None,
         })
         .await
         .expect("create");

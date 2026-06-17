@@ -21,6 +21,7 @@ use dashmap::DashMap;
 use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::SandboxBackend;
 use engram_core::types::egress::SessionEgressPolicy;
+use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -636,6 +637,55 @@ pub struct PooledBackend {
 }
 
 impl PooledBackend {
+    /// Run an image's capture-time `[warm]` hook ([`WarmConfig`]) in the
+    /// live capture VM, just before the base snapshot is frozen. The warm
+    /// command starts a long-lived process detached (e.g. `gradle
+    /// --daemon`) and exits; that process is then captured into the base
+    /// snapshot so every restored session inherits it warm.
+    ///
+    /// Fail-loud: an exec error, a non-zero exit, or a missing exit status
+    /// returns `Err` — `build_base_snapshot` propagates it, aborting the
+    /// capture and the enable. We never ship a base snapshot that a
+    /// `[warm]` hook claimed to warm but didn't.
+    async fn run_warm_hook(&self, id: SandboxId, warm: &WarmConfig) -> Result<(), SandboxError> {
+        let req = ExecRequest {
+            command: warm.command.clone(),
+            stdin: None,
+            env: Default::default(),
+            workdir: warm.workdir.clone(),
+            timeout: Some(warm.timeout()),
+        };
+        tracing::info!(
+            sandbox_id = %id,
+            command = ?warm.command,
+            timeout_secs = warm.timeout().as_secs(),
+            "running capture-time [warm] hook before base-snapshot capture",
+        );
+        let out = self.exec(id, req).await.map_err(|e| {
+            SandboxError::Snapshot(format!(
+                "[warm] hook exec failed before base-snapshot capture: {e}"
+            ))
+        })?;
+        match out.exit_status {
+            Some(0) => {
+                tracing::info!(sandbox_id = %id, "[warm] hook completed cleanly");
+                Ok(())
+            }
+            other => {
+                tracing::error!(
+                    sandbox_id = %id,
+                    exit_status = ?other,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "[warm] hook failed; aborting base-snapshot capture",
+                );
+                Err(SandboxError::Snapshot(format!(
+                    "[warm] hook exited with status {other:?} (expected 0); \
+                     aborting base-snapshot capture (see host logs for stderr)"
+                )))
+            }
+        }
+    }
+
     /// Shared body of `restore` (resume flavor) and `restore_fresh`
     /// (fresh-create flavor) — see ADR 0035 §3 for the split.
     async fn restore_with(
@@ -5713,6 +5763,7 @@ impl SandboxBackend for PooledBackend {
     async fn build_base_snapshot(
         &self,
         spec: SandboxSpec,
+        warm: Option<WarmConfig>,
     ) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0021 P1.5: no stub-harness attach — the harness lives
         // in the rootfs of the image being captured, so the snapshot
@@ -5731,6 +5782,21 @@ impl SandboxBackend for PooledBackend {
                 Ok(()) => {}
                 Err(SandboxError::InvalidSpec(_)) => {}
                 Err(e) => return Err(e),
+            }
+            // Capture-time prewarm hook (image `[warm]`): run the warm
+            // command in the live VM BEFORE the snapshot, so a process it
+            // leaves running (e.g. a `gradle --daemon`) is frozen into the
+            // base snapshot and every restored session inherits it warm.
+            // The command must start its daemon detached and exit; we run
+            // it to completion and gate the capture on a clean exit.
+            //
+            // FAIL-LOUD: a non-zero exit or timeout aborts the capture
+            // (and thus the enable) — we never ship a "cold" base snapshot
+            // that a `[warm]` hook claimed to warm. The warm command must
+            // be hermetic (baked offline caches, no network); the capture
+            // VM has the manifest `[env]` but no per-session secrets.
+            if let Some(warm) = warm {
+                self.run_warm_hook(id, &warm).await?;
             }
             // Close the cold-boot window (mirrors `start_agent`) before the
             // snapshot flush opens its own `snapshot` operation scope.

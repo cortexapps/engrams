@@ -114,6 +114,13 @@ impl EngramRepoConfig {
                 .validate_source()
                 .map_err(|e| BuildError::Config(format!("[harness]: {e}")))?;
         }
+        // A `[warm]` hook with an empty argv has nothing to run — fail the
+        // bake here rather than shipping an image whose enable aborts at
+        // base-snapshot capture (warm hooks are fail-loud).
+        if let Some(warm) = &manifest.warm {
+            warm.validate()
+                .map_err(|e| BuildError::Config(format!("[warm]: {e}")))?;
+        }
         Ok(Self { manifest, build })
     }
 
@@ -355,6 +362,38 @@ mod tests {
             msg.contains("[harness]"),
             "error must point at [harness]: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_accepts_warm_block() {
+        let cfg = EngramRepoConfig::parse(
+            r#"
+            name = "dev-brain"
+            [warm]
+            command = ["bash", "-lc", "gradle --daemon help"]
+            timeout_secs = 900
+            "#,
+        )
+        .unwrap();
+        let w = cfg.manifest.warm.expect("warm parsed");
+        assert_eq!(w.command.len(), 3);
+        assert_eq!(w.timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn parse_rejects_empty_warm_command() {
+        // An empty [warm] argv has nothing to run — fail the bake up
+        // front rather than shipping an image whose enable aborts at
+        // capture (warm hooks are fail-loud).
+        let res = EngramRepoConfig::parse(
+            r#"
+            name = "x"
+            [warm]
+            command = []
+            "#,
+        );
+        let err = format!("{:?}", res.unwrap_err());
+        assert!(err.contains("[warm]"), "error must point at [warm]: {err}");
     }
 
     #[test]
