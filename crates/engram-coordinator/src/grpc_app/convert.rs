@@ -299,18 +299,17 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_mem_used_mib,
         util_cpu_pct,
         last_heartbeat_at,
-        // ADR 0047/0048/0058 fleet telemetry added after #245 forked. The
-        // app `HostView` proto predates them; explicitly ignored to keep
-        // this totality guard honest. Exposing them on the proto is a
-        // follow-up contract change (not a silent `..`).
-        cordoned: _,
-        allocatable_mib: _,
-        reserved_mib: _,
-        free_mib: _,
-        total_vcpus: _,
-        cpu_budget_vcpus: _,
-        reserved_vcpus: _,
-        free_vcpus: _,
+        // ADR 0048 scheduler budget — now exposed on the proto (the
+        // follow-up contract change this totality guard flagged). The
+        // host-operator's scale-down wave reads them over gRPC ListHosts.
+        cordoned,
+        allocatable_mib,
+        reserved_mib,
+        free_mib,
+        total_vcpus,
+        cpu_budget_vcpus,
+        reserved_vcpus,
+        free_vcpus,
     } = v;
     app::HostView {
         id: id.to_string(),
@@ -328,6 +327,14 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_mem_used_mib: *util_mem_used_mib,
         util_cpu_pct: *util_cpu_pct,
         last_heartbeat_at: last_heartbeat_at.to_rfc3339(),
+        cordoned: *cordoned,
+        allocatable_mib: *allocatable_mib,
+        reserved_mib: *reserved_mib,
+        free_mib: *free_mib,
+        total_vcpus: *total_vcpus,
+        cpu_budget_vcpus: *cpu_budget_vcpus,
+        reserved_vcpus: *reserved_vcpus,
+        free_vcpus: *free_vcpus,
     }
 }
 

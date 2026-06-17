@@ -1,20 +1,31 @@
-//! ADR 0044 K3: thin client for the coordinator admin API the operator
-//! drives during a roll — cordon → drain → poll the drain gate → uncordon.
+//! ADR 0044 K3 / ADR 0051: app-gRPC client for the coordinator `FleetService`
+//! the operator drives during a roll — cordon → drain → poll the drain gate
+//! → uncordon — plus the scale-down wave's list/demand/delete.
 //!
-//! Auth: the admin routes sit behind `require_admin` (ADR 0031). In a synthetic
-//! -admin dev coord (`AuthMode::None`) no token is needed; in prod the operator
-//! carries a service bearer token via `ENGRAM_COORDINATOR_TOKEN`.
+//! This was a REST (`reqwest`) client until the coordinator retired its
+//! HTTP control plane (ADR 0051, gRPC-only). The REST routes the operator
+//! called (`/api/v1/admin/hosts/:id/{cordon,uncordon,drain}`, `DELETE
+//! /admin/hosts/:id`, `GET /hosts[/:id]`, `/admin/fleet/demand`) were
+//! removed but the operator was never migrated, so every call 404'd and the
+//! fleet silently stopped rolling. This client now talks `FleetService`.
+//!
+//! Auth: a service bearer token via `ENGRAM_COORDINATOR_TOKEN`, sent as
+//! `Authorization: Bearer <token>` gRPC metadata (the same scheme the cli
+//! uses). In a synthetic-admin dev coord (no accepted tokens) it's omitted.
 
 use engram_core::HostId;
-use serde::Deserialize;
+use engram_protocol::app;
+use engram_protocol::app::fleet_service_client::FleetServiceClient;
+use tonic::codegen::InterceptedService;
+use tonic::transport::Channel;
 
 use crate::error::OperatorError;
+use crate::scaler::FleetDemand;
 
-/// The `HostView` fields (GET /api/hosts/:id) the drain gate needs. serde
-/// ignores the rest of the payload.
-#[derive(Debug, Deserialize)]
+/// The `HostView` fields the drain gate needs (from `FleetService.GetHost`).
+#[derive(Debug)]
 pub struct HostStatus {
-    /// `"ready"` | `"draining"` | … — the coordinator's view of the host.
+    /// `"ready"` | `"draining"` | `"dead"` — the coordinator's view.
     #[allow(dead_code)]
     pub status: String,
     /// Live sandbox count from the host's latest heartbeat. The gate waits
@@ -22,215 +33,219 @@ pub struct HostStatus {
     pub running_sandboxes: u32,
 }
 
-/// One host's load + budget from `GET /api/hosts` (the `HostView` fields the
-/// scale-down wave planner needs). serde ignores the rest of the payload.
-/// ADR 0048: the budget fields are recent — `#[serde(default)]` keeps the
-/// operator tolerant of a pre-0048 coordinator (the wave just sees 0 free,
-/// which the 2D guard treats as "can't absorb", i.e. it won't shed — safe).
-#[derive(Clone, Debug, Deserialize)]
+/// One host's load + budget (from `FleetService.ListHosts`) — the fields the
+/// scale-down wave planner's victim selection + 2D capacity guard read.
+#[derive(Clone, Debug)]
 pub struct HostLoad {
     pub id: HostId,
     pub cordoned: bool,
     pub running_sandboxes: u32,
-    #[serde(default)]
     pub reserved_mib: u64,
-    #[serde(default)]
     pub free_mib: u64,
-    #[serde(default)]
     pub reserved_vcpus: u64,
-    #[serde(default)]
     pub free_vcpus: u64,
 }
 
-/// The coordinator API is versioned under this prefix — `api/mod.rs` nests the
-/// whole router at `/api/v1`. Centralised here (not at each call site) so a
-/// path typo can't silently 404; the `urls_are_v1_prefixed` test guards it.
-const API_V1: &str = "/api/v1";
-
-pub struct CoordClient {
-    base: String,
-    http: reqwest::Client,
+/// `Authorization: Bearer <token>` gRPC metadata interceptor (mirrors the
+/// cli's `BearerFn`). `None` omits the header — a dev coord with no accepted
+/// tokens.
+#[derive(Clone)]
+struct BearerFn {
     token: Option<String>,
 }
 
-impl CoordClient {
-    pub fn new(base: String, token: Option<String>) -> Self {
-        Self {
-            base: base.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
-            token,
+impl tonic::service::Interceptor for BearerFn {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(token) = &self.token {
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(|_| tonic::Status::invalid_argument("bearer token is not ASCII"))?,
+            );
         }
-    }
-
-    fn with_auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.token {
-            Some(t) => rb.bearer_auth(t),
-            None => rb,
-        }
-    }
-
-    /// `<base>/api/v1<suffix>`.
-    fn url(&self, suffix: &str) -> String {
-        format!("{}{API_V1}{suffix}", self.base)
-    }
-
-    async fn post(&self, op: &'static str, suffix: &str) -> Result<(), OperatorError> {
-        let resp = self
-            .with_auth(self.http.post(self.url(suffix)))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OperatorError::Coord {
-                op,
-                status: status.as_u16(),
-                body,
-            });
-        }
-        Ok(())
-    }
-
-    /// `POST /api/admin/hosts/:id/cordon` — stop the picker placing new
-    /// sessions on the host.
-    pub async fn cordon(&self, host: HostId) -> Result<(), OperatorError> {
-        self.post("cordon", &format!("/admin/hosts/{host}/cordon"))
-            .await
-    }
-
-    /// `POST /api/v1/admin/hosts/:id/uncordon`.
-    pub async fn uncordon(&self, host: HostId) -> Result<(), OperatorError> {
-        self.post("uncordon", &format!("/admin/hosts/{host}/uncordon"))
-            .await
-    }
-
-    /// `POST /api/admin/hosts/:id/drain` — evacuate every active session
-    /// (Evacuating = snapshot + warm-restore on a peer). Returns 202; the
-    /// actual progress is observed via [`Self::host_status`].
-    ///
-    /// The node-removal drain path (ADR 0045 Phase E / ADR 0048 scale-down).
-    /// Image rolls reattach and never drain (`reconcile::roll_node`); the
-    /// caller is the wave executor (`autoscale`).
-    pub async fn drain(&self, host: HostId) -> Result<(), OperatorError> {
-        self.post("drain", &format!("/admin/hosts/{host}/drain"))
-            .await
-    }
-
-    /// `DELETE /api/v1/admin/hosts/:id` (ADR 0048) — deregister a drained host
-    /// immediately after `remove_node`, so its row doesn't linger to the
-    /// dead-host TTL. The coordinator 409s if any session is still bound, so
-    /// the wave only calls this after the drain gate reports 0 sandboxes.
-    pub async fn delete_host(&self, host: HostId) -> Result<(), OperatorError> {
-        let resp = self
-            .with_auth(self.http.delete(self.url(&format!("/admin/hosts/{host}"))))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OperatorError::Coord {
-                op: "delete_host",
-                status: status.as_u16(),
-                body,
-            });
-        }
-        Ok(())
-    }
-
-    /// `GET /api/v1/hosts` (ADR 0048) — every host's load + budget, for the
-    /// scale-down wave planner's victim selection + 2D capacity guard.
-    pub async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError> {
-        let resp = self
-            .with_auth(self.http.get(self.url("/hosts")))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OperatorError::Coord {
-                op: "list_hosts",
-                status: status.as_u16(),
-                body,
-            });
-        }
-        // `GET /api/hosts` → `{ "hosts": [ HostView, … ] }`.
-        #[derive(Deserialize)]
-        struct ListResp {
-            hosts: Vec<HostLoad>,
-        }
-        Ok(resp.json::<ListResp>().await?.hosts)
-    }
-
-    /// `GET /api/v1/hosts/:id` — the drain gate. `Ok(None)` means the host is
-    /// no longer registered (already gone — nothing left to drain).
-    pub async fn host_status(&self, host: HostId) -> Result<Option<HostStatus>, OperatorError> {
-        let resp = self
-            .with_auth(self.http.get(self.url(&format!("/hosts/{host}"))))
-            .send()
-            .await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OperatorError::Coord {
-                op: "host_status",
-                status: status.as_u16(),
-                body,
-            });
-        }
-        Ok(Some(resp.json().await?))
-    }
-
-    /// `GET /api/v1/admin/fleet/demand` — the K4 autoscaler's input (schedulable
-    /// hosts + free/total guest-RAM reservation).
-    pub async fn fleet_demand(&self) -> Result<crate::scaler::FleetDemand, OperatorError> {
-        let resp = self
-            .with_auth(self.http.get(self.url("/admin/fleet/demand")))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OperatorError::Coord {
-                op: "fleet_demand",
-                status: status.as_u16(),
-                body,
-            });
-        }
-        Ok(resp.json().await?)
+        Ok(req)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+type FleetClient = FleetServiceClient<InterceptedService<Channel, BearerFn>>;
 
-    // The coordinator API is nested at `/api/v1` (api/mod.rs). This pins every
-    // path the operator builds to that prefix — the regression that a mock
-    // coordinator (which accepts any path) silently let through, caught only by
-    // the live K5 cutover.
-    #[test]
-    fn urls_are_v1_prefixed() {
-        let c = CoordClient::new("http://coord:8080/".into(), None);
-        assert_eq!(
-            c.url("/admin/hosts/h1/cordon"),
-            "http://coord:8080/api/v1/admin/hosts/h1/cordon"
-        );
-        assert_eq!(
-            c.url("/admin/hosts/h1/drain"),
-            "http://coord:8080/api/v1/admin/hosts/h1/drain"
-        );
-        assert_eq!(c.url("/hosts/h1"), "http://coord:8080/api/v1/hosts/h1");
-        assert_eq!(c.url("/hosts"), "http://coord:8080/api/v1/hosts");
-        assert_eq!(
-            c.url("/admin/hosts/h1"),
-            "http://coord:8080/api/v1/admin/hosts/h1"
-        );
-        assert_eq!(
-            c.url("/admin/fleet/demand"),
-            "http://coord:8080/api/v1/admin/fleet/demand"
-        );
+/// Ensure the endpoint carries a scheme so `Channel::from_shared` parses it
+/// — the CR's `coordinator_url` may be set scheme-less (mirrors the cli).
+fn normalize_endpoint(endpoint: &str) -> String {
+    if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
     }
+}
+
+pub struct CoordClient {
+    fleet: FleetClient,
+}
+
+impl CoordClient {
+    /// `endpoint` is the coordinator's app-gRPC address (e.g.
+    /// `http://engram-coordinator:50061`), from the CR's `coordinator_url`.
+    /// Connects lazily (`connect_lazy`) so construction stays infallible +
+    /// synchronous; a down coordinator surfaces as `Unavailable` on the
+    /// first RPC (which the reconcile loop already requeues on).
+    pub fn new(endpoint: String, token: Option<String>) -> Self {
+        let endpoint = normalize_endpoint(&endpoint);
+        let channel = Channel::from_shared(endpoint.clone())
+            .unwrap_or_else(|e| panic!("invalid coordinator gRPC endpoint {endpoint:?}: {e}"))
+            .connect_lazy();
+        let fleet = FleetServiceClient::with_interceptor(channel, BearerFn { token });
+        Self { fleet }
+    }
+
+    /// `FleetService.CordonHost` — stop the picker placing new sessions on
+    /// the host.
+    pub async fn cordon(&self, host: HostId) -> Result<(), OperatorError> {
+        self.fleet
+            .clone()
+            .cordon_host(app::CordonHostRequest {
+                host_id: host.to_string(),
+            })
+            .await
+            .map_err(|status| OperatorError::Rpc {
+                op: "cordon",
+                status: Box::new(status),
+            })?;
+        Ok(())
+    }
+
+    /// `FleetService.UncordonHost`.
+    pub async fn uncordon(&self, host: HostId) -> Result<(), OperatorError> {
+        self.fleet
+            .clone()
+            .uncordon_host(app::UncordonHostRequest {
+                host_id: host.to_string(),
+            })
+            .await
+            .map_err(|status| OperatorError::Rpc {
+                op: "uncordon",
+                status: Box::new(status),
+            })?;
+        Ok(())
+    }
+
+    /// `FleetService.AdminDrainHost` — the cordon+evacuate admin drain (the
+    /// old `POST /admin/hosts/:id/drain`), NOT the soft member-facing
+    /// `DrainHost` status flip. Returns the evacuating-session set; the wave
+    /// observes actual progress via [`Self::host_status`], so we ignore it.
+    pub async fn drain(&self, host: HostId) -> Result<(), OperatorError> {
+        self.fleet
+            .clone()
+            .admin_drain_host(app::AdminDrainHostRequest {
+                host_id: host.to_string(),
+            })
+            .await
+            .map_err(|status| OperatorError::Rpc {
+                op: "drain",
+                status: Box::new(status),
+            })?;
+        Ok(())
+    }
+
+    /// `FleetService.DeleteHost` (the old `DELETE /admin/hosts/:id`, ADR
+    /// 0048) — deregister a drained host. The coordinator returns
+    /// `FAILED_PRECONDITION` if any session is still bound, so the wave only
+    /// calls this after the drain gate reports 0 sandboxes.
+    pub async fn delete_host(&self, host: HostId) -> Result<(), OperatorError> {
+        self.fleet
+            .clone()
+            .delete_host(app::DeleteHostRequest {
+                host_id: host.to_string(),
+            })
+            .await
+            .map_err(|status| OperatorError::Rpc {
+                op: "delete_host",
+                status: Box::new(status),
+            })?;
+        Ok(())
+    }
+
+    /// `FleetService.ListHosts` — every host's load + budget, for the
+    /// scale-down wave planner's victim selection + 2D capacity guard.
+    pub async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError> {
+        let resp = self
+            .fleet
+            .clone()
+            .list_hosts(app::ListHostsRequest {})
+            .await
+            .map_err(|status| OperatorError::Rpc {
+                op: "list_hosts",
+                status: Box::new(status),
+            })?;
+        resp.into_inner()
+            .hosts
+            .into_iter()
+            .map(host_view_to_load)
+            .collect()
+    }
+
+    /// `FleetService.GetHost` — the drain gate. `Ok(None)` means the host is
+    /// no longer registered (already gone — nothing left to drain), faithful
+    /// to the old `GET /hosts/:id` 404 → `None`.
+    pub async fn host_status(&self, host: HostId) -> Result<Option<HostStatus>, OperatorError> {
+        match self
+            .fleet
+            .clone()
+            .get_host(app::GetHostRequest {
+                host_id: host.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => Ok(resp.into_inner().host.map(|v| HostStatus {
+                status: v.status,
+                running_sandboxes: v.running_sandboxes,
+            })),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(OperatorError::Rpc {
+                op: "host_status",
+                status: Box::new(status),
+            }),
+        }
+    }
+
+    /// `FleetService.GetFleetDemand` — the K4 autoscaler's input.
+    pub async fn fleet_demand(&self) -> Result<FleetDemand, OperatorError> {
+        let resp = self
+            .fleet
+            .clone()
+            .get_fleet_demand(app::GetFleetDemandRequest {})
+            .await
+            .map_err(|status| OperatorError::Rpc {
+                op: "fleet_demand",
+                status: Box::new(status),
+            })?
+            .into_inner();
+        Ok(FleetDemand {
+            schedulable_hosts: resp.schedulable_hosts,
+            free_mib: resp.free_mib,
+            total_mib: resp.total_mib,
+            free_vcpus: resp.free_vcpus,
+            total_vcpus: resp.total_vcpus,
+            queued_sessions: resp.queued_sessions,
+            queued_mib: resp.queued_mib,
+            queued_vcpus: resp.queued_vcpus,
+        })
+    }
+}
+
+/// proto `HostView` → the operator's `HostLoad` (the wave-relevant subset).
+fn host_view_to_load(v: app::HostView) -> Result<HostLoad, OperatorError> {
+    let id: HostId = v.id.parse().map_err(|_| {
+        OperatorError::Invalid(format!("coordinator returned malformed host id {:?}", v.id))
+    })?;
+    Ok(HostLoad {
+        id,
+        cordoned: v.cordoned,
+        running_sandboxes: v.running_sandboxes,
+        reserved_mib: v.reserved_mib,
+        free_mib: v.free_mib,
+        reserved_vcpus: v.reserved_vcpus,
+        free_vcpus: v.free_vcpus,
+    })
 }

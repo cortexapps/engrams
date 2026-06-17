@@ -18,12 +18,13 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 INTEG_DIR="./var/integration"
-COORD="http://127.0.0.1:8090"
 
-AUTH_HEADER=()
-if [ -n "${ENGRAM_TOKEN:-}" ]; then
-    AUTH_HEADER=(-H "Authorization: Bearer $ENGRAM_TOKEN")
-fi
+# ADR 0051: session create/delete go over the coord's app-gRPC via
+# engram-cli (the REST surface is gone). Endpoint + bearer default to the
+# `just dev` stack; integration-bake-demo.sh (steps 1-3) builds the cli.
+ENGRAM_CLI="${ENGRAM_INTEG_BIN_DIR:-./target/release}/engram-cli"
+export ENGRAM_APP_GRPC_ADDR="${ENGRAM_APP_GRPC_ADDR:-http://127.0.0.1:50061}"
+export ENGRAM_APP_GRPC_TOKENS="${ENGRAM_APP_GRPC_TOKENS:-dev-app-grpc-token}"
 
 dump_logs() {
     echo ""
@@ -40,25 +41,19 @@ IMAGE_URI=$(bash deploy/dev/integration-bake-demo.sh)
 echo "    image enabled and ready: $IMAGE_URI"
 
 echo ""
-echo "==> step 4/5: POST /sessions (cold-create with chunks already local)"
-SESS_BODY=$(printf '{"image": "%s", "harness": {"kind": "none"}}' "$IMAGE_URI")
+echo "==> step 4/5: session create (cold-create with chunks already local)"
+# --dev-vm == the old harness {kind:none}: create + boot, leave the baked
+# harness undriven. Prints the session_id on stdout.
 T0=$(date +%s.%N)
-SESS_RESP=$(curl -fsS -X POST "${AUTH_HEADER[@]}" \
-    -H "Content-Type: application/json" \
-    -d "$SESS_BODY" \
-    "$COORD/api/v1/sessions")
+SESS_ID=$("$ENGRAM_CLI" session create --image "$IMAGE_URI" --dev-vm)
 T1=$(date +%s.%N)
 SESS_ELAPSED=$(echo "$T1 - $T0" | bc)
-SESS_KIND=$(echo "$SESS_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("kind","?"))')
-SESS_ID=$(echo "$SESS_RESP"  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("session_id","?"))')
 echo "    session create elapsed: ${SESS_ELAPSED}s"
 echo "    session_id: $SESS_ID"
-echo "    kind:       $SESS_KIND"
 
 echo ""
-echo "==> step 5/5: cleanup — DELETE /sessions/$SESS_ID"
-curl -fsS -X DELETE "${AUTH_HEADER[@]}" \
-    "$COORD/api/v1/sessions/$SESS_ID" >/dev/null || true
+echo "==> step 5/5: cleanup — session delete $SESS_ID"
+"$ENGRAM_CLI" session delete "$SESS_ID" >/dev/null || true
 echo "    session deleted"
 
 trap - ERR

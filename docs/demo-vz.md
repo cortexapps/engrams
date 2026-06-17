@@ -102,50 +102,41 @@ recipe still exists, used by `just vz-test`.)
 ## Step 4 — exercise the lifecycle
 
 ```bash
+# The control plane is app-gRPC (ADR 0051); drive it with the `engram` CLI.
 # Pre-req: enable an image (one-time):
-curl -sS -X POST http://127.0.0.1:8090/api/enabled-images \
-    -H 'Content-Type: application/json' \
-    -d '{"image_uri": "localhost:5001/demo-claude:warm-1"}'
+engram image enable --uri localhost:5001/demo-claude:warm-1
 
-SID=$(curl -sS -X POST http://127.0.0.1:8090/sessions \
-        -H 'Content-Type: application/json' \
-        -d '{"image": "localhost:5001/demo-claude:warm-1",
-             "harness": {"kind": "builtin", "name": "claude"}}' \
-      | jq -r .session_id)
+# Create a session driving the image's baked claude harness.
+SID=$(engram session create --image localhost:5001/demo-claude:warm-1)
 
 # Watch the chat-shaped wire.
-curl -N http://127.0.0.1:8090/sessions/$SID/events
+engram session logs "$SID" --since 0
 # Expect:
 #   status_changed (pending → active)
 #   harness_idle
 #   <agent activity if a prompt is fed>
 
 # Send a prompt.
-curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
-    -H 'Content-Type: application/json' \
-    -d '{"text": "list /workspace and tell me what you see"}'
+engram session prompt "$SID" "list /workspace and tell me what you see"
 
 # Idle eviction → hot auto-resume. The default soft TTL is 5 min
 # (ADR 0039 follow-up #20) so it doesn't evict interactive sessions
 # mid-conversation; run the coord/host with `ENGRAM_IDLE_TTL_SECS=30`
 # so the sleeps below trip it.
 sleep 35       # crosses the demo soft TTL (ENGRAM_IDLE_TTL_SECS=30)
-curl http://127.0.0.1:8090/sessions/$SID  # status: idle
-curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
-    -H 'Content-Type: application/json' \
-    -d '{"text": "still there?"}'
+engram session get "$SID"  # status: idle
+engram session prompt "$SID" "still there?"
 # Hot resume: VZ rootfs clone restored, bridge re-binds, harness
 # adapter dials back, sub-second.
 
 # ADR 0005 — cold-tier flush + cold resume.
 sleep 35       # back to Idle
-# Explicitly flush (Stage 5 admin endpoint; same primitive Stage 7's
-# disk-pressure detector calls implicitly).
-curl -sS -X POST http://127.0.0.1:8090/api/admin/sessions/$SID/flush
-curl http://127.0.0.1:8090/sessions/$SID  # status: cold_evicted
+# Explicitly flush (same primitive Stage 7's disk-pressure detector
+# calls implicitly).
+engram admin flush "$SID"
+engram session get "$SID"  # status: cold_evicted
 # Resume from cold tier — downloads blob, untars, restores on any host.
-curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
-    -d '{"text": "still there after cold flush?"}'
+engram session prompt "$SID" "still there after cold flush?"
 
 # Force a Dead session (snapshot invalidation).
 sleep 35
@@ -153,9 +144,8 @@ rm -rf var/engram/snapshots/$SID
 # Also clear the cold copy from the blob backend; otherwise resume
 # falls back to cold tier successfully.
 ENGRAM_BLOB_BACKEND=local && rm -rf var/engram/blobs/engram/snapshots/*
-curl -sS -X POST http://127.0.0.1:8090/sessions/$SID/prompt \
-    -d '{"text": "this should fail"}'
-# Expect HTTP 410 Gone with body "snapshot_invalidated".
+engram session prompt "$SID" "this should fail"
+# Expect a FAILED_PRECONDITION error carrying "snapshot_invalidated".
 ```
 
 ## Diagnostic tips

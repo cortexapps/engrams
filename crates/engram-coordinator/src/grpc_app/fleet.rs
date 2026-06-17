@@ -242,6 +242,37 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         }))
     }
 
+    // Faithful gRPC port of the old `DELETE /api/admin/hosts/:id` handler
+    // (ADR 0048; dropped in the ADR 0051 gRPC-only migration but never
+    // re-added, which stranded the operator's scale-down wave). 204 →
+    // empty Ok; the "still bound" 409 → FAILED_PRECONDITION; other errors
+    // → INTERNAL.
+    async fn delete_host(
+        &self,
+        req: Request<app::DeleteHostRequest>,
+    ) -> Result<Response<app::DeleteHostResponse>, Status> {
+        self.auth.check(&req)?;
+        let host_id: engram_core::HostId = req
+            .get_ref()
+            .host_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("malformed host_id"))?;
+        use engram_core::types::session::DeleteHostOutcome;
+        match self.state.services.meta.delete_host(host_id).await {
+            Ok(DeleteHostOutcome::Deleted) => {
+                // Drop the in-memory routing entry (best-effort; a sibling
+                // replica clears its own on the host_dead notify / TTL).
+                self.state.host_registry.unregister(host_id);
+                tracing::info!(%host_id, "admin: host deregistered (row deleted)");
+                Ok(Response::new(app::DeleteHostResponse {}))
+            }
+            Ok(DeleteHostOutcome::SessionsBound(n)) => Err(Status::failed_precondition(format!(
+                "host {host_id} still has {n} bound session(s); drain it before deleting"
+            ))),
+            Err(e) => Err(Status::internal(format!("delete_host: {e}"))),
+        }
+    }
+
     async fn get_storage_summary(
         &self,
         req: Request<app::GetStorageSummaryRequest>,
