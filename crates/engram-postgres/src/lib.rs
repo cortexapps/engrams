@@ -2396,7 +2396,11 @@ impl MetadataStore for PostgresStore {
             WITH next AS (
                 UPDATE sessions
                    SET next_event_idx = next_event_idx + 1,
-                       updated_at = NOW()
+                       updated_at = NOW(),
+                       -- Track A: honest activity clock, bumped on every
+                       -- event append (unlike last_active_at, which only
+                       -- moves on state transitions).
+                       last_event_at = NOW()
                  WHERE id = $1
              RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
             ),
