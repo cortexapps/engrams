@@ -69,6 +69,16 @@ pub trait DockerRunner: Send + Sync {
 
     async fn rmi(&self, image_tag: &str) -> Result<(), DockerError>;
 
+    /// Reclaim the BuildKit build cache (`docker builder prune`). After a
+    /// build the cache holds a full copy of the image's layers; `rmi` drops
+    /// the image reference but NOT that cache, so for a large warm image the
+    /// ~image-sized cache lingers on disk through the ext4 pack and can
+    /// overrun the runner (`mke2fs: No space left on device`). The baker
+    /// calls this between export and pack to drop the pack's disk peak to
+    /// (exported tree + ext4). Best-effort — a prune failure must not fail
+    /// the bake.
+    async fn builder_prune(&self) -> Result<(), DockerError>;
+
     /// Read `Config.Env` + `Config.WorkingDir` off a created container
     /// (or image) via `docker inspect`. A created-but-unstarted
     /// container's `Config` mirrors the image's `ENV`/`WORKDIR`, so the
@@ -271,6 +281,15 @@ impl DockerRunner for DockerCli {
         let mut cmd = self.cmd();
         cmd.arg("rmi").arg("-f").arg(image_tag);
         run_to_completion(cmd, "docker rmi").await
+    }
+
+    async fn builder_prune(&self) -> Result<(), DockerError> {
+        // `-a` (all unused cache, not just dangling) + `-f` (no prompt). The
+        // bake just exported the only image it built, so there is no cache
+        // worth keeping for this run; CI runners start cache-cold anyway.
+        let mut cmd = self.cmd();
+        cmd.arg("builder").arg("prune").arg("-af");
+        run_to_completion(cmd, "docker builder prune").await
     }
 
     async fn inspect_config(&self, id: &str) -> Result<DockerImageConfig, DockerError> {
