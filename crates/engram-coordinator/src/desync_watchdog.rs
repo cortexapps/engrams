@@ -33,6 +33,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
+use engram_core::traits::metadata::DesyncedSession;
 use engram_core::types::SessionState;
 
 use crate::state::{SessionEvent, SharedState};
@@ -201,9 +202,43 @@ pub(crate) async fn run_once(
                 Ok(()) => {
                     ::metrics::counter!(crate::metrics::HARNESS_REHANDSHAKE_TOTAL).increment(1);
                 }
-                // No live harness to nudge (detached) or a transient host
-                // error — the time-based escalation above catches it if the
-                // session stays wedged.
+                // `NotFound` (= `NotAttached`): no live vsock to nudge — the
+                // harness link died without an EOF (its blocking read never
+                // woke, the reconnect loop never fired), or the harness exited
+                // and agentd, which only (re)spawns on a host `SpawnHarness`,
+                // sat idle. The FC VM is likely still alive, so re-establish
+                // the harness IN PLACE: re-issue the resume `start_agent`, which
+                // drives agentd's ADR 0045 C1 reattach arm (SIGUSR1 a live
+                // harness to re-dial, or respawn an exited one) — no
+                // snapshot/destroy/restore. Only on a persistent failure does
+                // the time-based escalation above fall through to teardown.
+                Err(engram_core::SandboxError::NotFound) => {
+                    match reattach_harness_in_place(state, d).await {
+                        Ok(true) => {
+                            ::metrics::counter!(crate::metrics::HARNESS_INPLACE_REATTACH_TOTAL)
+                                .increment(1);
+                            tracing::info!(
+                                session_id = %d.session_id,
+                                sandbox_id = %d.sandbox_id,
+                                "desync watchdog re-attached harness in place (live VM, no teardown)",
+                            );
+                        }
+                        // Nothing to reattach: the session moved off this
+                        // sandbox since the scan, or no manifest bundle (dev-VM
+                        // / process backend). Escalation catches a real wedge.
+                        Ok(false) => tracing::debug!(
+                            session_id = %d.session_id,
+                            "desync watchdog: in-place reattach skipped; escalation will catch a persistent wedge",
+                        ),
+                        Err(e) => tracing::debug!(
+                            session_id = %d.session_id,
+                            error = %e,
+                            "desync watchdog: in-place reattach failed; escalation will catch a persistent wedge",
+                        ),
+                    }
+                }
+                // A transient host error — the time-based escalation above
+                // catches it if the session stays wedged.
                 Err(e) => tracing::debug!(
                     session_id = %d.session_id,
                     error = %e,
@@ -213,6 +248,45 @@ pub(crate) async fn run_once(
         }
     }
     Ok(flagged.len())
+}
+
+/// ADR 0034 Track A in-place reattach. Re-establish a desynced session's
+/// harness on its EXISTING live sandbox without a teardown, by re-issuing the
+/// resume `start_agent` against that sandbox: agentd's ADR 0045 C1 arm SIGUSR1s
+/// a live-but-wedged harness to drop+re-dial, or reaps-and-respawns an exited
+/// one. The spec is resume-shaped (`prompt = None`), shared with
+/// `finish_resume_to_active`. Called only when `rehandshake` returned
+/// `NotFound` (dead vsock).
+///
+/// - `Ok(true)`  — reattach issued (`start_agent` succeeded). The harness
+///   re-emits `Idle`, which bumps `last_event_at` and drops the session out of
+///   the flagged set.
+/// - `Ok(false)` — nothing to do: the session moved off `d.sandbox_id` since
+///   the scan, or no manifest bundle (dev-VM / process backend).
+/// - `Err(_)`    — host/meta error; the time-based escalation catches a
+///   persistent wedge.
+pub(crate) async fn reattach_harness_in_place(
+    state: &SharedState,
+    d: &DesyncedSession,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let session = state.services.meta.get_session(d.session_id).await?;
+    // Re-confirm the session is still bound to the sandbox we flagged — a
+    // concurrent eviction/resume may have moved it since the scan, and we must
+    // never re-issue start_agent against a stale or unbound sandbox.
+    if session.sandbox_id != Some(d.sandbox_id) {
+        return Ok(false);
+    }
+    let Some((agent, policy)) =
+        crate::api::snapshot::resolve_resume_agent_and_policy(state, &session, d.sandbox_id).await
+    else {
+        return Ok(false);
+    };
+    state
+        .services
+        .host
+        .start_agent(d.sandbox_id, agent, policy)
+        .await?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -312,10 +386,12 @@ mod tests {
         }
     }
 
-    /// The incident shape, freshly past the stuck TTL: the watchdog flags
-    /// it and takes the non-destructive re-handshake path (no live harness
-    /// in the test, so the nudge errors harmlessly), leaving the session
-    /// Active — NOT escalated to eviction.
+    /// The incident shape, freshly past the stuck TTL: the watchdog flags it
+    /// and takes the non-destructive recovery path — NOT escalation. The test
+    /// host has no live harness, so `rehandshake` returns `NotFound`, which now
+    /// routes to the in-place reattach (ADR 0034 Track A). With no manifest
+    /// bundle in the test that's a graceful no-op, so the session stays Active
+    /// (the reattach branch ran without escalating or erroring).
     #[tokio::test]
     async fn rehandshakes_recently_desynced_session() {
         let session_id = engram_core::SessionId::new();
@@ -338,7 +414,28 @@ mod tests {
         assert_eq!(
             after.status,
             engram_core::types::SessionState::Active,
-            "within the escalate TTL the watchdog re-handshakes, not evicts",
+            "within the escalate TTL the watchdog recovers in place, not evicts",
+        );
+    }
+
+    /// In-place reattach guard: a session that has moved off the sandbox the
+    /// watchdog flagged (a concurrent eviction/resume re-bound it) must be a
+    /// no-op — we must never re-issue `start_agent` against a stale sandbox.
+    #[tokio::test]
+    async fn reattach_in_place_skips_a_moved_session() {
+        let session_id = engram_core::SessionId::new();
+        let flagged_sandbox = engram_core::SandboxId::new();
+        let moved_to_sandbox = engram_core::SandboxId::new();
+        let root = TempDir::new().unwrap();
+        // The live session is now bound to a DIFFERENT sandbox than the one the
+        // desync record names.
+        let (state, _meta) =
+            build_state_and_meta(active_session(session_id, moved_to_sandbox), root.path());
+        let d = desynced(session_id, flagged_sandbox, chrono::Duration::minutes(6));
+
+        assert!(
+            !reattach_harness_in_place(&state, &d).await.unwrap(),
+            "a session re-bound to another sandbox must not be reattached in place",
         );
     }
 

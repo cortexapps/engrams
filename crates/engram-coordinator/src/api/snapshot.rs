@@ -79,6 +79,68 @@ fn placeholder_egress_policy(
     }
 }
 
+/// Build the resume-shape `AgentSpec` + `SessionEgressPolicy` to (re)attach a
+/// harness to `sandbox_id` for `session`. Loads the image manifest bundle +
+/// secrets ONCE and reuses it for both the spec and the policy.
+///
+/// The spec is **resume-shaped**: `resolve_harness(prompt = None)`. Prompt-less
+/// is load-bearing — the initial prompt rides the harness env, so a boot-shape
+/// respawn of an *exited* harness would re-inject it mid-conversation; the
+/// resume shape just `--resume`s the existing claude session and goes `Idle`.
+///
+/// Shared by [`finish_resume_to_active`] (a fresh post-restore sandbox) and the
+/// ADR 0034 Track A desync watchdog's in-place reattach (the session's existing
+/// LIVE sandbox). `None` when the manifest bundle can't load (dev-VM / process
+/// backend) — callers skip the agent attach, exactly as resume did before.
+pub(crate) async fn resolve_resume_agent_and_policy(
+    state: &SharedState,
+    session: &Session,
+    sandbox_id: SandboxId,
+) -> Option<(
+    engram_core::types::sandbox::AgentSpec,
+    engram_core::types::egress::SessionEgressPolicy,
+)> {
+    let id = session.id;
+    // ADR 0016 §A.1.7: load manifest + SecretBundle + env once; reused for the
+    // launch env AND the egress policy (avoids a second SecretStore round-trip).
+    let (resume_bundle, resume_base_env) =
+        crate::api::sessions::resolve_session_env(state, session).await;
+    let b = resume_bundle.as_ref()?;
+    // Same split as create: agentd holds the durable session env (image env +
+    // secrets + session id); the harness gets the forge broker token as a
+    // per-spawn extra, from the PG-sealed row (ADR 0047) — same token across
+    // coord restarts and replicas.
+    let mut session_env = resume_base_env.clone();
+    session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
+    let mut agent = crate::api::sessions::resolve_harness(
+        state,
+        b.manifest.harness.as_ref(),
+        session.mode,
+        id,
+        None,
+        session_env,
+        b.manifest.workdir.clone(),
+    )
+    .ok()
+    .flatten()?;
+    crate::api::sessions::inject_harness_env(state, id, b.manifest.git.as_ref(), &mut agent.env)
+        .await;
+    // Rebuild the SessionEgressPolicy for `sandbox_id`. Falls back to the
+    // legacy placeholder when the host has no guest IP (process backend, VZ in
+    // some configs) or the IP is unparseable — same as the create path.
+    let policy = crate::api::sessions::build_resume_egress_policy(
+        state,
+        id,
+        sandbox_id,
+        &b.bundle,
+        &b.manifest,
+        &b.env,
+    )
+    .await
+    .unwrap_or_else(|| placeholder_egress_policy(id, sandbox_id));
+    Some((agent, policy))
+}
+
 #[derive(Serialize)]
 pub struct SnapshotResponse {
     pub session_id: SessionId,
@@ -1059,71 +1121,15 @@ pub async fn finish_resume_to_active(
     // a second SecretStore round-trip on the resume hot path.
     // `resolve_session_env` folds the manifest env + secrets + the
     // per-request overrides identically to the `/exec` path.
-    let (resume_bundle, resume_base_env) =
-        crate::api::sessions::resolve_session_env(state, session).await;
-    // ADR 0021 P1.3: resolve_harness reads the image manifest's
-    // [harness] block + the session's mode, not a per-session
-    // HarnessSpec. The resume bundle already loaded the manifest;
-    // a None bundle (manifest fetch failed above) means we skip the
-    // agent re-attach, same as the dev-VM path.
-    let agent_opt = match resume_bundle.as_ref() {
-        Some(b) => {
-            // Same split as create: agentd holds the durable session env
-            // (image env + secrets + session id); the harness gets the
-            // forge broker token as a per-spawn extra — loaded from the
-            // PG-sealed row (ADR 0047), so it's the same token across
-            // coord restarts and replicas.
-            let mut session_env = resume_base_env.clone();
-            session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
-            match crate::api::sessions::resolve_harness(
-                state,
-                b.manifest.harness.as_ref(),
-                session.mode,
-                id,
-                None,
-                session_env,
-                b.manifest.workdir.clone(),
-            )
-            .ok()
-            .flatten()
-            {
-                Some(mut agent) => {
-                    crate::api::sessions::inject_harness_env(
-                        state,
-                        id,
-                        b.manifest.git.as_ref(),
-                        &mut agent.env,
-                    )
-                    .await;
-                    Some(agent)
-                }
-                None => None,
-            }
-        }
-        None => None,
-    };
+    // Build the resume-shape AgentSpec + egress policy and (re)attach the
+    // harness to the restored sandbox. `resolve_resume_agent_and_policy`
+    // (shared with the ADR 0034 Track A in-place reattach) returns `None`
+    // when the manifest bundle can't load (dev-VM / process backend) — we
+    // skip the agent re-attach then, same as before.
     let mut start_agent_failed = false;
-    if let Some(agent) = agent_opt {
-        // Rebuild the SessionEgressPolicy for the new sandbox.
-        // Three failure modes fall back to the legacy placeholder so
-        // we never regress to "resume errors out": (a) the manifest
-        // bundle load failed above (already warn-logged); (b) the
-        // host has no guest IP for this sandbox (process backend,
-        // VZ in some configs — `build_resume_egress_policy` returns
-        // None); (c) the IP is unparseable.
-        let policy = match resume_bundle.as_ref() {
-            Some(b) => crate::api::sessions::build_resume_egress_policy(
-                state,
-                id,
-                new_sandbox_id,
-                &b.bundle,
-                &b.manifest,
-                &b.env,
-            )
-            .await
-            .unwrap_or_else(|| placeholder_egress_policy(id, new_sandbox_id)),
-            None => placeholder_egress_policy(id, new_sandbox_id),
-        };
+    if let Some((agent, policy)) =
+        resolve_resume_agent_and_policy(state, session, new_sandbox_id).await
+    {
         if let Err(e) = state
             .services
             .host

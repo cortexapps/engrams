@@ -162,6 +162,15 @@ pub const HARNESS_DESYNC_DETECTED_TOTAL: &str = "engram_harness_desync_detected_
 /// `engram_eviction_nominated_total{source="desync_watchdog"}`).
 pub const HARNESS_REHANDSHAKE_TOTAL: &str = "engram_harness_rehandshake_total";
 
+/// Counter (ADR 0034 Track A). In-place harness reattaches the desync
+/// watchdog issued when `rehandshake` returned `NotFound` (the harness vsock
+/// is dead but the FC VM is alive): re-issuing the resume `start_agent` drives
+/// agentd's reattach/respawn arm (SIGUSR1 a live-but-wedged harness, or respawn
+/// an exited one) without a snapshot/destroy/restore. A successful one re-emits
+/// `Idle` and the session leaves the flagged set; persistent failure still
+/// escalates to the eviction lane.
+pub const HARNESS_INPLACE_REATTACH_TOTAL: &str = "engram_harness_inplace_reattach_total";
+
 /// Counter (ADR 0034). Eviction scanner gave up after the retry
 /// budget (20 attempts ≈ 3 min) and fell the session back to
 /// HostLost. Should be ~0 — alarm-worthy if rising: it means the
