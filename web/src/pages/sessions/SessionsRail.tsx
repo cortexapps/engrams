@@ -55,7 +55,7 @@ export function SessionsRail() {
             action. Active rows use sidebar-accent (green), so no lime clash.
             Drives the one global New Session dialog (shared with `c` + ⌘K). */}
         <Button className="w-full" onClick={openNewSession}>
-          New session
+          New task
         </Button>
       </SidebarHeader>
 
@@ -90,10 +90,10 @@ export function SessionsRail() {
                 // glyph instead — glyph + word, the product's status grammar.
                 <p className="flex items-center gap-1.5 px-2 py-1.5 text-xs text-sidebar-foreground">
                   <TriangleAlert className="size-3.5 shrink-0" />
-                  Couldn’t load sessions.
+                  Couldn’t load tasks.
                 </p>
               ) : rows.length === 0 ? (
-                <p className="px-2 py-2 text-xs text-sidebar-foreground/70">No sessions yet.</p>
+                <p className="px-2 py-2 text-xs text-sidebar-foreground/70">No tasks yet.</p>
               ) : (
                 rows.map((r, i) => {
                   const showNum = jumpHeld && i < 9;
@@ -168,7 +168,7 @@ export function SessionsRail() {
             <SidebarMenuButton asChild isActive={onMyList}>
               <Link to="/sessions">
                 <Layers />
-                <span>My sessions</span>
+                <span>My tasks</span>
               </Link>
             </SidebarMenuButton>
             {total > 0 && <SidebarMenuBadge>{total}</SidebarMenuBadge>}
@@ -178,7 +178,7 @@ export function SessionsRail() {
               <SidebarMenuButton asChild isActive={onAllList}>
                 <Link to="/sessions/all">
                   <ListChecks />
-                  <span>All sessions</span>
+                  <span>All tasks</span>
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>

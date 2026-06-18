@@ -252,17 +252,17 @@ const UserMessage: FC = () => {
 };
 
 const COMPOSER_BANNER: Partial<Record<SessionState, string>> = {
-  dead: "This session is dead — fork it to continue.",
-  completed: "This session is completed — fork it to continue.",
-  failed: "This session failed during create — start a new one.",
+  dead: "This task is dead — fork it to continue.",
+  completed: "This task is completed — fork it to continue.",
+  failed: "This task failed during create — start a new one.",
   host_lost:
-    "The host running this session went away — waiting for the reconciler to resolve to idle (resumable) or dead.",
+    "The host running this task went away — waiting for the reconciler to resolve to idle (resumable) or dead.",
 };
 
 const COMPOSER_HINT: Partial<Record<SessionState, string>> = {
-  idle: "Session is idle — sending will resume it.",
-  created: "Session is still starting up — the harness will be ready in a moment.",
-  guest_ready: "Session is still starting up — the harness will be ready in a moment.",
+  idle: "Task is idle — sending will resume it.",
+  created: "Task is still starting up — the harness will be ready in a moment.",
+  guest_ready: "Task is still starting up — the harness will be ready in a moment.",
 };
 
 // The queued-message rail (ADR 0052): a message sent while a run is in flight
@@ -347,7 +347,7 @@ const Composer: FC = () => {
           // one-liner, so newline is the cheap key. submitMode="none" leaves
           // submit entirely to our keydown so it isn't run-gated.
           submitMode="none"
-          placeholder="Reply to the session…   (⌘↵ to send)"
+          placeholder="Reply to the task…   (⌘↵ to send)"
           className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/80"
           rows={1}
           aria-label="Message input"

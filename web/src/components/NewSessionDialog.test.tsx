@@ -84,7 +84,7 @@ describe("NewSessionDialog (profile picker)", () => {
       <NewSessionDialog open onOpenChange={() => {}} showTrigger={false} onCreated={() => {}} />,
     );
     // Router defers the initial render to a microtask — await the first match.
-    expect(await screen.findByPlaceholderText("Describe the task for this session…")).toBeTruthy();
+    expect(await screen.findByPlaceholderText("Describe the task…")).toBeTruthy();
   });
 
   it("shows empty state when no profiles are configured", async () => {
