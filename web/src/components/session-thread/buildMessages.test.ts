@@ -443,10 +443,10 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
     expect(user.metadata?.custom?.pending).toBeUndefined();
   });
 
-  test("a still-queued user echo (no run_started yet) stays pending/greyed", () => {
-    const { messages } = buildMessages(
+  test("a still-queued user echo (no run_started yet) is held OUT of the transcript", () => {
+    const { messages, queue } = buildMessages(
       indexed([
-        // A run is in flight; a type-ahead prompt is echoed but not yet consumed.
+        // A run is in flight; a type-ahead prompt is echoed + queued, not consumed.
         { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
         {
           type: "agent_message",
@@ -457,12 +457,16 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
           prompt_id: "p2",
           at: AT2,
         },
+        { type: "prompt_queued", prompt_id: "p2", summary: "and then deploy", at: AT2 },
       ]),
       SID,
       "idle",
     );
-    const queued = messages.find((m) => m.id === "p2")!;
-    expect(queued.metadata?.custom?.pending).toBe(true);
+    // Held: NOT in the thread — it lives in the composer rail until its run
+    // starts (then it joins the conversation at the consumption point).
+    expect(messages.some((m) => m.id === "p2")).toBe(false);
+    // Surfaced via `queue` for the rail.
+    expect(queue.map((q) => q.promptId)).toContain("p2");
   });
 });
 
@@ -498,7 +502,7 @@ describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
     ).toEqual([{ promptId: "p1", summary: "v2" }]);
   });
 
-  test("prompt_dequeued removes the entry AND drops its greyed bubble from the thread", () => {
+  test("prompt_dequeued removes the queue entry; the message never enters the transcript", () => {
     const result = buildMessages(
       indexed([
         {
@@ -516,7 +520,7 @@ describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
       SID,
     );
     expect(result.queue).toEqual([]);
-    // Pulled back into the composer / cancelled → no longer in the conversation.
+    // Held while queued, then recalled/cancelled — it never joined the conversation.
     expect(real(result.messages).some((m) => m.id === "p1")).toBe(false);
   });
 
@@ -530,6 +534,66 @@ describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
         SID,
       ).queue.map((q) => q.promptId),
     ).toEqual(["p1", "p2"]);
+  });
+
+  test("a message queued mid-run lands at its consumption point, below the prior response (59cb8557)", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u0",
+          role: "user",
+          text: "Count 1-60",
+          prompt_id: "p0",
+          at: AT,
+        },
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p0", at: AT },
+        // "Hi" queued mid-1-60-run: its echo is logged HERE, before the response.
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "Hi",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "prompt_queued", prompt_id: "p1", summary: "Hi", at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "1. one…",
+          at: AT,
+        },
+        { type: "run_interrupted", run_id: "r1", at: AT },
+        // consumed AFTER the interrupt
+        { type: "run_started", run_id: "r2", prompt_summary: null, prompt_id: "p1", at: AT },
+        {
+          type: "agent_message",
+          run_id: "r2",
+          message_id: "a2",
+          role: "assistant",
+          text: "Hi! How can I help?",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r2", ok: true, at: AT },
+      ]),
+      SID,
+    );
+    const seq = real(messages).map((m) => {
+      const c = m.content;
+      const text = Array.isArray(c)
+        ? ((c.find((p) => p.type === "text") as { text?: string } | undefined)?.text ?? "")
+        : "";
+      return { role: m.role, text };
+    });
+    // Count(user) → 1-60(assistant) → Hi(user) → Hi-response(assistant): the
+    // queued "Hi" is BELOW the interrupted 1-60 response, not above it.
+    expect(seq.map((s) => s.role)).toEqual(["user", "assistant", "user", "assistant"]);
+    expect(seq.map((s) => s.text)).toEqual(["Count 1-60", "1. one…", "Hi", "Hi! How can I help?"]);
   });
 });
 

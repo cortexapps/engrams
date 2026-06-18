@@ -73,41 +73,65 @@ export function SessionThread({
     [events, sessionId, status, streamingText],
   );
 
-  // Phase 1b: optimistic prompts. A prompt the user just submitted is held
-  // here (keyed by its client-minted prompt_id) and rendered as a greyed
-  // "pending" bubble, so the message is NEVER lost in the window between
-  // pressing Enter and the server's authoritative `role:user` echo landing
-  // over SSE. When that echo (same prompt_id) arrives, the optimistic entry
-  // is pruned and `buildMessages` renders the echo with the SAME id — so it
-  // transitions in place (no duplicate, no flicker), staying greyed until
-  // its run_started{prompt_id} consumes it.
-  const [pending, setPending] = useState<{ promptId: string; text: string }[]>([]);
+  // Phase 1b: optimistic prompts. A prompt the user just submitted is held here
+  // (keyed by its client-minted prompt_id) so it's NEVER lost in the window
+  // between pressing Enter and the server's authoritative echo landing over SSE.
+  // It renders two ways, by `queued`:
+  //   - idle send (`queued:false`) → an inline user bubble in the thread, which
+  //     the durable `role:user` echo (same prompt_id) replaces in place (no
+  //     duplicate, no flicker) once it arrives.
+  //   - mid-run send (`queued:true`) → the composer's queued-message rail
+  //     (Claude-Code style), NOT the thread; `buildMessages` only drops it into
+  //     the transcript at its `run_started{prompt_id}` consumption point, so it
+  //     lands in true conversation order (below the turn it was queued behind).
+  // Either way the entry is pruned once the run starts (consumed) or the message
+  // is dequeued.
+  const [pending, setPending] = useState<{ promptId: string; text: string; queued: boolean }[]>([]);
 
   // ADR 0052: full prompt text by prompt_id, retained for the session so the
-  // ↑-recall can repopulate the composer with the COMPLETE text even after the
-  // optimistic `pending` entry is pruned on echo (the wire `prompt_queued`
-  // summary is truncated to ~1 KB). Bounded — one short entry per prompt sent.
+  // ↑-recall / rail can show the COMPLETE text even after the optimistic
+  // `pending` entry is pruned (the wire `prompt_queued` summary is truncated to
+  // ~1 KB). Bounded — one short entry per prompt sent.
   const sentTextRef = useRef(new Map<string, string>());
 
-  const echoedPromptIds = useMemo(() => {
+  // prompt_ids the server has CONSUMED (`run_started{prompt_id}` — the bubble is
+  // now in the durable transcript) or DEQUEUED (recalled / cancelled). Either
+  // ends an optimistic entry's life.
+  const consumedPromptIds = useMemo(() => {
     const s = new Set<string>();
     for (const { event } of events) {
-      if (event.type === "agent_message" && event.role === "user" && event.prompt_id) {
-        s.add(event.prompt_id);
-      }
+      if (event.type === "run_started" && event.prompt_id) s.add(event.prompt_id);
     }
     return s;
   }, [events]);
+  const dequeuedPromptIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const { event } of events) {
+      if (event.type === "prompt_dequeued") s.add(event.prompt_id);
+    }
+    return s;
+  }, [events]);
+  // Server-confirmed queue membership (from `prompt_queued`, surfaced via
+  // buildMessages' `queue`). An optimistic "immediate" send the server actually
+  // queued (a run started just as it landed) moves to the rail once this knows.
+  const queuedPromptIds = useMemo(() => new Set(queue.map((q) => q.promptId)), [queue]);
 
-  // Drop optimistic entries the server has now echoed (the authoritative
-  // message took over rendering).
+  // Drop optimistic entries the server has consumed (the durable bubble took
+  // over) or dequeued (recalled / cancelled).
   useEffect(() => {
-    setPending((p) => p.filter((e) => !echoedPromptIds.has(e.promptId)));
-  }, [echoedPromptIds]);
+    setPending((p) =>
+      p.filter((e) => !consumedPromptIds.has(e.promptId) && !dequeuedPromptIds.has(e.promptId)),
+    );
+  }, [consumedPromptIds, dequeuedPromptIds]);
 
+  // Transcript = serverMessages + the IMMEDIATE optimistic bubbles (idle sends
+  // not yet consumed and not re-classified as queued by the server). Queued
+  // messages are NOT in the thread — they live in the composer rail.
   const messages = useMemo(() => {
     const optimistic: ThreadMessageLike[] = pending
-      .filter((e) => !echoedPromptIds.has(e.promptId))
+      .filter(
+        (e) => !e.queued && !consumedPromptIds.has(e.promptId) && !queuedPromptIds.has(e.promptId),
+      )
       .map((e) => ({
         role: "user",
         id: e.promptId,
@@ -115,7 +139,33 @@ export function SessionThread({
         metadata: { custom: { pending: true } },
       }));
     return optimistic.length ? [...serverMessages, ...optimistic] : serverMessages;
-  }, [serverMessages, pending, echoedPromptIds]);
+  }, [serverMessages, pending, consumedPromptIds, queuedPromptIds]);
+
+  // The composer's queued-message rail (Claude-Code style): everything submitted
+  // but not yet consumed into the conversation. Server-confirmed queue first
+  // (oldest→newest), then any just-submitted optimistic ones the server hasn't
+  // acked. Deduped by prompt_id; full text preferred over the wire summary.
+  const railItems = useMemo(() => {
+    const seen = new Set<string>();
+    const items: { promptId: string; text: string }[] = [];
+    for (const q of queue) {
+      if (seen.has(q.promptId)) continue;
+      seen.add(q.promptId);
+      items.push({ promptId: q.promptId, text: sentTextRef.current.get(q.promptId) ?? q.summary });
+    }
+    for (const e of pending) {
+      if (
+        !e.queued ||
+        seen.has(e.promptId) ||
+        consumedPromptIds.has(e.promptId) ||
+        dequeuedPromptIds.has(e.promptId)
+      )
+        continue;
+      seen.add(e.promptId);
+      items.push({ promptId: e.promptId, text: e.text });
+    }
+    return items;
+  }, [queue, pending, consumedPromptIds, dequeuedPromptIds]);
 
   // ADR 0051 Task 24: sendPrompt + interrupt move to the connect-query
   // useMutation so they flow via the gated passthrough (/rpc/…) rather than
@@ -152,15 +202,31 @@ export function SessionThread({
       const text = raw.trim();
       if (!text) return;
       const promptId = crypto.randomUUID();
-      setPending((p) => [...p, { promptId, text }]);
+      // `queued` is the client's optimistic guess (was a run in flight when we
+      // sent?) — it routes the bubble to the rail vs. inline until the server's
+      // prompt_queued / run_started confirms which it is.
+      setPending((p) => [...p, { promptId, text, queued: isRunning }]);
       sentTextRef.current.set(promptId, text);
       sendPromptMutation.mutateAsync({ sessionId, text, promptId }).catch((err) => {
-        // Send failed: drop the optimistic bubble so it isn't stuck greyed.
+        // Send failed: drop the optimistic entry so it isn't stuck.
         setPending((p) => p.filter((e) => e.promptId !== promptId));
         console.warn("sendPrompt failed", err);
       });
     },
-    [sessionId, sendPromptMutation],
+    [sessionId, sendPromptMutation, isRunning],
+  );
+
+  // Cancel a specific queued message (the rail's × button): dequeue it server-
+  // side and drop any optimistic entry. Distinct from `recall` (↑), which pulls
+  // the newest queued message back into the composer for editing.
+  const removeQueued = useCallback(
+    (promptId: string) => {
+      setPending((p) => p.filter((e) => e.promptId !== promptId));
+      dequeueQueuedMutation
+        .mutateAsync({ sessionId, promptId })
+        .catch((err) => console.warn("dequeueQueuedPrompt failed", err));
+    },
+    [sessionId, dequeueQueuedMutation],
   );
 
   // ADR 0052/0030: interrupt the in-flight run (Esc / the Stop button). No-op
@@ -196,6 +262,8 @@ export function SessionThread({
             sendBlocked: status ? SEND_BLOCKED.has(status) : false,
             canRecall: queue.length > 0,
             recall: recallQueued,
+            queued: railItems,
+            removeQueued,
           }}
         >
           <TooltipProvider>

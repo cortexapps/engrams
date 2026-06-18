@@ -26,6 +26,7 @@ import {
   CornerDownLeftIcon,
   Loader2Icon,
   SquareIcon,
+  XIcon,
 } from "lucide-react";
 import type { FC } from "react";
 import { ShellToolPart } from "@/components/session-thread/ShellToolPart";
@@ -264,6 +265,45 @@ const COMPOSER_HINT: Partial<Record<SessionState, string>> = {
   guest_ready: "Session is still starting up — the harness will be ready in a moment.",
 };
 
+// The queued-message rail (ADR 0052): a message sent while a run is in flight
+// sits HERE — just above the input, Claude-Code style — not inline in the
+// transcript, until its run starts (then it joins the conversation at the
+// consumption point, in the right order). Each row shows the full text; × cancels
+// it (DequeueQueued), and ↑ on an empty composer recalls the newest for editing.
+const QueuedRail: FC<{
+  items: { promptId: string; text: string }[];
+  onRemove: (promptId: string) => void;
+}> = ({ items, onRemove }) => {
+  if (items.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1" aria-label="Queued messages">
+      {items.map((item) => (
+        <div
+          key={item.promptId}
+          className="group flex items-center gap-2 rounded-lg bg-muted/50 py-1 pr-1 pl-2.5 text-sm text-muted-foreground"
+        >
+          <CornerDownLeftIcon className="size-3 shrink-0 opacity-40" />
+          <span className="min-w-0 flex-1 truncate" title={item.text}>
+            {item.text}
+          </span>
+          <TooltipIconButton
+            tooltip="Cancel"
+            side="left"
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-6 shrink-0 text-muted-foreground/50 hover:text-foreground"
+            aria-label="Cancel queued message"
+            onClick={() => onRemove(item.promptId)}
+          >
+            <XIcon className="size-3.5" />
+          </TooltipIconButton>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const Composer: FC = () => {
   const status = useSessionStatus();
   const banner = status ? COMPOSER_BANNER[status] : undefined;
@@ -274,7 +314,8 @@ const Composer: FC = () => {
   // prompt can be ENQUEUED while a run is in flight (type-ahead), ⌘↵ works
   // mid-run, and Esc interrupts. `submitMode="none"` disables the primitive's
   // own keyboard submit so plain Enter stays a newline and our keydown owns ⌘↵.
-  const { submit, interrupt, sendBlocked, canRecall, recall } = useComposerActions();
+  const { submit, interrupt, sendBlocked, canRecall, recall, queued, removeQueued } =
+    useComposerActions();
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const composer = useComposerRuntime();
   const text = useComposer((c) => c.text);
@@ -297,7 +338,8 @@ const Composer: FC = () => {
   const hintLine = hints.length ? hints.join(" · ") : hint;
 
   return (
-    <ComposerPrimitive.Root className="relative flex w-full flex-col">
+    <ComposerPrimitive.Root className="relative flex w-full flex-col gap-1.5">
+      <QueuedRail items={queued} onRemove={removeQueued} />
       <div className="flex w-full items-end gap-2 rounded-2xl border bg-background p-2 transition-shadow focus-within:ring-2 focus-within:ring-ring/20">
         <ComposerPrimitive.Input
           // Enter inserts a newline; ⌘/Ctrl+Enter submits. This is a writing
