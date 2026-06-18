@@ -340,3 +340,62 @@ chain; recovery + escalation. Metrics: `engram_harness_desync_detected_total`
 {signature}, `engram_harness_rehandshake_total`. Pre-rewrite this is the
 recovery; post-ADR-0052 the desync rate should fall to ~0 and the watchdog
 becomes a pure backstop.
+
+## Addendum (Track A, 2026-06-18): in-place harness reattach before teardown
+
+Prod session `6ed6afdb` exposed a hole between the two recovery rungs above.
+Point 3 claims "the watchdog only fires on sessions with a *live* vsock
+connection" — but detection is **PG-derived** (`list_active_sessions_desynced`
+reads the event shape, not vsock liveness), so it fires regardless of whether
+the harness link is up. When the link is **dead** — the harness's established
+connection didn't EOF (its blocking read never woke, the reconnect loop never
+fired) or the harness process exited and agentd, which only (re)spawns on a
+host `SpawnHarness`, sat idle — the in-band `rehandshake` has nothing to nudge:
+`HarnessHub::rehandshake` returns `NotAttached`, mapped to `SandboxError::NotFound`
+("sandbox not found"). The watchdog logged that every 30 s for **15 minutes**,
+burning the full escalate TTL before falling through to the eviction → resume
+lane — even though **the FC VM was alive the whole time** (disk daemon flushing
+live manifests v17→v22, ttyd up). Tearing a healthy warm VM down to a 2.1 GB
+snapshot and restoring it, purely to re-establish a vsock, is the wrong default.
+
+**The missing rung: re-establish the harness IN PLACE, no teardown.** The vsock
+transport is harness-dials-host (ADR 0013, NAT-friendly) — the host can't dial
+*into* the guest's harness, only the harness can re-dial out. But there is a
+second, always-up control surface to the live guest: **agentd** (PID 1), which
+supervises the harness. agentd already knows how to revive the link — the
+ADR 0045 C1 reattach arm (`harness_supervisor::spawn`) SIGUSR1s a live-but-wedged
+harness to drop+re-dial, or reaps-and-respawns an exited one. That arm fires on
+a host `SpawnHarness`, which today is sent only at restore time. Our wedge is
+that exact failure shape (the C1 comment even names the "prompts 'sandbox not
+found' while exec works" canaries) with no restore to trigger it.
+
+So the new rung is just: **re-issue the resume `start_agent` against the
+session's existing live sandbox.** `start_agent` is wait-ready (a no-op; agentd
+is up) → InstallHostCa (idempotent) → `SpawnHarness` → the C1 reattach/respawn
+arm. The spec is the **resume shape** — `resolve_harness(prompt = None)`, the
+same builder a real resume uses (now shared as `resolve_resume_agent_and_policy`,
+reused by `finish_resume_to_active`). Prompt-less is load-bearing: the initial
+prompt rides `req.env`, so a *boot*-shape respawn of an exited harness would
+re-inject the original prompt mid-conversation; the resume shape just `--resume`s
+the existing claude session and goes `Idle`. A successful reattach re-emits
+`Idle`, bumping `last_event_at` and dropping the session out of the flagged set —
+identical settle signal to the re-handshake rung.
+
+The recovery ladder becomes three rungs, cheapest first:
+
+1. `rehandshake` — live vsock, event-stream desync. One in-band command.
+2. **in-place reattach** (new) — `rehandshake` returned `NotFound` (dead vsock),
+   but the VM is alive. Re-issue `start_agent` → agentd SIGUSR1/respawn. Seconds,
+   no teardown, warm VM preserved.
+3. escalate → `Evicting → Idle → resume` — unchanged backstop, now reached only
+   when even the in-place reattach can't settle the session before the escalate
+   TTL (agentd genuinely unreachable, VM actually gone). The catch-all that works
+   regardless of *why* the link died stays the last resort, not the default.
+
+Coordinator-only change: no new host RPC, wire variant, or agentd code — the
+in-place rung reuses `HostClient::start_agent` end-to-end. Best-effort: a
+`None` manifest (dev-VM / process backend) or a session that moved off its
+sandbox mid-tick is a no-op, never a hard error — escalation still catches a
+genuine wedge. Metric: `engram_harness_inplace_reattach_total`. This is the
+fast-path that makes "the VM is alive, just reconnect" the common recovery and
+relegates teardown to the genuinely-unrecoverable tail.
