@@ -71,6 +71,21 @@ use engram_host_agent::pooled_backend::PooledBackend;
 use engram_storage_local::LocalBlobStorage;
 use tokio::sync::Notify;
 
+/// Containment (2026-06-18): clear any stale binding a prior, possibly-panicked
+/// NBD test left on the SHARED `/dev/nbd0`, so its leak can't surface here as
+/// "NBD attach failed" (the cascade that turned one flake into a suite wipeout).
+/// Idempotent (no-op when unbound). Full rationale in nbd_netlink_reconfigure.rs.
+fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
+    if let Some(idx) = nbd_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("nbd"))
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
+    }
+}
+
 fn preflight() -> Option<PathBuf> {
     let nbd_path = PathBuf::from(
         std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
@@ -87,7 +102,10 @@ fn preflight() -> Option<PathBuf> {
         .write(true)
         .open(&nbd_path)
     {
-        Ok(_) => Some(nbd_path),
+        Ok(_) => {
+            clear_stale_nbd_binding(&nbd_path);
+            Some(nbd_path)
+        }
         Err(e) => {
             eprintln!(
                 "SKIP: cannot open {} R/W: {e} — run as root (`sudo -E`)",
