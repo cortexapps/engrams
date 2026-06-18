@@ -29,6 +29,15 @@
         # >= 1.47.1). Pinned from a current nixpkgs (see the input note).
         e2fsprogs = (import nixpkgs-e2fsprogs { inherit system; }).e2fsprogs;
 
+        # ADR 0036: a STATIC (musl) mke2fs to BUNDLE into the `cli-tools`
+        # artifact, so `engram-cli image build` runs a pinned, portable mke2fs
+        # sibling on any runner — no nix store, no PATH dependency. The dynamic
+        # `e2fsprogs` above is fine for `nix develop` and the packer's CI test
+        # (its lib closure is present), but a binary copied into an OCI artifact
+        # must be self-contained. Linux-only (pkgsStatic targets musl); the
+        # `.bin` output carries `sbin/mke2fs`.
+        e2fsprogsStatic = (import nixpkgs-e2fsprogs { inherit system; }).pkgsStatic.e2fsprogs;
+
         # Reads rust-toolchain.toml so the flake stays in lockstep with
         # the file rustup picks up. Bumping Rust = edit rust-toolchain.toml,
         # the flake follows.
@@ -190,11 +199,19 @@
           '';
         };
 
-        # ADR 0036: the reproducible mke2fs as a buildable output, so CI + the
-        # image bakes get the SAME pinned e2fsprogs the dev shell has via
-        # `nix build .#mke2fs` (→ result/bin/mke2fs) — no apt, no source build.
-        # `.bin` is e2fsprogs' bin output (carries mke2fs + its lib closure).
-        packages.mke2fs = e2fsprogs.bin;
+        # ADR 0036: the reproducible mke2fs as buildable outputs, one pinned rev
+        # for everything.
+        #   .#mke2fs        — dynamic; for `nix develop` + the packer's CI test
+        #                     (`nix build .#mke2fs` → bin/mke2fs, lib closure in
+        #                     the nix store). `.bin` is e2fsprogs' bin output.
+        #   .#mke2fs-static — static musl; copied into the `cli-tools` artifact
+        #                     so engram-cli runs it as a portable sibling on any
+        #                     runner (`sbin/mke2fs`). Linux-only (pkgsStatic).
+        packages = {
+          mke2fs = e2fsprogs.bin;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          mke2fs-static = e2fsprogsStatic.bin;
+        };
 
         formatter = pkgs.nixpkgs-fmt;
       });

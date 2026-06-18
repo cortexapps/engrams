@@ -148,6 +148,23 @@ Adopt Docker's own model for the same problem, end to end:
    *delta* transfers: a deps-unchanged rebake should push/pull tens of
    chunks, not 625.
 
+   **Follow-up (the version floor + where the pin lives).** `mke2fs` only
+   *honors* `SOURCE_DATE_EPOCH` from **e2fsprogs 1.47.1**; older builds
+   (Ubuntu apt ≤ 1.47.0) silently stamp wall-clock times into the
+   superblock and every inode, so the `-U`/`hash_seed` pin above is a
+   no-op and re-bakes never byte-match — degrading the dedup this point
+   exists for. Rather than make that a per-workflow CI concern,
+   determinism is now a property of the **tool**: the OSS `cli-tools`
+   artifact bundles a pinned static `mke2fs` (`flake.nix`
+   `packages.mke2fs-static`, e2fsprogs ≥ 1.47.1) next to `engram-cli`,
+   and the packer resolves a sibling `mke2fs` before `$PATH`
+   (`ext4.rs::resolve_mke2fs`: `$ENGRAM_MKE2FS` → sibling → `$PATH`). So
+   every consumer of the golden binaries — the reusable bake workflow,
+   the engrams-internal bakes, downstream dogfood repos — gets a
+   byte-deterministic bake with zero setup. The from-source bake +
+   engrams' own packer test instead put the flake's dynamic `.#mke2fs`
+   on `$PATH` (their nix store is present, so dynamic is fine).
+
 4. **Base-snapshot capture reuse keyed on content.** The reuse check
    used to key on `(image_uri, OCI manifest digest)`, so the common
    prod case — a re-bake under a fresh `warm-<sha>` tag with
