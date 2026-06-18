@@ -394,6 +394,220 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     host_b.server.abort();
 }
 
+/// ADR 0052 Phase 4 (warm mid-turn teleport): the load-bearing unknown the
+/// Phase 0 spike had to prove — a process BLOCKED reading a held-open pipe
+/// (the `claude --input-format stream-json` shape: stdin held open, the read
+/// parked waiting for the next user message) survives the live UFFD teleport
+/// AND resumes reading a write delivered AFTER the move. The sibling reattach
+/// arm proves the process survives with its PID; this proves its held STDIN
+/// PIPE survives too, so a streaming agent crosses warm mid-turn and keeps
+/// consuming input — no turn restart. The harness-engine half (a connection
+/// bounce doesn't abort the in-flight turn) is unit-tested in
+/// engram-harness-claude's `connection_bounce_mid_turn_preserves_the_run`.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + Docker; boots microVMs on two host stacks"]
+async fn two_host_live_teleport_held_stdin_pipe_survives() {
+    if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
+        return;
+    }
+    let Some((kernel, handler, agent)) = gate() else {
+        return;
+    };
+    std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
+
+    let shared = tempfile::tempdir().expect("shared dir");
+    let blob_root = shared.path().join("blob");
+    let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+        engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+
+    let src = tempfile::tempdir().expect("source dir");
+    std::fs::write(src.path().join("Dockerfile"), "FROM debian:bookworm-slim\n").unwrap();
+    std::fs::write(
+        src.path().join("engram.toml"),
+        "name = \"engram-teleport-pipe\"\n",
+    )
+    .unwrap();
+    let images = tempfile::tempdir().expect("images dir");
+    let baker = Builder::new(DockerCli::new(), chunk_store.clone());
+    let outcome = baker
+        .build(&BuildRequest {
+            source: src.path().to_path_buf(),
+            repo: "engram-teleport-pipe".into(),
+            tag: "warm-1".into(),
+            images_dir: images.path().to_path_buf(),
+            format: Format::Ext4,
+            agent_injection: Some(AgentInjection {
+                agent_binary: agent,
+                vsock_port: ENGRAM_AGENTD_PORT,
+                transport: engram_image_builder::Transport::Vsock,
+                init_script: None,
+            }),
+        })
+        .await
+        .expect("bake");
+
+    let (pooled_a, _work_a) = build_host("pipe-a", &kernel, &handler, &blob_root, &chunk_store);
+    let (pooled_b, _work_b) = build_host("pipe-b", &kernel, &handler, &blob_root, &chunk_store);
+    let host_a = serve(pooled_a).await;
+    let host_b = serve(pooled_b).await;
+    let client_a = dial(host_a.addr).await;
+    let client_b = dial(host_b.addr).await;
+
+    let spec = SandboxSpec {
+        image: "engram-teleport-pipe".into(),
+        rootfs_source: Some(outcome.rootfs_path),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 256 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let vm = host_a.pooled.create(spec).await.expect("create on A");
+    let _ = exec(&host_a.pooled, vm, "true").await;
+    let ckpt = host_a
+        .pooled
+        .checkpoint_sandbox(vm)
+        .await
+        .expect("seed checkpoint on A");
+
+    // The streaming-stdin claude analog as the harness: open a FIFO read-write
+    // on fd 3 (held open, like the harness holding claude's stdin), then block
+    // reading it line by line, appending each line to an output file. `trap ''
+    // USR1` so the post-move reconnect nudge can't kill it (same as the
+    // heartbeat arm). At snapshot time the process is parked in the `read`
+    // syscall with the pipe held open and NOTHING yet written — exactly the
+    // mid-turn "awaiting the next stdin line" state.
+    const PIPE: &str = "/dev/shm/claude-stdin";
+    const OUT: &str = "/dev/shm/claude-out";
+    let reader = format!(
+        "trap '' USR1; echo $$ > /dev/shm/reader-pid; rm -f {PIPE} {OUT}; mkfifo {PIPE}; \
+         exec 3<>{PIPE}; while IFS= read -r line <&3; do printf '%s\\n' \"$line\" >> {OUT}; done"
+    );
+    host_a
+        .pooled
+        .start_agent(
+            vm,
+            engram_core::types::sandbox::AgentSpec {
+                argv: vec!["/bin/sh".into(), "-c".into(), reader.clone()],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: None,
+            },
+        )
+        .await
+        .expect("start the held-pipe reader on A");
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let reader_pid_a = exec(&host_a.pooled, vm, "cat /dev/shm/reader-pid")
+        .await
+        .trim()
+        .to_string();
+    assert!(!reader_pid_a.is_empty(), "reader running on A");
+    // Nothing consumed yet — the read is parked on the held-open pipe.
+    let pre = exec(
+        &host_a.pooled,
+        vm,
+        &format!("cat {OUT} 2>/dev/null | wc -c"),
+    )
+    .await
+    .trim()
+    .to_string();
+    assert_eq!(
+        pre, "0",
+        "the reader is blocked with an empty output before the move"
+    );
+
+    // ---- The move, over the wire ----
+    let cap = client_a.migration_capture(vm).await.expect("capture on A");
+    let mut metadata = ckpt.clone();
+    metadata.id = cap.snapshot_id;
+    metadata.memory_manifest = Some(cap.memory_manifest_ref);
+    metadata.disk_manifest = (!cap.disk_manifest_json.is_empty()).then_some(cap.disk_manifest_ref);
+    metadata.state_blob_key = None;
+    metadata.sidecar_blob_key = None;
+    metadata.migration_source = Some(MigrationSourceInfo {
+        export_id: cap.export_id.clone(),
+        source_addr: format!("http://{}", host_a.addr),
+        memory_manifest_json: cap.memory_manifest_json.clone(),
+        disk_manifest_json: cap.disk_manifest_json.clone(),
+        memory_manifest_ref: cap.memory_manifest_ref,
+        disk_manifest_ref: cap.disk_manifest_ref,
+        new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
+        new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
+        hot_chunks: vec![],
+        post_copy: false,
+        peer_addr: None,
+        peer_token: None,
+        sidecar_json: Vec::new(),
+    });
+    let moved = client_b.restore(metadata).await.expect("restore on B");
+
+    // Post-move handshake → the C1 reattach arm (SIGUSR1 ignored by this fake).
+    host_b
+        .pooled
+        .start_agent(
+            moved,
+            engram_core::types::sandbox::AgentSpec {
+                argv: vec!["/bin/sh".into(), "-c".into(), reader.clone()],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: None,
+            },
+        )
+        .await
+        .expect("post-move handshake on B");
+    let reader_pid_b = exec(&host_b.pooled, moved, "cat /dev/shm/reader-pid")
+        .await
+        .trim()
+        .to_string();
+    assert_eq!(
+        reader_pid_a, reader_pid_b,
+        "the held-pipe reader must be REATTACHED (same in-guest pid), not respawned"
+    );
+
+    // THE PROOF: write a line into the held pipe AFTER the move. If the pipe
+    // (and the reader's parked `read` on fd 3) survived the UFFD restore, the
+    // reader unblocks and appends the marker to the output file — a streaming
+    // agent consuming its next stdin line post-teleport.
+    const MARKER: &str = "engram-teleport-marker";
+    let wrote = exec(
+        &host_b.pooled,
+        moved,
+        &format!("printf '%s\\n' '{MARKER}' > {PIPE} && echo wrote"),
+    )
+    .await;
+    assert_eq!(wrote.trim(), "wrote", "post-move write into the held pipe");
+    // Give the resumed reader a moment to consume + append.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let consumed = exec(&host_b.pooled, moved, &format!("cat {OUT}"))
+        .await
+        .trim()
+        .to_string();
+    assert_eq!(
+        consumed, MARKER,
+        "the held stdin pipe survived the teleport: the reader consumed a \
+         post-move write (the streaming-claude warm-cross guarantee)"
+    );
+
+    client_a
+        .migration_commit(vm, &cap.export_id)
+        .await
+        .expect("commit on A");
+    host_b.pooled.destroy(moved).await.expect("destroy moved");
+    host_a.server.abort();
+    host_b.server.abort();
+}
+
 /// The NBD-rootfs arm (prod canaries 5fa742b7 / 4391e591): production
 /// sessions run on a CHUNKED-NBD rootfs, and both prod teleport
 /// canaries came out the other side with a corrupt disk — zeros /

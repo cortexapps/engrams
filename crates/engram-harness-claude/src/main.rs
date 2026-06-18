@@ -1908,6 +1908,74 @@ mod adapter {
             let _ = tokio::fs::remove_file(&script).await;
         }
 
+        // ADR 0052 Phase 4 (warm mid-turn teleport): a live host-to-host move
+        // drops + re-dials the vsock WHILE a turn is generating (agentd SIGUSR1s
+        // the moved harness → it reconnects). The engine is connection-decoupled
+        // (the `turn`/cmd loop + the persistent claude child outlive any
+        // connection), so the in-flight turn MUST survive the bounce: the
+        // reattach must NOT synthesize an `Idle` mid-turn, and the run that was
+        // open before the bounce is the same one that completes after it —
+        // exactly one RunStarted→RunCompleted, no restart. This is the
+        // engine-side guarantee behind the no-turn-restart-on-teleport promise
+        // (the FC-level pipe survival is proven by the two-host teleport suite).
+        #[tokio::test]
+        async fn connection_bounce_mid_turn_preserves_the_run() {
+            // One turn: sleep 300ms (stays in flight), then one assistant line
+            // + result.
+            let script = write_slow_fake_claude(
+                &[
+                    r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"ok"}]}}"#,
+                    r#"{"type":"result","subtype":"success","is_error":false}"#,
+                ],
+                300,
+            )
+            .await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                Some("first".into()), // initial prompt → turn 1 goes in flight
+            ));
+
+            // Turn 1 is now in flight (the fake sleeps 300ms before its result).
+            let r1 = expect_run_started(&mut evt_rx).await;
+
+            // The teleport connection bounce, mid-turn: a fresh connection
+            // attaches — exactly what the post-move SIGUSR1 re-dial drives. Fire
+            // it twice (re-dials can retry). While a turn is open the reattach
+            // arm must emit nothing.
+            reattach.notify_one();
+            reattach.notify_one();
+
+            // The very next events are the turn's own assistant line and its
+            // RunCompleted — NO `Idle` injected by the bounce. (If the reattach
+            // had synthesized one mid-turn, this `expect_agent_message` would see
+            // it and panic.)
+            expect_agent_message(&mut evt_rx, "ok").await;
+            let c1 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(
+                r1, c1,
+                "the run open before the bounce is the same one that completes after it — no restart",
+            );
+
+            // Now genuinely idle: the engine re-announces Idle. Clean shutdown.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+        }
+
         // ADR 0052: the host re-delivers un-confirmed prompts on every
         // reattach (command-side at-least-once, the twin of the `held`
         // event slot). A replay of a prompt the harness already accepted
