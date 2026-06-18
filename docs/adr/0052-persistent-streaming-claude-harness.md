@@ -120,8 +120,9 @@ pipe survives a UFFD restore before Track C relies on it.
   wired into `ci.yml`.
 - **Phase 1** — streaming engine rewrite (`engram-harness-claude`), respawn-with-
   resume. **Phase 1b** — harness-owned queued/steered messages. **Phase 2** —
-  clean-idle-shutdown (drain stdin before the idle capture; gated to
-  `CheckpointReason::Idle`). **Phase 3** — `control_request` interrupt + crash
+  clean-idle-shutdown (drain stdin before the idle capture; gated structurally to
+  the idle-only `snapshot_begin` seam — see the Progress note). **Phase 3** —
+  `control_request` interrupt + crash
   recovery. **Phase 4** — warm mid-turn teleport (gated on Phase 0); its merge
   flips this ADR to **Accepted**.
 
@@ -288,6 +289,41 @@ pipe survives a UFFD restore before Track C relies on it.
   unchanged, no crash artifact) — a direct `ba3ae8d5` regression guard.
   - *Retires:* the SIGINT-vs-persistent-process hazard ([[project_adr0030_operator_interrupt]])
     on the normal path — no signal racing FC suspend/resume.
+
+- **2026-06-17 — Phase 2 IMPLEMENTED: clean-idle-shutdown** (this PR, stacked on
+  Phase 3). On idle eviction the snapshot now captures **no live `claude`**:
+  before the pause+capture we send the harness `Shutdown { grace }`, which closes
+  claude's held stdin so the in-flight turn (if any) drains to a final `result`
+  and the process exits 0, then the harness itself exits. On resume agentd
+  respawns a fresh harness that `--resume`s into the same on-disk session
+  (decision 1: respawn-with-resume). This decouples idle-resume correctness from
+  the warm-survival question — only Phase 4 (live teleport) needs claude to cross
+  a snapshot warm; the far-more-common idle path now gets a deterministic,
+  agent-free image and a fresh epoll each wake.
+
+  **The harness side was already complete** (the `Shutdown` arm landed with the
+  Phase-1 engine): `stdin = None` closes the FD, the reap path distinguishes a
+  clean drain (no in-flight turn ⇒ silent exit; mid-turn grace-expiry ⇒
+  `RunCompleted{ok:false}`, never a spurious crash artifact) from a real crash, and
+  returns `SessionOutcome::Shutdown` ⇒ `ExitCode::SUCCESS` with **no respawn**.
+  So Phase 2 is **purely host-side wiring** — no harness, proto, coord, or web
+  change.
+
+  **Divergence from the plan — the gate is structural, not a `CheckpointReason`.**
+  The plan proposed gating the drain on `CheckpointReason::Idle` plumbed to the
+  host. In the actual topology that plumbing is unnecessary: the host's two-phase
+  `snapshot_begin` (ADR 0045 D5) is called **only** for `target_state == Idle`
+  (`idle_evictor.rs`) — live teleport goes through `migration_capture` (keeps
+  claude warm, Phase 4) and periodic/manual checkpoints through single-shot
+  `snapshot`. So draining inside `LocalHostClient::snapshot_begin` — the one host
+  layer that composes both the `SandboxBackend` and the `HarnessHub` — *is* "gate
+  strictly to the idle path," with zero wire surface added. New `HarnessHub::drain`
+  sends the `Shutdown` then waits (bounded by `grace + slack`) for the harness
+  vsock to drop — its exit is the unambiguous signal claude is gone. Best-effort:
+  a `NotAttached` sandbox or one that won't drain within grace is captured anyway
+  (a still-live child is reattached on resume per ADR 0045 C1), so an eviction
+  never blocks on a stuck agent. Pinned by two hub unit tests
+  (`drain_sends_shutdown_then_waits_for_disconnect`, `drain_unattached_is_a_noop`).
 
 ## Prior art
 
