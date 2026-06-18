@@ -209,12 +209,21 @@ export function buildMessages(
     if (tally) tally[k] += 1;
   };
 
+  // Assistant message ids MUST be position-independent. A previous `a:${out.length}`
+  // scheme keyed on array position, so inserting/removing an earlier bubble (a
+  // queued user message landing mid-run, or a `prompt_dequeued` filtering one out
+  // after the loop) re-numbered every later assistant turn — and assistant-ui keys
+  // messages by id, so a turn silently changing id throws "a message with the same
+  // id already exists in the parent tree" (the crash). A dedicated monotonic counter
+  // gives the Nth assistant turn a STABLE `a:N` regardless of what surrounds it.
+  let assistantSeq = 0;
+
   const ensureAssistant = (at?: string): Draft => {
     if (active) return active;
     active = {
       role: "assistant",
       content: [],
-      id: `a:${out.length}`,
+      id: `a:${assistantSeq++}`,
       createdAt: at ? new Date(at) : undefined,
       status: { type: "running" },
     };

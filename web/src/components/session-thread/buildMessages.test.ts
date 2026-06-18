@@ -640,3 +640,76 @@ describe("buildMessages — Phase 1c live token streaming", () => {
     expect(textParts).toContain("block two streaming");
   });
 });
+
+describe("buildMessages — stable assistant ids (crash regression, session 59cb8557)", () => {
+  // A queued+dequeued user message before a run's assistant turn used to shift the
+  // position-based `a:${out.length}` id between the streaming-tail render and the
+  // durable-message render — assistant-ui keys by id, so the turn silently changing
+  // id threw "a message with the same id already exists in the parent tree".
+  const base: SessionEvent[] = [
+    {
+      type: "agent_message",
+      run_id: "",
+      message_id: "u0",
+      role: "user",
+      text: "Count 1-60",
+      prompt_id: "p0",
+      at: AT,
+    },
+    { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p0", at: AT },
+    {
+      type: "agent_message",
+      run_id: "",
+      message_id: "u1",
+      role: "user",
+      text: "Hi",
+      prompt_id: "p1",
+      at: AT,
+    },
+    { type: "prompt_queued", prompt_id: "p1", summary: "Hi", at: AT },
+    { type: "prompt_dequeued", prompt_id: "p1", at: AT }, // the ↑-recall — shrinks out post-loop
+    {
+      type: "agent_message",
+      run_id: "",
+      message_id: "u2",
+      role: "user",
+      text: "Hi",
+      prompt_id: "p2",
+      at: AT,
+    },
+    { type: "prompt_queued", prompt_id: "p2", summary: "Hi", at: AT },
+  ];
+
+  test("the in-flight turn keeps its id from streaming-tail render to durable render", () => {
+    // Mid-stream: the 1-60 turn lives in the ephemeral overlay, no durable assistant yet.
+    const streaming = buildMessages(indexed(base), SID, undefined, "1. one…");
+    // Durable: the complete 1-60 assistant message has landed; overlay empty.
+    const durable = buildMessages(
+      indexed([
+        ...base,
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "1. one…",
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    const sId = real(streaming.messages).find((m) => m.role === "assistant")?.id;
+    const dId = real(durable.messages).find((m) => m.role === "assistant")?.id;
+    expect(sId).toBeDefined();
+    expect(sId).toBe(dId); // was a:2 (streaming) vs a:3 (durable) with the position-based id
+  });
+
+  test("no build produces duplicate message ids", () => {
+    for (const streamingText of ["", "1. one…"]) {
+      const ids = buildMessages(indexed(base), SID, undefined, streamingText).messages.map(
+        (m) => m.id,
+      );
+      expect(new Set(ids).size).toBe(ids.length);
+    }
+  });
+});
