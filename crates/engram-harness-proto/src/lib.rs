@@ -356,15 +356,6 @@ pub struct CheckpointAck {
     pub message: Option<String>,
 }
 
-/// Harness's reply to a [`HarnessCommand::Shutdown`]. Sent after the
-/// last `transcript_delta` has been flushed; harness exits its
-/// process tree shortly after.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShutdownAck {
-    pub ok: bool,
-    pub message: Option<String>,
-}
-
 // ---- Forge bridge (ADR 0023) -------------------------------------------
 //
 // A *separate* guest→host channel from the harness one above: the
