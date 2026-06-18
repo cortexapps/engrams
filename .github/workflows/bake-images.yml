@@ -498,7 +498,8 @@ jobs:
           MK="$(nix build .#mke2fs-static --no-link --print-out-paths)/sbin/mke2fs"
           cp "$MK" dist/mke2fs
           chmod 0755 dist/mke2fs   # nix store output is read-only + unstripped
-          strip dist/mke2fs        # ~9M -> ~2M; mke2fs's *output* is unaffected
+          strip dist/mke2fs        # trims symbols (~9M->8M; static code dominates);
+                                   # mke2fs's *output* (the ext4) is unaffected
           file dist/mke2fs
           dist/mke2fs -V           # fail loud if strip broke the static binary
 
