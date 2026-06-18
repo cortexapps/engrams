@@ -5,7 +5,7 @@ import { renderWithProviders } from "../test-utils";
 import { ThemeProvider } from "./theme-provider";
 import { MainSidebar } from "./app-sidebar";
 
-test("admin sees the two hats: Sessions and Operator", async () => {
+test("admin sees the two hats: Tasks and Operator", async () => {
   renderWithProviders(
     <ThemeProvider>
       <SidebarProvider>
@@ -15,14 +15,14 @@ test("admin sees the two hats: Sessions and Operator", async () => {
   );
   // Router defers the initial render to a microtask — await the first match.
   // Exact-string names target the destination links (not the logo link, whose
-  // accessible name also contains "sessions").
-  expect(await screen.findByRole("link", { name: "Sessions" })).toBeTruthy();
+  // accessible name also contains "tasks").
+  expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Operator" })).toBeTruthy();
   // Settings is not a rail destination; it lives in the avatar menu.
   expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
 });
 
-test("member sees only Sessions in the rail", async () => {
+test("member sees only Tasks in the rail", async () => {
   renderWithProviders(
     <ThemeProvider>
       <SidebarProvider>
@@ -40,6 +40,6 @@ test("member sees only Sessions in the rail", async () => {
       },
     },
   );
-  expect(await screen.findByRole("link", { name: "Sessions" })).toBeTruthy();
+  expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
   expect(screen.queryByRole("link", { name: "Operator" })).toBeNull();
 });
