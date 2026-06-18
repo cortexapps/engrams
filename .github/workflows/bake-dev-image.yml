@@ -93,6 +93,31 @@ jobs:
           chmod +x engram-cli engram-agentd
           file engram-cli engram-agentd
 
+      # ADR 0036: the ext4 pack (engram-cli image build → Mke2fsPacker) is
+      # byte-deterministic — the keystone for cross-bake chunk dedup — ONLY with
+      # an e2fsprogs that honors SOURCE_DATE_EPOCH (>= 1.47.1). Runner apt ships
+      # <= 1.47.0, which silently stamps wall-clock times, so re-bakes of
+      # unchanged content produce all-new chunk hashes (no dedup). Fetch + run
+      # engrams' ensure script (this workflow checks out the caller, not
+      # engrams; engrams is public) to put a >= 1.47.1 mke2fs ahead of the
+      # system one. Idempotent + cached.
+      - name: Cache reproducible e2fsprogs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/repro-e2fsprogs
+          key: repro-e2fsprogs-1.47.2-${{ runner.os }}
+      - name: Ensure reproducible mke2fs (e2fsprogs >= 1.47.1)
+        env:
+          REF: ${{ inputs.engrams_ref }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/cortexapps/engrams/${REF}/.github/scripts/ensure-reproducible-mke2fs.sh" \
+            -o /tmp/ensure-reproducible-mke2fs.sh
+          E2FSPROGS_PREFIX="$HOME/.cache/repro-e2fsprogs" \
+            bash /tmp/ensure-reproducible-mke2fs.sh
+          echo "$HOME/.cache/repro-e2fsprogs/sbin" >> "$GITHUB_PATH"
+
       - name: Bake + push image
         env:
           SOURCE: ${{ inputs.image_source_path }}
