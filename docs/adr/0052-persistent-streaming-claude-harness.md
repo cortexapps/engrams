@@ -1,6 +1,8 @@
 # ADR 0052: Persistent streaming Claude harness session
 
-Status: 2026-06-16 — **Proposed**.
+Status: 2026-06-18 — **Accepted** (Phases 0–4 shipped; warm mid-turn teleport
+proven, gated in prod behind `ENGRAM_LIVE_TELEPORT=1`). See the Progress section
+for the per-phase bookends and the commit chain.
 
 ## Context
 
@@ -324,6 +326,48 @@ pipe survives a UFFD restore before Track C relies on it.
   (a still-live child is reattached on resume per ADR 0045 C1), so an eviction
   never blocks on a stuck agent. Pinned by two hub unit tests
   (`drain_sends_shutdown_then_waits_for_disconnect`, `drain_unattached_is_a_noop`).
+
+- **2026-06-18 — Phase 4 PROVEN: warm mid-turn teleport → ADR Accepted** (this
+  PR). The genuinely-novel piece — keep the persistent streaming `claude` warm
+  across a live host-to-host move, mid-turn, with no run restart. **The mechanism
+  was already in place** and needed no new code: the teleport capture path
+  (`migration_capture`) deliberately does NOT drain (Phase 2's `Shutdown` is gated
+  to the idle `snapshot_begin` only, so the harness + its in-flight turn freeze
+  warm in the UFFD memory image); the destination's `finish_resume_to_active` →
+  `start_agent` → `SpawnHarness` drives agentd's ADR 0045 C1 arm, which SIGUSR1s
+  the still-alive (`try_wait → None`) moved harness to drop+re-dial rather than
+  respawning it; and the harness engine is connection-decoupled (the `turn`/cmd
+  loop + the persistent claude child outlive any connection, and the reattach arm
+  emits an `Idle` only when no turn is open). What was missing was **proof**, and
+  Phase 4 supplies the two that matter:
+
+  1. **`two_host_live_teleport_held_stdin_pipe_survives`** (FC, `test-firecracker`)
+     — the Phase 0 spike, realized faithfully. A process parked in **`epoll_wait`**
+     on a held-open pipe (the `claude`/libuv shape: stdin held, an `eppoll_entry`
+     registered on the pipe wait queue, the event loop parked for the next user
+     line — a static C `epoll` reader, NOT a blocking `read()`, since epoll is the
+     **exact mechanism ADR 0037 found wedged under File-restore**) is teleported
+     across two real host stacks; a line written into that pipe AFTER the move
+     wakes the frozen `epoll_wait` (`ep_poll_callback` fires) and is consumed.
+     This answers the load-bearing UFFD-restore question the teleport-gate flagged
+     — epoll survives UFFD restore (identical guest RAM incl. the kernel
+     `eventpoll`/wait-queue structures, same resumed kernel → pointers stay
+     valid), so the ADR 0037 File-restore wedge does not occur on the teleport
+     path. (Complements the sibling reattach arm, which proved PID-survives.)
+  2. **`connection_bounce_mid_turn_preserves_the_run`** (harness engine unit,
+     `test-linux`) — a connection drop + re-dial mid-turn (what the post-move
+     SIGUSR1 drives) does not abort the in-flight turn: no spurious mid-turn
+     `Idle`, exactly one `RunStarted → RunCompleted`, same `run_id`.
+
+  Together with the pre-existing `two_host_live_teleport` reattach + NBD-rootfs
+  arms, the warm-cross is proven end to end. **No fallback needed** — the spike
+  did not fail, so the Decision-§2 tmux-buffer / accept-turn-restart contingency
+  is moot. Live teleport stays behind `ENGRAM_LIVE_TELEPORT=1` (off by default);
+  flipping it on in prod is an engrams-internal rollout step, not an OSS change.
+
+  This closes the ADR. **Status → Accepted**; commit chain: PR-A (Track A) → PR-0
+  (ADR + Phase 0) → PR-1/1b/1c (streaming engine, queue, token streaming) → PR-3
+  (interrupt) → PR-2 (clean-idle-shutdown) → PR-4 (this — warm-teleport proofs).
 
 ## Prior art
 
