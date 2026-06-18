@@ -342,14 +342,18 @@ pipe survives a UFFD restore before Track C relies on it.
   Phase 4 supplies the two that matter:
 
   1. **`two_host_live_teleport_held_stdin_pipe_survives`** (FC, `test-firecracker`)
-     — the Phase 0 spike, realized. A process BLOCKED reading a held-open pipe
-     (the `claude --input-format stream-json` shape: stdin held, the read parked
-     for the next user line) is teleported across two real host stacks, then a
-     line is written into that pipe AFTER the move; the reader resumes and
-     consumes it. This is the load-bearing UFFD-restore question the
-     teleport-gate section flagged — answered in the affirmative by the real
-     two-host mechanism, not a synthetic pipe harness. (Complements the sibling
-     reattach arm, which already proved PID-survives.)
+     — the Phase 0 spike, realized faithfully. A process parked in **`epoll_wait`**
+     on a held-open pipe (the `claude`/libuv shape: stdin held, an `eppoll_entry`
+     registered on the pipe wait queue, the event loop parked for the next user
+     line — a static C `epoll` reader, NOT a blocking `read()`, since epoll is the
+     **exact mechanism ADR 0037 found wedged under File-restore**) is teleported
+     across two real host stacks; a line written into that pipe AFTER the move
+     wakes the frozen `epoll_wait` (`ep_poll_callback` fires) and is consumed.
+     This answers the load-bearing UFFD-restore question the teleport-gate flagged
+     — epoll survives UFFD restore (identical guest RAM incl. the kernel
+     `eventpoll`/wait-queue structures, same resumed kernel → pointers stay
+     valid), so the ADR 0037 File-restore wedge does not occur on the teleport
+     path. (Complements the sibling reattach arm, which proved PID-survives.)
   2. **`connection_bounce_mid_turn_preserves_the_run`** (harness engine unit,
      `test-linux`) — a connection drop + re-dial mid-turn (what the post-move
      SIGUSR1 drives) does not abort the in-flight turn: no spurious mid-turn
