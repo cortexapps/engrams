@@ -318,7 +318,7 @@ jobs:
       # same binary `nix develop` and the image bakes use. cache.nixos.org serves
       # it prebuilt, so this is a download (seconds), not a compile.
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v16
+        uses: DeterminateSystems/nix-installer-action@v22
       - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
         run: |
           MKE2FS_BIN="$(nix build .#mke2fs --no-link --print-out-paths)/bin"

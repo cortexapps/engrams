@@ -106,7 +106,7 @@ jobs:
       # `engrams_ref` — works once engrams is public, the same assumption the
       # previous raw.githubusercontent fetch made.
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v16
+        uses: DeterminateSystems/nix-installer-action@v22
       - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
         env:
           REF: ${{ inputs.engrams_ref }}
