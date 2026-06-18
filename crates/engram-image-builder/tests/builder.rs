@@ -1175,8 +1175,9 @@ async fn ext4_pack_is_deterministic_across_rebuilds() {
     // stamps WALL-CLOCK times into the superblock + every inode (ctime/crtime),
     // so two bakes of an identical tree differ whenever they straddle a second —
     // a flake, not a real determinism bug. Skip (don't flake) when the local
-    // mke2fs is too old; CI installs >=1.47.1 ahead of the system one via
-    // .github/scripts/ensure-reproducible-mke2fs.sh, so coverage is retained.
+    // mke2fs is too old; CI + the image bakes put the flake-pinned mke2fs
+    // (`nix build .#mke2fs`, e2fsprogs >=1.47.1) ahead of the system one, so
+    // coverage is retained there.
     fn mke2fs_honors_source_date_epoch() -> bool {
         let Ok(out) = std::process::Command::new("mke2fs").arg("-V").output() else {
             return false;
@@ -1195,7 +1196,7 @@ async fn ext4_pack_is_deterministic_across_rebuilds() {
     if !mke2fs_honors_source_date_epoch() {
         eprintln!(
             "mke2fs < 1.47.1 lacks SOURCE_DATE_EPOCH; skipping ext4 determinism test \
-             (run .github/scripts/ensure-reproducible-mke2fs.sh to install >=1.47.1)"
+             (use the flake-pinned mke2fs: `nix develop` or `nix build .#mke2fs`)"
         );
         return;
     }

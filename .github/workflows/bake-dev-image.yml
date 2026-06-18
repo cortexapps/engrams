@@ -97,26 +97,24 @@ jobs:
       # byte-deterministic — the keystone for cross-bake chunk dedup — ONLY with
       # an e2fsprogs that honors SOURCE_DATE_EPOCH (>= 1.47.1). Runner apt ships
       # <= 1.47.0, which silently stamps wall-clock times, so re-bakes of
-      # unchanged content produce all-new chunk hashes (no dedup). Fetch + run
-      # engrams' ensure script (this workflow checks out the caller, not
-      # engrams; engrams is public) to put a >= 1.47.1 mke2fs ahead of the
-      # system one. Idempotent + cached.
-      - name: Cache reproducible e2fsprogs
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/repro-e2fsprogs
-          key: repro-e2fsprogs-1.47.2-${{ runner.os }}
-      - name: Ensure reproducible mke2fs (e2fsprogs >= 1.47.1)
+      # unchanged content produce all-new chunk hashes (no dedup). Pull the
+      # pinned mke2fs from engrams' flake (`packages.mke2fs`, sourced from
+      # nixpkgs-e2fsprogs in flake.lock) and put it ahead of the system one — the
+      # same binary engrams CI and `nix develop` use, from one pinned rev.
+      # cache.nixos.org serves it prebuilt (seconds, no compile). This workflow
+      # checks out the caller (not engrams), so reference the flake remotely at
+      # `engrams_ref` — works once engrams is public, the same assumption the
+      # previous raw.githubusercontent fetch made.
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
         env:
           REF: ${{ inputs.engrams_ref }}
         run: |
           set -euo pipefail
-          curl -fsSL --retry 5 --retry-all-errors \
-            "https://raw.githubusercontent.com/cortexapps/engrams/${REF}/.github/scripts/ensure-reproducible-mke2fs.sh" \
-            -o /tmp/ensure-reproducible-mke2fs.sh
-          E2FSPROGS_PREFIX="$HOME/.cache/repro-e2fsprogs" \
-            bash /tmp/ensure-reproducible-mke2fs.sh
-          echo "$HOME/.cache/repro-e2fsprogs/sbin" >> "$GITHUB_PATH"
+          MKE2FS_BIN="$(nix build "github:cortexapps/engrams/${REF}#mke2fs" --no-link --print-out-paths)/bin"
+          "$MKE2FS_BIN/mke2fs" -V
+          echo "$MKE2FS_BIN" >> "$GITHUB_PATH"
 
       - name: Bake + push image
         env:

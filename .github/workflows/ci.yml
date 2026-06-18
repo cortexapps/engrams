@@ -312,19 +312,18 @@ jobs:
       # dedup) ONLY with an e2fsprogs that honors SOURCE_DATE_EPOCH, which the
       # packer sets but only e2fsprogs >= 1.47.1 reads. Ubuntu's apt ships
       # <= 1.47.0, so without this the `ext4_pack_is_deterministic_across_rebuilds`
-      # test self-skips (the runner's mke2fs stamps wall-clock times). Build +
-      # cache a >= 1.47.1 mke2fs ahead of the system one so the test actually
-      # runs. (Build is ~1-2 min cold; cache makes it a no-op on hits.)
-      - name: Cache reproducible e2fsprogs
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/repro-e2fsprogs
-          key: repro-e2fsprogs-1.47.2-${{ runner.os }}-${{ hashFiles('.github/scripts/ensure-reproducible-mke2fs.sh') }}
-      - name: Ensure reproducible mke2fs (e2fsprogs >= 1.47.1)
+      # test self-skips (the runner's mke2fs stamps wall-clock times). Pull the
+      # pinned mke2fs straight from the flake (`packages.mke2fs`, sourced from
+      # nixpkgs-e2fsprogs in flake.lock) and put it ahead of the system one — the
+      # same binary `nix develop` and the image bakes use. cache.nixos.org serves
+      # it prebuilt, so this is a download (seconds), not a compile.
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+      - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
         run: |
-          E2FSPROGS_PREFIX="$HOME/.cache/repro-e2fsprogs" \
-            bash .github/scripts/ensure-reproducible-mke2fs.sh
-          echo "$HOME/.cache/repro-e2fsprogs/sbin" >> "$GITHUB_PATH"
+          MKE2FS_BIN="$(nix build .#mke2fs --no-link --print-out-paths)/bin"
+          "$MKE2FS_BIN/mke2fs" -V
+          echo "$MKE2FS_BIN" >> "$GITHUB_PATH"
 
       # Default (non-ignored) tests across the entire workspace. Mirrors
       # `just check`'s nextest pass — same speedup, same coverage. The
