@@ -308,6 +308,23 @@ jobs:
       - name: Seed GCS test bucket
         run: bash deploy/dev/seed-buckets.sh
 
+      # ADR 0036: the ext4 pack is byte-deterministic (→ cross-bake chunk
+      # dedup) ONLY with an e2fsprogs that honors SOURCE_DATE_EPOCH, which the
+      # packer sets but only e2fsprogs >= 1.47.1 reads. Ubuntu's apt ships
+      # <= 1.47.0, so without this the `ext4_pack_is_deterministic_across_rebuilds`
+      # test self-skips (the runner's mke2fs stamps wall-clock times). Pull the
+      # pinned mke2fs straight from the flake (`packages.mke2fs`, sourced from
+      # nixpkgs-e2fsprogs in flake.lock) and put it ahead of the system one — the
+      # same binary `nix develop` and the image bakes use. cache.nixos.org serves
+      # it prebuilt, so this is a download (seconds), not a compile.
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+      - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
+        run: |
+          MKE2FS_BIN="$(nix build .#mke2fs --no-link --print-out-paths)/bin"
+          "$MKE2FS_BIN/mke2fs" -V
+          echo "$MKE2FS_BIN" >> "$GITHUB_PATH"
+
       # Default (non-ignored) tests across the entire workspace. Mirrors
       # `just check`'s nextest pass — same speedup, same coverage. The
       # engram-image-builder e2e bake test skips itself if `docker` is

@@ -1170,6 +1170,37 @@ async fn ext4_pack_is_deterministic_across_rebuilds() {
         return;
     }
 
+    // ADR 0036 byte-determinism hinges on SOURCE_DATE_EPOCH (which `Mke2fsPacker`
+    // sets), and e2fsprogs only honors it from 1.47.1. An older mke2fs silently
+    // stamps WALL-CLOCK times into the superblock + every inode (ctime/crtime),
+    // so two bakes of an identical tree differ whenever they straddle a second —
+    // a flake, not a real determinism bug. Skip (don't flake) when the local
+    // mke2fs is too old; CI + the image bakes put the flake-pinned mke2fs
+    // (`nix build .#mke2fs`, e2fsprogs >=1.47.1) ahead of the system one, so
+    // coverage is retained there.
+    fn mke2fs_honors_source_date_epoch() -> bool {
+        let Ok(out) = std::process::Command::new("mke2fs").arg("-V").output() else {
+            return false;
+        };
+        // `mke2fs -V` prints e.g. "mke2fs 1.47.2 (1-Jan-2025)" to stderr.
+        let text = String::from_utf8_lossy(&out.stderr);
+        let ver = text.split_whitespace().find_map(|tok| {
+            let mut it = tok.split('.');
+            let a: u32 = it.next()?.parse().ok()?;
+            let b: u32 = it.next()?.parse().ok()?;
+            let c: u32 = it.next()?.parse().ok()?;
+            Some((a, b, c))
+        });
+        matches!(ver, Some(v) if v >= (1, 47, 1))
+    }
+    if !mke2fs_honors_source_date_epoch() {
+        eprintln!(
+            "mke2fs < 1.47.1 lacks SOURCE_DATE_EPOCH; skipping ext4 determinism test \
+             (use the flake-pinned mke2fs: `nix develop` or `nix build .#mke2fs`)"
+        );
+        return;
+    }
+
     fn write_tree(root: &std::path::Path, order_flipped: bool) {
         std::fs::create_dir_all(root.join("etc")).unwrap();
         std::fs::create_dir_all(root.join("sbin")).unwrap();
