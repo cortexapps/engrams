@@ -23,7 +23,7 @@ const MINE: NavItem[] = [
 ];
 const ORG: NavItem[] = [
   { to: "/settings/members", label: "Members", icon: Users },
-  { to: "/settings/profiles", label: "Session Profiles", icon: IdCard },
+  { to: "/settings/profiles", label: "Profiles", icon: IdCard },
 ];
 
 export function SettingsLayout() {

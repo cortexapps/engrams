@@ -21,7 +21,7 @@ export function SessionsLayout() {
   const scopes: (NavItem & { active: boolean })[] = [
     {
       to: "/sessions",
-      label: "My sessions",
+      label: "My tasks",
       icon: Layers,
       active: pathname === "/sessions" || pathname === "/sessions/",
     },
@@ -29,7 +29,7 @@ export function SessionsLayout() {
       ? [
           {
             to: "/sessions/all" as LinkProps["to"],
-            label: "All sessions",
+            label: "All tasks",
             icon: ListChecks,
             active: pathname.startsWith("/sessions/all"),
           },

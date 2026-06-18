@@ -74,7 +74,7 @@ export function SessionDetail() {
             list in view and highlights this session (ADR 0029). Diagnostics
             opens from the masthead actions, on the title's baseline. */}
         <PageHeading
-          eyebrow="session"
+          eyebrow="task"
           title={id}
           titleVariant="mono"
           showRule={false}

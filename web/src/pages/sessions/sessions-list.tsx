@@ -55,7 +55,7 @@ export function SessionsList({
     return (
       <div role="alert" className="rounded-lg border border-dashed py-12 text-center">
         <p className="text-sm text-destructive">
-          Couldn’t load sessions.{error instanceof Error ? ` ${error.message}` : ""}
+          Couldn’t load tasks.{error instanceof Error ? ` ${error.message}` : ""}
         </p>
       </div>
     );
@@ -113,7 +113,7 @@ function SessionRows({
   if (rows.length === 0) {
     return (
       <p className="py-10 text-center text-sm text-muted-foreground">
-        {filter === "archived" ? "No archived sessions." : "No live sessions."}
+        {filter === "archived" ? "No archived tasks." : "No live tasks."}
       </p>
     );
   }
@@ -134,7 +134,7 @@ function Count({ n }: { n: number }) {
 // its shape while the fetch resolves (mirrors the rail's skeleton behaviour).
 function SkeletonRows() {
   return (
-    <div role="status" aria-label="Loading sessions">
+    <div role="status" aria-label="Loading tasks">
       <ul className="divide-y divide-border overflow-hidden rounded-lg border">
         {Array.from({ length: 5 }).map((_, i) => (
           <li key={i} className="flex items-center gap-3 px-3 py-2.5">

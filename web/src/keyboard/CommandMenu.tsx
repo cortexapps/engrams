@@ -48,7 +48,7 @@ interface Dest {
 // `value` strings (what cmdk scores against) deliberately include extra synonyms
 // so "go to fleet" / "hosts" style typing still lands.
 const DESTS: Dest[] = [
-  { to: "/sessions", label: "Sessions", icon: Layers, leader: "s" },
+  { to: "/sessions", label: "Tasks", icon: Layers, leader: "s" },
   { to: "/operator", label: "Operator", icon: Gauge, admin: true, leader: "o" },
   { to: "/operator/fleet", label: "Fleet", icon: Server, admin: true, leader: "f" },
   { to: "/operator/storage", label: "Storage", icon: Database, admin: true },
@@ -78,14 +78,14 @@ export function CommandMenu() {
 
   return (
     <CommandDialog open={open} onOpenChange={setPaletteOpen}>
-      <CommandInput placeholder="Type a command or session…" />
+      <CommandInput placeholder="Type a command or task…" />
       <CommandList>
         <CommandEmpty>No matching commands.</CommandEmpty>
 
         <CommandGroup heading="Actions">
-          <CommandItem value="start new session create launch" onSelect={() => run(openNewSession)}>
+          <CommandItem value="start new task create launch" onSelect={() => run(openNewSession)}>
             <SquarePlus />
-            <span>Start new session</span>
+            <span>Start new task</span>
             <CommandShortcut>
               <Kbd>c</Kbd>
             </CommandShortcut>
@@ -95,20 +95,20 @@ export function CommandMenu() {
         {(isPending || error || rows.length > 0) && (
           <>
             <CommandSeparator />
-            <CommandGroup heading="Sessions">
+            <CommandGroup heading="Tasks">
               {isPending ? (
-                <CommandItem disabled value="loading sessions">
-                  Loading sessions…
+                <CommandItem disabled value="loading tasks">
+                  Loading tasks…
                 </CommandItem>
               ) : error ? (
-                <CommandItem disabled value="sessions error">
-                  Couldn’t load sessions.
+                <CommandItem disabled value="tasks error">
+                  Couldn’t load tasks.
                 </CommandItem>
               ) : (
                 rows.map((r, i) => (
                   <CommandItem
                     key={r.id}
-                    value={`session ${shortId(r.id)} ${stripImageHost(r.image)} ${r.id}`}
+                    value={`task ${shortId(r.id)} ${stripImageHost(r.image)} ${r.id}`}
                     onSelect={() =>
                       run(() => navigate({ to: "/sessions/$id", params: { id: r.id } }))
                     }

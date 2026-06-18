@@ -16,7 +16,7 @@ export function MySessions() {
   return (
     <div className="flex-1 space-y-6 overflow-auto p-4 md:p-6">
       <PageHeading
-        title="Sessions"
+        title="Tasks"
         description="Bounded units of agent work: launch, watch, resume."
         actions={
           <NewSessionDialog
@@ -30,7 +30,7 @@ export function MySessions() {
         <Card>
           <CardContent className="flex items-center justify-between gap-4 py-3">
             <span className="text-sm">
-              No Claude Code token saved yet — built-in Claude sessions need one.
+              No Claude Code token saved yet — built-in Claude tasks need one.
             </span>
             <Button
               variant="secondary"
@@ -48,7 +48,7 @@ export function MySessions() {
         isPending={isPending}
         error={error}
         showOwner={false}
-        emptyText="No sessions yet. Start one to launch a sandbox and hand an agent a task."
+        emptyText="No tasks yet. Start one to launch a sandbox and hand an agent a task."
         emptyAction={
           <NewSessionDialog onCreated={(id) => navigate({ to: "/sessions/$id", params: { id } })} />
         }
