@@ -132,6 +132,13 @@ impl AuxRoDrive {
     /// host-agent to report `current_bundles`.
     pub const CURRENT_STAMP: &'static str = "current.json";
 
+    /// ADR 0055: stamp key (in `current.json`) for the sentinel squashfs — the
+    /// tiny placeholder every reserved slot carries at capture. The guest reads
+    /// its `mount.json` (`"kind":"sentinel"`) and skips it. All reserved slots
+    /// resolve to this generation at base-snapshot capture; per-session creates
+    /// `patch_drive` real skills over it in the paused restore window.
+    pub const SENTINEL_STAMP_KEY: &'static str = "sentinel";
+
     /// ADR 0055: number of reserved dynamic-mount slots captured into every
     /// base snapshot (`dyn-0..dyn-{RESERVED_SLOTS-1}`), one skill per slot.
     /// Bounded by Firecracker's x86 **virtio-mmio** GSI pool — engrams boots

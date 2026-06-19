@@ -166,7 +166,7 @@ fn sandbox_spec() -> SandboxSpec {
         },
         aux_ro_drives: vec![AuxRoDrive {
             sha256: Some("a".repeat(64)),
-            ..AuxRoDrive::skills()
+            ..AuxRoDrive::reserved_slot(0)
         }],
     }
 }
@@ -248,13 +248,13 @@ fn struct_payloads_golden() {
         "aux_ro_drive",
         &AuxRoDrive {
             sha256: Some("c".repeat(64)),
-            ..AuxRoDrive::playwright()
+            ..AuxRoDrive::reserved_slot(1)
         },
     );
     assert_golden(
         "aux_bundle_ref",
         &AuxBundleRef {
-            drive_id: "playwright".into(),
+            drive_id: "dyn-1".into(),
             sha256: "d".repeat(64),
         },
     );
@@ -344,13 +344,13 @@ fn regen_golden() {
         "aux_ro_drive",
         &AuxRoDrive {
             sha256: Some("c".repeat(64)),
-            ..AuxRoDrive::playwright()
+            ..AuxRoDrive::reserved_slot(1)
         },
     );
     write(
         "aux_bundle_ref",
         &AuxBundleRef {
-            drive_id: "playwright".into(),
+            drive_id: "dyn-1".into(),
             sha256: "d".repeat(64),
         },
     );

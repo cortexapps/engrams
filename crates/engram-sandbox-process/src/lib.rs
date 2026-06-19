@@ -631,28 +631,35 @@ fn env_iter<'a>(env: &'a HashMap<String, String>) -> impl Iterator<Item = (&'a s
 /// `just bundles` populates the defaults; override per drive via
 /// `ENGRAM_<DRIVE_ID>_BUNDLE_DIR`.
 ///
-/// We stage every dev skill bundle present under `var/bundles/<name>` rather
-/// than reading `spec.aux_ro_drives` (the ProcessBackend restore path
-/// synthesizes a spec without them — staging the same way for create and
-/// restore keeps a resumed dev session's symlinks valid). Best-effort: this is
-/// the non-isolated dev backend, with no reserved slots / `patch_drive`, so it
-/// just mirrors what `just bundles` populated and `activate` wires whatever it
-/// finds. ADR 0055: per-session selection + `mount.json`-declared guest paths
-/// arrive with the catalog; today each bundle lands at `/opt/engram/<name>`.
+/// ADR 0055 dev parity for the built-in skill bundles. Production FC reserves
+/// `dyn-*` slots and `patch_drive`s the selected skills in; the non-isolated
+/// dev backend has no drives, so it symlinks each available bundle tree (under
+/// `var/bundles/<name>`, populated by `just bundles`, or the
+/// `ENGRAM_<NAME>_BUNDLE_DIR` override) at its guest mount so
+/// `engram_session_bundles::activate(cwd, ..)` finds it. Spec-independent (the
+/// restore path synthesizes a spec without aux drives) so create and restore
+/// stage identically. The catalog-driven, per-session-selected dev staging
+/// lands with the rest of the ADR 0055 catalog; today it stages the known
+/// built-in bundles at their canonical guest mounts.
 async fn stage_aux_bundles(cwd: &Path) {
-    let mut entries = match tokio::fs::read_dir("var/bundles").await {
-        Ok(d) => d,
-        Err(_) => return, // no dev bundles staged (run `just bundles`)
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        // Honor the per-bundle env override, else `var/bundles/<name>`.
-        let host_dir = bundle_host_dir(name).unwrap_or_else(|| entry.path());
-        if !host_dir.is_dir() {
+    const DEV_BUNDLES: &[(&str, &str)] = &[
+        ("skills", "/opt/engram/skills"),
+        ("playwright", "/opt/engram/browser"),
+    ];
+    for &(name, guest_mount) in DEV_BUNDLES {
+        let Some(host_dir) = bundle_host_dir(name) else {
+            continue;
+        };
+        if !host_dir.exists() {
+            tracing::debug!(
+                bundle = %name,
+                host_dir = %host_dir.display(),
+                "ADR 0055 dev: bundle dir absent; skipping (run `just bundles`)",
+            );
             continue;
         }
-        let link = cwd.join("opt/engram").join(name);
+        let rel = guest_mount.strip_prefix('/').unwrap_or(guest_mount);
+        let link = cwd.join(rel);
         if let Some(parent) = link.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }

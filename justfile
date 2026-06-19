@@ -192,8 +192,8 @@ bundles:
     deploy/bundles/playwright/build.sh --stage var/bundles/playwright \
         || echo "playwright bundle skipped (needs Docker) — dev sessions get skills only"
 
-# ADR 0035: build + stage the squashfs bundles CONTENT-ADDRESSED
-# (<name>-<sha256>.squashfs + current.json stamp) under var/shared/, the
+# ADR 0035/0055: build + stage the squashfs bundles CONTENT-ADDRESSED
+# (<sha256>.squashfs + current.json stamp) under var/shared/, the
 # dev mirror of the FC-host image's /var/lib/engram/shared. Run the
 # host-agent with ENGRAM_BUNDLE_DIR=$PWD/var/shared so FC dev sessions
 # resolve/capture against it. Linux-only (mksquashfs; FC is Linux-only
@@ -205,7 +205,10 @@ bundles-squashfs:
     mkdir -p var/shared
     stamp="{"
     sep=""
-    for name in skills playwright; do
+    # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/playwright
+    # are catalog skills swapped in per session. Files are content-keyed
+    # (<sha>.squashfs); the stamp maps logical name -> sha.
+    for name in sentinel skills playwright; do
         tmp="var/shared/.$name.build.squashfs"
         if ! "deploy/bundles/$name/build.sh" "$tmp"; then
             echo "$name bundle build failed; skipping (sessions degrade gracefully)" >&2
@@ -213,7 +216,7 @@ bundles-squashfs:
             continue
         fi
         sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
-        mv "$tmp" "var/shared/$name-$sha.squashfs"
+        mv "$tmp" "var/shared/$sha.squashfs"
         stamp="$stamp$sep\"$name\": \"$sha\""
         sep=", "
     done
