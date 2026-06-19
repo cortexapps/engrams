@@ -154,7 +154,10 @@ async fn warm_hook_sees_manifest_env() {
 
     // Confirm the value the hook observed was the manifest one (not a stray
     // default), surviving into a restored session.
-    let restored = pooled.restore_fresh(meta, Vec::new()).await.expect("restore");
+    let restored = pooled
+        .restore_fresh(meta, Vec::new())
+        .await
+        .expect("restore");
     let seen = exec(&pooled, restored, "cat /dev/shm/engram-warm-env").await;
     assert_eq!(
         seen.trim(),

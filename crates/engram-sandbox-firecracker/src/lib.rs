@@ -4213,8 +4213,12 @@ impl SandboxBackend for FirecrackerBackend {
         // ADR 0035 §3 + 0055: fresh creates track the host's current bundle
         // generations AND patch the per-session selected skills into reserved
         // slots; both swaps happen load-paused inside restore_in_jail.
-        self.restore_with(metadata, /*swap_aux_to_current=*/ true, selected_mounts)
-            .await
+        self.restore_with(
+            metadata,
+            /*swap_aux_to_current=*/ true,
+            selected_mounts,
+        )
+        .await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
