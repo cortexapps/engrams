@@ -7,10 +7,18 @@ Builds on **ADR 0027** (the read-only host-mounted shared bundle engine), **ADR 
 capability scoping ADR 0053 §7 explicitly deferred to "its own ADR"**, and it realizes the
 **"dynamic per-session skill/tool selection" ADR 0027 deferred**.
 
-> **P1 landed materially differently from the plan below** (N=12 not 64; the catalog is the
-> existing `current_bundles` fleet stamp, not a new `MountCatalogService`; the wire carries
-> skill *names*, not pre-resolved mounts; `[browser]` is fully removed). The design sections
-> are preserved for rationale; **read [§ P1 implementation notes](#p1-implementation-notes-divergences-from-the-plan) for what was actually built.**
+> **P1 landed with a few simplifications vs the design below** (the catalog is the existing
+> `current_bundles` fleet stamp, not a new `MountCatalogService`; the wire carries skill
+> *names*, not pre-resolved mounts; `[browser]` is fully removed rather than memory-floored).
+> See [§ P1 implementation notes](#p1-implementation-notes-divergences-from-the-plan).
+
+Revised 2026-06-19 (P1 underway): the reserved-slot count drops from a speculative **N=64
+stress test** to a small **~12**, after source research on the vendored FC fork showed x86
+virtio-mmio (engrams boots `pci=off`) caps total devices at the 19-line legacy GSI pool —
+so ~13 aux drives, and N=64 was never possible on the production transport. The uniform
+one-skill-per-drive model is unchanged; size-aware packing remains the documented fallback
+if a profile ever needs more skills than fit. Threaded through §2, the measurement gate,
+Consequences, Alternatives (a new `pci=on` rejection), and Implications.
 
 ## Context
 
@@ -99,20 +107,23 @@ mounted drive to learn what to wire. `min_memory_mib` lets any heavy skill decla
 own floor (replacing the browser-specific 1 GiB special-case — §7/§9). Unused reserved
 slots carry a tiny **sentinel** squashfs (`"kind":"sentinel"`) the guest skips.
 
-### 2. Reserved slots in the base snapshot — N = 64 (a stress test)
+### 2. Reserved slots in the base snapshot — small N (~12, FC-mmio-bounded)
 
 Because FC needs every drive present at `load_snapshot`, base-snapshot capture attaches a
 **fixed pool of placeholder slots** — `dyn-0 .. dyn-{N-1}`, each pointing at the sentinel
 squashfs. At fresh-create the resolver `patch_drive`s the slots a session needs from
 sentinel to the selected skill; unused slots stay sentinel and the guest ignores them.
 
-We set **N = 64** deliberately, to **stress-test the hypothesis that a reserved-but-unused
-slot is near-free at restore** (a present-but-*unmounted* virtio-blk device backed by one
-shared tiny sentinel: a cheap file-open + a small device descriptor in `state.bin`, with
-no guest re-enumeration since the devices were enumerated once at capture and frozen). If
-that holds, N=64 makes the per-session skill cap a non-issue for any realistic profile
-while keeping the model maximally simple. **This is a hypothesis to be measured, not an
-assumption** — see the measurement gate below and in Open questions.
+**N is small (~12), set by Firecracker's device ceiling — not a preference.** engrams boots
+FC `pci=off`, so every virtio device (drives included) uses the x86 **virtio-mmio** legacy
+interrupt pool, `GSI_LEGACY_START=5 .. GSI_LEGACY_END=23` (19 lines). Minus the baseline
+virtio devices (rootfs, net, vsock) that leaves room for roughly **~13 aux drives**, NOT the
+hundreds a `pci=on` MSI pool would give. (An earlier draft proposed N=64 as a stress test;
+source research on the vendored FC fork settled it before any code was written — see the
+measurement gate.) The exact ceiling is pinned by a dev-vm probe; 12 leaves headroom. A
+present-but-*unmounted* slot is near-free at restore (a cheap file-open + a small device
+descriptor in `state.bin`, no guest re-enumeration). A profile needing more skills than fit
+is the documented fallback to size-aware packing (Alternatives).
 
 ### 3. One skill = one drive — no composition, no categories
 
@@ -127,10 +138,10 @@ squashfs in directly. Consequences, all good:
   stage.
 - **Uniform treatment + trivial extensibility.** Browser is a catalog entry on its own
   drive like any skill; a future large skill is handled identically with no new code path.
-- **The only bound is N skills per session.** With N=64 this is a non-issue for realistic
-  profiles. If the measurement shows reserved slots are *not* cheap enough to keep N
-  generous, we revisit with size-aware slot packing (Generalization B, in Alternatives) —
-  but that is a fallback the measurement must force, not the default.
+- **The only bound is ~N skills per session.** A curated profile mounts a handful of
+  skills, so the ~12 ceiling is a non-issue in practice. A profile that genuinely needs
+  more is the documented trigger for size-aware slot packing (Generalization B, in
+  Alternatives) — a fallback, not the default.
 
 ### 4. Late-bind in the paused restore window (the fast-boot core)
 
@@ -243,30 +254,33 @@ probes all retire. Zero-users clean break; base snapshots re-bake with the reser
 - The catalog is **pre-staged on every host**, so the swap is a local-file operation — no
   fetch on the boot path.
 - No composition → **no build on the create path**, ever.
-- Reserved slots are believed cheap at restore; **N=64 stress-tests exactly that** (next).
+- Reserved slots are cheap at restore (a present-but-unmounted virtio-blk device backed by
+  one shared sentinel); the dev-vm probe confirms the cost and pins the exact small N (next).
 
-## Measurement gate (must run before Accepted)
+## Measurement gate (must run before the base re-bake)
 
-The whole "generous N, no packing" choice rests on one empirical claim. Before flipping
-this ADR to Accepted, measure on real FC/KVM:
+One empirical number gates the base-snapshot re-bake. Source research on the vendored FC
+fork already settled the *order*: with `pci=off`, x86 virtio-mmio caps total devices at the
+19-line legacy GSI pool (`GSI_LEGACY_START=5 .. GSI_LEGACY_END=23`), so ~13 aux drives —
+N=64 was never possible on the production transport. The dev-vm probe pins the rest before
+we re-bake:
 
-- **Per-reserved-slot restore cost.** Restore latency at N=0 vs N=64 (and a midpoint),
-  via the existing OTel spans (`fc.restore_in_jail`, `fc.spawn_uffd_handler`). If 64
-  empty slots don't materially move restore p50/p99, the uniform model stands as-is.
-- **FC's device ceiling.** Confirm Firecracker actually boots + snapshots + restores with
-  64 aux virtio-blk drives (MMIO/IRQ/GSI allocation). If FC caps below 64, that ceiling —
-  not our preference — bounds N, and is itself a reason to revisit packing.
+- **Exact aux-drive ceiling.** Attach N reserved drives and boot + snapshot + restore until
+  it breaks; set `RESERVED_SLOTS` to the largest that survives with headroom (target ~12).
+- **Per-reserved-slot restore cost.** Restore latency at N=0 vs the chosen N via the OTel
+  spans (`fc.restore_in_jail`, `fc.spawn_uffd_handler`) — confirm ~12 empty slots don't move
+  restore p50/p99 (expected: a present-but-unmounted device is near-free).
 
-Outcomes: (a) slots cheap + FC fine → ship N generous, done; (b) slots cost real latency
-or FC caps low → **revisit with size-aware slot packing (Generalization B, Alternatives)**,
-which trades uniformity for a smaller N. Either way the conceptual model stays "a skill is
-a content-addressed mount"; packing would be a mechanical, size-keyed optimization, never
-a per-identity special-case.
+If a realistic profile ever needs more skills than the ceiling allows, the fallback is
+size-aware slot packing (Generalization B) — never a per-identity special-case. Lifting the
+ceiling via `pci=on` is rejected (Alternatives): it rewrites the device transport for every
+VM and is a separate snapshot/UFFD-compat project.
 
 ## Phasing
 
 - **P1 — engine generalization + admin-skill migration (one big PR is fine).** Generalize
-  `AuxRoDrive` + `mount.json`; reserved slots at capture (N=64); the coordinator mount
+  `AuxRoDrive` + `mount.json`; reserved slots at capture (`RESERVED_SLOTS` ~12, pinned by
+  the dev-vm probe); the coordinator mount
   resolver; generalize the init shim + `activate()` to manifest-driven; catalog +
   `MountCatalogService` (admin/CI-curated entries); profile selected-skills field +
   create-time resolve; catalog pin set; migrate `share-file` / `create-pull-request` /
@@ -280,20 +294,16 @@ a per-identity special-case.
 
 ## P1 implementation notes (divergences from the plan)
 
-P1 shipped across four commits on `feat/adr-0055-p1-dynamic-mount-engine`
+P1 shipped across the commits on `feat/adr-0055-p1-dynamic-mount-engine`
 (A: sentinel device model; B: dev-vm device-ceiling probe + pin N; C: per-session
 selection — proto, resolver, `activate()`, remount, init-shim; D: name-resolution +
-orchestrator `profile.skills` + `[browser]` retirement). What landed, and why it differs
-from the design above:
+orchestrator `profile.skills` + `[browser]` retirement). What landed, and where it
+simplifies the design above:
 
-- **N = 12, not 64 — the "stress test 64" hypothesis was *falsified by the device model*,
-  not by per-slot cost.** Prod is FC on x86 with `pci=off`, so aux drives are legacy
-  virtio-**mmio** and each needs a GSI from the legacy pool (`GSI_LEGACY_START=5 ..
-  GSI_LEGACY_END=23` ≈ 19 lines, minus console/rng/vsock/rootfs/etc.) → ~13 aux drives is
-  the hard ceiling; 64 is physically impossible on the production arch. The P1-B probe
-  booted + snapshotted + restored a VM with 12 reserved aux drives on real FC (~21.6s) to
-  pin N=12. The per-slot *latency* question (the original gate) is therefore moot at this N
-  — the ceiling bound first. (drive_id is `dyn_0`, underscore — FC rejects `dyn-0`.)
+- **N pinned at 12, confirmed on real FC.** The §2 ceiling argument held: the P1-B probe
+  booted + snapshotted + restored a VM with 12 reserved aux drives on real Firecracker
+  (~21.6s) — so N=12 is validated, not just derived. (drive_id is `dyn_0`, underscore — FC
+  rejects `dyn-0`; guest mount is `/opt/engram/dyn/<i>`.)
 
 - **No `MountCatalogService` and no coordinator catalog table.** The catalog *already
   exists*: every host bakes the `deploy/bundles/*` squashfs and reports a `current.json`
@@ -302,31 +312,32 @@ from the design above:
   selected name → staged sha → reserved slot. So P1 adds **zero** new service / table /
   coordinator migration — a thin function over data that already flows, per "simplify via
   abstractions." Per-skill pack/publish *at registration* is only needed for user uploads
-  and moves to **P2**; P1's catalog is the admin-baked fleet bundle set.
+  and moves to **P2**; P1's catalog is the admin-baked fleet bundle set. The host reads the
+  stamp **once at startup** (mirroring prod, where the Packer bake stages it into the host
+  image before the agent boots), so dev/CI must stage bundles before the host-agent starts.
 
-- **The wire carries skill *names*, not pre-resolved mounts.** `CreateSessionRequest`
-  gained `repeated string selected_skills` (not `repeated DynamicMount mounts`). The
-  orchestrator passes `profile.skills` verbatim and never learns shas; the coordinator owns
+- **The wire carries skill *names*, not pre-resolved mounts.** `CreateSessionRequest` gained
+  `repeated string selected_skills` (not `repeated DynamicMount mounts`). The orchestrator
+  passes `profile.skills` verbatim and never learns shas; the coordinator owns
   name→sha→slot resolution. Cleaner trust boundary; `grpc_app/convert.rs` is a pass-through.
   An unknown name or a selection > `RESERVED_SLOTS` is a create-time 400.
 
-- **`[browser] enabled` is fully removed, and the memory floor with it** (not "keyed off
-  the resolved set" as §Implications speculated). Playwright attachment was already a
-  profile skill after P1-C, leaving the flag's *only* live function the 1 GiB memory floor.
-  But the base snapshot is sized **once per image** and skills bind via `patch_drive`
-  without resizing memory, so memory is purely `suggested_memory_mib` (default 4096 already
+- **`[browser] enabled` is fully removed, and the memory floor with it** (rather than §7's
+  per-skill `min_memory_mib` keyed off the resolved set). Playwright attachment became a
+  profile skill in P1-C, leaving the flag's *only* live function the 1 GiB floor. But the
+  base snapshot is sized **once per image** and skills bind via `patch_drive` without
+  resizing memory, so memory is purely `suggested_memory_mib` (the 4096 default already
   exceeds the old floor; no in-repo image declared `[browser]` — behaviour-preserving).
-  Browser-capable profiles size their image; per-skill memory metadata + *validate-fit* is
-  a P2 catalog concern. `BrowserConfig` / `browser_enabled()` / `BROWSER_MEMORY_FLOOR_MIB` /
-  the bake-time musl warning are gone.
+  Browser-capable profiles size their image; per-skill memory metadata + *validate-fit*
+  (reject a selection whose floor exceeds the captured base, never resize) is the P2 catalog
+  refinement of the §1 `min_memory_mib` idea. `BrowserConfig` / `browser_enabled()` /
+  `BROWSER_MEMORY_FLOOR_MIB` / the bake-time musl warning are gone.
 
-- **Guest path = `/opt/engram/dyn/<slot>` (open question resolved: generic, slot-assigned).**
-  This forced the bundles to be **position-independent**: the playwright wrapper self-locates
-  its runtime from `$0` (`readlink -f` follows the PATH symlink `activate()` creates) instead
-  of hardcoding `/opt/engram/browser`, and `fonts.conf` uses fontconfig `<dir
-  prefix="relative">`. `activate()` scans `/opt/engram/dyn/*`, skips sentinels, and wires
-  each bundle's `mount.json`-declared skills (gating `requires_env`, askpass → gitconfig).
-  The dev `ProcessBackend` stages bundles at the same `dyn/<i>` paths.
+- **Position-independent bundles.** Because the guest mount path is a slot-assigned
+  `/opt/engram/dyn/<i>`, the playwright wrapper self-locates its runtime from `$0`
+  (`readlink -f` follows the PATH symlink `activate()` creates) instead of hardcoding
+  `/opt/engram/browser`, and `fonts.conf` uses fontconfig `<dir prefix="relative">`. The dev
+  `ProcessBackend` stages bundles at the same `dyn/<i>` paths.
 
 - **Known P1 gap — queued sessions lose their skill selection.** `prepare_from_row` (the
   scanner boot for a session queued under capacity pressure) passes `Vec::new()` because the
@@ -334,23 +345,16 @@ from the design above:
   Resume is unaffected (skills are pinned in the snapshot's `aux_bundles`). Closing the gap
   needs a session-row `selected_skills` column — deferred, documented at the call site.
 
-- **Memory floor vs fixed base (resolved): validate-fit, never resize.** Because FC can't
-  change `mem_size_mib` on restore, the base capture memory is authoritative. P1 sizes it
-  by `suggested_memory_mib`; P2's catalog can carry a per-skill memory requirement and the
-  resolver can *reject* a selection whose floor exceeds the image (validate-fit), rather than
-  ever resizing the base (which would re-explode the per-combination snapshot count).
-
 ## Consequences / risks
 
 - **Base-snapshot re-bake.** Reserved slots change the captured device model; all base
   snapshots re-capture. Acceptable (zero users; clean break) and auto-triggered by the
   host-image roll. Growing/shrinking N later is another re-bake.
-- **The N=64 hypothesis might not hold.** Empty slots may cost more than expected, or FC
-  may not support 64 aux drives. The measurement gate forces the answer; the fallback
-  (size-aware packing) is designed-for, not a rewrite — the catalog/resolver/activation
-  stay; only slot assignment changes.
-- **A per-session skill cap of N exists** (vs. truly unbounded). With a generous N this is
-  academic for skills; only realized if a single session selects > N skills.
+- **A small per-session skill cap (~N) exists**, set by FC's x86 mmio device ceiling
+  (~13 aux drives, `pci=off`) — not a preference. Academic for curated profiles (which mount
+  a handful), but real: a profile selecting > N skills is the documented trigger for
+  size-aware packing (Generalization B). The fallback is designed-for, not a rewrite — the
+  catalog/resolver/activation stay; only slot assignment changes.
 - **FC-only.** Aux drives are unsupported on VZ (`engram-sandbox-vz` →
   `aux_ro_drives: Vec::new()`); dynamic skills ride FC in prod and ProcessBackend in dev
   (which materializes bundles from `var/bundles/` and ignores `aux_ro_drives`). VZ parity
@@ -371,6 +375,11 @@ from the design above:
   fallback the measurement gate may force** — and notably it is the *uniform, size-keyed*
   version, never the original "browser is a different kind of thing" split, which was a
   smell and is dropped entirely.
+- **Enable virtio-PCI in FC (`pci=on`).** Lifts the device ceiling from ~13 (x86 mmio
+  legacy GSIs) to thousands (MSI / `KVM_MAX_IRQ_ROUTES=4096`), so one-skill-per-drive could
+  scale to N=64+. Rejected: it switches the virtio transport for *every* VM and makes PCI
+  snapshot/restore/UFFD compatibility its own large validation project on an incident-prone
+  substrate — far too much blast radius to lift a skills cap that packing already addresses.
 - **vsock-fetch into a writable overlay** (agentd fetches payloads over the upload/forge
   vsock seam at bind, into a tmpfs/overlay — ADR 0027's "light/dynamic" sketch). No
   re-bake, no slot cap, all backends — but doesn't reuse the content-addressed RO-bundle
@@ -398,9 +407,9 @@ from the design above:
 
 ## Open questions (to settle during P1)
 
-- **The measurement gate (above)** — per-reserved-slot restore cost + FC's aux-drive
-  ceiling. Start at N=64; the data decides whether N stays generous or we fall back to
-  size-aware packing.
+- **The measurement gate (above)** — the dev-vm probe pins the exact `RESERVED_SLOTS`
+  (~12) under FC's x86 mmio ceiling and confirms the per-slot restore cost, before the base
+  re-bake.
 - **Catalog source-of-truth boundary** — confirm coordinator-owns-artifacts /
   orchestrator-owns-curation and the exact `MountCatalogService` shape (this ADR's
   recommendation; sharpen against the ADR 0053 image-catalog precedent).
@@ -413,8 +422,9 @@ from the design above:
   `repeated DynamicMount mounts`; a new orchestrator-facing `MountCatalogService`; the
   orchestrator-native `profile.proto` gains a selected-skills field. The control-plane
   `CreateSession` contract is otherwise unchanged and stays profile-agnostic.
-- **Core / FC:** `AuxRoDrive` → general skill mount + `mount.json`; capture attaches N=64
-  sentinel slots; restore extends the `fc.swap_aux_bundles` plan to per-session selection;
+- **Core / FC:** `AuxRoDrive` → general skill mount + `mount.json`; capture attaches
+  `RESERVED_SLOTS` (~12) sentinel slots; restore extends the `fc.swap_aux_bundles` plan to
+  per-session selection;
   agentd remount + `activate()` go manifest-driven; memory floor keys off the resolved set.
 - **Coordinator:** mount resolver in `cold_boot_spec`; catalog table + `MountCatalogService`;
   per-skill pack + publish at registration; catalog pin set folded into the heartbeat
