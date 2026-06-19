@@ -297,35 +297,28 @@ if [ -b /dev/vdb ]; then
     rmdir /run/engram/.ca-stage 2>/dev/null || true
 fi
 mark ca_staged
-# ADR 0027: mount read-only host bundles (skills / playwright squashfs)
-# the host attached as extra virtio-blk drives. The device letter
-# depends on attach order (and whether the legacy CA ext4 drive above
-# took /dev/vdb), so we PROBE the non-root block devices and identify
-# each bundle by a content marker rather than hard-coding a letter —
-# order-independent and robust across snapshot/restore. squashfs-only,
-# so a probe never accidentally mounts the ext4 CA drive. The mounts are
-# captured in the base snapshot's VFS; on a fresh-create restore the
-# host may patch_drive a bundle to a newer generation, and agentd
-# umount/remounts at session bind so the superblock re-parses the
-# swapped device (ADR 0035 §3). Best-effort: a missing/absent bundle
-# just leaves the mount point empty; agentd degrades gracefully.
-for dev in /dev/vdb /dev/vdc /dev/vdd /dev/vde; do
+# ADR 0055: mount each reserved dynamic-mount slot the host attached as an
+# extra read-only virtio-blk drive. Slots carry a sentinel squashfs at
+# base-snapshot capture; a per-session create patch_drives the profile-selected
+# skills into the slots' devices in the paused restore window. We mount every
+# squashfs device (squashfs-only, so the ext4 CA drive is never matched) at a
+# sequential /opt/engram/dyn/<i> — the index tracks the host's slot order (FC
+# preserves attach order). The mounts freeze into the base snapshot's VFS; on a
+# fresh-create restore the host has swapped some slots' devices, and agentd
+# umount/remounts /opt/engram/dyn/* at session bind so each superblock re-parses
+# its (possibly swapped) device (ADR 0035 §3). agentd then reads each mount's
+# mount.json to wire skills (sentinels are skipped). Best-effort.
+i=0
+for dev in /dev/vd*; do
     [ -b "$dev" ] || continue
-    mkdir -p /opt/engram/.probe 2>/dev/null || true
-    mount -t squashfs -o ro "$dev" /opt/engram/.probe 2>/dev/null || continue
-    if [ -x /opt/engram/.probe/bin/engram-share ]; then
-        umount /opt/engram/.probe 2>/dev/null || true
-        mkdir -p /opt/engram/skills 2>/dev/null || true
-        mount -t squashfs -o ro "$dev" /opt/engram/skills 2>/dev/null || true
-    elif [ -x /opt/engram/.probe/bin/playwright-cli ]; then
-        umount /opt/engram/.probe 2>/dev/null || true
-        mkdir -p /opt/engram/browser 2>/dev/null || true
-        mount -t squashfs -o ro "$dev" /opt/engram/browser 2>/dev/null || true
+    [ "$dev" = "/dev/vda" ] && continue  # rootfs
+    mkdir -p "/opt/engram/dyn/$i" 2>/dev/null || true
+    if mount -t squashfs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null; then
+        i=$((i + 1))
     else
-        umount /opt/engram/.probe 2>/dev/null || true
+        rmdir "/opt/engram/dyn/$i" 2>/dev/null || true  # not squashfs (e.g. CA ext4)
     fi
 done
-rmdir /opt/engram/.probe 2>/dev/null || true
 mark bundles_mounted
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
