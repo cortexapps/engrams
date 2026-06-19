@@ -115,9 +115,10 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
             match serde_json::from_slice::<MountManifest>(&bytes) {
                 Ok(m) if m.kind == "sentinel" => {} // reserved-but-unused slot
                 Ok(m) => bundles.push((slot, m)),
-                Err(e) => report
-                    .warnings
-                    .push(format!("bad mount.json at {}: {e}", manifest_path.display())),
+                Err(e) => report.warnings.push(format!(
+                    "bad mount.json at {}: {e}",
+                    manifest_path.display()
+                )),
             }
         }
     }
@@ -354,7 +355,10 @@ mod tests {
         stage_sentinel_slot(dir.path(), 1);
         let report = activate(dir.path(), &env(&[]));
         assert!(report.activated.is_empty());
-        assert!(report.warnings.iter().any(|w| w.contains("no skill bundles")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no skill bundles")));
     }
 
     #[test]
@@ -468,7 +472,10 @@ mod tests {
         }
         let report = activate(dir.path(), &env(&[("ENGRAM_FORGE_TOKEN", "tok")]));
         assert!(report.activated.is_empty());
-        assert!(report.warnings.iter().any(|w| w.contains("no skill bundles")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no skill bundles")));
     }
 
     #[test]

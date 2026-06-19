@@ -1596,8 +1596,7 @@ mod tests {
 
         // Two skills → two drives at dyn_0 / dyn_1 with the catalog shas, in
         // request order.
-        let mounts =
-            assign_skill_slots(&catalog, &["skills".into(), "playwright".into()]).unwrap();
+        let mounts = assign_skill_slots(&catalog, &["skills".into(), "playwright".into()]).unwrap();
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(0));
         assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(0));
