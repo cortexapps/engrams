@@ -642,11 +642,12 @@ fn env_iter<'a>(env: &'a HashMap<String, String>) -> impl Iterator<Item = (&'a s
 /// lands with the rest of the ADR 0055 catalog; today it stages the known
 /// built-in bundles at their canonical guest mounts.
 async fn stage_aux_bundles(cwd: &Path) {
-    const DEV_BUNDLES: &[(&str, &str)] = &[
-        ("skills", "/opt/engram/skills"),
-        ("playwright", "/opt/engram/browser"),
-    ];
-    for &(name, guest_mount) in DEV_BUNDLES {
+    const DEV_BUNDLES: &[&str] = &["skills", "playwright"];
+    // Sequential slot index, mirroring the production init-shim's
+    // /opt/engram/dyn/<i> mounting so the shared `activate()` finds the bundles.
+    // A skipped (absent) bundle doesn't consume an index.
+    let mut i = 0usize;
+    for name in DEV_BUNDLES {
         let Some(host_dir) = bundle_host_dir(name) else {
             continue;
         };
@@ -658,8 +659,7 @@ async fn stage_aux_bundles(cwd: &Path) {
             );
             continue;
         }
-        let rel = guest_mount.strip_prefix('/').unwrap_or(guest_mount);
-        let link = cwd.join(rel);
+        let link = cwd.join(format!("opt/engram/dyn/{i}"));
         if let Some(parent) = link.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -667,6 +667,7 @@ async fn stage_aux_bundles(cwd: &Path) {
         if let Err(e) = tokio::fs::symlink(&host_dir, &link).await {
             tracing::debug!(bundle = %name, error = %e, "ADR 0055 dev: bundle symlink failed");
         }
+        i += 1;
     }
 }
 
