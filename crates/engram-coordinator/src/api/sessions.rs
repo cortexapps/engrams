@@ -875,6 +875,7 @@ fn assign_skill_slots(
     Ok(mounts)
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive session-create inputs; threading a struct buys nothing
 async fn prepare_inner(
     state: &SharedState,
     identity_env: HashMap<String, String>,
