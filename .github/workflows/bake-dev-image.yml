@@ -83,38 +83,20 @@ jobs:
 
       - uses: oras-project/setup-oras@v1
 
-      - name: Pull golden cli-tools (engram-cli + engram-agentd)
+      - name: Pull golden cli-tools (engram-cli + engram-agentd + mke2fs)
         env:
           REF: ${{ inputs.engrams_ref }}
         run: |
           set -euo pipefail
-          # Drops engram-cli + engram-agentd into the cwd verbatim.
+          # Drops engram-cli + engram-agentd + the pinned mke2fs into cwd. oras
+          # doesn't preserve the executable bit, so re-set it. ADR 0036: the
+          # bundled mke2fs (e2fsprogs >= 1.47.1) is what makes `engram-cli image
+          # build` byte-deterministic — engram-cli resolves it as a sibling, so
+          # no nix/apt setup step is needed here. (Determinism is a property of
+          # the tool, not this workflow.)
           oras pull "ghcr.io/cortexapps/engrams/cli-tools:${REF}"
-          chmod +x engram-cli engram-agentd
-          file engram-cli engram-agentd
-
-      # ADR 0036: the ext4 pack (engram-cli image build → Mke2fsPacker) is
-      # byte-deterministic — the keystone for cross-bake chunk dedup — ONLY with
-      # an e2fsprogs that honors SOURCE_DATE_EPOCH (>= 1.47.1). Runner apt ships
-      # <= 1.47.0, which silently stamps wall-clock times, so re-bakes of
-      # unchanged content produce all-new chunk hashes (no dedup). Pull the
-      # pinned mke2fs from engrams' flake (`packages.mke2fs`, sourced from
-      # nixpkgs-e2fsprogs in flake.lock) and put it ahead of the system one — the
-      # same binary engrams CI and `nix develop` use, from one pinned rev.
-      # cache.nixos.org serves it prebuilt (seconds, no compile). This workflow
-      # checks out the caller (not engrams), so reference the flake remotely at
-      # `engrams_ref` — works once engrams is public, the same assumption the
-      # previous raw.githubusercontent fetch made.
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v22
-      - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
-        env:
-          REF: ${{ inputs.engrams_ref }}
-        run: |
-          set -euo pipefail
-          MKE2FS_BIN="$(nix build "github:cortexapps/engrams/${REF}#mke2fs" --no-link --print-out-paths)/bin"
-          "$MKE2FS_BIN/mke2fs" -V
-          echo "$MKE2FS_BIN" >> "$GITHUB_PATH"
+          chmod +x engram-cli engram-agentd mke2fs
+          file engram-cli engram-agentd mke2fs
 
       - name: Bake + push image
         env:
