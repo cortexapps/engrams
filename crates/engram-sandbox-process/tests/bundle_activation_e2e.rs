@@ -75,9 +75,9 @@ async fn generated_session_has_skills_and_browser_tooling() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        // Dev staging is spec-independent, but pass them through anyway to
-        // mirror what coord capture records for a browser image.
-        aux_ro_drives: vec![AuxRoDrive::skills(), AuxRoDrive::playwright()],
+        // Dev staging is spec-independent, but pass reserved slots through to
+        // mirror what coord capture records (ADR 0055 sentinel device model).
+        aux_ro_drives: (0..2).map(AuxRoDrive::reserved_slot).collect(),
     };
     let id = backend.create(spec).await.expect("create session");
 

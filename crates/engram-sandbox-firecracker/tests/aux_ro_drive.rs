@@ -129,6 +129,98 @@ async fn aux_ro_drive_patch_then_resume_serves_new_generation() {
     run_scenario(&env, Mutation::PatchToNewGeneration, SENTINEL_B).await;
 }
 
+/// ADR 0055 device-ceiling probe. Boot + snapshot + restore a VM with
+/// `AuxRoDrive::RESERVED_SLOTS` reserved aux RO drives (`dyn-0..dyn-{N-1}`) —
+/// the per-image base-snapshot device model. Confirms Firecracker accepts N aux
+/// virtio-blk drives on the x86 virtio-mmio legacy-GSI pool (engrams boots
+/// `pci=off`, `GSI_LEGACY_START=5..GSI_LEGACY_END=23`, so ~13 lines minus
+/// rootfs/net/vsock) and that the snapshot/restore path carries all N. If the
+/// pool can't fit N, `InstanceStart` / `load_snapshot` / the guest boot fails
+/// HERE — which is exactly the ceiling the ADR's measurement gate names: drop
+/// `RESERVED_SLOTS` until this passes. (No net/vsock here, so this probe has
+/// MORE GSI headroom than production; treat a pass as necessary-not-sufficient
+/// and keep headroom in `RESERVED_SLOTS`.)
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + sudo mount; run with --ignored on the dev VM"]
+async fn reserved_slots_n_drives_boot_snapshot_restore() {
+    let env = match common::fc_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    if !common::require_bin("mount") || !common::require_bin("umount") {
+        return;
+    }
+    let n = engram_core::types::sandbox::AuxRoDrive::RESERVED_SLOTS;
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let work = work.path();
+
+    // N aux-drive files. Content is irrelevant to the ceiling probe — the
+    // guest only reads /dev/vdb (= dyn-0) post-resume as a liveness check.
+    let mut aux_files = Vec::with_capacity(n);
+    for i in 0..n {
+        let f = work.join(format!("dyn-{i}.bin"));
+        write_padded_file(&f, SENTINEL_A, BUNDLE_SIZE).await;
+        aux_files.push(f);
+    }
+
+    let rootfs = work.join("rootfs.ext4");
+    tokio::fs::copy(&env.rootfs, &rootfs)
+        .await
+        .expect("copy rootfs");
+    install_init_script(&rootfs, work).await;
+
+    let fc1_log = work.join("fc1.log");
+    let fc1_api = work.join("fc1.sock");
+    let mut fc1 = spawn_firecracker(&fc1_api, &fc1_log).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let client1 = FirecrackerClient::new(&fc1_api);
+    configure_boot_n(&client1, &env.kernel, &rootfs, &aux_files).await;
+    client1
+        .put_action(ActionType::InstanceStart)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("InstanceStart with {n} aux drives failed (FC device ceiling?): {e}")
+        });
+
+    // Boot + enter the 12s snapshot-window sleep.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let snapshot_paths = client1
+        .create_snapshot(work)
+        .await
+        .unwrap_or_else(|e| panic!("create_snapshot with {n} aux drives failed: {e}"));
+    let _ = fc1.start_kill();
+    let _ = fc1.wait().await;
+
+    let fc2_log = work.join("fc2.log");
+    let fc2_api = work.join("fc2.sock");
+    let mut fc2 = spawn_firecracker(&fc2_api, &fc2_log).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let client2 = FirecrackerClient::new(&fc2_api);
+    client2
+        .load_snapshot_paused(&snapshot_paths)
+        .await
+        .unwrap_or_else(|e| panic!("load_snapshot with {n} aux drives failed: {e}"));
+    client2
+        .patch_vm_state(VmState::Resumed)
+        .await
+        .expect("resume");
+
+    let post_log = wait_for_post_resume_reads(&fc2_log, 5, Duration::from_secs(40)).await;
+    let hits = post_log
+        .lines()
+        .filter(|l| l.contains("post_resume_iter"))
+        .count();
+    assert!(
+        hits >= 5,
+        "guest didn't complete post-resume reads with {n} aux drives \
+         (boot/restore broke at the ceiling?); got {hits}:\n{post_log}",
+    );
+
+    let _ = fc2.start_kill();
+    let _ = fc2.wait().await;
+}
+
 async fn run_scenario(env: &common::FcEnv, mutation: Mutation, expected_post_resume: &[u8]) {
     let work = tempfile::tempdir().expect("tempdir");
     let work = work.path();
@@ -398,4 +490,53 @@ async fn configure_boot(
         })
         .await
         .expect("put_drive aux RO bundle");
+}
+
+/// Like `configure_boot` but attaches N aux RO drives (`dyn-0..dyn-{N-1}`) —
+/// the ADR 0055 reserved-slot device model. Each `put_drive` that exceeds FC's
+/// GSI pool fails loudly with its slot index.
+async fn configure_boot_n(
+    client: &FirecrackerClient,
+    kernel: &Path,
+    rootfs: &Path,
+    aux: &[std::path::PathBuf],
+) {
+    client
+        .put_machine_config(&MachineConfig {
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            smt: false,
+            track_dirty_pages: false,
+            cpu_template: None,
+        })
+        .await
+        .expect("put_machine_config");
+    client
+        .put_boot_source(&BootSource {
+            kernel_image_path: kernel.to_string_lossy().into_owned(),
+            boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init.experiment".into(),
+            initrd_path: None,
+        })
+        .await
+        .expect("put_boot_source");
+    client
+        .put_drive(&DriveConfig {
+            drive_id: "rootfs".into(),
+            path_on_host: rootfs.to_string_lossy().into_owned(),
+            is_root_device: true,
+            is_read_only: false,
+        })
+        .await
+        .expect("put_drive rootfs");
+    for (i, path) in aux.iter().enumerate() {
+        client
+            .put_drive(&DriveConfig {
+                drive_id: format!("dyn-{i}"),
+                path_on_host: path.to_string_lossy().into_owned(),
+                is_root_device: false,
+                is_read_only: true,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("put_drive dyn-{i} failed (FC device ceiling?): {e}"));
+    }
 }

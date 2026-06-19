@@ -1963,20 +1963,25 @@ impl FirecrackerBackend {
         // this host currently stages") against the bake stamp BEFORE anything
         // embeds the spec — the manifest written below and FC's state.bin
         // must both carry the resolved, content-addressed form.
+        // ADR 0055: at capture every aux drive is a reserved slot carrying the
+        // sentinel, so resolve all symbolic drives to the host's staged sentinel
+        // generation (`current.json`'s `sentinel` key). Per-session skill
+        // selection happens later, at restore, by `patch_drive`-ing real skill
+        // shas into slots — never here.
         if spec.aux_ro_drives.iter().any(|d| d.sha256.is_none()) {
             let stamp = self.read_bundle_stamp().await?;
+            let sentinel_sha = stamp.get(AuxRoDrive::SENTINEL_STAMP_KEY).ok_or_else(|| {
+                SandboxError::InvalidSpec(format!(
+                    "reserved aux slots requested but this host's bundle stamp \
+                     ({}/{}) carries no `{}` entry — re-bake or roll the host image",
+                    self.config.bundle_dir.display(),
+                    AuxRoDrive::CURRENT_STAMP,
+                    AuxRoDrive::SENTINEL_STAMP_KEY,
+                ))
+            })?;
             for drive in &mut spec.aux_ro_drives {
                 if drive.sha256.is_none() {
-                    let sha = stamp.get(&drive.drive_id).ok_or_else(|| {
-                        SandboxError::InvalidSpec(format!(
-                            "aux RO drive `{}` requested but this host's bundle \
-                             stamp ({}/{}) doesn't carry it",
-                            drive.drive_id,
-                            self.config.bundle_dir.display(),
-                            AuxRoDrive::CURRENT_STAMP,
-                        ))
-                    })?;
-                    drive.sha256 = Some(sha.clone());
+                    drive.sha256 = Some(sentinel_sha.clone());
                 }
             }
         }
@@ -5312,11 +5317,11 @@ mod tests {
         }
     }
 
-    /// ADR 0035: a spec requesting aux drives on a host without a
-    /// bundle stamp must fail loudly at the resolve step — capturing a
-    /// skills-less snapshot silently is the incident's setup.
+    /// ADR 0055: a reserved slot requested on a host without a bundle stamp
+    /// (no `sentinel` entry) must fail loudly at the resolve step — capturing a
+    /// sentinel-less snapshot silently is the ADR 0035 incident's setup.
     #[tokio::test]
-    async fn create_with_aux_drives_requires_bundle_stamp() {
+    async fn create_with_reserved_slot_requires_sentinel_stamp() {
         let (b, d) = backend();
         // Satisfy the kernel + rootfs existence checks (they precede
         // the resolve step) so create reaches aux-drive resolution.
@@ -5325,19 +5330,19 @@ mod tests {
         std::fs::write(&rootfs, b"not-really-ext4").unwrap();
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
-        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
         match b.create(sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
-                assert!(msg.contains("bundle stamp"), "{msg}");
+                assert!(msg.contains("stages no bundles"), "{msg}");
             }
-            other => panic!("expected InvalidSpec(bundle stamp), got {other:?}"),
+            other => panic!("expected InvalidSpec(no stamp), got {other:?}"),
         }
     }
 
-    /// ADR 0035: a stamp that doesn't carry the requested drive_id is
-    /// equally loud (host image staged playwright but not skills, say).
+    /// ADR 0055: a stamp that doesn't carry the `sentinel` entry is equally
+    /// loud (the host image staged something else but not the sentinel).
     #[tokio::test]
-    async fn create_with_aux_drive_missing_from_stamp_errors() {
+    async fn create_with_missing_sentinel_stamp_errors() {
         let (b, d) = backend();
         std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
         let rootfs = d.path().join("rootfs.ext4");
@@ -5346,27 +5351,27 @@ mod tests {
         std::fs::create_dir_all(&bundle_dir).unwrap();
         std::fs::write(
             bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
-            br#"{"playwright": "aaaa"}"#,
+            br#"{"something-else": "aaaa"}"#,
         )
         .unwrap();
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
-        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
         match b.create(sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
-                assert!(msg.contains("doesn't carry it"), "{msg}");
+                assert!(msg.contains("sentinel"), "{msg}");
             }
-            other => panic!("expected InvalidSpec(missing entry), got {other:?}"),
+            other => panic!("expected InvalidSpec(missing sentinel), got {other:?}"),
         }
     }
 
-    /// ADR 0035: with a valid stamp entry the resolve step passes —
-    /// create proceeds past it (and fails much later on the
-    /// nonexistent firecracker binary, which is the negative-path
-    /// fixture's expected terminal error). Distinguishing the error
-    /// kind proves resolution consumed the stamp.
+    /// ADR 0055: with a valid `sentinel` stamp entry + staged file the resolve
+    /// step passes — create proceeds past it (and fails much later on the
+    /// nonexistent firecracker binary, the negative-path fixture's expected
+    /// terminal error). Distinguishing the error kind proves resolution
+    /// consumed the stamp.
     #[tokio::test]
-    async fn create_with_resolvable_aux_drive_passes_resolution() {
+    async fn create_with_resolvable_sentinel_passes_resolution() {
         let (b, d) = backend();
         std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
         let rootfs = d.path().join("rootfs.ext4");
@@ -5376,17 +5381,17 @@ mod tests {
         let sha = "a".repeat(64);
         std::fs::write(
             bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
-            format!("{{\"skills\": \"{sha}\"}}"),
+            format!("{{\"{}\": \"{sha}\"}}", AuxRoDrive::SENTINEL_STAMP_KEY),
         )
         .unwrap();
         std::fs::write(
-            bundle_dir.join(AuxRoDrive::staged_file_name("skills", &sha)),
+            bundle_dir.join(AuxRoDrive::staged_file_name(&sha)),
             b"squashfs-bytes",
         )
         .unwrap();
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
-        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
         match b.create(sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 panic!("resolution should have passed, got InvalidSpec: {msg}")
