@@ -909,7 +909,7 @@ impl FirecrackerBackend {
         Ok(self
             .config
             .bundle_dir
-            .join(AuxRoDrive::staged_file_name(&aux.drive_id, sha)))
+            .join(AuxRoDrive::staged_file_name(sha)))
     }
 
     /// Apply once-per-host networking setup: enable IP forwarding,
@@ -2571,7 +2571,7 @@ impl FirecrackerBackend {
                             let current_path = self
                                 .config
                                 .bundle_dir
-                                .join(AuxRoDrive::staged_file_name(&aux.drive_id, current_sha));
+                                .join(AuxRoDrive::staged_file_name(current_sha));
                             if !tokio::fs::try_exists(&current_path).await.unwrap_or(false) {
                                 tracing::warn!(
                                     drive_id = %aux.drive_id,
