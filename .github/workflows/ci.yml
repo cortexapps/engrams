@@ -1612,6 +1612,41 @@ jobs:
             | sudo bash
           tilt version
 
+      # ADR 0027 → 0035 → 0055: stage the RO skill bundles CONTENT-ADDRESSED
+      # (<sha256>.squashfs + current.json stamp) — the same shape the FC-host
+      # image bake / `just bundles-squashfs` produces.
+      #
+      # MUST run BEFORE the stack comes up: the host-agent reads current.json
+      # ONCE at startup (host_agent/src/lib.rs read_stamp) and reports the same
+      # current_bundles on every heartbeat, exactly like prod (the Packer bake
+      # stages the stamp into the host image before the agent starts). The coord
+      # resolves a session's selected_skills names against that reported catalog.
+      #
+      # ADR 0055: the `sentinel` bundle is MANDATORY — base-snapshot capture
+      # attaches RESERVED_SLOTS reserved dyn-* drives, all resolved to the
+      # sentinel sha from this stamp; without it every enable 500s (loudly, by
+      # design). `skills` is the catalog skill `e2e_session_has_mounted_skills_bundle`
+      # selects + asserts: the coord resolves "skills" -> its sha, patch_drives
+      # it into a reserved slot, the init shim mounts it at /opt/engram/dyn/<i>
+      # (the owned 6.1 kernel has squashfs), and agentd wires share-file.
+      # (playwright is omitted — heavy chromium build, and no test selects it.)
+      - name: Stage RO skill bundles (ADR 0055)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
+          sudo mkdir -p /var/lib/engram/shared
+          stamp="{"
+          sep=""
+          for name in sentinel skills; do
+            deploy/bundles/"$name"/build.sh "/tmp/$name.squashfs"
+            sha="$(sha256sum "/tmp/$name.squashfs" | cut -d' ' -f1)"
+            sudo install -m 0644 "/tmp/$name.squashfs" "/var/lib/engram/shared/$sha.squashfs"
+            stamp="$stamp$sep\"$name\": \"$sha\""
+            sep=", "
+          done
+          echo "$stamp}" | sudo tee /var/lib/engram/shared/current.json >/dev/null
+          ls -l /var/lib/engram/shared/
+          cat /var/lib/engram/shared/current.json
+
       - name: Bring up prod-shape stack (tilt)
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release
@@ -1635,26 +1670,6 @@ jobs:
           # reference predated ADR 0025 owning the kernel.)
           export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux"
           bash deploy/dev/tilt-up-ci.sh
-
-      # ADR 0027 → 0035: stage the skills RO bundle CONTENT-ADDRESSED
-      # (<name>-<sha256>.squashfs + current.json stamp) — the same shape the
-      # FC-host image bake produces. The FC backend resolves the symbolic
-      # `skills` drive against the stamp at base-snapshot capture; without the
-      # stamp the enable 500s (loudly, by design — a host that can't satisfy a
-      # requested aux drive must not capture a skills-less snapshot). The init
-      # shim mounts it (the owned 6.1 kernel has squashfs), agentd wires
-      # share-file, and `e2e_session_has_mounted_skills_bundle` asserts the
-      # whole path. (Only `skills` — the demo image isn't `[browser]`-enabled,
-      # so coord doesn't declare the heavy playwright drive.)
-      - name: Stage RO skills bundle (ADR 0035)
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
-          deploy/bundles/skills/build.sh /tmp/skills.squashfs
-          sudo mkdir -p /var/lib/engram/shared
-          SKILLS_SHA=$(sha256sum /tmp/skills.squashfs | cut -d' ' -f1)
-          sudo install -m 0644 /tmp/skills.squashfs "/var/lib/engram/shared/skills-$SKILLS_SHA.squashfs"
-          printf '{"skills": "%s"}\n' "$SKILLS_SHA" | sudo tee /var/lib/engram/shared/current.json >/dev/null
-          ls -l /var/lib/engram/shared/
 
       # ADR 0013: host-agent doesn't read docker config; it asks
       # the coord per-pull, and the coord reads sealed credentials
