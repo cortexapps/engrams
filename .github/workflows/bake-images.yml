@@ -660,6 +660,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # ADR 0055: sentinel — the tiny placeholder that rides every reserved
+          # dyn-* slot in the base snapshot. MANDATORY fleet-wide: base-snapshot
+          # capture resolves all RESERVED_SLOTS reserved drives to its sha, so a
+          # host image without it can't capture any base snapshot.
+          deploy/bundles/sentinel/build.sh dist/sentinel.squashfs
           # skills: pure pack of our wrapper scripts + SKILL.md.
           deploy/bundles/skills/build.sh dist/skills.squashfs
           # playwright: glibc Docker build (chromium-headless-shell + node +
@@ -683,7 +688,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in skills playwright; do
+          for name in sentinel skills playwright; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \
