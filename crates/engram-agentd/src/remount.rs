@@ -37,11 +37,12 @@ pub enum RemountOutcome {
     Failed(String),
 }
 
-/// The fixed guest mountpoints the init shim mounts bundles at
-/// (probe-by-content; see the image-builder's init script). Mirrors
-/// `AuxRoDrive::{skills,playwright}().guest_mount`.
+/// ADR 0055: the reserved dynamic-mount slot prefix the init shim mounts skill
+/// squashfs at (`/opt/engram/dyn/<i>`; see `AuxRoDrive::slot_guest_mount` and
+/// the image-builder init script). Every per-session skill swap lands under
+/// this prefix, so re-mounting the prefix covers them all uniformly.
 #[cfg(target_os = "linux")]
-const BUNDLE_MOUNTS: [&str; 2] = ["/opt/engram/skills", "/opt/engram/browser"];
+const DYN_MOUNT_PREFIX: &str = "/opt/engram/dyn/";
 
 /// Re-mount whatever bundle mounts exist. Returns one `(mountpoint,
 /// outcome)` per *mounted* bundle path — absent mounts (image without
@@ -65,7 +66,7 @@ pub fn remount_bundle_mounts() -> Vec<(String, RemountOutcome)> {
         else {
             continue;
         };
-        if fs_type != "squashfs" || !BUNDLE_MOUNTS.contains(&target) {
+        if fs_type != "squashfs" || !target.starts_with(DYN_MOUNT_PREFIX) {
             continue;
         }
         report.push((target.to_string(), remount_one(device, target)));
