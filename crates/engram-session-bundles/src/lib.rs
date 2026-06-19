@@ -1,34 +1,29 @@
-//! ADR 0027: activate read-only host-mounted bundles into the harness's
-//! skill discovery paths.
+//! ADR 0027 → 0055: activate read-only host-mounted skill bundles into the
+//! harness's skill discovery paths.
 //!
-//! The init shim RO-mounts the fleet-wide `skills` and (opt-in)
-//! `playwright` squashfs bundles at `/opt/engram/skills` and
-//! `/opt/engram/browser`. Those bundles are *static* — the same on every
-//! host. What's *dynamic* is which skills/tools a given session gets, and
-//! that's decided here, per session, just before the harness launches,
-//! from the durable session env:
+//! ADR 0055: the init shim RO-mounts each reserved dynamic slot at
+//! `/opt/engram/dyn/<i>`. Unused slots carry a sentinel (`mount.json`
+//! `{"kind":"sentinel"}`) and are skipped; a per-session create `patch_drive`s
+//! the profile-selected skills into the other slots. Each skill bundle ships a
+//! `mount.json` declaring the skills it carries, the wrapper binaries to put on
+//! PATH, and any per-skill env gate. This function scans those slots, reads
+//! each manifest, and wires the declared skills — replacing the old hardcoded
+//! `skills`/`browser` probe (and, before that, the bake-time injectors).
 //!
-//! - `share-file` — always (the ADR-0026 upload token is on every image),
-//!   iff the skills bundle mounted.
-//! - `create-pull-request` — iff a forge token is present *and* the skills
-//!   bundle mounted; also writes `/etc/gitconfig`.
-//! - `show-your-work` — iff the playwright bundle mounted; also symlinks the
-//!   bundle's `playwright-cli` wrapper onto PATH. The agent drives the
-//!   browser via that CLI (bash), so there is no MCP config to wire.
+//! Gating that depends on session state stays, now declared in `mount.json`:
+//! - a skill with `requires_env` (e.g. `ENGRAM_FORGE_TOKEN` for
+//!   `create-pull-request`) is wired only when that env key is present;
+//! - `/etc/gitconfig` gets a `[user]` block whenever an initiator is known
+//!   (ADR 0031 committer attribution, every session), and the askpass +
+//!   credential blocks only for a forge-bound session whose mounted skills
+//!   shipped an askpass (`provides_askpass`).
 //!
-//! This is what replaces the bake-time `inject_share_helpers` /
-//! `inject_forge_helpers` (retired): a skill edit now ships fleet-wide by
-//! rolling the bundle, no per-image re-bake.
+//! **Best-effort.** A missing/garbled bundle (or a failed symlink) is recorded
+//! as a warning and skipped — it must NEVER fail the session.
 //!
-//! **Best-effort.** A missing bundle (or a failed symlink) is recorded as
-//! a warning and skipped — it must NEVER fail the session. Universal skill
-//! delivery now depends on this engine, so the absence of a bundle can't
-//! be allowed to brick a session; the harness simply comes up without the
-//! affected skill.
-//!
-//! `root` is `/` in the FC guest (agentd). The dev `ProcessBackend` calls
-//! the same function with the same `/` root because `just bundles` stages
-//! the bundles at the real absolute paths on the dev box.
+//! `root` is `/` in the FC guest (agentd). The dev `ProcessBackend` calls the
+//! same function with the same `/` root because it symlinks the dev bundles at
+//! the real absolute paths.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,26 +39,52 @@ pub struct ActivationReport {
     /// Skills that were activated (e.g. `"share-file"`,
     /// `"create-pull-request"`, `"show-your-work"`).
     pub activated: Vec<String>,
-    /// Non-fatal problems (bundle absent, symlink failed). The caller
+    /// Non-fatal problems (bundle absent/garbled, symlink failed). The caller
     /// logs these; none of them fail the session.
     pub warnings: Vec<String>,
 }
 
+/// ADR 0055: the `mount.json` at the root of each mounted skill squashfs.
+#[derive(Debug, serde::Deserialize)]
+struct MountManifest {
+    /// `"skill"` (wire it) | `"sentinel"` (reserved-but-unused slot; skip).
+    kind: String,
+    /// Skills this bundle carries.
+    #[serde(default)]
+    skills: Vec<SkillEntry>,
+    /// Bundle-relative path to a git askpass binary, if this bundle ships one
+    /// (wired into `/etc/gitconfig` for forge sessions).
+    #[serde(default)]
+    provides_askpass: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SkillEntry {
+    /// Skill dir name under `skills/<name>` + the harness discovery name.
+    name: String,
+    /// Bundle-relative wrapper paths to symlink onto PATH (basename = the
+    /// PATH command name).
+    #[serde(default)]
+    bins: Vec<String>,
+    /// Gate: skip this skill unless this env key is present in `session_env`
+    /// (e.g. `create-pull-request` requires `ENGRAM_FORGE_TOKEN`).
+    #[serde(default)]
+    requires_env: Option<String>,
+}
+
 /// Resolve the canonical guest paths under `root`.
 struct Layout {
-    skills_bundle: PathBuf,  // /opt/engram/skills  (mounted squashfs)
-    browser_bundle: PathBuf, // /opt/engram/browser (mounted squashfs)
-    agents_skills: PathBuf,  // /root/.agents/skills (harness-agnostic dir)
-    claude_skills: PathBuf,  // /root/.claude/skills -> agents_skills
-    usr_local_bin: PathBuf,  // /usr/local/bin (on PATH)
-    etc_gitconfig: PathBuf,  // /etc/gitconfig
+    dyn_root: PathBuf,      // /opt/engram/dyn (reserved-slot mount points)
+    agents_skills: PathBuf, // /root/.agents/skills (harness-agnostic dir)
+    claude_skills: PathBuf, // /root/.claude/skills -> agents_skills
+    usr_local_bin: PathBuf, // /usr/local/bin (on PATH)
+    etc_gitconfig: PathBuf, // /etc/gitconfig
 }
 
 impl Layout {
     fn under(root: &Path) -> Self {
         Self {
-            skills_bundle: root.join("opt/engram/skills"),
-            browser_bundle: root.join("opt/engram/browser"),
+            dyn_root: root.join("opt/engram/dyn"),
             agents_skills: root.join("root/.agents/skills"),
             claude_skills: root.join("root/.claude/skills"),
             usr_local_bin: root.join("usr/local/bin"),
@@ -72,27 +93,45 @@ impl Layout {
     }
 }
 
-/// Wire whatever bundles are mounted under `root` into the harness's
-/// discovery paths, gated by `session_env`. Idempotent (recreates
-/// symlinks, overwrites config) so it's safe to call on every resume.
-/// Never errors — see the module docs on best-effort behavior.
+/// Wire whatever skill bundles are mounted under `root`'s reserved slots into
+/// the harness's discovery paths, gated by `session_env`. Idempotent (recreates
+/// symlinks, overwrites config) so it's safe to call on every resume. Never
+/// errors — see the module docs on best-effort behavior.
 pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> ActivationReport {
     let mut report = ActivationReport::default();
     let layout = Layout::under(root);
 
-    let skills_mounted = layout.skills_bundle.join("bin/engram-share").exists();
-    let browser_mounted = layout.browser_bundle.join("bin/playwright-cli").exists();
+    // Collect the mounted skill bundles from the reserved slots, skipping
+    // sentinels (reserved-but-unused) and unmounted/empty slots.
+    let mut bundles: Vec<(PathBuf, MountManifest)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&layout.dyn_root) {
+        for entry in entries.flatten() {
+            let slot = entry.path();
+            let manifest_path = slot.join("mount.json");
+            let bytes = match std::fs::read(&manifest_path) {
+                Ok(b) => b,
+                Err(_) => continue, // unmounted slot / no manifest
+            };
+            match serde_json::from_slice::<MountManifest>(&bytes) {
+                Ok(m) if m.kind == "sentinel" => {} // reserved-but-unused slot
+                Ok(m) => bundles.push((slot, m)),
+                Err(e) => report
+                    .warnings
+                    .push(format!("bad mount.json at {}: {e}", manifest_path.display())),
+            }
+        }
+    }
 
-    if !skills_mounted && !browser_mounted {
-        // Nothing mounted — a plain image with no bundles. Not an error.
+    if bundles.is_empty() {
+        // Plain image with no skills selected. Not an error.
         report
             .warnings
-            .push("no RO bundles mounted; skills not wired".into());
+            .push("no skill bundles mounted; skills not wired".into());
         return report;
     }
 
-    // The harness scans `~/.claude/skills`; point it at the
-    // harness-agnostic `~/.agents/skills` we selectively populate.
+    // The harness scans `~/.claude/skills`; point it at the harness-agnostic
+    // `~/.agents/skills` we selectively populate.
     if let Err(e) = ensure_dir(&layout.agents_skills) {
         report
             .warnings
@@ -104,45 +143,45 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
             .push(format!("link {}: {e}", layout.claude_skills.display()));
     }
 
-    if skills_mounted {
-        // share-file: universal (ADR 0026 upload token is every-image).
-        wire_skill(
-            &layout,
-            "share-file",
-            &layout.skills_bundle.join("skills/share-file"),
-            &[(
-                "engram-share",
-                &layout.skills_bundle.join("bin/engram-share"),
-            )],
-            &mut report,
-        );
-
-        // create-pull-request: only for a forge-bound session.
-        if session_env.contains_key(FORGE_TOKEN_ENV) {
-            wire_skill(
-                &layout,
-                "create-pull-request",
-                &layout.skills_bundle.join("skills/create-pull-request"),
-                &[("engram-pr", &layout.skills_bundle.join("bin/engram-pr"))],
-                &mut report,
-            );
+    // Wire each bundle's skills; remember the askpass binary if any bundle
+    // ships one (for the gitconfig credential wiring below).
+    let mut askpass: Option<PathBuf> = None;
+    for (slot, manifest) in &bundles {
+        if let Some(rel) = &manifest.provides_askpass {
+            askpass = Some(slot.join(rel));
         }
-    } else if session_env.contains_key(FORGE_TOKEN_ENV) {
-        report.warnings.push(
-            "forge session but skills bundle not mounted; create-pull-request unavailable".into(),
-        );
+        for skill in &manifest.skills {
+            if let Some(req) = &skill.requires_env {
+                if !session_env.contains_key(req) {
+                    report.warnings.push(format!(
+                        "skill {} requires {} (absent in session env); skipped",
+                        skill.name, req
+                    ));
+                    continue;
+                }
+            }
+            let skill_src = slot.join("skills").join(&skill.name);
+            let bins: Vec<(String, PathBuf)> = skill
+                .bins
+                .iter()
+                .filter_map(|b| {
+                    Path::new(b)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .map(|f| (f.to_string(), slot.join(b)))
+                })
+                .collect();
+            wire_skill(&layout, &skill.name, &skill_src, &bins, &mut report);
+        }
     }
 
-    // ADR 0031 + 0027: write /etc/gitconfig when there's anything to put in
-    // it. The `[user]` block (committer attribution) applies to EVERY session
-    // with a known initiator — not just forge sessions, so local commits are
-    // attributed too. The `[core] askPass` + `[credential]` blocks need the
-    // askpass binary from the skills bundle, so they're added only for a
-    // forge-bound session with the bundle mounted.
+    // ADR 0031 + 0027: `/etc/gitconfig`. The `[user]` block (committer
+    // attribution) applies to EVERY session with a known initiator; the askpass
+    // + credential blocks only to a forge-bound session whose mounted skills
+    // shipped an askpass.
     let user_email = session_env.get("ENGRAM_USER_EMAIL").map(String::as_str);
     let user_name = session_env.get("ENGRAM_USER_NAME").map(String::as_str);
-    let askpass = (skills_mounted && session_env.contains_key(FORGE_TOKEN_ENV))
-        .then(|| layout.skills_bundle.join("bin/git-askpass"));
+    let askpass = askpass.filter(|_| session_env.contains_key(FORGE_TOKEN_ENV));
     if user_email.is_some() || askpass.is_some() {
         let gitconfig = render_gitconfig(askpass.as_deref(), user_email, user_name);
         if let Err(e) = write_file(&layout.etc_gitconfig, &gitconfig) {
@@ -154,39 +193,22 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
         }
     }
 
-    if browser_mounted {
-        // show-your-work skill + the `playwright-cli` wrapper onto PATH. The
-        // wrapper bakes in the headless-shell config + runtime env, so the
-        // agent drives the browser with plain `playwright-cli` — no MCP
-        // config, no per-harness wiring.
-        wire_skill(
-            &layout,
-            "show-your-work",
-            &layout.browser_bundle.join("skills/show-your-work"),
-            &[(
-                "playwright-cli",
-                &layout.browser_bundle.join("bin/playwright-cli"),
-            )],
-            &mut report,
-        );
-    }
-
     report
 }
 
-/// Symlink a skill dir into `~/.agents/skills/<name>` and link any
-/// wrapper binaries onto PATH (`/usr/local/bin/<bin>`). Records the skill
-/// as activated iff its source dir exists.
+/// Symlink a skill dir into `~/.agents/skills/<name>` and link any wrapper
+/// binaries onto PATH (`/usr/local/bin/<bin>`). Records the skill as activated
+/// iff its source dir exists.
 fn wire_skill(
     layout: &Layout,
     name: &str,
     skill_src: &Path,
-    bins: &[(&str, &PathBuf)],
+    bins: &[(String, PathBuf)],
     report: &mut ActivationReport,
 ) {
     if !skill_src.exists() {
         report.warnings.push(format!(
-            "skill {name} not in bundle at {}",
+            "skill {name} declared in mount.json but missing at {}",
             skill_src.display()
         ));
         return;
@@ -214,7 +236,7 @@ fn wire_skill(
 /// Render `/etc/gitconfig`. The user block (ADR 0031 committer attribution) is
 /// emitted whenever `user_email` is set. The askpass + credential-helper
 /// blocks (ADR 0027 forge credential wiring) are emitted only when `askpass`
-/// is supplied (a forge-bound session with the skills bundle mounted).
+/// is supplied (a forge-bound session whose mounted skills shipped an askpass).
 fn render_gitconfig(
     askpass: Option<&Path>,
     user_email: Option<&str>,
@@ -272,28 +294,49 @@ fn ensure_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Build a fake skills + playwright bundle tree under `root` so the
-    /// activation has something to wire. Mirrors the bundle layout the
-    /// `deploy/bundles/*` recipes produce.
-    fn stage_bundles(root: &Path, skills: bool, browser: bool) {
-        if skills {
-            let b = root.join("opt/engram/skills");
-            std::fs::create_dir_all(b.join("bin")).unwrap();
-            std::fs::write(b.join("bin/engram-share"), "#!/bin/sh\n").unwrap();
-            std::fs::write(b.join("bin/engram-pr"), "#!/bin/sh\n").unwrap();
-            std::fs::write(b.join("bin/git-askpass"), "#!/bin/sh\n").unwrap();
-            std::fs::create_dir_all(b.join("skills/share-file")).unwrap();
-            std::fs::write(b.join("skills/share-file/SKILL.md"), "---\n").unwrap();
-            std::fs::create_dir_all(b.join("skills/create-pull-request")).unwrap();
-            std::fs::write(b.join("skills/create-pull-request/SKILL.md"), "---\n").unwrap();
+    /// Stage a fake `skills` bundle at reserved slot `n` with a `mount.json`,
+    /// mirroring what `deploy/bundles/skills` produces.
+    fn stage_skills_slot(root: &Path, n: usize) {
+        let b = root.join(format!("opt/engram/dyn/{n}"));
+        std::fs::create_dir_all(b.join("bin")).unwrap();
+        for bin in ["engram-share", "engram-pr", "git-askpass"] {
+            std::fs::write(b.join("bin").join(bin), "#!/bin/sh\n").unwrap();
         }
-        if browser {
-            let b = root.join("opt/engram/browser");
-            std::fs::create_dir_all(b.join("bin")).unwrap();
-            std::fs::write(b.join("bin/playwright-cli"), "#!/bin/sh\n").unwrap();
-            std::fs::create_dir_all(b.join("skills/show-your-work")).unwrap();
-            std::fs::write(b.join("skills/show-your-work/SKILL.md"), "---\n").unwrap();
+        for s in ["share-file", "create-pull-request"] {
+            std::fs::create_dir_all(b.join("skills").join(s)).unwrap();
+            std::fs::write(b.join("skills").join(s).join("SKILL.md"), "---\n").unwrap();
         }
+        std::fs::write(
+            b.join("mount.json"),
+            r#"{"kind":"skill",
+                "skills":[
+                  {"name":"share-file","bins":["bin/engram-share"]},
+                  {"name":"create-pull-request","bins":["bin/engram-pr"],"requires_env":"ENGRAM_FORGE_TOKEN"}
+                ],
+                "provides_askpass":"bin/git-askpass"}"#,
+        )
+        .unwrap();
+    }
+
+    /// Stage a fake `browser` bundle at reserved slot `n`.
+    fn stage_browser_slot(root: &Path, n: usize) {
+        let b = root.join(format!("opt/engram/dyn/{n}"));
+        std::fs::create_dir_all(b.join("bin")).unwrap();
+        std::fs::write(b.join("bin/playwright-cli"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(b.join("skills/show-your-work")).unwrap();
+        std::fs::write(b.join("skills/show-your-work/SKILL.md"), "---\n").unwrap();
+        std::fs::write(
+            b.join("mount.json"),
+            r#"{"kind":"skill","skills":[{"name":"show-your-work","bins":["bin/playwright-cli"]}]}"#,
+        )
+        .unwrap();
+    }
+
+    /// Stage a sentinel at reserved slot `n` (reserved-but-unused).
+    fn stage_sentinel_slot(root: &Path, n: usize) {
+        let b = root.join(format!("opt/engram/dyn/{n}"));
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join("mount.json"), r#"{"kind":"sentinel"}"#).unwrap();
     }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -306,22 +349,24 @@ mod tests {
     #[test]
     fn no_bundles_is_a_noop_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
+        // Reserved slots all sentinel — nothing to wire.
+        stage_sentinel_slot(dir.path(), 0);
+        stage_sentinel_slot(dir.path(), 1);
         let report = activate(dir.path(), &env(&[]));
         assert!(report.activated.is_empty());
-        // Surfaced as a warning, never a panic / failure.
-        assert!(report.warnings.iter().any(|w| w.contains("no RO bundles")));
+        assert!(report.warnings.iter().any(|w| w.contains("no skill bundles")));
     }
 
     #[test]
     fn skills_only_wires_share_file_not_forge() {
         let dir = tempfile::tempdir().unwrap();
-        stage_bundles(dir.path(), true, false);
+        stage_skills_slot(dir.path(), 0);
+        stage_sentinel_slot(dir.path(), 1);
         let report = activate(dir.path(), &env(&[]));
         assert!(report.activated.contains(&"share-file".to_string()));
         assert!(!report
             .activated
             .contains(&"create-pull-request".to_string()));
-        // ~/.claude/skills -> ~/.agents/skills, share-file linked, wrapper on PATH.
         let l = Layout::under(dir.path());
         assert!(l.claude_skills.is_symlink());
         assert!(l.agents_skills.join("share-file").is_symlink());
@@ -333,7 +378,7 @@ mod tests {
     #[test]
     fn forge_token_wires_pr_and_gitconfig() {
         let dir = tempfile::tempdir().unwrap();
-        stage_bundles(dir.path(), true, false);
+        stage_skills_slot(dir.path(), 0);
         let report = activate(dir.path(), &env(&[("ENGRAM_FORGE_TOKEN", "tok")]));
         assert!(report
             .activated
@@ -343,16 +388,14 @@ mod tests {
         assert!(l.agents_skills.join("create-pull-request").is_symlink());
         assert!(l.usr_local_bin.join("engram-pr").is_symlink());
         let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
-        assert!(gc.contains("opt/engram/skills/bin/git-askpass"));
+        assert!(gc.contains("bin/git-askpass"));
+        assert!(gc.contains("x-access-token"));
     }
 
     #[test]
     fn user_email_writes_gitconfig_user_block_without_forge() {
-        // ADR 0031: committer attribution applies to every session — a
-        // non-forge session with an initiator still gets /etc/gitconfig with a
-        // [user] block (and no askpass/credential wiring).
         let dir = tempfile::tempdir().unwrap();
-        stage_bundles(dir.path(), true, false);
+        stage_skills_slot(dir.path(), 0);
         let report = activate(
             dir.path(),
             &env(&[
@@ -374,7 +417,7 @@ mod tests {
     #[test]
     fn forge_and_user_writes_both_blocks() {
         let dir = tempfile::tempdir().unwrap();
-        stage_bundles(dir.path(), true, false);
+        stage_skills_slot(dir.path(), 0);
         let report = activate(
             dir.path(),
             &env(&[
@@ -391,40 +434,48 @@ mod tests {
     }
 
     #[test]
-    fn browser_bundle_wires_show_your_work_and_playwright_cli() {
+    fn browser_slot_wires_show_your_work_and_playwright_cli() {
         let dir = tempfile::tempdir().unwrap();
-        stage_bundles(dir.path(), true, true);
+        stage_skills_slot(dir.path(), 0);
+        stage_browser_slot(dir.path(), 1);
         let report = activate(dir.path(), &env(&[]));
         assert!(report.activated.contains(&"show-your-work".to_string()));
         let l = Layout::under(dir.path());
-        // The skill is discoverable and the CLI wrapper is on PATH — no MCP
-        // config is written.
         assert!(l.agents_skills.join("show-your-work").is_symlink());
         assert!(l.usr_local_bin.join("playwright-cli").is_symlink());
         assert!(!dir.path().join("root/.mcp.json").exists());
     }
 
     #[test]
-    fn forge_token_without_skills_bundle_degrades_gracefully() {
+    fn create_pr_skipped_when_only_browser_selected_and_forge_present() {
+        // A profile that selected only the browser skill (not the skills
+        // bundle) + a forge token: create-pull-request simply isn't mounted, so
+        // it isn't wired — no failure, show-your-work still works.
         let dir = tempfile::tempdir().unwrap();
-        stage_bundles(dir.path(), false, true); // browser only, no skills
+        stage_browser_slot(dir.path(), 0);
         let report = activate(dir.path(), &env(&[("ENGRAM_FORGE_TOKEN", "tok")]));
-        // No skills bundle -> no create-pull-request, but a clear warning,
-        // and the session is NOT failed. The browser skill still wires.
         assert!(!report
             .activated
             .contains(&"create-pull-request".to_string()));
         assert!(report.activated.contains(&"show-your-work".to_string()));
-        assert!(report
-            .warnings
-            .iter()
-            .any(|w| w.contains("skills bundle not mounted")));
+    }
+
+    #[test]
+    fn sentinel_only_slots_are_skipped_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..12 {
+            stage_sentinel_slot(dir.path(), i);
+        }
+        let report = activate(dir.path(), &env(&[("ENGRAM_FORGE_TOKEN", "tok")]));
+        assert!(report.activated.is_empty());
+        assert!(report.warnings.iter().any(|w| w.contains("no skill bundles")));
     }
 
     #[test]
     fn activation_is_idempotent_across_resumes() {
         let dir = tempfile::tempdir().unwrap();
-        stage_bundles(dir.path(), true, true);
+        stage_skills_slot(dir.path(), 0);
+        stage_browser_slot(dir.path(), 1);
         let e = env(&[("ENGRAM_FORGE_TOKEN", "tok")]);
         let first = activate(dir.path(), &e);
         let second = activate(dir.path(), &e);
