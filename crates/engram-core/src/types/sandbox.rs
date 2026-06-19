@@ -65,7 +65,7 @@ pub struct SandboxSpec {
     pub network: NetworkPolicy,
     /// ADR 0027/0055: read-only host-mounted bundles attached as virtio-blk
     /// drives — the RO-mount skills engine. ADR 0055 makes these the fixed
-    /// pool of reserved dynamic slots (`dyn-0..dyn-{RESERVED_SLOTS-1}`): each
+    /// pool of reserved dynamic slots (`dyn_0..dyn_{RESERVED_SLOTS-1}`): each
     /// carries the sentinel at capture and is `patch_drive`-swapped to a
     /// per-session selected skill in the paused restore window.
     ///
@@ -89,7 +89,7 @@ pub struct SandboxSpec {
 /// skills/tools to wire; agentd wires them at `SpawnHarness` time.
 ///
 /// ADR 0055 (uniform dynamic mounts): a base snapshot reserves a fixed pool
-/// of slots ([`Self::RESERVED_SLOTS`], `dyn-0..dyn-{N-1}`), each carrying the
+/// of slots ([`Self::RESERVED_SLOTS`], `dyn_0..dyn_{N-1}`), each carrying the
 /// sentinel until a per-session create swaps the selected skill in via
 /// `patch_drive` in the paused restore window. There is no longer a special
 /// "skills" / "playwright" drive — every mount is one content-addressed skill.
@@ -140,7 +140,7 @@ impl AuxRoDrive {
     pub const SENTINEL_STAMP_KEY: &'static str = "sentinel";
 
     /// ADR 0055: number of reserved dynamic-mount slots captured into every
-    /// base snapshot (`dyn-0..dyn-{RESERVED_SLOTS-1}`), one skill per slot.
+    /// base snapshot (`dyn_0..dyn_{RESERVED_SLOTS-1}`), one skill per slot.
     /// Bounded by Firecracker's x86 **virtio-mmio** GSI pool — engrams boots
     /// `pci=off`, and the legacy interrupt range is `GSI_LEGACY_START=5 ..
     /// GSI_LEGACY_END=23` (19 lines), minus the baseline virtio devices
@@ -155,9 +155,12 @@ impl AuxRoDrive {
     /// window.
     pub const RESERVED_SLOTS: usize = 12;
 
-    /// Firecracker `drive_id` for reserved dynamic slot `i` (`"dyn-<i>"`).
+    /// Firecracker `drive_id` for reserved dynamic slot `i` (`"dyn_<i>"`).
+    /// Underscore, NOT hyphen: FC rejects a `PUT /drives/<id>` whose id isn't
+    /// alphanumeric-or-underscore with a 400 (the device-ceiling probe caught
+    /// the original `dyn-0`).
     pub fn slot_drive_id(i: usize) -> String {
-        format!("dyn-{i}")
+        format!("dyn_{i}")
     }
 
     /// Generic guest mount point for reserved dynamic slot `i`
