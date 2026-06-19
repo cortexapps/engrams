@@ -1310,8 +1310,8 @@ async fn resume_from_fc_snapshot(
     // since the snapshot.
     //
     // `session.live_disk_manifest` is `None` when:
-    // - The session never went through Phase B (warm-pool /
-    //   non-NBD host / never had a publish land).
+    // - The session never went through Phase B (non-NBD host /
+    //   never had a publish land).
     // - The session is mid-eviction and `assign_session_sandbox(None)`
     //   cleared the column (commit 3's load-bearing race fix).
     //
@@ -1380,7 +1380,7 @@ async fn resume_from_fc_snapshot(
         // disproved it (the self-heal fell back to a good checkpoint,
         // but the resume landed on a non-capturing host and skipped
         // materialization). `rootfs` is rebuilt from `disk_manifest`
-        // chunks and `working_set` is a warm-pool-only prefetch hint, so
+        // chunks and `working_set` is a fresh-restore-only prefetch hint, so
         // both stay None.
         source_sandbox_id: None,
         state_blob_key: portable_state_key,

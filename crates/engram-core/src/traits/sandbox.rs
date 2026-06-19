@@ -406,7 +406,7 @@ pub trait SandboxBackend: Send + Sync {
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
 
     /// ADR 0035: restore for a *fresh* session (the base-snapshot
-    /// path, incl. warm-pool refill) — identical to [`Self::restore`]
+    /// path) — identical to [`Self::restore`]
     /// except aux RO bundles are swapped to the host's current
     /// generation while the VM is load-paused, so new sessions always
     /// run the latest fleet bundles (skills) without re-enabling the

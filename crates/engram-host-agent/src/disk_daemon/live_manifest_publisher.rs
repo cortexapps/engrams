@@ -21,9 +21,9 @@
 //! SessionResolver>` (implemented over PooledBackend's
 //! `session_bindings: Arc<DashMap<SandboxId, SessionId>>`). At drain
 //! time, a sandbox without a session binding is skipped with a
-//! `debug!` — common for warm-pool sandboxes (future) and the small
-//! window between `inner.create()` and `start_agent()` on the
-//! cold-create path.
+//! `debug!` — common for the small window between `inner.create()`
+//! and `start_agent()` on the cold-create path, before a sandbox is
+//! bound to a session.
 //!
 //! **Lifecycle**: the drain task runs for the host-agent's life.
 //! It's spawned at publisher construction and held in the
@@ -150,9 +150,9 @@ async fn drain_loop(
             let session_id = match session_resolver.session_id_for(sandbox_id) {
                 Some(sid) => sid,
                 None => {
-                    // Warm-pool sandboxes (future), or the small
-                    // window between inner.create() and
-                    // start_agent() populating session_bindings.
+                    // An unbound sandbox — the small window between
+                    // inner.create() and start_agent() populating
+                    // session_bindings.
                     // The host-side flush still happened; the
                     // diagnostic surface sees `last_flush_unix_ms`
                     // tick. Just no coord publish.

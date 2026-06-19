@@ -13,7 +13,7 @@
 //!   writable-NBD plumbing lands.
 //!
 //! All three are opaque blobs (not chunked). Keys are derived from
-//! the snapshot_id so the same scheme works for warm-pool template
+//! the snapshot_id so the same scheme works for base template
 //! snapshots (image-builder bake-time) and durability snapshots
 //! (host-agent runtime) alike. Lives in `engram-chunk-store` rather
 //! than `engram-host-agent` so producers in either crate (image
@@ -47,8 +47,8 @@ pub fn rootfs_blob_key(snapshot_id: SnapshotId) -> String {
 
 /// ADR 0014 M1.14: `snapshots/<snapshot_id>/working_set.json` —
 /// JSON-serialized `WorkingSetTrace` captured by the bake's
-/// synthetic profile pass. Pooled_backend reads it on warm-pool
-/// refill to narrow M1.13's parallel prefetch.
+/// synthetic profile pass. Pooled_backend reads it on a fresh
+/// base-snapshot restore to narrow M1.13's parallel prefetch.
 pub fn working_set_blob_key(snapshot_id: SnapshotId) -> String {
     format!("snapshots/{snapshot_id}/working_set.json")
 }

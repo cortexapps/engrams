@@ -462,10 +462,11 @@ pub struct CreateSessionResponse {
     pub session_id: SessionId,
     pub status: &'static str,
     pub image_version: String,
-    /// `"warm"` if the session was satisfied by a pre-restored
-    /// warm-pool slot, `"cold"` if it took the full create path.
-    /// Used both by the dashboard (badge in session detail) and by
-    /// the metrics wrapper to label `engram_session_boot_seconds`
+    /// Coarse create disposition (ADR 0020: every create is a
+    /// base-snapshot restore): `"restored"` if the session booted,
+    /// `"queued"` if it found no capacity and was enqueued (ADR 0048),
+    /// `"unknown"` on a pre-boot error. Surfaced to the dashboard badge
+    /// and used as the `kind` label on `engram_session_boot_seconds`
     /// without re-running the scheduling decision.
     pub kind: &'static str,
 }

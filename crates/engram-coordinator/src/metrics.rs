@@ -97,12 +97,10 @@ pub fn init(addr: SocketAddr) {
 ///   phases surfaces network and scheduler overhead.
 /// - `outcome`: `success` / `bad_request` / `image_not_enabled` /
 ///   `scheduling_rejected` / `internal`.
-/// - `kind`: `cold` (session took the full create path) or `warm`
-///   (warm-pool-leased) or `unknown` (errored before the path was
-///   chosen). Sourced from `CreateSessionResponse.kind` on success.
-///   The headline ADR 0014 win shows up as
-///   `engram_session_boot_seconds_sum{phase="total",kind="warm"}`
-///   trending toward sub-1s while `kind="cold"` stays at ~20-25s.
+/// - `kind`: `restored` (booted via base-snapshot restore — the
+///   normal path, ADR 0020) or `queued` (no capacity, enqueued per
+///   ADR 0048) or `unknown` (errored before the path was chosen).
+///   Sourced from `CreateSessionResponse.kind` on success.
 pub const SESSION_BOOT_SECONDS: &str = "engram_session_boot_seconds";
 
 /// Counter. Sessions that reached `Active`. Labels: `outcome`
