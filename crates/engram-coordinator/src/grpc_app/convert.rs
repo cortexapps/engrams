@@ -119,6 +119,8 @@ pub(crate) fn create_request_from_proto(
         prompt,
         harness_env: _, // Handled at RPC layer (folded into identity_env).
         secrets,
+        // ADR 0055: dynamic skill mounts (assigned to reserved slots below).
+        mounts,
         // Phase 1b: the initial prompt's client prompt_id. The create path
         // delivers the initial prompt via send_prompt (which mints one when
         // empty), so threading the client id for the FIRST message is a
@@ -139,11 +141,36 @@ pub(crate) fn create_request_from_proto(
     } else {
         Some(secrets.into_iter().collect())
     };
+    // ADR 0055: assign each requested mount to a reserved slot (dyn_0..) and
+    // build the AuxRoDrives the host patch_drives in. Cap at RESERVED_SLOTS.
+    use engram_core::types::sandbox::AuxRoDrive;
+    if mounts.len() > AuxRoDrive::RESERVED_SLOTS {
+        return Err(ApiError::BadRequest(format!(
+            "session requested {} dynamic mounts but only {} reserved slots exist",
+            mounts.len(),
+            AuxRoDrive::RESERVED_SLOTS,
+        )));
+    }
+    let selected_mounts = mounts
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| AuxRoDrive {
+            drive_id: AuxRoDrive::slot_drive_id(i),
+            guest_mount: AuxRoDrive::slot_guest_mount(i),
+            fs_type: if m.fs_type.is_empty() {
+                "squashfs".into()
+            } else {
+                m.fs_type
+            },
+            sha256: Some(m.sha256),
+        })
+        .collect();
     Ok(CreateSessionRequest {
         image: image_uri,
         mode,
         prompt,
         secrets,
+        selected_mounts,
     })
 }
 

@@ -82,7 +82,7 @@ async fn warm_hook_process_survives_base_snapshot() {
     // Restore a fresh session from the captured base snapshot and confirm
     // the warmed process came back live (the snapshot froze it running).
     let restored = pooled
-        .restore_fresh(meta)
+        .restore_fresh(meta, Vec::new())
         .await
         .expect("restore from warm base snapshot");
 
@@ -154,7 +154,7 @@ async fn warm_hook_sees_manifest_env() {
 
     // Confirm the value the hook observed was the manifest one (not a stray
     // default), surviving into a restored session.
-    let restored = pooled.restore_fresh(meta).await.expect("restore");
+    let restored = pooled.restore_fresh(meta, Vec::new()).await.expect("restore");
     let seen = exec(&pooled, restored, "cat /dev/shm/engram-warm-env").await;
     assert_eq!(
         seen.trim(),

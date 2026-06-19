@@ -713,6 +713,9 @@ impl PooledBackend {
         &self,
         metadata: SnapshotMetadata,
         fresh: bool,
+        // ADR 0055: per-session skills to patch into reserved slots (fresh only;
+        // ignored on resume, which keeps the snapshot's pinned mounts).
+        selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         // ADR 0014 M1.13: eager parallel prefetch of memory chunks
         // into local NVMe BEFORE we hand off to materialize +
@@ -978,7 +981,7 @@ impl PooledBackend {
             let abandoning = self.abandoning.clone();
             let join = tokio::spawn(async move {
                 let new_id = if fresh {
-                    inner.restore_fresh(metadata).await?
+                    inner.restore_fresh(metadata, selected_mounts).await?
                 } else {
                     inner.restore(metadata).await?
                 };
@@ -1030,7 +1033,7 @@ impl PooledBackend {
         }
 
         let new_id = if fresh {
-            self.inner.restore_fresh(metadata).await?
+            self.inner.restore_fresh(metadata, selected_mounts).await?
         } else {
             self.inner.restore(metadata).await?
         };
@@ -5662,7 +5665,10 @@ impl SandboxBackend for PooledBackend {
         }
         let memory_ref = metadata.memory_manifest;
         let row_template = migration.as_ref().map(|_| metadata.clone());
-        let id = self.restore_with(metadata, /*fresh=*/ false).await?;
+        // Resume keeps the snapshot's pinned mounts — no per-session selection.
+        let id = self
+            .restore_with(metadata, /*fresh=*/ false, Vec::new())
+            .await?;
         match migration {
             Some(mig) if mig.post_copy => {
                 // ADR 0045 C2: NO chain seed — sealed pages installed
@@ -5689,7 +5695,11 @@ impl SandboxBackend for PooledBackend {
         Ok(id)
     }
 
-    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore_fresh(
+        &self,
+        metadata: SnapshotMetadata,
+        selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
+    ) -> Result<SandboxId, SandboxError> {
         // ADR 0045 seed-at-create: guest RAM right after a fresh restore
         // is byte-identical to the base snapshot's memory manifest, and
         // FC dirty-page tracking runs from the restore — exactly the
@@ -5699,7 +5709,9 @@ impl SandboxBackend for PooledBackend {
         // manifest is shared across sessions, so the chain must own a
         // fresh lineage (see seed_checkpoint_chain_forked).
         let memory_ref = metadata.memory_manifest;
-        let id = self.restore_with(metadata, /*fresh=*/ true).await?;
+        let id = self
+            .restore_with(metadata, /*fresh=*/ true, selected_mounts)
+            .await?;
         if let Some(memory_ref) = memory_ref {
             self.seed_checkpoint_chain_forked(id, memory_ref).await;
         }
@@ -5873,6 +5885,7 @@ impl SandboxBackend for PooledBackend {
         &self,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
+        selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         // 1. Restore the base snapshot (cross-host materialize +
         //    load_snapshot). The VM comes up running with the bake-time
@@ -5880,7 +5893,9 @@ impl SandboxBackend for PooledBackend {
         //    Fresh flavor (ADR 0035 §3): aux bundles swap to the host's
         //    current generation so new sessions run the latest skills.
         let memory_ref = metadata.memory_manifest;
-        let id = self.restore_with(metadata, /*fresh=*/ true).await?;
+        let id = self
+            .restore_with(metadata, /*fresh=*/ true, selected_mounts)
+            .await?;
         // ADR 0045 seed-at-create: the session's RAM == the base
         // manifest at this instant (see `restore_fresh`); seed the
         // chain so the first eviction diffs instead of Full-dumping.

@@ -114,6 +114,20 @@ message CreateSessionRequest {
   // silently lose its token). Honored regardless of SecretMode: this is NOT a
   // user override, it is the trusted orchestrator's identity injection. NEVER logged.
   map<string, string> harness_env = 6;
+  // ADR 0055: dynamic skill mounts the orchestrator resolved from the
+  // session's profile. The coordinator assigns each to a reserved slot
+  // (dyn_0..) and patch_drives it into the paused restore window; the guest
+  // reads each mount's mount.json to wire the skills. Empty = base skills only.
+  repeated DynamicMount mounts = 8;
+}
+
+// ADR 0055: one read-only skill directory to mount, resolved by the
+// orchestrator from the profile's selected skills (content-addressed). The
+// drive_id / guest path are NOT set here — the coordinator assigns the reserved
+// slot and its /opt/engram/dyn/<i> mount point.
+message DynamicMount {
+  string sha256 = 1;  // content id of the skill squashfs (staging / BlobStorage)
+  string fs_type = 2; // "squashfs" | "erofs"
 }
 
 message CreateSessionResponse {
