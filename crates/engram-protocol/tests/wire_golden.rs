@@ -254,7 +254,7 @@ fn struct_payloads_golden() {
     assert_golden(
         "aux_bundle_ref",
         &AuxBundleRef {
-            drive_id: "dyn-1".into(),
+            drive_id: "dyn_1".into(),
             sha256: "d".repeat(64),
         },
     );
@@ -350,7 +350,7 @@ fn regen_golden() {
     write(
         "aux_bundle_ref",
         &AuxBundleRef {
-            drive_id: "dyn-1".into(),
+            drive_id: "dyn_1".into(),
             sha256: "d".repeat(64),
         },
     );

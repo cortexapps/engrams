@@ -531,12 +531,12 @@ async fn configure_boot_n(
     for (i, path) in aux.iter().enumerate() {
         client
             .put_drive(&DriveConfig {
-                drive_id: format!("dyn-{i}"),
+                drive_id: engram_core::types::sandbox::AuxRoDrive::slot_drive_id(i),
                 path_on_host: path.to_string_lossy().into_owned(),
                 is_root_device: false,
                 is_read_only: true,
             })
             .await
-            .unwrap_or_else(|e| panic!("put_drive dyn-{i} failed (FC device ceiling?): {e}"));
+            .unwrap_or_else(|e| panic!("put_drive dyn_{i} failed (FC device ceiling?): {e}"));
     }
 }
