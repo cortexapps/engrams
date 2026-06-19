@@ -36,17 +36,17 @@
     },
     "nixpkgs-e2fsprogs": {
       "locked": {
-        "lastModified": 1781577229,
-        "narHash": "sha256-lrp67w8AulE9Ks53n27I45ADSzbOCn4H+CNW1Ck8B+8=",
+        "lastModified": 1749250130,
+        "narHash": "sha256-vvRmxEp92D6CYKrgVxrhrzzLf68TVOLKtpchAv5AcQg=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "567a49d1913ce81ac6e9582e3553dd90a955875f",
+        "rev": "c6729488de632cc9f8af5aa82edd7097ea506c36",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
-        "ref": "nixos-unstable",
         "repo": "nixpkgs",
+        "rev": "c6729488de632cc9f8af5aa82edd7097ea506c36",
         "type": "github"
       }
     },
