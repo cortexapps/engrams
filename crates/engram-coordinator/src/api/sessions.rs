@@ -73,12 +73,13 @@ pub(crate) fn cold_boot_spec(
         .suggested_disk_gib
         .unwrap_or(DEFAULT_DISK_GIB);
 
-    // ADR 0027: the `skills` bundle is universal; `playwright` rides
-    // only when the image opted in.
-    let mut aux_ro_drives = vec![AuxRoDrive::skills()];
-    if manifest.browser_enabled() {
-        aux_ro_drives.push(AuxRoDrive::playwright());
-    }
+    // ADR 0055: capture reserves a fixed pool of dynamic-mount slots, each
+    // carrying the sentinel. Per-session creates `patch_drive` the selected
+    // skills into slots in the paused restore window, so the base snapshot
+    // stays skill-agnostic — one per image, not one per skill-combination.
+    let aux_ro_drives = (0..AuxRoDrive::RESERVED_SLOTS)
+        .map(AuxRoDrive::reserved_slot)
+        .collect();
 
     SandboxSpec {
         image: image_uri.to_string(),
