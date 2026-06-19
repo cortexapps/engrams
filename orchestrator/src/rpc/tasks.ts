@@ -82,6 +82,9 @@ export interface SessionsClient {
     // ADR 0051 Drip A: orchestrator-resolved harness identity env (e.g.
     // CLAUDE_CODE_OAUTH_TOKEN). The coordinator injects + persists it.
     harnessEnv?: Record<string, string>;
+    // ADR 0055: profile-selected skill bundle names; the coordinator resolves
+    // them to reserved-slot mounts at boot.
+    selectedSkills?: string[];
   }): Promise<{ sessionId: string; status: string; imageVersion: string; kind: string }>;
   listSessions(req: Record<string, never>): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
@@ -402,12 +405,15 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v; // profile overrides
       const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
-      // 4. Create the upstream session. Mode is always "agent" (ADR §5).
+      // 4. Create the upstream session. Mode is always "agent" (ADR §5). The
+      //    profile's selected skills (ADR 0055) ride as bundle names; the
+      //    coordinator resolves them to reserved-slot mounts at boot.
       const created = await sessionsClient.createSession({
         imageUri: image.imageUri,
         mode: "agent",
         ...(req.prompt != null ? { prompt: req.prompt } : {}),
         ...(harnessEnv != null ? { harnessEnv } : {}),
+        ...(profile.skills.length > 0 ? { selectedSkills: profile.skills } : {}),
       });
 
       // 5. Insert task + task_session (recording profile_id). Compensate on failure.

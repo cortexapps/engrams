@@ -29,6 +29,13 @@
       "when": 1781651154410,
       "tag": "0003_session_profiles",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1781892229199,
+      "tag": "0004_profile_skills",
+      "breakpoints": true
     }
   ]
 }

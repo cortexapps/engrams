@@ -36,6 +36,15 @@ describe("SessionProfileEditor (create)", () => {
     await waitFor(() => expect(create).toHaveBeenCalled());
     expect(create.mock.calls[0][0]).toMatchObject({ name: "Backend Agent", imageId: "i1" });
   });
+
+  it("toggling a built-in skill includes it in the createProfile payload (ADR 0055)", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "Browser Agent" } });
+    fireEvent.click(screen.getByTestId("skill-playwright"));
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].skills).toEqual(["playwright"]);
+  });
 });
 
 describe("SessionProfileEditor (edit)", () => {

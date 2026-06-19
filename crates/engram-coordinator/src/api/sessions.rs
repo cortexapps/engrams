@@ -14,29 +14,20 @@ use crate::state::{SessionEvent, SharedState};
 pub(crate) const DEFAULT_VCPUS: u32 = 2;
 pub(crate) const DEFAULT_MEMORY_MIB: u32 = 4096;
 pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
-/// ADR 0027: memory floor for browser-enabled images. chromium-headless-shell
-/// needs ~250-400 MB resident; floor at 1 GiB for headroom. The 4 GiB default
-/// already exceeds this, so it only bites images that lowered
-/// `suggested_memory_mib`. Capture (base snapshot) and restore must agree on
-/// `mem_size_mib` (FC requires it), so both paths apply this same floor.
-pub(crate) const BROWSER_MEMORY_FLOOR_MIB: u32 = 1024;
 
 /// Resolved guest memory (MiB) for an image: its `suggested_memory_mib` (or
-/// the default), floored for `[browser] enabled` images (ADR 0027). The
-/// single source of truth shared by base-snapshot capture
+/// the default). The single source of truth shared by base-snapshot capture
 /// (`enabled_images`) and session restore — FC requires the restore
 /// `mem_size_mib` to equal the snapshot's, so they MUST compute it
-/// identically. Don't inline the floor; call this.
+/// identically. ADR 0055: the base snapshot is sized once per image and is
+/// skill-agnostic (skills bind via `patch_drive`, never resize memory), so
+/// memory-heavy tooling (e.g. browser) is an image-sizing concern —
+/// declare `suggested_memory_mib` on the image, not a per-session skill.
 pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) -> u32 {
     manifest
         .resources
         .suggested_memory_mib
         .unwrap_or(DEFAULT_MEMORY_MIB)
-        .max(if manifest.browser_enabled() {
-            BROWSER_MEMORY_FLOOR_MIB
-        } else {
-            0
-        })
 }
 
 /// ADR 0048: resolved guest vCPU count for an image. Enable-time
@@ -456,11 +447,11 @@ pub struct CreateSessionRequest {
     /// reject overrides.
     #[serde(default)]
     pub secrets: Option<HashMap<String, String>>,
-    /// ADR 0055: per-session skills resolved from the profile, already assigned
-    /// to reserved slots (dyn_0..) by `create_request_from_proto`. Empty for
+    /// ADR 0055: profile-selected skill bundle names; resolved to reserved-slot
+    /// mounts at `prepare_inner` against the fleet's staged bundles. Empty for
     /// non-gRPC / legacy callers.
     #[serde(default)]
-    pub selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
+    pub selected_skills: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -760,7 +751,7 @@ pub(crate) async fn prepare_from_grpc(
         req.secrets.clone(),
         SessionId::new(),
         enabled,
-        req.selected_mounts.clone(),
+        req.selected_skills.clone(),
     )
     .await
 }
@@ -819,6 +810,61 @@ pub(crate) async fn prepare_from_row(
 /// `CLAUDE_CODE_OAUTH_TOKEN`) folded into the session env — empty for the
 /// queue path, populated only on the gRPC create.
 #[allow(clippy::too_many_arguments)]
+/// ADR 0055: resolve profile-selected skill bundle names to reserved-slot mount
+/// specs. The fleet bakes identical bundles, so any active host's
+/// `current_bundles` (name -> staged sha) is the catalog. Assigns each skill a
+/// reserved slot (dyn_0..) + the staged sha the host `patch_drive`s in.
+async fn resolve_selected_skills(
+    state: &SharedState,
+    names: &[String],
+) -> Result<Vec<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
+    use engram_core::types::sandbox::AuxRoDrive;
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    if names.len() > AuxRoDrive::RESERVED_SLOTS {
+        return Err(ApiError::BadRequest(format!(
+            "session requested {} skills but only {} reserved slots exist",
+            names.len(),
+            AuxRoDrive::RESERVED_SLOTS,
+        )));
+    }
+    let hosts = state
+        .services
+        .meta
+        .list_active_hosts()
+        .await
+        .map_err(|e| ApiError::Internal(format!("list_active_hosts for skill resolve: {e}")))?;
+    // Any host that reports bundles is the fleet catalog (all hosts bake the
+    // same generations). name -> staged content sha.
+    let catalog: std::collections::HashMap<&str, &str> = hosts
+        .iter()
+        .find(|h| !h.current_bundles.is_empty())
+        .map(|h| {
+            h.current_bundles
+                .iter()
+                .map(|b| (b.drive_id.as_str(), b.sha256.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut mounts = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let sha = catalog.get(name.as_str()).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "skill `{name}` is not staged on the fleet (unknown skill, or no host \
+                 has reported its bundle yet)"
+            ))
+        })?;
+        mounts.push(AuxRoDrive {
+            drive_id: AuxRoDrive::slot_drive_id(i),
+            guest_mount: AuxRoDrive::slot_guest_mount(i),
+            fs_type: "squashfs".into(),
+            sha256: Some((*sha).to_string()),
+        });
+    }
+    Ok(mounts)
+}
+
 async fn prepare_inner(
     state: &SharedState,
     identity_env: HashMap<String, String>,
@@ -828,8 +874,8 @@ async fn prepare_inner(
     secret_overrides: Option<HashMap<String, String>>,
     session_id: SessionId,
     enabled: engram_core::types::EnabledImage,
-    // ADR 0055: per-session skills, already assigned to reserved slots (dyn_0..).
-    selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
+    // ADR 0055: profile-selected skill names; resolved to reserved-slot mounts.
+    selected_skills: Vec<String>,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
     // ADR 0021 P1.3: a dev-VM session leaves any baked harness undriven,
     // so a prompt is meaningless — reject it explicitly.
@@ -963,6 +1009,10 @@ async fn prepare_inner(
              (POST /api/enabled-images) to capture one"
         ))
     })?;
+    // ADR 0055: resolve the profile's selected skill names to reserved-slot
+    // mounts against the fleet's staged bundles (name -> sha). Capped at
+    // RESERVED_SLOTS; an unknown skill name is a 400.
+    let selected_mounts = resolve_selected_skills(state, &selected_skills).await?;
     let memory_mib = resolved_memory_mib(&manifest);
     let cpu_budget_vcpus = resolved_vcpus(&manifest);
 
@@ -1494,39 +1544,29 @@ pub(crate) fn resolve_harness(
 mod tests {
     use super::*;
     use engram_core::traits::ResolvedSecret;
-    use engram_core::types::image::{BrowserConfig, NetworkPolicy, SecretSchema};
+    use engram_core::types::image::{NetworkPolicy, SecretSchema};
     use engram_core::types::ImageManifest;
     use engram_core::SandboxId;
 
-    /// ADR 0027: the browser memory floor is applied identically by base-
-    /// snapshot capture and session restore (both call `resolved_memory_mib`),
-    /// so FC's "restore mem_size must equal snapshot mem_size" holds. It only
-    /// raises memory for browser images that asked for less than the floor.
+    /// ADR 0055: memory is purely the image's `suggested_memory_mib` (or the
+    /// default) — the base snapshot is sized once per image and skills bind via
+    /// `patch_drive` without resizing it. Capture and restore both call this so
+    /// FC's "restore mem_size must equal snapshot mem_size" holds.
     #[test]
-    fn resolved_memory_mib_floors_only_browser_images_below_floor() {
-        let mk = |browser: bool, mem: Option<u32>| {
+    fn resolved_memory_mib_is_suggested_or_default() {
+        let mk = |mem: Option<u32>| {
             let mut m = ImageManifest {
                 name: "x".into(),
                 ..Default::default()
             };
             m.resources.suggested_memory_mib = mem;
-            if browser {
-                m.browser = Some(BrowserConfig { enabled: true });
-            }
             m
         };
-        // Non-browser: suggestion (or default) honored verbatim.
-        assert_eq!(resolved_memory_mib(&mk(false, None)), DEFAULT_MEMORY_MIB);
-        assert_eq!(resolved_memory_mib(&mk(false, Some(256))), 256);
-        // Browser + below floor: floored up.
-        assert_eq!(
-            resolved_memory_mib(&mk(true, Some(256))),
-            BROWSER_MEMORY_FLOOR_MIB
-        );
-        // Browser + already above floor: honored.
-        assert_eq!(resolved_memory_mib(&mk(true, Some(8192))), 8192);
-        // Browser + default (4 GiB): already above the floor.
-        assert_eq!(resolved_memory_mib(&mk(true, None)), DEFAULT_MEMORY_MIB);
+        // Unset → default.
+        assert_eq!(resolved_memory_mib(&mk(None)), DEFAULT_MEMORY_MIB);
+        // Set → honored verbatim, both below and above the default.
+        assert_eq!(resolved_memory_mib(&mk(Some(256))), 256);
+        assert_eq!(resolved_memory_mib(&mk(Some(8192))), 8192);
     }
 
     /// ADR 0039: the base-restore metadata points the host's memory-chunk
@@ -1604,7 +1644,6 @@ mod tests {
             secret_mode: SecretMode::Broker,
             harness: None,
             git: None,
-            browser: None,
             warm: None,
         };
 
@@ -1688,7 +1727,6 @@ mod tests {
             secret_mode: SecretMode::Broker,
             harness: None,
             git: None,
-            browser: None,
             warm: None,
         };
 

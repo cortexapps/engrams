@@ -90,17 +90,6 @@ pub struct ImageManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitConfig>,
 
-    /// Opt-in browser tooling (ADR 0027). When `enabled`, sessions of this
-    /// image get the read-only `playwright` bundle (chromium-headless-shell +
-    /// the `@playwright/cli` browser-automation CLI) attached as an aux RO
-    /// drive at base-snapshot capture, and agentd puts the `playwright-cli`
-    /// wrapper on PATH + wires the `show-your-work` skill at session bind.
-    /// Also raises the memory floor (the headless browser needs ~250-400 MB).
-    /// Off by default — most images never open a browser, and the bundle is
-    /// glibc-linked (musl/alpine bases can't use it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub browser: Option<BrowserConfig>,
-
     /// Optional capture-time prewarm hook. When set, base-snapshot
     /// capture runs `[warm] command` inside the capture VM AFTER agentd
     /// is ready and BEFORE the memory snapshot is frozen — so any
@@ -117,23 +106,6 @@ pub struct ImageManifest {
     /// `create` ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm: Option<WarmConfig>,
-}
-
-/// Browser-tooling binding for an image (ADR 0027). Gates the opt-in
-/// `playwright` RO bundle (chromium-headless-shell + `@playwright/cli`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserConfig {
-    /// `[browser] enabled = true` attaches the playwright bundle and wires
-    /// the `playwright-cli` + `show-your-work` skill for this image's sessions.
-    pub enabled: bool,
-}
-
-impl ImageManifest {
-    /// Whether this image opted into browser tooling (`[browser] enabled`).
-    pub fn browser_enabled(&self) -> bool {
-        self.browser.as_ref().is_some_and(|b| b.enabled)
-    }
 }
 
 /// Capture-time prewarm hook for an image's base snapshot.
@@ -516,47 +488,6 @@ mod tests {
             [git]
             provider = "github"
             repo = "cortexapps/engrams"
-        "#
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn manifest_parses_browser_block() {
-        // No [browser] block → browser tooling off.
-        let m: ImageManifest = toml::from_str(r#"name = "plain""#).unwrap();
-        assert!(m.browser.is_none());
-        assert!(!m.browser_enabled());
-
-        // Opt-in.
-        let on: ImageManifest = toml::from_str(
-            r#"
-            name = "demo"
-            [browser]
-            enabled = true
-        "#,
-        )
-        .unwrap();
-        assert!(on.browser_enabled());
-
-        // Explicit off.
-        let off: ImageManifest = toml::from_str(
-            r#"
-            name = "demo"
-            [browser]
-            enabled = false
-        "#,
-        )
-        .unwrap();
-        assert!(!off.browser_enabled());
-
-        // deny_unknown_fields guards typos in the block.
-        assert!(toml::from_str::<ImageManifest>(
-            r#"
-            name = "x"
-            [browser]
-            enabled = true
-            headed = true
         "#
         )
         .is_err());

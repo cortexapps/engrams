@@ -176,6 +176,7 @@ function makeFakeProfiles(opts?: {
   includeUserTokens?: boolean;
   envVars?: Record<string, string>;
   imageId?: string;
+  skills?: string[];
 }): ProfileStore {
   const row: ProfileRow = {
     id: PROFILE_ID,
@@ -185,6 +186,7 @@ function makeFakeProfiles(opts?: {
     imageId: opts?.imageId ?? "img-1",
     includeUserTokens: opts?.includeUserTokens ?? false,
     envVars: opts?.envVars ?? {},
+    skills: opts?.skills ?? [],
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -1059,6 +1061,43 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
         CLAUDE_CODE_OAUTH_TOKEN: "admin-token",
         ANTHROPIC_MODEL: "claude-opus-4-8",
       });
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("profile skills ride createSession as selected_skills (ADR 0055)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("skills-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ skills: ["skills", "playwright"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      expect(fakeSessions.createReqs[0]?.selectedSkills).toEqual(["skills", "playwright"]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("empty profile skills omit selected_skills (base session)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("noskills-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ skills: [] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      // Omitted on the wire → empty array after proto round-trip.
+      expect(fakeSessions.createReqs[0]?.selectedSkills ?? []).toEqual([]);
     } finally {
       await srv.close();
     }
