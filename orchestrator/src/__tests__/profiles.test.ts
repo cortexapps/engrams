@@ -65,7 +65,7 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 
 const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
-  includeUserTokens: false, envVars: { K: "V" }, createdAt: new Date(0), updatedAt: new Date(0),
+  includeUserTokens: false, envVars: { K: "V" }, skills: [], createdAt: new Date(0), updatedAt: new Date(0),
   deletedAt: new Date(0),
 };
 const active: ProfileRow = { ...archived, id: "act", name: "Active", deletedAt: null };

@@ -17,6 +17,7 @@ describe("ProfileStore", () => {
       imageId: "img-1",
       includeUserTokens: false,
       envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
+      skills: ["skills"],
     };
     const created = await store.create(input);
     try {

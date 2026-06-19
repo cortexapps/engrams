@@ -40,8 +40,28 @@ const schema = z.object({
   icon: z.string().min(1),
   imageId: z.string().min(1, "Select an image"),
   includeUserTokens: z.boolean(),
+  // ADR 0055: dynamic skill bundle names this profile's sessions mount.
+  skills: z.array(z.string()),
 });
 type Values = z.infer<typeof schema>;
+
+// ADR 0055: the built-in skill bundles an admin can grant a profile. The
+// coordinator resolves these names to staged content shas + reserved-slot
+// mounts at session create. (P2 replaces this fixed list with the dynamic
+// catalog once user-uploaded skills land.)
+const BUILTIN_SKILLS: { name: string; label: string; description: string }[] = [
+  {
+    name: "skills",
+    label: "Built-in skills",
+    description: "share-file, create-pull-request, and the git credential wiring.",
+  },
+  {
+    name: "playwright",
+    label: "Browser (Playwright)",
+    description:
+      "chromium-headless-shell + the playwright-cli powering the show-your-work skill. Use an image sized for a browser (≥1 GiB).",
+  },
+];
 
 export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const navigate = useNavigate();
@@ -61,6 +81,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       icon: "Bot",
       imageId: "",
       includeUserTokens: false,
+      skills: [],
     },
   });
 
@@ -74,6 +95,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         icon: p.icon,
         imageId: p.imageId,
         includeUserTokens: p.includeUserTokens,
+        skills: p.skills ?? [],
       });
       setEnvRows(mapToEnvRows(p.envVars));
     }
@@ -169,6 +191,43 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 </Select>
                 {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
               </Field>
+            )}
+          />
+        </FieldGroup>
+      </FieldSet>
+
+      <FieldSet>
+        <FieldLegend>Skills</FieldLegend>
+        <FieldGroup>
+          <Controller
+            name="skills"
+            control={form.control}
+            render={({ field }) => (
+              <>
+                {BUILTIN_SKILLS.map((s) => {
+                  const checked = field.value.includes(s.name);
+                  return (
+                    <Field key={s.name} orientation="horizontal">
+                      <Switch
+                        id={`skill-${s.name}`}
+                        data-testid={`skill-${s.name}`}
+                        checked={checked}
+                        onCheckedChange={(on) =>
+                          field.onChange(
+                            on
+                              ? [...field.value, s.name]
+                              : field.value.filter((n) => n !== s.name),
+                          )
+                        }
+                      />
+                      <div>
+                        <FieldLabel htmlFor={`skill-${s.name}`}>{s.label}</FieldLabel>
+                        <FieldDescription>{s.description}</FieldDescription>
+                      </div>
+                    </Field>
+                  );
+                })}
+              </>
             )}
           />
         </FieldGroup>

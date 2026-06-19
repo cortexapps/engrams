@@ -79,6 +79,10 @@ export const profile = pgTable("profile", {
   imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
   includeUserTokens: boolean("include_user_tokens").notNull().default(false),
   envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
+  // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
+  // ["skills", "playwright"]). Resolved by the coordinator to reserved-slot
+  // mounts at session create. Empty = base session (no skills).
+  skills: jsonb("skills").$type<string[]>().notNull().default([]),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at")
     .notNull()

@@ -62,6 +62,9 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     imageId: row.imageId,
     includeUserTokens: row.includeUserTokens,
     envVars: isAdmin ? row.envVars : {},
+    // ADR 0055: skills are not sensitive (they describe granted tooling), so
+    // they are surfaced to members too — unlike env_vars.
+    skills: row.skills,
     archived: row.deletedAt != null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -121,6 +124,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         imageId: req.imageId,
         includeUserTokens: req.includeUserTokens,
         envVars: req.envVars ?? {},
+        skills: req.skills ?? [],
       });
       return { profile: toProto(row, true) };
     },
@@ -138,6 +142,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         imageId: req.imageId,
         includeUserTokens: req.includeUserTokens,
         envVars: req.envVars ?? {},
+        skills: req.skills ?? [],
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
       return { profile: toProto(row, true) };
