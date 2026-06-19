@@ -277,8 +277,15 @@ def main():
     host_image = host_binaries or host_base
     # Golden cli+agentd artifact (cli-tools). Republish whenever either binary's
     # release closure moved, or a conservative common trigger (lockfile / root
-    # manifest / the bake workflow / this script) changed.
-    cli_tools = bool(cc & cli_tools_closure) or any_path(changed, BINARY_COMMON)
+    # manifest / the bake workflow / this script) changed, OR the flake changed:
+    # publish-cli-tools ALSO bundles a pinned static mke2fs built via
+    # `nix build .#mke2fs-static` (ADR 0036), so flake.nix/flake.lock feed the
+    # artifact even when no Rust binary moved. Without this, an e2fsprogs re-pin
+    # leaves cli-tools carrying the stale mke2fs and the dogfood bakes don't see
+    # the fix (exactly what happened with the 1.47.3 -> 1.47.2 pin).
+    cli_tools = (bool(cc & cli_tools_closure)
+                 or any_path(changed, BINARY_COMMON)
+                 or any_path(changed, ["flake.nix", "flake.lock"]))
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
     bundles = any_path(changed, BUNDLES_PATHS)
     # The dogfood image builds the whole repo via `just dev`, so it's stale on
