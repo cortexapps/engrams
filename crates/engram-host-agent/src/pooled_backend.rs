@@ -603,6 +603,14 @@ pub struct PooledBackend {
     /// guard + migration fence). Mirrored into the FC sandbox manifest
     /// for reattach (ADR 0044 K2).
     migration_roles: Arc<DashMap<SandboxId, crate::migration::MigrationRole>>,
+    /// Base-snapshot capture VMs in flight (`build_base_snapshot`). These
+    /// are host-local + transient and NEVER session-owned, so the teardown
+    /// reconcile (ADR 0050 E) would otherwise see them as orphans and reap
+    /// them mid-capture — fatal for a slow `[warm]` hook (dev-brain's gradle
+    /// warmup runs >60s, past the 2-strike debounce). Tracked for their full
+    /// lifetime (create → warm hook → snapshot → destroy) so the reconcile
+    /// can skip them, exactly like `migration_roles`.
+    base_captures: Arc<DashMap<SandboxId, ()>>,
     /// ADR 0044 K2 (issue #224): terminal-mode flag for graceful
     /// shutdown. `abandon_nbd_data_planes_for_shutdown` sets this
     /// `true` (SeqCst) BEFORE draining `nbd_sandboxes`, turning
@@ -1062,6 +1070,7 @@ impl PooledBackend {
             pending_presetups: Arc::new(DashMap::new()),
             postcopy_dests: Arc::new(DashMap::new()),
             migration_roles: Arc::new(DashMap::new()),
+            base_captures: Arc::new(DashMap::new()),
             #[cfg(target_os = "linux")]
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_manifest_publish: None,
@@ -1085,6 +1094,13 @@ impl PooledBackend {
     /// Lifecycle drivers (idle-evict nomination) skip roled sandboxes.
     pub fn migration_role(&self, id: SandboxId) -> Option<crate::migration::MigrationRole> {
         self.migration_roles.get(&id).map(|r| *r)
+    }
+
+    /// True while `build_base_snapshot` is driving `id` (an unowned,
+    /// transient capture VM). The teardown reconcile (ADR 0050 E) skips
+    /// these so a slow `[warm]` hook isn't reaped as an orphan.
+    pub fn is_base_capture(&self, id: SandboxId) -> bool {
+        self.base_captures.contains_key(&id)
     }
 
     /// In-memory-only role note (reattach re-arming: the manifest
@@ -5790,6 +5806,12 @@ impl SandboxBackend for PooledBackend {
         // Boot the capture VM (opens the cold_boot operation scope on Linux).
         let id = self.create(spec).await?;
 
+        // Mark it as a base-capture VM for its whole lifetime so the teardown
+        // reconcile (ADR 0050 E) doesn't reap it as an unowned orphan while a
+        // slow `[warm]` hook runs (dev-brain's gradle warmup is >60s, past the
+        // 2-strike debounce). Cleared after the destroy below, on every path.
+        self.base_captures.insert(id, ());
+
         // Drive the capture to a snapshot, then ALWAYS tear the VM down —
         // a capture VM has no session and must not linger.
         let captured = async {
@@ -5841,6 +5863,8 @@ impl SandboxBackend for PooledBackend {
                 "base-snapshot capture: destroy of capture VM failed; reconcile will GC",
             );
         }
+        // Capture is done (the VM is destroyed); drop the reconcile exemption.
+        self.base_captures.remove(&id);
         captured
     }
 
@@ -6459,6 +6483,127 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
         }
+    }
+
+    /// Regression: a base-snapshot capture VM must be exempt from the teardown
+    /// reconcile (ADR 0050 E) for its whole lifetime. It's host-local and never
+    /// session-owned, so the reconcile's orphan rule would otherwise reap it
+    /// mid-capture — fatal for a slow `[warm]` hook (dev-brain's gradle warmup
+    /// runs past the 2-strike debounce, which bricked the prod enable).
+    /// `build_base_snapshot` marks it (`is_base_capture`) and clears the mark
+    /// after teardown, on every path.
+    #[tokio::test]
+    async fn base_capture_vm_is_exempt_from_reconcile_then_cleared() {
+        use std::sync::{Mutex, OnceLock, Weak};
+
+        struct Probe {
+            created_id: Mutex<Option<SandboxId>>,
+            marked_mid_capture: Mutex<Option<bool>>,
+            weak: OnceLock<Weak<PooledBackend>>,
+            staging: PathBuf,
+        }
+        struct Mock(Arc<Probe>);
+        #[async_trait]
+        impl SandboxBackend for Mock {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                let id = SandboxId::new();
+                *self.0.created_id.lock().unwrap() = Some(id);
+                Ok(id)
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                // Mid-capture (after register, before teardown): the reconcile
+                // exemption MUST report this VM as a base capture.
+                let pooled = self.0.weak.get().unwrap().upgrade().unwrap();
+                *self.0.marked_mid_capture.lock().unwrap() = Some(pooled.is_base_capture(id));
+                // Minimal FC-shaped artifacts so the PooledBackend memory-chunk
+                // wrapper succeeds.
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.0.staging.join(snapshot_id.to_string());
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), vec![7u8; 4096])
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"x")
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("manifest.json"), b"{}")
+                    .await
+                    .unwrap();
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: 4096,
+                    created_at: chrono::Utc::now(),
+                    image_version: "t:1".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.0.staging.join(id.to_string())
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe {
+            created_id: Mutex::new(None),
+            marked_mid_capture: Mutex::new(None),
+            weak: OnceLock::new(),
+            staging: tmp.path().join("snaps"),
+        });
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = engram_chunk_store::ChunkStore::new(blob);
+        let inner: Arc<dyn SandboxBackend> = Arc::new(Mock(probe.clone()));
+        let pooled = Arc::new(
+            PooledBackend::new(inner).with_chunk_store(cs, tmp.path().join("materialized")),
+        );
+        probe.weak.set(Arc::downgrade(&pooled)).ok();
+
+        // No warm hook: the exemption must cover the whole capture lifetime —
+        // even a big image's snapshot alone can outlast the reconcile debounce.
+        pooled
+            .build_base_snapshot(live_spec("base-capture-exempt"), None)
+            .await
+            .expect("capture");
+
+        let id = probe.created_id.lock().unwrap().expect("create ran");
+        assert_eq!(
+            *probe.marked_mid_capture.lock().unwrap(),
+            Some(true),
+            "capture VM must be is_base_capture (reconcile-exempt) DURING the capture",
+        );
+        assert!(
+            !pooled.is_base_capture(id),
+            "the exemption must be cleared after the capture VM is torn down",
+        );
     }
 
     /// ADR 0045 C2 (E2B fold): hot chunks lead the pull set in fault
