@@ -818,16 +818,8 @@ async fn resolve_selected_skills(
     state: &SharedState,
     names: &[String],
 ) -> Result<Vec<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
-    use engram_core::types::sandbox::AuxRoDrive;
     if names.is_empty() {
         return Ok(Vec::new());
-    }
-    if names.len() > AuxRoDrive::RESERVED_SLOTS {
-        return Err(ApiError::BadRequest(format!(
-            "session requested {} skills but only {} reserved slots exist",
-            names.len(),
-            AuxRoDrive::RESERVED_SLOTS,
-        )));
     }
     let hosts = state
         .services
@@ -847,6 +839,24 @@ async fn resolve_selected_skills(
                 .collect()
         })
         .unwrap_or_default();
+    assign_skill_slots(&catalog, names)
+}
+
+/// Pure half of skill resolution (no I/O): assign each selected skill name to a
+/// reserved slot (dyn_0..) carrying its staged content sha from `catalog`. Caps
+/// at `RESERVED_SLOTS`; an unknown name (absent from the fleet catalog) is a 400.
+fn assign_skill_slots(
+    catalog: &std::collections::HashMap<&str, &str>,
+    names: &[String],
+) -> Result<Vec<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
+    use engram_core::types::sandbox::AuxRoDrive;
+    if names.len() > AuxRoDrive::RESERVED_SLOTS {
+        return Err(ApiError::BadRequest(format!(
+            "session requested {} skills but only {} reserved slots exist",
+            names.len(),
+            AuxRoDrive::RESERVED_SLOTS,
+        )));
+    }
     let mut mounts = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
         let sha = catalog.get(name.as_str()).ok_or_else(|| {
@@ -1567,6 +1577,45 @@ mod tests {
         // Set → honored verbatim, both below and above the default.
         assert_eq!(resolved_memory_mib(&mk(Some(256))), 256);
         assert_eq!(resolved_memory_mib(&mk(Some(8192))), 8192);
+    }
+
+    /// ADR 0055: the pure half of skill resolution assigns each selected name a
+    /// reserved slot (dyn_0..) carrying its staged sha, caps at RESERVED_SLOTS,
+    /// and rejects unknown names. The host-list → catalog half is exercised by
+    /// the e2e stack; this covers the slot-assignment + validation logic.
+    #[test]
+    fn assign_skill_slots_maps_caps_and_rejects() {
+        use engram_core::types::sandbox::AuxRoDrive;
+        let catalog: std::collections::HashMap<&str, &str> =
+            [("skills", "sha_a"), ("playwright", "sha_b")]
+                .into_iter()
+                .collect();
+
+        // Empty selection → empty mounts.
+        assert!(assign_skill_slots(&catalog, &[]).unwrap().is_empty());
+
+        // Two skills → two drives at dyn_0 / dyn_1 with the catalog shas, in
+        // request order.
+        let mounts =
+            assign_skill_slots(&catalog, &["skills".into(), "playwright".into()]).unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(0));
+        assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(0));
+        assert_eq!(mounts[0].fs_type, "squashfs");
+        assert_eq!(mounts[0].sha256.as_deref(), Some("sha_a"));
+        assert_eq!(mounts[1].drive_id, AuxRoDrive::slot_drive_id(1));
+        assert_eq!(mounts[1].sha256.as_deref(), Some("sha_b"));
+
+        // Unknown skill → 400.
+        let err = assign_skill_slots(&catalog, &["nope".into()]).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+
+        // Over the reserved-slot cap → 400 (even if every name is known).
+        let too_many: Vec<String> = (0..AuxRoDrive::RESERVED_SLOTS + 1)
+            .map(|_| "skills".to_string())
+            .collect();
+        let err = assign_skill_slots(&catalog, &too_many).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
     }
 
     /// ADR 0039: the base-restore metadata points the host's memory-chunk
