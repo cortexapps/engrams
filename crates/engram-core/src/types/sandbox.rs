@@ -63,11 +63,11 @@ pub struct SandboxSpec {
     /// non-empty.
     #[serde(default)]
     pub network: NetworkPolicy,
-    /// ADR 0027: extra read-only host-mounted bundles attached as
-    /// virtio-blk drives — the RO-mount skills/browser engine ADR 0023
-    /// deferred. First two consumers: the always-attached `skills`
-    /// bundle (the relocated built-in skill helpers) and the opt-in
-    /// `playwright` bundle (chromium-headless-shell + `@playwright/cli`).
+    /// ADR 0027/0055: read-only host-mounted bundles attached as virtio-blk
+    /// drives — the RO-mount skills engine. ADR 0055 makes these the fixed
+    /// pool of reserved dynamic slots (`dyn-0..dyn-{RESERVED_SLOTS-1}`): each
+    /// carries the sentinel at capture and is `patch_drive`-swapped to a
+    /// per-session selected skill in the paused restore window.
     ///
     /// ADR 0035: entries from the coord are *symbolic* (`sha256 = None`,
     /// "attach whatever generation this host currently stages"); the FC
@@ -83,78 +83,106 @@ pub struct SandboxSpec {
     pub aux_ro_drives: Vec<AuxRoDrive>,
 }
 
-/// A read-only bundle the host attaches to the guest as an additional
-/// virtio-blk drive (ADR 0027). The guest's init shim RO-mounts it at
-/// [`Self::guest_mount`]; agentd then wires whatever skills/tools the
-/// bundle carries into the harness at `SpawnHarness` time.
+/// A read-only mount the host attaches to the guest as an additional
+/// virtio-blk drive (ADR 0027/0055). The guest's init shim RO-mounts it at
+/// [`Self::guest_mount`] and reads the bundle's `mount.json` to learn which
+/// skills/tools to wire; agentd wires them at `SpawnHarness` time.
+///
+/// ADR 0055 (uniform dynamic mounts): a base snapshot reserves a fixed pool
+/// of slots ([`Self::RESERVED_SLOTS`], `dyn-0..dyn-{N-1}`), each carrying the
+/// sentinel until a per-session create swaps the selected skill in via
+/// `patch_drive` in the paused restore window. There is no longer a special
+/// "skills" / "playwright" drive — every mount is one content-addressed skill.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuxRoDrive {
-    /// Firecracker `drive_id` (e.g. `"skills"`, `"playwright"`). Stable
-    /// across snapshot/restore — embedded in `state.bin`. Doubles as the
-    /// bundle name in the staged filename and the blob-storage key space.
+    /// Firecracker `drive_id`. For ADR 0055 dynamic mounts this is the
+    /// reserved slot id (`"dyn-<i>"`, see [`Self::slot_drive_id`]). Stable
+    /// across snapshot/restore — embedded in `state.bin`. The slot is the
+    /// *device* identity; the *content* is carried by [`Self::sha256`].
     pub drive_id: String,
-    /// Fixed guest mount point the init shim mounts the drive at (e.g.
-    /// `/opt/engram/browser`).
+    /// Guest mount point the init shim mounts the drive at. For dynamic slots
+    /// this is the slot-assigned [`Self::slot_guest_mount`]
+    /// (`/opt/engram/dyn/<i>`); the mounted bundle's `mount.json` declares
+    /// what to wire, so the path itself is generic (ADR 0055 §1/§7).
     pub guest_mount: PathBuf,
     /// Filesystem type for the guest mount (`"squashfs"` | `"erofs"`).
     pub fs_type: String,
-    /// ADR 0035: content identity of the attached generation. `None` on
-    /// the symbolic coord→host request ("attach whatever generation this
-    /// host currently stages"); `Some` once the FC backend resolves it at
-    /// capture against the host's staged-bundle stamp. The host path is
-    /// *derived* from `(drive_id, sha256)` via [`Self::staged_path`] — path
-    /// and content can never disagree, which is the whole point: the
-    /// 2026-06-03 incident was a snapshot re-anchoring a fixed path whose
-    /// bytes a host roll had swapped underneath it.
+    /// ADR 0035: content identity of the attached generation. `None` on the
+    /// symbolic coord→host request ("attach whatever this host currently
+    /// stages" — sentinel at capture, the selected skill at per-session
+    /// swap); `Some` once resolved against the host's staged-bundle stamp.
+    /// The host path is *derived* from `sha256` alone via [`Self::staged_path`]
+    /// (ADR 0055: content-keyed, no `drive_id` prefix) — path and content can
+    /// never disagree, which is the whole point: the 2026-06-03 incident was a
+    /// snapshot re-anchoring a fixed path whose bytes a host roll had swapped.
     #[serde(default)]
     pub sha256: Option<String>,
 }
 
 impl AuxRoDrive {
-    /// Fleet-canonical directory where bundle generations are staged
-    /// (`<drive_id>-<sha256>.squashfs`, baked by the FC-host image or
-    /// materialized from BlobStorage on demand). Identical on every host
-    /// so a snapshot-embedded path re-anchors on restore.
+    /// Fleet-canonical directory where mount generations are staged
+    /// (`<sha256>.squashfs`, baked by the FC-host image or materialized from
+    /// BlobStorage on demand). Identical on every host so a snapshot-embedded
+    /// path re-anchors on restore.
     pub const SHARED_DIR: &'static str = "/var/lib/engram/shared";
 
-    /// The bake-time stamp file mapping `drive_id` → sha256 of the
-    /// generation this host image carries. Written by the Packer
-    /// provisioner; read by the FC backend to resolve symbolic drives at
-    /// capture and by the host-agent to report `current_bundles`.
+    /// The bake-time stamp file mapping logical mount name → sha256 of the
+    /// generation this host image carries. Written by the Packer provisioner;
+    /// read by the FC backend to resolve symbolic mounts at capture and by the
+    /// host-agent to report `current_bundles`.
     pub const CURRENT_STAMP: &'static str = "current.json";
 
-    /// The always-attached `skills` bundle: the relocated built-in skill
-    /// helpers (`engram-share` / `engram-pr` / `git-askpass` + SKILL.md).
-    /// Mounted at `/opt/engram/skills`; agentd activates the active subset.
-    pub fn skills() -> Self {
+    /// ADR 0055: number of reserved dynamic-mount slots captured into every
+    /// base snapshot (`dyn-0..dyn-{RESERVED_SLOTS-1}`), one skill per slot.
+    /// Bounded by Firecracker's x86 **virtio-mmio** GSI pool — engrams boots
+    /// `pci=off`, and the legacy interrupt range is `GSI_LEGACY_START=5 ..
+    /// GSI_LEGACY_END=23` (19 lines), minus the baseline virtio devices
+    /// (rootfs, net, vsock). That caps total aux drives around ~13, NOT the
+    /// hundreds a `pci=on` MSI pool would allow — so this is a small, honest
+    /// value, not a stress test. The exact ceiling is pinned by a dev-vm probe
+    /// (attach N drives until boot/capture/restore breaks) before the base
+    /// re-bake; 12 leaves headroom. A profile needing more skills than fit is
+    /// the documented fallback to size-aware packing (ADR 0055 Alternatives).
+    /// Each unused slot carries the sentinel; a per-session create
+    /// `patch_drive`s the selected skill into a slot in the paused restore
+    /// window.
+    pub const RESERVED_SLOTS: usize = 12;
+
+    /// Firecracker `drive_id` for reserved dynamic slot `i` (`"dyn-<i>"`).
+    pub fn slot_drive_id(i: usize) -> String {
+        format!("dyn-{i}")
+    }
+
+    /// Generic guest mount point for reserved dynamic slot `i`
+    /// (`/opt/engram/dyn/<i>`). Slot-assigned rather than skill-declared so
+    /// mounting stays uniform; agentd reads each mount's `mount.json` to learn
+    /// what to wire (ADR 0055 §1/§7).
+    pub fn slot_guest_mount(i: usize) -> PathBuf {
+        PathBuf::from(format!("/opt/engram/dyn/{i}"))
+    }
+
+    /// A symbolic reserved slot for capture: slot `i` at its generic guest
+    /// path, content unresolved (`sha256 = None`) until the FC backend stamps
+    /// the sentinel (capture) or the selected skill (per-session swap).
+    pub fn reserved_slot(i: usize) -> Self {
         Self {
-            drive_id: "skills".into(),
-            guest_mount: PathBuf::from("/opt/engram/skills"),
+            drive_id: Self::slot_drive_id(i),
+            guest_mount: Self::slot_guest_mount(i),
             fs_type: "squashfs".into(),
             sha256: None,
         }
     }
 
-    /// The opt-in `playwright` bundle: chromium-headless-shell + Node +
-    /// `@playwright/cli` + deps. Mounted at `/opt/engram/browser`; agentd
-    /// puts the `playwright-cli` wrapper on PATH + wires the `show-your-work`
-    /// skill when present.
-    pub fn playwright() -> Self {
-        Self {
-            drive_id: "playwright".into(),
-            guest_mount: PathBuf::from("/opt/engram/browser"),
-            fs_type: "squashfs".into(),
-            sha256: None,
-        }
+    /// Staged filename for one mount generation. ADR 0055: keyed by **content**
+    /// (`<sha256>.squashfs`), NOT the slot/`drive_id` — so a skill staged once
+    /// is reused whatever slot a session swaps it into (per-skill dedup at the
+    /// host staging layer; the same blob can't be duplicated per slot).
+    pub fn staged_file_name(sha256: &str) -> String {
+        format!("{sha256}.squashfs")
     }
 
-    /// Staged filename for one bundle generation.
-    pub fn staged_file_name(drive_id: &str, sha256: &str) -> String {
-        format!("{drive_id}-{sha256}.squashfs")
-    }
-
-    /// BlobStorage key for one bundle generation (publish at capture,
-    /// materialize at restore, GC by pin set).
+    /// BlobStorage key for one mount generation (content-addressed; publish at
+    /// registration/capture, materialize at restore, GC by pin set).
     pub fn blob_key(sha256: &str) -> String {
         format!("bundles/sha256/{sha256}")
     }
@@ -162,9 +190,9 @@ impl AuxRoDrive {
     /// Host path of the resolved generation, or `None` while the drive is
     /// still symbolic.
     pub fn staged_path(&self) -> Option<PathBuf> {
-        self.sha256.as_ref().map(|sha| {
-            PathBuf::from(Self::SHARED_DIR).join(Self::staged_file_name(&self.drive_id, sha))
-        })
+        self.sha256
+            .as_ref()
+            .map(|sha| PathBuf::from(Self::SHARED_DIR).join(Self::staged_file_name(sha)))
     }
 }
 
@@ -399,12 +427,12 @@ mod tests {
     #[test]
     fn sandbox_spec_aux_ro_drives_round_trip_bincode_and_json() {
         let spec = spec_with_aux_drives(vec![
-            // Symbolic (coord request) and resolved (recorded manifest)
-            // forms both cross the wire — pin both.
-            AuxRoDrive::skills(),
+            // Symbolic (sentinel reserved slot, coord request) and resolved
+            // (a per-session swapped-in skill) forms both cross the wire — pin both.
+            AuxRoDrive::reserved_slot(0),
             AuxRoDrive {
                 sha256: Some("a".repeat(64)),
-                ..AuxRoDrive::playwright()
+                ..AuxRoDrive::reserved_slot(1)
             },
         ]);
 
