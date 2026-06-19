@@ -67,6 +67,24 @@ options:[{label, description}]}`), and `tool_use_id`, and `permissionDecision`
 accepts `allow|deny|ask|defer`. Render-rich (`FileChanged`) needs none of this —
 it is pure stream observation.
 
+### Follow-up verification (claude 2.1.183 + first-party Agent SDK 0.3.183)
+
+A second probe (claude 2.1.183) plus an audit of Anthropic's own
+`@anthropic-ai/claude-agent-sdk` 0.3.183 type surface pin down the **resume** half
+of the round trip — the part findings #9/#10 only exercised through discrete `-p`
+invocations, not the harness's *persistent streaming* process. This is the seam
+B1 (below) lives on, so it is now load-bearing.
+
+| # | Probe | Result |
+|---|-------|--------|
+| 11 | Defer an AUQ, then write a new `user` message to the **live persistent** streaming process (no `--resume`) | **Re-inference, NOT replay.** The model proposes a *fresh* AUQ with a **new** `tool_use_id` (`toolu_01XQ…` → `toolu_01Am…`); the original deferred call is orphaned. The live process therefore **cannot** answer a deferred tool — the answer is keyed to the original id, which a new turn never reproduces. (A normal `Prompt` arriving while a question is pending does exactly this: it spawns a duplicate question, never an answer.) |
+| 12 | Defer an AUQ, then **streaming-mode** `--resume <sid>` (the harness's *actual* respawn shape — **not** `-p ""`) | **Re-fires the deferred hook on process startup, `tool_use_id`-stable, with no stdin written.** The persisted pending call is re-presented to the hook before any user turn; finding #9 reproduces in streaming mode (so no `-p ""` trick is needed). Caveat: if the hook keeps replying `defer`, claude re-presents in a tight loop (~5×/s) — so a resume is only safe **with the answer already in hand** (always true on the `AnswerQuestion` path). |
+| 13 | Audit the first-party Agent SDK (`@anthropic-ai/claude-agent-sdk` 0.3.183) type surface | Confirms the whole contract on supported surface: `HookPermissionDecision = allow\|deny\|ask\|defer` is **public-typed**; `PreToolUseHookSpecificOutput = {permissionDecision, updatedInput, …}` (our hook-bridge verbatim); `multiSelect` is **per-question**; a deferred tool surfaces on the result message as `deferred_tool_use:{id,name,input}` + `terminal_reason:"tool_deferred"`. **Decisive for the run model:** the SDK's live control protocol has **no verb to continue a deferred tool** (the only running-turn verbs are `interrupt`/`stop_task`), and `canUseTool`'s `PermissionResult` is `allow\|deny` only — it **cannot `defer`**. So the first-party SDK *also* continues a deferred tool only via a fresh `query({resume})` spawn. Our kill→respawn-with-`--resume` is the canonical path, not an engram limitation. |
+
+Net for the cycle below: a deferred AUQ is answerable **only** through a `--resume`
+re-spawn (#12), the live process must **not** be fed (#11), and that is exactly
+what Anthropic's own SDK does (#13).
+
 ### Flavor A — render-rich: `FileChanged`
 
 The adapter recognizes `Write`/`Edit`/`MultiEdit` in the normal stream and, on
@@ -190,41 +208,69 @@ hook fire it decides in one line and the hook exits immediately:
    waits until the harness is ready, then forwards. Answering an idle session *is*
    prompting an idle session — **no new coordinator state, no buffering**.
 3. The harness's `AnswerQuestion` arm — a new arm beside `Prompt` in the `cmd_rx`
-   `select!` (`main.rs:931`) — stashes the answer and re-fires:
+   `select!` (`main.rs:931`) — stashes the answer, then triggers an **intentional
+   re-spawn** of the persisted session. It must **not** write to the live process:
+   feeding the live streaming process a turn re-*infers* a new `tool_use_id`
+   (finding #11) and never answers the deferred call. There is no in-process
+   continuation — not for engram, and not for the first-party SDK (finding #13) —
+   so the only path is to end *this* `claude` and re-enter through the existing
+   death→respawn-with-`--resume` loop (`run_engine`, `main.rs:484`):
 
    ```rust
    Some(HarnessCommand::AnswerQuestion { tool_call_id, answers }) => {
-       answers_in_hand.insert(tool_call_id, answers);   // consumed by the imminent re-fire
-       start_resume_run().await;                          // `claude -p "" --resume` replays the deferred AUQ
+       // answers_in_hand is owned by `run_engine` (it outlives this process — see
+       // below) and borrowed into run_claude_session like `pending`/`seen_prompt_ids`.
+       answers_in_hand.insert(tool_call_id, answers);
+       sigint_child(&child);                   // claude flushes its transcript per-message,
+                                               // so the session stays cleanly --resume-able
+       return SessionOutcome::ResumeForAnswer; // NEW outcome: respawn with --resume, but
+                                               // do NOT trip fast-crash backoff and do NOT
+                                               // emit an abnormal-exit System message
    }
    ```
 
-4. `claude --resume` replays the persisted session, re-hits the deferred AUQ, and
-   **re-fires the hook with the same `tool_use_id` T** (finding #9 — proven
-   id-stable; replay of the persisted pending tool call, no re-inference, no new
-   id). The harness now finds `answers_in_hand[T]` → replies `{verdict:"answer",
-   answers}` + emits `QuestionAnswered{T}`. The hook returns
+   `ResumeForAnswer` is a sibling of `Respawn` so an intentional answer-resume is
+   not counted as a crash (`main.rs:485`) and carries the "I am resuming to answer"
+   intent into the next `run_claude_session`.
+
+4. `run_engine` respawns `claude` in its normal **streaming** shape with `--resume`
+   (`build_claude_argv`, unchanged — **not** a special `-p ""` invocation; finding
+   #12 proves streaming-mode `--resume` re-fires on startup). Because a
+   resume-for-answer is pending, `run_claude_session`'s startup does **not** go
+   `Idle` and does **not** pop a queued prompt — it establishes a **continuation
+   `TurnState`** (fresh `run_id`, `RunStarted` with no `prompt_id`/no user-echo) so
+   the re-fired output is captured rather than dropped by the "line outside any
+   turn" / "result with no in-flight turn" branches (`main.rs:907`, `:892`). claude
+   re-presents the deferred AUQ to the hook on startup, **id-stable** (finding
+   #9/#12). The harness finds `answers_in_hand[T]` → replies `{verdict:"answer",
+   answers}` + emits `QuestionAnswered{T}`; the hook returns
    `{ "hookSpecificOutput": { "permissionDecision": "allow",
    "updatedInput": { questions, answers } } }`; claude synthesizes the `tool_result`
-   and the model continues — the finding-#3/#6 path.
+   and the continuation turn streams normally — the finding-#3/#6 path — closing on
+   a `RunCompleted`. Because the answer is in hand on the **first** re-fire, the
+   defer-loop spin (finding #12) never arms.
 
-The re-fire invocation is `claude -p "" --resume <session>` (empty prompt; finding
-#10). It re-fires the deferred tool with no transcript pollution that engram can
-see: claude substitutes an internal `"Continue from where you left off."` user
-turn, but that lives **only** in claude's private transcript and **never appears in
-the `--output-format stream-json`** the harness observes — the sole `user` event on
-the stream is the deferred tool's `tool_result` (the answer). The harness emits a
-user-echo only on the `Prompt` path, never for `AnswerQuestion`, so the synthetic
-turn is never an engram `session_event` and never renders.
+The harness emits a user-echo only on the `Prompt` path, never for
+`AnswerQuestion`, so no synthetic user turn ever becomes an engram `session_event`.
+(With streaming `--resume` the stream's sole `user` event is the deferred
+`tool_result` itself; the `-p ""` `"Continue from where you left off."` transcript
+quirk of finding #10 does not arise because the harness never uses `-p`.)
 
 **No persistence, no parked state.** The durable "a question is outstanding" record
 is the persisted claude session (it carries the pending tool call) *plus* the
 `UserQuestion` event already in the log — both pre-exist. The coordinator buffers
 nothing; `ensure_active` is the whole resume mechanism, already hardened for
-prompts. The harness's only added state is the ephemeral `answers_in_hand` entry,
-set and consumed within a single resume in one process lifetime. The stable
-`tool_use_id` is the one correlation token across the whole round trip and makes
-re-emitted-question dedup trivial (same id → the UI already has the card).
+prompts. The harness's only added state is the ephemeral `answers_in_hand` entry, owned by
+`run_engine` (which outlives any single `claude` process). It is **set in the live
+process's `AnswerQuestion` arm and consumed by the hook of the *next*, resumed
+process**, so it must survive the respawn — findings #11/#12: the answer can only
+land on the resumed re-fire, never on the live one. The stable `tool_use_id` is the
+one correlation token across the whole round trip and makes re-emitted-question
+dedup trivial (same id → the UI already has the card). (One unhappy-path
+consequence: if the harness *process* itself dies between the stash and the
+re-fire — host roll, OOM — the in-memory answer is lost; the durable
+`UserQuestion` event keeps the card on screen and the user re-answers. The answer
+is not yet on the at-least-once command-replay path; see Consequences.)
 
 **Hook artifact.** Rather than ship a loose script, **re-invoke the harness
 binary as its own hook** — the `--settings` `command` is just
@@ -310,12 +356,18 @@ No new id space; no control `request_id` (the control protocol is not used).
 
 ## Alternatives considered
 
-- **`canUseTool` over the CLI control protocol.** Works (the binary speaks
-  `initialize`/`control_request`/`control_response`/`can_use_tool`/`defer`), and
-  was the original plan. Rejected: it requires reverse-engineering a non-public
-  frame layout and an `initialize` handshake, when a `PreToolUse` hook reaches the
-  identical `updatedInput` answer channel with public, documented surface
-  (finding #3). Hooks are strictly simpler and lower-risk.
+- **`canUseTool` over the CLI control protocol.** Was the original plan. Rejected
+  for two reasons, the second decisive. (1) It requires reverse-engineering a
+  non-public frame layout and an `initialize` handshake, when a `PreToolUse` hook
+  reaches the identical `updatedInput` answer channel with public, documented
+  surface (finding #3). (2) **The control protocol cannot do what we need anyway**
+  (finding #13): in the first-party SDK, `canUseTool`'s `PermissionResult` is
+  `allow|deny` only — it **cannot `defer`** (defer is a `PreToolUse`-hook-only
+  decision) — and the live control connection exposes **no verb to continue a
+  deferred tool** (only `interrupt`/`stop_task`). So even a full control-protocol
+  client would still have to defer via the hook and resume via a re-spawn. The hook
+  + `--resume` path is therefore not a lower-risk shortcut — it is the *same*
+  architecture Anthropic's own Agent SDK uses, minus a protocol we don't need.
 - **Smuggle a diff into `args_summary`** (no wire change) — viable for diffs but
   overloads the field, sniffs JSON shape in the web, and doesn't generalize to a
   semantic event family. Rejected in favor of concrete, named events that match
@@ -337,11 +389,18 @@ No new id space; no control `request_id` (the control protocol is not used).
 - **Older baked images without the hook** simply don't surface questions — Claude
   auto-denies as it does today (graceful; no regression). New wire variants are
   trailing, so a new host decoding an old harness's stream is unaffected.
-- **Answer idempotency:** `AnswerQuestion` rides the at-least-once command path
-  (ADR 0052), so it can be re-delivered. Idempotency is structural: the deferred
-  tool yields exactly **one** `tool_result` — the first re-fire that finds the
-  answer consumes the pending call; a duplicate `AnswerQuestion` triggers at worst
-  a no-op resume (nothing pending to re-fire). No dedup set needed.
+- **Answer delivery & idempotency:** *Idempotency on duplicate delivery is
+  structural and free* — the deferred tool yields exactly **one** `tool_result`, so
+  the first resume that finds the answer consumes the pending call and a duplicate
+  `AnswerQuestion` triggers at worst a no-op resume (nothing pending to re-fire); no
+  dedup set needed. *At-least-once delivery, however, is **not** yet provided:* the
+  host's command-replay buffer today carries only `Prompt` (retired on
+  `confirmed_prompt_id`, `engram-host-agent`), so a dropped `AnswerQuestion` is not
+  auto-redelivered, and the ephemeral `answers_in_hand` does not survive a harness
+  crash. Phase 2 must pick one: add `AnswerQuestion` to that buffer (retired by
+  `QuestionAnswered`), or lean on the durable `UserQuestion` card — a stuck session
+  stays visibly awaiting-input and the user re-answers. The former is preferred
+  (reliability is non-negotiable); called out here so it isn't assumed done.
 - **Echoed result / double-render:** the CLI writes the AUQ `tool_use`/
   `tool_result` into the normal stream; the web dedups it against the
   `UserQuestion`/`QuestionAnswered` it already rendered, keyed by `tool_call_id`.
@@ -355,10 +414,11 @@ No new id space; no control `request_id` (the control protocol is not used).
 
 ## Implementation
 
-The protocol spike is **complete** (pinned against `claude` 2.1.181); its ten
-findings *are* the [Decision](#empirical-findings-claude-21181-this-rests-on)
-above and the socket contract under [Flavor B](#hook--harness-socket-contract),
-so there are no protocol unknowns left to resolve. Two build phases remain — kept
+The protocol spike is **complete** (pinned against `claude` 2.1.181, with a
+follow-up on 2.1.183 + the first-party Agent SDK 0.3.183); its thirteen findings
+*are* the [Decision](#empirical-findings-claude-21181-this-rests-on) above and the
+socket contract under [Flavor B](#hook--harness-socket-contract), so there are no
+protocol unknowns left to resolve. Two build phases remain — kept
 separate because Phase 1 ships value with **no invocation change**, while Phase 2
 changes the run model (always-defer/resume) *and* the safety posture (drops
 `--dangerously-skip-permissions`). One logical change each.
@@ -369,11 +429,13 @@ changes the run model (always-defer/resume) *and* the safety posture (drops
 - **Phase 2 — interactive `AskUserQuestion`.** The `PreToolUse` hook + out-of-band
   socket (`ENGRAM_HOOK_SOCK` injection at `main.rs:754`, bind-before-spawn);
   `UserQuestion`/`AnswerQuestion`/`QuestionAnswered`; the `AnswerQuestion` arm
-  (stash answer + trigger `claude -p "" --resume`, finding #10) beside `Prompt`
-  at `main.rs:931`; web question component; drop `--dangerously-skip-permissions`.
-  The two residual build-out decisions (not unknowns): the concrete `--settings`
-  JSON baked into the guest image, and wiring `engram-harness-claude hook-bridge`
-  as the hook command.
+  (stash answer into the `run_engine`-owned `answers_in_hand`, then `sigint_child`
+  + return the new `SessionOutcome::ResumeForAnswer` — re-using the existing
+  streaming `--resume` respawn, findings #11–13) beside `Prompt` at `main.rs:931`,
+  plus the continuation-`TurnState` startup branch in `run_claude_session`; web
+  question component; drop `--dangerously-skip-permissions`. The residual build-out
+  decisions (not unknowns): the concrete `--settings` JSON baked into the guest
+  image, and wiring `engram-harness-claude hook-bridge` as the hook command.
 
 ### Tests (must run in CI)
 
