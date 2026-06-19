@@ -217,9 +217,10 @@ impl HostClient for LocalHostClient {
         &self,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
+        selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         self.sandbox
-            .restore_base_for_session(metadata, session_env)
+            .restore_base_for_session(metadata, session_env, selected_mounts)
             .await
     }
 

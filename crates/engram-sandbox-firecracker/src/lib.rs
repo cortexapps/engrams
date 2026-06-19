@@ -1016,6 +1016,7 @@ impl FirecrackerBackend {
             &src,
             &manifest,
             /*swap_aux_to_current=*/ false,
+            /*selected_mounts=*/ Vec::new(),
             self.effective_restore_mode(/*fresh=*/ false),
             // Reattach has no coordinator metadata; canonical falls back
             // to the session ref (unshared but correct — rare path).
@@ -1056,6 +1057,7 @@ impl FirecrackerBackend {
         &self,
         metadata: SnapshotMetadata,
         swap_aux_to_current: bool,
+        selected_mounts: Vec<AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         // ADR 0007 Phase 6: backend looks up its own staging dir.
         let src = self.snapshot_dir_for(metadata.id);
@@ -1103,6 +1105,7 @@ impl FirecrackerBackend {
                 &src,
                 &manifest,
                 swap_aux_to_current,
+                selected_mounts,
                 restore_mode,
                 metadata.base_memory_manifest,
             )
@@ -2500,6 +2503,10 @@ impl FirecrackerBackend {
         snapshot_dir: &Path,
         manifest: &FcSnapshotManifest,
         swap_aux_to_current: bool,
+        // ADR 0055: per-session skills the coordinator assigned to reserved
+        // slots (dyn_i + content sha), patch_drived in load-paused. Empty on
+        // resume / reattach.
+        selected_mounts: Vec<AuxRoDrive>,
         // ADR 0022: the effective memory backend for THIS restore
         // (base-create may be File while resume is UFFD). Computed by the
         // caller via `effective_restore_mode` rather than read from
@@ -2602,6 +2609,38 @@ impl FirecrackerBackend {
                         );
                     }
                 }
+            }
+        }
+        // ADR 0055: per-session skill selection. The coordinator assigned each
+        // selected skill to a reserved slot (dyn_i) + content sha; plan a
+        // `patch_drive` over that slot's sentinel and record it on the live spec
+        // so a later eviction snapshot pins the skill (resume re-attaches it).
+        // Only the fresh-create flavor carries selections; resume passes none.
+        for sel in &selected_mounts {
+            let staged = sel.staged_path().ok_or_else(|| {
+                SandboxError::Snapshot(format!(
+                    "ADR 0055 selected skill for slot {} has no content sha",
+                    sel.drive_id,
+                ))
+            })?;
+            if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
+                return Err(SandboxError::Snapshot(format!(
+                    "ADR 0055 selected skill {} for slot {} is not staged on this \
+                     host (catalog materialize gap?) — restore can't proceed",
+                    sel.sha256.as_deref().unwrap_or("?"),
+                    sel.drive_id,
+                )));
+            }
+            // Explicit per-session selection wins over any sentinel→current swap
+            // already planned for this slot.
+            aux_swap_plan.retain(|(id, _)| id != &sel.drive_id);
+            aux_swap_plan.push((sel.drive_id.clone(), staged));
+            if let Some(slot) = live_spec
+                .aux_ro_drives
+                .iter_mut()
+                .find(|d| d.drive_id == sel.drive_id)
+            {
+                slot.sha256 = sel.sha256.clone();
             }
         }
         // ADR 0045 C2: a post-copy destination starts restoring BEFORE
@@ -4162,14 +4201,19 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.restore_with(metadata, /*swap_aux_to_current=*/ false)
+        self.restore_with(metadata, /*swap_aux_to_current=*/ false, Vec::new())
             .await
     }
 
-    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        // ADR 0035 §3: fresh creates track the host's current bundle
-        // generations; the swap happens load-paused inside restore_in_jail.
-        self.restore_with(metadata, /*swap_aux_to_current=*/ true)
+    async fn restore_fresh(
+        &self,
+        metadata: SnapshotMetadata,
+        selected_mounts: Vec<AuxRoDrive>,
+    ) -> Result<SandboxId, SandboxError> {
+        // ADR 0035 §3 + 0055: fresh creates track the host's current bundle
+        // generations AND patch the per-session selected skills into reserved
+        // slots; both swaps happen load-paused inside restore_in_jail.
+        self.restore_with(metadata, /*swap_aux_to_current=*/ true, selected_mounts)
             .await
     }
 

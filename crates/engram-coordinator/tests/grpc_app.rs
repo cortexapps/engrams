@@ -849,6 +849,7 @@ async fn create_session_unknown_image_is_invalid_argument() {
 
     let err = client
         .create_session(app::CreateSessionRequest {
+            mounts: Vec::new(),
             image_uri: "localhost:5001/never-enabled:warm".into(),
             mode: "agent".into(),
             prompt: None,

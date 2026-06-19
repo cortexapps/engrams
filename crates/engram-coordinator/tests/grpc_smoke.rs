@@ -129,6 +129,7 @@ async fn stream_events_smoke() {
 
     // ---- 1. CreateSession ----
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
+        mounts: Vec::new(),
         image_uri: image_uri.clone(),
         mode: String::new(),
         prompt: None,
@@ -269,6 +270,7 @@ async fn session_crud_smoke() {
 
     // ---- 1. CreateSession ----
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
+        mounts: Vec::new(),
         image_uri: image_uri.clone(),
         mode: String::new(),
         prompt: None,
@@ -387,6 +389,7 @@ async fn exec_streaming_smoke() {
     let rpc_timeout = std::time::Duration::from_secs(30);
 
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
+        mounts: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".into(),
         prompt: None,
@@ -506,6 +509,7 @@ async fn snapshot_evict_resume_smoke() {
     let rpc_timeout = std::time::Duration::from_secs(30);
 
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
+        mounts: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".into(),
         prompt: None,
@@ -637,6 +641,7 @@ async fn get_artifact_not_found_smoke() {
     let rpc_timeout = std::time::Duration::from_secs(30);
 
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
+        mounts: Vec::new(),
         image_uri,
         mode: "dev_vm".into(),
         prompt: None,
@@ -709,6 +714,7 @@ async fn shell_relay_smoke() {
     let rpc_timeout = std::time::Duration::from_secs(30);
 
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
+        mounts: Vec::new(),
         image_uri,
         mode: "dev_vm".into(),
         prompt: None,

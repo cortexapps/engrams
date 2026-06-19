@@ -61,6 +61,9 @@ pub(crate) struct BootInputs {
     /// entries.
     pub secret_bundle: engram_core::traits::SecretBundle,
     pub network: engram_core::types::image::NetworkPolicy,
+    /// ADR 0055: per-session skills resolved from the profile + assigned to
+    /// reserved slots (dyn_0..). Patched into the restored VM load-paused.
+    pub selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     pub secret_mode: engram_core::types::image::SecretMode,
     /// Per-request `secrets` overrides to seal into `session_secrets`
     /// once the row exists (so resume rebuilds the harness env). `None`
@@ -122,6 +125,7 @@ pub(crate) async fn boot_on_reserved_host(
         session_env,
         secret_bundle,
         network,
+        selected_mounts,
         secret_mode,
         deferred_session_secrets,
         prompt,
@@ -166,7 +170,7 @@ pub(crate) async fn boot_on_reserved_host(
 
     let sandbox_id = match state
         .host_registry
-        .restore_base_on_host(host_id, metadata, spec_env.clone())
+        .restore_base_on_host(host_id, metadata, spec_env.clone(), selected_mounts)
         .await
     {
         Ok(sb) => sb,

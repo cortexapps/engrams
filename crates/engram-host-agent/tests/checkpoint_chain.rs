@@ -302,7 +302,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // fresh lineage at v2 (v2 = a diff of the v1 fork; a Full would
     // have minted yet another id at v1).
     let fresh_a = pooled
-        .restore_fresh(ckpt3.clone())
+        .restore_fresh(ckpt3.clone(), Vec::new())
         .await
         .expect("fresh restore A");
     // Marker planted BEFORE B exists: File-mode siblings restored from
@@ -314,7 +314,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     // fork — tracked separately, see issue #172.
     let sum4 = plant_marker(&pooled, fresh_a, 4).await;
     let fresh_b = pooled
-        .restore_fresh(ckpt3.clone())
+        .restore_fresh(ckpt3.clone(), Vec::new())
         .await
         .expect("fresh restore B");
     let t = Instant::now();

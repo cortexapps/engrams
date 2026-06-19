@@ -456,6 +456,11 @@ pub struct CreateSessionRequest {
     /// reject overrides.
     #[serde(default)]
     pub secrets: Option<HashMap<String, String>>,
+    /// ADR 0055: per-session skills resolved from the profile, already assigned
+    /// to reserved slots (dyn_0..) by `create_request_from_proto`. Empty for
+    /// non-gRPC / legacy callers.
+    #[serde(default)]
+    pub selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
 }
 
 #[derive(Serialize)]
@@ -755,6 +760,7 @@ pub(crate) async fn prepare_from_grpc(
         req.secrets.clone(),
         SessionId::new(),
         enabled,
+        req.selected_mounts.clone(),
     )
     .await
 }
@@ -797,6 +803,10 @@ pub(crate) async fn prepare_from_row(
         overrides,
         session.id,
         enabled,
+        // ADR 0055 TODO(P1-D): queued sessions don't yet carry dynamic mounts
+        // (they'd need persisting in the queue row); the scanner boots them
+        // with base skills only.
+        Vec::new(),
     )
     .await
 }
@@ -818,6 +828,8 @@ async fn prepare_inner(
     secret_overrides: Option<HashMap<String, String>>,
     session_id: SessionId,
     enabled: engram_core::types::EnabledImage,
+    // ADR 0055: per-session skills, already assigned to reserved slots (dyn_0..).
+    selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
     // ADR 0021 P1.3: a dev-VM session leaves any baked harness undriven,
     // so a prompt is meaningless — reject it explicitly.
@@ -965,6 +977,7 @@ async fn prepare_inner(
             session_env,
             secret_bundle,
             network,
+            selected_mounts,
             secret_mode: manifest.secret_mode,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),
