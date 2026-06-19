@@ -1,11 +1,16 @@
 # ADR 0055: Dynamic per-session directory mounts — profile-selected skills on the RO-bundle engine
 
-Status: 2026-06-19 — **Proposed.** No code yet. Builds on **ADR 0027** (the read-only
-host-mounted shared bundle engine), **ADR 0035** (content-addressed bundle generations +
-the load-paused `patch_drive` swap), and **ADR 0053** (session profiles). This is the
-first concrete instance of the **per-profile capability scoping ADR 0053 §7 explicitly
-deferred to "its own ADR"**, and it realizes the **"dynamic per-session skill/tool
-selection" ADR 0027 deferred**.
+Status: 2026-06-19 — **Proposed (P1 implemented; prod-validation pending before Accepted).**
+Builds on **ADR 0027** (the read-only host-mounted shared bundle engine), **ADR 0035**
+(content-addressed bundle generations + the load-paused `patch_drive` swap), and **ADR
+0053** (session profiles). This is the first concrete instance of the **per-profile
+capability scoping ADR 0053 §7 explicitly deferred to "its own ADR"**, and it realizes the
+**"dynamic per-session skill/tool selection" ADR 0027 deferred**.
+
+> **P1 landed materially differently from the plan below** (N=12 not 64; the catalog is the
+> existing `current_bundles` fleet stamp, not a new `MountCatalogService`; the wire carries
+> skill *names*, not pre-resolved mounts; `[browser]` is fully removed). The design sections
+> are preserved for rationale; **read [§ P1 implementation notes](#p1-implementation-notes-divergences-from-the-plan) for what was actually built.**
 
 ## Context
 
@@ -272,6 +277,68 @@ a per-identity special-case.
   content-address → register in the catalog, **per-user/owner scoped** (ADR 0031
   Principal); upload-path GC. The artifact/pin machinery from P1 carries it; P2 adds the
   upload UX, storage, and authorization. (No composition to extend — a uniform win.)
+
+## P1 implementation notes (divergences from the plan)
+
+P1 shipped across four commits on `feat/adr-0055-p1-dynamic-mount-engine`
+(A: sentinel device model; B: dev-vm device-ceiling probe + pin N; C: per-session
+selection — proto, resolver, `activate()`, remount, init-shim; D: name-resolution +
+orchestrator `profile.skills` + `[browser]` retirement). What landed, and why it differs
+from the design above:
+
+- **N = 12, not 64 — the "stress test 64" hypothesis was *falsified by the device model*,
+  not by per-slot cost.** Prod is FC on x86 with `pci=off`, so aux drives are legacy
+  virtio-**mmio** and each needs a GSI from the legacy pool (`GSI_LEGACY_START=5 ..
+  GSI_LEGACY_END=23` ≈ 19 lines, minus console/rng/vsock/rootfs/etc.) → ~13 aux drives is
+  the hard ceiling; 64 is physically impossible on the production arch. The P1-B probe
+  booted + snapshotted + restored a VM with 12 reserved aux drives on real FC (~21.6s) to
+  pin N=12. The per-slot *latency* question (the original gate) is therefore moot at this N
+  — the ceiling bound first. (drive_id is `dyn_0`, underscore — FC rejects `dyn-0`.)
+
+- **No `MountCatalogService` and no coordinator catalog table.** The catalog *already
+  exists*: every host bakes the `deploy/bundles/*` squashfs and reports a `current.json`
+  name→sha stamp as `HostRecord.current_bundles` in its heartbeat (ADR 0035, for GC). The
+  coordinator's `resolve_selected_skills` reads that via `list_active_hosts` and maps each
+  selected name → staged sha → reserved slot. So P1 adds **zero** new service / table /
+  coordinator migration — a thin function over data that already flows, per "simplify via
+  abstractions." Per-skill pack/publish *at registration* is only needed for user uploads
+  and moves to **P2**; P1's catalog is the admin-baked fleet bundle set.
+
+- **The wire carries skill *names*, not pre-resolved mounts.** `CreateSessionRequest`
+  gained `repeated string selected_skills` (not `repeated DynamicMount mounts`). The
+  orchestrator passes `profile.skills` verbatim and never learns shas; the coordinator owns
+  name→sha→slot resolution. Cleaner trust boundary; `grpc_app/convert.rs` is a pass-through.
+  An unknown name or a selection > `RESERVED_SLOTS` is a create-time 400.
+
+- **`[browser] enabled` is fully removed, and the memory floor with it** (not "keyed off
+  the resolved set" as §Implications speculated). Playwright attachment was already a
+  profile skill after P1-C, leaving the flag's *only* live function the 1 GiB memory floor.
+  But the base snapshot is sized **once per image** and skills bind via `patch_drive`
+  without resizing memory, so memory is purely `suggested_memory_mib` (default 4096 already
+  exceeds the old floor; no in-repo image declared `[browser]` — behaviour-preserving).
+  Browser-capable profiles size their image; per-skill memory metadata + *validate-fit* is
+  a P2 catalog concern. `BrowserConfig` / `browser_enabled()` / `BROWSER_MEMORY_FLOOR_MIB` /
+  the bake-time musl warning are gone.
+
+- **Guest path = `/opt/engram/dyn/<slot>` (open question resolved: generic, slot-assigned).**
+  This forced the bundles to be **position-independent**: the playwright wrapper self-locates
+  its runtime from `$0` (`readlink -f` follows the PATH symlink `activate()` creates) instead
+  of hardcoding `/opt/engram/browser`, and `fonts.conf` uses fontconfig `<dir
+  prefix="relative">`. `activate()` scans `/opt/engram/dyn/*`, skips sentinels, and wires
+  each bundle's `mount.json`-declared skills (gating `requires_env`, askpass → gitconfig).
+  The dev `ProcessBackend` stages bundles at the same `dyn/<i>` paths.
+
+- **Known P1 gap — queued sessions lose their skill selection.** `prepare_from_row` (the
+  scanner boot for a session queued under capacity pressure) passes `Vec::new()` because the
+  selection isn't persisted on the queue row; such sessions boot with base skills only.
+  Resume is unaffected (skills are pinned in the snapshot's `aux_bundles`). Closing the gap
+  needs a session-row `selected_skills` column — deferred, documented at the call site.
+
+- **Memory floor vs fixed base (resolved): validate-fit, never resize.** Because FC can't
+  change `mem_size_mib` on restore, the base capture memory is authoritative. P1 sizes it
+  by `suggested_memory_mib`; P2's catalog can carry a per-skill memory requirement and the
+  resolver can *reject* a selection whose floor exceeds the image (validate-fit), rather than
+  ever resizing the base (which would re-explode the per-combination snapshot count).
 
 ## Consequences / risks
 
