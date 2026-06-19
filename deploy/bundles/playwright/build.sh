@@ -186,6 +186,7 @@ WRAP
 if [[ "${1:-}" == "--stage" ]]; then
     dest="${2:?usage: build.sh --stage <dir>}"
     build_tree "$dest"
+    cp "$here/mount.json" "$dest/"  # ADR 0055: activate() reads this
     echo "staged playwright bundle tree -> $dest"
     exit 0
 fi
@@ -198,6 +199,7 @@ command -v mksquashfs >/dev/null || {
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 build_tree "$tmp"
+cp "$here/mount.json" "$tmp/"  # ADR 0055: activate() reads this
 rm -f "$out"
 mksquashfs "$tmp" "$out" -comp zstd -all-root -noappend -no-xattrs >/dev/null
 sha="$(sha256sum "$out" | cut -d' ' -f1)"

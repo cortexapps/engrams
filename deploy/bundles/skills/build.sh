@@ -18,6 +18,7 @@ stage_tree() {
     local dest="$1"
     mkdir -p "$dest"
     cp -R "$here/bin" "$here/skills" "$dest/"
+    cp "$here/mount.json" "$dest/"  # ADR 0055: activate() reads this
     chmod 0755 "$dest/bin/"*
 }
 

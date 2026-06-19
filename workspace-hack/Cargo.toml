@@ -44,6 +44,7 @@ idna = { version = "1" }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
+memchr = { version = "2" }
 nix = { version = "0.31", default-features = false, features = ["fs", "sched", "signal", "uio"] }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
 once_cell = { version = "1" }
@@ -105,6 +106,7 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 idna = { version = "1" }
 log = { version = "0.4", default-features = false, features = ["std"] }
+memchr = { version = "2" }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
@@ -145,7 +147,6 @@ zeroize = { version = "1" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-memchr = { version = "2" }
 nix = { version = "0.31", features = ["ioctl", "socket"] }
 nom = { version = "7" }
 ring = { version = "0.17", features = ["std"] }
@@ -157,7 +158,6 @@ tower-http = { version = "0.6", default-features = false, features = ["follow-re
 bitflags = { version = "2", default-features = false, features = ["std"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-memchr = { version = "2" }
 nom = { version = "7" }
 ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
@@ -166,7 +166,6 @@ rustix = { version = "1", features = ["fs"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-memchr = { version = "2" }
 nix = { version = "0.31", features = ["ioctl", "socket"] }
 nom = { version = "7" }
 ring = { version = "0.17", features = ["std"] }
@@ -178,7 +177,6 @@ tower-http = { version = "0.6", default-features = false, features = ["follow-re
 bitflags = { version = "2", default-features = false, features = ["std"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-memchr = { version = "2" }
 nom = { version = "7" }
 ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
