@@ -1,5 +1,5 @@
 import type { ThreadMessageLike } from "@assistant-ui/react";
-import type { AgentRole, IndexedEvent, SessionState } from "../../lib/types";
+import type { AgentRole, IndexedEvent, SessionState, UserQuestion } from "../../lib/types";
 
 // Session statuses that mean "no turn is in flight" — the authoritative
 // signal that overrides the event stream. A session evicted/terminated
@@ -73,6 +73,18 @@ export type SystemMarker =
       at: string;
     }
   | { kind: "note"; role: AgentRole; at: string }
+  // ADR 0054: the agent asked a clarifying question via `AskUserQuestion`
+  // (deferred by the harness). Rendered as an INTERACTIVE card — a form
+  // while unanswered, a read-only receipt once answered. `answers` is folded
+  // in from the matching `question_answered` event (keyed by `tool_call_id`)
+  // so a full rebuild shows the resolved state; null while still awaiting.
+  | {
+      kind: "user_question";
+      toolCallId: string;
+      questions: UserQuestion[];
+      answers: Record<string, string[]> | null;
+      at: string;
+    }
   // ADR 0028 A.log: a rung-1 recovery rewound the live transcript to a
   // checkpoint. The boundary itself is live; the rolled-back events above
   // it render greyed (see `rewound` tagging below). Outside-world side
@@ -202,11 +214,26 @@ export function buildMessages(
 
   // Is a run in flight (run_started seen, no run_completed/_interrupted yet)?
   let runOpen = false;
+  // `out.length` when the current run opened — bounds the search for "this
+  // run's assistant message" so the run receipt attaches to the right bubble
+  // even when a trailing harness marker (e.g. a deferred question) broke the
+  // active turn before run_completed.
+  let runStartLen = 0;
 
   // Per-run tally feeding the assistant-message footer.
   let tally: { reads: number; edits: number; ran: number; other: number } | null = null;
   const bump = (k: "reads" | "edits" | "ran" | "other") => {
     if (tally) tally[k] += 1;
+  };
+
+  // The most recent assistant draft created during the current run (since
+  // `runStartLen`), or null if this run produced none — used to attach the run
+  // receipt without synthesizing an empty bubble.
+  const runAssistant = (): Draft | null => {
+    for (let i = out.length - 1; i >= runStartLen; i--) {
+      if (out[i]!.role === "assistant") return out[i]!;
+    }
+    return null;
   };
 
   const ensureAssistant = (at?: string): Draft => {
@@ -242,6 +269,21 @@ export function buildMessages(
     d.metadata = { custom: { ...(d.metadata?.custom ?? {}), rewound: true } };
   };
 
+  // ADR 0054: AskUserQuestion is observed TWICE on the wire — as a generic
+  // `tool_call_started` (the harness translates every `tool_use` block) AND
+  // as the dedicated `user_question`/`question_answered` pair. Pre-scan so we
+  // can (a) suppress the generic tool part for those tool_call_ids — the
+  // interactive card is the canonical render — and (b) fold the answer onto
+  // the card even though it arrives in a LATER run (the deferred tool re-fires
+  // on `--resume`, so `question_answered` lands after a fresh run_started).
+  const questionToolCallIds = new Set<string>();
+  const answersByToolCallId = new Map<string, Record<string, string[]>>();
+  for (const { event } of events) {
+    if (event.type === "user_question") questionToolCallIds.add(event.tool_call_id);
+    else if (event.type === "question_answered")
+      answersByToolCallId.set(event.tool_call_id, event.answers);
+  }
+
   for (const indexed of events) {
     const { idx, event: ev } = indexed;
     const lenBefore = out.length;
@@ -250,6 +292,7 @@ export function buildMessages(
         tally = { reads: 0, edits: 0, ran: 0, other: 0 };
         runOpen = true;
         active = null;
+        runStartLen = out.length;
         // Most harnesses carry the prompt on a preceding user agent_message
         // (our claude harness sends a null prompt_summary). When a summary
         // IS present, surface it as the user turn.
@@ -304,6 +347,10 @@ export function buildMessages(
       }
 
       case "tool_call_started": {
+        // ADR 0054: the AskUserQuestion call renders as the interactive
+        // `user_question` card, not a generic tool part — drop the duplicate
+        // (and don't tally it as a tool run).
+        if (ev.tool_name === "AskUserQuestion" || questionToolCallIds.has(ev.tool_call_id)) break;
         bump(classifyTool(ev.tool_name));
         const a = ensureAssistant(ev.at);
         const part: ToolPart = {
@@ -319,6 +366,10 @@ export function buildMessages(
       }
 
       case "tool_call_completed": {
+        // ADR 0054: the answered AskUserQuestion's tool_result (it re-fired on
+        // resume) — its outcome is the card, not a tool part. `tool_name` is
+        // blank on completed events, so match on the pre-scanned id set.
+        if (questionToolCallIds.has(ev.tool_call_id)) break;
         const part = openTools.get(ev.tool_call_id);
         if (part) {
           part.result = ev.result_summary ?? undefined;
@@ -389,11 +440,17 @@ export function buildMessages(
           interrupted,
           endAt: ev.at,
         };
-        const a = ensureAssistant(ev.at);
-        a.status = ok
-          ? { type: "complete", reason: "stop" }
-          : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
-        a.metadata = { custom: { ...(a.metadata?.custom ?? {}), run: footer } };
+        // Attach the receipt to THIS run's assistant. When a deferred question
+        // (or other trailing marker) ended the turn, `active` is null and the
+        // run may have no assistant bubble at all — don't synthesize an empty
+        // one just to hold a footer (it would render as a stray ✗ receipt).
+        const a = active ?? runAssistant();
+        if (a) {
+          a.status = ok
+            ? { type: "complete", reason: "stop" }
+            : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
+          a.metadata = { custom: { ...(a.metadata?.custom ?? {}), run: footer } };
+        }
         active = null;
         runOpen = false;
         tally = null;
@@ -456,6 +513,25 @@ export function buildMessages(
 
       case "harness_idle":
         active = null;
+        break;
+
+      // ADR 0054: the interactive question card. Ends the active assistant
+      // turn (the run deferred here) and renders below the agent's reasoning.
+      // The answer (if it has landed, in a later run) is folded in from the
+      // pre-scanned map so a full rebuild shows the resolved card.
+      case "user_question":
+        pushSystem(`uq:${idx}`, "the agent asked a question", {
+          kind: "user_question",
+          toolCallId: ev.tool_call_id,
+          questions: ev.questions,
+          answers: answersByToolCallId.get(ev.tool_call_id) ?? null,
+          at: ev.at,
+        });
+        break;
+
+      // ADR 0054: folded onto its `user_question` card (above) via the
+      // pre-scan — no standalone render.
+      case "question_answered":
         break;
 
       // ADR 0052: the harness-owned queue, reflected up. A mid-turn prompt is

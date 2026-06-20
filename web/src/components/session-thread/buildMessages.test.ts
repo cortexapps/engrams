@@ -5,7 +5,7 @@
 
 import { describe, expect, test } from "vitest";
 import { buildMessages, SHELL_TOOL, type RunFooter, type SystemMarker } from "./buildMessages";
-import type { IndexedEvent, SessionEvent } from "../../lib/types";
+import type { IndexedEvent, SessionEvent, UserQuestion } from "../../lib/types";
 
 const AT = "2026-06-02T12:00:00.000Z";
 const AT2 = "2026-06-02T12:00:18.000Z";
@@ -638,5 +638,194 @@ describe("buildMessages — Phase 1c live token streaming", () => {
       .map((p) => (p as { text: string }).text);
     expect(textParts).toContain("block one");
     expect(textParts).toContain("block two streaming");
+  });
+});
+
+describe("buildMessages — ADR 0054 interactive AskUserQuestion", () => {
+  const Q: UserQuestion = {
+    question: "Which database?",
+    header: "Database",
+    multiSelect: false,
+    options: [
+      { label: "Postgres", description: "Relational, default" },
+      { label: "MySQL", description: "Also relational" },
+    ],
+  };
+
+  const toolParts = (messages: ReturnType<typeof buildMessages>["messages"]) =>
+    real(messages).flatMap((m) =>
+      ((m.content as ReadonlyArray<{ type: string }>) ?? []).filter((p) => p.type === "tool-call"),
+    ) as Array<{ toolName?: string; toolCallId?: string }>;
+
+  test("a deferred question becomes a user_question system card (unanswered)", () => {
+    const { messages, isRunning } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "I need to confirm a detail",
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "AskUserQuestion",
+          args_summary: '{"questions":[]}',
+          at: AT,
+        },
+        { type: "user_question", run_id: "r1", tool_call_id: "t1", questions: [Q], at: AT },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
+    expect(card.role).toBe("system");
+    const marker = customMarker(card) as Extract<SystemMarker, { kind: "user_question" }>;
+    expect(marker).toMatchObject({ kind: "user_question", toolCallId: "t1", answers: null });
+    expect(marker.questions).toEqual([Q]);
+    // Awaiting input is NOT "working" — the composer must not show a spinner.
+    expect(isRunning).toBe(false);
+  });
+
+  test("the generic AskUserQuestion tool part is suppressed (deduped against the card)", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "thinking",
+          at: AT,
+        },
+        // A real tool call in the same run must still render…
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tr",
+          tool_name: "Read",
+          args_summary: '{"file_path":"a.rs"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tr",
+          tool_name: "Read",
+          ok: true,
+          duration_ms: 3,
+          result_summary: "ok",
+          at: AT,
+        },
+        // …but the AskUserQuestion tool call must NOT.
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "AskUserQuestion",
+          args_summary: '{"questions":[]}',
+          at: AT,
+        },
+        { type: "user_question", run_id: "r1", tool_call_id: "t1", questions: [Q], at: AT },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const parts = toolParts(messages);
+    expect(parts.some((p) => p.toolName === "AskUserQuestion")).toBe(false);
+    expect(parts.some((p) => p.toolCallId === "t1")).toBe(false);
+    // The real Read call survives.
+    expect(parts.some((p) => p.toolName === "Read")).toBe(true);
+    // The question isn't tallied as a tool run (only the Read is).
+    const footer = real(messages).find((m) => m.role === "assistant")!.metadata?.custom
+      ?.run as RunFooter;
+    expect(footer).toMatchObject({ reads: 1, other: 0, ok: false });
+  });
+
+  test("a run that ONLY deferred a question leaves no stray empty assistant bubble", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "AskUserQuestion",
+          args_summary: null,
+          at: AT,
+        },
+        { type: "user_question", run_id: "r1", tool_call_id: "t1", questions: [Q], at: AT },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const msgs = real(messages);
+    // No empty assistant message synthesized just to hold a footer.
+    expect(msgs.filter((m) => m.role === "assistant")).toHaveLength(0);
+    expect(msgs.filter((m) => customMarker(m)?.kind === "user_question")).toHaveLength(1);
+  });
+
+  test("the answer (arriving in a later resume run) folds onto the card and suppresses its tool_result", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "AskUserQuestion",
+          args_summary: null,
+          at: AT,
+        },
+        { type: "user_question", run_id: "r1", tool_call_id: "t1", questions: [Q], at: AT },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+        // The deferred tool re-fires on `--resume` in a fresh run; its
+        // tool_result + the QuestionAnswered land here.
+        { type: "run_started", run_id: "r2", prompt_summary: null, at: AT2 },
+        {
+          type: "tool_call_completed",
+          run_id: "r2",
+          tool_call_id: "t1",
+          tool_name: "",
+          ok: true,
+          duration_ms: 0,
+          result_summary: "Postgres",
+          at: AT2,
+        },
+        {
+          type: "question_answered",
+          run_id: "r2",
+          tool_call_id: "t1",
+          answers: { "Which database?": ["Postgres"] },
+          at: AT2,
+        },
+        {
+          type: "agent_message",
+          run_id: "r2",
+          message_id: "a2",
+          role: "assistant",
+          text: "Great — using Postgres.",
+          at: AT2,
+        },
+        { type: "run_completed", run_id: "r2", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
+    const marker = customMarker(card) as Extract<SystemMarker, { kind: "user_question" }>;
+    expect(marker.answers).toEqual({ "Which database?": ["Postgres"] });
+    // The re-fired tool_result for the question is NOT rendered as a tool part.
+    expect(toolParts(messages).some((p) => p.toolCallId === "t1")).toBe(false);
+    // The resume run's own assistant reply still renders.
+    expect(real(messages).some((m) => m.role === "assistant")).toBe(true);
   });
 });

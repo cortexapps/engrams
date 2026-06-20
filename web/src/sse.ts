@@ -77,6 +77,9 @@ export function subscribeSession(sessionId: string, handlers: SseHandlers, since
     "pull_request_opened",
     "file_shared",
     "recovered_from_checkpoint",
+    // ADR 0054: interactive AskUserQuestion round-trip.
+    "user_question",
+    "question_answered",
   ];
 
   for (const kind of kinds) {

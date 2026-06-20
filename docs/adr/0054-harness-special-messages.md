@@ -5,9 +5,11 @@ landed backend-first: `0541be9c` (proto wire types) · `39127d87`
 (harness hook-bridge + socket + `ResumeForAnswer` + continuation turn) ·
 `e68639ee` (host-agent `answer_question` + at-least-once replay) · `30b67f45`
 (coordinator answer ingress + question event passthrough) · `89144922`
-(orchestrator passthrough + regenerated stubs). Deferred to follow-on
-branches: Phase 1 (`FileChanged`/`DiffToolPart`) and the web interactive
-question component.
+(orchestrator passthrough + regenerated stubs). The **web interactive
+question component** then landed in a follow-on branch (this change): the
+`user_question`/`question_answered` SSE event types, the dedup-and-render in
+`buildMessages`, and the `UserQuestionCard` answer form. Still deferred to a
+follow-on branch: Phase 1 (`FileChanged`/`DiffToolPart`).
 
 ## Context
 
@@ -372,9 +374,22 @@ No new id space; no control `request_id` (the control protocol is not used).
   JSONB payload → **no migration**); `AnswerQuestion` rides the existing command
   channel and the existing `ensure_active` resume-on-deliver path (`api/prompt.rs`)
   — no new state, no buffering.
-- **web** — `DiffToolPart` (red/green for `edit`, all-green for `write`) and an
-  interactive question component whose answer routes
+- **web** (interactive question component — this branch) — `user_question`/
+  `question_answered` added to the `SessionEvent` union + the per-kind SSE
+  listeners (the orchestrator relay is kind-agnostic, so no relay change).
+  `buildMessages` renders `user_question` as a `UserQuestionCard` in the system
+  ("harness register") lane and **dedups** the generic `AskUserQuestion` tool
+  part by `tool_call_id` (the harness emits both); the answer — which arrives in
+  the *later* `--resume` run — is folded back onto the card via a pre-scan, and
+  the card is the only render of that `tool_call_id` (no stray tool part, no
+  empty assistant bubble for a question-only run). `UserQuestionCard` is a form
+  (single-select = radios, multi-select = toggles) whose submit POSTs
+  `SessionService.AnswerQuestion` (answers keyed by **question text**, values =
+  selected option labels wrapped in `StringList`) and flips to an optimistic
+  receipt until `question_answered` confirms. Routes
   web → orchestrator → coordinator → host → harness.
+- **web** (Phase 1, deferred) — `DiffToolPart` (red/green for `edit`,
+  all-green for `write`).
 
 ## Alternatives considered
 

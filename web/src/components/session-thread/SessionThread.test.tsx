@@ -5,7 +5,10 @@
 
 import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "../../test-utils";
+import { SessionService } from "../../gen/engram/app/v1/session_pb";
 import { SessionThread } from "./SessionThread";
 import type { IndexedEvent, SessionEvent } from "../../lib/types";
 
@@ -142,5 +145,87 @@ describe("SessionThread", () => {
       />,
     );
     await waitFor(() => expect(screen.getByText(/read 1/)).toBeTruthy());
+  });
+
+  // ADR 0054: the interactive AskUserQuestion card — the deferred question
+  // renders a form; submitting POSTs answers keyed by question text (StringList
+  // values) and flips to an optimistic receipt.
+  test("a deferred question renders an interactive card; submitting POSTs the answer", async () => {
+    let captured: {
+      sessionId: string;
+      toolCallId: string;
+      answers: Record<string, string[]>;
+    } | null = null;
+    const transport = createRouterTransport((router) => {
+      router.service(SessionService, {
+        answerQuestion: (req) => {
+          captured = {
+            sessionId: req.sessionId,
+            toolCallId: req.toolCallId,
+            answers: Object.fromEntries(Object.entries(req.answers).map(([k, v]) => [k, v.values])),
+          };
+          return { sessionId: req.sessionId, note: "ok" };
+        },
+      });
+    });
+
+    const user = userEvent.setup();
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+          {
+            type: "tool_call_started",
+            run_id: "r1",
+            tool_call_id: "t1",
+            tool_name: "AskUserQuestion",
+            args_summary: null,
+            at: AT,
+          },
+          {
+            type: "user_question",
+            run_id: "r1",
+            tool_call_id: "t1",
+            questions: [
+              {
+                question: "Which database?",
+                header: "Database",
+                multiSelect: false,
+                options: [
+                  { label: "Postgres", description: "Relational, default" },
+                  { label: "MySQL", description: "Also relational" },
+                ],
+              },
+            ],
+            at: AT,
+          },
+          { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+        ])}
+      />,
+      { transport },
+    );
+
+    await waitFor(() => expect(screen.getByText("Which database?")).toBeTruthy());
+    // The generic AskUserQuestion tool part is suppressed — only the card shows.
+    expect(screen.queryByText("AskUserQuestion")).toBeNull();
+
+    // Submit is gated until a selection is made.
+    const submit = screen.getByRole("button", { name: "Submit answer" });
+    expect((submit as HTMLButtonElement).disabled).toBe(true);
+
+    await user.click(screen.getByText("Postgres"));
+    expect((submit as HTMLButtonElement).disabled).toBe(false);
+    await user.click(submit);
+
+    await waitFor(() => expect(captured).not.toBeNull());
+    expect(captured!).toEqual({
+      sessionId: "s1",
+      toolCallId: "t1",
+      answers: { "Which database?": ["Postgres"] },
+    });
+    // Optimistic receipt: the form is replaced while the answer round-trips.
+    await waitFor(() => expect(screen.getByText("saving…")).toBeTruthy());
   });
 });

@@ -17,6 +17,7 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 import { API_BASE } from "../../lib/base";
 import { fmtBytes, hms } from "../transcriptFmt";
 import type { SystemMarker } from "./buildMessages";
+import { UserQuestionCard } from "./UserQuestionCard";
 
 // The "harness register": non-message timeline events (durability markers,
 // opened PRs, shared artifacts, system notes) carried as system messages.
@@ -42,6 +43,8 @@ export function SystemMessage() {
       return <Artifact marker={marker} />;
     case "recovery":
       return <Recovery marker={marker} />;
+    case "user_question":
+      return <UserQuestionCard marker={marker} />;
     case "note":
       return <Note text={fallback} />;
   }

@@ -256,6 +256,8 @@ export type {
   IndexedEvent,
   SessionEvent,
   SessionEventKind,
+  UserQuestion,
+  UserQuestionOption,
 } from "../events";
 
 // ADR 0028 A.log: one checkpoint in a session's chain.
