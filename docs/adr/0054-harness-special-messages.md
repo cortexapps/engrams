@@ -1,6 +1,13 @@
 # ADR 0054: Harness special messages — rich file-change rendering and interactive `AskUserQuestion`
 
-Status: 2026-06-18 — **Proposed**.
+Status: 2026-06-20 — **Accepted**. Phase 2 (interactive `AskUserQuestion`)
+landed backend-first: `0541be9c` (proto wire types) · `39127d87`
+(harness hook-bridge + socket + `ResumeForAnswer` + continuation turn) ·
+`e68639ee` (host-agent `answer_question` + at-least-once replay) · `30b67f45`
+(coordinator answer ingress + question event passthrough) · `89144922`
+(orchestrator passthrough + regenerated stubs). Deferred to follow-on
+branches: Phase 1 (`FileChanged`/`DiffToolPart`) and the web interactive
+question component.
 
 ## Context
 
@@ -147,9 +154,10 @@ spawning claude, then adds one line to the existing `.env(...)` chain at
 claude inherits it; the hook inherits it from claude (**verified** against 2.1.181
 — a `PreToolUse` hook logged `ENGRAM_HOOK_SOCK` set on the `claude` parent).
 The hook reads `ENGRAM_HOOK_SOCK` to find the socket — so the path is dynamic
-per-session while the **hook artifact and `--settings` file stay static and
-baked into the image**. Binding before spawn means the socket always exists
-before any hook can fire (no startup race).
+per-session while the **hook artifact stays baked into the image** (the harness
+binary itself) and the **`--settings` file is generated at startup** from that
+binary's own path (see Hook artifact). Binding before spawn means the socket
+always exists before any hook can fire (no startup race).
 
 **Accept loop, no parking.** The listener accepts concurrently and replies to each
 hook in **one line**, after which the hook exits — connections are never held
@@ -278,14 +286,24 @@ binary as its own hook** — the `--settings` `command` is just
 *server* (normal mode) runs the transient hook *client* under this subcommand,
 selected by `argv` (the `git`/`busybox` pattern). Three reasons over a loose
 script: (1) **one artifact** — the harness is already baked into the guest, so
-there is nothing extra to bake/version/sync and the `--settings` stays static;
-(2) **no extra guest runtime** — a `.js` hook needs node, a `.sh` hook needs a
-shell + `jq`, the Rust binary needs nothing; (3) **no protocol drift** — client
-and server share the same serde types (`Question`/`Answers`/NDJSON framing)
-compiled once, so they can never be a version apart. Socket path arrives via
-`ENGRAM_HOOK_SOCK` (finding #7), keeping the artifact static and the path
-per-session. (The research spike used `node …/auq_hook.js`; the contract above
-is language-agnostic.)
+there is nothing extra to bake/version/sync; (2) **no extra guest runtime** — a
+`.js` hook needs node, a `.sh` hook needs a shell + `jq`, the Rust binary needs
+nothing; (3) **no protocol drift** — client and server share the same serde
+types (`Question`/`Answers`/NDJSON framing) compiled once, so they can never be
+a version apart. Socket path arrives via `ENGRAM_HOOK_SOCK` (finding #7). (The
+research spike used `node …/auq_hook.js`; the contract above is
+language-agnostic.)
+
+**The `--settings` file is *written at startup*, not baked** (a refinement of
+the original "baked + static" plan, landed in implementation). The hook
+`command` must be the **absolute path of this binary** + `hook-bridge`, and
+that path is *not* fixed — `resolve_claude_bin` shows the harness can live at a
+pack sibling, `$ENGRAM_CLAUDE_BIN`, or a bare `$PATH` name across the FC / VZ /
+Process backends. So `run_engine` generates the `--settings` JSON at startup
+from `std::env::current_exe()` — one source of truth (the running binary's own
+path), correct on every backend, with nothing extra to bake/version/sync. The
+binary *is* the one baked artifact; deriving the settings from it is strictly
+simpler than baking a second file that would hardcode a path wrong in dev.
 
 ### Wire surface (all trailing; `wire_golden` regen, graceful degrade)
 
@@ -295,8 +313,12 @@ is language-agnostic.)
 `HarnessCommand` (down): `AnswerQuestion { tool_call_id, answers: Answers }`.
 
 These are **append-only**: bincode keys enum variants by source position, so the
-three events append after `AgentMessageChunk` (indices 11–13) and the command
-after `DequeueQueued` (index 7) — never interleaved. Each also needs a `kind()`
+events append after `AgentMessageChunk` and the command after `DequeueQueued` —
+never interleaved. **Indices follow landing order** (Phase 2 shipped before
+Phase 1): `UserQuestion` = event 11, `QuestionAnswered` = event 12,
+`AnswerQuestion` = command 7. `FileChanged` takes event 13 whenever Phase 1
+lands (a clean trailing append — no placeholder variant reserved). Each also
+needs a `kind()`
 string (e.g. `"file_changed"`, `"user_question"`, `"question_answered"`) and the
 `UserQuestion`/`QuestionAnswered`/`FileChanged` arms wired into `tool_call_id()`.
 `engram-harness-proto/tests/wire_golden.rs` pins both the bytes and the `u32`
@@ -393,14 +415,15 @@ No new id space; no control `request_id` (the control protocol is not used).
   structural and free* — the deferred tool yields exactly **one** `tool_result`, so
   the first resume that finds the answer consumes the pending call and a duplicate
   `AnswerQuestion` triggers at worst a no-op resume (nothing pending to re-fire); no
-  dedup set needed. *At-least-once delivery, however, is **not** yet provided:* the
-  host's command-replay buffer today carries only `Prompt` (retired on
-  `confirmed_prompt_id`, `engram-host-agent`), so a dropped `AnswerQuestion` is not
-  auto-redelivered, and the ephemeral `answers_in_hand` does not survive a harness
-  crash. Phase 2 must pick one: add `AnswerQuestion` to that buffer (retired by
-  `QuestionAnswered`), or lean on the durable `UserQuestion` card — a stuck session
-  stays visibly awaiting-input and the user re-answers. The former is preferred
-  (reliability is non-negotiable); called out here so it isn't assumed done.
+  dedup set needed. *At-least-once delivery* is now also **provided** (the
+  preferred option — reliability is non-negotiable): the host's command-replay
+  buffer gained an `undelivered_answers` set alongside `undelivered_prompts`
+  (`engram-host-agent`), recorded on `answer_question` and retired on
+  `QuestionAnswered{tool_call_id}`, so a dropped `AnswerQuestion` is re-delivered
+  on the next reattach. The ephemeral `answers_in_hand` still doesn't survive a
+  *harness-process* crash between stash and re-fire, but the replay buffer
+  re-sends the answer (which re-stashes it) and the durable `UserQuestion` card
+  keeps the question on screen as the final backstop.
 - **Echoed result / double-render:** the CLI writes the AUQ `tool_use`/
   `tool_result` into the normal stream; the web dedups it against the
   `UserQuestion`/`QuestionAnswered` it already rendered, keyed by `tool_call_id`.
@@ -432,10 +455,13 @@ changes the run model (always-defer/resume) *and* the safety posture (drops
   (stash answer into the `run_engine`-owned `answers_in_hand`, then `sigint_child`
   + return the new `SessionOutcome::ResumeForAnswer` — re-using the existing
   streaming `--resume` respawn, findings #11–13) beside `Prompt` at `main.rs:931`,
-  plus the continuation-`TurnState` startup branch in `run_claude_session`; web
-  question component; drop `--dangerously-skip-permissions`. The residual build-out
-  decisions (not unknowns): the concrete `--settings` JSON baked into the guest
-  image, and wiring `engram-harness-claude hook-bridge` as the hook command.
+  plus the continuation-`TurnState` startup branch in `run_claude_session`; the
+  host-agent `answer_question` + `undelivered_answers` replay; the coordinator
+  answer ingress + `UserQuestion`/`QuestionAnswered` event passthrough; the
+  orchestrator passthrough; drop `--dangerously-skip-permissions`. The `--settings`
+  JSON is **generated at startup** from `current_exe()` (see Hook artifact), not
+  baked. Landed backend-first; the **web question component is a follow-on branch**
+  (so the echoed-AUQ dedup and the interactive card are not yet shipped).
 
 ### Tests (must run in CI)
 
