@@ -70,19 +70,21 @@ fi
 
 file "$OUT/vmlinux" | grep -q "ELF 64-bit" || { echo "kernel is not an ELF binary:" >&2; file "$OUT/vmlinux" >&2; exit 1; }
 
-# ── RO session bundles (ADR 0027) ───────────────────────────────────────────
-# The skills + playwright squashfs bundles + the current.json stamp
-# (drive_id -> sha256). The host-agent reads these from /var/lib/engram/shared
-# to attach aux RO drives ([git] -> skills, [browser] -> playwright); the
-# engram-host-fleet init container copies them out of this image. Pull the
-# published OCI artifacts (the publish-bundles job) at :main so a node-assets
-# bake always carries the current fleet bundles. Needs `oras` + GHCR auth.
+# ── RO session bundles (ADR 0027 → 0055) ────────────────────────────────────
+# The sentinel + skills + playwright squashfs bundles + the current.json stamp
+# (logical name -> sha256). The host-agent reads these from
+# /var/lib/engram/shared at startup; the engram-host-fleet init container copies
+# them out of this image. ADR 0055: skills are profile-selected per session — the
+# coord resolves a session's selected_skills names against this stamp and
+# patch_drives each into a reserved dyn-* slot. Pull the published OCI artifacts
+# (the publish-bundles job) at :main so a node-assets bake always carries the
+# current fleet bundles. Needs `oras` + GHCR auth.
 BUNDLE_REPO="${ENGRAM_BUNDLE_REPO:-ghcr.io/cortexapps/engrams}"
 BUNDLE_TAG="${ENGRAM_BUNDLE_TAG:-main}"
 BUNDLES_OUT="$OUT/bundles"
 mkdir -p "$BUNDLES_OUT"
 
-stage_bundle() {  # stage_bundle <drive_id>; echoes the staged sha256 on stdout
+stage_bundle() {  # stage_bundle <name>; echoes the staged sha256 on stdout
   local name="$1"
   echo "==> bundle ${name} (${BUNDLE_REPO}/bundle-${name}:${BUNDLE_TAG})" >&2
   ( cd "$tmp" && rm -f "${name}.squashfs" \
@@ -90,14 +92,21 @@ stage_bundle() {  # stage_bundle <drive_id>; echoes the staged sha256 on stdout
   [ -f "$tmp/${name}.squashfs" ] || { echo "oras pull yielded no ${name}.squashfs" >&2; return 1; }
   local sha
   sha="$(sha256sum "$tmp/${name}.squashfs" | awk '{print $1}')"
-  install -m0644 "$tmp/${name}.squashfs" "$BUNDLES_OUT/${name}-${sha}.squashfs"
+  # ADR 0055: content-keyed filename (<sha>.squashfs), matching
+  # AuxRoDrive::staged_file_name — NOT a <name>- prefix, so a skill staged once
+  # dedups across whatever reserved slot it lands in.
+  install -m0644 "$tmp/${name}.squashfs" "$BUNDLES_OUT/${sha}.squashfs"
   echo "$sha"
 }
 
+# ADR 0055: `sentinel` is MANDATORY — base-snapshot capture resolves every
+# reserved dyn-* slot to its sha, so a fleet without it can't capture any base.
+sentinel_sha="$(stage_bundle sentinel)"
 skills_sha="$(stage_bundle skills)"
 playwright_sha="$(stage_bundle playwright)"
-# Stamp: drive_id -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
-printf '{"skills":"%s","playwright":"%s"}\n' "$skills_sha" "$playwright_sha" \
+# Stamp: logical name -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
+printf '{"sentinel":"%s","skills":"%s","playwright":"%s"}\n' \
+  "$sentinel_sha" "$skills_sha" "$playwright_sha" \
   > "$BUNDLES_OUT/current.json"
 
 echo "==> staged into ${OUT}:"
