@@ -14,29 +14,14 @@ use engram_harness_proto::AgentRole;
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
 
-/// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`). Holds the
-/// SAME hardened auto-resume + mid-move HOLD logic as the axum `prompt`
-/// handler; only the I/O shape changed (request fields → params,
-/// `Json<PromptResponse>` → the `&'static str` note).
-pub(crate) async fn send_prompt_core(
+/// Shared delivery preamble for prompts and answers: auto-resume an
+/// Idle/evicted session, HOLD through an in-flight move, and resolve the
+/// live sandbox. Both a prompt and an answer drive an idle session back to
+/// life, so both need the identical hardened sequence.
+async fn ensure_active_and_resolve(
     state: &SharedState,
     id: SessionId,
-    prompt_id: String,
-    text: String,
-) -> Result<&'static str, ApiError> {
-    if text.is_empty() {
-        return Err(ApiError::BadRequest("`text` is required".into()));
-    }
-    // Phase 1b: the client (web) mints `prompt_id` so it can correlate its
-    // optimistic bubble with the server echo + `RunStarted{prompt_id}`
-    // (this is what dedupes the double-render). Mint one if a non-web
-    // caller left it empty, so the wire is always uniform.
-    let prompt_id = if prompt_id.is_empty() {
-        uuid::Uuid::new_v4().to_string()
-    } else {
-        prompt_id
-    };
-
+) -> Result<engram_core::SandboxId, ApiError> {
     // Auto-resume Idle sessions via the FC snapshot path. Dead
     // sessions surface 410 Gone here (ensure_active → resume_session
     // → ApiError::Gone for missing snapshots). Active sessions are a
@@ -44,10 +29,10 @@ pub(crate) async fn send_prompt_core(
     crate::api::snapshot::ensure_active(state, id).await?;
 
     // HOLD delivery while the session is mid-move/mid-resume.
-    // Forwarding into the freeze window writes the prompt into a
-    // frozen sandbox's vsock buffer, which the move's commit then
-    // destroys with the source: the message vanishes and the UI hangs
-    // "working…" (prod session 284d72e3).
+    // Forwarding into the freeze window writes into a frozen sandbox's
+    // vsock buffer, which the move's commit then destroys with the source:
+    // the message vanishes and the UI hangs "working…" (prod session
+    // 284d72e3).
     //
     // The hold condition is `lease held AND status != Active` — NOT
     // the lease alone. ADR 0045 C2's finalize task holds the lease
@@ -96,11 +81,11 @@ pub(crate) async fn send_prompt_core(
         tracing::info!(
             session_id = %id,
             held_ms = hold_start.elapsed().as_millis() as u64,
-            "prompt held during an in-flight session move, delivering now",
+            "delivery held during an in-flight session move, delivering now",
         );
     }
 
-    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
+    state.resolve_sandbox(id).await.ok_or_else(|| {
         // After ensure_active, an Active session must have a sandbox
         // bound. If not, we hit a state we don't have a clean
         // affordance for — surface a 409.
@@ -109,7 +94,35 @@ pub(crate) async fn send_prompt_core(
              try `engram session resume <id>` and retry"
                 .into(),
         )
-    })?;
+    })
+}
+
+/// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`). Holds the
+/// SAME hardened auto-resume + mid-move HOLD logic as the axum `prompt`
+/// handler; only the I/O shape changed (request fields → params,
+/// `Json<PromptResponse>` → the `&'static str` note).
+pub(crate) async fn send_prompt_core(
+    state: &SharedState,
+    id: SessionId,
+    prompt_id: String,
+    text: String,
+) -> Result<&'static str, ApiError> {
+    if text.is_empty() {
+        return Err(ApiError::BadRequest("`text` is required".into()));
+    }
+    // Phase 1b: the client (web) mints `prompt_id` so it can correlate its
+    // optimistic bubble with the server echo + `RunStarted{prompt_id}`
+    // (this is what dedupes the double-render). Mint one if a non-web
+    // caller left it empty, so the wire is always uniform.
+    let prompt_id = if prompt_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        prompt_id
+    };
+
+    // Auto-resume (Idle → FC snapshot), HOLD through any in-flight move,
+    // and resolve the live sandbox. Shared verbatim with `answer_question_core`.
+    let sandbox_id = ensure_active_and_resolve(state, id).await?;
 
     let prompt_text = text;
     state
@@ -148,6 +161,34 @@ pub(crate) async fn send_prompt_core(
     }
 
     Ok("prompt forwarded")
+}
+
+/// ADR 0054: transport-agnostic answer core (gRPC `AnswerQuestion`).
+/// Answering a deferred `UserQuestion` resumes the session exactly as a
+/// prompt does — so it reuses the identical auto-resume + HOLD + resolve
+/// preamble — then forwards `HarnessCommand::AnswerQuestion`. Unlike a
+/// prompt it emits **no user-echo**: the harness's own `QuestionAnswered`
+/// event is the durable "answered" record, and a synthetic user turn would
+/// pollute the transcript. Idempotent end to end (the deferred tool yields
+/// exactly one tool_result), so a duplicate answer is at worst a no-op
+/// resume.
+pub(crate) async fn answer_question_core(
+    state: &SharedState,
+    id: SessionId,
+    tool_call_id: String,
+    answers: engram_harness_proto::Answers,
+) -> Result<&'static str, ApiError> {
+    if tool_call_id.is_empty() {
+        return Err(ApiError::BadRequest("`tool_call_id` is required".into()));
+    }
+    let sandbox_id = ensure_active_and_resolve(state, id).await?;
+    state
+        .services
+        .host
+        .answer_question(sandbox_id, tool_call_id, answers)
+        .await
+        .map_err(|e| ApiError::Internal(format!("forward answer to harness: {e}")))?;
+    Ok("answer forwarded")
 }
 
 /// Phase 1b: edit a still-queued type-ahead prompt by its `prompt_id`,

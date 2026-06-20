@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_core::types::{ExecRusage, SessionState};
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
-use engram_harness_proto::HarnessEvent;
+use engram_harness_proto::{Answers, HarnessEvent, Question};
 use engram_host_agent::harness::{EventSink, HarnessHub};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -170,6 +170,27 @@ pub enum SessionEvent {
         chunk: String,
         at: DateTime<Utc>,
     },
+    /// ADR 0054: the agent called `AskUserQuestion` and the harness
+    /// deferred it — the durable "awaiting input" signal. The web renders
+    /// an interactive card and marks the session awaiting-input; it
+    /// survives eviction because it's in the log. `tool_call_id` correlates
+    /// defer → answer; the answer rides `AnswerQuestion` →
+    /// `HarnessQuestionAnswered` with the same id.
+    HarnessUserQuestion {
+        run_id: String,
+        tool_call_id: String,
+        questions: Vec<Question>,
+        at: DateTime<Utc>,
+    },
+    /// ADR 0054: the deferred question was answered — the harness holds the
+    /// answer and is feeding it back to the agent on the `--resume`
+    /// re-fire. Resolves the card and moves it out of awaiting-input.
+    HarnessQuestionAnswered {
+        run_id: String,
+        tool_call_id: String,
+        answers: Answers,
+        at: DateTime<Utc>,
+    },
     /// ADR 0023: the agent opened a change request (PR/MR) via the
     /// in-session forge seam. Surfaces the title + URL to the web UI /
     /// SSE subscribers so the session's output artifact is visible (the
@@ -272,6 +293,8 @@ impl SessionEvent {
             Self::HarnessPromptEdited { .. } => "prompt_edited",
             Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
             Self::HarnessAgentMessageChunk { .. } => "agent_message_chunk",
+            Self::HarnessUserQuestion { .. } => "user_question",
+            Self::HarnessQuestionAnswered { .. } => "question_answered",
             Self::PullRequestOpened { .. } => "pull_request_opened",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
@@ -362,6 +385,26 @@ impl SessionEvent {
                 run_id,
                 message_id,
                 chunk,
+                at,
+            },
+            HarnessEvent::UserQuestion {
+                run_id,
+                tool_call_id,
+                questions,
+            } => Self::HarnessUserQuestion {
+                run_id,
+                tool_call_id,
+                questions,
+                at,
+            },
+            HarnessEvent::QuestionAnswered {
+                run_id,
+                tool_call_id,
+                answers,
+            } => Self::HarnessQuestionAnswered {
+                run_id,
+                tool_call_id,
+                answers,
                 at,
             },
         }
@@ -828,6 +871,51 @@ pub(crate) mod tests {
             other => panic!("expected HarnessRunInterrupted, got {other:?}"),
         }
         assert_eq!(ev.kind(), "run_interrupted");
+    }
+
+    #[test]
+    fn user_question_and_answer_map_from_harness_with_stable_kinds() {
+        // ADR 0054: the interactive question/answer harness events map to
+        // coord SessionEvents under the stable `user_question` /
+        // `question_answered` kinds the SSE stream + web card key on.
+        let q = SessionEvent::from_harness(
+            HarnessEvent::UserQuestion {
+                run_id: "r1".into(),
+                tool_call_id: "toolu_1".into(),
+                questions: vec![],
+            },
+            chrono::Utc::now(),
+        );
+        match &q {
+            SessionEvent::HarnessUserQuestion { tool_call_id, .. } => {
+                assert_eq!(tool_call_id, "toolu_1")
+            }
+            other => panic!("expected HarnessUserQuestion, got {other:?}"),
+        }
+        assert_eq!(q.kind(), "user_question");
+
+        let mut answers = Answers::new();
+        answers.insert("Q?".into(), vec!["A".into()]);
+        let a = SessionEvent::from_harness(
+            HarnessEvent::QuestionAnswered {
+                run_id: "r1".into(),
+                tool_call_id: "toolu_1".into(),
+                answers,
+            },
+            chrono::Utc::now(),
+        );
+        match &a {
+            SessionEvent::HarnessQuestionAnswered {
+                tool_call_id,
+                answers,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "toolu_1");
+                assert_eq!(answers.get("Q?"), Some(&vec!["A".to_string()]));
+            }
+            other => panic!("expected HarnessQuestionAnswered, got {other:?}"),
+        }
+        assert_eq!(a.kind(), "question_answered");
     }
 
     #[test]

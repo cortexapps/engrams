@@ -309,6 +309,23 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0054: deliver a user's answer to a deferred AskUserQuestion to
+    /// the attached harness for `sandbox_id` (which stashes it and re-fires
+    /// the deferred tool via `--resume`). `answers` is keyed by question
+    /// text, each value the selected labels (1 for single-select, N for
+    /// multi-select) — the `BTreeMap` form of `engram_harness_proto::Answers`
+    /// (spelled out here to keep `engram-core` free of a harness-proto
+    /// dependency cycle). Default is a no-op for harness-less fakes; the
+    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
+    async fn answer_question(
+        &self,
+        _sandbox_id: SandboxId,
+        _tool_call_id: String,
+        _answers: std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     /// ADR 0030: operator interrupt — stop the in-flight run on the
     /// attached harness for `sandbox_id` while keeping the session
     /// alive. The harness SIGINTs its current child and returns to Idle;
