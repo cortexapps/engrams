@@ -2654,48 +2654,45 @@ mod adapter {
             assert_eq!(out["S?"], serde_json::json!("z"), "single → bare string");
         }
 
-        /// A fake claude for the answer-resume cycle. First invocation blocks
-        /// on stdin (we SIGINT it via `AnswerQuestion`); the second (marker
-        /// present) emits a continuation turn's output WITHOUT reading stdin
-        /// — simulating the deferred AUQ re-firing on `--resume` startup —
-        /// then blocks so it doesn't EOF-respawn.
-        async fn write_answer_resume_fake_claude() -> (String, String) {
+        /// A fake claude for the answer-resume cycle. On EVERY invocation it
+        /// emits one turn's output (assistant text + `result`) WITHOUT
+        /// reading stdin, then blocks so it doesn't EOF-respawn. Crucially
+        /// it is identical across invocations — the HARNESS state, not the
+        /// fake, decides the output's fate, so there is no test-side race:
+        /// on the first (idle) spawn there is no in-flight turn, so the
+        /// output is dropped and only the startup `Idle` surfaces; after
+        /// `AnswerQuestion` triggers the `--resume` respawn, the continuation
+        /// `TurnState` captures the same output. (An earlier marker-file
+        /// design raced the SIGINT — if the child was killed before it wrote
+        /// the marker, the resumed invocation emitted nothing and the test
+        /// hung. Making the fake stateless removes the race entirely.)
+        async fn write_answer_resume_fake_claude() -> String {
             use std::os::unix::fs::PermissionsExt;
-            let id = uuid::Uuid::new_v4();
-            let path = std::env::temp_dir().join(format!("fake-claude-{id}.sh"));
-            let marker = std::env::temp_dir().join(format!("fake-claude-marker-{id}"));
-            let body = format!(
-                "#!/bin/sh\n\
-                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\n\
-                 if [ -f '{m}' ]; then\n\
-                 printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m2\",\"content\":[{{\"type\":\"text\",\"text\":\"resumed\"}}]}}}}'\n\
-                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}'\n\
-                 while IFS= read -r _l; do :; done\n\
-                 else\n\
-                 touch '{m}'\n\
-                 while IFS= read -r _l; do :; done\n\
-                 fi\n",
-                m = marker.display()
-            );
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let body = "#!/bin/sh\n\
+                printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n\
+                printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"content\":[{\"type\":\"text\",\"text\":\"resumed\"}]}}'\n\
+                printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                while IFS= read -r _l; do :; done\n";
             tokio::fs::write(&path, body).await.unwrap();
             let mut perms = std::fs::metadata(&path).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&path, perms).unwrap();
-            (
-                path.to_string_lossy().into_owned(),
-                marker.to_string_lossy().into_owned(),
-            )
+            path.to_string_lossy().into_owned()
         }
 
         // Engine mechanics: an `AnswerQuestion` to an idle session stashes
         // the answer, SIGINTs claude, and respawns with `--resume` into a
         // CONTINUATION turn — `RunStarted` with NO prompt_id (no user-echo)
-        // — that captures the re-fired output. Drives the in-memory
+        // — that captures the re-fired output. The first (idle) spawn's
+        // identical output is dropped (no in-flight turn), so the only event
+        // before the answer is the startup `Idle`. Drives the in-memory
         // `answers_in_hand`; independent of the real hook socket, which the
         // test env may not be able to bind (graceful degradation).
         #[tokio::test]
         async fn answer_question_resumes_into_continuation_turn() {
-            let (script, marker) = write_answer_resume_fake_claude().await;
+            let script = write_answer_resume_fake_claude().await;
             let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
             let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
             let reattach = Arc::new(Notify::new());
@@ -2736,7 +2733,6 @@ mod adapter {
                 .expect("engine should exit on shutdown")
                 .expect("engine task should not panic");
             let _ = tokio::fs::remove_file(&script).await;
-            let _ = tokio::fs::remove_file(&marker).await;
         }
     }
 }
