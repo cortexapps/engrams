@@ -32,6 +32,8 @@
 //! length prefix + bincode body. Reusing the shape keeps the agent
 //! image small (one codec).
 
+use std::collections::BTreeMap;
+
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -92,6 +94,57 @@ pub enum HarnessFrame {
     Event(HarnessEvent),
     Command(HarnessCommand),
 }
+
+// ---- Interactive questions (ADR 0054 Flavor B) -------------------------
+//
+// A harness-agnostic mirror of an agent's "ask the user a question" tool
+// (Claude's `AskUserQuestion`). The harness recognizes such a tool, emits
+// a [`HarnessEvent::UserQuestion`] the UI renders as an interactive card,
+// and feeds the user's selection back via [`HarnessCommand::AnswerQuestion`]
+// → [`HarnessEvent::QuestionAnswered`]. No per-agent decoder downstream:
+// consumers read these structured fields, not agent bytes.
+
+/// One question in an interactive prompt. Mirrors the AUQ tool schema:
+/// one tool call can carry several of these (answered as one map, keyed
+/// by `question` text — ADR 0054 finding #8).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Question {
+    /// The full question text shown to the user. Also the **key** into the
+    /// [`Answers`] map (a single tool call's questions have distinct text).
+    pub question: String,
+    /// Short chip/tag label (≤ ~12 chars), presentational only.
+    pub header: String,
+    /// Single- vs multi-select lives HERE, on the question — never on the
+    /// answer. The hook-bridge uses it to denormalize an answer back into
+    /// the CLI's `updatedInput.answers` shape (bare string vs array, ADR
+    /// 0054 finding #6). `#[serde(rename)]` keeps the JSON byte-faithful to
+    /// Claude's `tool_input.questions[].multiSelect` so the bridge can
+    /// deserialize the hook payload straight into this type.
+    #[serde(rename = "multiSelect")]
+    pub multi_select: bool,
+    /// The selectable options.
+    pub options: Vec<QuestionOption>,
+}
+
+/// One selectable answer to a [`Question`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuestionOption {
+    /// The value selected and echoed back in the [`Answers`] map.
+    pub label: String,
+    /// Longer explanation of what choosing this option means.
+    pub description: String,
+}
+
+/// The user's selections for a [`HarnessEvent::UserQuestion`], keyed by
+/// each question's `question` text. The value is **always** the list of
+/// selected labels — a 1-element vec for single-select, N for multi-select
+/// (the arity is recovered from the paired [`Question::multi_select`], so
+/// the answer never needs to encode it). A uniform `Vec<String>` is
+/// mandatory because this rides the **bincode** wire, which is positional
+/// and *not* self-describing: a `#[serde(untagged)]` `One|Many` enum has
+/// no `deserialize_any` and would **panic at decode**. `wire_golden`
+/// pins a mixed-arity sample to keep that regression loud.
+pub type Answers = BTreeMap<String, Vec<String>>;
 
 /// Events the harness emits as the agent inside it does work. The
 /// host forwards each into `session_events`; consumers (Slack bot,
@@ -227,6 +280,37 @@ pub enum HarnessEvent {
         message_id: String,
         chunk: String,
     },
+    // ── ADR 0054 Flavor B: interactive AskUserQuestion. APPENDED after
+    //    `AgentMessageChunk` so existing bincode variant indices never
+    //    shift (… AgentMessageChunk=10, UserQuestion=11,
+    //    QuestionAnswered=12) — see tests/wire_golden.rs.
+    /// The agent is asking the user one or more questions and the harness
+    /// has **deferred** the call (the turn ends cleanly so the VM can
+    /// idle-evict; ADR 0054). This is the durable "awaiting input" signal:
+    /// the UI renders an interactive card and marks the session
+    /// awaiting-input, and it survives eviction because it is in the
+    /// session event log. `tool_call_id` (= Claude's `tool_use_id`) is the
+    /// single correlation token across defer → answer → resume; a
+    /// re-emitted question with the same id is the same card (dedup is
+    /// trivially by id). The answer comes back as
+    /// [`HarnessCommand::AnswerQuestion`] carrying this `tool_call_id`.
+    UserQuestion {
+        run_id: String,
+        tool_call_id: String,
+        questions: Vec<Question>,
+    },
+    /// The deferred [`UserQuestion`] `tool_call_id` has been answered — the
+    /// harness holds the answer and is feeding it back to the agent (on the
+    /// `--resume` re-fire). Emitted alongside the hook's `answer` verdict.
+    /// Carries the canonical [`Answers`] so the UI can render the resolved
+    /// selection and move the card out of awaiting-input. Also the
+    /// **delivery confirmation** that retires a buffered `AnswerQuestion`
+    /// command on the host (at-least-once delivery).
+    QuestionAnswered {
+        run_id: String,
+        tool_call_id: String,
+        answers: Answers,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -258,6 +342,8 @@ impl HarnessEvent {
             Self::PromptEdited { .. } => "prompt_edited",
             Self::PromptDequeued { .. } => "prompt_dequeued",
             Self::AgentMessageChunk { .. } => "agent_message_chunk",
+            Self::UserQuestion { .. } => "user_question",
+            Self::QuestionAnswered { .. } => "question_answered",
             Self::Idle => "harness_idle",
         }
     }
@@ -268,7 +354,9 @@ impl HarnessEvent {
     pub fn tool_call_id(&self) -> Option<&str> {
         match self {
             Self::ToolCallStarted { tool_call_id, .. }
-            | Self::ToolCallCompleted { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            | Self::ToolCallCompleted { tool_call_id, .. }
+            | Self::UserQuestion { tool_call_id, .. }
+            | Self::QuestionAnswered { tool_call_id, .. } => Some(tool_call_id.as_str()),
             _ => None,
         }
     }
@@ -329,6 +417,24 @@ pub enum HarnessCommand {
     /// cancelled it. No-op if already consumed. Emits
     /// `HarnessEvent::PromptDequeued` on success.
     DequeueQueued { prompt_id: String },
+    // ── ADR 0054 Flavor B: answer an interactive question. APPENDED after
+    //    `DequeueQueued` so existing variant indices (Checkpoint=0 …
+    //    DequeueQueued=6, AnswerQuestion=7) never shift — see wire_golden.rs.
+    /// The user's answer to a deferred [`HarnessEvent::UserQuestion`],
+    /// keyed by its `tool_call_id`. Delivered by the **same path as a
+    /// `Prompt`** (coordinator `ensure_active` resumes an idle/evicted
+    /// session, then forwards): answering an idle session *is* prompting an
+    /// idle session. The harness stashes the answer and triggers an
+    /// intentional `claude --resume` re-spawn so the deferred tool re-fires
+    /// `tool_use_id`-stable and is answered (ADR 0054 findings #9/#11/#12) —
+    /// it must NOT feed the live process, which would re-infer a new id and
+    /// never answer the deferred call. Idempotent: the deferred tool yields
+    /// exactly one `tool_result`, so a duplicate `AnswerQuestion` is at
+    /// worst a no-op resume.
+    AnswerQuestion {
+        tool_call_id: String,
+        answers: Answers,
+    },
 }
 
 /// Why the host is asking for a checkpoint. Logged in `session_events`
@@ -637,6 +743,60 @@ mod tests {
             run_id: "r1".into(),
         }));
         round_trip(HarnessFrame::Event(HarnessEvent::Idle));
+        round_trip(HarnessFrame::Event(HarnessEvent::UserQuestion {
+            run_id: "r1".into(),
+            tool_call_id: "toolu_1".into(),
+            questions: sample_questions(),
+        }));
+        round_trip(HarnessFrame::Event(HarnessEvent::QuestionAnswered {
+            run_id: "r1".into(),
+            tool_call_id: "toolu_1".into(),
+            answers: sample_answers(),
+        }));
+    }
+
+    /// Two questions in one call (one multi-select, one single) — the
+    /// finding-#8 shape — to exercise the `Question`/`QuestionOption` wire.
+    fn sample_questions() -> Vec<Question> {
+        vec![
+            Question {
+                question: "Which languages?".into(),
+                header: "Languages".into(),
+                multi_select: true,
+                options: vec![
+                    QuestionOption {
+                        label: "Python".into(),
+                        description: "snek".into(),
+                    },
+                    QuestionOption {
+                        label: "Rust".into(),
+                        description: "crab".into(),
+                    },
+                ],
+            },
+            Question {
+                question: "Which editor?".into(),
+                header: "Editor".into(),
+                multi_select: false,
+                options: vec![QuestionOption {
+                    label: "VS Code".into(),
+                    description: "the one".into(),
+                }],
+            },
+        ]
+    }
+
+    /// A **mixed-arity** answer map: a multi-element vec AND a 1-element
+    /// vec in the same map. The uniform `Vec<String>` shape must survive
+    /// bincode (an untagged `One|Many` enum would panic at decode).
+    fn sample_answers() -> Answers {
+        let mut m = Answers::new();
+        m.insert(
+            "Which languages?".into(),
+            vec!["Python".into(), "Rust".into()],
+        );
+        m.insert("Which editor?".into(), vec!["VS Code".into()]);
+        m
     }
 
     #[test]
@@ -663,6 +823,10 @@ mod tests {
         }));
         round_trip(HarnessFrame::Command(HarnessCommand::Interrupt));
         round_trip(HarnessFrame::Command(HarnessCommand::Rehandshake));
+        round_trip(HarnessFrame::Command(HarnessCommand::AnswerQuestion {
+            tool_call_id: "toolu_1".into(),
+            answers: sample_answers(),
+        }));
     }
 
     #[test]
@@ -834,6 +998,24 @@ mod tests {
             "prompt_dequeued"
         );
         assert_eq!(HarnessEvent::Idle.kind(), "harness_idle");
+        assert_eq!(
+            HarnessEvent::UserQuestion {
+                run_id: "x".into(),
+                tool_call_id: "t".into(),
+                questions: vec![],
+            }
+            .kind(),
+            "user_question"
+        );
+        assert_eq!(
+            HarnessEvent::QuestionAnswered {
+                run_id: "x".into(),
+                tool_call_id: "t".into(),
+                answers: Answers::new(),
+            }
+            .kind(),
+            "question_answered"
+        );
     }
 
     #[test]
@@ -855,6 +1037,24 @@ mod tests {
                 tool_call_id: id.into(),
                 tool_name: "Read".into(),
                 args_summary: None,
+            }
+            .tool_call_id(),
+            Some(id)
+        );
+        assert_eq!(
+            HarnessEvent::UserQuestion {
+                run_id: "x".into(),
+                tool_call_id: id.into(),
+                questions: vec![],
+            }
+            .tool_call_id(),
+            Some(id)
+        );
+        assert_eq!(
+            HarnessEvent::QuestionAnswered {
+                run_id: "x".into(),
+                tool_call_id: id.into(),
+                answers: Answers::new(),
             }
             .tool_call_id(),
             Some(id)
