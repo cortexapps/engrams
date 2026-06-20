@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{
-    read_msg, write_msg, CheckpointReason, HarnessAttach, HarnessAttachAck, HarnessCommand,
-    HarnessEvent, HarnessFrame,
+    read_msg, write_msg, Answers, CheckpointReason, HarnessAttach, HarnessAttachAck,
+    HarnessCommand, HarnessEvent, HarnessFrame,
 };
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -190,6 +190,16 @@ struct HubInner {
     /// (record/clear/replay each take it alone), so it's outside the
     /// `last_event_at → last_idle_at → connections` order (issue #217).
     undelivered_prompts: Mutex<HashMap<SandboxId, Vec<UndeliveredPrompt>>>,
+    /// ADR 0054: per-sandbox interactive answers forwarded but not yet
+    /// confirmed (no `QuestionAnswered{tool_call_id}` seen). The exact
+    /// `undelivered_prompts` story for answers: an `AnswerQuestion` buffered
+    /// into a connection that then bounces (the answer triggers a resume
+    /// from idle — precisely when a bounce is likely) would otherwise be
+    /// lost, leaving the question forever awaiting-input. Replayed on every
+    /// (re)attach, retired by `QuestionAnswered`; the harness's resume is
+    /// idempotent (the deferred tool yields one tool_result), so re-delivery
+    /// is a no-op. **Leaf lock**, like `undelivered_prompts`.
+    undelivered_answers: Mutex<HashMap<SandboxId, Vec<UndeliveredAnswer>>>,
 }
 
 /// A prompt forwarded to the harness but not yet confirmed received.
@@ -197,6 +207,14 @@ struct HubInner {
 struct UndeliveredPrompt {
     prompt_id: String,
     text: String,
+}
+
+/// An interactive answer forwarded to the harness but not yet confirmed
+/// (no `QuestionAnswered` for its `tool_call_id` yet). ADR 0054.
+#[derive(Clone)]
+struct UndeliveredAnswer {
+    tool_call_id: String,
+    answers: Answers,
 }
 
 struct ConnectionHandle {
@@ -247,6 +265,7 @@ impl HarnessHub {
                 shell_attached: Mutex::new(HashMap::new()),
                 eviction_inflight: Mutex::new(HashMap::new()),
                 undelivered_prompts: Mutex::new(HashMap::new()),
+                undelivered_answers: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(0),
             }),
         }
@@ -328,6 +347,8 @@ impl HarnessHub {
         // to a replacement anyway).
         if let Some(sandbox_id) = sandbox_id {
             self.inner.undelivered_prompts.lock().remove(&sandbox_id);
+            // ADR 0054: same reasoning for un-confirmed answers.
+            self.inner.undelivered_answers.lock().remove(&sandbox_id);
         }
     }
 
@@ -490,6 +511,42 @@ impl HarnessHub {
         Ok(())
     }
 
+    /// Acquire the connection's command sender, briefly retrying for the
+    /// post-resume attach race (see `send_prompt`'s call site), and clear
+    /// `last_idle_at` so the soft idle-TTL doesn't fire while the adapter
+    /// boots. Shared by `send_prompt` and `answer_question` — both deliver
+    /// work that resumes an idle session and must survive the same race.
+    async fn acquire_cmd_tx_waiting(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<mpsc::Sender<HarnessFrame>, HarnessError> {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(SEND_PROMPT_ATTACH_WAIT_SECS);
+        loop {
+            // Clone `cmd_tx` out into an owned Option so the `connections`
+            // guard is fully released before we touch `last_idle_at`.
+            // Holding `connections` across the `last_idle_at.lock()` would
+            // invert the canonical lock order (see HubInner docs) versus
+            // `idle_sandboxes`, which takes last_idle_at → connections — a
+            // classic ABBA deadlock under the prompt/eviction-tick race
+            // (issue #217). Never nest these two locks.
+            let cmd_tx_opt = self
+                .inner
+                .connections
+                .lock()
+                .get(&sandbox_id)
+                .map(|h| h.cmd_tx.clone());
+            if let Some(cmd_tx) = cmd_tx_opt {
+                self.inner.last_idle_at.lock().remove(&sandbox_id);
+                return Ok(cmd_tx);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(HarnessError::NotAttached);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Push a prompt to the running adapter. Adapter starts a
     /// fresh run (or queues if a run is in flight). Atomically
     /// clears `last_idle_at` so the soft idle-eviction TTL doesn't
@@ -514,34 +571,7 @@ impl HarnessHub {
         // Without a wait here, the user's prompt that triggered the
         // resume races the handshake and bounces with NotAttached
         // even though the system is healthy.
-        let cmd_tx = {
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_secs(SEND_PROMPT_ATTACH_WAIT_SECS);
-            loop {
-                // Clone `cmd_tx` out into an owned Option so the
-                // `connections` guard is fully released before we touch
-                // `last_idle_at`. Holding `connections` across the
-                // `last_idle_at.lock()` would invert the canonical lock
-                // order (see HubInner docs) versus `idle_sandboxes`,
-                // which takes last_idle_at → connections — a classic
-                // ABBA deadlock under the prompt/eviction-tick race
-                // (issue #217). Never nest these two locks.
-                let cmd_tx_opt = self
-                    .inner
-                    .connections
-                    .lock()
-                    .get(&sandbox_id)
-                    .map(|h| h.cmd_tx.clone());
-                if let Some(cmd_tx) = cmd_tx_opt {
-                    self.inner.last_idle_at.lock().remove(&sandbox_id);
-                    break cmd_tx;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(HarnessError::NotAttached);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        };
+        let cmd_tx = self.acquire_cmd_tx_waiting(sandbox_id).await?;
         // ADR 0052: remember this prompt as un-confirmed until the harness
         // emits a RunStarted/PromptQueued/… for it. If the connection we're
         // about to write to bounces before the harness processes the frame,
@@ -609,6 +639,39 @@ impl HarnessHub {
     ) -> Result<(), HarnessError> {
         self.send_queue_command(sandbox_id, HarnessCommand::DequeueQueued { prompt_id })
             .await
+    }
+
+    /// ADR 0054: deliver a user's answer to a deferred `UserQuestion`. Like
+    /// `send_prompt` it waits out the post-resume attach race (answering an
+    /// idle session resumes it) and records the answer as un-confirmed for
+    /// at-least-once replay — retired when the harness emits
+    /// `QuestionAnswered{tool_call_id}`. The harness stashes the answer and
+    /// re-fires the deferred tool via `--resume`; re-delivery is idempotent
+    /// (the deferred tool yields exactly one tool_result).
+    pub async fn answer_question(
+        &self,
+        sandbox_id: SandboxId,
+        tool_call_id: String,
+        answers: Answers,
+    ) -> Result<(), HarnessError> {
+        let cmd_tx = self.acquire_cmd_tx_waiting(sandbox_id).await?;
+        self.inner
+            .undelivered_answers
+            .lock()
+            .entry(sandbox_id)
+            .or_default()
+            .push(UndeliveredAnswer {
+                tool_call_id: tool_call_id.clone(),
+                answers: answers.clone(),
+            });
+        cmd_tx
+            .send(HarnessFrame::Command(HarnessCommand::AnswerQuestion {
+                tool_call_id,
+                answers,
+            }))
+            .await
+            .map_err(|_| HarnessError::WriterClosed)?;
+        Ok(())
     }
 
     /// Number of currently-attached harnesses. Diagnostic / test helper.
@@ -940,6 +1003,36 @@ async fn drive_attached<R, W>(
             }
         }
     }
+    // ADR 0054: replay un-confirmed answers the same way. An answer dropped
+    // with a bounced connection would otherwise leave the question stuck
+    // awaiting-input; re-delivery is idempotent (one tool_result per tool).
+    {
+        let pending = inner
+            .undelivered_answers
+            .lock()
+            .get(&sandbox_id)
+            .cloned()
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            tracing::debug!(
+                sandbox_id = %sandbox_id,
+                count = pending.len(),
+                "replaying un-confirmed answers onto fresh harness connection",
+            );
+        }
+        for a in pending {
+            if cmd_tx
+                .send(HarnessFrame::Command(HarnessCommand::AnswerQuestion {
+                    tool_call_id: a.tool_call_id,
+                    answers: a.answers,
+                }))
+                .await
+                .is_err()
+            {
+                break; // writer already gone — next attach will retry
+            }
+        }
+    }
     drop(cmd_tx);
 
     let reader_outcome = reader_loop(reader, &inner, attach.session_id, sandbox_id).await;
@@ -1039,6 +1132,17 @@ where
                     let mut undelivered = hub.undelivered_prompts.lock();
                     if let Some(v) = undelivered.get_mut(&sandbox_id) {
                         v.retain(|p| p.prompt_id != confirmed);
+                        if v.is_empty() {
+                            undelivered.remove(&sandbox_id);
+                        }
+                    }
+                }
+                // ADR 0054: a QuestionAnswered for a tool_call_id means the
+                // harness delivered the answer — retire it from the replay set.
+                if let HarnessEvent::QuestionAnswered { tool_call_id, .. } = &ev {
+                    let mut undelivered = hub.undelivered_answers.lock();
+                    if let Some(v) = undelivered.get_mut(&sandbox_id) {
+                        v.retain(|a| &a.tool_call_id != tool_call_id);
                         if v.is_empty() {
                             undelivered.remove(&sandbox_id);
                         }
@@ -1392,6 +1496,77 @@ mod tests {
         let hub = HarnessHub::new(sink);
         let err = hub.interrupt(SandboxId::new()).await.unwrap_err();
         assert!(matches!(err, HarnessError::NotAttached));
+    }
+
+    // ADR 0054: answer_question delivers an AnswerQuestion frame and buffers
+    // it un-confirmed; a QuestionAnswered event from the harness retires it.
+    #[tokio::test]
+    async fn answer_question_reaches_harness_and_retires_on_confirmation() {
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        // Harness: attach, read one AnswerQuestion, then emit QuestionAnswered
+        // to confirm delivery (which retires the replay-buffer entry).
+        let harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            let frame: HarnessFrame = read_msg(&mut hr).await.unwrap();
+            let ok = matches!(
+                &frame,
+                HarnessFrame::Command(HarnessCommand::AnswerQuestion { tool_call_id, .. })
+                    if tool_call_id == "toolu_1"
+            );
+            write_msg(
+                &mut hw,
+                &HarnessFrame::Event(HarnessEvent::QuestionAnswered {
+                    run_id: "run-1".into(),
+                    tool_call_id: "toolu_1".into(),
+                    answers: Answers::new(),
+                }),
+            )
+            .await
+            .unwrap();
+            ok
+        });
+
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "harness should attach within the 1s deadline"
+        );
+
+        let mut a = Answers::new();
+        a.insert("Q?".into(), vec!["A".into()]);
+        hub.answer_question(sandbox_id, "toolu_1".into(), a)
+            .await
+            .expect("answer_question");
+
+        let received = harness_task.await.unwrap();
+        assert!(received, "harness should receive an AnswerQuestion frame");
+
+        assert!(
+            wait_until(|| hub
+                .inner
+                .undelivered_answers
+                .lock()
+                .get(&sandbox_id)
+                .is_none())
+            .await,
+            "QuestionAnswered should retire the un-confirmed answer",
+        );
     }
 
     #[tokio::test]
