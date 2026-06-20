@@ -762,9 +762,9 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0014 M1.11: fetch a single snapshot row by id. Used by
     /// the heartbeat-ack template enrichment path to surface the
     /// snapshot's persisted `disk_manifest` + `memory_manifest`
-    /// to host-agents — without those, warm-pool refill on a
-    /// fresh host has no way to materialize the rootfs file FC
-    /// `load_snapshot` needs.
+    /// to host-agents — without those, a base-snapshot restore
+    /// on a fresh host has no way to materialize the rootfs file
+    /// FC `load_snapshot` needs.
     ///
     /// Default returns `None` so backends that don't have a real
     /// DB (mocks, tests) opt out cleanly; callers that depend on
