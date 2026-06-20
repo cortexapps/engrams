@@ -122,8 +122,8 @@ build_tree() {
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
   <!-- ADR 0055: the bundle mounts at a dynamic slot, so the font dir is
-       resolved relative to this config file's location (the wrapper points
-       FONTCONFIG_FILE at $here/fonts.conf), not a fixed mount path. -->
+       resolved relative to this config file location via prefix=relative.
+       The wrapper points FONTCONFIG_FILE at the bundle fonts.conf. -->
   <dir prefix="relative">fonts</dir>
   <cachedir>/tmp/engram-fontconfig-cache</cachedir>
   <config></config>
