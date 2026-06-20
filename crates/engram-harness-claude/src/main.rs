@@ -38,7 +38,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod adapter {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitCode, ExitStatus, Stdio};
     use std::sync::{Arc, Mutex};
@@ -59,6 +59,15 @@ mod adapter {
     use tokio::time::{timeout, Instant};
 
     pub const CLAUDE_SESSION_ID_FILE: &str = "/workspace/.engram/claude-session-id";
+
+    /// ADR 0054 Flavor B: the per-session hook↔harness unix socket and the
+    /// generated `--settings` file. Both live under `/workspace/.engram`
+    /// (already per-session, like the claude session-id file), so the names
+    /// are fixed yet collision-free across sessions and correct on every
+    /// backend (FC / VZ / Process). The harness binds the socket
+    /// before spawning claude; the hook reaches it via `ENGRAM_HOOK_SOCK`.
+    pub const HOOK_SOCK_FILE: &str = "/workspace/.engram/hook.sock";
+    pub const HOOK_SETTINGS_FILE: &str = "/workspace/.engram/claude-settings.json";
 
     /// Truncation budgets used when building summary fields. Adapter-
     /// local enforcement of the wire docs.
@@ -409,6 +418,332 @@ mod adapter {
         }
     }
 
+    /// ADR 0054 Flavor B: the hook↔harness socket server and its shared
+    /// state. The harness is a long-lived **server**; each `PreToolUse`
+    /// hook invocation (the `hook-bridge` subcommand) is a transient
+    /// **client**. The runtime process tree is three deep —
+    /// `engram-harness-claude` → `claude` → a per-PreToolUse hook — and the
+    /// hook's stdio is claimed by claude, so a unix socket is the only
+    /// out-of-band channel from the hook back to the harness (its
+    /// grandparent). NDJSON, one line each way; the connection is never
+    /// held open.
+    pub mod hook_server {
+        use super::{emit, BufReader, HarnessEvent};
+        use engram_harness_proto::{Answers, Question};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::{UnixListener, UnixStream};
+        use tokio::sync::{mpsc, Mutex};
+
+        /// `tool_use_id → canonical Answers`, owned by `run_engine` so it
+        /// survives a claude respawn: an answer is stashed by the live
+        /// process's `AnswerQuestion` arm and consumed by the hook of the
+        /// *next*, resumed process (findings #11/#12 — the answer can only
+        /// land on the resumed re-fire). `tokio::sync::Mutex` (not std)
+        /// because the accept handler holds it across an `.await`, and it is
+        /// touched concurrently by the accept task and the `cmd_rx` arm.
+        pub type AnswersInHand = Arc<Mutex<HashMap<String, Answers>>>;
+        /// The most-recently-started turn's `run_id`, so a hook (which only
+        /// ever fires inside an in-flight turn) can tag its
+        /// `UserQuestion`/`QuestionAnswered` events. Set by
+        /// `start_turn`/`start_continuation_turn`.
+        pub type CurrentRunId = Arc<Mutex<Option<String>>>;
+
+        /// hook → harness (request). One line.
+        #[derive(serde::Deserialize)]
+        pub struct HookRequest {
+            pub tool_use_id: String,
+            pub questions: Vec<Question>,
+        }
+
+        /// harness → hook (verdict). One line. `#[serde(tag = "verdict")]`
+        /// gives the exact `{"verdict":"answer","answers":{…}}` /
+        /// `{"verdict":"defer"}` wire shape. Shared by both ends (compiled
+        /// once → client and server can never be a version apart).
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(tag = "verdict", rename_all = "snake_case")]
+        pub enum HookVerdict {
+            Answer { answers: Answers },
+            Defer,
+        }
+
+        /// Accept loop: one transient hook client per connection, each
+        /// handled on its own task so parallel AUQ fires (distinct
+        /// `tool_use_id`s) never block one another. Runs for the whole
+        /// engine lifetime (outlives any single claude process).
+        pub async fn serve(
+            listener: UnixListener,
+            answers_in_hand: AnswersInHand,
+            current_run_id: CurrentRunId,
+            evt_tx: mpsc::Sender<HarnessEvent>,
+        ) {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        tokio::spawn(handle_one(
+                            stream,
+                            answers_in_hand.clone(),
+                            current_run_id.clone(),
+                            evt_tx.clone(),
+                        ));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "hook socket accept failed"),
+                }
+            }
+        }
+
+        async fn handle_one(
+            stream: UnixStream,
+            answers_in_hand: AnswersInHand,
+            current_run_id: CurrentRunId,
+            evt_tx: mpsc::Sender<HarnessEvent>,
+        ) {
+            let (r, mut w) = stream.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let line = match lines.next_line().await {
+                Ok(Some(l)) => l,
+                _ => return,
+            };
+            let req: HookRequest = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "malformed hook request; ignoring");
+                    return;
+                }
+            };
+            let run_id = current_run_id.lock().await.clone().unwrap_or_default();
+
+            // Verdict: answer-in-hand → answer + QuestionAnswered; else
+            // defer + UserQuestion. `remove` (consume), not `get`, so a
+            // duplicate re-fire defers — the deferred tool yields exactly
+            // one tool_result (structural idempotency, ADR 0054). Compute
+            // under the lock, then DROP it before `emit` (which can block on
+            // backpressure while the host link is down).
+            let (verdict, event) = {
+                let mut map = answers_in_hand.lock().await;
+                match map.remove(&req.tool_use_id) {
+                    Some(answers) => (
+                        HookVerdict::Answer {
+                            answers: answers.clone(),
+                        },
+                        HarnessEvent::QuestionAnswered {
+                            run_id,
+                            tool_call_id: req.tool_use_id,
+                            answers,
+                        },
+                    ),
+                    None => (
+                        HookVerdict::Defer,
+                        HarnessEvent::UserQuestion {
+                            run_id,
+                            tool_call_id: req.tool_use_id,
+                            questions: req.questions,
+                        },
+                    ),
+                }
+            };
+            emit(&evt_tx, event).await;
+
+            let mut out = serde_json::to_string(&verdict)
+                .unwrap_or_else(|_| r#"{"verdict":"defer"}"#.to_string());
+            out.push('\n');
+            let _ = w.write_all(out.as_bytes()).await;
+            let _ = w.flush().await;
+            // drop closes the connection; the hook reads its one line and exits.
+        }
+    }
+
+    /// ADR 0054 Flavor B: the `engram-harness-claude hook-bridge`
+    /// subcommand — the transient `PreToolUse` hook client. Re-invoking the
+    /// harness binary as its own hook (git/busybox style) means one
+    /// artifact, no extra guest runtime (no node/jq), and no protocol drift
+    /// (client & server share `hook_server`'s serde types). Reads the
+    /// PreToolUse payload on stdin, decides, writes claude's hook output on
+    /// stdout.
+    pub mod hook_bridge {
+        use super::hook_server::HookVerdict;
+        use super::BufReader;
+        use engram_harness_proto::{Answers, Question};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        pub async fn run() -> std::process::ExitCode {
+            let mut input = String::new();
+            if tokio::io::stdin().read_to_string(&mut input).await.is_err() {
+                print_allow();
+                return std::process::ExitCode::SUCCESS;
+            }
+            let v: serde_json::Value =
+                serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+            let tool_name = v.get("tool_name").and_then(|s| s.as_str()).unwrap_or("");
+
+            // Ordinary tool → allow. THIS is the
+            // `--dangerously-skip-permissions` replacement: the VM is still
+            // the safety boundary, but the decision is now explicit and
+            // auditable. No socket round-trip needed.
+            if tool_name != "AskUserQuestion" {
+                print_allow();
+                return std::process::ExitCode::SUCCESS;
+            }
+
+            let tool_use_id = v
+                .get("tool_use_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_input = v
+                .get("tool_input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            // Parse into the SHARED `Question` type so we keep `multi_select`
+            // per question for denormalization (its `#[serde(rename)]` makes
+            // this byte-faithful to claude's `tool_input.questions`).
+            let questions: Vec<Question> = tool_input
+                .get("questions")
+                .and_then(|q| serde_json::from_value(q.clone()).ok())
+                .unwrap_or_default();
+            let sock = std::env::var("ENGRAM_HOOK_SOCK").unwrap_or_default();
+
+            match round_trip(&sock, &tool_use_id, &questions).await {
+                Some(HookVerdict::Answer { answers }) => {
+                    // Denormalize canonical Vec<String> → claude's
+                    // updatedInput.answers: a bare string for single-select,
+                    // an array for multiSelect (finding #6), using each
+                    // question's multi_select flag. The claude arity quirk
+                    // stays isolated here. claude wants the full updatedInput
+                    // echoed (questions + answers), so graft `answers` onto
+                    // the original tool_input.
+                    let updated_answers = denormalize(&questions, &answers);
+                    let mut updated_input = tool_input;
+                    match updated_input {
+                        serde_json::Value::Object(ref mut map) => {
+                            map.insert("answers".to_string(), updated_answers);
+                        }
+                        _ => {
+                            updated_input = serde_json::json!({
+                                "questions": questions_to_json(&questions),
+                                "answers": updated_answers,
+                            });
+                        }
+                    }
+                    let out = serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "updatedInput": updated_input,
+                        }
+                    });
+                    println!("{out}");
+                }
+                // Defer verdict, or any socket failure → defer. The turn
+                // ends `tool_deferred` and the VM can idle-evict.
+                _ => print_defer(),
+            }
+            std::process::ExitCode::SUCCESS
+        }
+
+        fn print_allow() {
+            println!(
+                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
+            );
+        }
+        fn print_defer() {
+            println!(
+                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"defer"}}}}"#
+            );
+        }
+
+        async fn round_trip(
+            sock: &str,
+            tool_use_id: &str,
+            questions: &[Question],
+        ) -> Option<HookVerdict> {
+            if sock.is_empty() {
+                return None;
+            }
+            let stream = UnixStream::connect(sock).await.ok()?;
+            let (r, mut w) = stream.into_split();
+            let req = serde_json::json!({ "tool_use_id": tool_use_id, "questions": questions });
+            let mut line = serde_json::to_string(&req).ok()?;
+            line.push('\n');
+            w.write_all(line.as_bytes()).await.ok()?;
+            w.flush().await.ok()?;
+            let mut lines = BufReader::new(r).lines();
+            let resp = lines.next_line().await.ok()??;
+            serde_json::from_str(&resp).ok()
+        }
+
+        /// Build claude's `updatedInput.answers` map. Keyed by question text
+        /// (finding #8); value is a bare string (single-select) or an array
+        /// (multiSelect) per the paired `Question.multi_select`. `pub` for
+        /// unit testing — the binary has no external API to keep narrow.
+        pub fn denormalize(questions: &[Question], answers: &Answers) -> serde_json::Value {
+            let mut out = serde_json::Map::new();
+            for q in questions {
+                if let Some(labels) = answers.get(&q.question) {
+                    let val = if q.multi_select {
+                        serde_json::Value::Array(
+                            labels
+                                .iter()
+                                .cloned()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        )
+                    } else {
+                        serde_json::Value::String(labels.first().cloned().unwrap_or_default())
+                    };
+                    out.insert(q.question.clone(), val);
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+
+        fn questions_to_json(questions: &[Question]) -> serde_json::Value {
+            serde_json::to_value(questions).unwrap_or(serde_json::Value::Null)
+        }
+    }
+
+    /// Aborts the hook-socket accept task and unlinks the socket file when
+    /// `run_engine` returns (any path). The VM teardown reclaims the tmpfs
+    /// anyway; this matters for the ProcessBackend (dev), where the harness
+    /// process exits but the host persists — a stale bind would otherwise
+    /// `EADDRINUSE` the next harness.
+    struct SockGuard {
+        path: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for SockGuard {
+        fn drop(&mut self) {
+            self.task.abort();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// ADR 0054 Flavor B: generate the `--settings` file claude is launched
+    /// with — a `PreToolUse` command hook that re-invokes THIS binary as
+    /// `hook-bridge`. Written at startup (not baked) from `current_exe()`
+    /// so the hook command is always the path of the running binary,
+    /// correct across FC / VZ / Process (where `resolve_claude_bin`'s
+    /// sibling layout — and thus this binary's path — varies).
+    async fn write_hook_settings() {
+        let self_exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "engram-harness-claude".to_string());
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{ "type": "command", "command": format!("{self_exe} hook-bridge") }]
+                }]
+            }
+        });
+        let _ = tokio::fs::create_dir_all("/workspace/.engram").await;
+        if let Err(e) = tokio::fs::write(HOOK_SETTINGS_FILE, settings.to_string()).await {
+            tracing::warn!(error = %e, "couldn't write claude hook settings");
+        }
+    }
+
     /// The long-lived run engine. Owns the persistent `claude` process
     /// and the pending-prompt queue; spawned once and never torn down by
     /// a connection drop. Each iteration runs ONE `claude` process
@@ -460,6 +795,40 @@ mod adapter {
         const MAX_RESPAWN_BACKOFF_SECS: u64 = 10;
         let mut fast_crashes: u32 = 0;
 
+        // ADR 0054 Flavor B: the answer bridge. `answers_in_hand` and
+        // `current_run_id` are owned here so they survive a claude respawn
+        // (the answer is stashed by one process and consumed by the hook of
+        // the next, resumed one — findings #11/#12). The hook socket is
+        // bound ONCE, before the first spawn (bind-before-spawn → no hook
+        // can fire before the listener exists), and shared across respawns;
+        // the accept task outlives any single claude process.
+        let answers_in_hand: hook_server::AnswersInHand =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let current_run_id: hook_server::CurrentRunId = Arc::new(tokio::sync::Mutex::new(None));
+        write_hook_settings().await;
+        let _ = tokio::fs::remove_file(HOOK_SOCK_FILE).await; // clear a stale bind
+        let _sock_guard = match tokio::net::UnixListener::bind(HOOK_SOCK_FILE) {
+            Ok(listener) => {
+                let task = tokio::spawn(hook_server::serve(
+                    listener,
+                    answers_in_hand.clone(),
+                    current_run_id.clone(),
+                    evt_tx.clone(),
+                ));
+                Some(SockGuard {
+                    path: HOOK_SOCK_FILE.to_string(),
+                    task,
+                })
+            }
+            Err(e) => {
+                // Degraded, not fatal: ordinary tools still auto-allow (the
+                // hook never connects for them); only AskUserQuestion would
+                // perpetually defer (the bridge's connect fails → defer).
+                tracing::error!(error = %e, "bind hook socket failed; AskUserQuestion will always defer");
+                None
+            }
+        };
+
         loop {
             let spawned_at = Instant::now();
             match run_claude_session(
@@ -469,6 +838,8 @@ mod adapter {
                 &evt_tx,
                 &mut pending,
                 &mut seen_prompt_ids,
+                &answers_in_hand,
+                &current_run_id,
             )
             .await
             {
@@ -476,6 +847,15 @@ mod adapter {
                 // connection loop exited = process teardown).
                 SessionOutcome::Shutdown | SessionOutcome::ChannelClosed => {
                     return ExitCode::SUCCESS;
+                }
+                // ADR 0054: an intentional answer-resume — NOT a crash. The
+                // `AnswerQuestion` arm stashed the answer and SIGINT'd
+                // claude; respawn with `--resume` like `Respawn`, but reset
+                // the fast-crash budget (proof of liveness) and never sleep.
+                // The deferred AUQ re-fires on startup and is answered.
+                SessionOutcome::ResumeForAnswer => {
+                    fast_crashes = 0;
+                    // loop → respawn with --resume, no backoff
                 }
                 // claude died unexpectedly (crash / interrupt / per-turn
                 // timeout) or couldn't be spawned. Any in-flight run's
@@ -658,6 +1038,13 @@ mod adapter {
         Respawn,
         /// claude could not be spawned at all. Back off and retry.
         SpawnFailed,
+        /// ADR 0054: an `AnswerQuestion` arrived; the answer is stashed in
+        /// `answers_in_hand` and we SIGINT'd claude so the deferred AUQ
+        /// re-fires on a `--resume` re-spawn (findings #11/#12 — the live
+        /// process must NOT be fed, it would re-infer a new id). A sibling
+        /// of `Respawn` that is INTENTIONAL: no fast-crash backoff, no
+        /// abnormal-exit System message.
+        ResumeForAnswer,
     }
 
     /// The single in-flight turn, owned by the session loop. `run_id` is
@@ -717,6 +1104,7 @@ mod adapter {
     /// in-flight turn's terminal event is always emitted here (paired
     /// with the `RunStarted` we synthesized on prompt-accept), even when
     /// the process dies mid-turn.
+    #[allow(clippy::too_many_arguments)]
     async fn run_claude_session(
         cli: &Cli,
         cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
@@ -724,6 +1112,8 @@ mod adapter {
         evt_tx: &mpsc::Sender<HarnessEvent>,
         pending: &mut VecDeque<QueuedPrompt>,
         seen_prompt_ids: &mut HashSet<String>,
+        answers_in_hand: &hook_server::AnswersInHand,
+        current_run_id: &hook_server::CurrentRunId,
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
         let argv = build_claude_argv(&resume_id);
@@ -747,14 +1137,20 @@ mod adapter {
             // typically has no outbound to those endpoints anyway,
             // and they cause spurious failures on long runs.
             // `IS_SANDBOX=1` is the documented escape hatch for
-            // Claude's root-check: with --dangerously-skip-permissions
-            // the CLI otherwise refuses to start as root, which is
-            // exactly how it runs inside our VM. The VM itself is
+            // Claude's root-check: the CLI otherwise refuses to start as
+            // root, which is exactly how it runs inside our VM. Kept after
+            // ADR 0054 dropped `--dangerously-skip-permissions` — the
+            // root-check is independent of that flag, and the VM itself is
             // the security boundary.
+            // `ENGRAM_HOOK_SOCK` (ADR 0054): claude inherits it and the
+            // PreToolUse hook inherits it from claude (finding #7), so the
+            // hook finds the per-session socket while the `--settings`
+            // artifact stays path-agnostic.
             .env("BASH_DEFAULT_TIMEOUT_MS", "1800000")
             .env("BASH_MAX_TIMEOUT_MS", "7200000")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .env("IS_SANDBOX", "1")
+            .env("ENGRAM_HOOK_SOCK", HOOK_SOCK_FILE)
             // Held open for the whole session: we write one newline-
             // delimited `user` message per prompt and close it (drop) to
             // signal a clean drain on Shutdown.
@@ -815,17 +1211,42 @@ mod adapter {
         // Set when an operator Interrupt SIGINT'd the child mid-turn; the
         // reap path closes that run as `RunInterrupted` (not a crash).
         let mut interrupted_run: Option<String> = None;
+        // ADR 0054: set when an `AnswerQuestion` SIGINT'd the child to
+        // trigger an answer-resume; the reap path must NOT treat the exit as
+        // a crash (no abnormal-exit System message) and returns
+        // `ResumeForAnswer`.
+        let mut resuming_for_answer = false;
 
-        // Kick off the first queued prompt (an initial prompt, or a queue
-        // that survived a respawn) with no leading Idle; otherwise
-        // announce Idle so the host's soft TTL arms.
-        match pending.pop_front() {
-            Some(qp) => {
-                if let Some(s) = stdin.as_mut() {
-                    turn = Some(start_turn(evt_tx, s, cli, qp.prompt_id, &qp.text).await);
+        // ADR 0054: if an answer is stashed, claude WILL re-fire the
+        // deferred AUQ on this `--resume` startup (id-stable, no stdin —
+        // findings #9/#12). Establish a CONTINUATION turn (fresh run_id,
+        // `RunStarted` with no `prompt_id`, no user-echo, no
+        // `write_user_message`) so the re-fired `tool_result` and the
+        // model's continuation are captured by the in-flight-turn branch
+        // instead of dropped by the "line outside any turn" / "result with
+        // no in-flight turn" branches. This takes precedence over the
+        // pending queue — an outstanding answer must be delivered first.
+        // (Edge: a stale answer with no matching pending tool — e.g. a
+        // duplicate after full consumption — leaves a continuation turn with
+        // no output until `max_run_secs` or the next command; rare, and the
+        // session stays command-responsive.)
+        if !answers_in_hand.lock().await.is_empty() {
+            turn = Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
+        } else {
+            // Kick off the first queued prompt (an initial prompt, or a
+            // queue that survived a respawn) with no leading Idle; otherwise
+            // announce Idle so the host's soft TTL arms.
+            match pending.pop_front() {
+                Some(qp) => {
+                    if let Some(s) = stdin.as_mut() {
+                        turn = Some(
+                            start_turn(evt_tx, s, cli, qp.prompt_id, &qp.text, current_run_id)
+                                .await,
+                        );
+                    }
                 }
+                None => emit(evt_tx, HarnessEvent::Idle).await,
             }
-            None => emit(evt_tx, HarnessEvent::Idle).await,
         }
 
         loop {
@@ -881,7 +1302,12 @@ mod adapter {
                                             if let Some(s) = stdin.as_mut() {
                                                 turn = Some(
                                                     start_turn(
-                                                        evt_tx, s, cli, qp.prompt_id, &qp.text,
+                                                        evt_tx,
+                                                        s,
+                                                        cli,
+                                                        qp.prompt_id,
+                                                        &qp.text,
+                                                        current_run_id,
                                                     )
                                                     .await,
                                                 );
@@ -941,7 +1367,15 @@ mod adapter {
                                 // Idle: start the run immediately.
                                 if let Some(s) = stdin.as_mut() {
                                     turn = Some(
-                                        start_turn(evt_tx, s, cli, Some(prompt_id), &text).await,
+                                        start_turn(
+                                            evt_tx,
+                                            s,
+                                            cli,
+                                            Some(prompt_id),
+                                            &text,
+                                            current_run_id,
+                                        )
+                                        .await,
                                     );
                                 }
                             } else {
@@ -963,6 +1397,30 @@ mod adapter {
                                     text,
                                 });
                             }
+                        }
+                        Some(HarnessCommand::AnswerQuestion { tool_call_id, answers }) => {
+                            // ADR 0054: stash the answer for the hook of the
+                            // NEXT (resumed) process — it can ONLY land on the
+                            // resumed re-fire, never on this live process
+                            // (feeding the live stream re-infers a new
+                            // tool_use_id, finding #11). Then end THIS claude
+                            // and re-enter via `--resume`.
+                            tracing::info!(
+                                %tool_call_id,
+                                "answer received; resuming claude to re-fire the deferred AUQ"
+                            );
+                            answers_in_hand.lock().await.insert(tool_call_id, answers);
+                            resuming_for_answer = true;
+                            // claude flushes its transcript per-message, so the
+                            // session stays cleanly `--resume`-able after SIGINT.
+                            sigint_child(&child);
+                            // `break` (NOT `return`): the existing `None =>
+                            // return ChannelClosed` arm skips the reap block,
+                            // but we MUST reap (wait the child, drain stderr,
+                            // close any defensively-in-flight turn). Breaking
+                            // the loop runs the reap, which returns
+                            // `ResumeForAnswer`.
+                            break;
                         }
                         Some(HarnessCommand::EditQueued { prompt_id, text }) => {
                             // Single-writer: mutate only while still queued
@@ -1099,6 +1557,16 @@ mod adapter {
             } else if shutting_down {
                 // Grace expired mid-turn before claude could drain.
                 emit(evt_tx, HarnessEvent::RunCompleted { run_id, ok: false }).await;
+            } else if resuming_for_answer {
+                // ADR 0054: an `AnswerQuestion` tore down a turn that was
+                // (defensively) still in flight — the deferred-question turn
+                // normally already ended `tool_deferred` (so `turn` is
+                // None), but a racing answer is handled here. This is NOT a
+                // crash: close the run quietly (no abnormal-exit System
+                // message); the resumed process establishes the continuation
+                // turn. Branch ordering matters — this MUST precede the
+                // generic crash `else`.
+                emit(evt_tx, HarnessEvent::RunCompleted { run_id, ok: false }).await;
             } else {
                 // Unexpected crash mid-turn. Surface the durable artifact
                 // (bracketed by the run's RunStarted), close the run, and
@@ -1128,6 +1596,11 @@ mod adapter {
 
         if shutting_down {
             SessionOutcome::Shutdown
+        } else if resuming_for_answer {
+            // ADR 0054: intentional answer-resume — checked before the
+            // generic `Respawn` so it never trips fast-crash backoff or
+            // reads as a crash.
+            SessionOutcome::ResumeForAnswer
         } else {
             SessionOutcome::Respawn
         }
@@ -1142,8 +1615,12 @@ mod adapter {
         cli: &Cli,
         prompt_id: Option<String>,
         text: &str,
+        current_run_id: &hook_server::CurrentRunId,
     ) -> TurnState {
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        // ADR 0054: publish the run_id so a hook firing within this turn
+        // tags its UserQuestion/QuestionAnswered with the right run.
+        *current_run_id.lock().await = Some(run_id.clone());
         // `RunStarted{prompt_id}` is the "queued prompt consumed" signal:
         // a UI that drew a greyed type-ahead item with this id moves it
         // into the conversation now. `None` for the env-seeded initial
@@ -1169,6 +1646,40 @@ mod adapter {
             // died); the stdout-EOF reap path will close this run.
             tracing::warn!(error = %e, "writing prompt to claude stdin failed");
         }
+        TurnState {
+            run_id,
+            tool_calls: 0,
+            deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
+            current_message_id: None,
+        }
+    }
+
+    /// ADR 0054: start a CONTINUATION turn for an answer-resume. Like
+    /// `start_turn` it mints a `run_id`, publishes it to `current_run_id`,
+    /// and emits `RunStarted` BEFORE any output — but with **no `prompt_id`**
+    /// (this turn was not started by a user prompt) and **no
+    /// `write_user_message`** (the deferred AUQ re-fires from claude's
+    /// persisted state on `--resume`; the stream's sole `user` event is the
+    /// deferred `tool_result` = the answer). So no synthetic user turn ever
+    /// becomes an engram `session_event`. Reuses `max_run_secs` — the model
+    /// can grind arbitrarily long once unblocked; the defer-spin never arms
+    /// because the answer is in hand on the first re-fire.
+    async fn start_continuation_turn(
+        evt_tx: &mpsc::Sender<HarnessEvent>,
+        cli: &Cli,
+        current_run_id: &hook_server::CurrentRunId,
+    ) -> TurnState {
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        *current_run_id.lock().await = Some(run_id.clone());
+        emit(
+            evt_tx,
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                prompt_id: None,
+                prompt_summary: None,
+            },
+        )
+        .await;
         TurnState {
             run_id,
             tool_calls: 0,
@@ -1213,11 +1724,13 @@ mod adapter {
             // for live-typing. The complete message is still emitted and
             // remains the durable record.
             "--include-partial-messages".into(),
-            // No human in the VM to approve tool calls; `--print`
-            // aborts with exit 1 the first time a tool needs
-            // approval otherwise. The VM itself is the safety
-            // boundary.
-            "--dangerously-skip-permissions".into(),
+            // ADR 0054: a PreToolUse hook replaces
+            // `--dangerously-skip-permissions`. The hook (written by
+            // `write_hook_settings`, run as `hook-bridge`) auto-allows
+            // ordinary tools — explicit and auditable, the VM is still the
+            // safety boundary — and defers AskUserQuestion to the harness.
+            "--settings".into(),
+            HOOK_SETTINGS_FILE.into(),
         ];
         if let Some(id) = resume_id {
             argv.push("--resume".into());
@@ -1530,6 +2043,7 @@ mod adapter {
     #[cfg(test)]
     mod engine_tests {
         use super::*;
+        use engram_harness_proto::{Answers, Question, QuestionOption};
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
@@ -1952,12 +2466,291 @@ mod adapter {
                 .expect("engine task should not panic");
             let _ = tokio::fs::remove_file(&script).await;
         }
+
+        // ── ADR 0054 Flavor B: hook↔harness socket + answer-resume ──────
+
+        fn sample_q(text: &str, multi: bool) -> Question {
+            Question {
+                question: text.into(),
+                header: "H".into(),
+                multi_select: multi,
+                options: vec![QuestionOption {
+                    label: "A".into(),
+                    description: "a".into(),
+                }],
+            }
+        }
+
+        /// Spin up `hook_server::serve` on a fresh, isolated temp socket (NOT
+        /// the production `/workspace` path — tests run in parallel). Returns
+        /// the path plus the shared state and the event receiver.
+        async fn spawn_hook_server() -> (
+            String,
+            hook_server::AnswersInHand,
+            hook_server::CurrentRunId,
+            mpsc::Receiver<HarnessEvent>,
+        ) {
+            let sock = std::env::temp_dir()
+                .join(format!("engram-hooktest-{}.sock", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned();
+            let answers: hook_server::AnswersInHand =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let run_id: hook_server::CurrentRunId =
+                Arc::new(tokio::sync::Mutex::new(Some("run-x".into())));
+            let (evt_tx, evt_rx) = mpsc::channel::<HarnessEvent>(16);
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            tokio::spawn(hook_server::serve(
+                listener,
+                answers.clone(),
+                run_id.clone(),
+                evt_tx,
+            ));
+            (sock, answers, run_id, evt_rx)
+        }
+
+        /// A fake `PreToolUse` hook client: one request line, one verdict.
+        async fn hook_fire(
+            sock: &str,
+            tool_use_id: &str,
+            questions: &[Question],
+        ) -> hook_server::HookVerdict {
+            let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let req = serde_json::json!({ "tool_use_id": tool_use_id, "questions": questions });
+            let mut line = serde_json::to_string(&req).unwrap();
+            line.push('\n');
+            w.write_all(line.as_bytes()).await.unwrap();
+            w.flush().await.unwrap();
+            let mut lines = BufReader::new(r).lines();
+            let resp = lines.next_line().await.unwrap().unwrap();
+            serde_json::from_str(&resp).unwrap()
+        }
+
+        // No answer in hand → defer + UserQuestion. After an answer is
+        // stashed, a re-fire of the SAME tool_use_id → answer +
+        // QuestionAnswered.
+        #[tokio::test]
+        async fn hook_defers_then_answers_after_stash() {
+            let (sock, answers, _rid, mut evt_rx) = spawn_hook_server().await;
+            let questions = vec![sample_q("Pick one?", false)];
+
+            let v = hook_fire(&sock, "toolu_1", &questions).await;
+            assert!(matches!(v, hook_server::HookVerdict::Defer));
+            match evt_rx.recv().await {
+                Some(HarnessEvent::UserQuestion {
+                    run_id,
+                    tool_call_id,
+                    questions: qs,
+                }) => {
+                    assert_eq!(run_id, "run-x");
+                    assert_eq!(tool_call_id, "toolu_1");
+                    assert_eq!(qs.len(), 1);
+                }
+                other => panic!("expected UserQuestion, got {other:?}"),
+            }
+
+            {
+                let mut m = answers.lock().await;
+                let mut a = Answers::new();
+                a.insert("Pick one?".into(), vec!["A".into()]);
+                m.insert("toolu_1".into(), a);
+            }
+            let v = hook_fire(&sock, "toolu_1", &questions).await;
+            match v {
+                hook_server::HookVerdict::Answer { answers } => {
+                    assert_eq!(answers.get("Pick one?"), Some(&vec!["A".to_string()]));
+                }
+                hook_server::HookVerdict::Defer => panic!("expected answer after stash"),
+            }
+            match evt_rx.recv().await {
+                Some(HarnessEvent::QuestionAnswered {
+                    tool_call_id,
+                    answers,
+                    ..
+                }) => {
+                    assert_eq!(tool_call_id, "toolu_1");
+                    assert_eq!(answers.get("Pick one?"), Some(&vec!["A".to_string()]));
+                }
+                other => panic!("expected QuestionAnswered, got {other:?}"),
+            }
+        }
+
+        // One AUQ call carrying TWO questions (one multi, one single) → one
+        // request, one answers map keyed by question text (finding #8).
+        #[tokio::test]
+        async fn hook_multi_question_one_roundtrip() {
+            let (sock, answers, _rid, mut evt_rx) = spawn_hook_server().await;
+            let questions = vec![sample_q("Languages?", true), sample_q("Editor?", false)];
+            {
+                let mut m = answers.lock().await;
+                let mut a = Answers::new();
+                a.insert("Languages?".into(), vec!["Python".into(), "Rust".into()]);
+                a.insert("Editor?".into(), vec!["VS Code".into()]);
+                m.insert("toolu_multi".into(), a);
+            }
+            match hook_fire(&sock, "toolu_multi", &questions).await {
+                hook_server::HookVerdict::Answer { answers } => {
+                    assert_eq!(answers.len(), 2, "one answers map for N questions");
+                    assert_eq!(answers.get("Languages?").unwrap().len(), 2);
+                    assert_eq!(
+                        answers.get("Editor?").unwrap(),
+                        &vec!["VS Code".to_string()]
+                    );
+                }
+                _ => panic!("expected answer"),
+            }
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::QuestionAnswered { .. })
+            ));
+        }
+
+        // Idempotency: the deferred tool yields exactly one tool_result, so
+        // a duplicate re-fire after consumption DEFERS (consumed once).
+        #[tokio::test]
+        async fn hook_duplicate_refire_defers_after_consumption() {
+            let (sock, answers, _rid, mut evt_rx) = spawn_hook_server().await;
+            let questions = vec![sample_q("One?", false)];
+            {
+                let mut m = answers.lock().await;
+                let mut a = Answers::new();
+                a.insert("One?".into(), vec!["A".into()]);
+                m.insert("toolu_dup".into(), a);
+            }
+            assert!(matches!(
+                hook_fire(&sock, "toolu_dup", &questions).await,
+                hook_server::HookVerdict::Answer { .. }
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::QuestionAnswered { .. })
+            ));
+            assert!(matches!(
+                hook_fire(&sock, "toolu_dup", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::UserQuestion { .. })
+            ));
+            assert!(
+                answers.lock().await.is_empty(),
+                "the answer was consumed exactly once"
+            );
+        }
+
+        // The hook-bridge's claude-specific denormalization (finding #6): a
+        // single-select answer is a bare string, a multiSelect answer is an
+        // array, keyed by question text — driven by each question's flag.
+        #[test]
+        fn denormalize_single_is_string_multi_is_array() {
+            let questions = vec![sample_q("M?", true), sample_q("S?", false)];
+            let mut a = Answers::new();
+            a.insert("M?".into(), vec!["x".into(), "y".into()]);
+            a.insert("S?".into(), vec!["z".into()]);
+            let out = hook_bridge::denormalize(&questions, &a);
+            assert_eq!(out["M?"], serde_json::json!(["x", "y"]), "multi → array");
+            assert_eq!(out["S?"], serde_json::json!("z"), "single → bare string");
+        }
+
+        /// A fake claude for the answer-resume cycle. First invocation blocks
+        /// on stdin (we SIGINT it via `AnswerQuestion`); the second (marker
+        /// present) emits a continuation turn's output WITHOUT reading stdin
+        /// — simulating the deferred AUQ re-firing on `--resume` startup —
+        /// then blocks so it doesn't EOF-respawn.
+        async fn write_answer_resume_fake_claude() -> (String, String) {
+            use std::os::unix::fs::PermissionsExt;
+            let id = uuid::Uuid::new_v4();
+            let path = std::env::temp_dir().join(format!("fake-claude-{id}.sh"));
+            let marker = std::env::temp_dir().join(format!("fake-claude-marker-{id}"));
+            let body = format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\n\
+                 if [ -f '{m}' ]; then\n\
+                 printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m2\",\"content\":[{{\"type\":\"text\",\"text\":\"resumed\"}}]}}}}'\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}'\n\
+                 while IFS= read -r _l; do :; done\n\
+                 else\n\
+                 touch '{m}'\n\
+                 while IFS= read -r _l; do :; done\n\
+                 fi\n",
+                m = marker.display()
+            );
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            (
+                path.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            )
+        }
+
+        // Engine mechanics: an `AnswerQuestion` to an idle session stashes
+        // the answer, SIGINTs claude, and respawns with `--resume` into a
+        // CONTINUATION turn — `RunStarted` with NO prompt_id (no user-echo)
+        // — that captures the re-fired output. Drives the in-memory
+        // `answers_in_hand`; independent of the real hook socket, which the
+        // test env may not be able to bind (graceful degradation).
+        #[tokio::test]
+        async fn answer_question_resumes_into_continuation_turn() {
+            let (script, marker) = write_answer_resume_fake_claude().await;
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                None, // no initial prompt → Idle
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            let mut a = Answers::new();
+            a.insert("Q?".into(), vec!["A".into()]);
+            cmd_tx
+                .send(HarnessCommand::AnswerQuestion {
+                    tool_call_id: "toolu_1".into(),
+                    answers: a,
+                })
+                .await
+                .unwrap();
+
+            // The resumed process establishes a continuation turn (no
+            // prompt_id) and streams the re-fired output, closing cleanly.
+            let (_rid, pid) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(pid, None, "continuation turn carries no prompt_id");
+            expect_agent_message(&mut evt_rx, "resumed").await;
+            let _ = expect_run_completed(&mut evt_rx).await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+            let _ = tokio::fs::remove_file(&marker).await;
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // ADR 0054: git/busybox argv dispatch — the SAME binary is the socket
+    // SERVER (normal mode) and the transient PreToolUse hook CLIENT. Peek
+    // argv[1] BEFORE clap sees it: `Cli` requires `--session-id`, which a
+    // hook invocation never has, so a hook must bypass the parser entirely.
+    if std::env::args().nth(1).as_deref() == Some("hook-bridge") {
+        return adapter::hook_bridge::run().await;
+    }
     adapter::entry().await
 }
 
