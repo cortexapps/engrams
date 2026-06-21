@@ -38,6 +38,7 @@ pub mod queue_scanner;
 pub mod reconcile;
 pub mod scheduler;
 pub mod session_boot;
+pub mod skill_pack;
 pub mod snapshot_blob_gc;
 pub mod state;
 

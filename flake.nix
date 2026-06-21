@@ -85,6 +85,12 @@
             # let-binding (pinned current nixpkgs) lexically shadows the stale
             # `pkgs.e2fsprogs` here. All platforms (was macOS-only).
             e2fsprogs
+            # ADR 0055 P2: mksquashfs packs an uploaded skill dir into a
+            # content-addressed RO squashfs at registration (the coordinator's
+            # `skill_pack`); also what the deploy/bundles/* recipes already use.
+            # Needed by `nix develop` (the coordinator + `just check`'s pack test)
+            # and bundled into the coordinator runtime image.
+            squashfsTools
           ] ++ lib.optionals stdenv.isLinux [
             # Parallel linker; wired in via the `shellHook` below
             # (CARGO_TARGET_*_UNKNOWN_LINUX_GNU_RUSTFLAGS). Cuts
