@@ -44,6 +44,7 @@ fn pack_to_status(e: PackError) -> Status {
     }
 }
 
+// EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::mount_catalog_service_server::MountCatalogService for AppMountCatalogService {
     async fn register_skill(

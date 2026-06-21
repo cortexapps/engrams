@@ -371,6 +371,7 @@ mod convention {
         ("shell_relay.rs", include_str!("shell_relay.rs")),
         ("fleet.rs", include_str!("fleet.rs")),
         ("image.rs", include_str!("image.rs")),
+        ("mount_catalog.rs", include_str!("mount_catalog.rs")),
     ];
 
     /// Files under `src/grpc_app/` that are deliberately NOT listed in
