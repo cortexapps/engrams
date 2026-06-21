@@ -8,6 +8,7 @@ import eventsRoute from "./routes/events.ts";
 import artifactsRoute from "./routes/artifacts.ts";
 import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
+import skillsRoute from "./routes/skills.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
@@ -38,6 +39,8 @@ app.route("/", artifactsRoute);
 app.route("/", meRoute);
 // ADR 0051 Task 28: admin REST proxy (pause/resume session — no gRPC equiv yet).
 app.route("/", adminRoute);
+// ADR 0055 P2: skill catalog list/upload/delete (multipart upload is HTTP, not gRPC).
+app.route("/", skillsRoute);
 
 // ADR 0051 Task 21: Shell WebSocket route.
 const { app: shellApp, injectUpgrade } = makeShellRoute();
