@@ -1028,6 +1028,7 @@ dependencies = [
  "engram-harness-proto",
  "engram-host-agent",
  "engram-image-builder",
+ "engram-mount-manifest",
  "engram-oci",
  "engram-oci-auth",
  "engram-postgres",
@@ -1040,6 +1041,7 @@ dependencies = [
  "engram-storage-gcs",
  "engram-storage-local",
  "engram-telemetry",
+ "flate2",
  "futures",
  "http-body-util",
  "metrics",
@@ -1052,6 +1054,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1324,6 +1327,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-mount-manifest"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-oci"
 version = "0.1.0"
 dependencies = [
@@ -1547,6 +1559,7 @@ dependencies = [
 name = "engram-session-bundles"
 version = "0.1.0"
 dependencies = [
+ "engram-mount-manifest",
  "serde",
  "serde_json",
  "tempfile",

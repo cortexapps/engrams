@@ -44,33 +44,11 @@ pub struct ActivationReport {
     pub warnings: Vec<String>,
 }
 
-/// ADR 0055: the `mount.json` at the root of each mounted skill squashfs.
-#[derive(Debug, serde::Deserialize)]
-struct MountManifest {
-    /// `"skill"` (wire it) | `"sentinel"` (reserved-but-unused slot; skip).
-    kind: String,
-    /// Skills this bundle carries.
-    #[serde(default)]
-    skills: Vec<SkillEntry>,
-    /// Bundle-relative path to a git askpass binary, if this bundle ships one
-    /// (wired into `/etc/gitconfig` for forge sessions).
-    #[serde(default)]
-    provides_askpass: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct SkillEntry {
-    /// Skill dir name under `skills/<name>` + the harness discovery name.
-    name: String,
-    /// Bundle-relative wrapper paths to symlink onto PATH (basename = the
-    /// PATH command name).
-    #[serde(default)]
-    bins: Vec<String>,
-    /// Gate: skip this skill unless this env key is present in `session_env`
-    /// (e.g. `create-pull-request` requires `ENGRAM_FORGE_TOKEN`).
-    #[serde(default)]
-    requires_env: Option<String>,
-}
+// ADR 0055: the `mount.json` schema (`MountManifest` / `SkillEntry`) is the
+// shared contract in `engram-mount-manifest` — produced by the bake recipes and
+// the coordinator's P2 skill packer, consumed here. Kept in a serde-only crate
+// so it stays cheap to link into the in-guest agentd.
+use engram_mount_manifest::MountManifest;
 
 /// Resolve the canonical guest paths under `root`.
 struct Layout {
@@ -113,7 +91,7 @@ pub fn activate(root: &Path, session_env: &HashMap<String, String>) -> Activatio
                 Err(_) => continue, // unmounted slot / no manifest
             };
             match serde_json::from_slice::<MountManifest>(&bytes) {
-                Ok(m) if m.kind == "sentinel" => {} // reserved-but-unused slot
+                Ok(m) if m.is_sentinel() => {} // reserved-but-unused slot
                 Ok(m) => bundles.push((slot, m)),
                 Err(e) => report.warnings.push(format!(
                     "bad mount.json at {}: {e}",
