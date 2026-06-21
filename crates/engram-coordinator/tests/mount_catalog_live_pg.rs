@@ -69,14 +69,22 @@ async fn register_resolves_pins_upserts_and_soft_deletes() {
 
     // list_skills contains it.
     assert!(
-        meta.list_skills().await.unwrap().iter().any(|s| s.name == name),
+        meta.list_skills()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.name == name),
         "list_skills must include the registered skill",
     );
 
     // The catalog sha is in the pin set (∪ with snapshot pins) — so it reaches
     // every host's `live_bundles` and stages on-demand.
     assert!(
-        meta.bundle_pin_set().await.unwrap().iter().any(|r| r.sha256 == sha),
+        meta.bundle_pin_set()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.sha256 == sha),
         "bundle_pin_set must include a live catalog skill's sha",
     );
 
@@ -103,11 +111,24 @@ async fn register_resolves_pins_upserts_and_soft_deletes() {
 
     // Soft-delete → gone from resolve + list + pin set (upload-path GC enabled),
     // and idempotent.
-    assert!(meta.soft_delete_skill(&name).await.unwrap(), "deleted a live row");
-    assert!(meta.get_skill_by_name(&name).await.unwrap().is_none());
-    assert!(!meta.list_skills().await.unwrap().iter().any(|s| s.name == name));
     assert!(
-        !meta.bundle_pin_set().await.unwrap().iter().any(|r| r.sha256 == sha2),
+        meta.soft_delete_skill(&name).await.unwrap(),
+        "deleted a live row"
+    );
+    assert!(meta.get_skill_by_name(&name).await.unwrap().is_none());
+    assert!(!meta
+        .list_skills()
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.name == name));
+    assert!(
+        !meta
+            .bundle_pin_set()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.sha256 == sha2),
         "a soft-deleted skill drops out of the pin set",
     );
     assert!(
