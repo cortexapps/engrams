@@ -74,13 +74,12 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     setUploadErr(null);
     try {
       // The coordinator sniffs the form (tar / .tar.gz / .zip / lone SKILL.md)
-      // by magic bytes, so the raw file bytes ride the payloadTar field. The
-      // owner is stamped server-side from the session — what we send is ignored.
+      // by magic bytes, so the raw file bytes ride the payloadTar field. `owner`
+      // is intentionally not set — the orchestrator stamps it from the session.
       const payloadTar = new Uint8Array(await skillFile.arrayBuffer());
       await uploadSkill.mutateAsync({
         name: skillName.trim(),
         description: skillDesc.trim(),
-        owner: "",
         payloadTar,
       });
       toast.success(`Uploaded skill "${skillName.trim()}"`);

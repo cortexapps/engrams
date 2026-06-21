@@ -46,8 +46,12 @@ message RegisterSkillRequest {
   // alphanumerics, dash, underscore — and not a reserved fleet bundle name).
   string name = 1;
   string description = 2;
-  // Uploader principal for attribution (the orchestrator sets it from the
-  // authenticated user; the coordinator does not authenticate it).
+  // Orchestrator-asserted uploader principal (attribution / GC / quota). The
+  // coordinator is identity-agnostic (ADR 0051) and trusts this value the same
+  // way it trusts orchestrator-resolved session identity — so it MUST be set by
+  // the trusted orchestrator, NOT by the web. On the web→orchestrator hop the
+  // orchestrator overwrites it with the authenticated session's user, so a value
+  // sent by a less-trusted caller is ignored (no spoofing).
   string owner = 3;
   // The skill payload: an archive of the skill directory (tar, gzipped tar, or
   // zip) OR a lone SKILL.md — the coordinator sniffs the form by magic bytes

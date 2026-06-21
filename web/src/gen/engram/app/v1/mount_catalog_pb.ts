@@ -93,8 +93,12 @@ export type RegisterSkillRequest = Message<"engram.app.v1.RegisterSkillRequest">
   description: string;
 
   /**
-   * Uploader principal for attribution (the orchestrator sets it from the
-   * authenticated user; the coordinator does not authenticate it).
+   * Orchestrator-asserted uploader principal (attribution / GC / quota). The
+   * coordinator is identity-agnostic (ADR 0051) and trusts this value the same
+   * way it trusts orchestrator-resolved session identity — so it MUST be set by
+   * the trusted orchestrator, NOT by the web. On the web→orchestrator hop the
+   * orchestrator overwrites it with the authenticated session's user, so a value
+   * sent by a less-trusted caller is ignored (no spoofing).
    *
    * @generated from field: string owner = 3;
    */
