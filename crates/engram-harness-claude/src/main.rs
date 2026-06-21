@@ -47,8 +47,8 @@ mod adapter {
     use clap::Parser;
     use engram_core::SessionId;
     use engram_harness_proto::{
-        read_msg, write_msg, AgentRole, HarnessAttach, HarnessAttachAck, HarnessCommand,
-        HarnessEvent, HarnessFrame,
+        read_msg, write_msg, AgentRole, EditHunk, FileChange, HarnessAttach, HarnessAttachAck,
+        HarnessCommand, HarnessEvent, HarnessFrame, MAX_FILE_CHANGE_BYTES,
     };
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
@@ -1063,6 +1063,12 @@ mod adapter {
         /// terminal `AgentMessage` will use — the UI keys the live bubble
         /// on it and reconciles in place when the durable message lands.
         current_message_id: Option<String>,
+        /// ADR 0054 Flavor A: file changes parsed from a `Write`/`Edit`/
+        /// `MultiEdit` tool_use, keyed by tool_use_id and held until the
+        /// matching `tool_result` — so a `FileChanged` is emitted only on a
+        /// SUCCESSFUL result (never a phantom diff for a failed edit). Value
+        /// is `(path, change)`.
+        pending_file_changes: HashMap<String, (String, FileChange)>,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -1325,6 +1331,7 @@ mod adapter {
                                     &mut t.tool_calls,
                                     cli.max_tool_calls,
                                     &mut t.current_message_id,
+                                    &mut t.pending_file_changes,
                                 ) {
                                     for ev in translated {
                                         emit(evt_tx, ev).await;
@@ -1344,6 +1351,7 @@ mod adapter {
                                     &mut sink,
                                     cli.max_tool_calls,
                                     &mut None,
+                                    &mut HashMap::new(),
                                 );
                             }
                         }
@@ -1651,6 +1659,7 @@ mod adapter {
             tool_calls: 0,
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
+            pending_file_changes: HashMap::new(),
         }
     }
 
@@ -1685,6 +1694,7 @@ mod adapter {
             tool_calls: 0,
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
+            pending_file_changes: HashMap::new(),
         }
     }
 
@@ -1854,6 +1864,10 @@ mod adapter {
         // turn (set by `stream_event`/`message_start`) so token chunks carry
         // the same id as the terminal `assistant` message.
         current_message_id: &mut Option<String>,
+        // ADR 0054 Flavor A: file changes parsed from a tool_use, keyed by
+        // tool_use_id and held until the matching tool_result (so we emit a
+        // `FileChanged` only on success). Tracked across lines within a turn.
+        pending_file_changes: &mut HashMap<String, (String, FileChange)>,
     ) -> Option<Vec<HarnessEvent>> {
         let v: Value = serde_json::from_str(line).ok()?;
         let ty = v.get("type")?.as_str()?;
@@ -1955,8 +1969,16 @@ mod adapter {
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("?")
                                     .to_string();
-                                let args_summary = b
-                                    .get("input")
+                                let input = b.get("input");
+                                // ADR 0054 Flavor A: stash a parsed file change
+                                // for a Write/Edit/MultiEdit, keyed by id, to
+                                // emit on the SUCCESSFUL tool_result. The
+                                // generic ToolCallStarted still fires (the UI
+                                // dedups it against the FileChanged card).
+                                if let Some(fc) = input.and_then(|i| parse_file_change(&name, i)) {
+                                    pending_file_changes.insert(tcid.clone(), fc);
+                                }
+                                let args_summary = input
                                     .map(|v| truncate_str(&v.to_string(), MAX_ARGS_SUMMARY_BYTES));
                                 out.push(HarnessEvent::ToolCallStarted {
                                     run_id: rid.clone(),
@@ -2005,7 +2027,7 @@ mod adapter {
                             };
                             out.push(HarnessEvent::ToolCallCompleted {
                                 run_id: rid.clone(),
-                                tool_call_id: tcid,
+                                tool_call_id: tcid.clone(),
                                 tool_name: String::new(),
                                 ok: !is_error,
                                 duration_ms: 0,
@@ -2014,6 +2036,20 @@ mod adapter {
                                     MAX_RESULT_SUMMARY_BYTES,
                                 )),
                             });
+                            // ADR 0054 Flavor A: a Write/Edit/MultiEdit landed
+                            // its result. Emit the rich diff ONLY on success;
+                            // drop the stashed change on failure (truthful —
+                            // no phantom diff for a failed edit).
+                            if let Some((path, change)) = pending_file_changes.remove(&tcid) {
+                                if !is_error {
+                                    out.push(HarnessEvent::FileChanged {
+                                        run_id: rid.clone(),
+                                        tool_call_id: tcid,
+                                        path,
+                                        change,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -2025,6 +2061,50 @@ mod adapter {
             _ => {}
         }
         Some(out)
+    }
+
+    /// ADR 0054 Flavor A: map a Claude `Write`/`Edit`/`MultiEdit` tool input
+    /// into a normalized `(path, FileChange)`. Returns `None` for any other
+    /// tool or a malformed input. Each inner string is truncated to
+    /// `MAX_FILE_CHANGE_BYTES` *here* (per-string, before serialization) so a
+    /// single huge write can't blow the frame — the 1 KB `args_summary` cap is
+    /// untouched and still applies to every tool's generic event.
+    pub fn parse_file_change(name: &str, input: &Value) -> Option<(String, FileChange)> {
+        let path = input.get("file_path")?.as_str()?.to_string();
+        let clip = |s: &str| truncate_str(s, MAX_FILE_CHANGE_BYTES);
+        match name {
+            "Write" => {
+                let content = clip(input.get("content")?.as_str()?);
+                Some((path, FileChange::Write { content }))
+            }
+            "Edit" => {
+                let old = clip(input.get("old_string")?.as_str()?);
+                let new = clip(input.get("new_string")?.as_str()?);
+                Some((
+                    path,
+                    FileChange::Edit {
+                        hunks: vec![EditHunk { old, new }],
+                    },
+                ))
+            }
+            "MultiEdit" => {
+                let edits = input.get("edits")?.as_array()?;
+                let hunks: Vec<EditHunk> = edits
+                    .iter()
+                    .filter_map(|e| {
+                        Some(EditHunk {
+                            old: clip(e.get("old_string")?.as_str()?),
+                            new: clip(e.get("new_string")?.as_str()?),
+                        })
+                    })
+                    .collect();
+                if hunks.is_empty() {
+                    return None;
+                }
+                Some((path, FileChange::Edit { hunks }))
+            }
+            _ => None,
+        }
     }
 
     pub fn truncate_str(s: &str, max_bytes: usize) -> String {
@@ -2753,7 +2833,8 @@ async fn main() -> std::process::ExitCode {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::adapter::*;
-    use engram_harness_proto::HarnessEvent;
+    use engram_harness_proto::{FileChange, HarnessEvent};
+    use std::collections::HashMap;
 
     #[test]
     fn system_init_emits_nothing_and_assistant_text_carries_run_id() {
@@ -2763,10 +2844,11 @@ mod tests {
         let init = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
         let asst = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"hi there"}]}}"#;
         let mut tc = 0u32;
-        let evs = translate_jsonl(init, "run-1", &mut tc, 50, &mut None).unwrap();
+        let mut fc = HashMap::new();
+        let evs = translate_jsonl(init, "run-1", &mut tc, 50, &mut None, &mut fc).unwrap();
         assert!(evs.is_empty(), "init emits no HarnessEvent");
 
-        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None).unwrap();
+        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None, &mut fc).unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::AgentMessage { text, run_id, .. } => {
@@ -2792,20 +2874,25 @@ mod tests {
 
         let mut tc = 0u32;
         let mut mid: Option<String> = None;
+        let mut fc = HashMap::new();
 
         // message_start: no event, but the id is now tracked.
-        assert!(translate_jsonl(msg_start, "run-9", &mut tc, 50, &mut mid)
-            .unwrap()
-            .is_empty());
+        assert!(
+            translate_jsonl(msg_start, "run-9", &mut tc, 50, &mut mid, &mut fc)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(mid.as_deref(), Some("msg_42"));
 
         // content_block_start: no chunk (empty text), no event.
-        assert!(translate_jsonl(block_start, "run-9", &mut tc, 50, &mut mid)
-            .unwrap()
-            .is_empty());
+        assert!(
+            translate_jsonl(block_start, "run-9", &mut tc, 50, &mut mid, &mut fc)
+                .unwrap()
+                .is_empty()
+        );
 
         for (line, want) in [(d1, "hel"), (d2, "lo")] {
-            let evs = translate_jsonl(line, "run-9", &mut tc, 50, &mut mid).unwrap();
+            let evs = translate_jsonl(line, "run-9", &mut tc, 50, &mut mid, &mut fc).unwrap();
             assert_eq!(evs.len(), 1);
             match &evs[0] {
                 HarnessEvent::AgentMessageChunk {
@@ -2823,7 +2910,7 @@ mod tests {
 
         // The terminal `assistant` message uses the SAME id — the durable
         // record that supersedes the chunks downstream.
-        let evs = translate_jsonl(complete, "run-9", &mut tc, 50, &mut mid).unwrap();
+        let evs = translate_jsonl(complete, "run-9", &mut tc, 50, &mut mid, &mut fc).unwrap();
         match &evs[0] {
             HarnessEvent::AgentMessage {
                 message_id, text, ..
@@ -2841,12 +2928,13 @@ mod tests {
         let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1.txt\nfile2.py","is_error":false}]}}"#;
 
         let mut tc = 0u32;
-        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None).unwrap();
+        let mut fc = HashMap::new();
+        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None, &mut fc).unwrap();
         assert_eq!(evs.len(), 1);
         assert!(matches!(evs[0], HarnessEvent::ToolCallStarted { .. }));
         assert_eq!(tc, 1);
 
-        let evs = translate_jsonl(user, "run-1", &mut tc, 50, &mut None).unwrap();
+        let evs = translate_jsonl(user, "run-1", &mut tc, 50, &mut None, &mut fc).unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::ToolCallCompleted {
@@ -2861,6 +2949,74 @@ mod tests {
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
         }
+        // A non-file tool stashes no pending change.
+        assert!(fc.is_empty());
+    }
+
+    // ADR 0054 Flavor A: an Edit whose tool_result succeeds emits a
+    // FileChanged (alongside ToolCallCompleted), carrying the normalized hunk.
+    #[test]
+    fn successful_edit_emits_file_changed_with_hunks() {
+        let asst = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_e","name":"Edit","input":{"file_path":"src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}]}}"#;
+        let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_e","content":"ok","is_error":false}]}}"#;
+
+        let mut tc = 0u32;
+        let mut fc = HashMap::new();
+        // tool_use stashes the pending change; only ToolCallStarted is emitted.
+        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None, &mut fc).unwrap();
+        assert!(matches!(
+            evs.as_slice(),
+            [HarnessEvent::ToolCallStarted { .. }]
+        ));
+        assert_eq!(fc.len(), 1);
+
+        // The successful tool_result emits ToolCallCompleted THEN FileChanged,
+        // and retires the pending entry.
+        let evs = translate_jsonl(user, "run-1", &mut tc, 50, &mut None, &mut fc).unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0], HarnessEvent::ToolCallCompleted { .. }));
+        match &evs[1] {
+            HarnessEvent::FileChanged {
+                tool_call_id,
+                path,
+                change,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "toolu_e");
+                assert_eq!(path, "src/main.rs");
+                match change {
+                    FileChange::Edit { hunks } => {
+                        assert_eq!(hunks.len(), 1);
+                        assert_eq!(hunks[0].old, "let x = 1;");
+                        assert_eq!(hunks[0].new, "let x = 2;");
+                    }
+                    other => panic!("expected Edit, got {other:?}"),
+                }
+            }
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
+        assert!(fc.is_empty(), "pending change retired on result");
+    }
+
+    // ADR 0054 Flavor A: a FAILED edit emits no FileChanged (no phantom diff)
+    // but still drops the stashed change.
+    #[test]
+    fn failed_edit_emits_no_file_changed() {
+        let asst = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_w","name":"Write","input":{"file_path":"a.txt","content":"hello"}}]}}"#;
+        let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_w","content":"String to replace not found","is_error":true}]}}"#;
+
+        let mut tc = 0u32;
+        let mut fc = HashMap::new();
+        translate_jsonl(asst, "run-1", &mut tc, 50, &mut None, &mut fc).unwrap();
+        assert_eq!(fc.len(), 1);
+
+        let evs = translate_jsonl(user, "run-1", &mut tc, 50, &mut None, &mut fc).unwrap();
+        // Only the (failed) ToolCallCompleted — no FileChanged.
+        assert!(matches!(
+            evs.as_slice(),
+            [HarnessEvent::ToolCallCompleted { ok: false, .. }]
+        ));
+        assert!(fc.is_empty(), "stashed change dropped on failure");
     }
 
     #[test]
