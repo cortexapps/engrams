@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_core::types::{ExecRusage, SessionState};
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
-use engram_harness_proto::{Answers, HarnessEvent, Question};
+use engram_harness_proto::{Answers, FileChange, HarnessEvent, Question};
 use engram_host_agent::harness::{EventSink, HarnessHub};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -191,6 +191,18 @@ pub enum SessionEvent {
         answers: Answers,
         at: DateTime<Utc>,
     },
+    /// ADR 0054 Flavor A: the agent successfully changed a file via a
+    /// `Write`/`Edit`/`MultiEdit` tool. The web renders a rich diff (red/green
+    /// hunks for an edit, all-green for a write) in place of the generic tool
+    /// card, correlated by `tool_call_id`. Opaque JSONB on `session_events`
+    /// like every other passthrough event — no migration.
+    HarnessFileChanged {
+        run_id: String,
+        tool_call_id: String,
+        path: String,
+        change: FileChange,
+        at: DateTime<Utc>,
+    },
     /// ADR 0023: the agent opened a change request (PR/MR) via the
     /// in-session forge seam. Surfaces the title + URL to the web UI /
     /// SSE subscribers so the session's output artifact is visible (the
@@ -295,6 +307,7 @@ impl SessionEvent {
             Self::HarnessAgentMessageChunk { .. } => "agent_message_chunk",
             Self::HarnessUserQuestion { .. } => "user_question",
             Self::HarnessQuestionAnswered { .. } => "question_answered",
+            Self::HarnessFileChanged { .. } => "file_changed",
             Self::PullRequestOpened { .. } => "pull_request_opened",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
@@ -405,6 +418,18 @@ impl SessionEvent {
                 run_id,
                 tool_call_id,
                 answers,
+                at,
+            },
+            HarnessEvent::FileChanged {
+                run_id,
+                tool_call_id,
+                path,
+                change,
+            } => Self::HarnessFileChanged {
+                run_id,
+                tool_call_id,
+                path,
+                change,
                 at,
             },
         }
@@ -916,6 +941,45 @@ pub(crate) mod tests {
             other => panic!("expected HarnessQuestionAnswered, got {other:?}"),
         }
         assert_eq!(a.kind(), "question_answered");
+    }
+
+    #[test]
+    fn file_changed_maps_from_harness_with_stable_kind() {
+        // ADR 0054 Flavor A: the harness FileChanged event maps to the coord
+        // SessionEvent under the stable `file_changed` kind the web keys on,
+        // carrying the path + change through opaquely.
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::FileChanged {
+                run_id: "r1".into(),
+                tool_call_id: "toolu_e".into(),
+                path: "src/main.rs".into(),
+                change: FileChange::Edit {
+                    hunks: vec![engram_harness_proto::EditHunk {
+                        old: "a".into(),
+                        new: "b".into(),
+                    }],
+                },
+            },
+            chrono::Utc::now(),
+        );
+        match &ev {
+            SessionEvent::HarnessFileChanged {
+                tool_call_id,
+                path,
+                change,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "toolu_e");
+                assert_eq!(path, "src/main.rs");
+                assert!(matches!(change, FileChange::Edit { .. }));
+            }
+            other => panic!("expected HarnessFileChanged, got {other:?}"),
+        }
+        assert_eq!(ev.kind(), "file_changed");
+        // Externally-tagged FileChange serializes as `{ "edit": { "hunks": … }}`
+        // — the snake_case key the web discriminates on (and bincode-safe).
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json["change"]["edit"]["hunks"].is_array());
     }
 
     #[test]
