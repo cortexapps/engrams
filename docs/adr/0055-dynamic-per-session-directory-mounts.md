@@ -1,6 +1,6 @@
 # ADR 0055: Dynamic per-session directory mounts — profile-selected skills on the RO-bundle engine
 
-Status: 2026-06-19 — **Proposed (P1 implemented; prod-validation pending before Accepted).**
+Status: 2026-06-20 — **Proposed (P1 implemented + prod-validated; P2 implemented, validation pending before Accepted).**
 Builds on **ADR 0027** (the read-only host-mounted shared bundle engine), **ADR 0035**
 (content-addressed bundle generations + the load-paused `patch_drive` swap), and **ADR
 0053** (session profiles). This is the first concrete instance of the **per-profile
@@ -288,9 +288,10 @@ VM and is a separate snapshot/UFFD-compat project.
   base-snapshot re-bake. Run the measurement gate on dev-vm (slot cost + FC device
   ceiling) and validate a same-base-snapshot boot across two skill selections.
 - **P2 — user-uploaded skills.** Upload (orchestrator) → deterministic pack →
-  content-address → register in the catalog, **per-user/owner scoped** (ADR 0031
-  Principal); upload-path GC. The artifact/pin machinery from P1 carries it; P2 adds the
-  upload UX, storage, and authorization. (No composition to extend — a uniform win.)
+  content-address → register in an **org-shared** catalog (see § P2 design); upload-path
+  GC. The artifact/pin machinery from P1 carries it; P2 adds the upload UX, the durable
+  catalog the fleet stamp couldn't hold, and the registration authz. (No composition to
+  extend — a uniform win.)
 
 ## P1 implementation notes (divergences from the plan)
 
@@ -344,6 +345,95 @@ simplifies the design above:
   selection isn't persisted on the queue row; such sessions boot with base skills only.
   Resume is unaffected (skills are pinned in the snapshot's `aux_bundles`). Closing the gap
   needs a session-row `selected_skills` column — deferred, documented at the call site.
+
+## P2 design — org-shared user-uploaded skills
+
+P1 deferred a real catalog by leaning on the fleet's baked `current_bundles` stamp (a
+host bakes `deploy/bundles/*`, reports `name → sha`, the coordinator resolves selected
+names against it). User uploads can't be baked into the host image, so P2 finally builds
+the durable catalog §5 described — but **only for uploads**: the baked admin skills stay
+the fleet stamp, and the resolver reads **`fleet_stamp ∪ mount_catalog`**.
+
+### Ownership: org-shared, not per-user-private (the resolved §5/§6 open question)
+
+The ADR's "per-user/owner scoped" phrasing collides with reality: **profiles are
+admin-curated and shared today** (ADR 0053, no owner column). Making uploaded skills
+*private* would force a profile-ownership refactor, an owner principal on the
+`CreateSession` wire, cross-user name collisions, and per-session resolve-time authz —
+all speculative until profiles themselves are user-owned. So P2 ships an **org-shared
+catalog**:
+
+- One org-wide catalog. The `owner` column records *who uploaded* (attribution, quota,
+  GC ownership, and the future-private migration), **not an access boundary**. Any
+  (admin-curated, shared) profile may select any catalog skill.
+- **The wire is unchanged.** `profile.skills` stays a list of **names**;
+  `CreateSessionRequest.selected_skills` is untouched; the coordinator still owns
+  name→sha→slot resolution — now over `fleet_stamp ∪ mount_catalog`. Catalog names are
+  **UNIQUE org-wide and may not collide with a fleet bundle name** (`Register` rejects a
+  name already in the fleet stamp), so a single flat name namespace resolves
+  unambiguously. Zero proto change to the session-create path.
+- Per-user-private skills (and the user-owned profiles that would scope them) are a clean
+  follow-up once profiles gain ownership — the `owner` column is the seam.
+
+### The catalog (coordinator-owned artifacts + table)
+
+- **`mount_catalog`** (migration, coordinator PG): `id`, `owner`, `name` (UNIQUE),
+  `sha256`, `mount_json`, `size_bytes`, `created_at`, `deleted_at` (soft-delete →
+  upload-path GC). New `MetadataStore` methods (`register_skill` / `list_skills` /
+  `get_skill` / `soft_delete_skill`).
+- **`MountCatalogService`** (app-gRPC, mirrors `ImageService`): `RegisterSkill` (name +
+  description + a `.tar` of the skill dir), `ListSkills`, `GetSkill`, `DeleteSkill`.
+  `RegisterSkill` is synchronous and **idempotent by content** (re-registering the same
+  bytes yields the same `sha256`): it packs → publishes → upserts the row, no enable-job
+  state machine (a small markdown skill packs in well under a second).
+- **Pack** (coordinator, `skill_pack`): lay the upload under `skills/<name>/`, generate
+  the `mount.json` (`{"kind":"skill","skills":[{"name":"<name>"}]}` — the same schema
+  `activate()` already reads), then `mksquashfs` with deterministic flags →
+  `put_object("bundles/sha256/<sha>")`. The coordinator image + the nix dev shell gain
+  `squashfs-tools` (P1's admin bundles already pack with `mksquashfs` in CI — same tool,
+  same flags). Path-traversal-guarded untar; a `SKILL.md` at the upload root is required.
+
+### Hosts auto-stage uploads with **zero new host code**
+
+The §8 catalog pin set is the whole trick. The heartbeat ack's `live_bundles` is
+`meta.bundle_pin_set()`; today that's the shas in `snapshots.aux_bundles`. P2 extends it
+to **snapshot-pins ∪ catalog-pins** (`SELECT sha256 FROM mount_catalog WHERE deleted_at
+IS NULL`). The instant a skill is registered its sha enters the pin set → every host's
+bundle supervisor prefetches it via the already-content-addressed `fetch_one`
+(`bundles/sha256/<sha>`, digest-verified) → it's staged before any session selects it.
+The per-session `patch_drive` swap, agentd remount of `/opt/engram/dyn/*`, and
+manifest-driven `activate()` are all P1-complete and skill-agnostic — an uploaded skill is
+just another content-addressed generation.
+
+### GC is already correct (upload-path GC for free)
+
+`bundle_gc` sweeps any `bundles/` blob absent from the pin set after a grace period.
+Catalog-pinning a live skill keeps its blob; **soft-deleting the catalog row drops it from
+the pin set, and the existing sweep reclaims the blob after grace** — upload-path GC with
+no new mechanism. A skill currently pinned by an eviction snapshot's `aux_bundles`
+survives its catalog deletion until that snapshot is GC'd (correct: a resumed session
+keeps the skills it booted with).
+
+### Upload UX (orchestrator + web)
+
+No upload path exists today (`api/upload.rs` is the in-session artifact bridge). P2 adds an
+orchestrator multipart route: the web profile editor's static `BUILTIN_SKILLS` becomes a
+live catalog fetch (builtins + uploaded), with an upload control that posts a lone
+`SKILL.md` or a `.tar.gz` of the skill dir; the orchestrator normalizes either to a `.tar`,
+attaches the authenticated `user.id` as `owner`, and calls `RegisterSkill`. Profile-save
+validates each selected name against `builtins ∪ catalog`.
+
+### P2 scope boundaries (deferred, documented)
+
+- **Markdown/file skills only.** An uploaded skill's `mount.json` declares no `bins` /
+  `requires_env` / `provides_askpass` — executable-wrapper skills (like the built-in
+  `share-file`/`create-pull-request`) stay the admin/baked domain (glibc-only binaries,
+  ADR 0027). Declaring upload-time bins is a later refinement.
+- **Per-user-private skills + user-owned profiles** — the follow-up the `owner` column
+  seams.
+- **Streaming upload.** `RegisterSkill` carries the `.tar` as a unary `bytes` field under
+  a small cap (markdown skills are KiB); a client-streaming upload is the upgrade if
+  binary-bearing user skills ever land.
 
 ## Consequences / risks
 
