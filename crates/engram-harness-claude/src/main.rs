@@ -1063,6 +1063,13 @@ mod adapter {
         /// terminal `AgentMessage` will use — the UI keys the live bubble
         /// on it and reconciles in place when the durable message lands.
         current_message_id: Option<String>,
+        /// ADR 0054: `AskUserQuestion` tool_use_ids seen this turn that have
+        /// NOT yet received a `tool_result` — i.e. questions the hook deferred
+        /// and that are still pending. While this is non-empty, any assistant
+        /// text/chunk is the "narrate-past" hallucination (claude talking past
+        /// a deferred tool) and is suppressed; an answer-resume that delivers
+        /// the `tool_result` clears the id and re-enables normal output.
+        auq_pending: HashSet<String>,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -1274,13 +1281,39 @@ mod adapter {
                                 // run, then run the next queued prompt
                                 // back-to-back (no Idle gap) or announce Idle.
                                 if let Some(t) = turn.take() {
+                                    // ADR 0054: a turn that left an AUQ pending
+                                    // but ended `terminal_reason != "tool_deferred"`
+                                    // is a narrate-past — claude abandoned the
+                                    // deferred question instead of suspending. The
+                                    // hallucinated reply was already suppressed in
+                                    // `translate_jsonl`; surface the event for
+                                    // observability. The UserQuestion card the hook
+                                    // emitted stands, so the session stays
+                                    // awaiting-answer.
+                                    let narrated_past = marker.terminal_reason.as_deref()
+                                        != Some("tool_deferred")
+                                        && !t.auq_pending.is_empty();
+                                    let pending_questions = t.auq_pending.len();
                                     let run_id = t.run_id;
                                     tracing::info!(
                                         %run_id,
                                         subtype = %marker.subtype,
                                         is_error = marker.is_error,
+                                        terminal_reason =
+                                            marker.terminal_reason.as_deref().unwrap_or(""),
                                         "turn result"
                                     );
+                                    if narrated_past {
+                                        tracing::warn!(
+                                            %run_id,
+                                            pending_questions,
+                                            terminal_reason =
+                                                marker.terminal_reason.as_deref().unwrap_or(""),
+                                            "AskUserQuestion narrate-past: claude ended the turn \
+                                             without suspending on a deferred question; suppressed \
+                                             the hallucinated reply, question card stands (ADR 0054)"
+                                        );
+                                    }
                                     if interrupted_run.as_deref() == Some(run_id.as_str()) {
                                         // control_request-style abort that
                                         // surfaced as a result (Phase 3);
@@ -1325,6 +1358,7 @@ mod adapter {
                                     &mut t.tool_calls,
                                     cli.max_tool_calls,
                                     &mut t.current_message_id,
+                                    &mut t.auq_pending,
                                 ) {
                                     for ev in translated {
                                         emit(evt_tx, ev).await;
@@ -1344,6 +1378,7 @@ mod adapter {
                                     &mut sink,
                                     cli.max_tool_calls,
                                     &mut None,
+                                    &mut HashSet::new(),
                                 );
                             }
                         }
@@ -1651,6 +1686,7 @@ mod adapter {
             tool_calls: 0,
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
+            auq_pending: HashSet::new(),
         }
     }
 
@@ -1685,6 +1721,7 @@ mod adapter {
             tool_calls: 0,
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
+            auq_pending: HashSet::new(),
         }
     }
 
@@ -1770,6 +1807,14 @@ mod adapter {
     pub struct ResultMarker {
         pub subtype: String,
         pub is_error: bool,
+        /// ADR 0054: `tool_deferred` vs `completed` — the ONLY discriminator
+        /// between a genuinely-deferred `AskUserQuestion` (turn suspends,
+        /// awaiting an answer) and a "narrate-past" (claude abandons the
+        /// deferred tool and ends the turn). Both are `subtype:"success"`,
+        /// `is_error:false`, so neither of those can tell them apart. Mirrors
+        /// the Agent SDK's `SDKResultSuccess.terminal_reason`. `None` on older
+        /// CLIs that don't emit the field.
+        pub terminal_reason: Option<String>,
     }
 
     /// Detect claude's terminal `result` line. Substring-gated so we
@@ -1792,6 +1837,10 @@ mod adapter {
                 .unwrap_or("")
                 .to_string(),
             is_error: v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false),
+            terminal_reason: v
+                .get("terminal_reason")
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
         })
     }
 
@@ -1854,6 +1903,11 @@ mod adapter {
         // turn (set by `stream_event`/`message_start`) so token chunks carry
         // the same id as the terminal `assistant` message.
         current_message_id: &mut Option<String>,
+        // ADR 0054: pending (no-result) `AskUserQuestion` tool_use_ids for this
+        // turn. We add an id on a deferred AUQ tool_use and remove it on the
+        // matching tool_result; while the set is non-empty, assistant
+        // text/chunks are the narrate-past hallucination and are suppressed.
+        auq_pending: &mut HashSet<String>,
     ) -> Option<Vec<HarnessEvent>> {
         let v: Value = serde_json::from_str(line).ok()?;
         let ty = v.get("type")?.as_str()?;
@@ -1884,7 +1938,11 @@ mod adapter {
                         if let Some(delta) = event.get("delta") {
                             if delta.get("type").and_then(|s| s.as_str()) == Some("text_delta") {
                                 if let Some(chunk) = delta.get("text").and_then(|s| s.as_str()) {
-                                    if !chunk.is_empty() {
+                                    // ADR 0054: while an AUQ is pending (deferred,
+                                    // no result), live token chunks are the
+                                    // narrate-past hallucination streaming out —
+                                    // drop them so the bogus reply never types out.
+                                    if !chunk.is_empty() && auq_pending.is_empty() {
                                         out.push(HarnessEvent::AgentMessageChunk {
                                             run_id: run_id.to_string(),
                                             message_id: current_message_id
@@ -1920,6 +1978,13 @@ mod adapter {
             }
             "assistant" => {
                 let rid = run_id.to_string();
+                // ADR 0054: snapshot BEFORE the block loop. If an EARLIER
+                // message in this turn left an AUQ pending (the hook deferred
+                // it), any assistant text in THIS later message is the
+                // narrate-past hallucination → drop it. A preamble in the SAME
+                // message as the AUQ tool_use survives: that id is only inserted
+                // during this loop, after this snapshot.
+                let suppress_text = !auq_pending.is_empty();
                 let msg = v.get("message")?;
                 let msg_id = msg
                     .get("id")
@@ -1958,6 +2023,13 @@ mod adapter {
                                 let args_summary = b
                                     .get("input")
                                     .map(|v| truncate_str(&v.to_string(), MAX_ARGS_SUMMARY_BYTES));
+                                // ADR 0054: an `AskUserQuestion` is deferred by
+                                // the hook — no `tool_result` follows unless an
+                                // answer-resume delivers one. Mark it pending so
+                                // a subsequent narrate-past message is suppressed.
+                                if name == "AskUserQuestion" {
+                                    auq_pending.insert(tcid.clone());
+                                }
                                 out.push(HarnessEvent::ToolCallStarted {
                                     run_id: rid.clone(),
                                     tool_call_id: tcid,
@@ -1968,7 +2040,7 @@ mod adapter {
                             _ => {}
                         }
                     }
-                    if !text_buf.is_empty() {
+                    if !text_buf.is_empty() && !suppress_text {
                         out.push(HarnessEvent::AgentMessage {
                             run_id: rid,
                             message_id: msg_id,
@@ -1990,6 +2062,11 @@ mod adapter {
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("toolu-?")
                                 .to_string();
+                            // ADR 0054: a tool_result resolves a pending AUQ
+                            // (the answer-resume path), so following assistant
+                            // text is legitimate ("You selected …") and must
+                            // not be suppressed.
+                            auq_pending.remove(&tcid);
                             let is_error =
                                 b.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
                             let result_text = match b.get("content") {
@@ -2763,10 +2840,26 @@ mod tests {
         let init = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
         let asst = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"hi there"}]}}"#;
         let mut tc = 0u32;
-        let evs = translate_jsonl(init, "run-1", &mut tc, 50, &mut None).unwrap();
+        let evs = translate_jsonl(
+            init,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashSet::new(),
+        )
+        .unwrap();
         assert!(evs.is_empty(), "init emits no HarnessEvent");
 
-        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None).unwrap();
+        let evs = translate_jsonl(
+            asst,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::AgentMessage { text, run_id, .. } => {
@@ -2794,18 +2887,40 @@ mod tests {
         let mut mid: Option<String> = None;
 
         // message_start: no event, but the id is now tracked.
-        assert!(translate_jsonl(msg_start, "run-9", &mut tc, 50, &mut mid)
-            .unwrap()
-            .is_empty());
+        assert!(translate_jsonl(
+            msg_start,
+            "run-9",
+            &mut tc,
+            50,
+            &mut mid,
+            &mut std::collections::HashSet::new()
+        )
+        .unwrap()
+        .is_empty());
         assert_eq!(mid.as_deref(), Some("msg_42"));
 
         // content_block_start: no chunk (empty text), no event.
-        assert!(translate_jsonl(block_start, "run-9", &mut tc, 50, &mut mid)
-            .unwrap()
-            .is_empty());
+        assert!(translate_jsonl(
+            block_start,
+            "run-9",
+            &mut tc,
+            50,
+            &mut mid,
+            &mut std::collections::HashSet::new()
+        )
+        .unwrap()
+        .is_empty());
 
         for (line, want) in [(d1, "hel"), (d2, "lo")] {
-            let evs = translate_jsonl(line, "run-9", &mut tc, 50, &mut mid).unwrap();
+            let evs = translate_jsonl(
+                line,
+                "run-9",
+                &mut tc,
+                50,
+                &mut mid,
+                &mut std::collections::HashSet::new(),
+            )
+            .unwrap();
             assert_eq!(evs.len(), 1);
             match &evs[0] {
                 HarnessEvent::AgentMessageChunk {
@@ -2823,7 +2938,15 @@ mod tests {
 
         // The terminal `assistant` message uses the SAME id — the durable
         // record that supersedes the chunks downstream.
-        let evs = translate_jsonl(complete, "run-9", &mut tc, 50, &mut mid).unwrap();
+        let evs = translate_jsonl(
+            complete,
+            "run-9",
+            &mut tc,
+            50,
+            &mut mid,
+            &mut std::collections::HashSet::new(),
+        )
+        .unwrap();
         match &evs[0] {
             HarnessEvent::AgentMessage {
                 message_id, text, ..
@@ -2841,12 +2964,28 @@ mod tests {
         let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1.txt\nfile2.py","is_error":false}]}}"#;
 
         let mut tc = 0u32;
-        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None).unwrap();
+        let evs = translate_jsonl(
+            asst,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(evs.len(), 1);
         assert!(matches!(evs[0], HarnessEvent::ToolCallStarted { .. }));
         assert_eq!(tc, 1);
 
-        let evs = translate_jsonl(user, "run-1", &mut tc, 50, &mut None).unwrap();
+        let evs = translate_jsonl(
+            user,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::ToolCallCompleted {
@@ -2882,6 +3021,125 @@ mod tests {
         let err = r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
         let m = detect_result_marker(err).expect("error result still detected");
         assert!(m.is_error);
+    }
+
+    #[test]
+    fn detect_result_marker_captures_terminal_reason() {
+        // ADR 0054: a genuinely deferred AUQ ends the turn subtype=success
+        // but terminal_reason="tool_deferred"; a narrate-past ends
+        // terminal_reason="completed". `subtype`/`is_error` are identical in
+        // both, so `terminal_reason` is the only discriminator (matches the
+        // Agent SDK's SDKResultSuccess contract).
+        let deferred = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"tool_deferred"}"#;
+        assert_eq!(
+            detect_result_marker(deferred)
+                .unwrap()
+                .terminal_reason
+                .as_deref(),
+            Some("tool_deferred")
+        );
+        let completed = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}"#;
+        assert_eq!(
+            detect_result_marker(completed)
+                .unwrap()
+                .terminal_reason
+                .as_deref(),
+            Some("completed")
+        );
+        // Absent (older CLI / non-AUQ paths) → None.
+        let bare = r#"{"type":"result","subtype":"success","is_error":false}"#;
+        assert_eq!(detect_result_marker(bare).unwrap().terminal_reason, None);
+    }
+
+    #[test]
+    fn narrate_past_assistant_text_after_deferred_auq_is_suppressed() {
+        // ADR 0054 (observed on claude-sonnet-4-6, ~1/8): after an
+        // AskUserQuestion is deferred (the hook returns `defer`, no
+        // tool_result follows), claude sometimes narrates a bogus "internal
+        // error retrieving your answer" in a LATER assistant message and ends
+        // the turn `completed` instead of `tool_deferred`. That hallucination
+        // must NOT reach the UI — the UserQuestion card (emitted by the hook)
+        // is the source of truth and the session stays awaiting-answer.
+        let mut tc = 0u32;
+        let mut auq = std::collections::HashSet::new();
+
+        // 1) claude proposes the AUQ; the hook defers it (no tool_result).
+        let auq_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{"questions":[]}}]}}"#;
+        let evs = translate_jsonl(auq_use, "run-1", &mut tc, 50, &mut None, &mut auq).unwrap();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, HarnessEvent::ToolCallStarted { .. })),
+            "the AUQ tool call still surfaces (the UI dedups it against UserQuestion)"
+        );
+
+        // 2) the narrate-past: a NEW assistant message with bogus error text.
+        let bogus = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"It seems there was an internal error retrieving your answer."}]}}"#;
+        let evs = translate_jsonl(bogus, "run-1", &mut tc, 50, &mut None, &mut auq).unwrap();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, HarnessEvent::AgentMessage { .. })),
+            "the hallucinated post-defer message must be suppressed, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn narrate_past_chunks_after_deferred_auq_are_suppressed() {
+        // The hallucinated message also streams as live token chunks
+        // (`--include-partial-messages`); those must be suppressed too, or the
+        // user watches the bogus error type out live.
+        let mut tc = 0u32;
+        let mut mid: Option<String> = None;
+        let mut auq = std::collections::HashSet::new();
+
+        let auq_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{}}]}}"#;
+        translate_jsonl(auq_use, "run-1", &mut tc, 50, &mut mid, &mut auq).unwrap();
+
+        let chunk = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"internal error"}}}"#;
+        let evs = translate_jsonl(chunk, "run-1", &mut tc, 50, &mut mid, &mut auq).unwrap();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, HarnessEvent::AgentMessageChunk { .. })),
+            "post-defer chunks must be suppressed, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn answered_auq_does_not_suppress_following_text() {
+        // Regression guard: the LEGIT answer path is AUQ tool_use →
+        // tool_result (the answer) → assistant text ("You selected Red").
+        // The tool_result clears the pending AUQ, so the text MUST be emitted.
+        let mut tc = 0u32;
+        let mut auq = std::collections::HashSet::new();
+
+        let auq_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{}}]}}"#;
+        translate_jsonl(auq_use, "run-1", &mut tc, 50, &mut None, &mut auq).unwrap();
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_AUQ","content":"Do you prefer red or blue?=Red","is_error":false}]}}"#;
+        translate_jsonl(result, "run-1", &mut tc, 50, &mut None, &mut auq).unwrap();
+
+        let after = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"You selected Red."}]}}"#;
+        let evs = translate_jsonl(after, "run-1", &mut tc, 50, &mut None, &mut auq).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, HarnessEvent::AgentMessage { text, .. } if text == "You selected Red.")),
+            "text after an ANSWERED AUQ must be emitted, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn preamble_in_same_message_as_deferred_auq_is_kept() {
+        // Regression guard: a preamble in the SAME assistant message as the
+        // AUQ tool_use is a legitimate "I have a question:" — only LATER
+        // messages (after the defer) are the hallucination. The suppress flag
+        // is captured at line start, so same-message text survives.
+        let mut tc = 0u32;
+        let mut auq = std::collections::HashSet::new();
+        let line = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"Let me ask:"},{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{}}]}}"#;
+        let evs = translate_jsonl(line, "run-1", &mut tc, 50, &mut None, &mut auq).unwrap();
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, HarnessEvent::AgentMessage { text, .. } if text == "Let me ask:")
+            ),
+            "same-message preamble must be kept, got {evs:?}"
+        );
     }
 
     #[test]
