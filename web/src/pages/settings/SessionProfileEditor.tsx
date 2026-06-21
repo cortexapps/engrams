@@ -6,6 +6,7 @@ import * as z from "zod";
 import { toast } from "sonner";
 import { useProfile, useCreateProfile, useUpdateProfile } from "../../hooks/useProfiles";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
+import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { IconPicker } from "../../components/profiles/IconPicker";
 import {
   EnvVarsEditor,
@@ -45,33 +46,50 @@ const schema = z.object({
 });
 type Values = z.infer<typeof schema>;
 
-// ADR 0055: the built-in skill bundles an admin can grant a profile. The
-// coordinator resolves these names to staged content shas + reserved-slot
-// mounts at session create. (P2 replaces this fixed list with the dynamic
-// catalog once user-uploaded skills land.)
-const BUILTIN_SKILLS: { name: string; label: string; description: string }[] = [
-  {
-    name: "skills",
-    label: "Built-in skills",
-    description: "share-file, create-pull-request, and the git credential wiring.",
-  },
-  {
-    name: "playwright",
-    label: "Browser (Playwright)",
-    description:
-      "chromium-headless-shell + the playwright-cli powering the show-your-work skill. Use an image sized for a browser (≥1 GiB).",
-  },
-];
-
 export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const navigate = useNavigate();
   const params = useParams({ strict: false }) as { id?: string };
   const editingId = mode === "edit" ? params.id : undefined;
   const { data: existing } = useProfile(editingId);
   const { data: images } = useEnabledImages(true);
+  const { data: skills } = useSkills();
+  const uploadSkill = useUploadSkill();
   const create = useCreateProfile();
   const update = useUpdateProfile();
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
+
+  // ADR 0055 P2: inline skill upload (admin). Local state, separate from the
+  // react-hook-form; on success the catalog query invalidates and the new skill
+  // appears as a toggle.
+  const [skillName, setSkillName] = useState("");
+  const [skillDesc, setSkillDesc] = useState("");
+  const [skillFile, setSkillFile] = useState<File | null>(null);
+  const [uploadErr, setUploadErr] = useState<string | null>(null);
+
+  const onUploadSkill = async () => {
+    if (!skillName.trim() || !skillFile) {
+      setUploadErr("A name and a SKILL.md (or .tar.gz / .zip) are required.");
+      return;
+    }
+    setUploadErr(null);
+    try {
+      // The coordinator sniffs the form (tar / .tar.gz / .zip / lone SKILL.md)
+      // by magic bytes, so the raw file bytes ride the payloadTar field. `owner`
+      // is intentionally not set — the orchestrator stamps it from the session.
+      const payloadTar = new Uint8Array(await skillFile.arrayBuffer());
+      await uploadSkill.mutateAsync({
+        name: skillName.trim(),
+        description: skillDesc.trim(),
+        payloadTar,
+      });
+      toast.success(`Uploaded skill "${skillName.trim()}"`);
+      setSkillName("");
+      setSkillDesc("");
+      setSkillFile(null);
+    } catch (e) {
+      setUploadErr(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const form = useForm<Values>({
     resolver: zodResolver(schema),
@@ -204,7 +222,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             control={form.control}
             render={({ field }) => (
               <>
-                {BUILTIN_SKILLS.map((s) => {
+                {(skills ?? []).map((s) => {
                   const checked = field.value.includes(s.name);
                   return (
                     <Field key={s.name} orientation="horizontal">
@@ -214,14 +232,17 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                         checked={checked}
                         onCheckedChange={(on) =>
                           field.onChange(
-                            on
-                              ? [...field.value, s.name]
-                              : field.value.filter((n) => n !== s.name),
+                            on ? [...field.value, s.name] : field.value.filter((n) => n !== s.name),
                           )
                         }
                       />
                       <div>
-                        <FieldLabel htmlFor={`skill-${s.name}`}>{s.label}</FieldLabel>
+                        <FieldLabel htmlFor={`skill-${s.name}`}>
+                          {s.label}
+                          {!s.builtin && (
+                            <span className="ml-2 text-xs text-muted-foreground">(uploaded)</span>
+                          )}
+                        </FieldLabel>
                         <FieldDescription>{s.description}</FieldDescription>
                       </div>
                     </Field>
@@ -230,6 +251,53 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               </>
             )}
           />
+          {/* ADR 0055 P2: upload a skill (admin). A lone SKILL.md, or a .tar.gz /
+              .zip of the skill dir; the coordinator sniffs + packs it. */}
+          <Field>
+            <FieldLabel htmlFor="skill-upload-name">Upload a skill</FieldLabel>
+            <FieldDescription>
+              A skill is a <code>SKILL.md</code> (or a <code>.tar.gz</code> / <code>.zip</code> of
+              the skill directory). It joins the org-shared catalog for any profile to select.
+            </FieldDescription>
+            <Input
+              id="skill-upload-name"
+              data-testid="skill-upload-name"
+              placeholder="skill name (lowercase, dashes)"
+              value={skillName}
+              onChange={(e) => setSkillName(e.target.value)}
+            />
+            <Input
+              id="skill-upload-desc"
+              data-testid="skill-upload-desc"
+              placeholder="short description"
+              value={skillDesc}
+              onChange={(e) => setSkillDesc(e.target.value)}
+            />
+            <input
+              id="skill-upload-file"
+              data-testid="skill-upload-file"
+              type="file"
+              accept=".md,.markdown,.tar,.tar.gz,.tgz,.zip"
+              className="text-sm"
+              onChange={(e) => setSkillFile(e.target.files?.[0] ?? null)}
+            />
+            {uploadErr && (
+              <p className="text-sm text-destructive" data-testid="skill-upload-error">
+                {uploadErr}
+              </p>
+            )}
+            <div>
+              <Button
+                type="button"
+                variant="outline"
+                data-testid="skill-upload-submit"
+                disabled={uploadSkill.isPending}
+                onClick={onUploadSkill}
+              >
+                {uploadSkill.isPending ? "Uploading…" : "Upload skill"}
+              </Button>
+            </div>
+          </Field>
         </FieldGroup>
       </FieldSet>
 

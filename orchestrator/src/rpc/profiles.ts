@@ -24,6 +24,11 @@ import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { makeProfileStore, type ProfileRow, type ProfileStore } from "../db/profiles.ts";
 import { images as defaultImages } from "../control-plane/client.ts";
+import {
+  defaultCatalog,
+  selectableSkillNames,
+  type MountCatalogClient,
+} from "../skills/catalog.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -40,6 +45,7 @@ export interface ProfileDeps {
   getSession?: GetSession;
   store?: ProfileStore;
   images?: ImagesClient;
+  mountCatalog?: MountCatalogClient;
 }
 
 function headersOf(ctx: HandlerContext): Headers {
@@ -77,12 +83,31 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
   const store: ProfileStore = deps?.store ?? makeProfileStore(getDb());
   const images: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
+  const mountCatalog: MountCatalogClient = deps?.mountCatalog ?? defaultCatalog();
 
   /** Validate image_id against the live catalog; throw InvalidArgument if absent. */
   async function assertImageEnabled(imageId: string): Promise<void> {
     const resp = await images.listEnabledImages({});
     if (!resp.images.some((i) => i.id === imageId)) {
       throw new ConnectError("image_id is not an enabled image", Code.InvalidArgument);
+    }
+  }
+
+  /**
+   * ADR 0055 P2: validate selected skills against builtins ∪ the live upload
+   * catalog (like image_id). The coordinator re-checks at session-create, but
+   * failing here keeps a profile from ever referencing a skill the editor
+   * wouldn't have offered.
+   */
+  async function assertSkillsValid(skills: string[]): Promise<void> {
+    if (skills.length === 0) return;
+    const allowed = await selectableSkillNames(mountCatalog);
+    const unknown = skills.filter((s) => !allowed.has(s));
+    if (unknown.length > 0) {
+      throw new ConnectError(
+        `unknown skill(s): ${unknown.join(", ")}`,
+        Code.InvalidArgument,
+      );
     }
   }
 
@@ -117,6 +142,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
+      await assertSkillsValid(req.skills ?? []);
       const row = await store.create({
         name: req.name,
         description: req.description,
@@ -135,6 +161,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
+      await assertSkillsValid(req.skills ?? []);
       const row = await store.update(req.id, {
         name: req.name,
         description: req.description,

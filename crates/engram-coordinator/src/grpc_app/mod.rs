@@ -14,6 +14,7 @@ pub mod auth;
 mod convert;
 mod fleet;
 mod image;
+mod mount_catalog;
 mod session;
 mod shell_relay;
 
@@ -26,6 +27,7 @@ use tonic::Status;
 
 pub use fleet::AppFleetService;
 pub use image::AppImageService;
+pub use mount_catalog::AppMountCatalogService;
 pub use session::AppSessionService;
 pub use shell_relay::AppShellRelayService;
 
@@ -154,8 +156,17 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
             },
         ))
         .add_service(app::image_service_server::ImageServiceServer::new(
-            AppImageService { state, auth },
+            AppImageService {
+                state: state.clone(),
+                auth: auth.clone(),
+            },
         ))
+        // ADR 0055 P2: the org-shared user-uploaded skill catalog.
+        .add_service(
+            app::mount_catalog_service_server::MountCatalogServiceServer::new(
+                AppMountCatalogService { state, auth },
+            ),
+        )
 }
 
 #[cfg(test)]
@@ -360,6 +371,7 @@ mod convention {
         ("shell_relay.rs", include_str!("shell_relay.rs")),
         ("fleet.rs", include_str!("fleet.rs")),
         ("image.rs", include_str!("image.rs")),
+        ("mount_catalog.rs", include_str!("mount_catalog.rs")),
     ];
 
     /// Files under `src/grpc_app/` that are deliberately NOT listed in

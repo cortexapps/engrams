@@ -17,6 +17,7 @@ members = [
     "crates/engram-sandbox-process",
     "crates/engram-sandbox-vz",
     "crates/engram-session-bundles",
+    "crates/engram-mount-manifest",
     "crates/engram-cloud-gcp",
     "crates/engram-cloud-static",
     "crates/engram-cloud-mock",
@@ -81,6 +82,7 @@ engram-transport = { path = "crates/engram-transport" }
 engram-host-agent = { path = "crates/engram-host-agent" }
 engram-sandbox-process = { path = "crates/engram-sandbox-process" }
 engram-session-bundles = { path = "crates/engram-session-bundles" }
+engram-mount-manifest = { path = "crates/engram-mount-manifest" }
 engram-secrets-dev = { path = "crates/engram-secrets-dev" }
 engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
 engram-git-dev = { path = "crates/engram-git-dev" }
@@ -175,6 +177,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # misc
 tar = "0.4"
 flate2 = "1"
+# ADR 0055 P2: read user-uploaded .zip skill archives. Lean: deflate + store
+# only (no bzip2/zstd/aes), and extraction is budgeted against zip bombs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 zstd = "0.13"
 once_cell = "1"
 parking_lot = "0.12"

@@ -17,8 +17,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # (currently 2.39). bookworm (2.36) would refuse to load the binary
 # with: `version GLIBC_2.39 not found`.
 FROM debian:trixie-slim
+# squashfs-tools: ADR 0055 P2 — the coordinator's `skill_pack` shells to
+# `mksquashfs` to pack an uploaded skill dir into a content-addressed RO
+# squashfs at registration (MountCatalogService.RegisterSkill).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates squashfs-tools \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /tmp/engram-coordinator /usr/local/bin/engram-coordinator
 COPY deploy/migrations /opt/engram/migrations

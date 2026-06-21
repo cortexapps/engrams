@@ -124,6 +124,34 @@ fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
 }
 
+/// ADR 0055 P2: a `mount_catalog` row → the shared `CatalogSkill`. The tuple is
+/// `(id, owner, name, description, sha256, mount_json, size_bytes, created_at)`.
+#[allow(clippy::type_complexity)]
+fn catalog_skill_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+    ),
+) -> engram_core::types::CatalogSkill {
+    let (id, owner, name, description, sha256, mount_json, size_bytes, created_at) = row;
+    engram_core::types::CatalogSkill {
+        id,
+        owner,
+        name,
+        description,
+        sha256,
+        mount_json,
+        size_bytes,
+        created_at,
+    }
+}
+
 /// ADR 0048: per-host placement inputs. `alloc_mib` is the host-measured
 /// RAM headroom (`<= 0` = unmeasured); `cpu_budget` is `total_vcpus ×
 /// overcommit` (`0` = host hasn't reported its core count → no CPU gate).
@@ -3936,15 +3964,23 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    /// ADR 0035 §5: distinct bundle generations referenced by any
-    /// snapshot row. jsonb unnest in SQL so the coord never pages the
-    /// whole table; the result is at most a handful of refs.
+    /// ADR 0035 §5 + ADR 0055 P2: distinct bundle generations referenced by any
+    /// snapshot row **∪ every live `mount_catalog` skill** — so a
+    /// registered-but-currently-unused uploaded skill stays staged on the fleet
+    /// (its sha enters `live_bundles`) and survives the bundle GC. jsonb unnest
+    /// in SQL so the coord never pages either table; the result is a handful of
+    /// refs. Catalog pins carry the skill `name` as a cosmetic `drive_id` (the
+    /// host stages by `sha256`); a sha pinned by both a snapshot slot and the
+    /// catalog appears once per distinct drive_id, which the GC (keyed on sha)
+    /// and the host supervisor (stages by sha, idempotent) both collapse.
     async fn bundle_pin_set(
         &self,
     ) -> Result<Vec<engram_core::types::sandbox::AuxBundleRef>, MetaError> {
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT DISTINCT b->>'drive_id', b->>'sha256'
-               FROM snapshots, jsonb_array_elements(aux_bundles) AS b",
+               FROM snapshots, jsonb_array_elements(aux_bundles) AS b
+             UNION
+             SELECT name, sha256 FROM mount_catalog WHERE deleted_at IS NULL",
         )
         .fetch_all(&self.pool)
         .await
@@ -3957,6 +3993,122 @@ impl MetadataStore for PostgresStore {
             .collect();
         out.sort_by(|a, b| (&a.drive_id, &a.sha256).cmp(&(&b.drive_id, &b.sha256)));
         Ok(out)
+    }
+
+    /// ADR 0055 P2: upsert-by-name a packed user-uploaded skill into the
+    /// org-shared catalog. A name matching a live row updates it in place
+    /// (stable `id` + `created_at`); content-addressing makes re-registering the
+    /// same bytes a no-op-equivalent (same `sha256`). Returns the live row.
+    async fn register_skill(
+        &self,
+        owner: &str,
+        name: &str,
+        description: &str,
+        sha256: &str,
+        mount_json: &str,
+        size_bytes: i64,
+    ) -> Result<engram_core::types::CatalogSkill, MetaError> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "INSERT INTO mount_catalog (owner, name, description, sha256, mount_json, size_bytes)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (name) WHERE deleted_at IS NULL
+             DO UPDATE SET owner = EXCLUDED.owner,
+                           description = EXCLUDED.description,
+                           sha256 = EXCLUDED.sha256,
+                           mount_json = EXCLUDED.mount_json,
+                           size_bytes = EXCLUDED.size_bytes
+             RETURNING id, owner, name, description, sha256, mount_json, size_bytes, created_at",
+        )
+        .bind(owner)
+        .bind(name)
+        .bind(description)
+        .bind(sha256)
+        .bind(mount_json)
+        .bind(size_bytes)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(catalog_skill_from_row(row))
+    }
+
+    /// ADR 0055 P2: every live catalog skill, newest first.
+    async fn list_skills(&self) -> Result<Vec<engram_core::types::CatalogSkill>, MetaError> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT id, owner, name, description, sha256, mount_json, size_bytes, created_at
+               FROM mount_catalog WHERE deleted_at IS NULL
+             ORDER BY created_at DESC, name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(catalog_skill_from_row).collect())
+    }
+
+    /// ADR 0055 P2: resolve one selected skill name to its live catalog row.
+    async fn get_skill_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<engram_core::types::CatalogSkill>, MetaError> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT id, owner, name, description, sha256, mount_json, size_bytes, created_at
+               FROM mount_catalog WHERE name = $1 AND deleted_at IS NULL",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(catalog_skill_from_row))
+    }
+
+    /// ADR 0055 P2: soft-delete a catalog skill (drops it from the pin set →
+    /// existing bundle GC reclaims the blob after grace). Returns whether a live
+    /// row was deleted.
+    async fn soft_delete_skill(&self, name: &str) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE mount_catalog SET deleted_at = now()
+               WHERE name = $1 AND deleted_at IS NULL",
+        )
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// ADR 0035 §5: sticky-first-seen candidate upsert (bundle

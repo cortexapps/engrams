@@ -1442,11 +1442,59 @@ pub trait MetadataStore: Send + Sync {
     // ADR 0035 — bundle-generation GC (mirrors the chunk GC trio).
 
     /// ADR 0035 §5: the bundle pin set — every `(drive_id, sha256)`
-    /// some `snapshots.aux_bundles` row references. The union (plus
-    /// the hosts' reported current generations) is what the GC keeps
-    /// and what heartbeat acks advertise as `live_bundles`.
+    /// some `snapshots.aux_bundles` row references, **∪ every live
+    /// `mount_catalog` skill** (ADR 0055 P2, so a registered-but-currently-unused
+    /// uploaded skill stays staged + survives GC). The union (plus the hosts'
+    /// reported current generations) is what the GC keeps and what heartbeat
+    /// acks advertise as `live_bundles`.
     async fn bundle_pin_set(&self) -> Result<Vec<crate::types::sandbox::AuxBundleRef>, MetaError> {
         Ok(Vec::new())
+    }
+
+    // ----------------------------------------------------------------
+    // ADR 0055 P2 — org-shared user-uploaded skill catalog (`mount_catalog`).
+
+    /// Register (upsert by `name`) a packed, content-addressed user-uploaded
+    /// skill. Idempotent by content: re-registering identical bytes yields the
+    /// same `sha256`. `owner` is attribution only — the catalog is org-shared.
+    /// Returns the live row. A name matching an existing catalog row updates it
+    /// (new sha/owner/description); collision with a *fleet* bundle name is
+    /// rejected by the caller before this is reached.
+    async fn register_skill(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _description: &str,
+        _sha256: &str,
+        _mount_json: &str,
+        _size_bytes: i64,
+    ) -> Result<crate::types::CatalogSkill, MetaError> {
+        Err(MetaError::Db(
+            "register_skill is not supported by this MetadataStore".into(),
+        ))
+    }
+
+    /// Every live catalog skill (newest first) — for the orchestrator's catalog
+    /// listing + profile-editor validation.
+    async fn list_skills(&self) -> Result<Vec<crate::types::CatalogSkill>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve one selected skill name to its live catalog row, if any. The
+    /// session-create resolver calls this for a name absent from the fleet
+    /// stamp (ADR 0055 P2: `fleet_stamp ∪ mount_catalog`).
+    async fn get_skill_by_name(
+        &self,
+        _name: &str,
+    ) -> Result<Option<crate::types::CatalogSkill>, MetaError> {
+        Ok(None)
+    }
+
+    /// Soft-delete a catalog skill by name (sets `deleted_at`). Dropping it from
+    /// the pin set lets the existing bundle GC reclaim its blob after the grace
+    /// window (upload-path GC). Returns whether a live row was deleted.
+    async fn soft_delete_skill(&self, _name: &str) -> Result<bool, MetaError> {
+        Ok(false)
     }
 
     /// ADR 0035 §5: idempotent candidate upsert; `first_seen_at`

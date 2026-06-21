@@ -317,6 +317,12 @@ jobs:
       - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
         uses: ./.github/actions/setup-reproducible-mke2fs
 
+      # ADR 0055 P2: mksquashfs for the engram-coordinator `skill_pack`
+      # determinism test (it self-skips without the tool, like the ext4 test's
+      # mke2fs gate — install it so the test actually RUNS in this lane).
+      - name: Install squashfs-tools
+        run: sudo apt-get install -y -qq --no-install-recommends squashfs-tools
+
       # Default (non-ignored) tests across the entire workspace. Mirrors
       # `just check`'s nextest pass — same speedup, same coverage. The
       # engram-image-builder e2e bake test skips itself if `docker` is
@@ -362,6 +368,7 @@ jobs:
             --test host_status_transition_live_pg \
             --test queue_scanner_live_pg \
             --test binding_cas_live_pg \
+            --test mount_catalog_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

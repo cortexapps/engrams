@@ -1,0 +1,21 @@
+[package]
+name = "engram-mount-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ADR 0055: the mount.json schema carried at the root of every dynamic-mount squashfs — the single source of truth shared by the producers (the deploy/bundles bake recipes' Rust consumer + the coordinator's P2 skill packer) and the consumer (engram-session-bundles::activate in the FC guest). Serde-only, no heavy deps, so it stays cheap for agentd."
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
