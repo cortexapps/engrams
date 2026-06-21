@@ -146,6 +146,50 @@ pub struct QuestionOption {
 /// pins a mixed-arity sample to keep that regression loud.
 pub type Answers = BTreeMap<String, Vec<String>>;
 
+// ---- Rich file changes (ADR 0054 Flavor A) -----------------------------
+//
+// A harness-agnostic mirror of an agent's file-mutating tool (Claude's
+// `Write` / `Edit` / `MultiEdit`). The harness recognizes such a tool and,
+// on its **successful** `tool_result`, emits a [`HarnessEvent::FileChanged`]
+// the UI renders as a rich diff (red/green hunks for an edit, an all-green
+// block for a write) — in place of the generic tool card.
+
+/// Per-string truncation budget for a [`FileChange`]. Each inner string
+/// (`Write.content`, every `EditHunk.old`/`new`) is clipped to this *before*
+/// serialization — never the JSON blob — so a single huge write can't blow
+/// the frame. Distinct from (and far larger than) the 1 KB `args_summary`
+/// cap used for every other tool's generic event.
+pub const MAX_FILE_CHANGE_BYTES: usize = 64 * 1024;
+
+/// What changed about a file. **Externally tagged** (the default serde enum
+/// representation), NOT `#[serde(tag = "op")]`: this type rides the *bincode*
+/// harness wire as a field of [`HarnessEvent::FileChanged`], and bincode is
+/// positional with no `deserialize_any`, so an internally-tagged (`tag`) or
+/// untagged enum **panics at decode** — the same constraint that forces
+/// [`Answers`] to be a flat `Vec<String>`. `rename_all` keeps the JSON the
+/// coordinator re-emits over SSE clean: `{ "write": { "content": … } }` /
+/// `{ "edit": { "hunks": [ … ] } }`, which the web discriminates by key.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    /// A whole-file write (Claude's `Write`). The UI renders `content` as an
+    /// all-green (all-added) block.
+    Write { content: String },
+    /// One or more search/replace edits (Claude's `Edit` = one hunk;
+    /// `MultiEdit` = many). The UI renders red/green hunks.
+    Edit { hunks: Vec<EditHunk> },
+}
+
+/// One search/replace edit. Maps from Claude's `{ old_string, new_string }`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EditHunk {
+    /// The text being replaced (Claude's `old_string`). Empty for a pure
+    /// insertion.
+    pub old: String,
+    /// The replacement text (Claude's `new_string`).
+    pub new: String,
+}
+
 /// Events the harness emits as the agent inside it does work. The
 /// host forwards each into `session_events`; consumers (Slack bot,
 /// web UI, audit log) read `GET /sessions/:id/events` SSE and render
@@ -311,6 +355,23 @@ pub enum HarnessEvent {
         tool_call_id: String,
         answers: Answers,
     },
+    // ── ADR 0054 Flavor A: rich file-change rendering. APPENDED after
+    //    `QuestionAnswered` so existing bincode variant indices never shift
+    //    (… QuestionAnswered=12, FileChanged=13). Landed after Flavor B, so
+    //    it takes the next trailing index — see tests/wire_golden.rs.
+    /// The agent successfully changed a file via a `Write`/`Edit`/`MultiEdit`
+    /// tool. Emitted on the **successful** `tool_result` only (truthful —
+    /// never a phantom diff for a failed edit), correlated to the originating
+    /// tool call by `tool_call_id` (the UI renders this rich diff in place of
+    /// that tool's generic card). `path` is the file; `change` carries the
+    /// write content or the edit hunks (each inner string truncated to
+    /// [`MAX_FILE_CHANGE_BYTES`]).
+    FileChanged {
+        run_id: String,
+        tool_call_id: String,
+        path: String,
+        change: FileChange,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -344,6 +405,7 @@ impl HarnessEvent {
             Self::AgentMessageChunk { .. } => "agent_message_chunk",
             Self::UserQuestion { .. } => "user_question",
             Self::QuestionAnswered { .. } => "question_answered",
+            Self::FileChanged { .. } => "file_changed",
             Self::Idle => "harness_idle",
         }
     }
@@ -356,7 +418,8 @@ impl HarnessEvent {
             Self::ToolCallStarted { tool_call_id, .. }
             | Self::ToolCallCompleted { tool_call_id, .. }
             | Self::UserQuestion { tool_call_id, .. }
-            | Self::QuestionAnswered { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            | Self::QuestionAnswered { tool_call_id, .. }
+            | Self::FileChanged { tool_call_id, .. } => Some(tool_call_id.as_str()),
             _ => None,
         }
     }

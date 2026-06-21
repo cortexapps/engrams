@@ -36,8 +36,8 @@ use std::path::PathBuf;
 
 use engram_core::SessionId;
 use engram_harness_proto::{
-    AgentRole, Answers, CheckpointReason, ForgeOp, ForgeResponse, HarnessCommand, HarnessEvent,
-    HarnessFrame, Question, QuestionOption, UploadOp, UploadResponse,
+    AgentRole, Answers, CheckpointReason, EditHunk, FileChange, ForgeOp, ForgeResponse,
+    HarnessCommand, HarnessEvent, HarnessFrame, Question, QuestionOption, UploadOp, UploadResponse,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -235,6 +235,38 @@ fn cmd_answer_question() -> HarnessCommand {
         answers: sample_answers(),
     }
 }
+/// An edit with two hunks — one replacement and one pure insertion (empty
+/// `old`) — pins the `FileChange::Edit` + `EditHunk` field order (ADR 0054).
+fn ev_file_changed_edit() -> HarnessEvent {
+    HarnessEvent::FileChanged {
+        run_id: "r1".into(),
+        tool_call_id: "toolu_1".into(),
+        path: "src/main.rs".into(),
+        change: FileChange::Edit {
+            hunks: vec![
+                EditHunk {
+                    old: "let x = 1;".into(),
+                    new: "let x = 2;".into(),
+                },
+                EditHunk {
+                    old: String::new(),
+                    new: "// added".into(),
+                },
+            ],
+        },
+    }
+}
+/// A whole-file write — pins the `FileChange::Write` arm (the second `op`).
+fn ev_file_changed_write() -> HarnessEvent {
+    HarnessEvent::FileChanged {
+        run_id: "r1".into(),
+        tool_call_id: "toolu_2".into(),
+        path: "README.md".into(),
+        change: FileChange::Write {
+            content: "# Title\n\nbody\n".into(),
+        },
+    }
+}
 
 fn cmd_checkpoint() -> HarnessCommand {
     HarnessCommand::Checkpoint {
@@ -290,6 +322,8 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_agent_message_chunk", &ev_agent_message_chunk());
     assert_golden("event_user_question", &ev_user_question());
     assert_golden("event_question_answered", &ev_question_answered());
+    assert_golden("event_file_changed_edit", &ev_file_changed_edit());
+    assert_golden("event_file_changed_write", &ev_file_changed_write());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -318,6 +352,10 @@ fn harness_event_golden_and_variant_indices() {
         12,
         "HarnessEvent::QuestionAnswered",
     );
+    // ADR 0054 Flavor A file change — APPENDED after QuestionAnswered (13).
+    // Both `op` arms are the same enum variant, so both pin index 13.
+    assert_variant_index(&ev_file_changed_edit(), 13, "HarnessEvent::FileChanged");
+    assert_variant_index(&ev_file_changed_write(), 13, "HarnessEvent::FileChanged");
 }
 
 #[test]
@@ -520,6 +558,8 @@ fn regen_golden() {
     write("event_agent_message_chunk", &ev_agent_message_chunk());
     write("event_user_question", &ev_user_question());
     write("event_question_answered", &ev_question_answered());
+    write("event_file_changed_edit", &ev_file_changed_edit());
+    write("event_file_changed_write", &ev_file_changed_write());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);
