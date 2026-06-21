@@ -435,6 +435,45 @@ validates each selected name against `builtins ∪ catalog`.
   a small cap (markdown skills are KiB); a client-streaming upload is the upgrade if
   binary-bearing user skills ever land.
 
+## P2 implementation notes (divergences from the design above)
+
+P2 shipped across `refactor(mount-manifest)` → `feat(P2 store)` → `feat(P2 proto)` →
+`feat(P2 skill packer)` → `feat(P2 service + resolver)` → `feat(P2 orchestrator route)` →
+`feat(P2 web)` → `test(P2 live-pg)`. What landed, and where it sharpens the design:
+
+- **`mount.json` is its own crate.** The schema couldn't fold into `engram-core` (it pulls
+  sqlx/tonic, bloating the in-guest agentd), so it lives in a serde-only
+  `engram-mount-manifest` shared by the producer (`skill_pack`) and consumer (`activate`).
+
+- **Upload/delete are admin-gated; "user-uploaded" is "admin-uploaded" in P2.** The upload
+  control lives in the admin-only profile editor and skills feed admin-curated profiles, so
+  `POST`/`DELETE /api/v1/skills` require admin; list is open to any authenticated user. The
+  `owner` column records the uploading admin. True per-user upload + private scoping is the
+  deferred follow-up the `owner` column seams (it needs user-owned profiles first).
+
+- **Pack runs synchronously in `RegisterSkill`** (no enable-job state machine): a markdown
+  skill packs in well under a second, and content-addressing makes it idempotent. The
+  coordinator image + nix dev shell gained `squashfs-tools`; determinism comes from a pinned
+  `SOURCE_DATE_EPOCH` (NOT `-mkfs-time`, which mksquashfs refuses alongside it).
+
+- **Register→usable has a propagation delay (eventual, ~a heartbeat).** A registered skill's
+  sha enters `bundle_pin_set` immediately, but a host only stages it after the next heartbeat
+  ack's `live_bundles` diff drives the supervisor's `materialize_if_missing`. The FC restore
+  path requires a selected skill to be **already staged** (it fails loud — "not staged on this
+  host (catalog materialize gap)" — rather than materialize on the boot path). So a session
+  selecting a *just-registered* skill, before propagation, fails its create; it succeeds once
+  the fleet has staged it (seconds). Acceptable for the admin-upload-then-use flow; documented
+  here as the one new timing characteristic. (Blocking `RegisterSkill` on fleet staging, or a
+  resolve-time staging check, is the refinement if this ever bites.)
+
+- **Test strategy.** The new P2 logic is covered deterministically: `skill_pack` unit tests
+  (pack determinism, validation, traversal guards — mksquashfs-gated, runs in `test-linux`);
+  `mount_catalog_live_pg` (register/resolve/upsert/soft-delete + the pin-set union, against a
+  real Postgres); the orchestrator route + profile-validation tests; and the web editor tests.
+  The full **register → pin → host-stage → select → mount** path on real Firecracker is the
+  remaining pre-merge dev-vm validation (its mount mechanism is identical to P1's
+  prod-validated fleet-skill mount — only the artifact's *source* differs).
+
 ## Consequences / risks
 
 - **Base-snapshot re-bake.** Reserved slots change the captured device model; all base
