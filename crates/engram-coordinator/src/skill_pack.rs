@@ -11,19 +11,34 @@
 //! address (blob key `bundles/sha256/<sha>`), so re-registering identical bytes
 //! is idempotent.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use engram_mount_manifest::MountManifest;
 use sha2::{Digest, Sha256};
 
-/// Cap on the uploaded tar. Markdown skills are KiB; this is generous headroom
-/// and stays under the 4 MiB gRPC default decode cap.
-pub const MAX_SKILL_TAR_BYTES: usize = 2 * 1024 * 1024;
+/// Cap on the *compressed* upload (tar / tar.gz / zip). Markdown skills are KiB;
+/// this is generous headroom and stays under the 4 MiB gRPC default decode cap.
+/// Checked before any decompression, so it bounds the work an attacker's bytes
+/// can trigger up front.
+pub const MAX_SKILL_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
 
-/// Largest number of files one skill may carry (a sanity bound, not a quota).
+/// Cap on the *decompressed* total written across all entries — the
+/// decompression-bomb (zip/gzip bomb) defense. Enforced by streaming each entry
+/// through this budget in fixed chunks, so memory never exceeds it regardless of
+/// an entry's *claimed* size (zip/tar headers can lie), and a 2 MiB upload that
+/// would expand to gigabytes is aborted partway.
+const MAX_SKILL_UNPACKED_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Largest number of files one skill may carry — a metadata/inode-bomb bound
+/// (many tiny entries) on top of the byte budget.
 const MAX_SKILL_FILES: usize = 4096;
+
+/// Magic bytes for a zip local-file header (`PK\x03\x04`).
+const ZIP_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+/// Magic bytes for a gzip stream (`1f 8b`).
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 /// The result of packing an uploaded skill.
 #[derive(Debug)]
@@ -77,14 +92,14 @@ pub fn validate_skill_name(name: &str) -> Result<(), PackError> {
     Ok(())
 }
 
-/// Pack `payload_tar` (a plain or gzipped POSIX tar of the skill dir) into a
-/// content-addressed squashfs for skill `name`.
-pub fn pack_skill(name: &str, payload_tar: &[u8]) -> Result<PackedSkill, PackError> {
+/// Pack `payload` (a tar, gzipped tar, or zip of the skill dir — sniffed by
+/// magic bytes) into a content-addressed squashfs for skill `name`.
+pub fn pack_skill(name: &str, payload: &[u8]) -> Result<PackedSkill, PackError> {
     validate_skill_name(name)?;
-    if payload_tar.len() > MAX_SKILL_TAR_BYTES {
+    if payload.len() > MAX_SKILL_UPLOAD_BYTES {
         return Err(PackError::Invalid(format!(
-            "payload {} bytes exceeds the {MAX_SKILL_TAR_BYTES} byte cap",
-            payload_tar.len()
+            "payload {} bytes exceeds the {MAX_SKILL_UPLOAD_BYTES} byte cap",
+            payload.len()
         )));
     }
 
@@ -94,7 +109,7 @@ pub fn pack_skill(name: &str, payload_tar: &[u8]) -> Result<PackedSkill, PackErr
     std::fs::create_dir_all(&skill_dir)
         .map_err(|e| PackError::Internal(format!("mkdir skills/{name}: {e}")))?;
 
-    extract_tar_into(payload_tar, &skill_dir)?;
+    extract_into(payload, &skill_dir)?;
 
     // Every skill must carry a top-level SKILL.md (the harness discovery doc).
     if !skill_dir.join("SKILL.md").is_file() {
@@ -121,11 +136,26 @@ pub fn pack_skill(name: &str, payload_tar: &[u8]) -> Result<PackedSkill, PackErr
     })
 }
 
-/// Extract a (possibly gzipped) tar into `dest`, rejecting unsafe entries.
-fn extract_tar_into(payload: &[u8], dest: &Path) -> Result<(), PackError> {
-    // Sniff the gzip magic (1f 8b) — accept either a plain or gzipped tar so the
-    // orchestrator can forward a `.tar.gz` upload verbatim.
-    let reader: Box<dyn Read> = if payload.starts_with(&[0x1f, 0x8b]) {
+/// Extract a recognized archive into `dest`. The format is sniffed by **magic
+/// bytes**, never the filename: zip (`PK\x03\x04`) → zip; gzip (`1f 8b`) →
+/// gzipped tar; otherwise a plain tar. Every entry streams through a shared
+/// decompressed-byte budget (the bomb defense) and unsafe entries are rejected.
+fn extract_into(payload: &[u8], dest: &Path) -> Result<(), PackError> {
+    let mut budget = MAX_SKILL_UNPACKED_BYTES;
+    let count = if payload.starts_with(&ZIP_MAGIC) {
+        extract_zip_into(payload, dest, &mut budget)?
+    } else {
+        extract_tar_into(payload, dest, &mut budget)?
+    };
+    if count == 0 {
+        return Err(PackError::Invalid("empty skill payload".into()));
+    }
+    Ok(())
+}
+
+/// Extract a plain or gzipped tar. Returns the file count.
+fn extract_tar_into(payload: &[u8], dest: &Path, budget: &mut u64) -> Result<usize, PackError> {
+    let reader: Box<dyn Read> = if payload.starts_with(&GZIP_MAGIC) {
         Box::new(flate2::read::GzDecoder::new(payload))
     } else {
         Box::new(payload)
@@ -160,16 +190,7 @@ fn extract_tar_into(payload: &[u8], dest: &Path) -> Result<(), PackError> {
                 .map_err(|e| PackError::Internal(format!("mkdir {}: {e}", out.display())))?;
             continue;
         }
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| PackError::Internal(format!("mkdir {}: {e}", parent.display())))?;
-        }
-        let mut buf = Vec::new();
-        entry
-            .read_to_end(&mut buf)
-            .map_err(|e| PackError::Invalid(format!("read tar entry {}: {e}", safe.display())))?;
-        std::fs::write(&out, &buf)
-            .map_err(|e| PackError::Internal(format!("write {}: {e}", out.display())))?;
+        write_bounded(&mut entry, &out, budget)?;
         count += 1;
         if count > MAX_SKILL_FILES {
             return Err(PackError::Invalid(format!(
@@ -177,8 +198,87 @@ fn extract_tar_into(payload: &[u8], dest: &Path) -> Result<(), PackError> {
             )));
         }
     }
-    if count == 0 {
-        return Err(PackError::Invalid("empty skill payload".into()));
+    Ok(count)
+}
+
+/// Extract a zip. Returns the file count. Rejects symlink entries and unsafe
+/// paths; trusts neither the declared entry size nor the filename.
+fn extract_zip_into(payload: &[u8], dest: &Path, budget: &mut u64) -> Result<usize, PackError> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(payload))
+        .map_err(|e| PackError::Invalid(format!("not a valid zip: {e}")))?;
+
+    let mut count = 0usize;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| PackError::Invalid(format!("zip entry {i}: {e}")))?;
+
+        // Reject symlinks (unix mode S_IFLNK) — an escape risk, like tar.
+        if let Some(mode) = entry.unix_mode() {
+            if mode & 0o170000 == 0o120000 {
+                return Err(PackError::Invalid(
+                    "zip entry is a symlink (only files + dirs allowed)".into(),
+                ));
+            }
+        }
+        // `enclosed_name` returns None for absolute / `..`-escaping paths; we
+        // re-sanitize on top as defense in depth.
+        let Some(name) = entry.enclosed_name() else {
+            return Err(PackError::Invalid(format!(
+                "unsafe zip path: {}",
+                entry.name()
+            )));
+        };
+        let safe = sanitize_rel(&name)?;
+        let out = dest.join(&safe);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out)
+                .map_err(|e| PackError::Internal(format!("mkdir {}: {e}", out.display())))?;
+            continue;
+        }
+        write_bounded(&mut entry, &out, budget)?;
+        count += 1;
+        if count > MAX_SKILL_FILES {
+            return Err(PackError::Invalid(format!(
+                "skill has more than {MAX_SKILL_FILES} files"
+            )));
+        }
+    }
+    Ok(count)
+}
+
+/// Stream `reader` to `out_path` (creating parent dirs), debiting the shared
+/// decompressed-byte `budget`. Fixed-chunk copy so memory stays bounded
+/// regardless of a (possibly bomb) entry's size; aborts the instant the total
+/// would exceed the budget — the decompressor is never driven past the cap.
+fn write_bounded(
+    reader: &mut impl Read,
+    out_path: &Path,
+    budget: &mut u64,
+) -> Result<(), PackError> {
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| PackError::Internal(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    let mut file = std::fs::File::create(out_path)
+        .map_err(|e| PackError::Internal(format!("create {}: {e}", out_path.display())))?;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| PackError::Invalid(format!("read entry: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        if (n as u64) > *budget {
+            return Err(PackError::Invalid(format!(
+                "skill exceeds the {MAX_SKILL_UNPACKED_BYTES} byte unpacked cap \
+                 (decompression bomb?)"
+            )));
+        }
+        *budget -= n as u64;
+        file.write_all(&chunk[..n])
+            .map_err(|e| PackError::Internal(format!("write {}: {e}", out_path.display())))?;
     }
     Ok(())
 }
@@ -286,11 +386,83 @@ mod tests {
 
     #[test]
     fn pack_rejects_oversize() {
-        let big = vec![0u8; MAX_SKILL_TAR_BYTES + 1];
+        let big = vec![0u8; MAX_SKILL_UPLOAD_BYTES + 1];
         assert!(matches!(
             pack_skill("my-skill", &big),
             Err(PackError::Invalid(_))
         ));
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn zip_with(files: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+        for (name, body) in files {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(body).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn rejects_a_gzip_tar_bomb() {
+        // A tar whose one entry decompresses far past the unpacked cap, gzipped
+        // small enough to clear the compressed-input cap — the classic bomb. The
+        // budget aborts extraction before mksquashfs is ever reached (so this
+        // runs without squashfs-tools).
+        let huge = vec![0u8; (MAX_SKILL_UNPACKED_BYTES as usize) + 1024 * 1024];
+        let bomb = gzip(&tar_with(&[("SKILL.md", &huge)]));
+        assert!(
+            bomb.len() < MAX_SKILL_UPLOAD_BYTES,
+            "bomb clears the input cap"
+        );
+        match pack_skill("bomb", &bomb) {
+            Err(PackError::Invalid(m)) => assert!(m.contains("unpacked cap"), "got {m}"),
+            other => panic!("expected an unpacked-cap rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_zip_bomb() {
+        let huge = vec![0u8; (MAX_SKILL_UNPACKED_BYTES as usize) + 1024 * 1024];
+        let bomb = zip_with(&[("SKILL.md", &huge)], zip::CompressionMethod::Deflated);
+        assert!(
+            bomb.len() < MAX_SKILL_UPLOAD_BYTES,
+            "zip bomb clears the input cap"
+        );
+        match pack_skill("zbomb", &bomb) {
+            Err(PackError::Invalid(m)) => assert!(m.contains("unpacked cap"), "got {m}"),
+            other => panic!("expected an unpacked-cap rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zip_and_tar_pack_to_the_same_content_address() {
+        if !mksquashfs_available() {
+            eprintln!(
+                "skipping zip_and_tar_pack_to_the_same_content_address: mksquashfs not on PATH"
+            );
+            return;
+        }
+        // A .zip and a .tar carrying byte-identical files pack to the SAME
+        // squashfs — the content address keys on the unpacked tree, not the
+        // archive format (so a user can upload either and dedup still holds).
+        let files: &[(&str, &[u8])] = &[
+            ("SKILL.md", b"# Zip Skill\nhi\n"),
+            ("reference/notes.md", b"notes\n"),
+        ];
+        let from_zip =
+            pack_skill("z", &zip_with(files, zip::CompressionMethod::Stored)).expect("zip");
+        let from_tar = pack_skill("z", &tar_with(files)).expect("tar");
+        assert_eq!(from_zip.sha256, from_tar.sha256);
+        assert_eq!(&from_zip.squashfs[0..4], b"hsqs");
     }
 
     fn mksquashfs_available() -> bool {

@@ -87,11 +87,26 @@ export function makeSkillsRoute(deps?: SkillsDeps): Hono {
     if (bytes.length > MAX_UPLOAD_BYTES) {
       return c.json({ error: "skill upload exceeds the 2 MiB cap" }, 413);
     }
-    // A .tar(.gz) is forwarded verbatim; anything else is a lone SKILL.md.
+    // A recognized archive (.tar/.tar.gz/.zip) is forwarded verbatim — the
+    // coordinator sniffs the format by magic bytes and unpacks it (budgeted
+    // against decompression bombs). A lone SKILL.md (or .markdown) is wrapped
+    // into a one-entry tar. Anything else is rejected rather than silently
+    // mangled into a garbage SKILL.md.
     const fname = (file.name ?? "").toLowerCase();
-    const isTarball =
-      fname.endsWith(".tar.gz") || fname.endsWith(".tgz") || fname.endsWith(".tar");
-    const payloadTar = isTarball ? bytes : tarSingleFile("SKILL.md", bytes);
+    const isArchive =
+      fname.endsWith(".tar.gz") ||
+      fname.endsWith(".tgz") ||
+      fname.endsWith(".tar") ||
+      fname.endsWith(".zip");
+    const isMarkdown =
+      fname.endsWith(".md") || fname.endsWith(".markdown") || !fname.includes(".");
+    if (!isArchive && !isMarkdown) {
+      return c.json(
+        { error: "upload a SKILL.md, a .tar.gz, or a .zip of the skill directory" },
+        400,
+      );
+    }
+    const payloadTar = isArchive ? bytes : tarSingleFile("SKILL.md", bytes);
     try {
       const resp = await catalog.registerSkill({ name, description, owner: user.id, payloadTar });
       return c.json({ skill: serializeSkill(resp.skill) }, 201);

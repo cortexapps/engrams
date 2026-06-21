@@ -129,6 +129,31 @@ describe("POST /api/v1/skills", () => {
     expect(Array.from(rec.registered[0].payloadTar)).toEqual(Array.from(gz));
   });
 
+  test("a .zip is forwarded verbatim (coordinator sniffs + unpacks)", async () => {
+    const { client, rec } = fakeCatalog();
+    const zip = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 9, 9, 9]); // PK\x03\x04 + junk
+    const file = new File([zip], "skill.zip", { type: "application/zip" });
+    const res = await upload(
+      { mountCatalog: client, getSession: getSession("admin1", "admin") },
+      file,
+      { name: "zip-skill", description: "" },
+    );
+    expect(res.status).toBe(201);
+    expect(Array.from(rec.registered[0].payloadTar)).toEqual(Array.from(zip));
+  });
+
+  test("rejects an unrecognized file type instead of mangling it into SKILL.md", async () => {
+    const { client, rec } = fakeCatalog();
+    const file = new File([new Uint8Array([1, 2, 3])], "evil.exe");
+    const res = await upload(
+      { mountCatalog: client, getSession: getSession("admin1", "admin") },
+      file,
+      { name: "x", description: "" },
+    );
+    expect(res.status).toBe(400);
+    expect(rec.registered).toHaveLength(0);
+  });
+
   test("403 for a non-admin", async () => {
     const { client } = fakeCatalog();
     const file = new File([new Uint8Array([1])], "SKILL.md");

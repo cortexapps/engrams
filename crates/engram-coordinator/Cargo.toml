@@ -58,9 +58,11 @@ parking_lot.workspace = true
 serde.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
-# ADR 0055 P2: unpack an uploaded skill tar (gzip-sniffed) for the squashfs pack.
+# ADR 0055 P2: unpack an uploaded skill archive (tar/tar.gz/zip, magic-sniffed,
+# budgeted against decompression bombs) for the squashfs pack.
 tar.workspace = true
 flate2.workspace = true
+zip.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

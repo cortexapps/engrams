@@ -68,7 +68,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
 
   const onUploadSkill = async () => {
     if (!skillName.trim() || !skillFile) {
-      setUploadErr("A name and a SKILL.md (or .tar.gz) are required.");
+      setUploadErr("A name and a SKILL.md (or .tar.gz / .zip) are required.");
       return;
     }
     setUploadErr(null);
@@ -247,13 +247,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               </>
             )}
           />
-          {/* ADR 0055 P2: upload a skill (admin). A lone SKILL.md or a .tar.gz of
-              the skill dir; the orchestrator normalizes + the coordinator packs. */}
+          {/* ADR 0055 P2: upload a skill (admin). A lone SKILL.md, or a .tar.gz /
+              .zip of the skill dir; the coordinator sniffs + packs it. */}
           <Field>
             <FieldLabel htmlFor="skill-upload-name">Upload a skill</FieldLabel>
             <FieldDescription>
-              A skill is a <code>SKILL.md</code> (or a <code>.tar.gz</code> of the skill directory).
-              It joins the org-shared catalog for any profile to select.
+              A skill is a <code>SKILL.md</code> (or a <code>.tar.gz</code> / <code>.zip</code> of
+              the skill directory). It joins the org-shared catalog for any profile to select.
             </FieldDescription>
             <Input
               id="skill-upload-name"
@@ -273,7 +273,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               id="skill-upload-file"
               data-testid="skill-upload-file"
               type="file"
-              accept=".md,.markdown,.tar,.tar.gz,.tgz"
+              accept=".md,.markdown,.tar,.tar.gz,.tgz,.zip"
               className="text-sm"
               onChange={(e) => setSkillFile(e.target.files?.[0] ?? null)}
             />

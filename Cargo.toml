@@ -177,6 +177,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # misc
 tar = "0.4"
 flate2 = "1"
+# ADR 0055 P2: read user-uploaded .zip skill archives. Lean: deflate + store
+# only (no bzip2/zstd/aes), and extraction is budgeted against zip bombs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 zstd = "0.13"
 once_cell = "1"
 parking_lot = "0.12"
