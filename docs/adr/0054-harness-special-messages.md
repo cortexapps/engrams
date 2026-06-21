@@ -432,6 +432,25 @@ No new id space; no control `request_id` (the control protocol is not used).
   timed-out hook becoming a denial. The cost is that even a fast answer pays one
   resume cycle; acceptable because the wait is human-paced and `ensure_active` is
   already the hot path.
+- **Narrate-past of a deferred AUQ (claude-sonnet-4-6) — addendum 2026-06-20.**
+  `permissionDecision:"defer"` is *documented* to end the turn
+  `terminal_reason:"tool_deferred"` (findings #5/#13), but sonnet-4-6 does **not**
+  honor that reliably. On the **second** `AskUserQuestion` in a session — after a
+  first was answered via a `tool_result`, which primes the model to expect a result
+  — it intermittently (**~1/8 reproduced**; opus-4-8 0/4) records the
+  `hook_deferred_tool`, then runs an *extra* inference that concludes "It seems there
+  was an internal error retrieving your answer" and ends the turn `completed`, never
+  suspending. `subtype`/`is_error` are identical to a clean defer, so the only
+  discriminator is `terminal_reason` + `deferred_tool_use` (the Agent SDK's own
+  `SDKResultSuccess` contract). **Fix:** the harness now tracks pending
+  (no-`tool_result`) `AskUserQuestion` `tool_use_id`s per turn and **suppresses any
+  assistant text/chunks emitted while one is pending** — the hallucinated reply never
+  reaches the UI — and reads `terminal_reason` to log the narrate-past. The
+  `UserQuestion` card the hook already emitted stays the source of truth, so the
+  session remains awaiting-answer. Held-permission designs (the SDK's `canUseTool`;
+  t3code) avoid this class entirely but cannot idle-evict mid-wait — the documented
+  defer-vs-hold trade — which is why engrams keeps defer and hardens it. Evidence:
+  session `bc04ed42` + a two-question repro probe.
 - **Truncation** of large diffs is surfaced in the UI (no silent caps); MultiEdit
   overflow clips trailing hunks and logs the count dropped.
 
