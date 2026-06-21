@@ -39,6 +39,15 @@ const MAX_SKILL_FILES: usize = 4096;
 const ZIP_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
 /// Magic bytes for a gzip stream (`1f 8b`).
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+/// The `ustar` magic in a POSIX/GNU tar header (offset 257).
+const TAR_USTAR_OFFSET: usize = 257;
+const TAR_USTAR_MAGIC: &[u8] = b"ustar";
+
+/// `true` if `payload` looks like a (plain, uncompressed) tar — its header
+/// carries the `ustar` magic at offset 257. A lone markdown doc won't.
+fn looks_like_tar(payload: &[u8]) -> bool {
+    payload.get(TAR_USTAR_OFFSET..TAR_USTAR_OFFSET + TAR_USTAR_MAGIC.len()) == Some(TAR_USTAR_MAGIC)
+}
 
 /// The result of packing an uploaded skill.
 #[derive(Debug)]
@@ -92,8 +101,9 @@ pub fn validate_skill_name(name: &str) -> Result<(), PackError> {
     Ok(())
 }
 
-/// Pack `payload` (a tar, gzipped tar, or zip of the skill dir — sniffed by
-/// magic bytes) into a content-addressed squashfs for skill `name`.
+/// Pack `payload` — a tar, gzipped tar, or zip of the skill dir, or a lone
+/// `SKILL.md` (all sniffed by magic bytes) — into a content-addressed squashfs
+/// for skill `name`.
 pub fn pack_skill(name: &str, payload: &[u8]) -> Result<PackedSkill, PackError> {
     validate_skill_name(name)?;
     if payload.len() > MAX_SKILL_UPLOAD_BYTES {
@@ -136,16 +146,26 @@ pub fn pack_skill(name: &str, payload: &[u8]) -> Result<PackedSkill, PackError> 
     })
 }
 
-/// Extract a recognized archive into `dest`. The format is sniffed by **magic
-/// bytes**, never the filename: zip (`PK\x03\x04`) → zip; gzip (`1f 8b`) →
-/// gzipped tar; otherwise a plain tar. Every entry streams through a shared
-/// decompressed-byte budget (the bomb defense) and unsafe entries are rejected.
+/// Normalize an upload into the staging `dest`. Sniffed by **magic bytes**, never
+/// the filename: zip (`PK\x03\x04`) → zip; gzip (`1f 8b`) or a `ustar` header →
+/// (gzipped) tar; **otherwise the whole payload is a lone `SKILL.md`** — the
+/// common case where a user uploads just their skill doc, so the coordinator is
+/// the single normalization point and the orchestrator forwards raw bytes.
+/// Archive entries stream through a shared decompressed-byte budget (the bomb
+/// defense) and unsafe entries are rejected.
 fn extract_into(payload: &[u8], dest: &Path) -> Result<(), PackError> {
+    if payload.is_empty() {
+        return Err(PackError::Invalid("empty skill payload".into()));
+    }
     let mut budget = MAX_SKILL_UNPACKED_BYTES;
     let count = if payload.starts_with(&ZIP_MAGIC) {
         extract_zip_into(payload, dest, &mut budget)?
-    } else {
+    } else if payload.starts_with(&GZIP_MAGIC) || looks_like_tar(payload) {
         extract_tar_into(payload, dest, &mut budget)?
+    } else {
+        // A lone file → it IS the SKILL.md (bounded by the same byte budget).
+        write_bounded(&mut &payload[..], &dest.join("SKILL.md"), &mut budget)?;
+        1
     };
     if count == 0 {
         return Err(PackError::Invalid("empty skill payload".into()));
@@ -441,6 +461,27 @@ mod tests {
             Err(PackError::Invalid(m)) => assert!(m.contains("unpacked cap"), "got {m}"),
             other => panic!("expected an unpacked-cap rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pack_accepts_a_lone_skill_md() {
+        if !mksquashfs_available() {
+            eprintln!("skipping pack_accepts_a_lone_skill_md: mksquashfs not on PATH");
+            return;
+        }
+        // A raw markdown payload (no archive magic) is the SKILL.md itself, and
+        // packs identically to a one-entry tar carrying the same SKILL.md — so
+        // the orchestrator can forward raw bytes and dedup still holds.
+        let doc = b"# My Skill\nDo the thing.\n";
+        let lone = pack_skill("x", doc).expect("lone");
+        let tarred = pack_skill("x", &tar_with(&[("SKILL.md", doc)])).expect("tar");
+        assert_eq!(lone.sha256, tarred.sha256);
+        assert_eq!(&lone.squashfs[0..4], b"hsqs");
+    }
+
+    #[test]
+    fn rejects_an_empty_payload() {
+        assert!(matches!(pack_skill("x", b""), Err(PackError::Invalid(_))));
     }
 
     #[test]

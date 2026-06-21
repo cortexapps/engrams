@@ -416,11 +416,15 @@ keeps the skills it booted with).
 
 ### Upload UX (orchestrator + web)
 
-No upload path exists today (`api/upload.rs` is the in-session artifact bridge). P2 adds an
-orchestrator multipart route: the web profile editor's static `BUILTIN_SKILLS` becomes a
-live catalog fetch (builtins + uploaded), with an upload control that posts a lone
-`SKILL.md` or a `.tar.gz` of the skill dir; the orchestrator normalizes either to a `.tar`,
-attaches the authenticated `user.id` as `owner`, and calls `RegisterSkill`. Profile-save
+Skills ride the orchestrator's **native Connect `MountCatalogService`** (like
+`ProfileService`/`TaskService`) — *not* an HTTP route. It gates upload/delete to admins and
+stamps the catalog `owner` from the authenticated session, then delegates to the
+coordinator's `MountCatalogService`; list/get are open to any authenticated user. The web
+uses the generated Connect client: the profile editor's static `BUILTIN_SKILLS` becomes a
+live `ListSkills` (merged with the fleet builtins it renders), and the upload control reads
+the file into the `RegisterSkill` `payload_tar` **bytes** field — no multipart, no bespoke
+HTTP leg. The coordinator is the single normalization point: it sniffs tar / `.tar.gz` /
+`.zip` / lone-`SKILL.md` by magic bytes, so the web forwards raw bytes. Profile-save
 validates each selected name against `builtins ∪ catalog`.
 
 ### P2 scope boundaries (deferred, documented)

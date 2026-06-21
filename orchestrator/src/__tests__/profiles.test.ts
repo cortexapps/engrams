@@ -26,6 +26,9 @@ const fakeCatalog = (uploadedNames: string[] = []): MountCatalogClient => ({
       })),
     };
   },
+  async getSkill() {
+    return {};
+  },
   async registerSkill() {
     throw new Error("unused");
   },

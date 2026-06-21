@@ -8,12 +8,12 @@ import eventsRoute from "./routes/events.ts";
 import artifactsRoute from "./routes/artifacts.ts";
 import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
-import skillsRoute from "./routes/skills.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
+import { registerMountCatalog } from "./rpc/mount-catalog.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
@@ -39,8 +39,6 @@ app.route("/", artifactsRoute);
 app.route("/", meRoute);
 // ADR 0051 Task 28: admin REST proxy (pause/resume session — no gRPC equiv yet).
 app.route("/", adminRoute);
-// ADR 0055 P2: skill catalog list/upload/delete (multipart upload is HTTP, not gRPC).
-app.route("/", skillsRoute);
 
 // ADR 0051 Task 21: Shell WebSocket route.
 const { app: shellApp, injectUpgrade } = makeShellRoute();
@@ -59,6 +57,11 @@ const server = buildServer(
 
     // Native ProfileService: orchestrator-owned session profiles (ADR 0052).
     registerProfiles(router);
+
+    // Native MountCatalogService (ADR 0055 P2): admin-gated + owner-stamped
+    // wrapper over the coordinator's skill catalog. Registered before the
+    // passthrough so it owns the MountCatalogService prefix.
+    registerMountCatalog(router);
 
     // Generic passthrough: forwards SessionService, FleetService, ImageService
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).

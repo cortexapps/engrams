@@ -1,61 +1,73 @@
 /**
  * Skill catalog hooks (ADR 0055 P2).
  *
- * The orchestrator exposes the org-shared catalog over plain HTTP (file upload
- * is multipart, not Connect): GET /api/v1/skills lists builtins ∪ uploaded;
- * POST uploads (admin-only server-side). The profile editor renders the list as
- * toggles and offers the upload control.
+ * Skills live on the orchestrator's native Connect `MountCatalogService` (like
+ * profiles), so these are connect-query hooks — no bespoke HTTP. `useSkills`
+ * merges the fleet's built-in bundles (a stable, tiny set) with the uploaded
+ * catalog from `ListSkills`; `useUploadSkill` calls `RegisterSkill` with the
+ * file bytes (the server stamps the owner from the session + gates admin).
  */
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { API_BASE } from "../lib/base";
+import { useMutation, useQuery, createConnectQueryKey } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  listSkills,
+  registerSkill,
+} from "../gen/engram/app/v1/mount_catalog-MountCatalogService_connectquery";
 
-export interface CatalogSkill {
+export interface SelectableSkill {
   name: string;
   /** Display label (builtins carry a friendly label; uploads use their name). */
   label: string;
   description: string;
   builtin: boolean;
-  owner?: string;
-  sizeBytes?: number;
-  createdAt?: string;
 }
 
-/** GET /api/v1/skills — selectable skills (builtins ∪ uploaded). */
-export function useSkills(enabled = true) {
-  return useQuery({
-    queryKey: ["skills"],
-    queryFn: async (): Promise<CatalogSkill[]> => {
-      const res = await fetch(`${API_BASE}/skills`, { credentials: "include" });
-      if (!res.ok) throw new Error(`list skills → ${res.status}`);
-      const body = (await res.json()) as { skills: CatalogSkill[] };
-      return body.skills;
+/** The fleet's baked built-in skill bundles (resolved by name from the fleet
+ * stamp at session create). A stable set the editor renders next to uploads. */
+export const BUILTIN_SKILLS: { name: string; label: string; description: string }[] = [
+  {
+    name: "skills",
+    label: "Built-in skills",
+    description: "share-file, create-pull-request, and the git credential wiring.",
+  },
+  {
+    name: "playwright",
+    label: "Browser (Playwright)",
+    description:
+      "chromium-headless-shell + the playwright-cli powering the show-your-work skill. Use an image sized for a browser (≥1 GiB).",
+  },
+];
+
+/** Selectable skills: builtins ∪ the uploaded catalog. */
+export function useSkills() {
+  return useQuery(
+    listSkills,
+    {},
+    {
+      select: (data): SelectableSkill[] => [
+        ...BUILTIN_SKILLS.map((b) => ({ ...b, builtin: true })),
+        ...data.skills.map((s) => ({
+          name: s.name,
+          label: s.name,
+          description: s.description,
+          builtin: false,
+        })),
+      ],
+      staleTime: 10_000,
     },
-    enabled,
-    staleTime: 10_000,
-  });
+  );
 }
 
-/** POST /api/v1/skills — upload a skill (multipart). Admin-only server-side. */
+/** Upload (register) a skill — admin-only server-side; the file rides the
+ * `payloadTar` bytes field. Invalidates the catalog so the new skill appears. */
 export function useUploadSkill() {
   const qc = useQueryClient();
-  return useMutation({
-    mutationFn: async (input: { name: string; description: string; file: File }) => {
-      const fd = new FormData();
-      fd.append("name", input.name);
-      fd.append("description", input.description);
-      fd.append("file", input.file);
-      const res = await fetch(`${API_BASE}/skills`, {
-        method: "POST",
-        body: fd,
-        credentials: "include",
+  return useMutation(registerSkill, {
+    onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({ schema: listSkills, input: {}, cardinality: "finite" }),
       });
-      if (!res.ok) {
-        const err = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(err.error ?? `upload → ${res.status}`);
-      }
-      return res.json();
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["skills"] }),
   });
 }

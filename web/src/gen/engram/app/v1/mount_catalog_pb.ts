@@ -101,11 +101,12 @@ export type RegisterSkillRequest = Message<"engram.app.v1.RegisterSkillRequest">
   owner: string;
 
   /**
-   * An archive of the skill directory — a tar, gzipped tar, or zip; the
-   * coordinator sniffs the format by magic bytes (NOT the filename) and unpacks
-   * it, budgeted against decompression bombs. Must contain a top-level SKILL.md.
-   * Server-capped on both the compressed bytes and the decompressed total
-   * (markdown skills are KiB; the 4 MiB gRPC default is ample).
+   * The skill payload: an archive of the skill directory (tar, gzipped tar, or
+   * zip) OR a lone SKILL.md — the coordinator sniffs the form by magic bytes
+   * (NOT the filename), unpacks archives budgeted against decompression bombs,
+   * and treats anything else as the SKILL.md itself. An archive must contain a
+   * top-level SKILL.md. Server-capped on both the compressed bytes and the
+   * decompressed total (markdown skills are KiB; the 4 MiB gRPC default is ample).
    *
    * @generated from field: bytes payload_tar = 4;
    */

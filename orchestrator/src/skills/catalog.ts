@@ -40,9 +40,10 @@ export interface SkillRow {
   createdAt: string;
 }
 
-/** Subset of MountCatalogService used by the route + validation. */
+/** Subset of MountCatalogService the orchestrator handler + validation use. */
 export interface MountCatalogClient {
   listSkills(req: Record<string, never>): Promise<{ skills: SkillRow[] }>;
+  getSkill(req: { name: string }): Promise<{ skill?: SkillRow }>;
   registerSkill(req: {
     name: string;
     description: string;
