@@ -4,7 +4,14 @@
 // system markers, the run footer, and the derived isRunning flag.
 
 import { describe, expect, test } from "vitest";
-import { buildMessages, SHELL_TOOL, type RunFooter, type SystemMarker } from "./buildMessages";
+import {
+  buildMessages,
+  FILE_CHANGE_TOOL,
+  SHELL_TOOL,
+  type FileChangeArgs,
+  type RunFooter,
+  type SystemMarker,
+} from "./buildMessages";
 import type { IndexedEvent, SessionEvent, UserQuestion } from "../../lib/types";
 
 const AT = "2026-06-02T12:00:00.000Z";
@@ -827,5 +834,142 @@ describe("buildMessages — ADR 0054 interactive AskUserQuestion", () => {
     expect(toolParts(messages).some((p) => p.toolCallId === "t1")).toBe(false);
     // The resume run's own assistant reply still renders.
     expect(real(messages).some((m) => m.role === "assistant")).toBe(true);
+  });
+});
+
+describe("buildMessages — ADR 0054 Flavor A file changes", () => {
+  // All tool-call parts across the assistant messages.
+  const parts = (messages: ReturnType<typeof buildMessages>["messages"]) =>
+    real(messages).flatMap((m) =>
+      ((m.content as ReadonlyArray<{ type: string }>) ?? []).filter((p) => p.type === "tool-call"),
+    ) as Array<{
+      toolName?: string;
+      toolCallId?: string;
+      args?: FileChangeArgs;
+      isError?: boolean;
+    }>;
+
+  test("a successful edit renders a rich file-change part in place of the generic card", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "te",
+          tool_name: "Edit",
+          args_summary: '{"file_path":"src/a.rs"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "te",
+          tool_name: "",
+          ok: true,
+          duration_ms: 5,
+          result_summary: "ok",
+          at: AT,
+        },
+        {
+          type: "file_changed",
+          run_id: "r1",
+          tool_call_id: "te",
+          path: "src/a.rs",
+          change: { edit: { hunks: [{ old: "let x = 1;", new: "let x = 2;" }] } },
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const tps = parts(messages);
+    // No generic "Edit" card — it was swapped for the rich diff.
+    expect(tps.some((p) => p.toolName === "Edit")).toBe(false);
+    const fc = tps.find((p) => p.toolName === FILE_CHANGE_TOOL)!;
+    expect(fc.toolCallId).toBe("te");
+    expect(fc.args?.path).toBe("src/a.rs");
+    expect(fc.args?.change.edit?.hunks).toEqual([{ old: "let x = 1;", new: "let x = 2;" }]);
+    // Still tallied as an edit in the run footer.
+    const footer = real(messages).find((m) => m.role === "assistant")!.metadata?.custom
+      ?.run as RunFooter;
+    expect(footer.edits).toBe(1);
+  });
+
+  test("a write renders a file-change part carrying the content", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tw",
+          tool_name: "Write",
+          args_summary: null,
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tw",
+          tool_name: "",
+          ok: true,
+          duration_ms: 1,
+          result_summary: "ok",
+          at: AT,
+        },
+        {
+          type: "file_changed",
+          run_id: "r1",
+          tool_call_id: "tw",
+          path: "new.txt",
+          change: { write: { content: "hello\nworld\n" } },
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const fc = parts(messages).find((p) => p.toolName === FILE_CHANGE_TOOL)!;
+    expect(fc.args?.path).toBe("new.txt");
+    expect(fc.args?.change.write?.content).toBe("hello\nworld\n");
+  });
+
+  test("a FAILED edit (no file_changed) keeps its generic error card", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tf",
+          tool_name: "Edit",
+          args_summary: '{"file_path":"a.rs"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tf",
+          tool_name: "",
+          ok: false,
+          duration_ms: 1,
+          result_summary: "String to replace not found",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const tps = parts(messages);
+    // No rich diff (no file_changed was emitted); the generic Edit card shows
+    // the failure.
+    expect(tps.some((p) => p.toolName === FILE_CHANGE_TOOL)).toBe(false);
+    const edit = tps.find((p) => p.toolCallId === "tf")!;
+    expect(edit.toolName).toBe("Edit");
+    expect(edit.isError).toBe(true);
   });
 });

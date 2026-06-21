@@ -252,7 +252,9 @@ export interface SessionCowStateResponse {
 // so existing consumers need no import changes.
 export type {
   AgentRole,
+  EditHunk,
   ExecRusage,
+  FileChange,
   IndexedEvent,
   SessionEvent,
   SessionEventKind,

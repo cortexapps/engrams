@@ -1,5 +1,11 @@
 import type { ThreadMessageLike } from "@assistant-ui/react";
-import type { AgentRole, IndexedEvent, SessionState, UserQuestion } from "../../lib/types";
+import type {
+  AgentRole,
+  FileChange,
+  IndexedEvent,
+  SessionState,
+  UserQuestion,
+} from "../../lib/types";
 
 // Session statuses that mean "no turn is in flight" — the authoritative
 // signal that overrides the event stream. A session evicted/terminated
@@ -47,6 +53,18 @@ export interface ShellArgs {
   command: string;
   exit?: number | null;
   durationMs?: number | null;
+}
+
+/** ADR 0054 Flavor A: synthetic tool name for a file change. A
+ *  Write/Edit/MultiEdit tool call that has a matching `file_changed` event is
+ *  re-rendered under this name (a rich diff) instead of the generic tool card;
+ *  a registered tool UI (`FileChangePart`) reads {@link FileChangeArgs}. */
+export const FILE_CHANGE_TOOL = "engram.fileChange";
+
+/** Args we stash on the synthetic file-change tool-call part. */
+export interface FileChangeArgs {
+  path: string;
+  change: FileChange;
 }
 
 /** Payload carried in a system message's `metadata.custom.marker` — the
@@ -278,10 +296,20 @@ export function buildMessages(
   // on `--resume`, so `question_answered` lands after a fresh run_started).
   const questionToolCallIds = new Set<string>();
   const answersByToolCallId = new Map<string, Record<string, string[]>>();
+  // ADR 0054 Flavor A: a Write/Edit/MultiEdit tool call emits a generic
+  // tool_call_started AND (on success) a `file_changed` carrying the diff. We
+  // pre-scan so the generic card is re-rendered as a rich diff in place; a
+  // failed edit emits NO file_changed and keeps its generic (error) card.
+  const fileChangesByToolCallId = new Map<string, FileChangeArgs>();
   for (const { event } of events) {
     if (event.type === "user_question") questionToolCallIds.add(event.tool_call_id);
     else if (event.type === "question_answered")
       answersByToolCallId.set(event.tool_call_id, event.answers);
+    else if (event.type === "file_changed")
+      fileChangesByToolCallId.set(event.tool_call_id, {
+        path: event.path,
+        change: event.change,
+      });
   }
 
   for (const indexed of events) {
@@ -353,13 +381,27 @@ export function buildMessages(
         if (ev.tool_name === "AskUserQuestion" || questionToolCallIds.has(ev.tool_call_id)) break;
         bump(classifyTool(ev.tool_name));
         const a = ensureAssistant(ev.at);
-        const part: ToolPart = {
-          type: "tool-call",
-          toolCallId: ev.tool_call_id,
-          toolName: ev.tool_name,
-          args: parseArgs(ev.args_summary),
-          argsText: ev.args_summary ?? "",
-        };
+        // ADR 0054 Flavor A: a Write/Edit/MultiEdit that produced a successful
+        // `file_changed` renders as a rich diff (the `FILE_CHANGE_TOOL` part)
+        // in place of the generic card. The tally still counts the ORIGINAL
+        // tool (an edit), and the part keeps its real id so the completion
+        // correlates as usual. No file_changed (e.g. a failed edit) → generic.
+        const fc = fileChangesByToolCallId.get(ev.tool_call_id);
+        const part: ToolPart = fc
+          ? {
+              type: "tool-call",
+              toolCallId: ev.tool_call_id,
+              toolName: FILE_CHANGE_TOOL,
+              args: fc as unknown as Record<string, unknown>,
+              argsText: fc.path,
+            }
+          : {
+              type: "tool-call",
+              toolCallId: ev.tool_call_id,
+              toolName: ev.tool_name,
+              args: parseArgs(ev.args_summary),
+              argsText: ev.args_summary ?? "",
+            };
         a.content.push(part);
         openTools.set(ev.tool_call_id, part);
         break;
@@ -532,6 +574,12 @@ export function buildMessages(
       // ADR 0054: folded onto its `user_question` card (above) via the
       // pre-scan — no standalone render.
       case "question_answered":
+        break;
+
+      // ADR 0054 Flavor A: folded onto its originating tool-call part (the
+      // FILE_CHANGE_TOOL swap in `tool_call_started`) via the pre-scan — no
+      // standalone render.
+      case "file_changed":
         break;
 
       // ADR 0052: the harness-owned queue, reflected up. A mid-turn prompt is

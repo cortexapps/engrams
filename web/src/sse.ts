@@ -80,6 +80,8 @@ export function subscribeSession(sessionId: string, handlers: SseHandlers, since
     // ADR 0054: interactive AskUserQuestion round-trip.
     "user_question",
     "question_answered",
+    // ADR 0054 Flavor A: rich file-change diffs.
+    "file_changed",
   ];
 
   for (const kind of kinds) {

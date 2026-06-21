@@ -40,6 +40,21 @@ export interface UserQuestion {
   options: UserQuestionOption[];
 }
 
+// ADR 0054 Flavor A: what changed about a file, carried on a `file_changed`
+// event. Mirrors `engram_harness_proto::FileChange` — **externally tagged**
+// (a single `write`/`edit` key), NOT an `op` discriminant, because the Rust
+// type rides the bincode harness wire where internally-tagged enums panic at
+// decode. The web discriminates by which key is present.
+export interface EditHunk {
+  /** The replaced text (Claude's `old_string`); empty for a pure insertion. */
+  old: string;
+  /** The replacement text (Claude's `new_string`). */
+  new: string;
+}
+export type FileChange =
+  | { write: { content: string }; edit?: undefined }
+  | { edit: { hunks: EditHunk[] }; write?: undefined };
+
 // `serde(tag = "type", rename_all = "snake_case")` produces a discriminated
 // union with `type` as the discriminant.
 export type SessionEvent =
@@ -152,6 +167,18 @@ export type SessionEvent =
       run_id: string;
       tool_call_id: string;
       answers: Record<string, string[]>;
+      at: string;
+    }
+  // ADR 0054 Flavor A: the agent successfully changed a file via a
+  // Write/Edit/MultiEdit tool. Correlated to the originating tool call by
+  // `tool_call_id`; the web renders a rich diff (Pierre) in place of that
+  // tool's generic card.
+  | {
+      type: "file_changed";
+      run_id: string;
+      tool_call_id: string;
+      path: string;
+      change: FileChange;
       at: string;
     }
   // Phase 1b (ADR 0052): a prompt arrived mid-run and was queued
