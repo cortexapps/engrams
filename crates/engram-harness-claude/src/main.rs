@@ -1076,6 +1076,13 @@ mod adapter {
         /// a deferred tool) and is suppressed; an answer-resume that delivers
         /// the `tool_result` clears the id and re-enables normal output.
         auq_pending: HashSet<String>,
+        /// ADR 0054 Part B: set for a `start_continuation_turn` (answer-resume).
+        /// If such a turn ENDS with an answer still in `answers_in_hand`, the
+        /// deferred tool was never re-fired — claude narrate-past'd and
+        /// abandoned it (a `--resume` does not re-present an abandoned tool).
+        /// The engine then delivers the answer as a fresh user message rather
+        /// than leaving the question hanging.
+        is_answer_resume: bool,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -1300,6 +1307,7 @@ mod adapter {
                                         != Some("tool_deferred")
                                         && !t.auq_pending.is_empty();
                                     let pending_questions = t.auq_pending.len();
+                                    let is_answer_resume = t.is_answer_resume;
                                     let run_id = t.run_id;
                                     tracing::info!(
                                         %run_id,
@@ -1336,23 +1344,61 @@ mod adapter {
                                         )
                                         .await;
                                     }
-                                    match pending.pop_front() {
-                                        Some(qp) => {
-                                            if let Some(s) = stdin.as_mut() {
-                                                turn = Some(
-                                                    start_turn(
-                                                        evt_tx,
-                                                        s,
-                                                        cli,
-                                                        qp.prompt_id,
-                                                        &qp.text,
-                                                        current_run_id,
-                                                    )
-                                                    .await,
-                                                );
+                                    // ADR 0054 Part B: an answer-resume that ends
+                                    // with the answer STILL in hand means the
+                                    // deferred tool was never re-fired — claude
+                                    // narrate-past'd and abandoned it (a `--resume`
+                                    // does NOT re-present an abandoned tool, verified
+                                    // empirically). The stash→resume→re-fire path is
+                                    // a dead end here, so deliver the answer as a
+                                    // fresh user message (claude asked for it
+                                    // conversationally) and mark the card answered —
+                                    // never leave the question hanging.
+                                    let stale: Vec<(String, engram_harness_proto::Answers)> =
+                                        if is_answer_resume {
+                                            answers_in_hand.lock().await.drain().collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    if !stale.is_empty() {
+                                        if let Some(s) = stdin.as_mut() {
+                                            let text = fallback_answer_message(&stale);
+                                            let ft = start_turn(
+                                                evt_tx, s, cli, None, &text, current_run_id,
+                                            )
+                                            .await;
+                                            for (tool_call_id, answers) in stale {
+                                                emit(
+                                                    evt_tx,
+                                                    HarnessEvent::QuestionAnswered {
+                                                        run_id: ft.run_id.clone(),
+                                                        tool_call_id,
+                                                        answers,
+                                                    },
+                                                )
+                                                .await;
                                             }
+                                            turn = Some(ft);
                                         }
-                                        None => emit(evt_tx, HarnessEvent::Idle).await,
+                                    } else {
+                                        match pending.pop_front() {
+                                            Some(qp) => {
+                                                if let Some(s) = stdin.as_mut() {
+                                                    turn = Some(
+                                                        start_turn(
+                                                            evt_tx,
+                                                            s,
+                                                            cli,
+                                                            qp.prompt_id,
+                                                            &qp.text,
+                                                            current_run_id,
+                                                        )
+                                                        .await,
+                                                    );
+                                                }
+                                            }
+                                            None => emit(evt_tx, HarnessEvent::Idle).await,
+                                        }
                                     }
                                 } else {
                                     tracing::warn!("result line with no in-flight turn; ignoring");
@@ -1696,6 +1742,7 @@ mod adapter {
             current_message_id: None,
             pending_file_changes: HashMap::new(),
             auq_pending: HashSet::new(),
+            is_answer_resume: false,
         }
     }
 
@@ -1732,7 +1779,22 @@ mod adapter {
             current_message_id: None,
             pending_file_changes: HashMap::new(),
             auq_pending: HashSet::new(),
+            is_answer_resume: true,
         }
+    }
+
+    /// ADR 0054 Part B: render the canonical answer map(s) as a plain user
+    /// message — used when a narrate-past abandoned the deferred tool, so the
+    /// answer can't ride a re-fired `tool_result`. claude asked the question
+    /// conversationally, so an ordinary message is exactly what it awaits.
+    fn fallback_answer_message(stale: &[(String, engram_harness_proto::Answers)]) -> String {
+        let mut lines = vec!["Here are my answers to the question(s) you just asked:".to_string()];
+        for (_tool_call_id, answers) in stale {
+            for (question, labels) in answers {
+                lines.push(format!("- {}: {}", question, labels.join(", ")));
+            }
+        }
+        lines.join("\n")
     }
 
     /// Write one prompt to claude's stdin as a stream-json `user` message.
@@ -2811,19 +2873,17 @@ mod adapter {
             assert_eq!(out["S?"], serde_json::json!("z"), "single → bare string");
         }
 
-        /// A fake claude for the answer-resume cycle. On EVERY invocation it
-        /// emits one turn's output (assistant text + `result`) WITHOUT
-        /// reading stdin, then blocks so it doesn't EOF-respawn. Crucially
-        /// it is identical across invocations — the HARNESS state, not the
-        /// fake, decides the output's fate, so there is no test-side race:
-        /// on the first (idle) spawn there is no in-flight turn, so the
-        /// output is dropped and only the startup `Idle` surfaces; after
-        /// `AnswerQuestion` triggers the `--resume` respawn, the continuation
-        /// `TurnState` captures the same output. (An earlier marker-file
-        /// design raced the SIGINT — if the child was killed before it wrote
-        /// the marker, the resumed invocation emitted nothing and the test
-        /// hung. Making the fake stateless removes the race entirely.)
-        async fn write_answer_resume_fake_claude() -> String {
+        /// A fake claude for the answer-resume + Part B fallback cycle. The
+        /// first turn it emits (init + "resumed" + `result`) models the
+        /// NARRATE-PAST: on the `--resume` it does NOT re-fire the deferred
+        /// tool — it just recaps and ends — so the stashed answer is left
+        /// UNCONSUMED in `answers_in_hand`. Then (unlike the old fake) it
+        /// RESPONDS to each stdin line with "got your answer" + `result`, so
+        /// the harness's fallback delivery (a fresh user message) produces a
+        /// completing turn. On the first (idle) spawn there's no in-flight
+        /// turn so the recap is dropped and only the startup `Idle` surfaces;
+        /// the continuation turn after `AnswerQuestion` captures the recap.
+        async fn write_answer_fallback_fake_claude() -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
                 std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
@@ -2831,7 +2891,10 @@ mod adapter {
                 printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n\
                 printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"content\":[{\"type\":\"text\",\"text\":\"resumed\"}]}}'\n\
                 printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
-                while IFS= read -r _l; do :; done\n";
+                while IFS= read -r _l; do\n\
+                  printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m3\",\"content\":[{\"type\":\"text\",\"text\":\"got your answer\"}]}}'\n\
+                  printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                done\n";
             tokio::fs::write(&path, body).await.unwrap();
             let mut perms = std::fs::metadata(&path).unwrap().permissions();
             perms.set_mode(0o755);
@@ -2839,17 +2902,19 @@ mod adapter {
             path.to_string_lossy().into_owned()
         }
 
-        // Engine mechanics: an `AnswerQuestion` to an idle session stashes
-        // the answer, SIGINTs claude, and respawns with `--resume` into a
-        // CONTINUATION turn — `RunStarted` with NO prompt_id (no user-echo)
-        // — that captures the re-fired output. The first (idle) spawn's
-        // identical output is dropped (no in-flight turn), so the only event
-        // before the answer is the startup `Idle`. Drives the in-memory
-        // `answers_in_hand`; independent of the real hook socket, which the
-        // test env may not be able to bind (graceful degradation).
+        // ADR 0054 Part B: an `AnswerQuestion` stashes the answer, SIGINTs
+        // claude, and respawns `--resume` into a CONTINUATION turn (RunStarted
+        // with NO prompt_id). When claude NARRATE-PASTs, it does NOT re-fire
+        // the deferred tool on resume (verified: an abandoned tool is not
+        // re-presented), so the answer is left UNCONSUMED in `answers_in_hand`
+        // after the continuation turn. The engine must then DELIVER the answer
+        // as a fresh user message (a new no-prompt_id turn) and mark the card
+        // answered (`QuestionAnswered`), instead of going idle with the
+        // question hanging. (The fake never consumes the answer, exactly like
+        // the abandoned-tool case; the first idle spawn's recap is dropped.)
         #[tokio::test]
-        async fn answer_question_resumes_into_continuation_turn() {
-            let script = write_answer_resume_fake_claude().await;
+        async fn answer_resume_unconsumed_falls_back_to_user_message() {
+            let script = write_answer_fallback_fake_claude().await;
             let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
             let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
             let reattach = Arc::new(Notify::new());
@@ -2873,11 +2938,32 @@ mod adapter {
                 .await
                 .unwrap();
 
-            // The resumed process establishes a continuation turn (no
-            // prompt_id) and streams the re-fired output, closing cleanly.
+            // 1) the answer-resume continuation turn — claude recaps ("resumed")
+            //    and ends WITHOUT re-firing the deferred tool: answer unconsumed.
             let (_rid, pid) = expect_run_started_id(&mut evt_rx).await;
             assert_eq!(pid, None, "continuation turn carries no prompt_id");
             expect_agent_message(&mut evt_rx, "resumed").await;
+            let _ = expect_run_completed(&mut evt_rx).await;
+
+            // 2) Part B fallback: a fresh turn (no prompt_id) delivers the answer
+            //    as a user message, and the card is marked answered.
+            let (_fid, fpid) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(
+                fpid, None,
+                "the fallback answer delivery is not a user prompt"
+            );
+            match evt_rx.recv().await {
+                Some(HarnessEvent::QuestionAnswered {
+                    tool_call_id,
+                    answers,
+                    ..
+                }) => {
+                    assert_eq!(tool_call_id, "toolu_1");
+                    assert_eq!(answers.get("Q?"), Some(&vec!["A".to_string()]));
+                }
+                other => panic!("expected QuestionAnswered, got {other:?}"),
+            }
+            expect_agent_message(&mut evt_rx, "got your answer").await;
             let _ = expect_run_completed(&mut evt_rx).await;
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
 

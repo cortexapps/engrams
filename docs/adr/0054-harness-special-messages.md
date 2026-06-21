@@ -499,7 +499,16 @@ No new id space; no control `request_id` (the control protocol is not used).
   assistant text/chunks emitted while one is pending** — the hallucinated reply never
   reaches the UI — and reads `terminal_reason` to log the narrate-past. The
   `UserQuestion` card the hook already emitted stays the source of truth, so the
-  session remains awaiting-answer. Held-permission designs (the SDK's `canUseTool`;
+  session remains awaiting-answer. **Part B (answer delivery, 2026-06-21):** the
+  re-fire was then VERIFIED to FAIL — after a narrate-past a `--resume` does **not**
+  re-present the abandoned tool (the hook fires 0×; claude even misremembers the
+  prior answer), so an answer stashed for it can never land and the card would hang.
+  So the harness now detects the dead end — an answer-resume continuation turn that
+  ENDS with the answer still un-consumed in `answers_in_hand` — and **falls back to
+  delivering the answer as a fresh user message** (claude asked conversationally, so
+  a plain message is what it awaits), emitting `QuestionAnswered` to mark the card.
+  This is try-then-fallback: no pre-classification, and it survives an idle-eviction
+  between the question and the answer. Held-permission designs (the SDK's `canUseTool`;
   t3code) avoid this class entirely but cannot idle-evict mid-wait — the documented
   defer-vs-hold trade — which is why engrams keeps defer and hardens it. Evidence:
   session `bc04ed42` + a two-question repro probe.
