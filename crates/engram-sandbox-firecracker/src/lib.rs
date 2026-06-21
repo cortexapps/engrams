@@ -3290,6 +3290,21 @@ fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
 }
 
+/// Timeout for `PUT /snapshot/create`. The call flushes the full guest
+/// memory to memory.bin synchronously, so its duration scales with guest
+/// RAM. A flat 60s fit small VMs but tripped on large warm images — the
+/// dev-brain 32 GiB capture failed with "PUT /snapshot/create timed out
+/// after 60s". Budget a 60s base (pause + device serialize; preserves the
+/// prior behavior for small VMs) plus a conservative 128 MiB/s flush-
+/// throughput floor (the host disk may be cold or shared), so a 32 GiB VM
+/// gets ~5min instead of 60s. A too-generous ceiling is harmless — a
+/// genuinely hung FC is caught by the process supervisor, not this timeout.
+fn snapshot_create_timeout(mem_mib: u32) -> Duration {
+    const BASE_SECS: u64 = 60;
+    const MIB_PER_SEC_FLOOR: u64 = 128;
+    Duration::from_secs(BASE_SECS + mem_mib as u64 / MIB_PER_SEC_FLOOR)
+}
+
 /// ADR 0014: re-install the canonical rootfs + harness symlinks for
 /// a restored sandbox. Two symlinks per drive:
 ///
@@ -5140,11 +5155,12 @@ impl FirecrackerBackend {
         // pause → PUT /snapshot/create → resume happens inside the
         // client; a failure mid-sequence still tries to resume the
         // VM rather than leaving it stuck Paused.
-        // Snapshot duration scales with guest memory (every dirty page
-        // is flushed to memory.bin synchronously). The default 10s
-        // client timeout fits a 64 MiB VM but trips on larger ones —
-        // give the snapshot path 60s explicitly. Tune up for huge VMs.
-        let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
+        // Snapshot duration scales with guest memory (every dirty page is
+        // flushed to memory.bin synchronously), so the timeout scales with
+        // the VM's RAM — a flat 60s tripped on large warm images (dev-brain's
+        // 32 GiB capture). See `snapshot_create_timeout`.
+        let api = FirecrackerClient::new(&socket)
+            .with_timeout(snapshot_create_timeout(spec.memory.max_mib));
         let paths = match snapshot_type {
             client::SnapshotType::Full => api.create_snapshot(&dest).await?,
             client::SnapshotType::Diff => {
@@ -5287,6 +5303,22 @@ impl FirecrackerBackend {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn snapshot_timeout_scales_with_guest_memory() {
+        // Small VMs keep the prior 60s floor (no regression).
+        assert_eq!(snapshot_create_timeout(64), Duration::from_secs(60));
+        assert_eq!(snapshot_create_timeout(4096), Duration::from_secs(60 + 32));
+        // The dev-brain 32 GiB capture that tripped the flat 60s now gets
+        // ~5min — comfortably more than 60s.
+        let big = snapshot_create_timeout(32 * 1024);
+        assert!(
+            big >= Duration::from_secs(300),
+            "32 GiB snapshot budget must be ample, got {big:?}"
+        );
+        // Monotonic in memory.
+        assert!(snapshot_create_timeout(16 * 1024) < big);
+    }
 
     // ADR 0044 K2: node-cgroup escape helpers. A tempdir stands in for the
     // cgroup parent — this exercises the leaf-path + pid-write + rmdir logic,
