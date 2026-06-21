@@ -466,6 +466,16 @@ P2 shipped across `refactor(mount-manifest)` → `feat(P2 store)` → `feat(P2 p
   here as the one new timing characteristic. (Blocking `RegisterSkill` on fleet staging, or a
   resolve-time staging check, is the refinement if this ever bites.)
 
+- **Upload formats + decompression-bomb defense.** `RegisterSkill` accepts a tar,
+  gzipped tar, or **zip**, sniffed by magic bytes (not the filename); a lone `SKILL.md`
+  is wrapped client-side, and an unrecognized type is rejected (no silent
+  mangle-into-SKILL.md). Extraction is **streamed through a fixed decompressed-byte
+  budget** (`MAX_SKILL_UNPACKED_BYTES`), so a small-but-explosive upload can't OOM the
+  shared coordinator — memory stays bounded regardless of an entry's *claimed* size, and
+  the compressed-input cap, file-count cap, and symlink/`..` rejection (tar **and** zip)
+  round out the defenses. The uploader is an authenticated admin (accountable), but this
+  is defense in depth.
+
 - **Test strategy.** The new P2 logic is covered deterministically: `skill_pack` unit tests
   (pack determinism, validation, traversal guards — mksquashfs-gated, runs in `test-linux`);
   `mount_catalog_live_pg` (register/resolve/upsert/soft-delete + the pin-set union, against a
