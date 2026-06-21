@@ -6,10 +6,26 @@ landed backend-first: `0541be9c` (proto wire types) · `39127d87`
 `e68639ee` (host-agent `answer_question` + at-least-once replay) · `30b67f45`
 (coordinator answer ingress + question event passthrough) · `89144922`
 (orchestrator passthrough + regenerated stubs). The **web interactive
-question component** then landed in a follow-on branch (this change): the
+question component** then landed in a follow-on branch: the
 `user_question`/`question_answered` SSE event types, the dedup-and-render in
-`buildMessages`, and the `UserQuestionCard` answer form. Still deferred to a
-follow-on branch: Phase 1 (`FileChanged`/`DiffToolPart`).
+`buildMessages`, and the `UserQuestionCard` answer form. **Phase 1 (Flavor A —
+rich file-change rendering)** then landed full-stack in a follow-on branch
+(this change): the `FileChanged` wire event (proto idx 13), the harness
+emission on a successful `Write`/`Edit`/`MultiEdit` result, the
+`HarnessFileChanged` coordinator passthrough, and the web's `FileChangePart`
+(a collapsed path + `+N −M` row, expandable to a **Pierre** [`@pierre/diffs`]
+diff lazy-loaded so Shiki stays out of the main bundle).
+
+Two reconciliations vs. the sketches below, both forced by the bincode wire
+(see Decision → Wire surface): **(1)** `FileChange` is **externally tagged**
+(`{ "write": … }` / `{ "edit": … }`), NOT `#[serde(tag = "op")]` — an
+internally-tagged enum rides bincode through `HarnessEvent::FileChanged` and
+would panic at decode (`DeserializeAnyNotSupported`), the very rule this ADR
+cites for `Answers`; the wire-golden test caught the `tag="op"` sketch
+immediately. **(2)** `path` is hoisted onto the **event** (`FileChanged {
+run_id, tool_call_id, path, change }`), so `FileChange` carries only the
+op-specific payload (`Write { content }` / `Edit { hunks }`) instead of
+repeating `path` in each arm.
 
 ## Context
 
@@ -99,13 +115,19 @@ what Anthropic's own SDK does (#13).
 The adapter recognizes `Write`/`Edit`/`MultiEdit` in the normal stream and, on
 the **successful** `tool_result` (truthful — never a phantom diff for a failed
 edit), emits a `FileChanged` event correlated by `tool_use_id`. Normalized,
-harness-agnostic schema (in `engram-harness-proto`):
+harness-agnostic schema (in `engram-harness-proto`) — **as built**:
 
 ```rust
-#[serde(tag = "op", rename_all = "snake_case")]
+// Event carries `path`; the change is the op-specific payload only.
+HarnessEvent::FileChanged { run_id, tool_call_id, path: String, change: FileChange }
+
+// Externally tagged (`{"write":…}` / `{"edit":…}`), NOT `#[serde(tag="op")]`:
+// FileChange rides bincode inside FileChanged, where an internally-tagged enum
+// panics at decode (the Answers rule). `rename_all` keeps the SSE JSON clean.
+#[serde(rename_all = "snake_case")]
 pub enum FileChange {
-    Write { path: String, content: String },                 // → all-green block
-    Edit  { path: String, hunks: Vec<EditHunk> },             // → red/green hunks
+    Write { content: String },          // → all-green block
+    Edit  { hunks: Vec<EditHunk> },     // → red/green hunks
 }
 pub struct EditHunk { pub old: String, pub new: String }
 ```
@@ -114,6 +136,13 @@ Claude mapping: `Write → write{content}`; `Edit → edit{[{old_string,new_stri
 `MultiEdit → edit{edits[…]}`. A dedicated byte budget (`MAX_FILE_CHANGE_BYTES`,
 ~64 KB) is truncated **per inner string before serializing** (never the JSON
 blob). The 1 KB `args_summary` cap is untouched and stays for every other tool.
+
+The harness keeps the parsed `(path, change)` in a per-turn `pending_file_changes`
+map keyed by `tool_use_id`, populated when the `tool_use` is observed and drained
+on the matching `tool_result` — emitting `FileChanged` only on success, dropping
+it on a failed result. The generic `ToolCallStarted`/`Completed` still fire; the
+web dedups by `tool_call_id` (renders the rich diff in place of the generic card,
+exactly like the AskUserQuestion dedup).
 
 ### Flavor B — interactive: `AskUserQuestion` via a `PreToolUse` hook
 
@@ -388,8 +417,16 @@ No new id space; no control `request_id` (the control protocol is not used).
   selected option labels wrapped in `StringList`) and flips to an optimistic
   receipt until `question_answered` confirms. Routes
   web → orchestrator → coordinator → host → harness.
-- **web** (Phase 1, deferred) — `DiffToolPart` (red/green for `edit`,
-  all-green for `write`).
+- **web** (Phase 1 Flavor A — this branch) — `file_changed` added to the
+  `SessionEvent` union + the per-kind SSE listener. `buildMessages` swaps the
+  generic `Write`/`Edit`/`MultiEdit` tool card for a `FILE_CHANGE_TOOL` part
+  carrying `{path, change}` (pre-scanned by `tool_call_id`; a failed edit has no
+  `file_changed`, so it keeps its generic error card). `FileChangePart` renders
+  a collapsed row — path + `+N −M` counts computed eagerly with jsdiff (cheap,
+  no Shiki) — expandable to a **Pierre** (`@pierre/diffs`) `FileDiff` built from
+  the before/after via `parseDiffFromFile`. The Pierre+Shiki renderer is
+  `React.lazy()`'d into its own chunk (`PierreDiff`), so the main bundle barely
+  grows and Shiki's WASM/grammars load only on expand.
 
 ## Alternatives considered
 
