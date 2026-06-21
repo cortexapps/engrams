@@ -811,40 +811,83 @@ pub(crate) async fn prepare_from_row(
 /// queue path, populated only on the gRPC create.
 #[allow(clippy::too_many_arguments)]
 /// ADR 0055: resolve profile-selected skill bundle names to reserved-slot mount
-/// specs. The fleet bakes identical bundles, so any active host's
-/// `current_bundles` (name -> staged sha) is the catalog. Assigns each skill a
-/// reserved slot (dyn_0..) + the staged sha the host `patch_drive`s in.
+/// specs. A name resolves against the **fleet stamp ∪ the org-shared upload
+/// catalog** (ADR 0055 P2): the fleet bakes identical bundles, so any active
+/// host's `current_bundles` (name -> staged sha) is the baked admin catalog, and
+/// a name the fleet doesn't carry is looked up in the `mount_catalog` table.
+/// Each skill gets a reserved slot (dyn_0..) + the staged sha the host
+/// `patch_drive`s in.
 async fn resolve_selected_skills(
     state: &SharedState,
     names: &[String],
 ) -> Result<Vec<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
+    use engram_core::types::sandbox::AuxRoDrive;
     if names.is_empty() {
         return Ok(Vec::new());
     }
+    // Cap up front so an over-cap request doesn't trigger N catalog lookups.
+    if names.len() > AuxRoDrive::RESERVED_SLOTS {
+        return Err(ApiError::BadRequest(format!(
+            "session requested {} skills but only {} reserved slots exist",
+            names.len(),
+            AuxRoDrive::RESERVED_SLOTS,
+        )));
+    }
+    // Start from the fleet stamp (baked admin bundles)…
+    let mut catalog = fleet_bundle_catalog(state).await?;
+    // …then fall through to the org-shared upload catalog for any selected name
+    // the fleet doesn't carry (ADR 0055 P2).
+    for name in names {
+        if catalog.contains_key(name) {
+            continue;
+        }
+        if let Some(skill) = state
+            .services
+            .meta
+            .get_skill_by_name(name)
+            .await
+            .map_err(|e| ApiError::Internal(format!("catalog lookup for skill `{name}`: {e}")))?
+        {
+            catalog.insert(name.clone(), skill.sha256);
+        }
+    }
+    let view: std::collections::HashMap<&str, &str> = catalog
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assign_skill_slots(&view, names)
+}
+
+/// The fleet's baked bundle catalog: any active host's `current_bundles`
+/// (name -> staged sha256). All hosts bake the same generations, so the first
+/// non-empty report is authoritative; empty if no host has reported yet. Shared
+/// by the session-create resolver and `RegisterSkill`'s fleet-name collision
+/// check (ADR 0055 P2: catalog names may not shadow a fleet bundle name).
+pub(crate) async fn fleet_bundle_catalog(
+    state: &SharedState,
+) -> Result<std::collections::HashMap<String, String>, ApiError> {
     let hosts = state
         .services
         .meta
         .list_active_hosts()
         .await
         .map_err(|e| ApiError::Internal(format!("list_active_hosts for skill resolve: {e}")))?;
-    // Any host that reports bundles is the fleet catalog (all hosts bake the
-    // same generations). name -> staged content sha.
-    let catalog: std::collections::HashMap<&str, &str> = hosts
+    Ok(hosts
         .iter()
         .find(|h| !h.current_bundles.is_empty())
         .map(|h| {
             h.current_bundles
                 .iter()
-                .map(|b| (b.drive_id.as_str(), b.sha256.as_str()))
+                .map(|b| (b.drive_id.clone(), b.sha256.clone()))
                 .collect()
         })
-        .unwrap_or_default();
-    assign_skill_slots(&catalog, names)
+        .unwrap_or_default())
 }
 
 /// Pure half of skill resolution (no I/O): assign each selected skill name to a
-/// reserved slot (dyn_0..) carrying its staged content sha from `catalog`. Caps
-/// at `RESERVED_SLOTS`; an unknown name (absent from the fleet catalog) is a 400.
+/// reserved slot (dyn_0..) carrying its staged content sha from `catalog` (the
+/// combined fleet ∪ upload-catalog view). Caps at `RESERVED_SLOTS`; a name in
+/// neither source is a 400.
 fn assign_skill_slots(
     catalog: &std::collections::HashMap<&str, &str>,
     names: &[String],
@@ -861,8 +904,8 @@ fn assign_skill_slots(
     for (i, name) in names.iter().enumerate() {
         let sha = catalog.get(name.as_str()).ok_or_else(|| {
             ApiError::BadRequest(format!(
-                "skill `{name}` is not staged on the fleet (unknown skill, or no host \
-                 has reported its bundle yet)"
+                "skill `{name}` is unknown (not a staged fleet bundle and not in the \
+                 upload catalog), or no host has reported its bundle yet"
             ))
         })?;
         mounts.push(AuxRoDrive {
