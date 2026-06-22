@@ -21,6 +21,7 @@ pub mod cert_mint;
 pub mod dns;
 pub mod inject;
 pub mod intercept;
+pub mod observe;
 pub mod policy;
 pub mod proxy;
 pub mod registry;
@@ -37,8 +38,12 @@ pub use resolver::{
 
 pub use ca::{Ca, CaError, CaSource, EnvCaSource, LocalDiskCaSource};
 pub use cert_mint::{CertMint, MintError};
+pub use observe::{ObserveSink, ObservedAsset};
 pub use policy::{HostList, HostSpec, ParseError as PolicyParseError};
-pub use registry::{Decision, InjectEntry, Registry, RequestPolicy, SecretEntry, SessionState};
+pub use registry::{
+    Decision, InjectEntry, ObserveEntry, Registry, RequestPolicy, SecretEntry, SessionState,
+    SuccessRule,
+};
 pub use sni::{peek_sni, PeekError as SniPeekError};
 pub use substitute::{scan_for_violation, substitute};
 pub use violation::first_match as scan_for_placeholder;

@@ -38,6 +38,12 @@ pub struct SessionState {
     /// header. A request to an inject-gated host whose shape matches no
     /// entry is rejected. The guest never holds the injected secret.
     pub injects: Vec<InjectEntry>,
+    /// ADR 0056 (Phase 4): response-observation specs. Any whose `allow`
+    /// matches the SNI triggers MITM; for a request whose shape matches the
+    /// entry's `RequestPolicy`, the proxy buffers + parses the *response* and
+    /// emits an `IntegrationAsset` (the side-effect ⟹ event invariant). An
+    /// observe-only host (no secret, no inject) is MITM'd purely to observe.
+    pub observes: Vec<ObserveEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +97,50 @@ impl RequestPolicy {
                     .iter()
                     .any(|p| path.starts_with(p.as_str())))
     }
+}
+
+/// ADR 0056 (Phase 4): when does an observed response count as a successful
+/// side effect worth recording? The proxy evaluates this against the parsed
+/// response status. Omitted in the connector → `Always`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SuccessRule {
+    /// Record only when the response status is 2xx.
+    #[default]
+    StatusClass2xx,
+    /// Record on any status (the connector omitted a success rule).
+    Always,
+}
+
+impl SuccessRule {
+    /// Does `status` satisfy this rule? `None` (unparseable status) is treated
+    /// as "indeterminate" — see [`crate::observe`] for the coarse-emit posture.
+    pub fn satisfied_by(&self, status: u16) -> bool {
+        match self {
+            Self::StatusClass2xx => (200..300).contains(&status),
+            Self::Always => true,
+        }
+    }
+}
+
+/// ADR 0056 (Phase 4): one response-observation spec. On an outbound request
+/// matching `allow` (SNI) AND `policy` (method + path), the proxy buffers the
+/// response and — when `success` is satisfied — emits an `IntegrationAsset`
+/// built from `data`/`fetchable` (uniform `$.resp.*` / `$.req.*` / `$.status`
+/// extractor paths). Opaque `surface` ("action" | "asset") — the coordinator
+/// maps it to its `AssetSurface`. The proxy never asserts asset truth from the
+/// guest; it reads the real response bytes.
+#[derive(Clone, Debug)]
+pub struct ObserveEntry {
+    pub allow: HostList,
+    pub policy: RequestPolicy,
+    pub provider: String,
+    pub asset_kind: String,
+    pub surface: String,
+    pub success: SuccessRule,
+    /// `(field name, extractor path)` pairs, e.g. `("number", "$.resp.number")`.
+    pub data: Vec<(String, String)>,
+    /// Extractor path yielding an external URL, e.g. `"$.resp.html_url"`.
+    pub fetchable: Option<String>,
 }
 
 #[derive(Default)]
@@ -157,8 +207,17 @@ impl SessionState {
             .iter()
             .filter(|i| i.allow.matches(hostname))
             .collect();
-        if !secrets.is_empty() || !injects.is_empty() {
-            return Decision::Intercept { secrets, injects };
+        let observes: Vec<&ObserveEntry> = self
+            .observes
+            .iter()
+            .filter(|o| o.allow.matches(hostname))
+            .collect();
+        if !secrets.is_empty() || !injects.is_empty() || !observes.is_empty() {
+            return Decision::Intercept {
+                secrets,
+                injects,
+                observes,
+            };
         }
         if self.network_allow.matches(hostname) {
             Decision::Bypass
@@ -185,11 +244,13 @@ pub enum Decision<'a> {
     Reject,
     /// SNI in `network_allow`, nothing to substitute or inject. Splice through.
     Bypass,
-    /// One or more secrets/injections apply. MITM, then substitute
-    /// placeholders (`secrets`) and/or inject + gate (`injects`, ADR 0056).
+    /// One or more secrets/injections/observations apply. MITM, then
+    /// substitute placeholders (`secrets`), inject + gate (`injects`), and/or
+    /// observe the response (`observes`, ADR 0056 Phase 4).
     Intercept {
         secrets: Vec<&'a SecretEntry>,
         injects: Vec<&'a InjectEntry>,
+        observes: Vec<&'a ObserveEntry>,
     },
 }
 
@@ -222,6 +283,19 @@ mod tests {
                     path_prefixes: vec!["/api/v2/logs".into()],
                 },
             }],
+            observes: vec![ObserveEntry {
+                allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
+                policy: RequestPolicy {
+                    methods: vec!["POST".into()],
+                    path_prefixes: vec!["/repos/".into()],
+                },
+                provider: "github".into(),
+                asset_kind: "issue".into(),
+                surface: "asset".into(),
+                success: SuccessRule::StatusClass2xx,
+                data: vec![("number".into(), "$.resp.number".into())],
+                fetchable: Some("$.resp.html_url".into()),
+            }],
         }
     }
 
@@ -239,10 +313,35 @@ mod tests {
         // and not in network_allow — the request-policy gating happens at
         // intercept time, not here.
         match state().decide("api.datadoghq.com") {
-            Decision::Intercept { secrets, injects } => {
+            Decision::Intercept {
+                secrets,
+                injects,
+                observes,
+            } => {
                 assert!(secrets.is_empty());
                 assert_eq!(injects.len(), 1);
                 assert_eq!(injects[0].header_name, "DD-API-KEY");
+                assert!(observes.is_empty());
+            }
+            other => panic!("expected Intercept, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decision_intercept_when_observe_allows() {
+        // ADR 0056 Phase 4: an observe-only host MITMs (to read the response)
+        // even though it carries no secret/inject — it IS in network_allow but
+        // the observe spec forces Intercept over Bypass.
+        match state().decide("api.github.com") {
+            Decision::Intercept {
+                secrets,
+                injects,
+                observes,
+            } => {
+                assert!(secrets.is_empty());
+                assert!(injects.is_empty());
+                assert_eq!(observes.len(), 1);
+                assert_eq!(observes[0].asset_kind, "issue");
             }
             other => panic!("expected Intercept, got {other:?}"),
         }
@@ -250,7 +349,11 @@ mod tests {
 
     #[test]
     fn decision_bypass_when_only_network_allows() {
-        assert!(matches!(state().decide("api.github.com"), Decision::Bypass));
+        // registry.npmjs.org is in network_allow with no secret/inject/observe.
+        assert!(matches!(
+            state().decide("registry.npmjs.org"),
+            Decision::Bypass
+        ));
     }
 
     #[test]

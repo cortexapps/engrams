@@ -147,6 +147,9 @@ pub fn register_policy(
         network_allow,
         secrets,
         injects,
+        // ADR 0056 Phase 4: response-observation specs are translated from the
+        // policy in Phase 4b; until then the proxy observes nothing.
+        observes: Vec::new(),
     });
     Ok(())
 }
