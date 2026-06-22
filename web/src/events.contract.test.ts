@@ -84,6 +84,16 @@ const SYNTH_RECOVERED = {
   data: '{"idx":8,"kind":"recovered_from_checkpoint","payload_json":"{\\"_recovery_epoch\\":1,\\"_rewound\\":false,\\"at\\":\\"2026-06-12T01:01:00.000Z\\",\\"cause\\":\\"host_failure_recovery\\",\\"recovery_epoch\\":1,\\"rolled_back\\":2,\\"surviving_side_effects\\":[],\\"through_idx\\":6,\\"type\\":\\"recovered_from_checkpoint\\"}"}',
 };
 
+/**
+ * SYNTH: integration_asset (ADR 0056) for a provider the UI has no
+ * hand-crafted renderer for (datadog). Proves the generic semantic envelope
+ * parses regardless of provider; rendering falls back to the generic card.
+ */
+const SYNTH_INTEGRATION_ASSET = {
+  kind: "integration_asset",
+  data: '{"idx":9,"kind":"integration_asset","payload_json":"{\\"_recovery_epoch\\":0,\\"_rewound\\":false,\\"asset_kind\\":\\"query_result\\",\\"at\\":\\"2026-06-21T00:00:00.000Z\\",\\"data\\":{\\"p99\\":\\"812ms\\"},\\"fetchable\\":null,\\"provider\\":\\"datadog\\",\\"surface\\":\\"action\\",\\"type\\":\\"integration_asset\\"}"}',
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -172,6 +182,19 @@ describe("parseOrchestratorFrame — SYNTH fixtures", () => {
     expect(ev.cause).toBe("host_failure_recovery");
     expect((ev as Record<string, unknown>)._rewound).toBeUndefined();
     expect((ev as Record<string, unknown>)._recovery_epoch).toBeUndefined();
+  });
+
+  test("integration_asset: a generic provider's envelope + payload parse intact", () => {
+    const result = parse(SYNTH_INTEGRATION_ASSET);
+    expect(result).not.toBeNull();
+    expect(result!.idx).toBe(9);
+    const ev = result!.event as Extract<SessionEvent, { type: "integration_asset" }>;
+    expect(ev.type).toBe("integration_asset");
+    expect(ev.provider).toBe("datadog");
+    expect(ev.asset_kind).toBe("query_result");
+    expect(ev.surface).toBe("action");
+    expect(ev.fetchable).toBeNull();
+    expect((ev as Record<string, unknown>)._rewound).toBeUndefined();
   });
 
   test("unknown kind still parses (EventSource only fires listeners for registered kinds)", () => {

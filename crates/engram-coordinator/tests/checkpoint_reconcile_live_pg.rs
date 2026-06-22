@@ -254,8 +254,14 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
     .expect("append e1");
     meta.append_session_event(
         session_id,
-        "pull_request_opened",
-        serde_json::json!({"url": "https://github.com/x/y/pull/7", "number": 7}),
+        "integration_asset",
+        serde_json::json!({
+            "provider": "forge",
+            "asset_kind": "pull_request",
+            "surface": "asset",
+            "data": {"number": 7},
+            "fetchable": {"kind": "external", "url": "https://github.com/x/y/pull/7"},
+        }),
     )
     .await
     .expect("append PR");

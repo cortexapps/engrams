@@ -2622,7 +2622,8 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT kind, payload FROM session_events
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
-               AND kind IN ('pull_request_opened', 'file_shared')
+               AND (kind = 'file_shared'
+                    OR (kind = 'integration_asset' AND payload->>'surface' = 'asset'))
              ORDER BY idx
             "#,
         )
@@ -2637,13 +2638,40 @@ impl MetadataStore for PostgresStore {
                 let kind: String = sqlx::Row::try_get(r, "kind").ok()?;
                 let payload: serde_json::Value = sqlx::Row::try_get(r, "payload").ok()?;
                 Some(match kind.as_str() {
-                    "pull_request_opened" => format!(
-                        "A pull request was opened and still exists: {}",
-                        payload
-                            .get("url")
+                    // ADR 0056: a durable integration asset (surface='asset')
+                    // survives the rewind. Build the line generically from the
+                    // payload — prefer a fetchable URL, then data.url/title,
+                    // else fall back to the provider/asset_kind pair.
+                    "integration_asset" => {
+                        let provider = payload
+                            .get("provider")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("(url unknown)"),
-                    ),
+                            .unwrap_or("integration");
+                        let asset_kind = payload
+                            .get("asset_kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("asset");
+                        let detail = payload
+                            .get("fetchable")
+                            .and_then(|f| f.get("url"))
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                payload
+                                    .get("data")
+                                    .and_then(|d| d.get("url").or_else(|| d.get("title")))
+                                    .and_then(|v| v.as_str())
+                            });
+                        match detail {
+                            Some(d) => {
+                                format!(
+                                    "A {provider} {asset_kind} was produced and still exists: {d}"
+                                )
+                            }
+                            None => {
+                                format!("A {provider} {asset_kind} was produced and still exists")
+                            }
+                        }
+                    }
                     "file_shared" => format!(
                         "A file was shared and still exists: {}",
                         payload
