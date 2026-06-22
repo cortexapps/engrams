@@ -420,11 +420,21 @@ at the end with the commit chain.
    the orchestrator compiles bound capabilities → a per-session `IntegrationPolicy`
    and ships it. Datadog reachable, gated, guest holds no key; the coordinator stays
    a pure enforcer.
-4. **Interceptor response-observation + asset specs (the new core).** The connector
-   config's `asset`: the proxy buffers + parses responses for marked endpoints,
-   evaluates the map (+ coarse-emit-on-failure), and emits `IntegrationAsset` via a
-   host→coordinator channel. A marked endpoint on *any* provider now surfaces an
-   asset with zero Rust. First consumers: a Datadog query result; a GitHub issue.
+4. **Interceptor response-observation + asset specs (the new core).** Splits like
+   Phase 3. **4a** (*done*): the observation **engine** in `engram-egress-proxy` —
+   an `ObserveEntry` (host + method/path gate + asset spec), an HTTP/1.1 response
+   parser (status + de-chunked, identity body), a `$.resp.*`/`$.req.*`/`$.status`
+   extractor, and the `intercept::run` observe path (strip `Accept-Encoding` +
+   force `Connection: close` on marked requests, tap the response while forwarding,
+   evaluate the map, call an `ObserveSink`; coarse-emit on parse failure). Unit +
+   loopback-TLS e2e tested; inert in prod (host-agent ships no observe specs + no
+   sink until 4b). **4b**: `SessionEgressPolicy.observes` + `IntegrationPolicy.observes`
+   (parse/persist/resume) + a coordinator `/sessions/:id/integration-asset` ingest
+   (→ `state.emit(IntegrationAsset)`) + the host-agent sink (`coord_client` POST,
+   mirroring the harness-event path) + `register_policy` observe translation.
+   **4c**: the orchestrator compiles connector `asset` specs → `observes`; first
+   consumers — a Datadog query result, a GitHub issue. A marked endpoint on *any*
+   provider then surfaces an asset with zero Rust.
 5. **Mint (credential source) for GitHub + retire `GitForge`.** Slim `Integration`
    trait (mint + provider metadata + the hybrid `perform_action`); `state.forge` →
    `state.integrations`; `ForgeOp` → a generic `IntegrationOp`; profile-scoped App
