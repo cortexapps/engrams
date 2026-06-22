@@ -1107,6 +1107,55 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     }
   });
 
+  test("an inject capability compiles + ships integration_policy_json (ADR 0056 B′)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("dd-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ capabilities: ["datadog:logs:read"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
+      expect(json).toBeDefined();
+      expect(JSON.parse(json!)).toEqual({
+        injects: [
+          {
+            hosts: ["api.datadoghq.com"],
+            header_name: "DD-API-KEY",
+            header_template: "{}",
+            secret_ref: "datadog-api-key",
+            methods: ["GET"],
+            path_prefixes: ["/api/v2/logs/events"],
+          },
+        ],
+      });
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("a mint-only capability set omits integration_policy_json (no injects)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("gh-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ capabilities: ["github:issues:write"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      expect(fakeSessions.createReqs[0]?.integrationPolicyJson).toBeUndefined();
+    } finally {
+      await srv.close();
+    }
+  });
+
   test("empty profile skills omit selected_skills (base session)", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("noskills-sess")], existing: [] });
     const srv = await spawnServer({
