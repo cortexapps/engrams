@@ -13,6 +13,14 @@ real response bytes at the proxy — so a side effect on a marked endpoint **can
 occur without emitting an event**. A server-mediated action seam survives only as
 a **hybrid exception** for the rare cases needing pre-effect mediation.
 
+Revised 2026-06-22: detailed the connector config (§3) — **option B′**: connectors
+are orchestrator-owned static JSON (a plugin in the orchestrator/web tier); the
+orchestrator compiles bound capabilities → a per-session policy it ships, and the
+coordinator/host are pure enforcers with zero connector knowledge. Added the
+**`grants` tag** (the capability→operation join) and a **`protocol` discriminator**
+(`http` implemented; `grpc`/`graphql` designed-in as example shapes for future
+parsers — only `match`/`success` are protocol-shaped).
+
 Builds on ADR 0023 (the git-forge seam + per-session broker token), ADR 0053
 (session profiles — the per-session capability selector), ADR 0055 (dynamic
 per-session mounts — skills/connectors ship without platform code), ADR 0006 (the
@@ -93,49 +101,118 @@ identical and always happen at the interceptor.** This is the correction to the
 prior framing, which over-loaded "Plane A/B" with enforcement *and* auth. Mint is
 hand-coded per provider (bespoke, security-critical — §6/§9); inject is config.
 
-### 3. The connector config — one declarative per-endpoint table
+### 3. The connector config (B′) — orchestrator-owned static JSON; the coordinator is a pure enforcer
 
-A connector describes a provider as a table keyed by endpoint pattern. It is the
-single place that says, per endpoint: *is it allowed, does the proxy inject a key,
-and is it an asset?* — plane-agnostic.
+A **connector** describes one provider as static JSON, authored as a plugin in the
+orchestrator (`orchestrator/src/connectors/*.json`, validated against a JSON
+Schema). It is the single declarative source for *what a capability unlocks*:
+which operations are allowed, whether the proxy injects a key, and which produce
+assets. The orchestrator is the natural home — it already owns profiles (the
+producer) and the renderer (presentation), so a connector's response→asset map
+and its asset renderer co-locate (the WYSIWYG-plugin direction, §9).
 
-```yaml
-provider: github
-endpoints:
-  - match: { method: POST, path: /repos/*/pulls }
-    allow: true
-    asset:
-      kind: pull_request            # → IntegrationAsset{provider:"github", asset_kind:"pull_request"}
-      surface: asset
-      success: "status:2xx"
-      data:      { number: $.resp.number, title: $.resp.title, repo: $.req.path[1:3] }
-      fetchable: { external_url: $.resp.html_url }
-  - match: { method: POST, path: /repos/*/issues }
-    allow: true
-    asset: { kind: issue, surface: asset, success: "status:2xx",
-             data: { number: $.resp.number, title: $.resp.title },
-             fetchable: { external_url: $.resp.html_url } }
-  - match: { method: GET, path: /repos/* }       # read-only, allowed, not an asset
-    allow: true
+**Flow (option B′ — the coordinator/host have ZERO connector knowledge; they
+enforce a *resolved* policy):**
+
+1. **Validate (orchestrator).** Profile-save checks each capability's
+   `provider:action` against the connectors — the editor offers only what a
+   connector grants.
+2. **Compile (orchestrator, at session create).** For the profile's bound
+   capabilities, select the operations whose `grants` include the capability's
+   `action` (further constrained by `resource`), and emit a per-session
+   **IntegrationPolicy**: the activated operations' match/inject/asset rules
+   (carrying secret *refs*, never values) + the mint *scopes* for Plane-A
+   providers.
+3. **Persist + enforce (coordinator/host).** The coordinator persists the policy
+   (resume re-reads it from PG — ADR 0047 — with no orchestrator round-trip),
+   resolves `secret_ref`s from its SecretStore (host-side only), runs the mint
+   engines for the shipped scopes, and ships the gate/inject/asset rules to the
+   host proxy via `SessionEgressPolicy`. The proxy enforces. The coordinator never
+   parses a connector — it only executes a compiled policy and mints declared
+   scopes.
+
+**The `grants` tag is the capability→operation join.** A bound capability
+activates only the operations whose `grants` include its `action`:
+
+```jsonc
+// orchestrator/src/connectors/github.json — credential source = mint
+{
+  "provider": "github",
+  "protocol": "http",                                   // "http" today; "grpc" | "graphql" later (§9)
+  "credential": { "source": "mint", "mint": { "kind": "github_app" } },
+  "hosts": ["api.github.com"],                          // egress opened for any granted cap
+  "operations": [
+    { "grants": ["issues:write"],
+      "match":  { "method": "POST", "path": "/repos/*/issues" },        // ← protocol-shaped
+      "asset":  { "kind": "issue", "surface": "asset",
+                  "success":   { "statusClass": "2xx" },                 // ← protocol-shaped
+                  "data":      { "number": "$.resp.number", "title": "$.resp.title" },
+                  "fetchable": { "external": "$.resp.html_url" } } },
+    { "grants": ["contents:write"], "match": { "method": "PUT", "path": "/repos/*/contents/*" } }
+  ]
+}
+```
+```jsonc
+// orchestrator/src/connectors/datadog.json — credential source = inject
+{
+  "provider": "datadog", "protocol": "http",
+  "credential": { "source": "inject",
+                  "inject": { "header": "DD-API-KEY", "secretRef": "datadog-api-key", "template": "{}" } },
+  "hosts": ["api.datadoghq.com"],
+  "operations": [
+    { "grants": ["logs:read"],
+      "match": { "method": "GET", "path": "/api/v2/logs/events*" },
+      "asset": { "kind": "query_result", "surface": "action", "success": { "statusClass": "2xx" },
+                 "data": { "count": "$.resp.meta.page.total_count" } } }
+  ]
+}
 ```
 
-```yaml
-provider: datadog
-inject: { header: "DD-API-KEY", secret_ref: "datadog-api-key" }   # credential source = inject
-endpoints:
-  - match: { method: POST, path: /api/v2/logs/events/search }
-    allow: true
-    asset: { kind: query_result, surface: action, success: "status:2xx",
-             data: { count: $.resp.meta.page.total_count } }
+So `datadog:logs:read` activates the `logs:read` operation's allow + inject +
+asset; `github:issues:write` activates the issue operation **and** feeds the mint
+engine `{permissions:{issues:write}}` (a `resource` like `@cortexapps/engrams` →
+`repositories:[…]`). Same tag, different layering per credential source (§2).
+
+**Protocol-extensible by construction.** Only two fields are protocol-shaped —
+`match` and `success` (plus a `descriptors` ref for gRPC) — modeled as
+discriminated unions on `protocol`. Everything else (provider, credential, hosts,
+`grants`, the semantic `asset` kind/surface/fetchable, and the uniform
+`$.req`/`$.resp` extractor-path syntax) is protocol-agnostic; injection is
+transport-level (HTTP headers, gRPC metadata, GraphQL headers), so `inject.header`
+works across all three. Today only `http` is implemented; gRPC and GraphQL are
+**designed-in shapes for future engine work** — the same connector skeleton, a
+different `match`/`success`:
+
+```jsonc
+// FUTURE — gRPC: same skeleton; match by service/rpc, decode via a descriptor set
+{ "provider": "github", "protocol": "grpc",
+  "credential": { "source": "mint", "mint": { "kind": "github_app" } },
+  "hosts": ["api.github.com"], "descriptors": "github_v1.fds",   // FileDescriptorSet for protobuf decode
+  "operations": [
+    { "grants": ["issues:write"],
+      "match":  { "service": "github.v1.Issues", "rpc": "CreateIssue" },
+      "asset":  { "kind": "issue", "surface": "asset", "success": { "grpcStatus": 0 },
+                  "data": { "number": "$.resp.number" }, "fetchable": { "external": "$.resp.html_url" } } }
+  ] }
+```
+```jsonc
+// FUTURE — GraphQL: one endpoint; match the body-parsed operation/field
+{ "provider": "linear", "protocol": "graphql",
+  "credential": { "source": "inject",
+                  "inject": { "header": "Authorization", "secretRef": "linear-key", "template": "Bearer {}" } },
+  "hosts": ["api.linear.app"], "endpoint": "/graphql",
+  "operations": [
+    { "grants": ["issues:write"],
+      "match":  { "operation": "mutation", "field": "issueCreate" },
+      "asset":  { "kind": "issue", "surface": "asset", "success": { "noGraphqlErrors": true },
+                  "data": { "id": "$.resp.data.issueCreate.issue.id" },
+                  "fetchable": { "external": "$.resp.data.issueCreate.issue.url" } } }
+  ] }
 ```
 
-The `asset` block is exactly the "munge the response into a renderer-interpretable
-payload" surface: it maps request/response fields into the semantic
-`IntegrationAsset` the Phase-1 renderer already consumes. **Adding an
-asset-generating API on *any* provider — a GitHub issue, a Datadog query, a Linear
-issue — is a config row. Zero Rust.** Connectors live in an orchestrator-owned
-registry (à la the ADR 0055 catalog) and are compiled into the per-session
-`SessionEgressPolicy` shipped to the host at create.
+Adding a protocol = a new `protocol` enum value + a new host-proxy parser (Rust) +
+the two sub-shapes — **no restructuring of existing connectors**. The proxy
+rejects an unimplemented `protocol` until its parser lands.
 
 ### 4. Assets: observed at the interceptor by default; mediated only as a hybrid exception
 
@@ -240,10 +317,13 @@ pub enum ScopedCredential {                          // generalizes today's Scop
 ```
 
 No `plane()` method, no `Proxy(...)` variant — injection is config, not a trait
-shape. The **broker** owns `HashMap<provider, Arc<dyn Integration>>`, exposes
-`mint(bound, requested, hint)` = `clamp(requested, bound)` then `mint_credential`,
-and compiles connector config into the per-session egress policy. `clamp`/`covers`
-are pure, unit-testable — the "server decides the scope" invariant in one place.
+shape. The **broker** owns `HashMap<provider, Arc<dyn Integration>>` and runs the
+mint engines (`mint_credential` for the scope the per-session policy declares). It
+does **not** parse connectors: under B′ the *orchestrator* compiles the bound
+capabilities → the policy (§3), and the broker just mints the declared scopes +
+enforces the gate. `clamp`/`covers`/`resource_matches` are the pure
+capability→operation join + resource-constraint primitives (used at compile time
+and by the proxy gate) — the "server decides the scope" invariant.
 
 ### 7. Why git folds — it is mostly config now
 
@@ -275,18 +355,31 @@ regression test over an extracted pure `egress_secret_entries` helper. Substitut
 is host-side, so it runs in the normal Rust lane (not FC-gated). Header injection +
 method/path policy + response observation are later phases, not Step 0.
 
-### 9. Extensibility: declarative is the default; hand-coded Rust is the exception
+### 9. Extensibility: a connector is orchestrator-owned static config + a renderer; the engines stay Rust
 
-- **Declarative (config, no Rust, no rebuild):** request gating (allow/deny),
-  credential **injection**, and **asset marking on any provider** — all live in the
-  connector registry. Adding Datadog, marking a new GitHub/Linear endpoint as an
-  asset, opening a read path: config rows.
-- **Hand-coded Rust (small, audited):** only credential **minting** protocols
-  (GitHub App, AWS STS — bespoke + security-critical) and the rare **mediated**
-  `perform_action`. A generic/config-driven (or WASM) mint is deferred until ≥2
-  hand-coded mint adapters prove the shape.
-- **Presentation:** the `(provider, asset_kind) → renderer` registry in
-  web/orchestrator; the future WYSIWYG plugin registers render treatment there.
+A **connector is a plugin in the orchestrator/web tier** — static JSON (§3) plus an
+optional asset renderer (§4). The coordinator/host hold only **generic engines**:
+
+- **Declarative (orchestrator static JSON, no Rust, no coordinator rebuild):**
+  request gating (`allow`/`grants`), credential **injection**, **asset marking** on
+  any provider, and the response→asset `data`/`fetchable` map. Adding Datadog,
+  marking a new GitHub/Linear operation as an asset, opening a read path, or
+  declaring a new provider's whole surface is a connector JSON file. The
+  orchestrator validates it, compiles the bound capabilities → a per-session policy,
+  and ships it (B′, §3); the coordinator never parses a connector.
+- **Hand-coded Rust (small, audited, coordinator/host):** the generic engines — the
+  egress proxy (gate/inject/observe), the per-**protocol** parsers (`http` now;
+  `grpc`/`graphql` are designed-in §3, added later as new parsers), the credential
+  **mint** protocols (GitHub App, AWS STS — they hold the provider key), and the
+  rare **mediated** `perform_action`. A generic/config-driven (or WASM) mint is
+  deferred until ≥2 hand-coded mint adapters prove the shape.
+- **Presentation:** the `(provider, asset_kind) → renderer` registry in web; the
+  future WYSIWYG plugin registers render treatment there — co-located with the
+  connector's `data` map, so a plugin contributes both halves in one tier.
+
+The split: **per-connector stuff (config + renderer) is orchestrator/web; the
+generic substrate (proxy, protocol parsers, mint protocols) is coordinator/host
+Rust.** A connector flows orchestrator → coordinator (compiled policy) → host proxy.
 
 ## Phasing (each phase is one PR on its own worktree)
 
@@ -299,14 +392,20 @@ at the end with the commit chain.
    `forge/pull_request` reuses today's card. No proto/orchestrator change.
    **Survives the reframe unchanged** — it is the rendering layer the config feeds,
    and the coordinator-side PR emit is the mediated hybrid exception.
-2. **Capability model scaffolding.** `Capability` type (+ `parse`/`covers`/`clamp`);
-   `session.proto capabilities`; `session_capabilities` PG table + `MetadataStore`
-   bind/get; orchestrator `profiles.capabilities`. Bound but not yet enforced.
-3. **Interceptor request-gating + credential injection.** The connector config's
-   `allow` + `inject`: proxy `Decision` gains method/path enforcement + header
-   injection; `EgressSecretEntry` gains an injection variant + `RequestPolicy`;
-   `build_egress_policy` compiles bound caps → policy. Datadog reachable, gated, and
-   the guest holds no key. (This is the universal-gate substrate.)
+2. **Capability model scaffolding** — *done*. **2a** (#370): `Capability` type
+   (+ `parse`/`covers`/`clamp`); `session.proto capabilities`;
+   `session_capabilities` PG table + `MetadataStore` bind/get; bound at create in
+   both the boot + enqueue paths. **2b** (#371): orchestrator `profiles.capabilities`
+   (Drizzle 0005) + proto + `CreateTask` passthrough + profile validation/UI. Bound
+   end-to-end, not yet enforced.
+3. **Connector config (B′) + interceptor request-gating + injection.** Introduce
+   the orchestrator-owned connector JSON (§3, `http` only) + JSON-Schema validation;
+   the orchestrator compiles bound capabilities → a per-session `IntegrationPolicy`,
+   ships it on `CreateSession`, and the coordinator **persists** it (resume-safe) +
+   resolves `secret_ref`s. Host proxy: `Decision` gains `grants` method/path
+   enforcement + header injection; `EgressSecretEntry` gains an injection variant +
+   `RequestPolicy`. Datadog reachable, gated, guest holds no key. (The universal-gate
+   substrate; the coordinator stays a pure enforcer.)
 4. **Interceptor response-observation + asset specs (the new core).** The connector
    config's `asset`: the proxy buffers + parses responses for marked endpoints,
    evaluates the map (+ coarse-emit-on-failure), and emits `IntegrationAsset` via a
