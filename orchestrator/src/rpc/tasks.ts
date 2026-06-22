@@ -64,7 +64,7 @@ import {
 } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
-import { compileIntegrationPolicy } from "../connectors/registry.ts";
+import { compileIntegrationPolicy, policyHasContent } from "../connectors/registry.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -424,11 +424,17 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       //    the coordinator persists, resolving inject secret_refs host-side and
       //    shipping the observes to the proxy. Only shipped when non-empty (a
       //    capability-less profile, or one whose ops declare no inject/asset).
-      const policy = compileIntegrationPolicy(profile.capabilities);
-      const integrationPolicyJson =
-        policy.injects.length > 0 || policy.observes.length > 0
-          ? JSON.stringify(policy)
-          : undefined;
+      // ADR 0057: the policy is now the full session policy — it also carries
+      // the profile's network allow-list + injected secrets, which the
+      // coordinator sources the egress policy from. Shipped whenever it carries
+      // anything (caps OR secrets OR a non-trivial network).
+      const policy = compileIntegrationPolicy(profile.capabilities, undefined, {
+        network: profile.network,
+        secrets: profile.secrets,
+      });
+      const integrationPolicyJson = policyHasContent(policy)
+        ? JSON.stringify(policy)
+        : undefined;
       const created = await sessionsClient.createSession({
         imageUri: image.imageUri,
         mode: "agent",

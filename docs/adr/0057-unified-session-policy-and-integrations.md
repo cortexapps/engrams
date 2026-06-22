@@ -104,9 +104,19 @@ config-driven mint ADR 0056 §9 deferred).
   read-adapter, `LayeredSecretStore` composed into the coordinator's secret store, and the
   admin `OrgSecretService` app-gRPC + orchestrator proxy. *(this PR; ADR Proposed)*
 - **B1** — Profile gains `network` + `secrets` (Drizzle + proto + editor; additive).
-- **B2** — `SessionPolicy` cutover: compile profile → policy; coordinator persists +
-  builds egress from it + resumes from PG; **strip** `secrets`/`secret_mode`/`network`
-  from `ImageManifest`; seed default/dogfood profiles; re-bake images.
+- **B2** — `SessionPolicy` cutover, split into two PRs to keep the high-blast-radius
+  coordinator rewrite (which needs dev-vm FC/resume validation) isolated and reviewable:
+  - **B2a** *(additive; deploy-safe)*: the policy (`IntegrationPolicy`) carries `network` +
+    `secrets`; the orchestrator compiles them from the profile and ships them. The
+    coordinator doesn't consume them yet → zero behavior change. The type keeps its
+    `IntegrationPolicy` name + the `integration_policy_json` wire field — the cosmetic rename
+    to `SessionPolicy` is a deferred follow-up (cf. ADR 0056's deferred `ForgeOp`→
+    `IntegrationOp` rename).
+  - **B2b** *(the clean break)*: the coordinator sources network + secrets from the policy
+    (per-secret resolution: literal→env, broker→placeholder+egress entry) with a manifest
+    fallback, then **strip** `secrets`/`secret_mode`/`network` from `ImageManifest` (drop
+    `deny_unknown_fields` so pre-strip manifests still parse), seed default/dogfood profiles,
+    re-bake images.
 - **C1** — DB-back the connector catalog (orchestrator-only; built-ins as read-only seeds).
 - **C2** — Mint-kind registry + GitHub cred migration (creds sourced from the org store;
   retire `--git-forge`/`--github-app-*`).
