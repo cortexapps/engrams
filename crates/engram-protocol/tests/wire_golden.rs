@@ -215,6 +215,9 @@ fn session_egress_policy() -> SessionEgressPolicy {
             allow_hosts: vec!["api.anthropic.com".into()],
             allow_host_patterns: vec![],
         }],
+        // ADR 0056 (Phase 3b): injects ride SessionEgressPolicy. Empty here —
+        // the golden pins the length prefix; WIRE_VERSION was bumped for it.
+        injects: vec![],
         secret_mode: SecretMode::Broker,
     }
 }
@@ -318,7 +321,7 @@ fn wire_version_pinned() {
     // signal that a payload shape changed; pin it so a payload change
     // without a bump (or vice-versa) is a conscious decision.
     assert_eq!(
-        WIRE_VERSION, 2,
+        WIRE_VERSION, 3,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

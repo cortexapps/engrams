@@ -68,6 +68,11 @@ pub(crate) struct BootInputs {
     /// to `session_capabilities` once the session row exists. Empty on the
     /// queued re-prepare (those were bound at enqueue), so the bind is a no-op.
     pub capabilities: Vec<engram_core::types::Capability>,
+    /// ADR 0056 (B′): the orchestrator-compiled integration policy, if any. Its
+    /// inject `secret_ref`s are resolved host-side into the egress policy's
+    /// inject entries at boot. `None` on the queued/resume re-prepare for now
+    /// (persistence + re-inject is Phase 3b-2).
+    pub integration_policy: Option<engram_core::types::IntegrationPolicy>,
     pub secret_mode: engram_core::types::image::SecretMode,
     /// Per-request `secrets` overrides to seal into `session_secrets`
     /// once the row exists (so resume rebuilds the harness env). `None`
@@ -131,12 +136,18 @@ pub(crate) async fn boot_on_reserved_host(
         network,
         selected_mounts,
         capabilities,
+        integration_policy,
         secret_mode,
         deferred_session_secrets,
         prompt,
         memory_mib: _,
         cpu_budget_vcpus: _,
     } = inputs;
+
+    // ADR 0056: the image ref doubles as the SecretContext for resolving the
+    // integration policy's inject `secret_ref`s; capture it before `spec` is
+    // moved into `create_session_created` below.
+    let image_ref = spec.image.clone();
 
     // ---- restore the base snapshot on the reserved host ----
     let record = match state.services.meta.get_snapshot(base_snapshot_id).await {
@@ -256,6 +267,8 @@ pub(crate) async fn boot_on_reserved_host(
         &spec_env,
         &network,
         secret_mode,
+        &image_ref,
+        integration_policy.as_ref(),
     )
     .await;
 
@@ -279,6 +292,7 @@ pub(crate) async fn boot_on_reserved_host(
         network_allow_hosts: network.allow_hosts.clone(),
         network_allow_host_patterns: network.allow_host_patterns.clone(),
         secrets: Vec::new(),
+        injects: Vec::new(),
         secret_mode,
     });
 
@@ -385,6 +399,7 @@ fn map_restore_error(e: engram_core::SandboxError) -> ApiError {
 /// Build the per-session egress policy from the resolved guest IP, or
 /// `None` when the backend exposes no guest IP (process backend / some
 /// VZ configs) — the caller synthesizes an unspecified-IP fallback.
+#[allow(clippy::too_many_arguments)]
 async fn build_egress_policy(
     state: &SharedState,
     session_id: SessionId,
@@ -393,6 +408,8 @@ async fn build_egress_policy(
     spec_env: &HashMap<String, String>,
     network: &engram_core::types::image::NetworkPolicy,
     secret_mode: engram_core::types::image::SecretMode,
+    image: &str,
+    integration_policy: Option<&engram_core::types::IntegrationPolicy>,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
     let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
@@ -403,8 +420,70 @@ async fn build_egress_policy(
         network_allow_hosts: network.allow_hosts.clone(),
         network_allow_host_patterns: network.allow_host_patterns.clone(),
         secrets: egress_secret_entries(secret_bundle, spec_env),
+        injects: resolve_inject_entries(state, integration_policy, image).await,
         secret_mode,
     })
+}
+
+/// ADR 0056 (B′): resolve an integration policy's Plane-B injections into
+/// host-side egress entries. Each inject's `secret_ref` is resolved via the
+/// deployment `SecretStore` (the session's image ref is the lookup context);
+/// the resolved value rides the policy to the host, never to the orchestrator
+/// or guest. A ref that doesn't resolve is skipped + logged (the connector
+/// gates the request regardless, but without a credential it would fail
+/// upstream — so we drop it rather than inject an empty header).
+async fn resolve_inject_entries(
+    state: &SharedState,
+    integration_policy: Option<&engram_core::types::IntegrationPolicy>,
+    image: &str,
+) -> Vec<engram_core::types::egress::EgressInjectEntry> {
+    let Some(policy) = integration_policy else {
+        return Vec::new();
+    };
+    let (repo, image_tag) = {
+        let (r, t) = engram_core::types::session::split_image_ref(image);
+        (r.to_string(), t.to_string())
+    };
+    let ctx = engram_core::traits::SecretContext {
+        repo: &repo,
+        image_tag: &image_tag,
+    };
+    let schema = engram_core::types::image::SecretSchema::default();
+    let mut out = Vec::with_capacity(policy.injects.len());
+    for inj in &policy.injects {
+        let secret = match state
+            .services
+            .secrets
+            .get(&ctx, &inj.secret_ref, &schema)
+            .await
+        {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                tracing::warn!(
+                    secret_ref = %inj.secret_ref,
+                    "integration inject secret_ref not resolvable; skipping injection",
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    secret_ref = %inj.secret_ref, error = %e,
+                    "integration inject secret_ref resolution failed; skipping injection",
+                );
+                continue;
+            }
+        };
+        out.push(engram_core::types::egress::EgressInjectEntry {
+            secret,
+            header_name: inj.header_name.clone(),
+            header_template: inj.header_template.clone(),
+            allow_hosts: inj.hosts.clone(),
+            allow_host_patterns: Vec::new(),
+            methods: inj.methods.clone(),
+            path_prefixes: inj.path_prefixes.clone(),
+        });
+    }
+    out
 }
 
 /// Pair each resolved secret with the placeholder that

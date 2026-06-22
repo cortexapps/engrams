@@ -8454,6 +8454,7 @@ mod tests {
                 network_allow_hosts: allow.iter().map(|s| s.to_string()).collect(),
                 network_allow_host_patterns: Vec::new(),
                 secrets: Vec::new(),
+                injects: Vec::new(),
                 secret_mode: SecretMode::Literal,
             }
         }

@@ -75,6 +75,7 @@ fn placeholder_egress_policy(
         network_allow_hosts: vec![],
         network_allow_host_patterns: vec![],
         secrets: vec![],
+        injects: vec![],
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
 }

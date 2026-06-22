@@ -126,6 +126,10 @@ pub(crate) fn create_request_from_proto(
         // parsed + validated + bound to the session at create (the broker later
         // clamps requests to them).
         capabilities,
+        // ADR 0056 (B′): the orchestrator-compiled per-session integration
+        // policy (JSON). Parsed here; the coordinator resolves its inject refs
+        // into the egress policy at boot.
+        integration_policy_json,
         // Phase 1b: the initial prompt's client prompt_id. The create path
         // delivers the initial prompt via send_prompt (which mints one when
         // empty), so threading the client id for the FIRST message is a
@@ -146,6 +150,10 @@ pub(crate) fn create_request_from_proto(
     } else {
         Some(secrets.into_iter().collect())
     };
+    // ADR 0056: a malformed integration policy is a create-time 400 (like a
+    // malformed capability), not a silent drop.
+    let integration_policy = engram_core::types::IntegrationPolicy::parse(&integration_policy_json)
+        .map_err(|e| ApiError::BadRequest(format!("invalid integration_policy_json: {e}")))?;
     Ok(CreateSessionRequest {
         image: image_uri,
         mode,
@@ -153,6 +161,7 @@ pub(crate) fn create_request_from_proto(
         secrets,
         selected_skills,
         capabilities,
+        integration_policy,
     })
 }
 

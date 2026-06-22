@@ -390,6 +390,10 @@ pub(crate) fn assemble_resume_egress_policy(
         network_allow_hosts: manifest.network.allow_hosts.clone(),
         network_allow_host_patterns: manifest.network.allow_host_patterns.clone(),
         secrets,
+        // ADR 0056 (B′): resume re-injection (resolving the persisted policy's
+        // inject refs) is Phase 3b-2; until then a resumed session carries no
+        // Plane-B injections.
+        injects: Vec::new(),
         secret_mode: manifest.secret_mode,
     }
 }
@@ -461,6 +465,12 @@ pub struct CreateSessionRequest {
     /// after its row exists. Empty for non-gRPC / legacy callers.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// ADR 0056 (B′): the orchestrator-compiled per-session integration policy
+    /// (gRPC path parses it from `integration_policy_json`). Its inject
+    /// `secret_ref`s are resolved host-side into the egress policy at boot.
+    /// `None` for non-gRPC / legacy callers.
+    #[serde(default)]
+    pub integration_policy: Option<engram_core::types::IntegrationPolicy>,
 }
 
 #[derive(Serialize)]
@@ -774,6 +784,7 @@ pub(crate) async fn prepare_from_grpc(
         enabled,
         req.selected_skills.clone(),
         req.capabilities.clone(),
+        req.integration_policy.clone(),
     )
     .await
 }
@@ -824,6 +835,10 @@ pub(crate) async fn prepare_from_row(
         // `session_capabilities` at enqueue (the row existed); the re-prepare
         // carries an empty set so the boot-path bind is a no-op, preserving them.
         Vec::new(),
+        // ADR 0056 (B′): queued/resume sessions don't yet re-carry the
+        // integration policy — persistence + re-inject is Phase 3b-2. The
+        // scanner boots them without Plane-B injection for now.
+        None,
     )
     .await
 }
@@ -958,6 +973,8 @@ async fn prepare_inner(
     selected_skills: Vec<String>,
     // ADR 0056: profile-granted "provider:action[@resource]" capability strings.
     capabilities: Vec<String>,
+    // ADR 0056 (B′): the orchestrator-compiled integration policy, if any.
+    integration_policy: Option<engram_core::types::IntegrationPolicy>,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
     // ADR 0021 P1.3: a dev-VM session leaves any baked harness undriven,
     // so a prompt is meaningless — reject it explicitly.
@@ -1120,6 +1137,7 @@ async fn prepare_inner(
             network,
             selected_mounts,
             capabilities,
+            integration_policy,
             secret_mode: manifest.secret_mode,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),

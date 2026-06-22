@@ -131,6 +131,7 @@ async fn stream_events_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         selected_skills: Vec::new(),
         capabilities: Vec::new(),
+        integration_policy_json: String::new(),
         image_uri: image_uri.clone(),
         mode: String::new(),
         prompt: None,
@@ -273,6 +274,7 @@ async fn session_crud_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         selected_skills: Vec::new(),
         capabilities: Vec::new(),
+        integration_policy_json: String::new(),
         image_uri: image_uri.clone(),
         mode: String::new(),
         prompt: None,
@@ -393,6 +395,7 @@ async fn exec_streaming_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         selected_skills: Vec::new(),
         capabilities: Vec::new(),
+        integration_policy_json: String::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".into(),
         prompt: None,
@@ -514,6 +517,7 @@ async fn snapshot_evict_resume_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         selected_skills: Vec::new(),
         capabilities: Vec::new(),
+        integration_policy_json: String::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".into(),
         prompt: None,
@@ -647,6 +651,7 @@ async fn get_artifact_not_found_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         selected_skills: Vec::new(),
         capabilities: Vec::new(),
+        integration_policy_json: String::new(),
         image_uri,
         mode: "dev_vm".into(),
         prompt: None,
@@ -721,6 +726,7 @@ async fn shell_relay_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         selected_skills: Vec::new(),
         capabilities: Vec::new(),
+        integration_policy_json: String::new(),
         image_uri,
         mode: "dev_vm".into(),
         prompt: None,
