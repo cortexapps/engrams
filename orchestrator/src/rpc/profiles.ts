@@ -23,6 +23,11 @@ import { abilityFor } from "../authz/ability.ts";
 import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { makeProfileStore, type ProfileRow, type ProfileStore } from "../db/profiles.ts";
+import {
+  DEFAULT_PROFILE_NETWORK,
+  type ProfileNetwork,
+  type ProfileSecret,
+} from "../db/schema.ts";
 import { images as defaultImages } from "../control-plane/client.ts";
 import {
   defaultCatalog,
@@ -75,10 +80,84 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     // ADR 0056: capabilities likewise describe granted access (not secrets),
     // so they are member-visible.
     capabilities: row.capabilities,
+    // ADR 0057: network + secrets describe access/config (the secret VALUES
+    // live in the org store, never here), so they're member-visible like skills.
+    network: row.network,
+    secrets: row.secrets,
     archived: row.deletedAt != null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   } as Profile;
+}
+
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** ADR 0057: map the proto network message (or undefined) to the stored shape. */
+function normalizeNetwork(
+  n: { default?: string; allowHosts?: string[]; allowHostPatterns?: string[] } | undefined,
+): ProfileNetwork {
+  if (!n) return { ...DEFAULT_PROFILE_NETWORK };
+  return {
+    default: n.default === "allow" ? "allow" : "deny",
+    allowHosts: n.allowHosts ?? [],
+    allowHostPatterns: n.allowHostPatterns ?? [],
+  };
+}
+
+/** ADR 0057: map proto secrets to the stored shape (mode coerced to broker|literal). */
+function normalizeSecrets(
+  secrets: ReadonlyArray<{
+    ref?: string;
+    envVar?: string;
+    mode?: string;
+    allowHosts?: string[];
+    allowHostPatterns?: string[];
+  }>,
+): ProfileSecret[] {
+  return secrets.map((s) => ({
+    ref: (s.ref ?? "").trim(),
+    envVar: (s.envVar ?? "").trim(),
+    mode: s.mode === "literal" ? "literal" : "broker",
+    allowHosts: s.allowHosts ?? [],
+    allowHostPatterns: s.allowHostPatterns ?? [],
+  }));
+}
+
+/** ADR 0057: a network allow entry must be a non-empty host string. */
+function assertNetworkValid(n: ProfileNetwork): void {
+  for (const h of [...n.allowHosts, ...n.allowHostPatterns]) {
+    if (!h.trim()) {
+      throw new ConnectError("network allow entry must not be empty", Code.InvalidArgument);
+    }
+  }
+}
+
+/**
+ * ADR 0057: each profile secret needs a non-empty org-secret `ref` and a valid,
+ * unique env var name. The `ref` isn't checked to exist in the org store here —
+ * a secret may be entered after the profile (decoupled, like a capability vs.
+ * its connector). The coordinator resolves `ref` at session create (B2).
+ */
+function assertSecretsValid(secrets: ProfileSecret[]): void {
+  const seenEnv = new Set<string>();
+  for (const s of secrets) {
+    if (!s.ref) {
+      throw new ConnectError(
+        "secret ref (org-secret name) must not be empty",
+        Code.InvalidArgument,
+      );
+    }
+    if (!ENV_NAME_RE.test(s.envVar)) {
+      throw new ConnectError(
+        `invalid secret env var "${s.envVar}" (expected [A-Za-z_][A-Za-z0-9_]*)`,
+        Code.InvalidArgument,
+      );
+    }
+    if (seenEnv.has(s.envVar)) {
+      throw new ConnectError(`duplicate secret env var "${s.envVar}"`, Code.InvalidArgument);
+    }
+    seenEnv.add(s.envVar);
+  }
 }
 
 export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): void {
@@ -175,6 +254,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       await assertImageEnabled(req.imageId);
       await assertSkillsValid(req.skills ?? []);
       assertCapabilitiesValid(req.capabilities ?? []);
+      const network = normalizeNetwork(req.network);
+      const secrets = normalizeSecrets(req.secrets ?? []);
+      assertNetworkValid(network);
+      assertSecretsValid(secrets);
       const row = await store.create({
         name: req.name,
         description: req.description,
@@ -184,6 +267,8 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
         capabilities: req.capabilities ?? [],
+        network,
+        secrets,
       });
       return { profile: toProto(row, true) };
     },
@@ -196,6 +281,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       await assertImageEnabled(req.imageId);
       await assertSkillsValid(req.skills ?? []);
       assertCapabilitiesValid(req.capabilities ?? []);
+      const network = normalizeNetwork(req.network);
+      const secrets = normalizeSecrets(req.secrets ?? []);
+      assertNetworkValid(network);
+      assertSecretsValid(secrets);
       const row = await store.update(req.id, {
         name: req.name,
         description: req.description,
@@ -205,6 +294,8 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
         capabilities: req.capabilities ?? [],
+        network,
+        secrets,
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
       return { profile: toProto(row, true) };

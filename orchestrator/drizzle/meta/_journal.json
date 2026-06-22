@@ -43,6 +43,13 @@
       "when": 1782132459031,
       "tag": "0005_profile_capabilities",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1782167358737,
+      "tag": "0006_profile_network_secrets",
+      "breakpoints": true
     }
   ]
 }

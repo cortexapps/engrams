@@ -1,0 +1,2 @@
+ALTER TABLE "profile" ADD COLUMN "network" jsonb DEFAULT '{"default":"deny","allowHosts":[],"allowHostPatterns":[]}'::jsonb NOT NULL;--> statement-breakpoint
+ALTER TABLE "profile" ADD COLUMN "secrets" jsonb DEFAULT '[]'::jsonb NOT NULL;
