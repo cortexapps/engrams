@@ -47,6 +47,35 @@ message Profile {
   // coordinator binds + (later) clamps. Member-visible (describes granted
   // access, like skills — not sensitive like env_vars).
   repeated string capabilities = 12;
+  // ADR 0057: egress network allow-list this profile's sessions may reach
+  // (deny by default). Lifted from the image manifest onto the profile; compiled
+  // into the per-session egress policy (not consumed at boot until B2).
+  ProfileNetwork network = 13;
+  // ADR 0057: secrets injected into this profile's sessions, resolved from the
+  // org secret store by `ref` (the value lives there, never here). Lifted from
+  // the image manifest onto the profile; B2 consumes it at boot.
+  repeated ProfileSecret secrets = 14;
+}
+
+// ADR 0057: a profile's egress network allow-list. `default` is the posture for
+// hosts not matched by an allow entry ("deny" — the only sane default — or
+// "allow" for a fully-open profile). Mirrors the manifest NetworkPolicy it lifts.
+message ProfileNetwork {
+  string default = 1; // "deny" (default) | "allow"
+  repeated string allow_hosts = 2; // exact hostnames
+  repeated string allow_host_patterns = 3; // leading-wildcard globs (*.example.com)
+}
+
+// ADR 0057: one secret a profile injects. The value is NOT here — `ref` names an
+// org secret resolved at session create. `mode` picks the injection style:
+// "broker" (env placeholder + proxy substitution on allow_hosts; the guest never
+// holds the value) or "literal" (raw value in the guest env).
+message ProfileSecret {
+  string ref = 1; // org-secret name (the value-store key)
+  string env_var = 2; // env var the value is exposed as
+  string mode = 3; // "broker" (default) | "literal"
+  repeated string allow_hosts = 4; // broker-mode substitution hosts
+  repeated string allow_host_patterns = 5;
 }
 
 // Lightweight resolved identity embedded on TaskSessionRef for the chip
@@ -87,6 +116,9 @@ message CreateProfileRequest {
   repeated string skills = 7;
   // ADR 0056: integration capabilities (see Profile.capabilities).
   repeated string capabilities = 8;
+  // ADR 0057: see Profile.network / Profile.secrets.
+  ProfileNetwork network = 9;
+  repeated ProfileSecret secrets = 10;
 }
 
 message CreateProfileResponse {
@@ -105,6 +137,9 @@ message UpdateProfileRequest {
   repeated string skills = 8;
   // ADR 0056: integration capabilities (see Profile.capabilities).
   repeated string capabilities = 9;
+  // ADR 0057: see Profile.network / Profile.secrets.
+  ProfileNetwork network = 10;
+  repeated ProfileSecret secrets = 11;
 }
 
 message UpdateProfileResponse {

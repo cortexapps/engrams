@@ -14,6 +14,13 @@ import {
   mapToEnvRows,
   type EnvRow,
 } from "../../components/profiles/EnvVarsEditor";
+import {
+  ProfileSecretsEditor,
+  secretRowsToWire,
+  wireToSecretRows,
+  type SecretRow,
+} from "../../components/profiles/ProfileSecretsEditor";
+import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -75,6 +82,15 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   // validated into the payload at submit.
   const [capsText, setCapsText] = useState("");
 
+  // ADR 0057: profile-defined egress network policy + injected secrets (lifted
+  // off the image manifest). Local state like envRows/capsText, assembled into
+  // the payload at submit.
+  const [networkDefault, setNetworkDefault] = useState<"deny" | "allow">("deny");
+  const [allowHostsText, setAllowHostsText] = useState("");
+  const [allowPatternsText, setAllowPatternsText] = useState("");
+  const [secretRows, setSecretRows] = useState<SecretRow[]>([]);
+  const { data: orgSecretNames } = useOrgSecretNames();
+
   // ADR 0055 P2: inline skill upload (admin). Local state, separate from the
   // react-hook-form; on success the catalog query invalidates and the new skill
   // appears as a toggle.
@@ -134,6 +150,10 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       });
       setEnvRows(mapToEnvRows(p.envVars));
       setCapsText((p.capabilities ?? []).join("\n"));
+      setNetworkDefault(p.network?.default === "allow" ? "allow" : "deny");
+      setAllowHostsText((p.network?.allowHosts ?? []).join("\n"));
+      setAllowPatternsText((p.network?.allowHostPatterns ?? []).join("\n"));
+      setSecretRows(wireToSecretRows(p.secrets ?? []));
     }
   }, [existing, form]);
 
@@ -157,7 +177,18 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       });
       return;
     }
-    const payload = { ...v, envVars: envRowsToMap(envRows), capabilities };
+    const linesOf = (text: string) =>
+      text
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const network = {
+      default: networkDefault,
+      allowHosts: linesOf(allowHostsText),
+      allowHostPatterns: linesOf(allowPatternsText),
+    };
+    const secrets = secretRowsToWire(secretRows);
+    const payload = { ...v, envVars: envRowsToMap(envRows), capabilities, network, secrets };
     try {
       if (mode === "edit" && editingId) {
         await update.mutateAsync({ id: editingId, ...payload });
@@ -240,6 +271,58 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               </Field>
             )}
           />
+        </FieldGroup>
+      </FieldSet>
+
+      <FieldSet>
+        <FieldLegend>Network</FieldLegend>
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="net-default">Default egress</FieldLabel>
+            <Select
+              value={networkDefault}
+              onValueChange={(v) => setNetworkDefault(v as "deny" | "allow")}
+            >
+              <SelectTrigger id="net-default" className="w-40">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="deny">deny</SelectItem>
+                <SelectItem value="allow">allow</SelectItem>
+              </SelectContent>
+            </Select>
+            <FieldDescription>
+              Which hosts a session may reach. <strong>deny</strong> (recommended) blocks everything
+              except the allow-lists below; <strong>allow</strong> opens all egress. Lifted off the
+              image manifest (ADR 0057; enforced at boot once B2 lands).
+            </FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="net-hosts">Allowed hosts</FieldLabel>
+            <Textarea
+              id="net-hosts"
+              value={allowHostsText}
+              onChange={(e) => setAllowHostsText(e.target.value)}
+              rows={3}
+              placeholder={"api.github.com\nsentry.io"}
+              className="font-mono text-sm"
+            />
+            <FieldDescription>One exact hostname per line.</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="net-patterns">Allowed host patterns</FieldLabel>
+            <Textarea
+              id="net-patterns"
+              value={allowPatternsText}
+              onChange={(e) => setAllowPatternsText(e.target.value)}
+              rows={2}
+              placeholder={"*.pypi.org\n*.githubusercontent.com"}
+              className="font-mono text-sm"
+            />
+            <FieldDescription>
+              One leading-wildcard glob per line (e.g. <code>*.example.com</code>).
+            </FieldDescription>
+          </Field>
         </FieldGroup>
       </FieldSet>
 
@@ -364,13 +447,29 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               value={capsText}
               onChange={(e) => setCapsText(e.target.value)}
               rows={3}
-              placeholder={"github:contents:write@cortexapps/engrams\ngithub:issues:write\ndatadog:logs:read"}
+              placeholder={
+                "github:contents:write@cortexapps/engrams\ngithub:issues:write\ndatadog:logs:read"
+              }
               className="font-mono text-sm"
             />
             <FieldDescription>
               One per line, <code>provider:action[@resource]</code>. Sessions from this profile are
               granted these third-party integration capabilities (ADR 0056). Empty = none.
             </FieldDescription>
+          </Field>
+        </FieldGroup>
+      </FieldSet>
+
+      <FieldSet>
+        <FieldLegend>Secrets</FieldLegend>
+        <FieldGroup>
+          <Field>
+            <FieldLabel>Injected secrets</FieldLabel>
+            <ProfileSecretsEditor
+              rows={secretRows}
+              onChange={setSecretRows}
+              secretNames={orgSecretNames ?? []}
+            />
           </Field>
         </FieldGroup>
       </FieldSet>

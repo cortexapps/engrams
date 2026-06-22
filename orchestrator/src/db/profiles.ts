@@ -9,7 +9,12 @@
 import { and, eq, inArray, isNull } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
-import { profile as profileTable } from "./schema.ts";
+import {
+  profile as profileTable,
+  DEFAULT_PROFILE_NETWORK,
+  type ProfileNetwork,
+  type ProfileSecret,
+} from "./schema.ts";
 
 export interface ProfileRow {
   id: string;
@@ -23,6 +28,9 @@ export interface ProfileRow {
   skills: string[];
   // ADR 0056: integration capabilities ("provider:action[@resource]").
   capabilities: string[];
+  // ADR 0057: profile-defined egress allow-list + injected secrets.
+  network: ProfileNetwork;
+  secrets: ProfileSecret[];
   createdAt: Date;
   updatedAt: Date;
   deletedAt: Date | null;
@@ -37,6 +45,8 @@ export interface ProfileInput {
   envVars: Record<string, string>;
   skills: string[];
   capabilities: string[];
+  network: ProfileNetwork;
+  secrets: ProfileSecret[];
 }
 
 /** The seam injected into ProfileService and TaskService. */
@@ -67,6 +77,8 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     envVars: (r.envVars ?? {}) as Record<string, string>,
     skills: (r.skills ?? []) as string[],
     capabilities: (r.capabilities ?? []) as string[],
+    network: (r.network ?? DEFAULT_PROFILE_NETWORK) as ProfileNetwork,
+    secrets: (r.secrets ?? []) as ProfileSecret[],
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
     deletedAt: r.deletedAt,

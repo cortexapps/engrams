@@ -19,6 +19,8 @@ describe("ProfileStore", () => {
       envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
       skills: ["skills"],
       capabilities: ["github:issues:write", "datadog:logs:read"],
+      network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
+      secrets: [],
     };
     const created = await store.create(input);
     try {
