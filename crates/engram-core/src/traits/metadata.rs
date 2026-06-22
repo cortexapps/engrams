@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::error::MetaError;
+use crate::types::capability::Capability;
 use crate::types::event::{ArtifactRow, PersistedEvent};
 use crate::types::host::{HostHeartbeat, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
@@ -1183,6 +1184,32 @@ pub trait MetadataStore: Send + Sync {
         session_id: SessionId,
     ) -> Result<Option<SessionSecrets>, MetaError>;
     async fn delete_session_secrets(&self, session_id: SessionId) -> Result<(), MetaError>;
+
+    // ---- session capabilities (ADR 0056) ----
+    //
+    // The `(provider, action, resource)` grants a profile declared, bound
+    // to the session at create (`session_capabilities`). The broker reads
+    // them to clamp every guest credential/action request. Default impls so
+    // stores that don't model capabilities (test doubles) compile unchanged;
+    // `PostgresStore` is the authority. `bind` is idempotent and a no-op on
+    // an empty set — both create paths (boot + enqueue) call it, and the
+    // queued-then-booted re-prepare carries an empty set (the rows were
+    // bound at enqueue), so the no-op preserves them.
+    async fn bind_session_capabilities(
+        &self,
+        session_id: SessionId,
+        caps: &[Capability],
+    ) -> Result<(), MetaError> {
+        let _ = (session_id, caps);
+        Ok(())
+    }
+    async fn get_session_capabilities(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<Capability>, MetaError> {
+        let _ = session_id;
+        Ok(Vec::new())
+    }
 
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — cross-replica per-session op lease.

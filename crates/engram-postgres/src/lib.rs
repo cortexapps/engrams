@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore};
 use engram_core::types::{
-    ArtifactRow, EnableJob, EnableJobState, EnabledImage, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
+    ArtifactRow, Capability, EnableJob, EnableJobState, EnabledImage, HostRecord, HostStatus,
+    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState,
+    SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use row::col_err;
@@ -3501,6 +3502,70 @@ impl MetadataStore for PostgresStore {
         // session-terminate; if there were never overrides, no row
         // ever existed.
         Ok(())
+    }
+
+    // ---- session capabilities (ADR 0056) ----
+
+    async fn bind_session_capabilities(
+        &self,
+        session_id: SessionId,
+        caps: &[Capability],
+    ) -> Result<(), MetaError> {
+        // No-op on empty (the queued-then-booted re-prepare carries an empty
+        // set; the rows were bound at enqueue). ON CONFLICT DO NOTHING keeps
+        // it idempotent across the boot/enqueue double-bind. `resource` ''
+        // is the no-resource sentinel (NULL can't sit in the PK).
+        if caps.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        for c in caps {
+            sqlx::query(
+                r#"
+                INSERT INTO session_capabilities (session_id, provider, action, resource)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(session_id.as_uuid())
+            .bind(&c.provider)
+            .bind(&c.action)
+            .bind(c.resource.as_deref().unwrap_or(""))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_session_capabilities(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<Capability>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT provider, action, resource FROM session_capabilities
+            WHERE session_id = $1
+            ORDER BY provider, action, resource
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let provider: String = sqlx::Row::try_get(r, "provider").map_err(db_err)?;
+            let action: String = sqlx::Row::try_get(r, "action").map_err(db_err)?;
+            let resource: String = sqlx::Row::try_get(r, "resource").map_err(db_err)?;
+            out.push(Capability {
+                provider,
+                action,
+                resource: (!resource.is_empty()).then_some(resource),
+            });
+        }
+        Ok(out)
     }
 
     // ----------------------------------------------------------------

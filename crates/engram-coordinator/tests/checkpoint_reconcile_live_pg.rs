@@ -14,6 +14,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use engram_core::traits::MetadataStore;
 use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::Capability;
 use engram_core::{SandboxId, SessionId, SnapshotId};
 
 async fn pg() -> Option<Arc<dyn MetadataStore>> {
@@ -351,4 +352,58 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
         "the post-recovery event (idx > cursor, still live) is rolled back",
     );
     assert_eq!(re.recovery_epoch, 2, "epoch bumps again: 1 → 2");
+}
+
+/// ADR 0056 Phase 2: a session's profile-granted capabilities round-trip
+/// through `session_capabilities` — covering the empty no-op, idempotent
+/// re-bind (ON CONFLICT DO NOTHING), and the `resource` '' <-> Option::None
+/// mapping. This is the data-plumbing the broker reads to clamp (no
+/// enforcement yet).
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn session_capabilities_bind_get_round_trip() {
+    let Some(meta) = pg().await else {
+        return;
+    };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    // Empty bind is a no-op; get returns nothing.
+    meta.bind_session_capabilities(session_id, &[])
+        .await
+        .expect("empty bind");
+    assert!(meta
+        .get_session_capabilities(session_id)
+        .await
+        .expect("get empty")
+        .is_empty());
+
+    let caps = vec![
+        Capability::parse("github:contents:write@cortexapps/engrams").unwrap(),
+        Capability::parse("datadog:logs:read").unwrap(),
+    ];
+    meta.bind_session_capabilities(session_id, &caps)
+        .await
+        .expect("bind");
+    // Idempotent: re-binding the same set must not error or duplicate.
+    meta.bind_session_capabilities(session_id, &caps)
+        .await
+        .expect("idempotent re-bind");
+
+    let got = meta
+        .get_session_capabilities(session_id)
+        .await
+        .expect("get");
+    assert_eq!(got.len(), 2, "two distinct capabilities, no duplicates");
+    assert!(
+        got.contains(&Capability::parse("github:contents:write@cortexapps/engrams").unwrap()),
+        "resource-scoped capability round-trips verbatim",
+    );
+    let dd = got
+        .iter()
+        .find(|c| c.provider == "datadog")
+        .expect("datadog cap present");
+    assert_eq!(
+        dd.resource, None,
+        "the '' resource sentinel maps back to Option::None",
+    );
 }

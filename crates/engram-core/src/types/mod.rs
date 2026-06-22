@@ -1,6 +1,7 @@
 //! Shared, I/O-free domain types used across coordinator, host agent,
 //! and backend implementations.
 
+pub mod capability;
 pub mod catalog;
 pub mod cow_state;
 pub mod egress;
@@ -16,6 +17,7 @@ pub mod session;
 pub mod shell;
 pub mod snapshot;
 
+pub use capability::*;
 pub use catalog::*;
 pub use cow_state::*;
 pub use egress::*;

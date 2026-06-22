@@ -784,6 +784,7 @@ async fn session_create(
 ) -> Result<(), CliError> {
     let req = app::CreateSessionRequest {
         selected_skills: Vec::new(),
+        capabilities: Vec::new(),
         image_uri: image.to_string(),
         mode: if dev_vm { "dev_vm" } else { "agent" }.to_string(),
         prompt: prompt.map(str::to_string),

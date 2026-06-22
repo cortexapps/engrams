@@ -456,6 +456,11 @@ pub struct CreateSessionRequest {
     /// non-gRPC / legacy callers.
     #[serde(default)]
     pub selected_skills: Vec<String>,
+    /// ADR 0056: profile-granted "provider:action[@resource]" capability
+    /// strings, parsed + validated at `prepare_inner` and bound to the session
+    /// after its row exists. Empty for non-gRPC / legacy callers.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -690,6 +695,18 @@ async fn enqueue_create(
                 "queued session secrets persist failed; resume/boot will lose overrides");
         }
     }
+    // ADR 0056: bind capabilities now the FK target exists, so they're durable
+    // while queued — the scanner's boot re-prepare carries an empty set and the
+    // boot-path bind is a no-op (it won't clobber these).
+    if let Err(e) = state
+        .services
+        .meta
+        .bind_session_capabilities(session_id, &inputs.capabilities)
+        .await
+    {
+        tracing::warn!(%session_id, error = %e,
+            "queued session capabilities bind failed; the broker will see none on boot");
+    }
     if let Err(e) = state
         .emit(
             session_id,
@@ -756,6 +773,7 @@ pub(crate) async fn prepare_from_grpc(
         SessionId::new(),
         enabled,
         req.selected_skills.clone(),
+        req.capabilities.clone(),
     )
     .await
 }
@@ -801,6 +819,10 @@ pub(crate) async fn prepare_from_row(
         // ADR 0055 TODO(P1-D): queued sessions don't yet carry dynamic mounts
         // (they'd need persisting in the queue row); the scanner boots them
         // with base skills only.
+        Vec::new(),
+        // ADR 0056: a queued session's capabilities were already bound to
+        // `session_capabilities` at enqueue (the row existed); the re-prepare
+        // carries an empty set so the boot-path bind is a no-op, preserving them.
         Vec::new(),
     )
     .await
@@ -934,6 +956,8 @@ async fn prepare_inner(
     enabled: engram_core::types::EnabledImage,
     // ADR 0055: profile-selected skill names; resolved to reserved-slot mounts.
     selected_skills: Vec<String>,
+    // ADR 0056: profile-granted "provider:action[@resource]" capability strings.
+    capabilities: Vec<String>,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
     // ADR 0021 P1.3: a dev-VM session leaves any baked harness undriven,
     // so a prompt is meaningless — reject it explicitly.
@@ -942,6 +966,15 @@ async fn prepare_inner(
             "`prompt` requires `mode = agent` — a dev-VM session has no agent to receive it".into(),
         ));
     }
+
+    // ADR 0056: parse + validate the capability strings now (a malformed one
+    // is a create-time 400, mirroring the skills cap check). Nothing enforces
+    // them yet; they are bound to the session after its row exists.
+    let capabilities = capabilities
+        .iter()
+        .map(|s| engram_core::types::Capability::parse(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::BadRequest(format!("invalid capability: {e}")))?;
 
     let (image_repo, image_tag) = {
         let (r, t) = split_image_ref(image_uri);
@@ -1086,6 +1119,7 @@ async fn prepare_inner(
             secret_bundle,
             network,
             selected_mounts,
+            capabilities,
             secret_mode: manifest.secret_mode,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),
