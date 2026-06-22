@@ -512,6 +512,34 @@ No new id space; no control `request_id` (the control protocol is not used).
   t3code) avoid this class entirely but cannot idle-evict mid-wait — the documented
   defer-vs-hold trade — which is why engrams keeps defer and hardens it. Evidence:
   session `bc04ed42` + a two-question repro probe.
+  **Part C (transcript scrub, 2026-06-22):** Part A hides the narrate-past text from
+  the UI, but it still PERSISTS in claude's own `.jsonl` transcript — so on `--resume`
+  the model reads its own stale "internal error / I'll ask again" text and re-asks
+  regardless of the real answer we deliver (session `bd4230f8`). Root cause is an
+  **upstream claude bug, [anthropics/claude-code#64389](https://github.com/anthropics/claude-code/issues/64389)**:
+  a `PreToolUse` `defer` nondeterministically (~1-in-6 locally; any model / tool /
+  permission-mode) runs a continuation `/v1/messages` request that feeds the model
+  `tool_result{is_error:true, content:"[Tool result missing due to internal error]"}`
+  for the deferred tool — confirmed at the wire (the placeholder is **wire-only**,
+  never written to disk; the on-disk poison is the assistant *text*). NOT our wiring —
+  the hook-bridge returns a clean `defer`, exit 0; the placeholder is synthesized
+  inside claude. Wire interventions were all tried and rejected: rewrite-to-"waiting"
+  (the benign text still persists → resume re-asks), drop-via-synthetic-empty-response
+  (trips claude's `[Your previous response had no visible output. Please continue…]`
+  guard → thrash + a "continue" artifact that poisons resume), and inject-error on the
+  continuation (5xx → exponential-backoff retry storm; 400 → persists an "API Error"
+  line). Each leaves a residue that re-breaks resume, because you cannot make claude
+  both *stop* and *leave nothing behind* via the wire. **Fix:** the harness records the
+  `message_id`s Part A suppressed (a respawn-surviving, `run_engine`-owned set) and, in
+  the `ResumeForAnswer` gap (claude is dead, transcript quiescent), DELETES those exact
+  assistant lines from the `.jsonl` (`scrub_transcript`: match by `message.id`, re-link
+  `parentUuid`, atomic temp+rename) so the resumed transcript is byte-equivalent to a
+  clean defer (`tool_use`, nothing after). Validated **10/10** locally — every scrubbed
+  resume registered the answer, zero re-asks, the `is_error` bug never recurred.
+  Fail-safe: any miss/parse error skips the scrub and Part B still delivers the answer
+  as a user message. Unit-tested (`scrub_*`, `suppressed_narrate_past_id_is_recorded`);
+  the locate+resume integration is exercised by the local repro, not engine-tested
+  (same constraint as Part B's hook-dependent path).
 - **Truncation** of large diffs is surfaced in the UI (no silent caps); MultiEdit
   overflow clips trailing hunks and logs the count dropped.
 

@@ -40,6 +40,7 @@ fn main() {
 mod adapter {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
     use std::process::{ExitCode, ExitStatus, Stdio};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -805,6 +806,11 @@ mod adapter {
         let answers_in_hand: hook_server::AnswersInHand =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let current_run_id: hook_server::CurrentRunId = Arc::new(tokio::sync::Mutex::new(None));
+        // ADR 0054 Part C: narrate-past message-ids to scrub from claude's
+        // transcript at the next answer-resume. Owned here so it survives a
+        // respawn (populated during the defer turn, drained at ResumeForAnswer).
+        let scrub_msg_ids: Arc<tokio::sync::Mutex<HashSet<String>>> =
+            Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         write_hook_settings().await;
         let _ = tokio::fs::remove_file(HOOK_SOCK_FILE).await; // clear a stale bind
         let _sock_guard = match tokio::net::UnixListener::bind(HOOK_SOCK_FILE) {
@@ -840,6 +846,7 @@ mod adapter {
                 &mut seen_prompt_ids,
                 &answers_in_hand,
                 &current_run_id,
+                &scrub_msg_ids,
             )
             .await
             {
@@ -855,6 +862,50 @@ mod adapter {
                 // The deferred AUQ re-fires on startup and is answered.
                 SessionOutcome::ResumeForAnswer => {
                     fast_crashes = 0;
+                    // ADR 0054 Part C: claude was SIGINT'd by the AnswerQuestion
+                    // arm and is dead now → its transcript is quiescent and safe
+                    // to edit. Remove any narrate-past poison so the resumed
+                    // model sees a clean defer (`tool_use`, nothing after) and
+                    // delivers the real answer instead of re-asking. Fail-safe:
+                    // on any miss/error we skip — the Part B fallback still
+                    // delivers the answer as a user message.
+                    let ids: HashSet<String> = {
+                        let mut g = scrub_msg_ids.lock().await;
+                        std::mem::take(&mut *g)
+                    };
+                    if !ids.is_empty() {
+                        if let Some(sid) = read_claude_session_id().await {
+                            match find_claude_transcript(&sid) {
+                                Some(tr) => {
+                                    let res = tokio::task::spawn_blocking(move || {
+                                        scrub_transcript(&tr, &ids)
+                                    })
+                                    .await;
+                                    match res {
+                                        Ok(Ok(n)) => tracing::info!(
+                                            removed = n,
+                                            %sid,
+                                            "ADR 0054 Part C: scrubbed narrate-past from transcript before resume"
+                                        ),
+                                        Ok(Err(e)) => tracing::warn!(
+                                            error = %e,
+                                            %sid,
+                                            "Part C scrub failed; relying on Part B answer-as-message fallback"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            %sid,
+                                            "Part C scrub task panicked; relying on Part B fallback"
+                                        ),
+                                    }
+                                }
+                                None => tracing::warn!(
+                                    %sid,
+                                    "Part C: claude transcript not found; relying on Part B fallback"
+                                ),
+                            }
+                        }
+                    }
                     // loop → respawn with --resume, no backoff
                 }
                 // claude died unexpectedly (crash / interrupt / per-turn
@@ -1083,6 +1134,12 @@ mod adapter {
         /// The engine then delivers the answer as a fresh user message rather
         /// than leaving the question hanging.
         is_answer_resume: bool,
+        /// ADR 0054 Part C: message-ids of the narrate-past assistant messages
+        /// suppressed THIS turn (Part A hid them from the UI). Copied into the
+        /// session-level scrub set at turn-end so they survive the kill→resume
+        /// gap, then removed from claude's transcript before `--resume` (see
+        /// `scrub_transcript`).
+        suppressed_msg_ids: Vec<String>,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -1134,6 +1191,10 @@ mod adapter {
         seen_prompt_ids: &mut HashSet<String>,
         answers_in_hand: &hook_server::AnswersInHand,
         current_run_id: &hook_server::CurrentRunId,
+        // ADR 0054 Part C: session-level set of narrate-past message-ids to
+        // scrub from the transcript before the next answer-resume. Owned by
+        // `run_engine` so it survives a respawn; populated at turn-end here.
+        scrub_msg_ids: &Arc<tokio::sync::Mutex<HashSet<String>>>,
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
         let argv = build_claude_argv(&resume_id);
@@ -1294,6 +1355,17 @@ mod adapter {
                                 // run, then run the next queued prompt
                                 // back-to-back (no Idle gap) or announce Idle.
                                 if let Some(t) = turn.take() {
+                                    // ADR 0054 Part C: carry this turn's
+                                    // suppressed narrate-past ids into the
+                                    // session-level scrub set so they survive
+                                    // the kill→resume gap (empty for a clean
+                                    // defer — nothing was suppressed).
+                                    if !t.suppressed_msg_ids.is_empty() {
+                                        scrub_msg_ids
+                                            .lock()
+                                            .await
+                                            .extend(t.suppressed_msg_ids.iter().cloned());
+                                    }
                                     // ADR 0054: a turn that left an AUQ pending
                                     // but ended `terminal_reason != "tool_deferred"`
                                     // is a narrate-past — claude abandoned the
@@ -1412,6 +1484,7 @@ mod adapter {
                                     &mut t.current_message_id,
                                     &mut t.pending_file_changes,
                                     &mut t.auq_pending,
+                                    &mut t.suppressed_msg_ids,
                                 ) {
                                     for ev in translated {
                                         emit(evt_tx, ev).await;
@@ -1433,6 +1506,7 @@ mod adapter {
                                     &mut None,
                                     &mut HashMap::new(),
                                     &mut HashSet::new(),
+                                    &mut Vec::new(),
                                 );
                             }
                         }
@@ -1743,6 +1817,7 @@ mod adapter {
             pending_file_changes: HashMap::new(),
             auq_pending: HashSet::new(),
             is_answer_resume: false,
+            suppressed_msg_ids: Vec::new(),
         }
     }
 
@@ -1780,6 +1855,7 @@ mod adapter {
             pending_file_changes: HashMap::new(),
             auq_pending: HashSet::new(),
             is_answer_resume: true,
+            suppressed_msg_ids: Vec::new(),
         }
     }
 
@@ -1867,6 +1943,127 @@ mod adapter {
         if let Err(e) = tokio::fs::write(CLAUDE_SESSION_ID_FILE, id).await {
             tracing::warn!(error = %e, "couldn't persist claude session id");
         }
+    }
+
+    /// ADR 0054 Part C — remove the narrate-past poison from claude's
+    /// transcript so an answer-resume starts from a clean defer.
+    ///
+    /// This only fires **once in a while.** A PreToolUse `defer` is *supposed*
+    /// to end the turn right at the `tool_use` (transcript byte-identical,
+    /// nothing after it). But nondeterministically — ~1-in-6 in local repros,
+    /// independent of model/tool/permission-mode — claude instead runs a
+    /// continuation inference, hands *itself* `tool_result{is_error:true,
+    /// content:"[Tool result missing due to internal error]"}` for the deferred
+    /// tool, and narrates an error / "I'll ask again." That is an **upstream
+    /// claude-code bug**, tracked at
+    /// <https://github.com/anthropics/claude-code/issues/64389> — NOT our hook
+    /// (the hook-bridge returns a clean `defer`, exit 0; the error placeholder
+    /// is synthesized inside claude on the continuation request, never on the
+    /// wire we control).
+    ///
+    /// Part A already hides that assistant text from the UI, but it still
+    /// lands in claude's own `.jsonl`; on `--resume` the model reads its own
+    /// stale text and re-asks regardless of the real answer we deliver. We
+    /// remove exactly the assistant messages whose ids Part A suppressed
+    /// (matched by `message.id`, never a content heuristic), re-link the
+    /// `parentUuid` of any survivor that pointed at a removed line, and write
+    /// atomically. The result is byte-equivalent to a clean defer, which
+    /// resumes correctly (validated 10/10 locally). Returns messages removed.
+    fn scrub_transcript(path: &Path, suppressed_ids: &HashSet<String>) -> std::io::Result<usize> {
+        let content = std::fs::read_to_string(path)?;
+        // uuid -> parentUuid of each removed line, for re-linking survivors.
+        let mut removed_parent: HashMap<String, Option<String>> = HashMap::new();
+        let mut kept: Vec<String> = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    kept.push(line.to_string());
+                    continue;
+                }
+            };
+            let is_assistant = v.get("type").and_then(|t| t.as_str()) == Some("assistant");
+            let id = v
+                .get("message")
+                .and_then(|m| m.get("id"))
+                .and_then(|s| s.as_str());
+            if is_assistant && id.map(|i| suppressed_ids.contains(i)).unwrap_or(false) {
+                if let Some(uuid) = v.get("uuid").and_then(|s| s.as_str()) {
+                    let parent = v
+                        .get("parentUuid")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string);
+                    removed_parent.insert(uuid.to_string(), parent);
+                }
+                continue; // drop the narrate-past message
+            }
+            kept.push(line.to_string());
+        }
+        let removed = removed_parent.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        // Re-link any survivor whose parent we removed (defensive — the
+        // narrate-past is normally the trailing message of the turn, so this is
+        // usually a no-op, but it keeps the parentUuid chain intact regardless).
+        let out: Vec<String> = kept
+            .into_iter()
+            .map(|line| {
+                let mut v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => return line,
+                };
+                let reparent = v
+                    .get("parentUuid")
+                    .and_then(|s| s.as_str())
+                    .and_then(|p| removed_parent.get(p))
+                    .cloned();
+                if let Some(grandparent) = reparent {
+                    v["parentUuid"] = match grandparent {
+                        Some(gp) => Value::String(gp),
+                        None => Value::Null,
+                    };
+                    return v.to_string();
+                }
+                line
+            })
+            .collect();
+        // Atomic replace: write a sibling temp file, then rename over the
+        // original (claude is dead at the resume gap, so nothing races us).
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".scrubtmp");
+        let tmp = PathBuf::from(tmp);
+        let mut body = out.join("\n");
+        body.push('\n');
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(removed)
+    }
+
+    /// Locate claude's on-disk transcript for `sid`. claude writes it under
+    /// `<config>/projects/<encoded-cwd>/<sid>.jsonl`, where `<config>` is
+    /// `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`. We glob by session id rather
+    /// than recompute the cwd-encoding, so the lookup is robust to changes in
+    /// that scheme.
+    fn find_claude_transcript(sid: &str) -> Option<PathBuf> {
+        let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME").unwrap_or_else(|| "/root".into());
+                PathBuf::from(home).join(".claude")
+            });
+        let projects = config.join("projects");
+        let target = format!("{sid}.jsonl");
+        for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+            let candidate = entry.path().join(&target);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// The terminal `result` line claude emits at the end of every
@@ -1966,6 +2163,10 @@ mod adapter {
     /// lifecycle); it only captures claude's session id for `--resume`.
     /// The terminal `result` line is handled by the session loop via
     /// `detect_result_marker`, so it's a no-op here.
+    // The params are the per-turn mutable state threaded from the session loop
+    // (TurnState fields + the line); bundling them into a struct would obscure
+    // more than it clarifies, and the throwaway call site has no TurnState.
+    #[allow(clippy::too_many_arguments)]
     pub fn translate_jsonl(
         line: &str,
         run_id: &str,
@@ -1984,6 +2185,10 @@ mod adapter {
         // matching tool_result; while the set is non-empty, assistant
         // text/chunks are the narrate-past hallucination and are suppressed.
         auq_pending: &mut HashSet<String>,
+        // ADR 0054 Part C: ids of assistant messages suppressed as narrate-past
+        // this turn, recorded here so `scrub_transcript` can delete them from
+        // claude's transcript before the answer-resume.
+        suppressed_msg_ids: &mut Vec<String>,
     ) -> Option<Vec<HarnessEvent>> {
         let v: Value = serde_json::from_str(line).ok()?;
         let ty = v.get("type")?.as_str()?;
@@ -2124,13 +2329,24 @@ mod adapter {
                             _ => {}
                         }
                     }
-                    if !text_buf.is_empty() && !suppress_text {
-                        out.push(HarnessEvent::AgentMessage {
-                            run_id: rid,
-                            message_id: msg_id,
-                            role: AgentRole::Assistant,
-                            text: truncate_str(&text_buf, MAX_AGENT_MESSAGE_BYTES),
-                        });
+                    if !text_buf.is_empty() {
+                        if suppress_text {
+                            // ADR 0054 Part C: this assistant message is the
+                            // narrate-past hallucination (already dropped from
+                            // the UI by Part A). Record its id so the scrub can
+                            // remove it from claude's transcript before the
+                            // answer-resume — otherwise claude reads its own
+                            // stale "I'll try again" text on `--resume` and
+                            // re-asks regardless of the real answer.
+                            suppressed_msg_ids.push(msg_id);
+                        } else {
+                            out.push(HarnessEvent::AgentMessage {
+                                run_id: rid,
+                                message_id: msg_id,
+                                role: AgentRole::Assistant,
+                                text: truncate_str(&text_buf, MAX_AGENT_MESSAGE_BYTES),
+                            });
+                        }
                     }
                 }
             }
@@ -2307,6 +2523,77 @@ mod adapter {
                 Some(HarnessEvent::Idle),
                 "the un-acked event must be parked for the next connection",
             );
+        }
+
+        // ADR 0054 Part C: the scrub removes exactly the suppressed
+        // narrate-past message(s) by id, keeps the deferred tool_use, and
+        // re-links any survivor whose parent it removed.
+        #[test]
+        fn scrub_removes_narrate_past_and_relinks() {
+            let dir = std::env::temp_dir().join(format!("engram-scrub-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("sess.jsonl");
+            let lines = [
+                r#"{"type":"user","uuid":"u-prompt","parentUuid":null,"message":{"role":"user","content":[{"type":"text","text":"ask me red or green"}]}}"#,
+                r#"{"type":"assistant","uuid":"u-A","parentUuid":"u-prompt","message":{"id":"msg_AAA","role":"assistant","content":[{"type":"tool_use","id":"toolu_X","name":"AskUserQuestion","input":{"questions":[]}}]}}"#,
+                r#"{"type":"assistant","uuid":"u-B","parentUuid":"u-A","message":{"id":"msg_BBB","role":"assistant","content":[{"type":"text","text":"It seems the tool encountered an internal error."}]}}"#,
+                r#"{"type":"assistant","uuid":"u-C","parentUuid":"u-B","message":{"id":"msg_CCC","role":"assistant","content":[{"type":"text","text":"trailing"}]}}"#,
+            ];
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+            let mut ids = HashSet::new();
+            ids.insert("msg_BBB".to_string());
+            let removed = scrub_transcript(&path, &ids).unwrap();
+            assert_eq!(removed, 1, "exactly one narrate-past message removed");
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(!after.contains("msg_BBB"), "narrate-past message gone");
+            assert!(!after.contains("internal error"), "narration text gone");
+            assert!(
+                after.contains("msg_AAA"),
+                "the tool_use message is preserved"
+            );
+            assert!(
+                after.contains("toolu_X"),
+                "the deferred tool_use_id is preserved"
+            );
+
+            // u-C pointed at the removed u-B → must be re-linked to u-B's parent (u-A).
+            let c = after
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .find(|v| v["uuid"] == "u-C")
+                .unwrap();
+            assert_eq!(
+                c["parentUuid"], "u-A",
+                "survivor re-linked past the removed line"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A transcript with none of the suppressed ids is left byte-for-byte
+        // untouched (clean defer / nothing to scrub).
+        #[test]
+        fn scrub_is_noop_when_nothing_matches() {
+            let dir =
+                std::env::temp_dir().join(format!("engram-scrub-noop-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("sess.jsonl");
+            let body = "{\"type\":\"assistant\",\"uuid\":\"u-A\",\"parentUuid\":null,\"message\":{\"id\":\"msg_AAA\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_X\",\"name\":\"AskUserQuestion\"}]}}\n";
+            std::fs::write(&path, body).unwrap();
+
+            let mut ids = HashSet::new();
+            ids.insert("msg_NOPE".to_string());
+            let removed = scrub_transcript(&path, &ids).unwrap();
+            assert_eq!(removed, 0);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                body,
+                "file is untouched on a no-op scrub",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         // The next connection re-sends the parked event first (at-least-once).
@@ -3016,6 +3303,7 @@ mod tests {
             &mut None,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(evs.is_empty(), "init emits no HarnessEvent");
@@ -3028,6 +3316,7 @@ mod tests {
             &mut None,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(evs.len(), 1);
@@ -3065,7 +3354,8 @@ mod tests {
             50,
             &mut mid,
             &mut fc,
-            &mut std::collections::HashSet::new()
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new()
         )
         .unwrap()
         .is_empty());
@@ -3079,7 +3369,8 @@ mod tests {
             50,
             &mut mid,
             &mut fc,
-            &mut std::collections::HashSet::new()
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new()
         )
         .unwrap()
         .is_empty());
@@ -3093,6 +3384,7 @@ mod tests {
                 &mut mid,
                 &mut fc,
                 &mut std::collections::HashSet::new(),
+                &mut Vec::new(),
             )
             .unwrap();
             assert_eq!(evs.len(), 1);
@@ -3120,6 +3412,7 @@ mod tests {
             &mut mid,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         match &evs[0] {
@@ -3148,6 +3441,7 @@ mod tests {
             &mut None,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(evs.len(), 1);
@@ -3162,6 +3456,7 @@ mod tests {
             &mut None,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(evs.len(), 1);
@@ -3200,6 +3495,7 @@ mod tests {
             &mut None,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -3218,6 +3514,7 @@ mod tests {
             &mut None,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(evs.len(), 2);
@@ -3262,6 +3559,7 @@ mod tests {
             &mut None,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(fc.len(), 1);
@@ -3274,6 +3572,7 @@ mod tests {
             &mut None,
             &mut fc,
             &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         // Only the (failed) ToolCallCompleted — no FileChanged.
@@ -3355,6 +3654,7 @@ mod tests {
             &mut None,
             &mut std::collections::HashMap::new(),
             &mut auq,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
@@ -3373,12 +3673,58 @@ mod tests {
             &mut None,
             &mut std::collections::HashMap::new(),
             &mut auq,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
             !evs.iter()
                 .any(|e| matches!(e, HarnessEvent::AgentMessage { .. })),
             "the hallucinated post-defer message must be suppressed, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn suppressed_narrate_past_id_is_recorded_for_scrub() {
+        // ADR 0054 Part C: when a post-defer assistant message is suppressed,
+        // its message-id is recorded so `scrub_transcript` can remove that
+        // exact line from claude's transcript before the answer-resume.
+        let mut tc = 0u32;
+        let mut auq = std::collections::HashSet::new();
+        let mut suppressed: Vec<String> = Vec::new();
+
+        let auq_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{}}]}}"#;
+        translate_jsonl(
+            auq_use,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut suppressed,
+        )
+        .unwrap();
+        assert!(
+            suppressed.is_empty(),
+            "the AUQ message itself is not a narrate-past, so nothing recorded yet"
+        );
+
+        let bogus = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"It seems there was an internal error."}]}}"#;
+        translate_jsonl(
+            bogus,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut suppressed,
+        )
+        .unwrap();
+        assert_eq!(
+            suppressed,
+            vec!["m2".to_string()],
+            "the suppressed narrate-past message-id is recorded for the scrub"
         );
     }
 
@@ -3400,6 +3746,7 @@ mod tests {
             &mut mid,
             &mut std::collections::HashMap::new(),
             &mut auq,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3412,6 +3759,7 @@ mod tests {
             &mut mid,
             &mut std::collections::HashMap::new(),
             &mut auq,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
@@ -3438,6 +3786,7 @@ mod tests {
             &mut None,
             &mut std::collections::HashMap::new(),
             &mut auq,
+            &mut Vec::new(),
         )
         .unwrap();
         let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_AUQ","content":"Do you prefer red or blue?=Red","is_error":false}]}}"#;
@@ -3449,6 +3798,7 @@ mod tests {
             &mut None,
             &mut std::collections::HashMap::new(),
             &mut auq,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3461,6 +3811,7 @@ mod tests {
             &mut None,
             &mut std::collections::HashMap::new(),
             &mut auq,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
@@ -3486,6 +3837,7 @@ mod tests {
             &mut None,
             &mut std::collections::HashMap::new(),
             &mut auq,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(
