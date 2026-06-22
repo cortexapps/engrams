@@ -101,9 +101,52 @@ export interface IntegrationObserveJson {
   data: [string, string][];
   fetchable: string | null;
 }
+/** ADR 0057: the profile's egress network allow-list (snake_case wire shape). */
+export interface IntegrationNetworkJson {
+  default: "deny" | "allow";
+  allow_hosts: string[];
+  allow_host_patterns: string[];
+}
+/** ADR 0057: one profile-defined secret (snake_case wire shape). Value-free. */
+export interface IntegrationSecretJson {
+  secret_ref: string;
+  env_var: string;
+  mode: "literal" | "broker";
+  allow_hosts: string[];
+  allow_host_patterns: string[];
+}
 export interface IntegrationPolicyJson {
   injects: IntegrationInjectJson[];
   observes: IntegrationObserveJson[];
+  // ADR 0057: the policy is now the full session policy — it also carries the
+  // profile's network + secrets (the coordinator sources the egress policy from
+  // these). Mirrors engram_core::types::IntegrationPolicy.
+  network: IntegrationNetworkJson;
+  secrets: IntegrationSecretJson[];
+}
+
+/** Profile-side inputs compiled into the policy's network + secrets (ADR 0057). */
+export interface SessionPolicyInputs {
+  network?: { default?: string; allowHosts?: string[]; allowHostPatterns?: string[] };
+  secrets?: ReadonlyArray<{
+    ref: string;
+    envVar: string;
+    mode?: string;
+    allowHosts?: string[];
+    allowHostPatterns?: string[];
+  }>;
+}
+
+/** Whether a compiled policy carries anything worth shipping on CreateSession. */
+export function policyHasContent(p: IntegrationPolicyJson): boolean {
+  return (
+    p.injects.length > 0 ||
+    p.observes.length > 0 ||
+    p.secrets.length > 0 ||
+    p.network.allow_hosts.length > 0 ||
+    p.network.allow_host_patterns.length > 0 ||
+    p.network.default === "allow"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +327,7 @@ function pathPrefix(p: string): string {
 export function compileIntegrationPolicy(
   capabilities: string[],
   registry: Map<string, Connector> = connectorRegistry(),
+  inputs?: SessionPolicyInputs,
 ): IntegrationPolicyJson {
   const injects: IntegrationInjectJson[] = [];
   const observes: IntegrationObserveJson[] = [];
@@ -339,5 +383,20 @@ export function compileIntegrationPolicy(
       }
     }
   }
-  return { injects, observes };
+  // ADR 0057: carry the profile's network + secrets in the same policy. The
+  // coordinator sources the egress policy's network + secret injection from
+  // here (the secret VALUES are resolved host-side from `secret_ref`).
+  const network: IntegrationNetworkJson = {
+    default: inputs?.network?.default === "allow" ? "allow" : "deny",
+    allow_hosts: inputs?.network?.allowHosts ?? [],
+    allow_host_patterns: inputs?.network?.allowHostPatterns ?? [],
+  };
+  const secrets: IntegrationSecretJson[] = (inputs?.secrets ?? []).map((s) => ({
+    secret_ref: s.ref,
+    env_var: s.envVar,
+    mode: s.mode === "literal" ? "literal" : "broker",
+    allow_hosts: s.allowHosts ?? [],
+    allow_host_patterns: s.allowHostPatterns ?? [],
+  }));
+  return { injects, observes, network, secrets };
 }

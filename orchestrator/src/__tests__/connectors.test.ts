@@ -14,6 +14,7 @@ import {
   parseCapability,
   grantsCapability,
   compileIntegrationPolicy,
+  policyHasContent,
   connectorRegistry,
   type Connector,
 } from "../connectors/registry.ts";
@@ -175,6 +176,50 @@ describe("compileIntegrationPolicy", () => {
     // The bare fixtures (no asset specs) yield only injects.
     expect(compileIntegrationPolicy(["datadog:logs:read"], reg).observes).toEqual([]);
     expect(compileIntegrationPolicy(["github:issues:write"], reg).observes).toEqual([]);
+  });
+
+  test("ADR 0057: network + secrets compile from the profile inputs", () => {
+    const policy = compileIntegrationPolicy([], reg, {
+      network: { default: "deny", allowHosts: ["sentry.io"], allowHostPatterns: ["*.pypi.org"] },
+      secrets: [
+        { ref: "datadog-api-key", envVar: "DD_API_KEY", mode: "broker", allowHosts: ["api.datadoghq.com"] },
+        { ref: "db-url", envVar: "DATABASE_URL", mode: "literal" },
+      ],
+    });
+    expect(policy.network).toEqual({
+      default: "deny",
+      allow_hosts: ["sentry.io"],
+      allow_host_patterns: ["*.pypi.org"],
+    });
+    expect(policy.secrets).toEqual([
+      {
+        secret_ref: "datadog-api-key",
+        env_var: "DD_API_KEY",
+        mode: "broker",
+        allow_hosts: ["api.datadoghq.com"],
+        allow_host_patterns: [],
+      },
+      {
+        secret_ref: "db-url",
+        env_var: "DATABASE_URL",
+        mode: "literal",
+        allow_hosts: [],
+        allow_host_patterns: [],
+      },
+    ]);
+  });
+
+  test("ADR 0057: a default deny + empty profile yields a contentless policy", () => {
+    const empty = compileIntegrationPolicy([], reg);
+    expect(empty.network).toEqual({ default: "deny", allow_hosts: [], allow_host_patterns: [] });
+    expect(empty.secrets).toEqual([]);
+    expect(policyHasContent(empty)).toBe(false);
+    // ...but a profile with a network host (or a secret, or a cap) has content.
+    expect(
+      policyHasContent(
+        compileIntegrationPolicy([], reg, { network: { allowHosts: ["sentry.io"] } }),
+      ),
+    ).toBe(true);
   });
 });
 

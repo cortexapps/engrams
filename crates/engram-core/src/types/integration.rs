@@ -16,6 +16,15 @@ use serde::{Deserialize, Serialize};
 
 /// The per-session compiled policy. Persisted as JSON keyed by session;
 /// re-read on resume to rebuild the egress policy without the orchestrator.
+///
+/// ADR 0057: this is now the full **session policy** — the orchestrator compiles
+/// the whole profile (network + secrets + integration capabilities) into it, and
+/// the coordinator sources the egress policy's network + secrets from here
+/// instead of the image manifest. The type keeps its `IntegrationPolicy` name and
+/// the `integration_policy_json` wire field for now; the cosmetic rename to
+/// `SessionPolicy` is a deferred follow-up (cf. ADR 0056's deferred
+/// `ForgeOp`→`IntegrationOp` rename). All new fields are `#[serde(default)]`, so
+/// policies persisted before 0057 still parse.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrationPolicy {
     /// Plane-B credential injections selected by the session's capabilities.
@@ -28,6 +37,39 @@ pub struct IntegrationPolicy {
     /// straight through to the egress policy (no host-side resolution).
     #[serde(default)]
     pub observes: Vec<IntegrationObserve>,
+    /// ADR 0057: the profile's egress network allow-list (deny by default),
+    /// lifted off the image manifest. The coordinator builds the session egress
+    /// policy's `network_allow_*` from this.
+    #[serde(default)]
+    pub network: crate::types::image::NetworkPolicy,
+    /// ADR 0057: profile-defined secrets injected into the session, lifted off
+    /// the image manifest. Each `secret_ref` is resolved host-side via the
+    /// coordinator's `SecretStore` (the org-secret backend); a `literal` secret
+    /// is placed in the guest env, a `broker` secret becomes an env placeholder
+    /// the proxy substitutes only on its `allow_hosts`.
+    #[serde(default)]
+    pub secrets: Vec<IntegrationSecret>,
+}
+
+/// ADR 0057: one profile-defined secret the session injects. The value lives in
+/// the org secret store (resolved by the coordinator from `secret_ref`); this
+/// carries only the ref + how to inject it. NEVER a secret value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationSecret {
+    /// `SecretStore` reference (the org-secret name). NEVER a value.
+    pub secret_ref: String,
+    /// Env var the resolved value is exposed as in the guest.
+    pub env_var: String,
+    /// `literal` (raw value in the guest env) | `broker` (env placeholder +
+    /// proxy substitution only on `allow_hosts`; the guest never holds it).
+    #[serde(default)]
+    pub mode: crate::types::image::SecretMode,
+    /// Broker-mode substitution hosts (exact).
+    #[serde(default)]
+    pub allow_hosts: Vec<String>,
+    /// Broker-mode substitution host globs (`*.example.com`).
+    #[serde(default)]
+    pub allow_host_patterns: Vec<String>,
 }
 
 /// One Plane-B injection: on an outbound request to `hosts` matching the
@@ -111,6 +153,7 @@ mod tests {
                 path_prefixes: vec!["/api/v2/logs".into()],
             }],
             observes: vec![],
+            ..Default::default()
         };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(IntegrationPolicy::parse(&json).unwrap(), Some(p));
@@ -140,6 +183,7 @@ mod tests {
                 data: vec![("number".into(), "$.resp.number".into())],
                 fetchable: Some("$.resp.html_url".into()),
             }],
+            ..Default::default()
         };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(IntegrationPolicy::parse(&json).unwrap(), Some(p));
@@ -151,5 +195,39 @@ mod tests {
         let json = r#"{"injects":[]}"#;
         let p = IntegrationPolicy::parse(json).unwrap().unwrap();
         assert!(p.observes.is_empty());
+    }
+
+    #[test]
+    fn round_trips_network_and_secrets() {
+        // ADR 0057: the policy now carries the profile's network + secrets.
+        use crate::types::image::{NetworkDefault, NetworkPolicy, SecretMode};
+        let p = IntegrationPolicy {
+            network: NetworkPolicy {
+                default: NetworkDefault::Deny,
+                allow_hosts: vec!["sentry.io".into()],
+                allow_host_patterns: vec!["*.pypi.org".into()],
+            },
+            secrets: vec![IntegrationSecret {
+                secret_ref: "datadog-api-key".into(),
+                env_var: "DD_API_KEY".into(),
+                mode: SecretMode::Broker,
+                allow_hosts: vec!["api.datadoghq.com".into()],
+                allow_host_patterns: vec![],
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(IntegrationPolicy::parse(&json).unwrap(), Some(p));
+    }
+
+    #[test]
+    fn network_and_secrets_default_when_absent() {
+        // A policy serialized before 0057 (no network/secrets) still decodes:
+        // network defaults to deny+empty, secrets to empty.
+        let json = r#"{"injects":[],"observes":[]}"#;
+        let p = IntegrationPolicy::parse(json).unwrap().unwrap();
+        assert!(p.secrets.is_empty());
+        assert!(p.network.allow_hosts.is_empty());
+        assert_eq!(p.network.default, crate::types::image::NetworkDefault::Deny);
     }
 }
