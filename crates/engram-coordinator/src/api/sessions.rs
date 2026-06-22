@@ -343,31 +343,29 @@ pub(crate) async fn build_resume_egress_policy(
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
     let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
-    // ADR 0056 (B′): re-read + resolve the persisted integration policy so a
-    // resumed session re-injects on the new host (same as the create path).
-    let injects = match state
+    // ADR 0056: re-read the persisted integration policy once → injects
+    // (resolved host-side) + observes (pure), so a resumed session re-injects
+    // AND re-observes on the new host (same as the create path).
+    let policy = match state
         .services
         .meta
         .get_session_integration_policy(session_id)
         .await
     {
-        Ok(Some(json)) => match engram_core::types::IntegrationPolicy::parse(&json) {
-            Ok(policy) => {
-                crate::session_boot::resolve_inject_entries(state, policy.as_ref(), image).await
-            }
-            Err(e) => {
-                tracing::warn!(%session_id, error = %e,
-                    "persisted integration policy failed to parse on resume; no injection");
-                Vec::new()
-            }
-        },
-        Ok(None) => Vec::new(),
+        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json).unwrap_or_else(|e| {
+            tracing::warn!(%session_id, error = %e,
+                "persisted integration policy failed to parse on resume; no injection/observation");
+            None
+        }),
+        Ok(None) => None,
         Err(e) => {
             tracing::warn!(%session_id, error = %e,
-                "integration policy lookup failed on resume; no injection");
-            Vec::new()
+                "integration policy lookup failed on resume; no injection/observation");
+            None
         }
     };
+    let injects = crate::session_boot::resolve_inject_entries(state, policy.as_ref(), image).await;
+    let observes = crate::session_boot::build_observe_entries(policy.as_ref());
     Some(assemble_resume_egress_policy(
         session_id,
         sandbox_id,
@@ -376,6 +374,7 @@ pub(crate) async fn build_resume_egress_policy(
         manifest,
         env_with_placeholders,
         injects,
+        observes,
     ))
 }
 
@@ -394,6 +393,7 @@ pub(crate) fn assemble_resume_egress_policy(
     manifest: &ImageManifest,
     env_with_placeholders: &HashMap<String, String>,
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
+    observes: Vec<engram_core::types::egress::EgressObserveEntry>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     let mut secrets = Vec::new();
     for (name, resolved) in &bundle.secrets {
@@ -422,6 +422,9 @@ pub(crate) fn assemble_resume_egress_policy(
         // ADR 0056 (B′): the resolved Plane-B injections (from the persisted
         // policy), so a resumed session re-injects on the new host.
         injects,
+        // ADR 0056 (Phase 4): observe specs (from the persisted policy), so a
+        // resumed session keeps emitting assets on the new host.
+        observes,
         secret_mode: manifest.secret_mode,
     }
 }
@@ -1941,6 +1944,7 @@ mod tests {
             &manifest,
             &env_with_ph,
             Vec::new(),
+            Vec::new(),
         );
 
         // 1. Real IP, not UNSPECIFIED.
@@ -2015,6 +2019,7 @@ mod tests {
             &bundle,
             &manifest,
             &env_with_ph,
+            Vec::new(),
             Vec::new(),
         );
 

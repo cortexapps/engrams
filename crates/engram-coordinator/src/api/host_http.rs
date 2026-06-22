@@ -703,6 +703,52 @@ pub async fn harness_event_ingest(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---- POST /api/sessions/:session_id/integration-asset (ADR 0056 Phase 4) ----
+
+#[derive(Deserialize)]
+pub struct IntegrationAssetReport {
+    pub provider: String,
+    pub asset_kind: String,
+    /// `"action"` | `"asset"` — anything but `"asset"` is treated as `Action`.
+    pub surface: String,
+    pub data: serde_json::Value,
+    #[serde(default)]
+    pub fetchable_url: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+/// The host-agent's egress proxy observed a response on a marked endpoint and
+/// built an asset from the *real* response bytes (never a guest claim — the
+/// proxy is the trusted observer). Append it as an `IntegrationAsset` session
+/// event, the same `state.emit` path the mediated forge PR uses.
+pub async fn integration_asset_ingest(
+    State(state): State<SharedState>,
+    Path(session_id): Path<SessionId>,
+    Json(req): Json<IntegrationAssetReport>,
+) -> Result<StatusCode, ApiError> {
+    let surface = match req.surface.as_str() {
+        "asset" => crate::state::AssetSurface::Asset,
+        _ => crate::state::AssetSurface::Action,
+    };
+    let fetchable = req
+        .fetchable_url
+        .map(|url| crate::state::FetchableRef::External { url });
+    state
+        .emit(
+            session_id,
+            crate::state::SessionEvent::IntegrationAsset {
+                provider: req.provider,
+                asset_kind: req.asset_kind,
+                surface,
+                data: req.data,
+                fetchable,
+                at: req.at,
+            },
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---- POST /api/hosts/:id/idle-eviction-candidates (ADR 0011 #2) ----
 
 #[derive(Deserialize)]

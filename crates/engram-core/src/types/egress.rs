@@ -42,6 +42,12 @@ pub struct SessionEgressPolicy {
     /// policies serialized before this field decode with none.
     #[serde(default)]
     pub injects: Vec<EgressInjectEntry>,
+    /// ADR 0056 Phase 4: response-observation specs. Copied straight from the
+    /// session's `IntegrationPolicy.observes` (no secret to resolve — the asset
+    /// map is pure). The proxy emits an `IntegrationAsset` from a matching
+    /// request's real response. `#[serde(default)]` so older policies decode.
+    #[serde(default)]
+    pub observes: Vec<EgressObserveEntry>,
     /// Image's secret delivery mode. The proxy uses this to decide
     /// whether to MITM (`Broker`) or just SNI-filter (`Literal`).
     pub secret_mode: SecretMode,
@@ -75,4 +81,24 @@ pub struct EgressInjectEntry {
     pub allow_host_patterns: Vec<String>,
     pub methods: Vec<String>,
     pub path_prefixes: Vec<String>,
+}
+
+/// ADR 0056 Phase 4: one resolved response-observation spec the host proxy
+/// applies. Carries no secret — the asset map operates on the response. On an
+/// outbound request matching `allow_hosts`/`allow_host_patterns` (SNI) AND the
+/// request policy (`methods` + `path_prefixes`), the proxy parses the response
+/// and emits an `IntegrationAsset` (`provider`/`asset_kind`/`surface`) built
+/// from `data` + `fetchable`, gated by `success_status_class`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EgressObserveEntry {
+    pub allow_hosts: Vec<String>,
+    pub allow_host_patterns: Vec<String>,
+    pub methods: Vec<String>,
+    pub path_prefixes: Vec<String>,
+    pub provider: String,
+    pub asset_kind: String,
+    pub surface: String,
+    pub success_status_class: Option<String>,
+    pub data: Vec<(String, String)>,
+    pub fetchable: Option<String>,
 }

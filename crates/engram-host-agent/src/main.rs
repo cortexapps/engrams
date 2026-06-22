@@ -476,6 +476,14 @@ async fn main() -> Result<(), HostAgentError> {
             .await
             .map_err(|e| HostAgentError::Config(format!("oci cache: {e}")))?;
 
+    // ADR 0056 Phase 4: capture the coord endpoint + token before `cfg` is
+    // moved into HostAgent — the observe sink below needs them.
+    let observe_coord_url = cfg
+        .coordinator_endpoint
+        .clone()
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    let observe_token = cfg.coordinator_token.clone();
+
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store, materialize_dir)
         .with_chunk_cache(chunk_cache)
@@ -505,7 +513,29 @@ async fn main() -> Result<(), HostAgentError> {
     // The egress proxy is mandatory (issue #240). A host that cannot
     // stand it up (CA unloadable, port unbindable) must NOT serve a
     // session — there is no "unfiltered access" fallback. Fail closed.
-    match build_host_egress(&cli).await {
+    // ADR 0056 Phase 4: the egress proxy's observed-asset sink — forwards each
+    // proxy-built IntegrationAsset to the coord (mirrors the harness-event
+    // path). Best-effort fire-and-forget: spawn the POST, log on failure.
+    let observe_sink: engram_egress_proxy::ObserveSink = Arc::new(move |session_id, asset| {
+        let cc = engram_host_agent::coord_client::CoordClient::new(
+            observe_coord_url.clone(),
+            observe_token.clone(),
+        );
+        tokio::spawn(async move {
+            let req = engram_host_agent::coord_client::IntegrationAssetReport {
+                provider: asset.provider,
+                asset_kind: asset.asset_kind,
+                surface: asset.surface,
+                data: serde_json::Value::Object(asset.data),
+                fetchable_url: asset.fetchable_url,
+                at: chrono::Utc::now(),
+            };
+            if let Err(e) = cc.integration_asset(session_id, &req).await {
+                tracing::debug!(%session_id, error = %e, "forward integration asset to coord failed");
+            }
+        });
+    });
+    match build_host_egress(&cli, Some(observe_sink)).await {
         Ok(egress) => agent = agent.with_egress(Arc::new(egress)),
         Err(e) => {
             tracing::error!(error = %e, "egress proxy spawn failed; aborting (egress filtering is mandatory)");
@@ -524,7 +554,10 @@ async fn main() -> Result<(), HostAgentError> {
 /// receiver's harness symlinks resolve relative to their own parent
 /// directory (the bake's `/tmp/.tmpXXX/harness/`), so a relative
 /// `./var/...` target would dangle there.
-async fn build_host_egress(cli: &Cli) -> Result<engram_host_agent::egress::HostEgress, String> {
+async fn build_host_egress(
+    cli: &Cli,
+    observe_sink: Option<engram_egress_proxy::ObserveSink>,
+) -> Result<engram_host_agent::egress::HostEgress, String> {
     use std::sync::Arc;
     let source: Arc<dyn engram_egress_proxy::CaSource> = match cli.ca_source {
         CaSourceChoice::Env => Arc::new(engram_egress_proxy::EnvCaSource::new(
@@ -554,7 +587,7 @@ async fn build_host_egress(cli: &Cli) -> Result<engram_host_agent::egress::HostE
     let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
         .parse()
         .map_err(|e| format!("parse bind addr: {e}"))?;
-    engram_host_agent::egress::HostEgress::spawn(source, bind)
+    engram_host_agent::egress::HostEgress::spawn(source, bind, observe_sink)
         .await
         .map_err(|e| e.to_string())
 }

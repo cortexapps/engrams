@@ -299,6 +299,7 @@ pub(crate) async fn boot_on_reserved_host(
         network_allow_host_patterns: network.allow_host_patterns.clone(),
         secrets: Vec::new(),
         injects: Vec::new(),
+        observes: Vec::new(),
         secret_mode,
     });
 
@@ -427,8 +428,37 @@ async fn build_egress_policy(
         network_allow_host_patterns: network.allow_host_patterns.clone(),
         secrets: egress_secret_entries(secret_bundle, spec_env),
         injects: resolve_inject_entries(state, integration_policy, image).await,
+        observes: build_observe_entries(integration_policy),
         secret_mode,
     })
+}
+
+/// ADR 0056 (Phase 4): translate an integration policy's response-observation
+/// specs into host-side egress entries. Unlike injections these carry no
+/// secret (the asset map operates on the response), so this is a pure copy —
+/// no `SecretStore` lookup, hence sync.
+pub(crate) fn build_observe_entries(
+    integration_policy: Option<&engram_core::types::IntegrationPolicy>,
+) -> Vec<engram_core::types::egress::EgressObserveEntry> {
+    let Some(policy) = integration_policy else {
+        return Vec::new();
+    };
+    policy
+        .observes
+        .iter()
+        .map(|o| engram_core::types::egress::EgressObserveEntry {
+            allow_hosts: o.hosts.clone(),
+            allow_host_patterns: Vec::new(),
+            methods: o.methods.clone(),
+            path_prefixes: o.path_prefixes.clone(),
+            provider: o.provider.clone(),
+            asset_kind: o.asset_kind.clone(),
+            surface: o.surface.clone(),
+            success_status_class: o.success_status_class.clone(),
+            data: o.data.clone(),
+            fetchable: o.fetchable.clone(),
+        })
+        .collect()
 }
 
 /// ADR 0056 (B′): resolve an integration policy's Plane-B injections into

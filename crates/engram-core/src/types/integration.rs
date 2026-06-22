@@ -21,6 +21,13 @@ pub struct IntegrationPolicy {
     /// Plane-B credential injections selected by the session's capabilities.
     #[serde(default)]
     pub injects: Vec<IntegrationInject>,
+    /// ADR 0056 Phase 4: response-observation specs — the connector `asset`
+    /// maps for the session's capabilities. The proxy emits an
+    /// `IntegrationAsset` from the real response of a matching request. Carries
+    /// no secret (the asset map is pure), so the coordinator copies these
+    /// straight through to the egress policy (no host-side resolution).
+    #[serde(default)]
+    pub observes: Vec<IntegrationObserve>,
 }
 
 /// One Plane-B injection: on an outbound request to `hosts` matching the
@@ -41,6 +48,34 @@ pub struct IntegrationInject {
     pub methods: Vec<String>,
     #[serde(default)]
     pub path_prefixes: Vec<String>,
+}
+
+/// One response-observation spec. On an outbound request to `hosts` matching
+/// `methods` + `path_prefixes`, the proxy parses the response and emits an
+/// `IntegrationAsset` (`provider`/`asset_kind`/`surface`) built from the `data`
+/// extractor map + optional `fetchable` URL extractor, gated by `success`.
+/// Extractor paths are `$.resp.<dotted>` / `$.req.method|path` / `$.status`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationObserve {
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub path_prefixes: Vec<String>,
+    pub provider: String,
+    pub asset_kind: String,
+    /// `"action"` (transient) | `"asset"` (durable). Opaque to the proxy; the
+    /// coordinator maps it to its `AssetSurface`.
+    pub surface: String,
+    /// Status class gating emission, e.g. `"2xx"`. `None` → emit on any status.
+    #[serde(default)]
+    pub success_status_class: Option<String>,
+    /// `(field name, extractor path)` pairs for the asset's `data` payload.
+    #[serde(default)]
+    pub data: Vec<(String, String)>,
+    /// Extractor path producing an external URL, e.g. `"$.resp.html_url"`.
+    #[serde(default)]
+    pub fetchable: Option<String>,
 }
 
 impl IntegrationPolicy {
@@ -75,6 +110,7 @@ mod tests {
                 methods: vec!["GET".into()],
                 path_prefixes: vec!["/api/v2/logs".into()],
             }],
+            observes: vec![],
         };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(IntegrationPolicy::parse(&json).unwrap(), Some(p));
@@ -87,5 +123,33 @@ mod tests {
         let p = IntegrationPolicy::parse(json).unwrap().unwrap();
         assert!(p.injects[0].methods.is_empty());
         assert!(p.injects[0].path_prefixes.is_empty());
+    }
+
+    #[test]
+    fn round_trips_an_observe() {
+        let p = IntegrationPolicy {
+            injects: vec![],
+            observes: vec![IntegrationObserve {
+                hosts: vec!["api.github.com".into()],
+                methods: vec!["POST".into()],
+                path_prefixes: vec!["/repos/".into()],
+                provider: "github".into(),
+                asset_kind: "issue".into(),
+                surface: "asset".into(),
+                success_status_class: Some("2xx".into()),
+                data: vec![("number".into(), "$.resp.number".into())],
+                fetchable: Some("$.resp.html_url".into()),
+            }],
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(IntegrationPolicy::parse(&json).unwrap(), Some(p));
+    }
+
+    #[test]
+    fn observes_default_to_empty_when_absent() {
+        // A policy serialized before Phase 4 (injects only) still decodes.
+        let json = r#"{"injects":[]}"#;
+        let p = IntegrationPolicy::parse(json).unwrap().unwrap();
+        assert!(p.observes.is_empty());
     }
 }

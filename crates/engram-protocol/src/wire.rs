@@ -38,10 +38,10 @@ use serde::{Deserialize, Serialize};
 ///   - The host reports its version on every heartbeat; the scheduler
 ///     excludes version-mismatched hosts so a rolling deploy becomes a
 ///     graceful drain rather than a stream of hard failures.
-// v3: ADR 0056 added `injects` to `SessionEgressPolicy` (coord→host). A
-// mixed-version fleet fails fast on the version gate above rather than
-// misparsing the positional bincode payload.
-pub const WIRE_VERSION: u32 = 3;
+// v3 (ADR 0056 Phase 3b): added `injects` to `SessionEgressPolicy` (coord→host).
+// v4 (ADR 0056 Phase 4b): added `observes`. A mixed-version fleet fails fast on
+// the version gate above rather than misparsing the positional bincode payload.
+pub const WIRE_VERSION: u32 = 4;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

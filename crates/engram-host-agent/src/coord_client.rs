@@ -187,6 +187,35 @@ impl CoordClient {
         Ok(())
     }
 
+    /// POST /api/v1/sessions/:session_id/integration-asset
+    ///
+    /// ADR 0056 Phase 4: the egress proxy observed a response on a marked
+    /// endpoint and built an asset. The host-agent forwards it to the coord —
+    /// which appends it as an `IntegrationAsset` session event — mirroring the
+    /// harness-event path. Best-effort: a transport/HTTP failure is logged by
+    /// the caller, not retried (at-least-once observation, ADR 0028).
+    pub async fn integration_asset(
+        &self,
+        session_id: SessionId,
+        req: &IntegrationAssetReport,
+    ) -> Result<(), CoordClientError> {
+        let url = self.endpoint(&format!("/sessions/{session_id}/integration-asset"));
+        let builder = self.http.post(&url);
+        let resp = self
+            .auth(builder, req)
+            .send()
+            .await
+            .map_err(CoordClientError::Transport)?;
+        if !resp.status().is_success() {
+            return Err(CoordClientError::Http {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+                what: "integration_asset",
+            });
+        }
+        Ok(())
+    }
+
     /// POST /api/v1/hosts/forge
     ///
     /// ADR 0023 split-mode forge forwarding. The host-agent reads the
@@ -560,6 +589,20 @@ pub struct RegistryCreds {
 pub struct HarnessEventRequest {
     pub sandbox_id: SandboxId,
     pub event: HarnessEvent,
+    pub at: DateTime<Utc>,
+}
+
+/// ADR 0056 Phase 4: a proxy-observed integration asset, forwarded to the
+/// coord's `/sessions/:id/integration-asset` ingest. `surface` is opaque here
+/// ("action" | "asset"); the coord maps it to its `AssetSurface`.
+#[derive(Serialize)]
+pub struct IntegrationAssetReport {
+    pub provider: String,
+    pub asset_kind: String,
+    pub surface: String,
+    pub data: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetchable_url: Option<String>,
     pub at: DateTime<Utc>,
 }
 
