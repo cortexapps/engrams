@@ -88,8 +88,22 @@ export interface IntegrationInjectJson {
   methods: string[];
   path_prefixes: string[];
 }
+/** One response-observation spec, snake_case to match the Rust serde shape. */
+export interface IntegrationObserveJson {
+  hosts: string[];
+  methods: string[];
+  path_prefixes: string[];
+  provider: string;
+  asset_kind: string;
+  surface: string;
+  success_status_class: string | null;
+  /** `[field, extractorPath]` pairs (serde `Vec<(String, String)>`). */
+  data: [string, string][];
+  fetchable: string | null;
+}
 export interface IntegrationPolicyJson {
   injects: IntegrationInjectJson[];
+  observes: IntegrationObserveJson[];
 }
 
 // ---------------------------------------------------------------------------
@@ -255,41 +269,75 @@ function pathPrefix(p: string): string {
 /**
  * Compile a profile's bound capabilities → the per-session IntegrationPolicy.
  *
- * For each capability whose provider's connector is credential-source `inject`,
- * activate the operations whose `grants` include the capability's `action`, and
- * emit one inject entry per activated operation (host-gated + method/path-gated
- * from the op's `match`). Mint connectors are skipped (Phase 5). Unknown
- * providers/actions are skipped (profile-save validation already rejected them;
- * a clamp-drop here is the defensive belt). Exact-duplicate injects are deduped.
+ * For each capability, activate the operations whose `grants` include its
+ * `action`, and for each activated operation emit:
+ *   - an **inject** (Plane B) if the connector's credential source is `inject`
+ *     (host-gated + method/path-gated from the op's `match`); and
+ *   - an **observe** if the operation declares an `asset` spec — *regardless of
+ *     credential source*, since observation is orthogonal to auth (a mint
+ *     provider like GitHub still surfaces assets from its responses).
+ *
+ * Unknown providers/actions are skipped (profile-save validation already
+ * rejected them; a clamp-drop here is the defensive belt). Exact-duplicate
+ * entries are deduped.
  */
 export function compileIntegrationPolicy(
   capabilities: string[],
   registry: Map<string, Connector> = connectorRegistry(),
 ): IntegrationPolicyJson {
   const injects: IntegrationInjectJson[] = [];
-  const seen = new Set<string>();
+  const observes: IntegrationObserveJson[] = [];
+  const seenInject = new Set<string>();
+  const seenObserve = new Set<string>();
   for (const capStr of capabilities) {
     const cap = parseCapability(capStr);
     if (!cap) continue;
     const connector = registry.get(cap.provider);
-    if (!connector || connector.credential.source !== "inject") continue;
-    const inj = connector.credential.inject;
+    if (!connector) continue;
     for (const op of connector.operations) {
       if (!op.grants.includes(cap.action)) continue;
-      const entry: IntegrationInjectJson = {
-        hosts: connector.hosts,
-        header_name: inj.header,
-        header_template: inj.template ?? "{}",
-        secret_ref: inj.secretRef,
-        methods: op.match?.method ? [op.match.method.toUpperCase()] : [],
-        path_prefixes: op.match?.path ? [pathPrefix(op.match.path)] : [],
-      };
-      const key = JSON.stringify(entry);
-      if (!seen.has(key)) {
-        seen.add(key);
-        injects.push(entry);
+      const methods = op.match?.method ? [op.match.method.toUpperCase()] : [];
+      const path_prefixes = op.match?.path ? [pathPrefix(op.match.path)] : [];
+
+      if (connector.credential.source === "inject") {
+        const inj = connector.credential.inject;
+        const entry: IntegrationInjectJson = {
+          hosts: connector.hosts,
+          header_name: inj.header,
+          header_template: inj.template ?? "{}",
+          secret_ref: inj.secretRef,
+          methods,
+          path_prefixes,
+        };
+        const key = JSON.stringify(entry);
+        if (!seenInject.has(key)) {
+          seenInject.add(key);
+          injects.push(entry);
+        }
+      }
+
+      if (op.asset) {
+        const a = op.asset;
+        const statusClass = a.success?.statusClass;
+        const fetchableExternal = a.fetchable?.external;
+        const entry: IntegrationObserveJson = {
+          hosts: connector.hosts,
+          methods,
+          path_prefixes,
+          provider: connector.provider,
+          asset_kind: a.kind,
+          surface: a.surface,
+          success_status_class: typeof statusClass === "string" ? statusClass : null,
+          data: Object.entries(a.data ?? {}),
+          fetchable: typeof fetchableExternal === "string" ? fetchableExternal : null,
+        };
+        const key = JSON.stringify(entry);
+        if (!seenObserve.has(key)) {
+          seenObserve.add(key);
+          observes.push(entry);
+        }
       }
     }
   }
-  return { injects };
+  return { injects, observes };
 }

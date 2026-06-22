@@ -170,6 +170,63 @@ describe("compileIntegrationPolicy", () => {
     const policy = compileIntegrationPolicy(["datadog:logs:read", "datadog:logs:read"], reg);
     expect(policy.injects).toHaveLength(1);
   });
+
+  test("ops without an asset compile to no observes", () => {
+    // The bare fixtures (no asset specs) yield only injects.
+    expect(compileIntegrationPolicy(["datadog:logs:read"], reg).observes).toEqual([]);
+    expect(compileIntegrationPolicy(["github:issues:write"], reg).observes).toEqual([]);
+  });
+});
+
+// A mint connector whose op carries an asset spec (the GitHub-issue shape).
+const githubAssetRaw = {
+  provider: "github",
+  protocol: "http",
+  credential: { source: "mint", mint: { kind: "github_app" } },
+  hosts: ["api.github.com"],
+  operations: [
+    {
+      grants: ["issues:write"],
+      match: { method: "POST", path: "/repos/*/issues" },
+      asset: {
+        kind: "issue",
+        surface: "asset",
+        success: { statusClass: "2xx" },
+        data: { number: "$.resp.number", title: "$.resp.title" },
+        fetchable: { external: "$.resp.html_url" },
+      },
+    },
+  ],
+};
+
+describe("compileIntegrationPolicy — observes", () => {
+  const reg = registryOf(githubAssetRaw);
+
+  test("an op with an asset compiles to an observe — even for a mint connector", () => {
+    const policy = compileIntegrationPolicy(["github:issues:write"], reg);
+    expect(policy.injects).toEqual([]); // mint → no inject
+    expect(policy.observes).toEqual([
+      {
+        hosts: ["api.github.com"],
+        methods: ["POST"],
+        path_prefixes: ["/repos/"],
+        provider: "github",
+        asset_kind: "issue",
+        surface: "asset",
+        success_status_class: "2xx",
+        data: [
+          ["number", "$.resp.number"],
+          ["title", "$.resp.title"],
+        ],
+        fetchable: "$.resp.html_url",
+      },
+    ]);
+  });
+
+  test("observes dedupe across duplicate capabilities", () => {
+    const policy = compileIntegrationPolicy(["github:issues:write", "github:issues:write"], reg);
+    expect(policy.observes).toHaveLength(1);
+  });
 });
 
 describe("on-disk registry", () => {
@@ -186,5 +243,21 @@ describe("on-disk registry", () => {
     const policy = compileIntegrationPolicy(["datadog:logs:read"]);
     expect(policy.injects).toHaveLength(1);
     expect(policy.injects[0]!.header_name).toBe("DD-API-KEY");
+  });
+
+  test("the shipped datadog logs:read also compiles a query_result observe", () => {
+    const policy = compileIntegrationPolicy(["datadog:logs:read"]);
+    expect(policy.observes).toHaveLength(1);
+    expect(policy.observes[0]!.provider).toBe("datadog");
+    expect(policy.observes[0]!.asset_kind).toBe("query_result");
+  });
+
+  test("the shipped github issues:write compiles an issue observe (mint, no inject)", () => {
+    const policy = compileIntegrationPolicy(["github:issues:write"]);
+    expect(policy.injects).toEqual([]);
+    expect(policy.observes).toHaveLength(1);
+    expect(policy.observes[0]!.provider).toBe("github");
+    expect(policy.observes[0]!.asset_kind).toBe("issue");
+    expect(policy.observes[0]!.fetchable).toBe("$.resp.html_url");
   });
 });

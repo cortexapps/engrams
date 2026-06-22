@@ -1121,29 +1121,57 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
       const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
       expect(json).toBeDefined();
-      expect(JSON.parse(json!)).toEqual({
-        injects: [
-          {
-            hosts: ["api.datadoghq.com"],
-            header_name: "DD-API-KEY",
-            header_template: "{}",
-            secret_ref: "datadog-api-key",
-            methods: ["GET"],
-            path_prefixes: ["/api/v2/logs/events"],
-          },
-        ],
-      });
+      const policy = JSON.parse(json!);
+      // datadog logs:read is inject-source AND declares a query_result asset, so
+      // it compiles to both an inject and an observe (ADR 0056 Phase 4c).
+      expect(policy.injects).toEqual([
+        {
+          hosts: ["api.datadoghq.com"],
+          header_name: "DD-API-KEY",
+          header_template: "{}",
+          secret_ref: "datadog-api-key",
+          methods: ["GET"],
+          path_prefixes: ["/api/v2/logs/events"],
+        },
+      ]);
+      expect(policy.observes).toHaveLength(1);
+      expect(policy.observes[0].provider).toBe("datadog");
+      expect(policy.observes[0].asset_kind).toBe("query_result");
     } finally {
       await srv.close();
     }
   });
 
-  test("a mint-only capability set omits integration_policy_json (no injects)", async () => {
+  test("a mint capability with an asset ships observes, no inject (ADR 0056 Phase 4c)", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("gh-sess")], existing: [] });
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
       profiles: makeFakeProfiles({ capabilities: ["github:issues:write"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
+      expect(json).toBeDefined();
+      const policy = JSON.parse(json!);
+      expect(policy.injects).toEqual([]); // mint → proxy injects nothing
+      expect(policy.observes).toHaveLength(1);
+      expect(policy.observes[0].provider).toBe("github");
+      expect(policy.observes[0].asset_kind).toBe("issue");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("a capability-less profile omits integration_policy_json", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("bare-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ capabilities: [] }),
       images: fakeImages(),
       db: okDb(),
     });
