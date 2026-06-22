@@ -32,5 +32,5 @@ pub use metadata::{
 pub use sandbox::{
     ForgeSink, HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend, UploadSink,
 };
-pub use secrets::{ResolvedSecret, SecretBundle, SecretContext, SecretStore};
+pub use secrets::{LayeredSecretStore, ResolvedSecret, SecretBundle, SecretContext, SecretStore};
 pub use storage::{BlobObjectMeta, BlobStorage, ByteStream};
