@@ -285,6 +285,39 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0057: the KEK-sealed, admin-managed org secret store. The org
+    /// `SecretStore` backend resolves these through the composed store; the
+    /// admin `OrgSecretService` writes them (sealed at the coordinator).
+    /// `upsert` is name-keyed (`ON CONFLICT (name) DO UPDATE`) and fires
+    /// `pg_notify('org_secret_changed', name)` so the mint broker invalidates
+    /// its cache (ADR 0057 C2). `list` returns metadata only — NEVER ciphertext.
+    /// Default impls (mocks): upsert/delete no-op, get/list find nothing.
+    async fn upsert_org_secret(
+        &self,
+        sealed: crate::types::org_secret::SealedOrgSecret,
+    ) -> Result<crate::types::org_secret::OrgSecret, MetaError> {
+        Ok(crate::types::org_secret::OrgSecret {
+            name: sealed.name,
+            key_id: sealed.key_id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        })
+    }
+    async fn get_org_secret_sealed(
+        &self,
+        _name: &str,
+    ) -> Result<Option<crate::types::org_secret::SealedOrgSecret>, MetaError> {
+        Ok(None)
+    }
+    async fn list_org_secrets(
+        &self,
+    ) -> Result<Vec<crate::types::org_secret::OrgSecret>, MetaError> {
+        Ok(Vec::new())
+    }
+    async fn delete_org_secret(&self, _name: &str) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
     /// ADR 0047 (replica-safe reconciler): apply one heartbeat's
     /// missing-sandbox strike accounting on the session rows. Sessions
     /// whose sandbox WAS in the heartbeat get their counter reset;

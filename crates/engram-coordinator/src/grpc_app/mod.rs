@@ -15,6 +15,7 @@ mod convert;
 mod fleet;
 mod image;
 mod mount_catalog;
+mod org_secret;
 mod session;
 mod shell_relay;
 
@@ -28,6 +29,7 @@ use tonic::Status;
 pub use fleet::AppFleetService;
 pub use image::AppImageService;
 pub use mount_catalog::AppMountCatalogService;
+pub use org_secret::AppOrgSecretService;
 pub use session::AppSessionService;
 pub use shell_relay::AppShellRelayService;
 
@@ -164,9 +166,16 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
         // ADR 0055 P2: the org-shared user-uploaded skill catalog.
         .add_service(
             app::mount_catalog_service_server::MountCatalogServiceServer::new(
-                AppMountCatalogService { state, auth },
+                AppMountCatalogService {
+                    state: state.clone(),
+                    auth: auth.clone(),
+                },
             ),
         )
+        // ADR 0057: the admin-managed, KEK-sealed org secret store.
+        .add_service(app::org_secret_service_server::OrgSecretServiceServer::new(
+            AppOrgSecretService { state, auth },
+        ))
 }
 
 #[cfg(test)]
@@ -372,6 +381,7 @@ mod convention {
         ("fleet.rs", include_str!("fleet.rs")),
         ("image.rs", include_str!("image.rs")),
         ("mount_catalog.rs", include_str!("mount_catalog.rs")),
+        ("org_secret.rs", include_str!("org_secret.rs")),
     ];
 
     /// Files under `src/grpc_app/` that are deliberately NOT listed in

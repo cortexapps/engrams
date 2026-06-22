@@ -816,7 +816,7 @@ async fn main() -> Result<(), CoordinatorError> {
     // manifest's `[secrets.*]` entry against GCP Secret Manager at
     // session-create time, authenticating via the metadata server
     // (Workload Identity).
-    let secrets: Arc<dyn SecretStore> = match cli.secrets_backend {
+    let deployment_secrets: Arc<dyn SecretStore> = match cli.secrets_backend {
         SecretsChoice::Env => Arc::new(EnvSecretStore::new()),
         SecretsChoice::Gcp => {
             let project = cli.gcp_project_id.clone().ok_or_else(|| {
@@ -832,6 +832,20 @@ async fn main() -> Result<(), CoordinatorError> {
             )
         }
     };
+
+    // ADR 0057: layer the admin-managed org-secret store ahead of the
+    // deployment backend. An admin-entered org secret (profile secret,
+    // integration inject cred, GitHub App mint key) resolves first; anything it
+    // doesn't hold falls through to the deployment backend (image/manifest env
+    // secrets, ops-provisioned refs). Resolution stays coordinator-side and
+    // PG-authoritative (ADR 0047) — resume re-resolves with no orchestrator hop.
+    let org_secret_backend =
+        engram_coordinator::org_secrets::OrgSecretBackend::new(meta_arc.clone(), kek.clone());
+    let secrets: Arc<dyn SecretStore> =
+        Arc::new(engram_core::traits::LayeredSecretStore::new(vec![
+            Arc::new(org_secret_backend) as Arc<dyn SecretStore>,
+            deployment_secrets,
+        ]));
 
     // KEK + meta_arc + blob were constructed up-front so the OCI
     // auth resolver / chunk store could reference them. They flow
