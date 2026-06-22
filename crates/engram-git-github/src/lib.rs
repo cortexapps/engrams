@@ -16,10 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use engram_core::error::GitForgeError;
-use engram_core::traits::{
-    ForgeKind, GitForge, PullRequest, PullRequestSpec, RepoRef, ScopedToken,
-};
+use engram_core::error::IntegrationError;
+use engram_core::traits::{CredentialHint, Integration, ScopedCredential};
 use engram_core::types::Capability;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use parking_lot::Mutex;
@@ -28,6 +26,28 @@ use serde::{Deserialize, Serialize};
 const GITHUB_API: &str = "https://api.github.com";
 const GITHUB_HOST: &str = "github.com";
 const API_VERSION: &str = "2022-11-28";
+
+/// A repository identified by `owner/name`. Internal to this provider now
+/// (ADR 0056 Phase 5b retired the cross-crate `RepoRef`).
+struct RepoRef {
+    owner: String,
+    name: String,
+}
+
+impl RepoRef {
+    fn parse(slug: &str) -> Result<Self, IntegrationError> {
+        let mut parts = slug.split('/');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty() => Ok(Self {
+                owner: owner.to_string(),
+                name: name.to_string(),
+            }),
+            _ => Err(IntegrationError::InvalidSpec(format!(
+                "repo must be `owner/name`, got `{slug}`"
+            ))),
+        }
+    }
+}
 
 /// ADR 0056 (Plane A): compute the GitHub App `permissions` object from the
 /// session's bound `github:` capabilities. A capability action is
@@ -93,29 +113,29 @@ struct JwtClaims {
     iss: String,
 }
 
-/// A GitForge backed by a GitHub App installation.
+/// An [`Integration`] backed by a GitHub App installation (ADR 0056).
 pub struct GitHubApp {
     app_id: String,
     encoding_key: EncodingKey,
     http: reqwest::Client,
     base_url: String,
-    /// repo slug → installation id (installations rarely change).
+    /// owner → installation id (installations rarely change).
     installations: Mutex<HashMap<String, u64>>,
-    /// repo slug → last minted token (lazily refreshed near expiry).
-    tokens: Mutex<HashMap<String, ScopedToken>>,
+    /// scope key → last minted credential (lazily refreshed near expiry).
+    tokens: Mutex<HashMap<String, ScopedCredential>>,
 }
 
 impl GitHubApp {
     /// `app_id` is the GitHub App's numeric ID (as a string);
     /// `private_key_pem` is its RSA private key (PKCS#1 or PKCS#8 PEM).
-    pub fn new(app_id: impl Into<String>, private_key_pem: &str) -> Result<Self, GitForgeError> {
+    pub fn new(app_id: impl Into<String>, private_key_pem: &str) -> Result<Self, IntegrationError> {
         let encoding_key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).map_err(|e| {
-            GitForgeError::Unauthorized(format!("invalid GitHub App private key: {e}"))
+            IntegrationError::Unauthorized(format!("invalid GitHub App private key: {e}"))
         })?;
         let http = reqwest::Client::builder()
             .user_agent("engram-git-github")
             .build()
-            .map_err(|e| GitForgeError::Backend(Box::new(e)))?;
+            .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
         Ok(Self {
             app_id: app_id.into(),
             encoding_key,
@@ -134,10 +154,10 @@ impl GitHubApp {
 
     /// Mint a fresh app-level JWT (RS256, ≤10-min life). Coord-internal —
     /// never enters a sandbox.
-    fn app_jwt(&self) -> Result<String, GitForgeError> {
+    fn app_jwt(&self) -> Result<String, IntegrationError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| GitForgeError::Backend(Box::new(e)))?
+            .map_err(|e| IntegrationError::Backend(Box::new(e)))?
             .as_secs();
         let claims = JwtClaims {
             iat: now - 60,  // backdate for clock skew
@@ -145,13 +165,13 @@ impl GitHubApp {
             iss: self.app_id.clone(),
         };
         jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.encoding_key)
-            .map_err(|e| GitForgeError::Unauthorized(format!("sign app JWT: {e}")))
+            .map_err(|e| IntegrationError::Unauthorized(format!("sign app JWT: {e}")))
     }
 
     /// Resolve the installation id for `owner` (org first, then user),
     /// or the app's sole installation when `owner` is `None`. Cached by
     /// owner key (`""` for the default).
-    async fn installation_id(&self, owner: Option<&str>) -> Result<u64, GitForgeError> {
+    async fn installation_id(&self, owner: Option<&str>) -> Result<u64, IntegrationError> {
         let key = owner.unwrap_or("").to_string();
         if let Some(id) = self.installations.lock().get(&key).copied() {
             return Ok(id);
@@ -165,7 +185,7 @@ impl GitHubApp {
                 .await
             {
                 Ok(id) => id,
-                Err(GitForgeError::NotFound(_)) => {
+                Err(IntegrationError::NotFound(_)) => {
                     self.get_installation_id(
                         &jwt,
                         &format!("{}/users/{}/installation", self.base_url, o),
@@ -184,7 +204,7 @@ impl GitHubApp {
                     .header("X-GitHub-Api-Version", API_VERSION)
                     .send()
                     .await
-                    .map_err(|e| GitForgeError::Backend(Box::new(e)))?;
+                    .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
                 let resp = ensure_ok(resp, "list installations").await?;
                 #[derive(Deserialize)]
                 struct Inst {
@@ -193,12 +213,16 @@ impl GitHubApp {
                 let insts: Vec<Inst> = resp
                     .json()
                     .await
-                    .map_err(|e| GitForgeError::Protocol(format!("installations json: {e}")))?;
+                    .map_err(|e| IntegrationError::Protocol(format!("installations json: {e}")))?;
                 match insts.as_slice() {
                     [one] => one.id,
-                    [] => return Err(GitForgeError::NotFound("app has no installations".into())),
+                    [] => {
+                        return Err(IntegrationError::NotFound(
+                            "app has no installations".into(),
+                        ))
+                    }
                     _ => {
-                        return Err(GitForgeError::InvalidSpec(
+                        return Err(IntegrationError::InvalidSpec(
                             "app spans multiple installations; specify an owner".into(),
                         ))
                     }
@@ -209,7 +233,7 @@ impl GitHubApp {
         Ok(id)
     }
 
-    async fn get_installation_id(&self, jwt: &str, url: &str) -> Result<u64, GitForgeError> {
+    async fn get_installation_id(&self, jwt: &str, url: &str) -> Result<u64, IntegrationError> {
         let resp = self
             .http
             .get(url)
@@ -218,7 +242,7 @@ impl GitHubApp {
             .header("X-GitHub-Api-Version", API_VERSION)
             .send()
             .await
-            .map_err(|e| GitForgeError::Backend(Box::new(e)))?;
+            .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
         let resp = ensure_ok(resp, "look up installation").await?;
         #[derive(Deserialize)]
         struct Installation {
@@ -227,18 +251,20 @@ impl GitHubApp {
         let inst: Installation = resp
             .json()
             .await
-            .map_err(|e| GitForgeError::Protocol(format!("installation json: {e}")))?;
+            .map_err(|e| IntegrationError::Protocol(format!("installation json: {e}")))?;
         Ok(inst.id)
     }
 }
 
-#[async_trait]
-impl GitForge for GitHubApp {
-    async fn mint_installation_token(
+impl GitHubApp {
+    /// Mint an installation token scoped to `caps` — the
+    /// `ScopedCredential::Basic` the git askpass helper wields. Shared by
+    /// [`Integration::mint_credential`] and the mediated PR action.
+    async fn mint_basic(
         &self,
         caps: &[Capability],
         owner: Option<&str>,
-    ) -> Result<ScopedToken, GitForgeError> {
+    ) -> Result<ScopedCredential, IntegrationError> {
         // ADR 0056 (Plane A): scope the token to the session's bound caps.
         let permissions = permissions_for_caps(caps);
         let repositories = repositories_for_caps(caps);
@@ -257,9 +283,12 @@ impl GitForge for GitHubApp {
             repositories.join(",")
         );
         // Serve from cache while comfortably inside the validity window.
-        if let Some(tok) = self.tokens.lock().get(&key) {
-            if tok.expires_at > Utc::now() + Duration::minutes(5) {
-                return Ok(tok.clone());
+        {
+            let cache = self.tokens.lock();
+            if let Some(c @ ScopedCredential::Basic { expires_at, .. }) = cache.get(&key) {
+                if *expires_at > Utc::now() + Duration::minutes(5) {
+                    return Ok(c.clone());
+                }
             }
         }
         let id = self.installation_id(owner).await?;
@@ -273,7 +302,7 @@ impl GitForge for GitHubApp {
             serde_json::json!({ "contents": "write", "pull_requests": "write" })
         } else {
             serde_json::to_value(&permissions)
-                .map_err(|e| GitForgeError::Protocol(format!("permissions json: {e}")))?
+                .map_err(|e| IntegrationError::Protocol(format!("permissions json: {e}")))?
         };
         let mut body = serde_json::json!({ "permissions": permissions_json });
         if !repositories.is_empty() {
@@ -288,7 +317,7 @@ impl GitForge for GitHubApp {
             .json(&body)
             .send()
             .await
-            .map_err(|e| GitForgeError::Backend(Box::new(e)))?;
+            .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
         let resp = ensure_ok(resp, "mint installation token").await?;
         #[derive(Deserialize)]
         struct TokenResp {
@@ -298,8 +327,8 @@ impl GitForge for GitHubApp {
         let tr: TokenResp = resp
             .json()
             .await
-            .map_err(|e| GitForgeError::Protocol(format!("token json: {e}")))?;
-        let scoped = ScopedToken {
+            .map_err(|e| IntegrationError::Protocol(format!("token json: {e}")))?;
+        let scoped = ScopedCredential::Basic {
             username: "x-access-token".to_string(),
             password: tr.token,
             expires_at: tr.expires_at,
@@ -307,34 +336,83 @@ impl GitForge for GitHubApp {
         self.tokens.lock().insert(key, scoped.clone());
         Ok(scoped)
     }
+}
 
-    async fn create_pull_request(
+#[async_trait]
+impl Integration for GitHubApp {
+    fn provider(&self) -> &str {
+        "github"
+    }
+
+    async fn mint_credential(
         &self,
-        repo: &RepoRef,
-        pr: &PullRequestSpec,
-    ) -> Result<PullRequest, GitForgeError> {
-        // The mediated PR action uses the provider's default scopes (an empty
-        // cap set) — PR creation needs pull_requests + contents write, the same
+        caps: &[Capability],
+        hint: &CredentialHint,
+    ) -> Result<ScopedCredential, IntegrationError> {
+        if let Some(h) = hint.host.as_deref().filter(|s| !s.is_empty()) {
+            if !h.eq_ignore_ascii_case(GITHUB_HOST) {
+                return Err(IntegrationError::InvalidSpec(format!(
+                    "github integration does not serve host `{h}`"
+                )));
+            }
+        }
+        self.mint_basic(caps, hint.owner.as_deref().filter(|s| !s.is_empty()))
+            .await
+    }
+
+    /// The one mediated action today: open a pull request (`pulls:write`).
+    /// `args` = `{repo, head_branch, base_branch, title, body, draft}`; the
+    /// reply carries `{url, id, number, state}` the coordinator emits as an
+    /// `IntegrationAsset`.
+    async fn perform_action(
+        &self,
+        cap: &Capability,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, IntegrationError> {
+        if cap.action != "pulls:write" {
+            return Err(IntegrationError::Unsupported);
+        }
+        #[derive(Deserialize)]
+        struct PrArgs {
+            repo: String,
+            head_branch: String,
+            base_branch: String,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            body: String,
+            #[serde(default)]
+            draft: bool,
+        }
+        let a: PrArgs = serde_json::from_value(args.clone())
+            .map_err(|e| IntegrationError::InvalidSpec(format!("pull request args: {e}")))?;
+        let repo = RepoRef::parse(&a.repo)?;
+        // PR creation uses the provider default scopes (empty caps) — the same
         // scopes the forge minted before ADR 0056's capability scoping.
-        let token = self.mint_installation_token(&[], Some(&repo.owner)).await?;
+        let cred = self.mint_basic(&[], Some(&repo.owner)).await?;
+        let ScopedCredential::Basic { password, .. } = &cred else {
+            return Err(IntegrationError::Protocol(
+                "github mint returned a non-basic credential".into(),
+            ));
+        };
         let url = format!("{}/repos/{}/{}/pulls", self.base_url, repo.owner, repo.name);
         let body = serde_json::json!({
-            "title": pr.title,
-            "head": pr.head_branch,
-            "base": pr.base_branch,
-            "body": pr.body,
-            "draft": pr.draft,
+            "title": a.title,
+            "head": a.head_branch,
+            "base": a.base_branch,
+            "body": a.body,
+            "draft": a.draft,
         });
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&token.password)
+            .bearer_auth(password)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
             .json(&body)
             .send()
             .await
-            .map_err(|e| GitForgeError::Backend(Box::new(e)))?;
+            .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
         let resp = ensure_ok(resp, "create pull request").await?;
         #[derive(Deserialize)]
         struct PrResp {
@@ -342,29 +420,25 @@ impl GitForge for GitHubApp {
             number: u64,
             state: String,
         }
-        let pr_resp: PrResp = resp
+        let pr: PrResp = resp
             .json()
             .await
-            .map_err(|e| GitForgeError::Protocol(format!("pull request json: {e}")))?;
-        Ok(PullRequest {
-            url: pr_resp.html_url,
-            id: pr_resp.number,
-            state: pr_resp.state,
-        })
-    }
-
-    fn host(&self) -> &str {
-        GITHUB_HOST
-    }
-
-    fn kind(&self) -> ForgeKind {
-        ForgeKind::GitHub
+            .map_err(|e| IntegrationError::Protocol(format!("pull request json: {e}")))?;
+        Ok(serde_json::json!({
+            "url": pr.html_url,
+            "id": pr.number,
+            "number": pr.number,
+            "state": pr.state,
+        }))
     }
 }
 
-/// Map a non-2xx GitHub response onto a typed `GitForgeError`, folding a
+/// Map a non-2xx GitHub response onto a typed `IntegrationError`, folding a
 /// truncated body in for diagnostics.
-async fn ensure_ok(resp: reqwest::Response, ctx: &str) -> Result<reqwest::Response, GitForgeError> {
+async fn ensure_ok(
+    resp: reqwest::Response,
+    ctx: &str,
+) -> Result<reqwest::Response, IntegrationError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
@@ -373,10 +447,10 @@ async fn ensure_ok(resp: reqwest::Response, ctx: &str) -> Result<reqwest::Respon
     let snippet: String = body.chars().take(300).collect();
     let msg = format!("{ctx}: HTTP {status}: {snippet}");
     Err(match status.as_u16() {
-        401 | 403 => GitForgeError::Unauthorized(msg),
-        404 => GitForgeError::NotFound(msg),
-        422 => GitForgeError::Rejected(msg),
-        _ => GitForgeError::Protocol(msg),
+        401 | 403 => IntegrationError::Unauthorized(msg),
+        404 => IntegrationError::NotFound(msg),
+        422 => IntegrationError::Rejected(msg),
+        _ => IntegrationError::Protocol(msg),
     })
 }
 

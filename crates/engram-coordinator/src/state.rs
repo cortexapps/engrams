@@ -548,12 +548,12 @@ pub struct AppState {
     /// lifetime on every replica). A miss loads + unseals from PG;
     /// cleared at terminal alongside the row.
     pub git_broker_tokens: Arc<dashmap::DashMap<SessionId, String>>,
-    /// ADR 0023: the configured git forge authority (GitHub App, etc).
-    /// Set on `main`'s run path via `run_with_registry_and_local`;
-    /// `None` in tests and when `--git-forge` is unset (the forge
-    /// endpoints then 501). Kept here rather than on `Services` so the
-    /// many test `Services` literals don't need touching.
-    pub forge: Option<Arc<dyn engram_core::traits::GitForge>>,
+    /// ADR 0056: the configured provider integrations (GitHub App, etc) —
+    /// subsumes the old single `forge`. Set on `main`'s run path via
+    /// `run_with_registry_and_local`; empty in tests and when `--git-forge`
+    /// is unset (the forge endpoints then 501). Kept here rather than on
+    /// `Services` so the many test `Services` literals don't need touching.
+    pub integrations: crate::integrations::IntegrationBroker,
     // ADR 0051: the per-user auth runtime (`auth: Option<Arc<AuthRuntime>>`)
     // is removed. The coordinator no longer resolves human principals — the
     // orchestrator owns auth/authz and calls the coordinator over the trusted
@@ -611,7 +611,7 @@ impl AppState {
             cow_state_cache: Arc::new(crate::cow_state::CowStateCache::new()),
             pod_id: Arc::new(resolve_pod_id()),
             git_broker_tokens: Arc::new(dashmap::DashMap::new()),
-            forge: None,
+            integrations: crate::integrations::IntegrationBroker::new(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
         }
     }

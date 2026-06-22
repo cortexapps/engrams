@@ -1160,6 +1160,7 @@ dependencies = [
  "chrono",
  "engram-core",
  "parking_lot",
+ "serde_json",
  "tokio",
  "workspace-hack",
 ]

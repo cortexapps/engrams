@@ -544,7 +544,11 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
 /// seeded session whose credential-broker token is `broker-tok-123`.
 /// Returns the router, the session id, and the forge handle (so tests
 /// can assert recorded change requests).
-async fn build_forge_app() -> (axum::Router, SessionId, Arc<engram_git_dev::StaticGitForge>) {
+async fn build_forge_app() -> (
+    axum::Router,
+    SessionId,
+    Arc<engram_git_dev::StaticGitHubIntegration>,
+) {
     let meta = Arc::new(MockMetadataStore::new());
     let session_id = meta
         .create_session(engram_core::types::session::SessionSpec {
@@ -554,7 +558,9 @@ async fn build_forge_app() -> (axum::Router, SessionId, Arc<engram_git_dev::Stat
         .await
         .expect("seed session");
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
-    let forge = Arc::new(engram_git_dev::StaticGitForge::github("ghs_test_xyz"));
+    let forge = Arc::new(engram_git_dev::StaticGitHubIntegration::github(
+        "ghs_test_xyz",
+    ));
     let services = Services {
         meta,
         cloud: Arc::new(MockCloud::new()),
@@ -585,7 +591,7 @@ async fn build_forge_app() -> (axum::Router, SessionId, Arc<engram_git_dev::Stat
         ..CoordinatorConfig::default()
     };
     let mut app = AppState::new(cfg, services);
-    app.forge = Some(forge.clone());
+    app.integrations = engram_coordinator::integrations::IntegrationBroker::with(forge.clone());
     let state = Arc::new(app);
     state
         .git_broker_tokens
@@ -667,8 +673,8 @@ async fn forge_create_pull_request_opens_and_records() {
 
     let recorded = forge.recorded_pull_requests();
     assert_eq!(recorded.len(), 1, "forge should have recorded one PR");
-    assert_eq!(recorded[0].0.to_string(), "cortexapps/engrams");
-    assert_eq!(recorded[0].1.title, "Add x");
+    assert_eq!(recorded[0]["repo"], "cortexapps/engrams");
+    assert_eq!(recorded[0]["title"], "Add x");
 }
 
 #[tokio::test]

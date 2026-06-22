@@ -1,6 +1,16 @@
 # ADR 0056: Generic third-party integrations — the interceptor is the universal gate + asset observer; credentials are an orthogonal axis
 
-Status: 2026-06-21 — **Proposed.**
+Status: 2026-06-22 — **Accepted.** Implemented across the phase chain below
+(PRs #368–#380): the interceptor gates + injects + observes for any provider
+from connector config; capabilities bind profile→session; the orchestrator
+compiles them into a per-session policy; GitHub minting is capability-scoped;
+and `GitForge` is retired into the slim `Integration` trait. Remaining work is
+operational, not design: a one-time GitHub-App permission re-consent + declaring
+`github:` capabilities on the default/dogfood profiles (both in
+`engrams-internal`) to make scoped credentials live in prod; the empty-caps
+fallback preserves today's behavior until then. The `ForgeOp`→`IntegrationOp`
+wire rename, the `api/forge.rs`→`integrations.rs` file rename, and retiring
+`GitConfig`/`[git]` are deferred cosmetic/orthogonal cleanups (no behavior gain).
 
 Revised 2026-06-21: **reframed around the interceptor as the universal choke
 point.** The egress proxy (ADR 0006) gates every outbound request *and* observes
@@ -450,10 +460,15 @@ at the end with the commit chain.
    be served a cached write token; an empty cap set falls back to today's default
    scopes (a capability-less profile is unaffected — no regression without a
    cross-repo profile change). Keeps `GitForge`, the `ForgeOp` wire, and
-   `GitConfig`. **5b** (follow-up): the structural refactor — slim `Integration`
-   trait (mint + the hybrid `perform_action`) retiring `GitForge`; `state.forge` →
-   `state.integrations`; `ForgeOp` → a generic `IntegrationOp`; retire
-   `GitConfig`/`[git]`; the one-time App union re-consent; flip **Accepted**.
+   `GitConfig`. **5b** (*done*): the structural refactor — the slim `Integration`
+   trait (capability-scoped `mint_credential` + the hybrid `perform_action`)
+   **retires `GitForge`**; `engram-git-github`'s `GitHubApp` + `engram-git-dev`'s
+   mock now impl it; `state.forge` → `state.integrations` (an `IntegrationBroker`
+   keyed by `provider()`); `api/forge.rs` drives the broker (PR creation is the
+   mediated `perform_action`, still emitting the `forge/pull_request` asset). The
+   `ForgeOp`→`IntegrationOp` wire rename, the file rename, retiring
+   `GitConfig`/`[git]`, and the one-time App union re-consent are deferred as
+   cosmetic/operational follow-ups (see the Status note). **ADR complete.**
 
 ## Consequences and risks
 
