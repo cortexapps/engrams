@@ -21,6 +21,8 @@ export interface ProfileRow {
   envVars: Record<string, string>;
   // ADR 0055: dynamic skill bundle names this profile's sessions mount.
   skills: string[];
+  // ADR 0056: integration capabilities ("provider:action[@resource]").
+  capabilities: string[];
   createdAt: Date;
   updatedAt: Date;
   deletedAt: Date | null;
@@ -34,6 +36,7 @@ export interface ProfileInput {
   includeUserTokens: boolean;
   envVars: Record<string, string>;
   skills: string[];
+  capabilities: string[];
 }
 
 /** The seam injected into ProfileService and TaskService. */
@@ -63,6 +66,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     includeUserTokens: r.includeUserTokens,
     envVars: (r.envVars ?? {}) as Record<string, string>,
     skills: (r.skills ?? []) as string[],
+    capabilities: (r.capabilities ?? []) as string[],
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
     deletedAt: r.deletedAt,

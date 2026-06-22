@@ -92,7 +92,7 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 
 const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
-  includeUserTokens: false, envVars: { K: "V" }, skills: [], createdAt: new Date(0), updatedAt: new Date(0),
+  includeUserTokens: false, envVars: { K: "V" }, skills: [], capabilities: [], createdAt: new Date(0), updatedAt: new Date(0),
   deletedAt: new Date(0),
 };
 const active: ProfileRow = { ...archived, id: "act", name: "Active", deletedAt: null };
@@ -182,6 +182,33 @@ describe("ProfileService — auth + field filtering", () => {
         name: "Skilled", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, skills: ["skills", "my-linter"],
       });
       expect(r.profile!.skills).toEqual(["skills", "my-linter"]);
+    } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile with a malformed capability → InvalidArgument (ADR 0056)", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+    });
+    try {
+      await expectErr(
+        s.client.createProfile({ name: "x", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, capabilities: ["github"] }),
+        Code.InvalidArgument,
+      );
+    } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile accepts + returns well-formed capabilities (ADR 0056)", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+    });
+    try {
+      const r = await s.client.createProfile({
+        name: "Capable", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {},
+        capabilities: ["github:issues:write", "datadog:logs:read@idx-1"],
+      });
+      expect(r.profile!.capabilities).toEqual(["github:issues:write", "datadog:logs:read@idx-1"]);
     } finally { await s.close(); }
   });
 });

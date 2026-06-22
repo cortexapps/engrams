@@ -46,6 +46,19 @@ const schema = z.object({
 });
 type Values = z.infer<typeof schema>;
 
+// ADR 0056: a capability is "provider:action[@resource]" (mirrors
+// engram_core::types::Capability::parse + the orchestrator's validator). The
+// orchestrator + coordinator re-validate; this just keeps the editor honest.
+function isValidCapability(c: string): boolean {
+  const at = c.indexOf("@");
+  const head = at === -1 ? c : c.slice(0, at);
+  const resource = at === -1 ? null : c.slice(at + 1);
+  const colon = head.indexOf(":");
+  const provider = colon === -1 ? "" : head.slice(0, colon);
+  const action = colon === -1 ? "" : head.slice(colon + 1);
+  return Boolean(provider) && Boolean(action) && (at === -1 || Boolean(resource));
+}
+
 export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const navigate = useNavigate();
   const params = useParams({ strict: false }) as { id?: string };
@@ -57,6 +70,10 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const create = useCreateProfile();
   const update = useUpdateProfile();
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
+  // ADR 0056: capabilities are a free-form list (no catalog) — one
+  // "provider:action[@resource]" per line. Local state like envRows; parsed +
+  // validated into the payload at submit.
+  const [capsText, setCapsText] = useState("");
 
   // ADR 0055 P2: inline skill upload (admin). Local state, separate from the
   // react-hook-form; on success the catalog query invalidates and the new skill
@@ -116,6 +133,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         skills: p.skills ?? [],
       });
       setEnvRows(mapToEnvRows(p.envVars));
+      setCapsText((p.capabilities ?? []).join("\n"));
     }
   }, [existing, form]);
 
@@ -128,7 +146,18 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   }, [mode, imageId, images, form]);
 
   const onSubmit = async (v: Values) => {
-    const payload = { ...v, envVars: envRowsToMap(envRows) };
+    const capabilities = capsText
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const badCap = capabilities.find((c) => !isValidCapability(c));
+    if (badCap) {
+      form.setError("root", {
+        message: `Invalid capability "${badCap}": expected "provider:action[@resource]"`,
+      });
+      return;
+    }
+    const payload = { ...v, envVars: envRowsToMap(envRows), capabilities };
     try {
       if (mode === "edit" && editingId) {
         await update.mutateAsync({ id: editingId, ...payload });
@@ -327,6 +356,21 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
           <Field>
             <FieldLabel>Environment variables</FieldLabel>
             <EnvVarsEditor rows={envRows} onChange={setEnvRows} />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="capabilities">Integration capabilities</FieldLabel>
+            <Textarea
+              id="capabilities"
+              value={capsText}
+              onChange={(e) => setCapsText(e.target.value)}
+              rows={3}
+              placeholder={"github:contents:write@cortexapps/engrams\ngithub:issues:write\ndatadog:logs:read"}
+              className="font-mono text-sm"
+            />
+            <FieldDescription>
+              One per line, <code>provider:action[@resource]</code>. Sessions from this profile are
+              granted these third-party integration capabilities (ADR 0056). Empty = none.
+            </FieldDescription>
           </Field>
         </FieldGroup>
       </FieldSet>

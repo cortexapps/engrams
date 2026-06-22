@@ -71,6 +71,9 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     // ADR 0055: skills are not sensitive (they describe granted tooling), so
     // they are surfaced to members too — unlike env_vars.
     skills: row.skills,
+    // ADR 0056: capabilities likewise describe granted access (not secrets),
+    // so they are member-visible.
+    capabilities: row.capabilities,
     archived: row.deletedAt != null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -111,6 +114,31 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     }
   }
 
+  /**
+   * ADR 0056: validate each capability is a well-formed
+   * `provider:action[@resource]` string (mirrors
+   * engram_core::types::Capability::parse). The coordinator re-validates
+   * authoritatively at session-create; rejecting here keeps a profile from
+   * storing a malformed grant. Provider/action aren't yet checked against a
+   * registry — that arrives with the broker (a later phase).
+   */
+  function assertCapabilitiesValid(capabilities: string[]): void {
+    for (const c of capabilities) {
+      const at = c.indexOf("@");
+      const head = at === -1 ? c : c.slice(0, at);
+      const resource = at === -1 ? null : c.slice(at + 1);
+      const colon = head.indexOf(":");
+      const provider = colon === -1 ? "" : head.slice(0, colon);
+      const action = colon === -1 ? "" : head.slice(colon + 1);
+      if (!provider || !action || (at !== -1 && !resource)) {
+        throw new ConnectError(
+          `invalid capability "${c}": expected "provider:action[@resource]"`,
+          Code.InvalidArgument,
+        );
+      }
+    }
+  }
+
   router.service(ProfileService, {
     async listProfiles(req, ctx) {
       const user = await requireUser(ctx, getSession);
@@ -143,6 +171,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
       await assertSkillsValid(req.skills ?? []);
+      assertCapabilitiesValid(req.capabilities ?? []);
       const row = await store.create({
         name: req.name,
         description: req.description,
@@ -151,6 +180,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         includeUserTokens: req.includeUserTokens,
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
+        capabilities: req.capabilities ?? [],
       });
       return { profile: toProto(row, true) };
     },
@@ -162,6 +192,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
       await assertSkillsValid(req.skills ?? []);
+      assertCapabilitiesValid(req.capabilities ?? []);
       const row = await store.update(req.id, {
         name: req.name,
         description: req.description,
@@ -170,6 +201,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         includeUserTokens: req.includeUserTokens,
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
+        capabilities: req.capabilities ?? [],
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
       return { profile: toProto(row, true) };

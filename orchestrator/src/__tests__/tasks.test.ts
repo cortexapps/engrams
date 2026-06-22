@@ -177,6 +177,7 @@ function makeFakeProfiles(opts?: {
   envVars?: Record<string, string>;
   imageId?: string;
   skills?: string[];
+  capabilities?: string[];
 }): ProfileStore {
   const row: ProfileRow = {
     id: PROFILE_ID,
@@ -187,6 +188,7 @@ function makeFakeProfiles(opts?: {
     includeUserTokens: opts?.includeUserTokens ?? false,
     envVars: opts?.envVars ?? {},
     skills: opts?.skills ?? [],
+    capabilities: opts?.capabilities ?? [],
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -1079,6 +1081,27 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       const client = makeClient(srv.serverUrl);
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
       expect(fakeSessions.createReqs[0]?.selectedSkills).toEqual(["skills", "playwright"]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("profile capabilities ride createSession as capabilities (ADR 0056)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("caps-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ capabilities: ["github:issues:write", "datadog:logs:read"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      expect(fakeSessions.createReqs[0]?.capabilities).toEqual([
+        "github:issues:write",
+        "datadog:logs:read",
+      ]);
     } finally {
       await srv.close();
     }
