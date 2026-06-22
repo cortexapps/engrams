@@ -339,9 +339,35 @@ pub(crate) async fn build_resume_egress_policy(
     bundle: &SecretBundle,
     manifest: &ImageManifest,
     env_with_placeholders: &HashMap<String, String>,
+    image: &str,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
     let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    // ADR 0056 (B′): re-read + resolve the persisted integration policy so a
+    // resumed session re-injects on the new host (same as the create path).
+    let injects = match state
+        .services
+        .meta
+        .get_session_integration_policy(session_id)
+        .await
+    {
+        Ok(Some(json)) => match engram_core::types::IntegrationPolicy::parse(&json) {
+            Ok(policy) => {
+                crate::session_boot::resolve_inject_entries(state, policy.as_ref(), image).await
+            }
+            Err(e) => {
+                tracing::warn!(%session_id, error = %e,
+                    "persisted integration policy failed to parse on resume; no injection");
+                Vec::new()
+            }
+        },
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e,
+                "integration policy lookup failed on resume; no injection");
+            Vec::new()
+        }
+    };
     Some(assemble_resume_egress_policy(
         session_id,
         sandbox_id,
@@ -349,6 +375,7 @@ pub(crate) async fn build_resume_egress_policy(
         bundle,
         manifest,
         env_with_placeholders,
+        injects,
     ))
 }
 
@@ -358,6 +385,7 @@ pub(crate) async fn build_resume_egress_policy(
 /// without standing up a SharedState. The behaviour mirrors the
 /// create path's policy build (sessions.rs around line 635) by
 /// construction.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_resume_egress_policy(
     session_id: SessionId,
     sandbox_id: engram_core::SandboxId,
@@ -365,6 +393,7 @@ pub(crate) fn assemble_resume_egress_policy(
     bundle: &SecretBundle,
     manifest: &ImageManifest,
     env_with_placeholders: &HashMap<String, String>,
+    injects: Vec<engram_core::types::egress::EgressInjectEntry>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     let mut secrets = Vec::new();
     for (name, resolved) in &bundle.secrets {
@@ -390,10 +419,9 @@ pub(crate) fn assemble_resume_egress_policy(
         network_allow_hosts: manifest.network.allow_hosts.clone(),
         network_allow_host_patterns: manifest.network.allow_host_patterns.clone(),
         secrets,
-        // ADR 0056 (B′): resume re-injection (resolving the persisted policy's
-        // inject refs) is Phase 3b-2; until then a resumed session carries no
-        // Plane-B injections.
-        injects: Vec::new(),
+        // ADR 0056 (B′): the resolved Plane-B injections (from the persisted
+        // policy), so a resumed session re-injects on the new host.
+        injects,
         secret_mode: manifest.secret_mode,
     }
 }
@@ -717,6 +745,14 @@ async fn enqueue_create(
         tracing::warn!(%session_id, error = %e,
             "queued session capabilities bind failed; the broker will see none on boot");
     }
+    // ADR 0056 (B′): persist the integration policy now the FK target exists, so
+    // the scanner's boot re-prepare (prepare_from_row) reads it back and injects.
+    crate::session_boot::persist_integration_policy(
+        state,
+        session_id,
+        inputs.integration_policy.as_ref(),
+    )
+    .await;
     if let Err(e) = state
         .emit(
             session_id,
@@ -818,6 +854,27 @@ pub(crate) async fn prepare_from_row(
                 session.id, session.image
             ))
         })?;
+    // ADR 0056 (B′): re-read the persisted integration policy so the queued
+    // boot re-injects (build_egress_policy resolves its refs again on the new
+    // host). A malformed/absent blob → None (no injection).
+    let integration_policy = match state
+        .services
+        .meta
+        .get_session_integration_policy(session.id)
+        .await
+    {
+        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json).unwrap_or_else(|e| {
+            tracing::warn!(session_id = %session.id, error = %e,
+                    "persisted integration policy failed to parse; booting without injection");
+            None
+        }),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(session_id = %session.id, error = %e,
+                "integration policy lookup failed; booting without injection");
+            None
+        }
+    };
     prepare_inner(
         state,
         HashMap::new(),
@@ -835,10 +892,9 @@ pub(crate) async fn prepare_from_row(
         // `session_capabilities` at enqueue (the row existed); the re-prepare
         // carries an empty set so the boot-path bind is a no-op, preserving them.
         Vec::new(),
-        // ADR 0056 (B′): queued/resume sessions don't yet re-carry the
-        // integration policy — persistence + re-inject is Phase 3b-2. The
-        // scanner boots them without Plane-B injection for now.
-        None,
+        // ADR 0056 (B′): the integration policy persisted at create/enqueue,
+        // re-read above so the queued boot re-injects on the new host.
+        integration_policy,
     )
     .await
 }
@@ -1884,6 +1940,7 @@ mod tests {
             &bundle,
             &manifest,
             &env_with_ph,
+            Vec::new(),
         );
 
         // 1. Real IP, not UNSPECIFIED.
@@ -1958,6 +2015,7 @@ mod tests {
             &bundle,
             &manifest,
             &env_with_ph,
+            Vec::new(),
         );
 
         assert_eq!(policy.guest_ip, guest_ip);

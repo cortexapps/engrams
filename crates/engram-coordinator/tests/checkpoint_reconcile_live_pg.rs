@@ -407,3 +407,44 @@ async fn session_capabilities_bind_get_round_trip() {
         "the '' resource sentinel maps back to Option::None",
     );
 }
+
+/// ADR 0056 Phase 3b-2: the compiled integration policy round-trips through
+/// `session_integration_policy` (upsert + JSON verbatim), so a queued
+/// re-prepare / resume can re-resolve its inject refs without the orchestrator.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn session_integration_policy_round_trip() {
+    let Some(meta) = pg().await else {
+        return;
+    };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    // Absent → None.
+    assert!(meta
+        .get_session_integration_policy(session_id)
+        .await
+        .expect("get empty")
+        .is_none());
+
+    let json = r#"{"injects":[{"hosts":["api.datadoghq.com"],"header_name":"DD-API-KEY","header_template":"{}","secret_ref":"datadog-api-key","methods":["GET"],"path_prefixes":["/api/v2/logs"]}]}"#;
+    meta.bind_session_integration_policy(session_id, json)
+        .await
+        .expect("bind");
+    // Upsert: a re-bind replaces, no error.
+    meta.bind_session_integration_policy(session_id, json)
+        .await
+        .expect("re-bind");
+
+    let got = meta
+        .get_session_integration_policy(session_id)
+        .await
+        .expect("get")
+        .expect("policy present");
+    // Parses back to the typed policy the coordinator resolves.
+    let policy = engram_core::types::IntegrationPolicy::parse(&got)
+        .expect("valid json")
+        .expect("non-empty");
+    assert_eq!(policy.injects.len(), 1);
+    assert_eq!(policy.injects[0].secret_ref, "datadog-api-key");
+    assert_eq!(policy.injects[0].methods, vec!["GET".to_string()]);
+}

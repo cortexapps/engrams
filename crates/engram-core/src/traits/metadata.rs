@@ -1211,6 +1211,29 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    // ---- session integration policy (ADR 0056 B′) ----
+    //
+    // The orchestrator-compiled per-session policy, persisted verbatim as its
+    // JSON string so the queued re-prepare + resume can rebuild the egress
+    // injects without the orchestrator. One blob per session (upsert). Default
+    // impls (no-op / None) so test doubles compile; `PostgresStore` is the
+    // authority.
+    async fn bind_session_integration_policy(
+        &self,
+        session_id: SessionId,
+        policy_json: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (session_id, policy_json);
+        Ok(())
+    }
+    async fn get_session_integration_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — cross-replica per-session op lease.
     // Serializes mutually-exclusive session-lifecycle ops (idle
