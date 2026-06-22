@@ -3568,6 +3568,44 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    // ---- session integration policy (ADR 0056 B′) ----
+
+    async fn bind_session_integration_policy(
+        &self,
+        session_id: SessionId,
+        policy_json: &str,
+    ) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO session_integration_policy (session_id, policy_json)
+            VALUES ($1, $2)
+            ON CONFLICT (session_id) DO UPDATE SET policy_json = EXCLUDED.policy_json
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(policy_json)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_session_integration_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        let row =
+            sqlx::query("SELECT policy_json FROM session_integration_policy WHERE session_id = $1")
+                .bind(session_id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        match row {
+            Some(r) => Ok(Some(sqlx::Row::try_get(&r, "policy_json").map_err(db_err)?)),
+            None => Ok(None),
+        }
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — session_lease leasing row.
     // ----------------------------------------------------------------

@@ -136,6 +136,7 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         &b.bundle,
         &b.manifest,
         &b.env,
+        &session.image,
     )
     .await
     .unwrap_or_else(|| placeholder_egress_policy(id, sandbox_id));

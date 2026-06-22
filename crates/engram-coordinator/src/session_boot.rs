@@ -243,6 +243,12 @@ pub(crate) async fn boot_on_reserved_host(
         );
     }
 
+    // ADR 0056 (B′): persist the compiled integration policy now the FK target
+    // row exists, so a queued re-prepare / post-eviction resume rebuilds the
+    // egress injections without the orchestrator. Same placement + warn-not-
+    // fatal posture as the secret/capability persistence above.
+    persist_integration_policy(state, session_id, integration_policy.as_ref()).await;
+
     // Inject the per-spawn forge/upload broker tokens NOW the session row
     // exists. These mint a `session_broker_tokens` row that FKs to
     // `sessions.id`, so doing it any earlier (e.g. while `prepare_inner`
@@ -432,7 +438,7 @@ async fn build_egress_policy(
 /// or guest. A ref that doesn't resolve is skipped + logged (the connector
 /// gates the request regardless, but without a credential it would fail
 /// upstream — so we drop it rather than inject an empty header).
-async fn resolve_inject_entries(
+pub(crate) async fn resolve_inject_entries(
     state: &SharedState,
     integration_policy: Option<&engram_core::types::IntegrationPolicy>,
     image: &str,
@@ -484,6 +490,38 @@ async fn resolve_inject_entries(
         });
     }
     out
+}
+
+/// ADR 0056 (B′): persist the compiled integration policy (as its JSON) so a
+/// queued re-prepare or post-eviction resume can rebuild the egress injections
+/// without the orchestrator. No-op when the session has no policy. Warn-not-
+/// fatal: a persist miss only loses Plane-B injection on a later resume, not
+/// the live session. Shared by the boot + enqueue create paths.
+pub(crate) async fn persist_integration_policy(
+    state: &SharedState,
+    session_id: SessionId,
+    policy: Option<&engram_core::types::IntegrationPolicy>,
+) {
+    let Some(policy) = policy else {
+        return;
+    };
+    let json = match serde_json::to_string(policy) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e,
+                "serialize integration policy failed; not persisting");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .services
+        .meta
+        .bind_session_integration_policy(session_id, &json)
+        .await
+    {
+        tracing::warn!(%session_id, error = %e,
+            "integration policy persist failed; resume/queued boot will lose Plane-B injection");
+    }
 }
 
 /// Pair each resolved secret with the placeholder that
