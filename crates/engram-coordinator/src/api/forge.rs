@@ -74,7 +74,14 @@ async fn authorize(
 }
 
 /// Mint a credential, rejecting a host that doesn't match the forge.
+///
+/// ADR 0056 (Plane A): the token is scoped to the session's bound capabilities
+/// — read them from PG and hand them to the mint, which clamps the GitHub App
+/// permissions to exactly what the profile granted (filtering to its own
+/// provider). An empty set falls back to the provider's default scopes.
 async fn op_fetch_credential(
+    state: &SharedState,
+    session: SessionId,
     forge: &Arc<dyn GitForge>,
     host: Option<String>,
     owner: Option<String>,
@@ -87,8 +94,14 @@ async fn op_fetch_credential(
             ));
         }
     }
+    let caps = state
+        .services
+        .meta
+        .get_session_capabilities(session)
+        .await
+        .unwrap_or_default();
     forge
-        .mint_installation_token(owner.as_deref().filter(|s| !s.is_empty()))
+        .mint_installation_token(&caps, owner.as_deref().filter(|s| !s.is_empty()))
         .await
         .map_err(|e| format!("mint git credential: {e}"))
 }
@@ -189,7 +202,7 @@ pub async fn git_credential(
     let token =
         bearer(&headers).ok_or_else(|| ApiError::Unauthorized("missing forge token".into()))?;
     let forge = authorize(&state, id, &token).await?;
-    let tok = op_fetch_credential(&forge, q.host, q.owner)
+    let tok = op_fetch_credential(&state, id, &forge, q.host, q.owner)
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(GitCredentialResponse {
@@ -282,7 +295,7 @@ async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeRespons
     };
     match req.op {
         ForgeOp::FetchCredential { host, owner } => {
-            match op_fetch_credential(&forge, Some(host), owner).await {
+            match op_fetch_credential(state, req.session_id, &forge, Some(host), owner).await {
                 Ok(t) => ForgeResponse::Credential {
                     username: t.username,
                     password: t.password,

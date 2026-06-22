@@ -441,12 +441,19 @@ at the end with the commit chain.
    Rust** — and the web renders it via the Phase-1 `(provider, asset_kind)` generic
    fallback with **zero web code** (a polished card is an opt-in registry entry).
    *Phase 4 complete.*
-5. **Mint (credential source) for GitHub + retire `GitForge`.** Slim `Integration`
-   trait (mint + provider metadata + the hybrid `perform_action`); `state.forge` →
-   `state.integrations`; `ForgeOp` → a generic `IntegrationOp`; profile-scoped App
-   `permissions` computed from caps (default profile keeps today's scopes — no
-   regression); one-time App union re-consent; retire `GitConfig`/`[git]`. Decide
-   per case whether PR creation stays mediated or moves to observed. Flip Accepted.
+5. **Mint (credential source) for GitHub + retire `GitForge`.** Split, so the
+   high-value behavior change lands ahead of the structural refactor.
+   **5a** (*done*): **profile-scoped GitHub minting** — `mint_installation_token`
+   takes the session's bound `github:` caps and computes the App `permissions`
+   (`pulls`→`pull_requests`, highest level wins) + `repositories` (when every cap
+   names one); the token cache key folds in the scope so a read-only session can't
+   be served a cached write token; an empty cap set falls back to today's default
+   scopes (a capability-less profile is unaffected — no regression without a
+   cross-repo profile change). Keeps `GitForge`, the `ForgeOp` wire, and
+   `GitConfig`. **5b** (follow-up): the structural refactor — slim `Integration`
+   trait (mint + the hybrid `perform_action`) retiring `GitForge`; `state.forge` →
+   `state.integrations`; `ForgeOp` → a generic `IntegrationOp`; retire
+   `GitConfig`/`[git]`; the one-time App union re-consent; flip **Accepted**.
 
 ## Consequences and risks
 
