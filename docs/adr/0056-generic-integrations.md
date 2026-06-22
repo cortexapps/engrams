@@ -432,12 +432,15 @@ at the end with the commit chain.
    (parse/persist/resume) + a coordinator `/sessions/:id/integration-asset` ingest
    (→ `state.emit(IntegrationAsset)`) + the host-agent sink (`coord_client` POST,
    mirroring the harness-event path) + `register_policy` observe translation.
-   *(4b done; `injects`+`observes` made `SessionEgressPolicy` a wider bincode wire
-   type — bumped `WIRE_VERSION` 2→3 so a mixed-version fleet fails fast on the
-   skew gate rather than misparsing; regenerated the wire golden.)*
-   **4c**: the orchestrator compiles connector `asset` specs → `observes`; first
-   consumers — a Datadog query result, a GitHub issue. A marked endpoint on *any*
-   provider then surfaces an asset with zero Rust.
+   *(4b done; bumped `WIRE_VERSION` 3→4 — see 3b for the wire-discipline note.)*
+   **4c** (*done*): `compileIntegrationPolicy` now also emits `observes` from any
+   activated operation's `asset` spec — *regardless of credential source* (a mint
+   provider like GitHub surfaces assets too). First consumers ship as connector
+   config: `datadog/query_result` (inject + observe) and `github/issue` (mint +
+   observe). A marked endpoint on *any* provider now surfaces an asset with **zero
+   Rust** — and the web renders it via the Phase-1 `(provider, asset_kind)` generic
+   fallback with **zero web code** (a polished card is an opt-in registry entry).
+   *Phase 4 complete.*
 5. **Mint (credential source) for GitHub + retire `GitForge`.** Slim `Integration`
    trait (mint + provider metadata + the hybrid `perform_action`); `state.forge` →
    `state.integrations`; `ForgeOp` → a generic `IntegrationOp`; profile-scoped App

@@ -420,12 +420,15 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       //    strings; the coordinator binds them to the session (+ later clamps).
       //    The capabilities are also compiled here (B′) against the connector
       //    config into a per-session IntegrationPolicy — the activated Plane-B
-      //    injects — which rides as a JSON string the coordinator persists +
-      //    whose secret_refs it resolves host-side. Only shipped when non-empty
-      //    (a mint-only / capability-less profile compiles to no injects).
+      //    injects + response-observation specs — which rides as a JSON string
+      //    the coordinator persists, resolving inject secret_refs host-side and
+      //    shipping the observes to the proxy. Only shipped when non-empty (a
+      //    capability-less profile, or one whose ops declare no inject/asset).
       const policy = compileIntegrationPolicy(profile.capabilities);
       const integrationPolicyJson =
-        policy.injects.length > 0 ? JSON.stringify(policy) : undefined;
+        policy.injects.length > 0 || policy.observes.length > 0
+          ? JSON.stringify(policy)
+          : undefined;
       const created = await sessionsClient.createSession({
         imageUri: image.imageUri,
         mode: "agent",
