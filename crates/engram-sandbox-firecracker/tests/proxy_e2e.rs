@@ -336,6 +336,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         guest_ip,
         network_allow,
         secrets: vec![secret],
+        injects: Vec::new(),
     });
 
     // PID-1's env doesn't carry a PATH; child execs need one to

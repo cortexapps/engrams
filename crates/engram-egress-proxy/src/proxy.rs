@@ -215,9 +215,9 @@ async fn handle(
             );
             Ok(())
         }
-        Decision::Intercept(secrets) => {
+        Decision::Intercept { secrets, injects } => {
             let result = intercept::run(
-                stream, peeked, &sni, port, resolver, &secrets, server_cfg, client_cfg,
+                stream, peeked, &sni, port, resolver, &secrets, &injects, server_cfg, client_cfg,
             )
             .await;
             match result {
@@ -228,6 +228,17 @@ async fn handle(
                         sni = %sni,
                         placeholder,
                         "VIOLATION: placeholder sent to host outside its allow_hosts",
+                    );
+                    Ok(())
+                }
+                // ADR 0056: an inject-gated host got a request shape no policy
+                // permits — close it (the side effect never reaches upstream),
+                // same disposition as a placeholder leak.
+                Err(intercept::InterceptError::RequestRejected { method, path }) => {
+                    tracing::info!(
+                        session_id = %session.session_id,
+                        sni = %sni, %method, %path,
+                        "egress rejected — request shape not permitted by integration policy",
                     );
                     Ok(())
                 }

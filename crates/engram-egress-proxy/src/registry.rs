@@ -32,6 +32,12 @@ pub struct SessionState {
     /// Per-secret entries. Any of these whose `allow` matches the
     /// SNI triggers MITM + substitution.
     pub secrets: Vec<SecretEntry>,
+    /// ADR 0056 (Plane B): per-credential injections. Any whose `allow`
+    /// matches the SNI triggers MITM; the proxy then enforces the entry's
+    /// `RequestPolicy` (method + path) and, on a match, adds its auth
+    /// header. A request to an inject-gated host whose shape matches no
+    /// entry is rejected. The guest never holds the injected secret.
+    pub injects: Vec<InjectEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +51,46 @@ pub struct SecretEntry {
     /// Hosts the real value may be substituted on. SNI matched against
     /// this list at MITM time.
     pub allow: HostList,
+}
+
+/// ADR 0056 (Plane B): a credential the proxy injects host-side. The
+/// guest holds no placeholder; on an outbound request matching `allow`
+/// (SNI) AND `policy` (method + path), the proxy adds
+/// `header_name: <header_template with "{}" → secret>`. The secret lives
+/// only in this struct, on the host.
+#[derive(Clone, Debug)]
+pub struct InjectEntry {
+    /// The real credential — host-side only.
+    pub secret: String,
+    pub header_name: String,
+    /// `{}` is replaced by `secret` (e.g. `"Bearer {}"`, or `"{}"`).
+    pub header_template: String,
+    /// Hosts (SNI) this injection applies to.
+    pub allow: HostList,
+    /// Request shapes this injection gates + applies to.
+    pub policy: RequestPolicy,
+}
+
+/// ADR 0056: the request shapes a Plane-B injection gates + applies to.
+/// Layered on top of the SNI host match. `methods` empty = any method;
+/// `path_prefixes` empty = any path.
+#[derive(Clone, Debug, Default)]
+pub struct RequestPolicy {
+    pub methods: Vec<String>,
+    pub path_prefixes: Vec<String>,
+}
+
+impl RequestPolicy {
+    /// Is `(method, path)` permitted? Method match is case-insensitive;
+    /// path match is prefix. An empty list means "any".
+    pub fn allows(&self, method: &str, path: &str) -> bool {
+        (self.methods.is_empty() || self.methods.iter().any(|m| m.eq_ignore_ascii_case(method)))
+            && (self.path_prefixes.is_empty()
+                || self
+                    .path_prefixes
+                    .iter()
+                    .any(|p| path.starts_with(p.as_str())))
+    }
 }
 
 #[derive(Default)]
@@ -96,20 +142,28 @@ impl Registry {
 }
 
 impl SessionState {
-    /// Decision for a given destination host: which (if any) secrets
-    /// should the proxy try to substitute?
+    /// Decision for a given destination host: bypass, reject, or MITM —
+    /// and, when MITM, which secrets to substitute + which injections
+    /// apply. A host with any matching secret OR injection is MITM'd;
+    /// otherwise the `network_allow` list decides bypass vs reject.
     pub fn decide(&self, hostname: &str) -> Decision<'_> {
-        let mut applicable: Vec<&SecretEntry> = Vec::new();
-        for secret in &self.secrets {
-            if secret.allow.matches(hostname) {
-                applicable.push(secret);
-            }
+        let secrets: Vec<&SecretEntry> = self
+            .secrets
+            .iter()
+            .filter(|s| s.allow.matches(hostname))
+            .collect();
+        let injects: Vec<&InjectEntry> = self
+            .injects
+            .iter()
+            .filter(|i| i.allow.matches(hostname))
+            .collect();
+        if !secrets.is_empty() || !injects.is_empty() {
+            return Decision::Intercept { secrets, injects };
         }
-        let in_network_allow = self.network_allow.matches(hostname);
-        match (applicable.is_empty(), in_network_allow) {
-            (true, true) => Decision::Bypass,
-            (true, false) => Decision::Reject,
-            (false, _) => Decision::Intercept(applicable),
+        if self.network_allow.matches(hostname) {
+            Decision::Bypass
+        } else {
+            Decision::Reject
         }
     }
 
@@ -127,12 +181,16 @@ impl SessionState {
 
 #[derive(Debug)]
 pub enum Decision<'a> {
-    /// SNI not in `network_allow` and no secret allows it. Drop.
+    /// SNI not in `network_allow` and no secret/injection applies. Drop.
     Reject,
-    /// SNI in `network_allow` but no secret applies. Splice through.
+    /// SNI in `network_allow`, nothing to substitute or inject. Splice through.
     Bypass,
-    /// One or more secrets allow this destination. MITM + substitute.
-    Intercept(Vec<&'a SecretEntry>),
+    /// One or more secrets/injections apply. MITM, then substitute
+    /// placeholders (`secrets`) and/or inject + gate (`injects`, ADR 0056).
+    Intercept {
+        secrets: Vec<&'a SecretEntry>,
+        injects: Vec<&'a InjectEntry>,
+    },
 }
 
 #[cfg(test)]
@@ -154,6 +212,16 @@ mod tests {
                 real_value: "sk-real".into(),
                 allow: HostList::from_manifest(&["api.openai.com".into()], &[]).unwrap(),
             }],
+            injects: vec![InjectEntry {
+                secret: "dd-secret".into(),
+                header_name: "DD-API-KEY".into(),
+                header_template: "{}".into(),
+                allow: HostList::from_manifest(&["api.datadoghq.com".into()], &[]).unwrap(),
+                policy: RequestPolicy {
+                    methods: vec!["GET".into()],
+                    path_prefixes: vec!["/api/v2/logs".into()],
+                },
+            }],
         }
     }
 
@@ -161,8 +229,23 @@ mod tests {
     fn decision_intercept_when_secret_allows() {
         assert!(matches!(
             state().decide("api.openai.com"),
-            Decision::Intercept(_)
+            Decision::Intercept { .. }
         ));
+    }
+
+    #[test]
+    fn decision_intercept_when_inject_allows() {
+        // ADR 0056: an inject host MITMs even though it's not a secret host
+        // and not in network_allow — the request-policy gating happens at
+        // intercept time, not here.
+        match state().decide("api.datadoghq.com") {
+            Decision::Intercept { secrets, injects } => {
+                assert!(secrets.is_empty());
+                assert_eq!(injects.len(), 1);
+                assert_eq!(injects[0].header_name, "DD-API-KEY");
+            }
+            other => panic!("expected Intercept, got {other:?}"),
+        }
     }
 
     #[test]
