@@ -85,6 +85,9 @@ export interface SessionsClient {
     // ADR 0055: profile-selected skill bundle names; the coordinator resolves
     // them to reserved-slot mounts at boot.
     selectedSkills?: string[];
+    // ADR 0056: profile-granted "provider:action[@resource]" capabilities; the
+    // coordinator binds them to the session (+ later clamps).
+    capabilities?: string[];
   }): Promise<{ sessionId: string; status: string; imageVersion: string; kind: string }>;
   listSessions(req: Record<string, never>): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
@@ -407,13 +410,16 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
 
       // 4. Create the upstream session. Mode is always "agent" (ADR §5). The
       //    profile's selected skills (ADR 0055) ride as bundle names; the
-      //    coordinator resolves them to reserved-slot mounts at boot.
+      //    coordinator resolves them to reserved-slot mounts at boot. The
+      //    profile's capabilities (ADR 0056) ride as "provider:action[@resource]"
+      //    strings; the coordinator binds them to the session (+ later clamps).
       const created = await sessionsClient.createSession({
         imageUri: image.imageUri,
         mode: "agent",
         ...(req.prompt != null ? { prompt: req.prompt } : {}),
         ...(harnessEnv != null ? { harnessEnv } : {}),
         ...(profile.skills.length > 0 ? { selectedSkills: profile.skills } : {}),
+        ...(profile.capabilities.length > 0 ? { capabilities: profile.capabilities } : {}),
       });
 
       // 5. Insert task + task_session (recording profile_id). Compensate on failure.

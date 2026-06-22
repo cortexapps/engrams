@@ -83,6 +83,11 @@ export const profile = pgTable("profile", {
   // ["skills", "playwright"]). Resolved by the coordinator to reserved-slot
   // mounts at session create. Empty = base session (no skills).
   skills: jsonb("skills").$type<string[]>().notNull().default([]),
+  // ADR 0056: integration capabilities ("provider:action[@resource]") this
+  // profile's sessions are granted. Passed to the coordinator at session create
+  // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
+  // no third-party integration access.
+  capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at")
     .notNull()
