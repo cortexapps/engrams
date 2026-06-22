@@ -78,6 +78,8 @@ A):
   key host-side, injects the auth header on outbound requests, and enforces a
   per-profile **request policy** (`host + method + path`). The guest never holds
   the secret — strictly better hygiene than today's `secret_mode = "literal"`.
+  Plane B providers are **declarative** — registered as connector-definition
+  config, not Rust (§7).
 
 Two unifications make this exact:
 
@@ -259,6 +261,48 @@ divergence from the issue's "FC e2e" suggestion, justified by this finding).
 Header injection + `method/path` request policy are **out of Step 0** — they are
 the real Plane-B gaps, built in Phase 5.
 
+### 7. Extensibility: Plane B is declarative (no Rust); Plane A stays hand-coded
+
+The `Integration` trait is the host-side seam, **not** the unit of extensibility.
+How a new provider is added differs sharply by plane, and that asymmetry is a
+deliberate goal of this ADR.
+
+**Plane B integrations are declarative — a config row, no Rust, no coordinator
+rebuild.** The egress proxy is already a generic, data-driven engine
+(`SecretEntry` + the request policy are *data*, ADR 0006). A Plane B provider is
+fully described by `(host, injection header name + template, secret reference,
+request policy {methods, path prefixes})` — there is no provider-specific code to
+write. So Plane B providers are registered as **connector definitions**: rows in
+an orchestrator-owned registry, the same shape and spirit as the ADR 0055 skills
+catalog and the ADR 0051 connections store, which the broker compiles into the one
+generic proxy-inject adapter at session create. Adding Datadog, Stripe, or an
+internal `X-API-Key` service is an insert, not a deploy:
+
+    name        text   -- provider key ("datadog", "acme-internal")
+    plane       text   -- "proxy" (Plane B)
+    config      jsonb  -- { host, header_name, header_template, methods[], path_prefixes[] }
+    secret_ref  text   -- pointer into the SecretStore for the static key
+
+This is an explicit deliverable — Phase 5 ships *the generic proxy-inject adapter
++ the connector registry*, with Datadog as the first connector **config** (not a
+bespoke Rust impl).
+
+**Plane A stays hand-coded Rust, per provider.** Minting a scoped credential is
+provider-specific, security-critical protocol work (GitHub App: JWT signing → an
+installation token with a permissions object; AWS STS: SigV4 + AssumeRole session
+policy). These are compiled-in `Integration` impls, deliberately — we do not want
+user-supplied code holding an App private key. A *generic, config-driven* Plane A
+(e.g. one OAuth2 token-exchange adapter parameterized by endpoint + scope map) is
+plausible for standard protocols, but the long tail of bespoke mint protocols
+realistically needs sandboxed custom logic (**WASM**) or an external mint-RPC the
+deployment runs — so generic/pluggable Plane A is **explicitly out of scope here**
+and deferred until two or more hand-coded Plane A adapters have proven the trait
+shape. Until then, a new Plane A provider = a new (small, audited) Rust adapter.
+
+**Presentation is already above Rust** (§4): the `(provider, asset_kind) →
+renderer` registry lives in web/orchestrator, so a connector can ship a card with
+no coordinator code.
+
 ## Phasing (each phase is one PR on its own worktree)
 
 Phases merge in order; this ADR is updated between them with divergences/pitfalls
@@ -282,10 +326,13 @@ and flipped to **Accepted** at the end with the commit chain.
    `mint_credential` computes the App `permissions`/`repositories` from caps; the
    default profile keeps today's scopes (no regression); gh-shim consumer; one-time
    App union re-consent.
-5. **Plane B — Datadog-style injection + policy.** New `engram-integration-datadog`
-   (`Plane::Proxy`); `EgressSecretEntry` injection variant + `RequestPolicy`; proxy
-   `Decision::Inject` + request-line method/path enforcement + header injection.
-   Flip this ADR to Accepted.
+5. **Plane B — generic proxy-inject adapter + declarative connector registry (§7).**
+   `EgressSecretEntry` gains an injection variant + `RequestPolicy`; proxy
+   `Decision::Inject` + request-line method/path enforcement + header injection;
+   **one** generic proxy-inject adapter (no per-provider Rust); an
+   orchestrator-owned **connector registry** whose rows the broker compiles into
+   Plane-B entries at create. Datadog is the first connector **config**, not a
+   bespoke crate. Flip this ADR to Accepted.
 
 ## Consequences and risks
 
@@ -320,3 +367,8 @@ and flipped to **Accepted** at the end with the commit chain.
   credential response (a secret the guest wields) and an action response (a
   structured asset the seam emits) have different trust shapes; collapsing them
   loses the distinction the seam needs.
+- **A generic, config-driven (or WASM) Plane A so *all* providers are pluggable
+  without Rust.** Deferred (§7). Plane B generalizes to pure config because the
+  proxy is already a generic engine; Plane A minting is bespoke per protocol and
+  security-critical, so it stays hand-coded until two adapters prove the shape —
+  at which point WASM or an external mint-RPC is the escape hatch, not core Rust.
