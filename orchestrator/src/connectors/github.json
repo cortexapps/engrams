@@ -1,0 +1,46 @@
+{
+  "provider": "github",
+  "protocol": "http",
+  "credential": { "source": "mint", "mint": { "kind": "github_app" } },
+  "hosts": ["api.github.com"],
+  "operations": [
+    {
+      "grants": ["contents:read"],
+      "match": { "method": "GET", "path": "/repos/*/contents/*" }
+    },
+    {
+      "grants": ["contents:write"],
+      "match": { "method": "PUT", "path": "/repos/*/contents/*" }
+    },
+    {
+      "grants": ["pulls:read"],
+      "match": { "method": "GET", "path": "/repos/*/pulls*" }
+    },
+    {
+      "grants": ["pulls:write"],
+      "match": { "method": "POST", "path": "/repos/*/pulls" },
+      "asset": {
+        "kind": "pull_request",
+        "surface": "asset",
+        "success": { "statusClass": "2xx" },
+        "data": { "number": "$.resp.number", "title": "$.resp.title" },
+        "fetchable": { "external": "$.resp.html_url" }
+      }
+    },
+    {
+      "grants": ["issues:read"],
+      "match": { "method": "GET", "path": "/repos/*/issues*" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "POST", "path": "/repos/*/issues" },
+      "asset": {
+        "kind": "issue",
+        "surface": "asset",
+        "success": { "statusClass": "2xx" },
+        "data": { "number": "$.resp.number", "title": "$.resp.title" },
+        "fetchable": { "external": "$.resp.html_url" }
+      }
+    }
+  ]
+}

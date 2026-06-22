@@ -64,6 +64,7 @@ import {
 } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
+import { compileIntegrationPolicy } from "../connectors/registry.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -88,6 +89,10 @@ export interface SessionsClient {
     // ADR 0056: profile-granted "provider:action[@resource]" capabilities; the
     // coordinator binds them to the session (+ later clamps).
     capabilities?: string[];
+    // ADR 0056 (B′): the per-session IntegrationPolicy the orchestrator compiled
+    // from the profile's capabilities + connector config (a JSON string). The
+    // coordinator persists it + resolves its secret_refs host-side.
+    integrationPolicyJson?: string;
   }): Promise<{ sessionId: string; status: string; imageVersion: string; kind: string }>;
   listSessions(req: Record<string, never>): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
@@ -413,6 +418,14 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       //    coordinator resolves them to reserved-slot mounts at boot. The
       //    profile's capabilities (ADR 0056) ride as "provider:action[@resource]"
       //    strings; the coordinator binds them to the session (+ later clamps).
+      //    The capabilities are also compiled here (B′) against the connector
+      //    config into a per-session IntegrationPolicy — the activated Plane-B
+      //    injects — which rides as a JSON string the coordinator persists +
+      //    whose secret_refs it resolves host-side. Only shipped when non-empty
+      //    (a mint-only / capability-less profile compiles to no injects).
+      const policy = compileIntegrationPolicy(profile.capabilities);
+      const integrationPolicyJson =
+        policy.injects.length > 0 ? JSON.stringify(policy) : undefined;
       const created = await sessionsClient.createSession({
         imageUri: image.imageUri,
         mode: "agent",
@@ -420,6 +433,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         ...(harnessEnv != null ? { harnessEnv } : {}),
         ...(profile.skills.length > 0 ? { selectedSkills: profile.skills } : {}),
         ...(profile.capabilities.length > 0 ? { capabilities: profile.capabilities } : {}),
+        ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
       });
 
       // 5. Insert task + task_session (recording profile_id). Compensate on failure.

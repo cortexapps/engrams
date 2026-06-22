@@ -21,6 +21,17 @@ coordinator/host are pure enforcers with zero connector knowledge. Added the
 (`http` implemented; `grpc`/`graphql` designed-in as example shapes for future
 parsers — only `match`/`success` are protocol-shaped).
 
+Revised 2026-06-22 (Phase 3c implementation note): connectors are validated by a
+**hand-written typed loader** (`orchestrator/src/connectors/registry.ts`,
+`parseConnector`), not a JSON-Schema dependency. The orchestrator has no schema
+library and validates everything else by hand (`assertSkillsValid`,
+`assertCapabilitiesValid`); connectors are trusted first-party files, so this is a
+developer-error guard, not a security boundary. The loader reads every
+`connectors/*.json` at first use (lazy, cached), so dropping a new connector file
+registers it with no code change. Compile (`compileIntegrationPolicy`) currently
+emits Plane-B *injects* only; mint connectors validate + gate capabilities now,
+their scopes compiled in Phase 5.
+
 Builds on ADR 0023 (the git-forge seam + per-session broker token), ADR 0053
 (session profiles — the per-session capability selector), ADR 0055 (dynamic
 per-session mounts — skills/connectors ship without platform code), ADR 0006 (the
@@ -104,8 +115,9 @@ hand-coded per provider (bespoke, security-critical — §6/§9); inject is conf
 ### 3. The connector config (B′) — orchestrator-owned static JSON; the coordinator is a pure enforcer
 
 A **connector** describes one provider as static JSON, authored as a plugin in the
-orchestrator (`orchestrator/src/connectors/*.json`, validated against a JSON
-Schema). It is the single declarative source for *what a capability unlocks*:
+orchestrator (`orchestrator/src/connectors/*.json`, validated by a typed loader at
+startup — see the implementation note below). It is the single declarative source
+for *what a capability unlocks*:
 which operations are allowed, whether the proxy injects a key, and which produce
 assets. The orchestrator is the natural home — it already owns profiles (the
 producer) and the renderer (presentation), so a connector's response→asset map
@@ -398,14 +410,16 @@ at the end with the commit chain.
    both the boot + enqueue paths. **2b** (#371): orchestrator `profiles.capabilities`
    (Drizzle 0005) + proto + `CreateTask` passthrough + profile validation/UI. Bound
    end-to-end, not yet enforced.
-3. **Connector config (B′) + interceptor request-gating + injection.** Introduce
-   the orchestrator-owned connector JSON (§3, `http` only) + JSON-Schema validation;
-   the orchestrator compiles bound capabilities → a per-session `IntegrationPolicy`,
-   ships it on `CreateSession`, and the coordinator **persists** it (resume-safe) +
-   resolves `secret_ref`s. Host proxy: `Decision` gains `grants` method/path
-   enforcement + header injection; `EgressSecretEntry` gains an injection variant +
-   `RequestPolicy`. Datadog reachable, gated, guest holds no key. (The universal-gate
-   substrate; the coordinator stays a pure enforcer.)
+3. **Connector config (B′) + interceptor request-gating + injection** — *done*,
+   landed across four sub-PRs. **3a**: host proxy gate + credential-injection engine
+   (`Decision` gains `grants` method/path enforcement + header injection;
+   `EgressInjectEntry` + `RequestPolicy`). **3b**: wire `IntegrationPolicy` on
+   `CreateSession`, coordinator create-path resolve + enforce. **3b-2**: persist the
+   policy (resume/queued re-inject, no orchestrator round-trip). **3c**: the
+   orchestrator-owned connector JSON (§3, `http` only) + a typed loader/validator;
+   the orchestrator compiles bound capabilities → a per-session `IntegrationPolicy`
+   and ships it. Datadog reachable, gated, guest holds no key; the coordinator stays
+   a pure enforcer.
 4. **Interceptor response-observation + asset specs (the new core).** The connector
    config's `asset`: the proxy buffers + parses responses for marked endpoints,
    evaluates the map (+ coarse-emit-on-failure), and emits `IntegrationAsset` via a

@@ -29,6 +29,7 @@ import {
   selectableSkillNames,
   type MountCatalogClient,
 } from "../skills/catalog.ts";
+import { parseCapability, grantsCapability } from "../connectors/registry.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -115,24 +116,26 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   }
 
   /**
-   * ADR 0056: validate each capability is a well-formed
+   * ADR 0056 (B′): validate each capability is (1) a well-formed
    * `provider:action[@resource]` string (mirrors
-   * engram_core::types::Capability::parse). The coordinator re-validates
-   * authoritatively at session-create; rejecting here keeps a profile from
-   * storing a malformed grant. Provider/action aren't yet checked against a
-   * registry — that arrives with the broker (a later phase).
+   * engram_core::types::Capability::parse) and (2) actually *granted* by a
+   * connector — the editor offers only what a connector grants. The coordinator
+   * re-validates authoritatively at session-create; rejecting here keeps a
+   * profile from ever storing a grant no connector backs.
    */
   function assertCapabilitiesValid(capabilities: string[]): void {
     for (const c of capabilities) {
-      const at = c.indexOf("@");
-      const head = at === -1 ? c : c.slice(0, at);
-      const resource = at === -1 ? null : c.slice(at + 1);
-      const colon = head.indexOf(":");
-      const provider = colon === -1 ? "" : head.slice(0, colon);
-      const action = colon === -1 ? "" : head.slice(colon + 1);
-      if (!provider || !action || (at !== -1 && !resource)) {
+      const parsed = parseCapability(c);
+      if (!parsed) {
         throw new ConnectError(
           `invalid capability "${c}": expected "provider:action[@resource]"`,
+          Code.InvalidArgument,
+        );
+      }
+      if (!grantsCapability(parsed.provider, parsed.action)) {
+        throw new ConnectError(
+          `capability "${c}" is not granted by any connector ` +
+            `(no operation grants "${parsed.provider}:${parsed.action}")`,
           Code.InvalidArgument,
         );
       }

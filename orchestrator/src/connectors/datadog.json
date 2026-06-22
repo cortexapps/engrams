@@ -1,0 +1,21 @@
+{
+  "provider": "datadog",
+  "protocol": "http",
+  "credential": {
+    "source": "inject",
+    "inject": { "header": "DD-API-KEY", "secretRef": "datadog-api-key", "template": "{}" }
+  },
+  "hosts": ["api.datadoghq.com"],
+  "operations": [
+    {
+      "grants": ["logs:read"],
+      "match": { "method": "GET", "path": "/api/v2/logs/events*" },
+      "asset": {
+        "kind": "query_result",
+        "surface": "action",
+        "success": { "statusClass": "2xx" },
+        "data": { "count": "$.resp.meta.page.total_count" }
+      }
+    }
+  ]
+}
