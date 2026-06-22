@@ -64,6 +64,10 @@ pub(crate) struct BootInputs {
     /// ADR 0055: per-session skills resolved from the profile + assigned to
     /// reserved slots (dyn_0..). Patched into the restored VM load-paused.
     pub selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
+    /// ADR 0056: the profile-granted capabilities (parsed + validated), bound
+    /// to `session_capabilities` once the session row exists. Empty on the
+    /// queued re-prepare (those were bound at enqueue), so the bind is a no-op.
+    pub capabilities: Vec<engram_core::types::Capability>,
     pub secret_mode: engram_core::types::image::SecretMode,
     /// Per-request `secrets` overrides to seal into `session_secrets`
     /// once the row exists (so resume rebuilds the harness env). `None`
@@ -126,6 +130,7 @@ pub(crate) async fn boot_on_reserved_host(
         secret_bundle,
         network,
         selected_mounts,
+        capabilities,
         secret_mode,
         deferred_session_secrets,
         prompt,
@@ -209,6 +214,22 @@ pub(crate) async fn boot_on_reserved_host(
                 "session secrets persistence failed; resume will lose secrets",
             );
         }
+    }
+
+    // ADR 0056: bind the profile-granted capabilities now the FK target row
+    // exists — same placement + rationale as the secret-persistence above. A
+    // no-op on an empty set (the queued-then-booted path: the rows were bound
+    // at enqueue), so this never clobbers them.
+    if let Err(e) = state
+        .services
+        .meta
+        .bind_session_capabilities(session_id, &capabilities)
+        .await
+    {
+        tracing::warn!(
+            %session_id, error = %e,
+            "session capabilities bind failed; the broker will see no granted capabilities",
+        );
     }
 
     // Inject the per-spawn forge/upload broker tokens NOW the session row

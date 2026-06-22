@@ -511,6 +511,7 @@ mod tests {
         use engram_protocol::app;
         let r = app::CreateSessionRequest {
             selected_skills: Vec::new(),
+            capabilities: Vec::new(),
             image_uri: "localhost:5001/demo:warm".into(),
             mode: "agent".into(),
             prompt: None,
@@ -538,6 +539,7 @@ mod tests {
         use engram_protocol::app;
         let r = app::CreateSessionRequest {
             selected_skills: Vec::new(),
+            capabilities: Vec::new(),
             image_uri: "localhost:5001/demo:warm".into(),
             mode: "agent".into(),
             prompt: None,

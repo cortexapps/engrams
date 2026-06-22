@@ -120,6 +120,14 @@ message CreateSessionRequest {
   // during the paused restore window; the guest reads each mount's mount.json to
   // wire the skills. Capped at RESERVED_SLOTS. Empty = base session, no skills.
   repeated string selected_skills = 8;
+  // ADR 0056: profile-granted integration capabilities, each
+  // "provider:action[@resource]" (e.g. "github:issues:write",
+  // "datadog:logs:read", "s3:read@bucket"). The coordinator parses +
+  // validates each (a malformed string is a create-time error), binds them
+  // to the session in Postgres (`session_capabilities`), and the broker
+  // clamps every guest credential/action request to this set. Empty = no
+  // third-party integration access. Bound this phase; enforced in a later one.
+  repeated string capabilities = 9;
 }
 
 message CreateSessionResponse {

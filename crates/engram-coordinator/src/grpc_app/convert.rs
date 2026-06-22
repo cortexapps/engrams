@@ -122,6 +122,10 @@ pub(crate) fn create_request_from_proto(
         // ADR 0055: profile-selected skill names; the coordinator resolves
         // these to reserved-slot mounts (name -> staged sha) at prepare time.
         selected_skills,
+        // ADR 0056: profile-granted "provider:action[@resource]" capabilities;
+        // parsed + validated + bound to the session at create (the broker later
+        // clamps requests to them).
+        capabilities,
         // Phase 1b: the initial prompt's client prompt_id. The create path
         // delivers the initial prompt via send_prompt (which mints one when
         // empty), so threading the client id for the FIRST message is a
@@ -148,6 +152,7 @@ pub(crate) fn create_request_from_proto(
         prompt,
         secrets,
         selected_skills,
+        capabilities,
     })
 }
 
