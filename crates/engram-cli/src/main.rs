@@ -785,6 +785,7 @@ async fn session_create(
     let req = app::CreateSessionRequest {
         selected_skills: Vec::new(),
         capabilities: Vec::new(),
+        integration_policy_json: String::new(),
         image_uri: image.to_string(),
         mode: if dev_vm { "dev_vm" } else { "agent" }.to_string(),
         prompt: prompt.map(str::to_string),

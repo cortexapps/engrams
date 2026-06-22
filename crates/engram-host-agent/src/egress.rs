@@ -123,15 +123,79 @@ pub fn register_policy(
             allow,
         });
     }
+    // ADR 0056 Plane B: the coordinator already resolved each inject's
+    // secret_ref → real `secret` (host-side); translate into the proxy's
+    // InjectEntry + RequestPolicy.
+    let mut injects = Vec::with_capacity(policy.injects.len());
+    for i in policy.injects {
+        let allow =
+            engram_egress_proxy::HostList::from_manifest(&i.allow_hosts, &i.allow_host_patterns)?;
+        injects.push(engram_egress_proxy::InjectEntry {
+            secret: i.secret,
+            header_name: i.header_name,
+            header_template: i.header_template,
+            allow,
+            policy: engram_egress_proxy::RequestPolicy {
+                methods: i.methods,
+                path_prefixes: i.path_prefixes,
+            },
+        });
+    }
     registry.register(engram_egress_proxy::SessionState {
         session_id: policy.session_id,
         guest_ip: policy.guest_ip,
         network_allow,
         secrets,
-        // ADR 0056 Plane B: no inject entries on the wire yet — the
-        // coordinator starts producing them (from connector config) in
-        // Phase 3b, where this gains a translation loop like `secrets`.
-        injects: Vec::new(),
+        injects,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_core::types::egress::{EgressInjectEntry, SessionEgressPolicy};
+    use engram_core::types::image::SecretMode;
+    use engram_core::{SandboxId, SessionId};
+    use std::net::Ipv4Addr;
+
+    /// ADR 0056 (B′): `register_policy` translates a wire `EgressInjectEntry`
+    /// (secret already resolved by the coordinator) into the proxy's
+    /// `InjectEntry` + `RequestPolicy` the 3a engine enforces.
+    #[test]
+    fn register_policy_translates_injects_to_proxy_entries() {
+        let registry = Registry::new();
+        let guest_ip = Ipv4Addr::new(10, 200, 0, 2);
+        register_policy(
+            &registry,
+            SessionEgressPolicy {
+                session_id: SessionId::new(),
+                sandbox_id: SandboxId::new(),
+                guest_ip,
+                network_allow_hosts: vec![],
+                network_allow_host_patterns: vec![],
+                secrets: vec![],
+                injects: vec![EgressInjectEntry {
+                    secret: "dd-secret".into(),
+                    header_name: "DD-API-KEY".into(),
+                    header_template: "{}".into(),
+                    allow_hosts: vec!["api.datadoghq.com".into()],
+                    allow_host_patterns: vec![],
+                    methods: vec!["GET".into()],
+                    path_prefixes: vec!["/api/v2/logs".into()],
+                }],
+                secret_mode: SecretMode::Broker,
+            },
+        )
+        .expect("register");
+
+        let state = registry.lookup(guest_ip).expect("session registered");
+        assert_eq!(state.injects.len(), 1);
+        let inj = &state.injects[0];
+        assert_eq!(inj.secret, "dd-secret");
+        assert_eq!(inj.header_name, "DD-API-KEY");
+        assert!(inj.allow.matches("api.datadoghq.com"));
+        assert!(inj.policy.allows("GET", "/api/v2/logs/events"));
+        assert!(!inj.policy.allows("POST", "/api/v2/logs/events"));
+    }
 }

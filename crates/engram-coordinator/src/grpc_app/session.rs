@@ -512,6 +512,7 @@ mod tests {
         let r = app::CreateSessionRequest {
             selected_skills: Vec::new(),
             capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: "localhost:5001/demo:warm".into(),
             mode: "agent".into(),
             prompt: None,
@@ -540,6 +541,7 @@ mod tests {
         let r = app::CreateSessionRequest {
             selected_skills: Vec::new(),
             capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: "localhost:5001/demo:warm".into(),
             mode: "agent".into(),
             prompt: None,

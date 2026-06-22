@@ -35,6 +35,13 @@ pub struct SessionEgressPolicy {
     /// Per-secret entries (placeholder → real_value with per-secret
     /// host allow-list). Empty for `SecretMode::Literal` images.
     pub secrets: Vec<EgressSecretEntry>,
+    /// ADR 0056 (Plane B): per-credential injections — the coordinator has
+    /// already resolved each `secret_ref` to its real value (host-side; never
+    /// the orchestrator or guest). The proxy adds the auth header on outbound
+    /// requests matching the host + request policy. `#[serde(default)]` so
+    /// policies serialized before this field decode with none.
+    #[serde(default)]
+    pub injects: Vec<EgressInjectEntry>,
     /// Image's secret delivery mode. The proxy uses this to decide
     /// whether to MITM (`Broker`) or just SNI-filter (`Literal`).
     pub secret_mode: SecretMode,
@@ -50,4 +57,22 @@ pub struct EgressSecretEntry {
     pub real_value: String,
     pub allow_hosts: Vec<String>,
     pub allow_host_patterns: Vec<String>,
+}
+
+/// ADR 0056 (Plane B): one resolved credential injection the host proxy
+/// applies. The coordinator resolves the connector's `secret_ref` to
+/// `secret` (its real value, host-side) before shipping; on an outbound
+/// request matching `allow_hosts`/`allow_host_patterns` (SNI) AND the
+/// request policy (`methods` + `path_prefixes`), the proxy adds
+/// `header_name: <header_template with "{}" → secret>`. The guest never
+/// holds the secret. Empty `methods`/`path_prefixes` = any.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EgressInjectEntry {
+    pub secret: String,
+    pub header_name: String,
+    pub header_template: String,
+    pub allow_hosts: Vec<String>,
+    pub allow_host_patterns: Vec<String>,
+    pub methods: Vec<String>,
+    pub path_prefixes: Vec<String>,
 }

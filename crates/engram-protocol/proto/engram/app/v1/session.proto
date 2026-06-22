@@ -128,6 +128,13 @@ message CreateSessionRequest {
   // clamps every guest credential/action request to this set. Empty = no
   // third-party integration access. Bound this phase; enforced in a later one.
   repeated string capabilities = 9;
+  // ADR 0056 (option B′): the per-session integration policy the orchestrator
+  // compiled from the profile's capabilities + its connector config, as a JSON
+  // string (an orchestrator-authored artifact, opaque to proto — like an event
+  // payload_json). The coordinator resolves each inject's `secret_ref`
+  // host-side and the host proxy enforces the gate + injection. Carries secret
+  // *refs*, never values. Empty = no integration policy.
+  string integration_policy_json = 10;
 }
 
 message CreateSessionResponse {

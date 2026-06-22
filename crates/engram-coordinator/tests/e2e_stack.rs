@@ -149,6 +149,7 @@ impl Driver {
         let req = app::CreateSessionRequest {
             selected_skills: Vec::new(),
             capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: image.to_string(),
             mode: "dev_vm".to_string(),
             prompt: None,
@@ -173,6 +174,7 @@ impl Driver {
         let req = app::CreateSessionRequest {
             selected_skills: skills.iter().map(|s| s.to_string()).collect(),
             capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: image.to_string(),
             mode: "dev_vm".to_string(),
             prompt: None,
@@ -211,6 +213,7 @@ impl Driver {
         let req = app::CreateSessionRequest {
             selected_skills: Vec::new(),
             capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: image.to_string(),
             mode: "agent".to_string(),
             prompt: prompt.map(str::to_string),
