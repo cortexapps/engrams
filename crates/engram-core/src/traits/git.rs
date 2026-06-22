@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::GitForgeError;
+use crate::types::Capability;
 
 /// Which forge a [`GitForge`] talks to. Used for repo→provider
 /// matching and for labelling.
@@ -122,8 +123,16 @@ pub trait GitForge: Send + Sync {
     /// (impls error if that's ambiguous). Called on demand by the
     /// in-session forge seam; never injected at session create. Impls
     /// cache + lazily refresh (provider tokens are typically ~1h).
+    ///
+    /// ADR 0056 (Plane A): `caps` are the session's bound capabilities for
+    /// this forge's provider (clamped server-side at create). The impl mints
+    /// a token scoped to EXACTLY those capabilities — a `github:contents:read`
+    /// profile yields a read-only token. An empty set falls back to the
+    /// provider's default scopes (today's behavior), so a profile that
+    /// declares no capabilities is unaffected.
     async fn mint_installation_token(
         &self,
+        caps: &[Capability],
         owner: Option<&str>,
     ) -> Result<ScopedToken, GitForgeError>;
 

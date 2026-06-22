@@ -13,6 +13,7 @@ use engram_core::error::GitForgeError;
 use engram_core::traits::{
     ForgeKind, GitForge, PullRequest, PullRequestSpec, RepoRef, ScopedToken,
 };
+use engram_core::types::Capability;
 use parking_lot::Mutex;
 
 /// A `GitForge` that mints a fixed token and records `create_pull_request`
@@ -22,6 +23,9 @@ pub struct StaticGitForge {
     token: String,
     kind: ForgeKind,
     pull_requests: Mutex<Vec<(RepoRef, PullRequestSpec)>>,
+    /// ADR 0056: the capability sets each `mint_installation_token` was asked
+    /// for, in order — so a test can assert the bound caps reached the mint.
+    minted_caps: Mutex<Vec<Vec<Capability>>>,
     next_id: AtomicU64,
 }
 
@@ -33,6 +37,7 @@ impl StaticGitForge {
             token: token.into(),
             kind: ForgeKind::GitHub,
             pull_requests: Mutex::new(Vec::new()),
+            minted_caps: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -46,14 +51,21 @@ impl StaticGitForge {
     pub fn recorded_pull_requests(&self) -> Vec<(RepoRef, PullRequestSpec)> {
         self.pull_requests.lock().clone()
     }
+
+    /// Snapshot of the capability set passed to each `mint_installation_token`.
+    pub fn recorded_mint_caps(&self) -> Vec<Vec<Capability>> {
+        self.minted_caps.lock().clone()
+    }
 }
 
 #[async_trait]
 impl GitForge for StaticGitForge {
     async fn mint_installation_token(
         &self,
+        caps: &[Capability],
         _owner: Option<&str>,
     ) -> Result<ScopedToken, GitForgeError> {
+        self.minted_caps.lock().push(caps.to_vec());
         Ok(ScopedToken {
             username: "x-access-token".to_string(),
             password: self.token.clone(),
@@ -91,10 +103,20 @@ mod tests {
     #[tokio::test]
     async fn mints_the_configured_token() {
         let forge = StaticGitForge::github("ghs_test");
-        let tok = forge.mint_installation_token(None).await.unwrap();
+        let tok = forge.mint_installation_token(&[], None).await.unwrap();
         assert_eq!(tok.username, "x-access-token");
         assert_eq!(tok.password, "ghs_test");
         assert!(tok.expires_at > Utc::now());
+    }
+
+    #[tokio::test]
+    async fn records_the_caps_it_was_minted_for() {
+        let forge = StaticGitForge::github("ghs_test");
+        let caps = vec![Capability::parse("github:contents:read").unwrap()];
+        forge.mint_installation_token(&caps, None).await.unwrap();
+        let recorded = forge.recorded_mint_caps();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0][0].action, "contents:read");
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@
 //! The app private key is the only long-lived secret and never leaves
 //! the coordinator.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -20,6 +20,7 @@ use engram_core::error::GitForgeError;
 use engram_core::traits::{
     ForgeKind, GitForge, PullRequest, PullRequestSpec, RepoRef, ScopedToken,
 };
+use engram_core::types::Capability;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,63 @@ use serde::{Deserialize, Serialize};
 const GITHUB_API: &str = "https://api.github.com";
 const GITHUB_HOST: &str = "github.com";
 const API_VERSION: &str = "2022-11-28";
+
+/// ADR 0056 (Plane A): compute the GitHub App `permissions` object from the
+/// session's bound `github:` capabilities. A capability action is
+/// `<resource>:<level>` (e.g. `contents:write`, `pulls:write`); the App
+/// permission key is the resource with `pulls` → `pull_requests`, and the
+/// level is the highest granted (read < write < admin). Returns an empty map
+/// when no `github:` cap is bound — the caller then falls back to the default
+/// scopes (today's behavior), so a capability-less profile is unaffected.
+fn permissions_for_caps(caps: &[Capability]) -> BTreeMap<String, String> {
+    let rank = |l: &str| match l {
+        "admin" => 3,
+        "write" => 2,
+        "read" => 1,
+        _ => 0,
+    };
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for c in caps {
+        if c.provider != "github" {
+            continue;
+        }
+        let Some((resource, level)) = c.action.split_once(':') else {
+            continue;
+        };
+        let key = match resource {
+            "pulls" => "pull_requests",
+            other => other,
+        }
+        .to_string();
+        match out.get(&key) {
+            Some(existing) if rank(existing) >= rank(level) => {}
+            _ => {
+                out.insert(key, level.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// ADR 0056 (Plane A): restrict the minted token to specific repositories when
+/// EVERY bound `github:` capability names one via its `resource`
+/// (`owner/repo` or `repo` → the repo name). If any cap is unscoped (no
+/// `resource`), the union is installation-wide → empty (no `repositories`
+/// restriction), matching today's installation-wide token.
+fn repositories_for_caps(caps: &[Capability]) -> Vec<String> {
+    let github: Vec<&Capability> = caps.iter().filter(|c| c.provider == "github").collect();
+    if github.is_empty() || github.iter().any(|c| c.resource.is_none()) {
+        return Vec::new();
+    }
+    let mut repos: Vec<String> = github
+        .iter()
+        .filter_map(|c| c.resource.as_deref())
+        .map(|r| r.rsplit('/').next().unwrap_or(r).to_string())
+        .collect();
+    repos.sort();
+    repos.dedup();
+    repos
+}
 
 #[derive(Serialize)]
 struct JwtClaims {
@@ -178,9 +236,26 @@ impl GitHubApp {
 impl GitForge for GitHubApp {
     async fn mint_installation_token(
         &self,
+        caps: &[Capability],
         owner: Option<&str>,
     ) -> Result<ScopedToken, GitForgeError> {
-        let key = owner.unwrap_or("").to_string();
+        // ADR 0056 (Plane A): scope the token to the session's bound caps.
+        let permissions = permissions_for_caps(caps);
+        let repositories = repositories_for_caps(caps);
+        // The cache key MUST include the scope: two sessions with the same
+        // owner but different capabilities get DIFFERENT tokens — otherwise a
+        // read-only session could be served a cached write token.
+        let perm_fp = permissions
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let key = format!(
+            "{}|{}|{}",
+            owner.unwrap_or(""),
+            perm_fp,
+            repositories.join(",")
+        );
         // Serve from cache while comfortably inside the validity window.
         if let Some(tok) = self.tokens.lock().get(&key) {
             if tok.expires_at > Utc::now() + Duration::minutes(5) {
@@ -190,12 +265,20 @@ impl GitForge for GitHubApp {
         let id = self.installation_id(owner).await?;
         let jwt = self.app_jwt()?;
         let url = format!("{}/app/installations/{}/access_tokens", self.base_url, id);
-        // No `repositories` restriction: the token covers every repo the
-        // installation can access, so one credential works across repos
-        // (ADR 0023). GitHub still enforces the installation boundary.
-        let body = serde_json::json!({
-            "permissions": { "contents": "write", "pull_requests": "write" },
-        });
+        // Permissions are computed from the bound caps; an empty set (a
+        // capability-less profile) falls back to the historical default scopes
+        // so existing forge-bound sessions are unaffected. `repositories` is
+        // added only when every cap names one (else installation-wide).
+        let permissions_json = if permissions.is_empty() {
+            serde_json::json!({ "contents": "write", "pull_requests": "write" })
+        } else {
+            serde_json::to_value(&permissions)
+                .map_err(|e| GitForgeError::Protocol(format!("permissions json: {e}")))?
+        };
+        let mut body = serde_json::json!({ "permissions": permissions_json });
+        if !repositories.is_empty() {
+            body["repositories"] = serde_json::json!(repositories);
+        }
         let resp = self
             .http
             .post(&url)
@@ -230,7 +313,10 @@ impl GitForge for GitHubApp {
         repo: &RepoRef,
         pr: &PullRequestSpec,
     ) -> Result<PullRequest, GitForgeError> {
-        let token = self.mint_installation_token(Some(&repo.owner)).await?;
+        // The mediated PR action uses the provider's default scopes (an empty
+        // cap set) — PR creation needs pull_requests + contents write, the same
+        // scopes the forge minted before ADR 0056's capability scoping.
+        let token = self.mint_installation_token(&[], Some(&repo.owner)).await?;
         let url = format!("{}/repos/{}/{}/pulls", self.base_url, repo.owner, repo.name);
         let body = serde_json::json!({
             "title": pr.title,
@@ -292,4 +378,60 @@ async fn ensure_ok(resp: reqwest::Response, ctx: &str) -> Result<reqwest::Respon
         422 => GitForgeError::Rejected(msg),
         _ => GitForgeError::Protocol(msg),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(specs: &[&str]) -> Vec<Capability> {
+        specs
+            .iter()
+            .map(|s| Capability::parse(s).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn permissions_map_action_to_github_key_and_level() {
+        let p = permissions_for_caps(&caps(&["github:contents:read", "github:pulls:write"]));
+        assert_eq!(p.get("contents").map(String::as_str), Some("read"));
+        // `pulls` action → GitHub's `pull_requests` permission key.
+        assert_eq!(p.get("pull_requests").map(String::as_str), Some("write"));
+    }
+
+    #[test]
+    fn permissions_keep_the_highest_level() {
+        let p = permissions_for_caps(&caps(&["github:contents:read", "github:contents:write"]));
+        assert_eq!(p.get("contents").map(String::as_str), Some("write"));
+    }
+
+    #[test]
+    fn permissions_ignore_other_providers() {
+        let p = permissions_for_caps(&caps(&["datadog:logs:read", "github:issues:write"]));
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.get("issues").map(String::as_str), Some("write"));
+    }
+
+    #[test]
+    fn empty_caps_yield_empty_permissions() {
+        // The caller falls back to the default scopes for an empty set.
+        assert!(permissions_for_caps(&[]).is_empty());
+    }
+
+    #[test]
+    fn repositories_restrict_only_when_every_cap_is_scoped() {
+        // All scoped → restrict to those repo names.
+        let repos = repositories_for_caps(&caps(&[
+            "github:contents:write@cortexapps/engrams",
+            "github:pulls:write@cortexapps/engrams",
+        ]));
+        assert_eq!(repos, vec!["engrams".to_string()]);
+
+        // Any unscoped cap → installation-wide (no restriction).
+        let mixed = repositories_for_caps(&caps(&[
+            "github:contents:write@cortexapps/engrams",
+            "github:pulls:write",
+        ]));
+        assert!(mixed.is_empty());
+    }
 }

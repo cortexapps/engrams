@@ -65,14 +65,14 @@ async fn mints_and_caches_installation_token() {
         .with_base_url(server.uri());
 
     let t1 = app
-        .mint_installation_token(Some("cortexapps"))
+        .mint_installation_token(&[], Some("cortexapps"))
         .await
         .unwrap();
     assert_eq!(t1.username, "x-access-token");
     assert_eq!(t1.password, "ghs_abc123");
 
     let t2 = app
-        .mint_installation_token(Some("cortexapps"))
+        .mint_installation_token(&[], Some("cortexapps"))
         .await
         .unwrap();
     assert_eq!(t2.password, "ghs_abc123");
