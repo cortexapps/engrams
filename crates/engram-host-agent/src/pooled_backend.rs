@@ -8437,7 +8437,9 @@ mod tests {
             // Port 0 ⇒ OS-assigned ephemeral port (no fixed-port
             // collisions when the suite runs in parallel).
             let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let egress = HostEgress::spawn(source, bind).await.expect("spawn egress");
+            let egress = HostEgress::spawn(source, bind, None)
+                .await
+                .expect("spawn egress");
             (egress, dir)
         }
 
@@ -8455,6 +8457,7 @@ mod tests {
                 network_allow_host_patterns: Vec::new(),
                 secrets: Vec::new(),
                 injects: Vec::new(),
+                observes: Vec::new(),
                 secret_mode: SecretMode::Literal,
             }
         }

@@ -645,7 +645,12 @@ async fn main() -> Result<(), CoordinatorError> {
                 let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
                     .parse()
                     .expect("egress-proxy-port maps to a valid SocketAddr");
-                match engram_host_agent::egress::HostEgress::spawn(source, bind).await {
+                // ADR 0056 Phase 4: --mode=all (single-binary dev) doesn't wire
+                // the observe sink yet — response-observation is exercised in
+                // split/prod (the host-agent binary builds the sink) + the proxy
+                // unit/e2e tests. Wiring the coord's own loopback ingest here is
+                // a dev-parity follow-up.
+                match engram_host_agent::egress::HostEgress::spawn(source, bind, None).await {
                     Ok(e) => Some(Arc::new(e)),
                     Err(e) => {
                         tracing::error!(error = %e, "--mode=all egress proxy spawn failed; aborting");

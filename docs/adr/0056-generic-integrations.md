@@ -432,6 +432,9 @@ at the end with the commit chain.
    (parse/persist/resume) + a coordinator `/sessions/:id/integration-asset` ingest
    (→ `state.emit(IntegrationAsset)`) + the host-agent sink (`coord_client` POST,
    mirroring the harness-event path) + `register_policy` observe translation.
+   *(4b done; `injects`+`observes` made `SessionEgressPolicy` a wider bincode wire
+   type — bumped `WIRE_VERSION` 2→3 so a mixed-version fleet fails fast on the
+   skew gate rather than misparsing; regenerated the wire golden.)*
    **4c**: the orchestrator compiles connector `asset` specs → `observes`; first
    consumers — a Datadog query result, a GitHub issue. A marked endpoint on *any*
    provider then surfaces an asset with zero Rust.
