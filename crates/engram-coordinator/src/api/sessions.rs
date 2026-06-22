@@ -96,11 +96,23 @@ pub(crate) fn cold_boot_spec(
 /// In `Literal` mode, real values land as env vars — fine for the dev
 /// loop, never use in production.
 ///
-/// In `Broker` mode, *placeholder* env vars land — the per-session
-/// network proxy substitutes the real value only on outbound HTTPS
-/// requests to the secret's `allow_hosts`. Today the proxy isn't
-/// wired yet, so Broker mode results in placeholders that don't
-/// authenticate anything; documented as next-round work in DESIGN.md.
+/// In `Broker` mode, *placeholder* env vars land. The host-agent's
+/// per-session egress proxy substitutes the real value on outbound
+/// HTTPS requests whose host matches the secret's `allow_hosts`
+/// (ADR 0006), so the agent process never sees the real credential and
+/// prompt-injection exfiltration fails. This is wired end to end:
+/// [`crate::session_boot::egress_secret_entries`] pairs each
+/// placeholder with its real value into a `SessionEgressPolicy`,
+/// `start_agent` ships it via `notify_session_policy` *before* the
+/// agent spawns (ADR 0013 atomicity), `engram_host_agent::egress::
+/// register_policy` registers it with the proxy, and
+/// `engram_egress_proxy::substitute` swaps placeholder→real after MITM.
+///
+/// The placeholder this function writes into the env is the **same**
+/// string `egress_secret_entries` reads back out as the
+/// `EgressSecretEntry.placeholder` — that coupling is what makes Broker
+/// mode authenticate, and is locked by the
+/// `broker_env_placeholder_matches_egress_entry` regression test.
 fn apply_secrets_to_env(
     env: &mut HashMap<String, String>,
     bundle: &SecretBundle,
@@ -114,11 +126,9 @@ fn apply_secrets_to_env(
             }
         }
         SecretMode::Broker => {
-            // Per-session, per-secret placeholder — the only way the
-            // real value can leak via process state is if the proxy
-            // is misconfigured. We log every placeholder issue with
-            // a SHA-256 prefix so audit logs can correlate without
-            // exposing the value.
+            // Per-session, per-secret placeholder. The real value never
+            // enters the guest env; the egress proxy substitutes it
+            // host-side (see the doc comment above).
             for name in bundle.secrets.keys() {
                 let placeholder = format!(
                     "engram_ph_{}_{}",
@@ -127,17 +137,11 @@ fn apply_secrets_to_env(
                 );
                 env.insert(name.clone(), placeholder);
             }
-            // TODO(secrets-broker): register the keyring with the
-            // per-session proxy here, and have the proxy substitute
-            // placeholders on outbound HTTPS requests whose host
-            // matches `schema.allow_hosts` / `schema.allow_host_patterns`.
-            // Until that lands, Broker-mode images will see
-            // unsubstituted placeholders and any real-API calls fail.
-            tracing::warn!(
+            tracing::debug!(
                 %session,
                 secret_count = bundle.secrets.len(),
-                "secret broker proxy is not yet implemented; \
-                 placeholders will not be substituted on outbound traffic",
+                "broker mode: installed secret placeholders; the egress proxy \
+                 substitutes real values on outbound traffic to allowed hosts",
             );
         }
     }
@@ -1621,6 +1625,60 @@ mod tests {
         // Set → honored verbatim, both below and above the default.
         assert_eq!(resolved_memory_mib(&mk(Some(256))), 256);
         assert_eq!(resolved_memory_mib(&mk(Some(8192))), 8192);
+    }
+
+    /// ADR 0056 Step 0: Broker mode authenticates only because the placeholder
+    /// `apply_secrets_to_env` writes into the guest env is the SAME string
+    /// `egress_secret_entries` hands the proxy as the substitution target. This
+    /// locks that coupling across the two functions (which live in different
+    /// modules) so a change to the placeholder format in one can't silently break
+    /// the other. The proxy half (placeholder → real_value on an allowed host,
+    /// violation-close on a disallowed one) is covered by
+    /// `engram-egress-proxy/tests/intercept_e2e.rs`.
+    #[test]
+    fn broker_env_placeholder_matches_egress_entry() {
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(
+            "OPENAI_API_KEY".to_string(),
+            ResolvedSecret {
+                value: "sk-real-value".to_string(),
+                schema: SecretSchema {
+                    allow_hosts: vec!["api.openai.com".to_string()],
+                    ..Default::default()
+                },
+            },
+        );
+        let bundle = SecretBundle { secrets };
+        let session = SessionId::new();
+
+        // Broker mode: the env carries a placeholder, never the real value.
+        let mut env = HashMap::new();
+        apply_secrets_to_env(&mut env, &bundle, SecretMode::Broker, session);
+        let env_ph = env.get("OPENAI_API_KEY").expect("placeholder injected");
+        assert_ne!(
+            env_ph, "sk-real-value",
+            "broker mode must not leak the real value into the guest env"
+        );
+        assert!(env_ph.starts_with("engram_ph_"));
+
+        // The egress entry the proxy substitutes on must carry the SAME
+        // placeholder, the real value, and the secret's allow_hosts.
+        let entries = crate::session_boot::egress_secret_entries(&bundle, &env);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            &entries[0].placeholder, env_ph,
+            "the proxy's substitution target must equal the env placeholder"
+        );
+        assert_eq!(entries[0].real_value, "sk-real-value");
+        assert_eq!(entries[0].allow_hosts, vec!["api.openai.com".to_string()]);
+
+        // Literal mode: env carries the real value; entry placeholder ==
+        // real_value, so the proxy's substitution is a harmless no-op.
+        let mut env_lit = HashMap::new();
+        apply_secrets_to_env(&mut env_lit, &bundle, SecretMode::Literal, session);
+        assert_eq!(env_lit.get("OPENAI_API_KEY").unwrap(), "sk-real-value");
+        let lit = crate::session_boot::egress_secret_entries(&bundle, &env_lit);
+        assert_eq!(lit[0].placeholder, lit[0].real_value);
     }
 
     /// ADR 0055: the pure half of skill resolution assigns each selected name a
