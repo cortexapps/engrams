@@ -128,6 +128,10 @@ pub fn register_policy(
         guest_ip: policy.guest_ip,
         network_allow,
         secrets,
+        // ADR 0056 Plane B: no inject entries on the wire yet — the
+        // coordinator starts producing them (from connector config) in
+        // Phase 3b, where this gains a translation loop like `secrets`.
+        injects: Vec::new(),
     });
     Ok(())
 }

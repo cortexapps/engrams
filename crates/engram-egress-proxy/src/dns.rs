@@ -392,6 +392,7 @@ mod tests {
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             network_allow: HostList::from_manifest(&["api.anthropic.com".into()], &[]).unwrap(),
             secrets: Vec::new(),
+            injects: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -408,6 +409,7 @@ mod tests {
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             network_allow: HostList::from_manifest(&[], &["*.anthropic.com".into()]).unwrap(),
             secrets: Vec::new(),
+            injects: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -434,6 +436,7 @@ mod tests {
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             network_allow: HostList::from_manifest(&["api.anthropic.com".into()], &[]).unwrap(),
             secrets: Vec::new(),
+            injects: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("evil.example.com.", RecordType::A);
@@ -471,6 +474,7 @@ mod tests {
                 real_value: "sk-test".into(),
                 allow: HostList::from_manifest(&["api.anthropic.com".into()], &[]).unwrap(),
             }],
+            injects: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -518,6 +522,7 @@ mod tests {
             guest_ip: client_ip,
             network_allow: HostList::from_manifest(&["allowed.example.com".into()], &[]).unwrap(),
             secrets: Vec::new(),
+            injects: Vec::new(),
         });
         let proxy_task = tokio::spawn(serve_udp(proxy_sock.clone(), registry, upstream_addr));
 
@@ -552,6 +557,7 @@ mod tests {
             guest_ip: client_ip,
             network_allow: HostList::from_manifest(&["allowed.example.com".into()], &[]).unwrap(),
             secrets: Vec::new(),
+            injects: Vec::new(),
         });
         // Point upstream at an obviously-dead address so the test
         // can't accidentally succeed by hitting a real resolver.

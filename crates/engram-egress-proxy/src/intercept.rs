@@ -32,7 +32,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::cert_mint::CertMint;
-use crate::registry::SecretEntry;
+use crate::inject;
+use crate::registry::{InjectEntry, SecretEntry};
 use crate::replayed::Replayed;
 use crate::resolver::{ResolveError, UpstreamResolver};
 use crate::substitute::{scan_for_violation, substitute};
@@ -50,7 +51,17 @@ pub enum InterceptError {
     Tls(rustls::Error),
     Mint(crate::cert_mint::MintError),
     Resolve(ResolveError),
-    Violation { placeholder: String },
+    Violation {
+        placeholder: String,
+    },
+    /// ADR 0056: an inject-gated host got a request whose (method, path)
+    /// matched no injection's `RequestPolicy` — the operation isn't permitted.
+    RequestRejected {
+        method: String,
+        path: String,
+    },
+    /// ADR 0056: an inject-gated request had no parseable HTTP/1.1 request line.
+    MalformedRequest,
     InvalidServerName(String),
 }
 
@@ -63,6 +74,12 @@ impl std::fmt::Display for InterceptError {
             Self::Resolve(e) => write!(f, "resolve: {e}"),
             Self::Violation { placeholder } => {
                 write!(f, "placeholder leak: {placeholder} sent to disallowed host")
+            }
+            Self::RequestRejected { method, path } => {
+                write!(f, "request rejected by integration policy: {method} {path}")
+            }
+            Self::MalformedRequest => {
+                write!(f, "malformed request line on an inject-gated host")
             }
             Self::InvalidServerName(s) => write!(f, "invalid SNI `{s}`"),
         }
@@ -216,6 +233,7 @@ pub async fn run<C>(
     port: u16,
     resolver: Arc<dyn UpstreamResolver>,
     secrets: &[&SecretEntry],
+    injects: &[&InjectEntry],
     server_cfg: Arc<ServerConfig>,
     client_cfg: Arc<ClientConfig>,
 ) -> Result<(), InterceptError>
@@ -260,6 +278,24 @@ where
         {
             break;
         }
+    }
+
+    // ADR 0056 (Plane B): an inject-gated host must satisfy a request
+    // policy (method + path). Add the matching injection's auth header(s);
+    // a request whose shape matches no injection is rejected — the
+    // operation isn't permitted on this host.
+    if !injects.is_empty() {
+        let (method, path) =
+            inject::request_line(&prefix).ok_or(InterceptError::MalformedRequest)?;
+        let matched: Vec<&InjectEntry> = injects
+            .iter()
+            .copied()
+            .filter(|i| i.policy.allows(&method, &path))
+            .collect();
+        if matched.is_empty() {
+            return Err(InterceptError::RequestRejected { method, path });
+        }
+        prefix = inject::inject_headers(prefix, &matched);
     }
 
     if let Some(ph) = scan_for_violation(&prefix, sni, secrets) {

@@ -19,7 +19,7 @@ use engram_egress_proxy::intercept::{
     self, build_client_config, build_server_config, InterceptError,
 };
 use engram_egress_proxy::policy::HostList;
-use engram_egress_proxy::registry::SecretEntry;
+use engram_egress_proxy::registry::{InjectEntry, RequestPolicy, SecretEntry};
 use engram_egress_proxy::resolver::StaticResolver;
 use parking_lot::Mutex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
@@ -44,6 +44,46 @@ fn entry(placeholder: &str, real: &str, allow: &[&str]) -> SecretEntry {
             &[],
         )
         .unwrap(),
+    }
+}
+
+/// TLS-handshake to the proxy as if it were `fake-upstream`, trusting the
+/// engram CA so the proxy-minted leaf validates. (Factored from the inline
+/// setup the substitution tests use.)
+async fn tls_client_to(
+    ca: &Ca,
+    client_to_proxy: tokio::io::DuplexStream,
+) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+    let pem = ca.cert_pem.clone();
+    let mut roots = rustls::RootCertStore::empty();
+    let cert_der = rustls_pemfile::certs(&mut pem.as_bytes())
+        .next()
+        .unwrap()
+        .unwrap();
+    roots.add(cert_der).unwrap();
+    let cli_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(cli_cfg));
+    let server_name: rustls::pki_types::ServerName<'static> = "fake-upstream".try_into().unwrap();
+    connector
+        .connect(server_name, client_to_proxy)
+        .await
+        .unwrap()
+}
+
+// ADR 0056: a Plane-B injection allowing `GET /api/v2/logs*` on
+// fake-upstream, adding `DD-API-KEY: <secret>`.
+fn inject_entry(secret: &str, methods: &[&str], paths: &[&str]) -> InjectEntry {
+    InjectEntry {
+        secret: secret.into(),
+        header_name: "DD-API-KEY".into(),
+        header_template: "{}".into(),
+        allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
+        policy: RequestPolicy {
+            methods: methods.iter().map(|s| s.to_string()).collect(),
+            path_prefixes: paths.iter().map(|s| s.to_string()).collect(),
+        },
     }
 }
 
@@ -137,6 +177,7 @@ async fn substitutes_placeholder_in_intercept_path() {
             upstream_addr.port(),
             resolver,
             &secrets,
+            &[],
             server_cfg_for_task,
             client_cfg_for_task,
         )
@@ -228,6 +269,7 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
             upstream_addr.port(),
             resolver,
             &secrets,
+            &[],
             server_cfg,
             client_cfg,
         )
@@ -273,5 +315,126 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
     assert!(
         captured.lock().is_empty(),
         "upstream should not see any bytes when violation fires",
+    );
+}
+
+// ADR 0056: an allowed request shape gets the credential header injected;
+// the guest never sent (and never holds) the secret.
+#[tokio::test]
+async fn injects_header_on_allowed_request() {
+    let ca = ca();
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+
+    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs"]);
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let injects: Vec<&InjectEntry> = vec![&inj];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &injects,
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    tls_client
+        .write_all(
+            b"GET /api/v2/logs/events HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tls_client.flush().await.unwrap();
+    let mut resp = [0u8; 1024];
+    let _ = tls_client.read(&mut resp).await;
+    let _ = tls_client.shutdown().await;
+    drop(tls_client);
+
+    let outcome = proxy_task.await.unwrap();
+    if let Err(e) = &outcome {
+        let msg = format!("{e}");
+        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+
+    let body = String::from_utf8(captured.lock().clone()).unwrap();
+    assert!(
+        body.contains("DD-API-KEY: dd-secret-xyz\r\n"),
+        "upstream should have seen the injected credential header; got: {body}",
+    );
+    assert!(
+        body.starts_with("GET /api/v2/logs/events HTTP/1.1\r\n"),
+        "request line preserved",
+    );
+}
+
+// ADR 0056: a request to an inject-gated host whose (method, path) matches
+// no policy is rejected — the secret is never injected and nothing reaches
+// upstream.
+#[tokio::test]
+async fn rejects_request_shape_outside_policy() {
+    let ca = ca();
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+
+    // Only GET /api/v2/logs* is allowed; the client tries POST /api/v2/metrics.
+    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs"]);
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let injects: Vec<&InjectEntry> = vec![&inj];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &injects,
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    tls_client
+        .write_all(
+            b"POST /api/v2/metrics HTTP/1.1\r\nHost: fake-upstream\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tls_client.flush().await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut buf = [0u8; 1024];
+        let _ = tls_client.read(&mut buf).await;
+    })
+    .await;
+
+    let outcome = proxy_task.await.unwrap();
+    assert!(
+        matches!(outcome, Err(InterceptError::RequestRejected { .. })),
+        "expected RequestRejected, got: {outcome:?}",
+    );
+    assert!(
+        captured.lock().is_empty(),
+        "upstream must see nothing when the request shape is rejected",
     );
 }
