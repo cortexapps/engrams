@@ -3,6 +3,16 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # ADR 0036: byte-deterministic ext4 packs (engram-image-builder) need an
+    # e2fsprogs that honors SOURCE_DATE_EPOCH (added in 1.47.1) — apt on the
+    # CI/bake runners ships 1.47.0. But 1.47.3 introduced a `mke2fs -d`
+    # regression that fails on any file > 2 GiB ("Ext2 file too big"), tripped by
+    # dev-brain's 2.3 GB compose-images.tar. So pin a nixpkgs rev that ships
+    # e2fsprogs EXACTLY 1.47.2 (SOURCE_DATE_EPOCH, no >2 GiB bug) — and one from
+    # *before* nixpkgs added the libarchive feature (2025-06-28), which breaks
+    # the static-musl link. This is the single pinned source of a reproducible
+    # mke2fs — for `nix develop`, the determinism test, and the image bakes.
+    nixpkgs-e2fsprogs.url = "github:NixOS/nixpkgs/c6729488de632cc9f8af5aa82edd7097ea506c36";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -10,13 +20,28 @@
     };
   };
 
-  outputs = { nixpkgs, flake-utils, rust-overlay, ... }:
+  outputs = { nixpkgs, nixpkgs-e2fsprogs, flake-utils, rust-overlay, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
+
+        # ADR 0036: e2fsprogs 1.47.2 (pinned via the nixpkgs-e2fsprogs input rev,
+        # see the input note) — SOURCE_DATE_EPOCH determinism without the 1.47.3
+        # >2 GiB `mke2fs -d` regression.
+        e2fsprogsPkgs = import nixpkgs-e2fsprogs { inherit system; };
+        e2fsprogs = e2fsprogsPkgs.e2fsprogs;
+
+        # ADR 0036: a STATIC (musl) mke2fs to BUNDLE into the `cli-tools`
+        # artifact, so `engram-cli image build` runs a pinned, portable mke2fs
+        # sibling on any runner — no nix store, no PATH dependency. The dynamic
+        # `e2fsprogs` above is fine for `nix develop` and the packer's CI test
+        # (its lib closure is present), but a binary copied into an OCI artifact
+        # must be self-contained. Linux-only (pkgsStatic targets musl); the
+        # `.bin` output carries `sbin/mke2fs`. Same 1.47.2 pin (input rev).
+        e2fsprogsStatic = e2fsprogsPkgs.pkgsStatic.e2fsprogs;
 
         # Reads rust-toolchain.toml so the flake stays in lockstep with
         # the file rustup picks up. Bumping Rust = edit rust-toolchain.toml,
@@ -54,6 +79,18 @@
                                     # but harmless on macOS)
             nodejs_22               # web SPA dev server (`just web` -> vite)
             pnpm                    # workspace package manager for web/
+            # ADR 0036: a SOURCE_DATE_EPOCH-honoring mke2fs (e2fsprogs >= 1.47.1)
+            # for byte-deterministic ext4 packs — `just bake-demo`, the
+            # determinism test, and `engram-cli image build`. The `e2fsprogs`
+            # let-binding (pinned current nixpkgs) lexically shadows the stale
+            # `pkgs.e2fsprogs` here. All platforms (was macOS-only).
+            e2fsprogs
+            # ADR 0055 P2: mksquashfs packs an uploaded skill dir into a
+            # content-addressed RO squashfs at registration (the coordinator's
+            # `skill_pack`); also what the deploy/bundles/* recipes already use.
+            # Needed by `nix develop` (the coordinator + `just check`'s pack test)
+            # and bundled into the coordinator runtime image.
+            squashfsTools
           ] ++ lib.optionals stdenv.isLinux [
             # Parallel linker; wired in via the `shellHook` below
             # (CARGO_TARGET_*_UNKNOWN_LINUX_GNU_RUSTFLAGS). Cuts
@@ -67,14 +104,10 @@
           ] ++ lib.optionals stdenv.isDarwin [
             libiconv                # required by some macOS-aarch64 crates
             # `just bake-demo` cross-compiles the in-guest musl binaries
-            # (agentd, harness-claude) and mke2fs's the rootfs into ext4.
-            # On macOS those used to come from Homebrew (`musl-cross`,
-            # `e2fsprogs`); provide them here so `nix develop -c just
-            # bake-demo` needs no brew. e2fsprogs ships `mke2fs`; the cross
-            # stdenvs ship `<target>-cc` linkers wired below in the shellHook
-            # (.cargo/config.toml hard-codes the brew binary names, so we
-            # override the linker via CARGO_TARGET_*_LINKER instead).
-            e2fsprogs
+            # (agentd, harness-claude); the cross stdenvs ship `<target>-cc`
+            # linkers wired below in the shellHook (.cargo/config.toml hard-codes
+            # the brew binary names, so we override via CARGO_TARGET_*_LINKER).
+            # (mke2fs for the ext4 pack is now common, above — no brew needed.)
             pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
             pkgs.pkgsCross.musl64.stdenv.cc
           ];
@@ -175,6 +208,20 @@
               export CFLAGS_x86_64_unknown_linux_musl="-I${pkgs.pkgsCross.musl64.linuxHeaders}/include"
             fi
           '';
+        };
+
+        # ADR 0036: the reproducible mke2fs as buildable outputs, one pinned rev
+        # for everything.
+        #   .#mke2fs        — dynamic; for `nix develop` + the packer's CI test
+        #                     (`nix build .#mke2fs` → bin/mke2fs, lib closure in
+        #                     the nix store). `.bin` is e2fsprogs' bin output.
+        #   .#mke2fs-static — static musl; copied into the `cli-tools` artifact
+        #                     so engram-cli runs it as a portable sibling on any
+        #                     runner (`sbin/mke2fs`). Linux-only (pkgsStatic).
+        packages = {
+          mke2fs = e2fsprogs.bin;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          mke2fs-static = e2fsprogsStatic.bin;
         };
 
         formatter = pkgs.nixpkgs-fmt;

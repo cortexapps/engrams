@@ -81,6 +81,10 @@ pub fn router(state: SharedState) -> Router {
             "/sessions/:id/harness-events",
             post(host_http::harness_event_ingest),
         )
+        .route(
+            "/sessions/:id/integration-asset",
+            post(host_http::integration_asset_ingest),
+        )
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::require_bearer,

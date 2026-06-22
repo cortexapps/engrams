@@ -458,6 +458,15 @@ impl HostAgent {
                                 strikes.remove(&sandbox_id);
                                 continue;
                             }
+                            // Base-snapshot capture VMs are host-local + transient
+                            // and NEVER session-owned by design; reaping one as an
+                            // "orphan" kills an in-flight capture (a slow `[warm]`
+                            // hook runs past the strike debounce). `build_base_snapshot`
+                            // destroys them itself.
+                            if pooled_for_reap.is_base_capture(sandbox_id) {
+                                strikes.remove(&sandbox_id);
+                                continue;
+                            }
                             let session = pooled_for_reap.session_for_sandbox(sandbox_id);
                             let orphan = match session {
                                 Some(sid) => match coord_for_reap

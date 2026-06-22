@@ -73,7 +73,7 @@ pub struct Mke2fsPacker {
 impl Default for Mke2fsPacker {
     fn default() -> Self {
         Self {
-            bin: PathBuf::from("mke2fs"),
+            bin: resolve_mke2fs(),
         }
     }
 }
@@ -82,6 +82,36 @@ impl Mke2fsPacker {
     pub fn with_binary(bin: impl Into<PathBuf>) -> Self {
         Self { bin: bin.into() }
     }
+}
+
+/// Resolve the `mke2fs` to shell out to, preferring a pinned one.
+///
+/// ADR 0036 byte-determinism requires an e2fsprogs that honors
+/// `SOURCE_DATE_EPOCH` (>= 1.47.1); most distros' system e2fsprogs is older and
+/// silently stamps wall-clock times, breaking cross-bake chunk dedup. So we
+/// don't rely on whatever `mke2fs` happens to be on `$PATH` — we ship a pinned
+/// static `mke2fs` *inside the `cli-tools` artifact* (next to this binary) and
+/// resolve it here, so the bake is deterministic by construction wherever it
+/// runs. Order:
+///
+/// 1. `$ENGRAM_MKE2FS` — explicit override (CI's packer test, debugging).
+/// 2. an `mke2fs` sibling of the current executable — the one bundled in
+///    `cli-tools` beside `engram-cli`.
+/// 3. `mke2fs` from `$PATH` — `nix develop` dev shells, and the host-agent's
+///    distro e2fsprogs (which packs only the empty stub, where determinism is
+///    immaterial).
+fn resolve_mke2fs() -> PathBuf {
+    if let Some(p) = std::env::var_os("ENGRAM_MKE2FS") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|d| d.join("mke2fs")) {
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("mke2fs")
 }
 
 #[async_trait]

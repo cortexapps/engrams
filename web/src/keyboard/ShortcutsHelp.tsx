@@ -37,7 +37,7 @@ const GROUPS: Group[] = [
     heading: "General",
     rows: [
       { label: "Open command palette", cap: chord(MOD_LABEL, "K") },
-      { label: "Start new session", cap: chord("c") },
+      { label: "Start new task", cap: chord("c") },
       { label: "Toggle sidebar", cap: chord(MOD_LABEL, "B") },
       { label: "Keyboard shortcuts", cap: chord("?") },
     ],
@@ -45,17 +45,17 @@ const GROUPS: Group[] = [
   {
     heading: "Go to",
     rows: [
-      { label: "Sessions", cap: seq("g", "s") },
+      { label: "Tasks", cap: seq("g", "s") },
       { label: "Operator", cap: seq("g", "o"), admin: true },
       { label: "Fleet", cap: seq("g", "f"), admin: true },
       { label: "Settings", cap: seq("g", ",") },
     ],
   },
   {
-    heading: "Switch sessions",
+    heading: "Switch tasks",
     rows: [
-      { label: "Jump to session 1–9", cap: range(ALT_LABEL, "1", "9") },
-      { label: "Previous / next session", cap: range(ALT_LABEL, "[", "]") },
+      { label: "Jump to task 1–9", cap: range(ALT_LABEL, "1", "9") },
+      { label: "Previous / next task", cap: range(ALT_LABEL, "[", "]") },
     ],
   },
 ];
@@ -108,7 +108,7 @@ export function ShortcutsHelp() {
         <DialogHeader>
           <DialogTitle>Keyboard shortcuts</DialogTitle>
           <DialogDescription>
-            Hold {ALT_LABEL} to reveal each session’s jump number on the rail.
+            Hold {ALT_LABEL} to reveal each task’s jump number on the rail.
           </DialogDescription>
         </DialogHeader>
 

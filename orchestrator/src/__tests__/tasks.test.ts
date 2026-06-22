@@ -176,6 +176,8 @@ function makeFakeProfiles(opts?: {
   includeUserTokens?: boolean;
   envVars?: Record<string, string>;
   imageId?: string;
+  skills?: string[];
+  capabilities?: string[];
 }): ProfileStore {
   const row: ProfileRow = {
     id: PROFILE_ID,
@@ -185,6 +187,8 @@ function makeFakeProfiles(opts?: {
     imageId: opts?.imageId ?? "img-1",
     includeUserTokens: opts?.includeUserTokens ?? false,
     envVars: opts?.envVars ?? {},
+    skills: opts?.skills ?? [],
+    capabilities: opts?.capabilities ?? [],
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -1059,6 +1063,141 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
         CLAUDE_CODE_OAUTH_TOKEN: "admin-token",
         ANTHROPIC_MODEL: "claude-opus-4-8",
       });
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("profile skills ride createSession as selected_skills (ADR 0055)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("skills-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ skills: ["skills", "playwright"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      expect(fakeSessions.createReqs[0]?.selectedSkills).toEqual(["skills", "playwright"]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("profile capabilities ride createSession as capabilities (ADR 0056)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("caps-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ capabilities: ["github:issues:write", "datadog:logs:read"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      expect(fakeSessions.createReqs[0]?.capabilities).toEqual([
+        "github:issues:write",
+        "datadog:logs:read",
+      ]);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("an inject capability compiles + ships integration_policy_json (ADR 0056 B′)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("dd-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ capabilities: ["datadog:logs:read"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
+      expect(json).toBeDefined();
+      const policy = JSON.parse(json!);
+      // datadog logs:read is inject-source AND declares a query_result asset, so
+      // it compiles to both an inject and an observe (ADR 0056 Phase 4c).
+      expect(policy.injects).toEqual([
+        {
+          hosts: ["api.datadoghq.com"],
+          header_name: "DD-API-KEY",
+          header_template: "{}",
+          secret_ref: "datadog-api-key",
+          methods: ["GET"],
+          path_prefixes: ["/api/v2/logs/events"],
+        },
+      ]);
+      expect(policy.observes).toHaveLength(1);
+      expect(policy.observes[0].provider).toBe("datadog");
+      expect(policy.observes[0].asset_kind).toBe("query_result");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("a mint capability with an asset ships observes, no inject (ADR 0056 Phase 4c)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("gh-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ capabilities: ["github:issues:write"] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
+      expect(json).toBeDefined();
+      const policy = JSON.parse(json!);
+      expect(policy.injects).toEqual([]); // mint → proxy injects nothing
+      expect(policy.observes).toHaveLength(1);
+      expect(policy.observes[0].provider).toBe("github");
+      expect(policy.observes[0].asset_kind).toBe("issue");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("a capability-less profile omits integration_policy_json", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("bare-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ capabilities: [] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      expect(fakeSessions.createReqs[0]?.integrationPolicyJson).toBeUndefined();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("empty profile skills omit selected_skills (base session)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("noskills-sess")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      profiles: makeFakeProfiles({ skills: [] }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await client.createTask({ type: "chat", profileId: PROFILE_ID });
+      // Omitted on the wire → empty array after proto round-trip.
+      expect(fakeSessions.createReqs[0]?.selectedSkills ?? []).toEqual([]);
     } finally {
       await srv.close();
     }

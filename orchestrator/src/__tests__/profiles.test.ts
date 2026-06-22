@@ -9,6 +9,33 @@ import { registerProfiles } from "../rpc/profiles.ts";
 import type { ProfileDeps, ImagesClient, GetSession } from "../rpc/profiles.ts";
 import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
 import { ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
+import type { MountCatalogClient } from "../skills/catalog.ts";
+
+/** Fake catalog whose live uploaded skills are `uploadedNames` (builtins are implicit). */
+const fakeCatalog = (uploadedNames: string[] = []): MountCatalogClient => ({
+  async listSkills() {
+    return {
+      skills: uploadedNames.map((name, i) => ({
+        id: `s${i}`,
+        owner: "x",
+        name,
+        description: "",
+        sha256: "h",
+        sizeBytes: 0n,
+        createdAt: "",
+      })),
+    };
+  },
+  async getSkill() {
+    return {};
+  },
+  async registerSkill() {
+    throw new Error("unused");
+  },
+  async deleteSkill() {
+    return { deleted: false };
+  },
+});
 
 function makeGetSession(userId: string | null, role: "user" | "admin" = "user"): GetSession {
   return async () => (userId ? { user: { id: userId, role, email: `${userId}@t.invalid` } } : null);
@@ -65,7 +92,7 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 
 const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
-  includeUserTokens: false, envVars: { K: "V" }, createdAt: new Date(0), updatedAt: new Date(0),
+  includeUserTokens: false, envVars: { K: "V" }, skills: [], capabilities: [], createdAt: new Date(0), updatedAt: new Date(0),
   deletedAt: new Date(0),
 };
 const active: ProfileRow = { ...archived, id: "act", name: "Active", deletedAt: null };
@@ -128,6 +155,60 @@ describe("ProfileService — auth + field filtering", () => {
       expect(r.profile!.archived).toBe(false);
       expect(r.profile!.envVars).toEqual({ ANTHROPIC_MODEL: "claude-opus-4-8" });
       expect(r.profile!.includeUserTokens).toBe(true);
+    } finally { await s.close(); }
+  });
+
+  // ADR 0055 P2: skills validated against builtins ∪ the upload catalog.
+  test("admin CreateProfile with an unknown skill → InvalidArgument", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog(["my-linter"]),
+    });
+    try {
+      await expectErr(
+        s.client.createProfile({ name: "x", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, skills: ["nope"] }),
+        Code.InvalidArgument,
+      );
+    } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile accepts a builtin + an uploaded skill", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog(["my-linter"]),
+    });
+    try {
+      const r = await s.client.createProfile({
+        name: "Skilled", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, skills: ["skills", "my-linter"],
+      });
+      expect(r.profile!.skills).toEqual(["skills", "my-linter"]);
+    } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile with a malformed capability → InvalidArgument (ADR 0056)", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+    });
+    try {
+      await expectErr(
+        s.client.createProfile({ name: "x", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {}, capabilities: ["github"] }),
+        Code.InvalidArgument,
+      );
+    } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile accepts + returns well-formed capabilities (ADR 0056)", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+    });
+    try {
+      const r = await s.client.createProfile({
+        name: "Capable", description: "", icon: "Bot", imageId: "img-1", includeUserTokens: false, envVars: {},
+        capabilities: ["github:issues:write", "datadog:logs:read@idx-1"],
+      });
+      expect(r.profile!.capabilities).toEqual(["github:issues:write", "datadog:logs:read@idx-1"]);
     } finally { await s.close(); }
   });
 });

@@ -77,7 +77,7 @@ export function ImagesPanel() {
     <div className="space-y-6">
       <PageHeading
         title="Images"
-        description="OCI URIs sessions may reference. The manifest is cached on enable; refresh when tags move."
+        description="OCI URIs tasks may reference. The manifest is cached on enable; refresh when tags move."
         actions={<EnableImageDialog />}
       />
 

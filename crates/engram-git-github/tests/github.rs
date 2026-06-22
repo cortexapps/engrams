@@ -4,8 +4,9 @@
 
 use std::sync::OnceLock;
 
-use engram_core::error::GitForgeError;
-use engram_core::traits::{GitForge, PullRequestSpec, RepoRef};
+use engram_core::error::IntegrationError;
+use engram_core::traits::{CredentialHint, Integration, ScopedCredential};
+use engram_core::types::Capability;
 use engram_git_github::GitHubApp;
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
@@ -27,8 +28,8 @@ fn test_key() -> &'static str {
     })
 }
 
-fn repo() -> RepoRef {
-    RepoRef::parse("cortexapps/engrams").unwrap()
+fn pulls_cap() -> Capability {
+    Capability::parse("github:pulls:write").unwrap()
 }
 
 async fn mount_installation(server: &MockServer, times: u64) {
@@ -64,18 +65,24 @@ async fn mints_and_caches_installation_token() {
         .unwrap()
         .with_base_url(server.uri());
 
-    let t1 = app
-        .mint_installation_token(Some("cortexapps"))
-        .await
-        .unwrap();
-    assert_eq!(t1.username, "x-access-token");
-    assert_eq!(t1.password, "ghs_abc123");
+    let hint = CredentialHint {
+        host: None,
+        owner: Some("cortexapps".into()),
+    };
+    let t1 = app.mint_credential(&[], &hint).await.unwrap();
+    let ScopedCredential::Basic {
+        username, password, ..
+    } = &t1
+    else {
+        panic!("expected a basic credential, got {t1:?}");
+    };
+    assert_eq!(username, "x-access-token");
+    assert_eq!(password, "ghs_abc123");
 
-    let t2 = app
-        .mint_installation_token(Some("cortexapps"))
-        .await
-        .unwrap();
-    assert_eq!(t2.password, "ghs_abc123");
+    // Same scope (empty caps + same owner) → served from cache (both mocks
+    // verified `.expect(1)` on drop).
+    let t2 = app.mint_credential(&[], &hint).await.unwrap();
+    assert!(matches!(t2, ScopedCredential::Basic { password, .. } if password == "ghs_abc123"));
 }
 
 #[tokio::test]
@@ -97,17 +104,18 @@ async fn creates_pull_request() {
     let app = GitHubApp::new("123", test_key())
         .unwrap()
         .with_base_url(server.uri());
-    let spec = PullRequestSpec {
-        head_branch: "feat/x".into(),
-        base_branch: "main".into(),
-        title: "Add x".into(),
-        body: "does x".into(),
-        draft: false,
-    };
-    let pr = app.create_pull_request(&repo(), &spec).await.unwrap();
-    assert_eq!(pr.url, "https://github.com/cortexapps/engrams/pull/7");
-    assert_eq!(pr.id, 7);
-    assert_eq!(pr.state, "open");
+    let args = serde_json::json!({
+        "repo": "cortexapps/engrams",
+        "head_branch": "feat/x",
+        "base_branch": "main",
+        "title": "Add x",
+        "body": "does x",
+        "draft": false,
+    });
+    let reply = app.perform_action(&pulls_cap(), &args).await.unwrap();
+    assert_eq!(reply["url"], "https://github.com/cortexapps/engrams/pull/7");
+    assert_eq!(reply["id"], 7);
+    assert_eq!(reply["state"], "open");
 }
 
 #[tokio::test]
@@ -126,16 +134,15 @@ async fn maps_422_to_rejected() {
     let app = GitHubApp::new("123", test_key())
         .unwrap()
         .with_base_url(server.uri());
-    let spec = PullRequestSpec {
-        head_branch: "feat/x".into(),
-        base_branch: "main".into(),
-        title: "dup".into(),
-        body: String::new(),
-        draft: false,
-    };
-    let err = app.create_pull_request(&repo(), &spec).await.unwrap_err();
+    let args = serde_json::json!({
+        "repo": "cortexapps/engrams",
+        "head_branch": "feat/x",
+        "base_branch": "main",
+        "title": "dup",
+    });
+    let err = app.perform_action(&pulls_cap(), &args).await.unwrap_err();
     assert!(
-        matches!(err, GitForgeError::Rejected(_)),
+        matches!(err, IntegrationError::Rejected(_)),
         "expected Rejected, got {err:?}"
     );
 }
@@ -146,6 +153,6 @@ async fn rejects_invalid_private_key() {
     // `Result` directly rather than `unwrap_err()`.
     assert!(matches!(
         GitHubApp::new("123", "not a pem"),
-        Err(GitForgeError::Unauthorized(_))
+        Err(IntegrationError::Unauthorized(_))
     ));
 }

@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::{DisableEnabledImageOutcome, MetadataStore};
 use engram_core::types::{
-    ArtifactRow, EnableJob, EnableJobState, EnabledImage, HostRecord, HostStatus, PersistedEvent,
-    RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
+    ArtifactRow, Capability, EnableJob, EnableJobState, EnabledImage, HostRecord, HostStatus,
+    PersistedEvent, RegistryCredential, Session, SessionSecrets, SessionSpec, SessionState,
+    SnapshotRecord,
 };
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 use row::col_err;
@@ -122,6 +123,34 @@ impl PostgresStore {
 
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
+}
+
+/// ADR 0055 P2: a `mount_catalog` row → the shared `CatalogSkill`. The tuple is
+/// `(id, owner, name, description, sha256, mount_json, size_bytes, created_at)`.
+#[allow(clippy::type_complexity)]
+fn catalog_skill_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+    ),
+) -> engram_core::types::CatalogSkill {
+    let (id, owner, name, description, sha256, mount_json, size_bytes, created_at) = row;
+    engram_core::types::CatalogSkill {
+        id,
+        owner,
+        name,
+        description,
+        sha256,
+        mount_json,
+        size_bytes,
+        created_at,
+    }
 }
 
 /// ADR 0048: per-host placement inputs. `alloc_mib` is the host-measured
@@ -2594,7 +2623,8 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT kind, payload FROM session_events
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
-               AND kind IN ('pull_request_opened', 'file_shared')
+               AND (kind = 'file_shared'
+                    OR (kind = 'integration_asset' AND payload->>'surface' = 'asset'))
              ORDER BY idx
             "#,
         )
@@ -2609,13 +2639,40 @@ impl MetadataStore for PostgresStore {
                 let kind: String = sqlx::Row::try_get(r, "kind").ok()?;
                 let payload: serde_json::Value = sqlx::Row::try_get(r, "payload").ok()?;
                 Some(match kind.as_str() {
-                    "pull_request_opened" => format!(
-                        "A pull request was opened and still exists: {}",
-                        payload
-                            .get("url")
+                    // ADR 0056: a durable integration asset (surface='asset')
+                    // survives the rewind. Build the line generically from the
+                    // payload — prefer a fetchable URL, then data.url/title,
+                    // else fall back to the provider/asset_kind pair.
+                    "integration_asset" => {
+                        let provider = payload
+                            .get("provider")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("(url unknown)"),
-                    ),
+                            .unwrap_or("integration");
+                        let asset_kind = payload
+                            .get("asset_kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("asset");
+                        let detail = payload
+                            .get("fetchable")
+                            .and_then(|f| f.get("url"))
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                payload
+                                    .get("data")
+                                    .and_then(|d| d.get("url").or_else(|| d.get("title")))
+                                    .and_then(|v| v.as_str())
+                            });
+                        match detail {
+                            Some(d) => {
+                                format!(
+                                    "A {provider} {asset_kind} was produced and still exists: {d}"
+                                )
+                            }
+                            None => {
+                                format!("A {provider} {asset_kind} was produced and still exists")
+                            }
+                        }
+                    }
                     "file_shared" => format!(
                         "A file was shared and still exists: {}",
                         payload
@@ -3447,6 +3504,108 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    // ---- session capabilities (ADR 0056) ----
+
+    async fn bind_session_capabilities(
+        &self,
+        session_id: SessionId,
+        caps: &[Capability],
+    ) -> Result<(), MetaError> {
+        // No-op on empty (the queued-then-booted re-prepare carries an empty
+        // set; the rows were bound at enqueue). ON CONFLICT DO NOTHING keeps
+        // it idempotent across the boot/enqueue double-bind. `resource` ''
+        // is the no-resource sentinel (NULL can't sit in the PK).
+        if caps.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        for c in caps {
+            sqlx::query(
+                r#"
+                INSERT INTO session_capabilities (session_id, provider, action, resource)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(session_id.as_uuid())
+            .bind(&c.provider)
+            .bind(&c.action)
+            .bind(c.resource.as_deref().unwrap_or(""))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_session_capabilities(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<Capability>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT provider, action, resource FROM session_capabilities
+            WHERE session_id = $1
+            ORDER BY provider, action, resource
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let provider: String = sqlx::Row::try_get(r, "provider").map_err(db_err)?;
+            let action: String = sqlx::Row::try_get(r, "action").map_err(db_err)?;
+            let resource: String = sqlx::Row::try_get(r, "resource").map_err(db_err)?;
+            out.push(Capability {
+                provider,
+                action,
+                resource: (!resource.is_empty()).then_some(resource),
+            });
+        }
+        Ok(out)
+    }
+
+    // ---- session integration policy (ADR 0056 B′) ----
+
+    async fn bind_session_integration_policy(
+        &self,
+        session_id: SessionId,
+        policy_json: &str,
+    ) -> Result<(), MetaError> {
+        sqlx::query(
+            r#"
+            INSERT INTO session_integration_policy (session_id, policy_json)
+            VALUES ($1, $2)
+            ON CONFLICT (session_id) DO UPDATE SET policy_json = EXCLUDED.policy_json
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(policy_json)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_session_integration_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        let row =
+            sqlx::query("SELECT policy_json FROM session_integration_policy WHERE session_id = $1")
+                .bind(session_id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        match row {
+            Some(r) => Ok(Some(sqlx::Row::try_get(&r, "policy_json").map_err(db_err)?)),
+            None => Ok(None),
+        }
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — session_lease leasing row.
     // ----------------------------------------------------------------
@@ -3936,15 +4095,23 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    /// ADR 0035 §5: distinct bundle generations referenced by any
-    /// snapshot row. jsonb unnest in SQL so the coord never pages the
-    /// whole table; the result is at most a handful of refs.
+    /// ADR 0035 §5 + ADR 0055 P2: distinct bundle generations referenced by any
+    /// snapshot row **∪ every live `mount_catalog` skill** — so a
+    /// registered-but-currently-unused uploaded skill stays staged on the fleet
+    /// (its sha enters `live_bundles`) and survives the bundle GC. jsonb unnest
+    /// in SQL so the coord never pages either table; the result is a handful of
+    /// refs. Catalog pins carry the skill `name` as a cosmetic `drive_id` (the
+    /// host stages by `sha256`); a sha pinned by both a snapshot slot and the
+    /// catalog appears once per distinct drive_id, which the GC (keyed on sha)
+    /// and the host supervisor (stages by sha, idempotent) both collapse.
     async fn bundle_pin_set(
         &self,
     ) -> Result<Vec<engram_core::types::sandbox::AuxBundleRef>, MetaError> {
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT DISTINCT b->>'drive_id', b->>'sha256'
-               FROM snapshots, jsonb_array_elements(aux_bundles) AS b",
+               FROM snapshots, jsonb_array_elements(aux_bundles) AS b
+             UNION
+             SELECT name, sha256 FROM mount_catalog WHERE deleted_at IS NULL",
         )
         .fetch_all(&self.pool)
         .await
@@ -3957,6 +4124,122 @@ impl MetadataStore for PostgresStore {
             .collect();
         out.sort_by(|a, b| (&a.drive_id, &a.sha256).cmp(&(&b.drive_id, &b.sha256)));
         Ok(out)
+    }
+
+    /// ADR 0055 P2: upsert-by-name a packed user-uploaded skill into the
+    /// org-shared catalog. A name matching a live row updates it in place
+    /// (stable `id` + `created_at`); content-addressing makes re-registering the
+    /// same bytes a no-op-equivalent (same `sha256`). Returns the live row.
+    async fn register_skill(
+        &self,
+        owner: &str,
+        name: &str,
+        description: &str,
+        sha256: &str,
+        mount_json: &str,
+        size_bytes: i64,
+    ) -> Result<engram_core::types::CatalogSkill, MetaError> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "INSERT INTO mount_catalog (owner, name, description, sha256, mount_json, size_bytes)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (name) WHERE deleted_at IS NULL
+             DO UPDATE SET owner = EXCLUDED.owner,
+                           description = EXCLUDED.description,
+                           sha256 = EXCLUDED.sha256,
+                           mount_json = EXCLUDED.mount_json,
+                           size_bytes = EXCLUDED.size_bytes
+             RETURNING id, owner, name, description, sha256, mount_json, size_bytes, created_at",
+        )
+        .bind(owner)
+        .bind(name)
+        .bind(description)
+        .bind(sha256)
+        .bind(mount_json)
+        .bind(size_bytes)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(catalog_skill_from_row(row))
+    }
+
+    /// ADR 0055 P2: every live catalog skill, newest first.
+    async fn list_skills(&self) -> Result<Vec<engram_core::types::CatalogSkill>, MetaError> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT id, owner, name, description, sha256, mount_json, size_bytes, created_at
+               FROM mount_catalog WHERE deleted_at IS NULL
+             ORDER BY created_at DESC, name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(catalog_skill_from_row).collect())
+    }
+
+    /// ADR 0055 P2: resolve one selected skill name to its live catalog row.
+    async fn get_skill_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<engram_core::types::CatalogSkill>, MetaError> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT id, owner, name, description, sha256, mount_json, size_bytes, created_at
+               FROM mount_catalog WHERE name = $1 AND deleted_at IS NULL",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(catalog_skill_from_row))
+    }
+
+    /// ADR 0055 P2: soft-delete a catalog skill (drops it from the pin set →
+    /// existing bundle GC reclaims the blob after grace). Returns whether a live
+    /// row was deleted.
+    async fn soft_delete_skill(&self, name: &str) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            "UPDATE mount_catalog SET deleted_at = now()
+               WHERE name = $1 AND deleted_at IS NULL",
+        )
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// ADR 0035 §5: sticky-first-seen candidate upsert (bundle

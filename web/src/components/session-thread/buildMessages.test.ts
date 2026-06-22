@@ -275,26 +275,61 @@ describe("buildMessages — message/part shaping", () => {
     expect((msgs[0]!.content[0] as { type: string }).type).toBe("text");
   });
 
-  test("pull_request_opened becomes a pull_request system marker", () => {
+  test("integration_asset(forge/pull_request) becomes an integration_asset marker", () => {
     const { messages } = buildMessages(
       indexed([
         {
-          type: "pull_request_opened",
-          url: "https://gh/x/pull/7",
-          repo: "x/y",
-          title: "Fix it",
-          number: 7,
-          head_branch: "fix",
-          base_branch: "main",
+          type: "integration_asset",
+          provider: "forge",
+          asset_kind: "pull_request",
+          surface: "asset",
+          data: {
+            repo: "x/y",
+            title: "Fix it",
+            number: 7,
+            head_branch: "fix",
+            base_branch: "main",
+          },
+          fetchable: { kind: "external", url: "https://gh/x/pull/7" },
           at: AT,
         },
       ]),
       SID,
     );
     expect(customMarker(real(messages)[0]!)).toMatchObject({
-      kind: "pull_request",
-      number: 7,
-      repo: "x/y",
+      kind: "integration_asset",
+      provider: "forge",
+      assetKind: "pull_request",
+      surface: "asset",
+      data: { repo: "x/y", number: 7 },
+      fetchable: { kind: "external", url: "https://gh/x/pull/7" },
+    });
+  });
+
+  // ADR 0056: a provider the UI has no hand-crafted renderer for still
+  // surfaces as a generic integration_asset marker (rendered by the fallback
+  // card) with zero new web code — the "PRs aren't special" property.
+  test("a never-seen integration_asset provider still becomes a generic marker", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "integration_asset",
+          provider: "datadog",
+          asset_kind: "query_result",
+          surface: "action",
+          data: { query: "avg:system.cpu", p99: "812ms" },
+          fetchable: null,
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    expect(customMarker(real(messages)[0]!)).toMatchObject({
+      kind: "integration_asset",
+      provider: "datadog",
+      assetKind: "query_result",
+      surface: "action",
+      fetchable: null,
     });
   });
 
@@ -450,10 +485,10 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
     expect(user.metadata?.custom?.pending).toBeUndefined();
   });
 
-  test("a still-queued user echo (no run_started yet) stays pending/greyed", () => {
-    const { messages } = buildMessages(
+  test("a still-queued user echo (no run_started yet) is held OUT of the transcript", () => {
+    const { messages, queue } = buildMessages(
       indexed([
-        // A run is in flight; a type-ahead prompt is echoed but not yet consumed.
+        // A run is in flight; a type-ahead prompt is echoed + queued, not consumed.
         { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
         {
           type: "agent_message",
@@ -464,12 +499,16 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
           prompt_id: "p2",
           at: AT2,
         },
+        { type: "prompt_queued", prompt_id: "p2", summary: "and then deploy", at: AT2 },
       ]),
       SID,
       "idle",
     );
-    const queued = messages.find((m) => m.id === "p2")!;
-    expect(queued.metadata?.custom?.pending).toBe(true);
+    // Held: NOT in the thread — it lives in the composer rail until its run
+    // starts (then it joins the conversation at the consumption point).
+    expect(messages.some((m) => m.id === "p2")).toBe(false);
+    // Surfaced via `queue` for the rail.
+    expect(queue.map((q) => q.promptId)).toContain("p2");
   });
 });
 
@@ -505,7 +544,7 @@ describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
     ).toEqual([{ promptId: "p1", summary: "v2" }]);
   });
 
-  test("prompt_dequeued removes the entry AND drops its greyed bubble from the thread", () => {
+  test("prompt_dequeued removes the queue entry; the message never enters the transcript", () => {
     const result = buildMessages(
       indexed([
         {
@@ -523,7 +562,7 @@ describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
       SID,
     );
     expect(result.queue).toEqual([]);
-    // Pulled back into the composer / cancelled → no longer in the conversation.
+    // Held while queued, then recalled/cancelled — it never joined the conversation.
     expect(real(result.messages).some((m) => m.id === "p1")).toBe(false);
   });
 
@@ -537,6 +576,66 @@ describe("buildMessages — ADR 0052 queue (type-ahead recall/cancel)", () => {
         SID,
       ).queue.map((q) => q.promptId),
     ).toEqual(["p1", "p2"]);
+  });
+
+  test("a message queued mid-run lands at its consumption point, below the prior response (59cb8557)", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u0",
+          role: "user",
+          text: "Count 1-60",
+          prompt_id: "p0",
+          at: AT,
+        },
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p0", at: AT },
+        // "Hi" queued mid-1-60-run: its echo is logged HERE, before the response.
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "Hi",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "prompt_queued", prompt_id: "p1", summary: "Hi", at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "1. one…",
+          at: AT,
+        },
+        { type: "run_interrupted", run_id: "r1", at: AT },
+        // consumed AFTER the interrupt
+        { type: "run_started", run_id: "r2", prompt_summary: null, prompt_id: "p1", at: AT },
+        {
+          type: "agent_message",
+          run_id: "r2",
+          message_id: "a2",
+          role: "assistant",
+          text: "Hi! How can I help?",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r2", ok: true, at: AT },
+      ]),
+      SID,
+    );
+    const seq = real(messages).map((m) => {
+      const c = m.content;
+      const text = Array.isArray(c)
+        ? ((c.find((p) => p.type === "text") as { text?: string } | undefined)?.text ?? "")
+        : "";
+      return { role: m.role, text };
+    });
+    // Count(user) → 1-60(assistant) → Hi(user) → Hi-response(assistant): the
+    // queued "Hi" is BELOW the interrupted 1-60 response, not above it.
+    expect(seq.map((s) => s.role)).toEqual(["user", "assistant", "user", "assistant"]);
+    expect(seq.map((s) => s.text)).toEqual(["Count 1-60", "1. one…", "Hi", "Hi! How can I help?"]);
   });
 });
 
@@ -645,6 +744,79 @@ describe("buildMessages — Phase 1c live token streaming", () => {
       .map((p) => (p as { text: string }).text);
     expect(textParts).toContain("block one");
     expect(textParts).toContain("block two streaming");
+  });
+});
+
+describe("buildMessages — stable assistant ids (crash regression, session 59cb8557)", () => {
+  // A queued+dequeued user message before a run's assistant turn used to shift the
+  // position-based `a:${out.length}` id between the streaming-tail render and the
+  // durable-message render — assistant-ui keys by id, so the turn silently changing
+  // id threw "a message with the same id already exists in the parent tree".
+  const base: SessionEvent[] = [
+    {
+      type: "agent_message",
+      run_id: "",
+      message_id: "u0",
+      role: "user",
+      text: "Count 1-60",
+      prompt_id: "p0",
+      at: AT,
+    },
+    { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p0", at: AT },
+    {
+      type: "agent_message",
+      run_id: "",
+      message_id: "u1",
+      role: "user",
+      text: "Hi",
+      prompt_id: "p1",
+      at: AT,
+    },
+    { type: "prompt_queued", prompt_id: "p1", summary: "Hi", at: AT },
+    { type: "prompt_dequeued", prompt_id: "p1", at: AT }, // the ↑-recall — shrinks out post-loop
+    {
+      type: "agent_message",
+      run_id: "",
+      message_id: "u2",
+      role: "user",
+      text: "Hi",
+      prompt_id: "p2",
+      at: AT,
+    },
+    { type: "prompt_queued", prompt_id: "p2", summary: "Hi", at: AT },
+  ];
+
+  test("the in-flight turn keeps its id from streaming-tail render to durable render", () => {
+    // Mid-stream: the 1-60 turn lives in the ephemeral overlay, no durable assistant yet.
+    const streaming = buildMessages(indexed(base), SID, undefined, "1. one…");
+    // Durable: the complete 1-60 assistant message has landed; overlay empty.
+    const durable = buildMessages(
+      indexed([
+        ...base,
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "1. one…",
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    const sId = real(streaming.messages).find((m) => m.role === "assistant")?.id;
+    const dId = real(durable.messages).find((m) => m.role === "assistant")?.id;
+    expect(sId).toBeDefined();
+    expect(sId).toBe(dId); // was a:2 (streaming) vs a:3 (durable) with the position-based id
+  });
+
+  test("no build produces duplicate message ids", () => {
+    for (const streamingText of ["", "1. one…"]) {
+      const ids = buildMessages(indexed(base), SID, undefined, streamingText).messages.map(
+        (m) => m.id,
+      );
+      expect(new Set(ids).size).toBe(ids.length);
+    }
   });
 });
 

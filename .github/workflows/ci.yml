@@ -308,6 +308,21 @@ jobs:
       - name: Seed GCS test bucket
         run: bash deploy/dev/seed-buckets.sh
 
+      # ADR 0036: put the flake-pinned e2fsprogs (>= 1.47.1) mke2fs ahead of the
+      # runner's apt <= 1.47.0 one, so `ext4_pack_is_deterministic_across_rebuilds`
+      # actually runs (and prod bakes dedup) instead of self-skipping. The
+      # install-Nix + build-mke2fs incantation lives in one composite action that
+      # engrams-internal's bakes also consume; here we use the local copy
+      # (default `.` flake-ref = this checkout).
+      - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
+        uses: ./.github/actions/setup-reproducible-mke2fs
+
+      # ADR 0055 P2: mksquashfs for the engram-coordinator `skill_pack`
+      # determinism test (it self-skips without the tool, like the ext4 test's
+      # mke2fs gate — install it so the test actually RUNS in this lane).
+      - name: Install squashfs-tools
+        run: sudo apt-get install -y -qq --no-install-recommends squashfs-tools
+
       # Default (non-ignored) tests across the entire workspace. Mirrors
       # `just check`'s nextest pass — same speedup, same coverage. The
       # engram-image-builder e2e bake test skips itself if `docker` is
@@ -353,6 +368,7 @@ jobs:
             --test host_status_transition_live_pg \
             --test queue_scanner_live_pg \
             --test binding_cas_live_pg \
+            --test mount_catalog_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -1272,13 +1288,22 @@ jobs:
         env:
           PRIMARY: ${{ steps.tags.outputs.primary }}
           EXTRA_TAGS: ${{ steps.tags.outputs.extra_tags }}
+          # Pin crane (ADR 0021 reproducibility) instead of the moving
+          # `releases/latest/download/` redirect, which 404'd transiently
+          # while GitHub rotated the `latest` pointer mid-publish and
+          # flaked this step (one variant of the matrix failed while the
+          # other, running the same download, passed). Bump deliberately.
+          CRANE_VERSION: v0.21.7
         run: |
           # crane copies tags without re-uploading layers — saves
           # bandwidth vs `docker pull && tag && push`. (The harness
           # bake intentionally doesn't mirror to `:main` / `:latest`
           # aliases — it sticks to the pinned `<version>-<platform>`
           # tag per ADR 0021's reproducibility rule.)
-          curl -fsSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
+          # --retry-all-errors covers a transient 404/5xx on the asset
+          # CDN; --retry-delay backs off between attempts.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
             | sudo tar -xzf - -C /usr/local/bin crane
           crane auth login ghcr.io \
             -u "${{ github.actor }}" \
@@ -1594,6 +1619,41 @@ jobs:
             | sudo bash
           tilt version
 
+      # ADR 0027 → 0035 → 0055: stage the RO skill bundles CONTENT-ADDRESSED
+      # (<sha256>.squashfs + current.json stamp) — the same shape the FC-host
+      # image bake / `just bundles-squashfs` produces.
+      #
+      # MUST run BEFORE the stack comes up: the host-agent reads current.json
+      # ONCE at startup (host_agent/src/lib.rs read_stamp) and reports the same
+      # current_bundles on every heartbeat, exactly like prod (the Packer bake
+      # stages the stamp into the host image before the agent starts). The coord
+      # resolves a session's selected_skills names against that reported catalog.
+      #
+      # ADR 0055: the `sentinel` bundle is MANDATORY — base-snapshot capture
+      # attaches RESERVED_SLOTS reserved dyn-* drives, all resolved to the
+      # sentinel sha from this stamp; without it every enable 500s (loudly, by
+      # design). `skills` is the catalog skill `e2e_session_has_mounted_skills_bundle`
+      # selects + asserts: the coord resolves "skills" -> its sha, patch_drives
+      # it into a reserved slot, the init shim mounts it at /opt/engram/dyn/<i>
+      # (the owned 6.1 kernel has squashfs), and agentd wires share-file.
+      # (playwright is omitted — heavy chromium build, and no test selects it.)
+      - name: Stage RO skill bundles (ADR 0055)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
+          sudo mkdir -p /var/lib/engram/shared
+          stamp="{"
+          sep=""
+          for name in sentinel skills; do
+            deploy/bundles/"$name"/build.sh "/tmp/$name.squashfs"
+            sha="$(sha256sum "/tmp/$name.squashfs" | cut -d' ' -f1)"
+            sudo install -m 0644 "/tmp/$name.squashfs" "/var/lib/engram/shared/$sha.squashfs"
+            stamp="$stamp$sep\"$name\": \"$sha\""
+            sep=", "
+          done
+          echo "$stamp}" | sudo tee /var/lib/engram/shared/current.json >/dev/null
+          ls -l /var/lib/engram/shared/
+          cat /var/lib/engram/shared/current.json
+
       - name: Bring up prod-shape stack (tilt)
         env:
           ENGRAM_INTEG_BIN_DIR: ./target/release
@@ -1617,26 +1677,6 @@ jobs:
           # reference predated ADR 0025 owning the kernel.)
           export ENGRAM_KERNEL_IMAGE_PATH="$HOME/.cache/engram-fc-test/vmlinux"
           bash deploy/dev/tilt-up-ci.sh
-
-      # ADR 0027 → 0035: stage the skills RO bundle CONTENT-ADDRESSED
-      # (<name>-<sha256>.squashfs + current.json stamp) — the same shape the
-      # FC-host image bake produces. The FC backend resolves the symbolic
-      # `skills` drive against the stamp at base-snapshot capture; without the
-      # stamp the enable 500s (loudly, by design — a host that can't satisfy a
-      # requested aux drive must not capture a skills-less snapshot). The init
-      # shim mounts it (the owned 6.1 kernel has squashfs), agentd wires
-      # share-file, and `e2e_session_has_mounted_skills_bundle` asserts the
-      # whole path. (Only `skills` — the demo image isn't `[browser]`-enabled,
-      # so coord doesn't declare the heavy playwright drive.)
-      - name: Stage RO skills bundle (ADR 0035)
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
-          deploy/bundles/skills/build.sh /tmp/skills.squashfs
-          sudo mkdir -p /var/lib/engram/shared
-          SKILLS_SHA=$(sha256sum /tmp/skills.squashfs | cut -d' ' -f1)
-          sudo install -m 0644 /tmp/skills.squashfs "/var/lib/engram/shared/skills-$SKILLS_SHA.squashfs"
-          printf '{"skills": "%s"}\n' "$SKILLS_SHA" | sudo tee /var/lib/engram/shared/current.json >/dev/null
-          ls -l /var/lib/engram/shared/
 
       # ADR 0013: host-agent doesn't read docker config; it asks
       # the coord per-pull, and the coord reads sealed credentials

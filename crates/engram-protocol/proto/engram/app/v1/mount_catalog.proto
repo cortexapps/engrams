@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// ADR 0055 P2: the org-shared user-uploaded skill catalog. The caller is the
+// single trusted orchestrator (bearer-authed); per-user authz lives there. The
+// `owner` carried on RegisterSkill is attribution / GC ownership / quota only —
+// the catalog is org-shared, so any profile may select any skill. This service
+// is the durable catalog the P1 fleet `current_bundles` stamp couldn't hold:
+// uploaded skills can't be baked into the host image.
+service MountCatalogService {
+  // Register (upsert by name) a user-uploaded skill. The coordinator unpacks
+  // `payload_tar`, lays it under `skills/<name>/`, generates the mount.json,
+  // packs a deterministic content-addressed squashfs, publishes it to
+  // BlobStorage, and upserts the catalog row — synchronous and idempotent by
+  // content (re-registering identical bytes yields the same sha256). Rejects a
+  // name that isn't a safe bundle name or collides with a fleet bundle name.
+  rpc RegisterSkill(RegisterSkillRequest) returns (RegisterSkillResponse);
+  rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
+  rpc GetSkill(GetSkillRequest) returns (GetSkillResponse);
+  rpc DeleteSkill(DeleteSkillRequest) returns (DeleteSkillResponse);
+}
+
+// One catalog skill — mirrors engram_core::types::CatalogSkill (the internal
+// `mount_json` is omitted; clients don't need it).
+message CatalogSkill {
+  string id = 1;
+  // Uploader principal (the orchestrator's better-auth user id). Attribution /
+  // GC ownership / quota only — NOT an access boundary (org-shared catalog).
+  string owner = 2;
+  // Logical bundle name, used verbatim in profile.skills and on the
+  // CreateSessionRequest.selected_skills wire. UNIQUE org-wide.
+  string name = 3;
+  string description = 4;
+  // Content address of the packed squashfs (its blob key is
+  // bundles/sha256/<sha256>).
+  string sha256 = 5;
+  // Packed squashfs size in bytes.
+  int64 size_bytes = 6;
+  // ISO-8601.
+  string created_at = 7;
+}
+
+message RegisterSkillRequest {
+  // Logical bundle name (validated: a single safe path segment — lowercase
+  // alphanumerics, dash, underscore — and not a reserved fleet bundle name).
+  string name = 1;
+  string description = 2;
+  // Orchestrator-asserted uploader principal (attribution / GC / quota). The
+  // coordinator is identity-agnostic (ADR 0051) and trusts this value the same
+  // way it trusts orchestrator-resolved session identity — so it MUST be set by
+  // the trusted orchestrator, NOT by the web. On the web→orchestrator hop the
+  // orchestrator overwrites it with the authenticated session's user, so a value
+  // sent by a less-trusted caller is ignored (no spoofing).
+  string owner = 3;
+  // The skill payload: an archive of the skill directory (tar, gzipped tar, or
+  // zip) OR a lone SKILL.md — the coordinator sniffs the form by magic bytes
+  // (NOT the filename), unpacks archives budgeted against decompression bombs,
+  // and treats anything else as the SKILL.md itself. An archive must contain a
+  // top-level SKILL.md. Server-capped on both the compressed bytes and the
+  // decompressed total (markdown skills are KiB; the 4 MiB gRPC default is ample).
+  bytes payload_tar = 4;
+}
+
+message RegisterSkillResponse {
+  CatalogSkill skill = 1;
+}
+
+message ListSkillsRequest {}
+
+// Every live catalog skill, newest first.
+message ListSkillsResponse {
+  repeated CatalogSkill skills = 1;
+}
+
+message GetSkillRequest {
+  // By logical name.
+  string name = 1;
+}
+
+message GetSkillResponse {
+  CatalogSkill skill = 1;
+}
+
+message DeleteSkillRequest {
+  // By logical name (soft-delete → the existing bundle GC reclaims the blob
+  // after grace).
+  string name = 1;
+}
+
+message DeleteSkillResponse {
+  // Whether a live row was deleted (idempotent: deleting an absent skill is
+  // `false`, not an error).
+  bool deleted = 1;
+}

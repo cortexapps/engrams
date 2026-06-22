@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::error::MetaError;
+use crate::types::capability::Capability;
 use crate::types::event::{ArtifactRow, PersistedEvent};
 use crate::types::host::{HostHeartbeat, HostRecord, HostStatus};
 use crate::types::ids::{HostId, SandboxId, SessionId};
@@ -762,9 +763,9 @@ pub trait MetadataStore: Send + Sync {
     /// ADR 0014 M1.11: fetch a single snapshot row by id. Used by
     /// the heartbeat-ack template enrichment path to surface the
     /// snapshot's persisted `disk_manifest` + `memory_manifest`
-    /// to host-agents — without those, warm-pool refill on a
-    /// fresh host has no way to materialize the rootfs file FC
-    /// `load_snapshot` needs.
+    /// to host-agents — without those, a base-snapshot restore
+    /// on a fresh host has no way to materialize the rootfs file
+    /// FC `load_snapshot` needs.
     ///
     /// Default returns `None` so backends that don't have a real
     /// DB (mocks, tests) opt out cleanly; callers that depend on
@@ -1184,6 +1185,55 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Option<SessionSecrets>, MetaError>;
     async fn delete_session_secrets(&self, session_id: SessionId) -> Result<(), MetaError>;
 
+    // ---- session capabilities (ADR 0056) ----
+    //
+    // The `(provider, action, resource)` grants a profile declared, bound
+    // to the session at create (`session_capabilities`). The broker reads
+    // them to clamp every guest credential/action request. Default impls so
+    // stores that don't model capabilities (test doubles) compile unchanged;
+    // `PostgresStore` is the authority. `bind` is idempotent and a no-op on
+    // an empty set — both create paths (boot + enqueue) call it, and the
+    // queued-then-booted re-prepare carries an empty set (the rows were
+    // bound at enqueue), so the no-op preserves them.
+    async fn bind_session_capabilities(
+        &self,
+        session_id: SessionId,
+        caps: &[Capability],
+    ) -> Result<(), MetaError> {
+        let _ = (session_id, caps);
+        Ok(())
+    }
+    async fn get_session_capabilities(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<Capability>, MetaError> {
+        let _ = session_id;
+        Ok(Vec::new())
+    }
+
+    // ---- session integration policy (ADR 0056 B′) ----
+    //
+    // The orchestrator-compiled per-session policy, persisted verbatim as its
+    // JSON string so the queued re-prepare + resume can rebuild the egress
+    // injects without the orchestrator. One blob per session (upsert). Default
+    // impls (no-op / None) so test doubles compile; `PostgresStore` is the
+    // authority.
+    async fn bind_session_integration_policy(
+        &self,
+        session_id: SessionId,
+        policy_json: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (session_id, policy_json);
+        Ok(())
+    }
+    async fn get_session_integration_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        let _ = session_id;
+        Ok(None)
+    }
+
     // ----------------------------------------------------------------
     // ADR 0016 §A.1.5c — cross-replica per-session op lease.
     // Serializes mutually-exclusive session-lifecycle ops (idle
@@ -1442,11 +1492,59 @@ pub trait MetadataStore: Send + Sync {
     // ADR 0035 — bundle-generation GC (mirrors the chunk GC trio).
 
     /// ADR 0035 §5: the bundle pin set — every `(drive_id, sha256)`
-    /// some `snapshots.aux_bundles` row references. The union (plus
-    /// the hosts' reported current generations) is what the GC keeps
-    /// and what heartbeat acks advertise as `live_bundles`.
+    /// some `snapshots.aux_bundles` row references, **∪ every live
+    /// `mount_catalog` skill** (ADR 0055 P2, so a registered-but-currently-unused
+    /// uploaded skill stays staged + survives GC). The union (plus the hosts'
+    /// reported current generations) is what the GC keeps and what heartbeat
+    /// acks advertise as `live_bundles`.
     async fn bundle_pin_set(&self) -> Result<Vec<crate::types::sandbox::AuxBundleRef>, MetaError> {
         Ok(Vec::new())
+    }
+
+    // ----------------------------------------------------------------
+    // ADR 0055 P2 — org-shared user-uploaded skill catalog (`mount_catalog`).
+
+    /// Register (upsert by `name`) a packed, content-addressed user-uploaded
+    /// skill. Idempotent by content: re-registering identical bytes yields the
+    /// same `sha256`. `owner` is attribution only — the catalog is org-shared.
+    /// Returns the live row. A name matching an existing catalog row updates it
+    /// (new sha/owner/description); collision with a *fleet* bundle name is
+    /// rejected by the caller before this is reached.
+    async fn register_skill(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _description: &str,
+        _sha256: &str,
+        _mount_json: &str,
+        _size_bytes: i64,
+    ) -> Result<crate::types::CatalogSkill, MetaError> {
+        Err(MetaError::Db(
+            "register_skill is not supported by this MetadataStore".into(),
+        ))
+    }
+
+    /// Every live catalog skill (newest first) — for the orchestrator's catalog
+    /// listing + profile-editor validation.
+    async fn list_skills(&self) -> Result<Vec<crate::types::CatalogSkill>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve one selected skill name to its live catalog row, if any. The
+    /// session-create resolver calls this for a name absent from the fleet
+    /// stamp (ADR 0055 P2: `fleet_stamp ∪ mount_catalog`).
+    async fn get_skill_by_name(
+        &self,
+        _name: &str,
+    ) -> Result<Option<crate::types::CatalogSkill>, MetaError> {
+        Ok(None)
+    }
+
+    /// Soft-delete a catalog skill by name (sets `deleted_at`). Dropping it from
+    /// the pin set lets the existing bundle GC reclaim its blob after the grace
+    /// window (upload-path GC). Returns whether a live row was deleted.
+    async fn soft_delete_skill(&self, _name: &str) -> Result<bool, MetaError> {
+        Ok(false)
     }
 
     /// ADR 0035 §5: idempotent candidate upsert; `first_seen_at`

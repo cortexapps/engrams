@@ -20,15 +20,14 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use engram_core::traits::{
-    GitForge, HarnessByteStream, PullRequest, PullRequestSpec, RepoRef, ScopedToken,
-};
+use engram_core::traits::{CredentialHint, HarnessByteStream, Integration, ScopedCredential};
 use engram_core::types::ids::SessionId;
+use engram_core::types::Capability;
 use engram_harness_proto::{read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::state::{SessionEvent, SharedState};
+use crate::state::{AssetSurface, FetchableRef, SessionEvent, SharedState};
 
 // ---- shared auth + dispatch core (HTTP + vsock) ------------------------
 
@@ -64,31 +63,45 @@ async fn authorize(
     state: &SharedState,
     session: SessionId,
     token: &str,
-) -> Result<Arc<dyn GitForge>, Denied> {
-    let forge = state.forge.clone().ok_or(Denied::NoForge)?;
+) -> Result<Arc<dyn Integration>, Denied> {
+    let integration = state
+        .integrations
+        .get("github")
+        .cloned()
+        .ok_or(Denied::NoForge)?;
     if crate::api::session_auth::authorize_broker_token(state, session, token).await {
-        Ok(forge)
+        Ok(integration)
     } else {
         Err(Denied::BadToken)
     }
 }
 
 /// Mint a credential, rejecting a host that doesn't match the forge.
+///
+/// ADR 0056 (Plane A): the token is scoped to the session's bound capabilities
+/// — read them from PG and hand them to the mint, which clamps the GitHub App
+/// permissions to exactly what the profile granted (filtering to its own
+/// provider). An empty set falls back to the provider's default scopes.
 async fn op_fetch_credential(
-    forge: &Arc<dyn GitForge>,
+    state: &SharedState,
+    session: SessionId,
+    integration: &Arc<dyn Integration>,
     host: Option<String>,
     owner: Option<String>,
-) -> Result<ScopedToken, String> {
-    if let Some(h) = host.as_deref().filter(|s| !s.is_empty()) {
-        if !h.eq_ignore_ascii_case(forge.host()) {
-            return Err(format!(
-                "no forge configured for host `{h}` (this coordinator serves `{}`)",
-                forge.host()
-            ));
-        }
-    }
-    forge
-        .mint_installation_token(owner.as_deref().filter(|s| !s.is_empty()))
+) -> Result<ScopedCredential, String> {
+    let caps = state
+        .services
+        .meta
+        .get_session_capabilities(session)
+        .await
+        .unwrap_or_default();
+    // The integration validates the host against its own (e.g. github.com).
+    let hint = CredentialHint {
+        host: host.filter(|s| !s.is_empty()),
+        owner: owner.filter(|s| !s.is_empty()),
+    };
+    integration
+        .mint_credential(&caps, &hint)
         .await
         .map_err(|e| format!("mint git credential: {e}"))
 }
@@ -99,33 +112,55 @@ async fn op_fetch_credential(
 async fn op_create_pull_request(
     state: &SharedState,
     session: SessionId,
-    forge: &Arc<dyn GitForge>,
-    repo: &str,
-    spec: PullRequestSpec,
-) -> Result<PullRequest, String> {
-    let repo_ref = RepoRef::parse(repo).map_err(|e| format!("invalid repo: {e}"))?;
-    let pr = forge
-        .create_pull_request(&repo_ref, &spec)
+    integration: &Arc<dyn Integration>,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // ADR 0056 §4: PR creation is the mediated (server-performed) action. The
+    // capability isn't yet cap-gated here (the broker token + GitConfig gate
+    // it); synthesize the `pulls:write` action the GitHub integration matches.
+    let cap = Capability {
+        provider: "github".to_string(),
+        action: "pulls:write".to_string(),
+        resource: None,
+    };
+    let reply = integration
+        .perform_action(&cap, &args)
         .await
         .map_err(|e| format!("create pull request: {e}"))?;
+    // ADR 0056: a PR is one instance of the generic IntegrationAsset — a
+    // durable `forge`/`pull_request` asset whose URL is an external link. The
+    // wire stays semantic (provider + asset_kind + data); the web keys its
+    // renderer on (provider, asset_kind). Built from the request args + the
+    // real reply bytes.
+    let number = reply
+        .get("number")
+        .or_else(|| reply.get("id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let url = reply.get("url").and_then(|v| v.as_str()).map(String::from);
     if let Err(e) = state
         .emit(
             session,
-            SessionEvent::PullRequestOpened {
-                url: pr.url.clone(),
-                repo: repo.to_string(),
-                title: spec.title,
-                number: pr.id,
-                head_branch: spec.head_branch,
-                base_branch: spec.base_branch,
+            SessionEvent::IntegrationAsset {
+                provider: "forge".into(),
+                asset_kind: "pull_request".into(),
+                surface: AssetSurface::Asset,
+                data: serde_json::json!({
+                    "repo": args.get("repo"),
+                    "title": args.get("title"),
+                    "number": number,
+                    "head_branch": args.get("head_branch"),
+                    "base_branch": args.get("base_branch"),
+                }),
+                fetchable: url.map(|url| FetchableRef::External { url }),
                 at: chrono::Utc::now(),
             },
         )
         .await
     {
-        tracing::warn!(session = %session, error = %e, "emit PullRequestOpened failed (PR was created)");
+        tracing::warn!(session = %session, error = %e, "emit IntegrationAsset(forge/pull_request) failed (PR was created)");
     }
-    Ok(pr)
+    Ok(reply)
 }
 
 use crate::api::session_auth::bearer;
@@ -177,14 +212,24 @@ pub async fn git_credential(
 ) -> Result<Json<GitCredentialResponse>, ApiError> {
     let token =
         bearer(&headers).ok_or_else(|| ApiError::Unauthorized("missing forge token".into()))?;
-    let forge = authorize(&state, id, &token).await?;
-    let tok = op_fetch_credential(&forge, q.host, q.owner)
+    let integration = authorize(&state, id, &token).await?;
+    let cred = op_fetch_credential(&state, id, &integration, q.host, q.owner)
         .await
         .map_err(ApiError::Internal)?;
+    let ScopedCredential::Basic {
+        username,
+        password,
+        expires_at,
+    } = cred
+    else {
+        return Err(ApiError::Internal(
+            "github mint returned a non-basic credential".into(),
+        ));
+    };
     Ok(Json(GitCredentialResponse {
-        username: tok.username,
-        password: tok.password,
-        expires_at: tok.expires_at.to_rfc3339(),
+        username,
+        password,
+        expires_at: expires_at.to_rfc3339(),
     }))
 }
 
@@ -198,21 +243,25 @@ pub async fn create_pull_request(
 ) -> Result<Json<CreatePrResponse>, ApiError> {
     let token =
         bearer(&headers).ok_or_else(|| ApiError::Unauthorized("missing forge token".into()))?;
-    let forge = authorize(&state, id, &token).await?;
-    let spec = PullRequestSpec {
-        head_branch: req.head_branch,
-        base_branch: req.base_branch,
-        title: req.title,
-        body: req.body,
-        draft: req.draft,
-    };
-    let pr = op_create_pull_request(&state, id, &forge, &req.repo, spec)
+    let integration = authorize(&state, id, &token).await?;
+    let args = serde_json::json!({
+        "repo": req.repo,
+        "head_branch": req.head_branch,
+        "base_branch": req.base_branch,
+        "title": req.title,
+        "body": req.body,
+        "draft": req.draft,
+    });
+    let reply = op_create_pull_request(&state, id, &integration, args)
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(CreatePrResponse {
-        url: pr.url,
-        id: pr.id,
-        state: pr.state,
+        url: reply["url"].as_str().unwrap_or_default().to_string(),
+        id: reply["id"]
+            .as_u64()
+            .or_else(|| reply["number"].as_u64())
+            .unwrap_or(0),
+        state: reply["state"].as_str().unwrap_or_default().to_string(),
     }))
 }
 
@@ -261,7 +310,7 @@ pub async fn handle_vsock_connection(state: SharedState, mut stream: HarnessByte
 }
 
 async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeResponse {
-    let forge = match authorize(state, req.session_id, &req.broker_token).await {
+    let integration = match authorize(state, req.session_id, &req.broker_token).await {
         Ok(f) => f,
         Err(d) => {
             return ForgeResponse::Error {
@@ -271,10 +320,13 @@ async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeRespons
     };
     match req.op {
         ForgeOp::FetchCredential { host, owner } => {
-            match op_fetch_credential(&forge, Some(host), owner).await {
-                Ok(t) => ForgeResponse::Credential {
-                    username: t.username,
-                    password: t.password,
+            match op_fetch_credential(state, req.session_id, &integration, Some(host), owner).await
+            {
+                Ok(ScopedCredential::Basic {
+                    username, password, ..
+                }) => ForgeResponse::Credential { username, password },
+                Ok(_) => ForgeResponse::Error {
+                    message: "github mint returned a non-basic credential".into(),
                 },
                 Err(message) => ForgeResponse::Error { message },
             }
@@ -287,18 +339,22 @@ async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeRespons
             body,
             draft,
         } => {
-            let spec = PullRequestSpec {
-                head_branch,
-                base_branch,
-                title,
-                body,
-                draft,
-            };
-            match op_create_pull_request(state, req.session_id, &forge, &repo, spec).await {
-                Ok(pr) => ForgeResponse::PullRequest {
-                    url: pr.url,
-                    id: pr.id,
-                    state: pr.state,
+            let args = serde_json::json!({
+                "repo": repo,
+                "head_branch": head_branch,
+                "base_branch": base_branch,
+                "title": title,
+                "body": body,
+                "draft": draft,
+            });
+            match op_create_pull_request(state, req.session_id, &integration, args).await {
+                Ok(reply) => ForgeResponse::PullRequest {
+                    url: reply["url"].as_str().unwrap_or_default().to_string(),
+                    id: reply["id"]
+                        .as_u64()
+                        .or_else(|| reply["number"].as_u64())
+                        .unwrap_or(0),
+                    state: reply["state"].as_str().unwrap_or_default().to_string(),
                 },
                 Err(message) => ForgeResponse::Error { message },
             }

@@ -316,13 +316,14 @@ impl HostRegistry {
         host_id: HostId,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
+        selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         // The capacity decision already happened in `reserve_placement`; just
         // resolve the chosen host's backend (dialing through PG if this
         // replica hasn't seen the host yet — ADR 0047).
         let backend = self.backend_for(host_id).await?;
         let sandbox_id = backend
-            .restore_base_for_session(metadata, session_env)
+            .restore_base_for_session(metadata, session_env, selected_mounts)
             .await?;
         self.sandbox_owner.insert(sandbox_id, host_id);
         Ok(sandbox_id)

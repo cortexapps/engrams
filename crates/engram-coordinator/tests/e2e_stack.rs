@@ -147,6 +147,9 @@ impl Driver {
     /// execs the harness binary even if it's sitting in the rootfs.
     async fn create_session_none_harness(&mut self, image: &str) -> SessionId {
         let req = app::CreateSessionRequest {
+            selected_skills: Vec::new(),
+            capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: image.to_string(),
             mode: "dev_vm".to_string(),
             prompt: None,
@@ -159,6 +162,31 @@ impl Driver {
             .create_session(req)
             .await
             .expect("CreateSession (dev_vm)")
+            .into_inner();
+        resp.session_id.parse().expect("session_id is a SessionId")
+    }
+
+    /// ADR 0055: a `dev_vm`-mode session that mounts the named profile skills.
+    /// The coord resolves each name to its staged content sha (the e2e-stack
+    /// lane stages `skills` + the `sentinel` on the host) and `patch_drive`s it
+    /// into a reserved dyn-* slot in the paused restore window.
+    async fn create_session_skills(&mut self, image: &str, skills: &[&str]) -> SessionId {
+        let req = app::CreateSessionRequest {
+            selected_skills: skills.iter().map(|s| s.to_string()).collect(),
+            capabilities: Vec::new(),
+            integration_policy_json: String::new(),
+            image_uri: image.to_string(),
+            mode: "dev_vm".to_string(),
+            prompt: None,
+            secrets: HashMap::new(),
+            harness_env: HashMap::new(),
+            prompt_id: None,
+        };
+        let resp = self
+            .sess
+            .create_session(req)
+            .await
+            .expect("CreateSession (dev_vm + skills)")
             .into_inner();
         resp.session_id.parse().expect("session_id is a SessionId")
     }
@@ -183,6 +211,9 @@ impl Driver {
         let mut harness_env = HashMap::new();
         harness_env.insert("ANTHROPIC_API_KEY".to_string(), api_key.to_string());
         let req = app::CreateSessionRequest {
+            selected_skills: Vec::new(),
+            capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: image.to_string(),
             mode: "agent".to_string(),
             prompt: prompt.map(str::to_string),
@@ -584,34 +615,39 @@ async fn e2e_cold_session_no_harness_can_exec_ls() {
     driver.delete(sid).await;
 }
 
-/// ADR 0027: a generated session must actually carry the RO-mounted skills.
+/// ADR 0055: a session that SELECTS the `skills` profile skill must actually
+/// carry it as a dynamically-mounted RO bundle.
 ///
-/// Baked skills are retired, so a session's skills come ONLY from the
-/// `skills` squashfs the FC host mounts. The e2e-stack lane stages it at
-/// `/var/lib/engram/shared/skills.squashfs`, so this exercises the WHOLE
-/// chain end-to-end: capture attaches the aux RO drive → the snapshot embeds
-/// it → restore re-anchors by presence → the init shim mounts it at
-/// `/opt/engram/skills` → agentd wires `share-file` at SpawnHarness. (Runs on
-/// the owned 6.1 guest kernel, which has `CONFIG_SQUASHFS_ZSTD=y`.) This is
-/// the integrated counterpart to the `engram-session-bundles` unit tests and
-/// the `aux_ro_drive` FC drive-mechanism test.
+/// Baked skills are retired and skills are now profile-selected, so the session
+/// is created with `selected_skills = ["skills"]`. The e2e-stack lane stages the
+/// content-addressed `skills` + `sentinel` bundles under
+/// `/var/lib/engram/shared`, so this exercises the WHOLE ADR 0055 chain
+/// end-to-end: capture attaches the reserved sentinel slots → the coord resolves
+/// `"skills"` → its staged sha and `patch_drive`s it into a reserved slot in the
+/// paused restore window → the init shim mounts it at `/opt/engram/dyn/<i>` (the
+/// owned 6.1 guest kernel has `CONFIG_SQUASHFS_ZSTD=y`) → agentd `activate()`
+/// wires `share-file` onto PATH + the discovery dir. The mount path is a dynamic
+/// slot, so the physical-mount assertion is position-independent; the activation
+/// assertion targets the stable wired paths. Integrated counterpart to the
+/// `engram-session-bundles` unit tests + the `aux_ro_drive` FC mechanism test.
 #[tokio::test]
-#[ignore = "requires the e2e-stack lane (stages the skills RO bundle at /var/lib/engram/shared)"]
+#[ignore = "requires the e2e-stack lane (stages the skills + sentinel RO bundles at /var/lib/engram/shared)"]
 async fn e2e_session_has_mounted_skills_bundle() {
     let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
-    let sid = driver.create_session_none_harness(&image).await;
+    let sid = driver.create_session_skills(&image, &["skills"]).await;
 
-    // The bundle is mounted read-only at the canonical guest path.
+    // The bundle is mounted read-only at some reserved dyn-* slot (the exact
+    // slot index is an allocation detail) — assert position-independently.
     let mounted = driver
         .exec(
             sid,
-            "test -x /opt/engram/skills/bin/engram-share && echo MOUNTED",
+            "ls /opt/engram/dyn/*/bin/engram-share >/dev/null 2>&1 && echo MOUNTED",
         )
         .await;
     assert!(
         mounted.stdout.contains("MOUNTED"),
-        "skills RO bundle not mounted at /opt/engram/skills; stdout=<{}> stderr=<{}>",
+        "skills RO bundle not mounted under /opt/engram/dyn/*; stdout=<{}> stderr=<{}>",
         mounted.stdout,
         mounted.stderr,
     );

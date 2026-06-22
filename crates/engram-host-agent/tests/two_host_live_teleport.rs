@@ -394,6 +394,311 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     host_b.server.abort();
 }
 
+/// A faithful `claude`(libuv) stdin reader for the Phase 4 spike: hold a pipe
+/// open, register it with EPOLL, then block in `epoll_wait` for the next line,
+/// appending each to OUT. The point is to freeze a real `eppoll_entry` on the
+/// pipe's wait queue — the exact machinery ADR 0037 flagged under File-restore —
+/// NOT just a blocking `read()` (a strictly weaker property). Compiled static
+/// in a throwaway gcc stage so the slim runtime needs no toolchain.
+/// argv: `<fifo> <out> <pid> <ready>`.
+const EPOLL_READER_C: &str = r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 5) { fprintf(stderr, "usage: %s fifo out pid ready\n", argv[0]); return 2; }
+    const char *fifo = argv[1], *outp = argv[2], *pidp = argv[3], *readyp = argv[4];
+
+    /* The post-move C1 reattach nudge SIGUSR1s us; default action is terminate,
+     * so ignore it (this fake doesn't re-dial — the test drives I/O directly). */
+    signal(SIGUSR1, SIG_IGN);
+
+    FILE *pf = fopen(pidp, "w");
+    if (!pf) { perror("pid"); return 1; }
+    fprintf(pf, "%d\n", (int)getpid());
+    fclose(pf);
+
+    unlink(fifo);
+    if (mkfifo(fifo, 0600) < 0 && errno != EEXIST) { perror("mkfifo"); return 1; }
+    /* O_RDWR holds a write-end too (like the harness holding claude's stdin),
+     * so the read side never EOFs/HUPs even after a transient writer closes. */
+    int fd = open(fifo, O_RDWR);
+    if (fd < 0) { perror("open"); return 1; }
+
+    int ep = epoll_create(1); /* size arg ignored since 2.6.8; no feature-test macro needed */
+    if (ep < 0) { perror("epoll_create"); return 1; }
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) < 0) { perror("epoll_ctl"); return 1; }
+
+    /* Registration is live now — the test snapshots only after this file
+     * exists, so the frozen image holds a real eppoll_entry on the pipe. */
+    FILE *rf = fopen(readyp, "w");
+    if (rf) { fputs("1\n", rf); fclose(rf); }
+
+    for (;;) {
+        struct epoll_event out[8];
+        int n = epoll_wait(ep, out, 8, -1); /* BLOCK — the frozen mid-turn state */
+        if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); return 1; }
+        for (int i = 0; i < n; i++) {
+            if (!(out[i].events & EPOLLIN)) continue;
+            char buf[4096];
+            ssize_t r = read(fd, buf, sizeof buf);
+            if (r > 0) {
+                int of = open(outp, O_WRONLY | O_CREAT | O_APPEND, 0600);
+                if (of >= 0) { ssize_t w = write(of, buf, (size_t)r); (void)w; close(of); }
+            }
+        }
+    }
+}
+"#;
+
+/// ADR 0052 Phase 4 (warm mid-turn teleport): the load-bearing unknown the
+/// Phase 0 spike had to prove — a process blocked in `epoll_wait` on a held-open
+/// pipe (the `claude --input-format stream-json` / libuv shape: stdin held open,
+/// an `eppoll_entry` registered on the pipe, the event loop parked waiting for
+/// the next user line) survives the live UFFD teleport AND resumes — its epoll
+/// fires for a write delivered AFTER the move. This is the EXACT mechanism
+/// ADR 0037 found wedged under File-restore; here we prove it holds across a
+/// real two-host UFFD teleport. The sibling reattach arm proves the process
+/// survives with its PID; this proves its epoll-registered stdin pipe survives
+/// too, so a streaming agent crosses warm mid-turn and keeps consuming input —
+/// no turn restart. The harness-engine half (a connection bounce doesn't abort
+/// the in-flight turn) is unit-tested in engram-harness-claude's
+/// `connection_bounce_mid_turn_preserves_the_run`.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + Docker; boots microVMs on two host stacks"]
+async fn two_host_live_teleport_held_stdin_pipe_survives() {
+    if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
+        return;
+    }
+    let Some((kernel, handler, agent)) = gate() else {
+        return;
+    };
+    std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
+
+    let shared = tempfile::tempdir().expect("shared dir");
+    let blob_root = shared.path().join("blob");
+    let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+        engram_storage_local::LocalBlobStorage::new(blob_root.clone()),
+    );
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+
+    let src = tempfile::tempdir().expect("source dir");
+    std::fs::write(src.path().join("epoll_reader.c"), EPOLL_READER_C).unwrap();
+    std::fs::write(
+        src.path().join("Dockerfile"),
+        "FROM gcc:bookworm AS build\n\
+         COPY epoll_reader.c /epoll_reader.c\n\
+         RUN gcc -O2 -static -o /epoll_reader /epoll_reader.c\n\
+         FROM debian:bookworm-slim\n\
+         COPY --from=build /epoll_reader /usr/local/bin/epoll_reader\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.path().join("engram.toml"),
+        "name = \"engram-teleport-pipe\"\n",
+    )
+    .unwrap();
+    let images = tempfile::tempdir().expect("images dir");
+    let baker = Builder::new(DockerCli::new(), chunk_store.clone());
+    let outcome = baker
+        .build(&BuildRequest {
+            source: src.path().to_path_buf(),
+            repo: "engram-teleport-pipe".into(),
+            tag: "warm-1".into(),
+            images_dir: images.path().to_path_buf(),
+            format: Format::Ext4,
+            agent_injection: Some(AgentInjection {
+                agent_binary: agent,
+                vsock_port: ENGRAM_AGENTD_PORT,
+                transport: engram_image_builder::Transport::Vsock,
+                init_script: None,
+            }),
+        })
+        .await
+        .expect("bake");
+
+    let (pooled_a, _work_a) = build_host("pipe-a", &kernel, &handler, &blob_root, &chunk_store);
+    let (pooled_b, _work_b) = build_host("pipe-b", &kernel, &handler, &blob_root, &chunk_store);
+    let host_a = serve(pooled_a).await;
+    let host_b = serve(pooled_b).await;
+    let client_a = dial(host_a.addr).await;
+    let client_b = dial(host_b.addr).await;
+
+    let spec = SandboxSpec {
+        image: "engram-teleport-pipe".into(),
+        rootfs_source: Some(outcome.rootfs_path),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 256 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: Vec::new(),
+    };
+    let vm = host_a.pooled.create(spec).await.expect("create on A");
+    let _ = exec(&host_a.pooled, vm, "true").await;
+    let ckpt = host_a
+        .pooled
+        .checkpoint_sandbox(vm)
+        .await
+        .expect("seed checkpoint on A");
+
+    // The streaming-stdin claude analog as the harness: the epoll reader holds a
+    // FIFO open, registers it with epoll, and parks in `epoll_wait` for the next
+    // line. At snapshot time it's frozen in epoll_wait with a live eppoll_entry
+    // on the pipe and NOTHING yet consumed — exactly the mid-turn "awaiting the
+    // next stdin line" state of a libuv agent.
+    const PIPE: &str = "/dev/shm/claude-stdin";
+    const OUT: &str = "/dev/shm/claude-out";
+    let reader_argv: Vec<String> = vec![
+        "/usr/local/bin/epoll_reader".into(),
+        PIPE.into(),
+        OUT.into(),
+        "/dev/shm/reader-pid".into(),
+        "/dev/shm/epoll-ready".into(),
+    ];
+    host_a
+        .pooled
+        .start_agent(
+            vm,
+            engram_core::types::sandbox::AgentSpec {
+                argv: reader_argv.clone(),
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: None,
+            },
+        )
+        .await
+        .expect("start the epoll stdin reader on A");
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let reader_pid_a = exec(&host_a.pooled, vm, "cat /dev/shm/reader-pid")
+        .await
+        .trim()
+        .to_string();
+    assert!(!reader_pid_a.is_empty(), "reader running on A");
+    // The epoll registration is live (so the frozen image holds an eppoll_entry
+    // on the pipe), and nothing is consumed yet — parked in epoll_wait.
+    let ready = exec(&host_a.pooled, vm, "cat /dev/shm/epoll-ready 2>/dev/null")
+        .await
+        .trim()
+        .to_string();
+    assert_eq!(
+        ready, "1",
+        "the reader registered the pipe with epoll before the move"
+    );
+    let pre = exec(
+        &host_a.pooled,
+        vm,
+        &format!("cat {OUT} 2>/dev/null | wc -c"),
+    )
+    .await
+    .trim()
+    .to_string();
+    assert_eq!(
+        pre, "0",
+        "the reader is parked in epoll_wait with an empty output before the move"
+    );
+
+    // ---- The move, over the wire ----
+    let cap = client_a.migration_capture(vm).await.expect("capture on A");
+    let mut metadata = ckpt.clone();
+    metadata.id = cap.snapshot_id;
+    metadata.memory_manifest = Some(cap.memory_manifest_ref);
+    metadata.disk_manifest = (!cap.disk_manifest_json.is_empty()).then_some(cap.disk_manifest_ref);
+    metadata.state_blob_key = None;
+    metadata.sidecar_blob_key = None;
+    metadata.migration_source = Some(MigrationSourceInfo {
+        export_id: cap.export_id.clone(),
+        source_addr: format!("http://{}", host_a.addr),
+        memory_manifest_json: cap.memory_manifest_json.clone(),
+        disk_manifest_json: cap.disk_manifest_json.clone(),
+        memory_manifest_ref: cap.memory_manifest_ref,
+        disk_manifest_ref: cap.disk_manifest_ref,
+        new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
+        new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
+        hot_chunks: vec![],
+        post_copy: false,
+        peer_addr: None,
+        peer_token: None,
+        sidecar_json: Vec::new(),
+    });
+    let moved = client_b.restore(metadata).await.expect("restore on B");
+
+    // Post-move handshake → the C1 reattach arm (SIGUSR1 ignored by this fake).
+    host_b
+        .pooled
+        .start_agent(
+            moved,
+            engram_core::types::sandbox::AgentSpec {
+                argv: reader_argv.clone(),
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: None,
+            },
+        )
+        .await
+        .expect("post-move handshake on B");
+    let reader_pid_b = exec(&host_b.pooled, moved, "cat /dev/shm/reader-pid")
+        .await
+        .trim()
+        .to_string();
+    assert_eq!(
+        reader_pid_a, reader_pid_b,
+        "the epoll reader must be REATTACHED (same in-guest pid), not respawned"
+    );
+
+    // THE PROOF: write a line into the held pipe AFTER the move. If the pipe AND
+    // the reader's frozen `epoll_wait` (its eppoll_entry on the pipe wait queue)
+    // survived the UFFD restore, ep_poll_callback fires, epoll_wait wakes, the
+    // reader reads the line and appends the marker — a libuv streaming agent
+    // consuming its next stdin line post-teleport, no turn restart.
+    const MARKER: &str = "engram-teleport-marker";
+    let wrote = exec(
+        &host_b.pooled,
+        moved,
+        &format!("printf '%s\\n' '{MARKER}' > {PIPE} && echo wrote"),
+    )
+    .await;
+    assert_eq!(wrote.trim(), "wrote", "post-move write into the held pipe");
+    // Give the resumed reader a moment to consume + append.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let consumed = exec(&host_b.pooled, moved, &format!("cat {OUT}"))
+        .await
+        .trim()
+        .to_string();
+    assert_eq!(
+        consumed, MARKER,
+        "epoll survived the teleport: the reader's frozen epoll_wait woke for a \
+         post-move write to the held pipe (the libuv streaming-claude warm-cross \
+         guarantee — the ADR 0037 File-restore wedge does NOT occur under UFFD)"
+    );
+
+    client_a
+        .migration_commit(vm, &cap.export_id)
+        .await
+        .expect("commit on A");
+    host_b.pooled.destroy(moved).await.expect("destroy moved");
+    host_a.server.abort();
+    host_b.server.abort();
+}
+
 /// The NBD-rootfs arm (prod canaries 5fa742b7 / 4391e591): production
 /// sessions run on a CHUNKED-NBD rootfs, and both prod teleport
 /// canaries came out the other side with a corrupt disk — zeros /

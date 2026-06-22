@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/profile.proto.
  */
 export const file_engram_app_v1_profile: GenFile = /*@__PURE__*/
-  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Byb2ZpbGUucHJvdG8SDWVuZ3JhbS5hcHAudjEilgIKB1Byb2ZpbGUSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRpY29uGAQgASgJEhAKCGltYWdlX2lkGAUgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBiABKAgSNQoIZW52X3ZhcnMYByADKAsyIy5lbmdyYW0uYXBwLnYxLlByb2ZpbGUuRW52VmFyc0VudHJ5EhAKCGFyY2hpdmVkGAggASgIEhIKCmNyZWF0ZWRfYXQYCSABKAkSEgoKdXBkYXRlZF9hdBgKIAEoCRouCgxFbnZWYXJzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJeCg9Qcm9maWxlU25hcHNob3QSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIMCgRpY29uGAMgASgJEhAKCGFyY2hpdmVkGAQgASgIEhEKCWltYWdlX3VyaRgFIAEoCSIvChNMaXN0UHJvZmlsZXNSZXF1ZXN0EhgKEGluY2x1ZGVfYXJjaGl2ZWQYASABKAgiQAoUTGlzdFByb2ZpbGVzUmVzcG9uc2USKAoIcHJvZmlsZXMYASADKAsyFi5lbmdyYW0uYXBwLnYxLlByb2ZpbGUiHwoRR2V0UHJvZmlsZVJlcXVlc3QSCgoCaWQYASABKAkiPQoSR2V0UHJvZmlsZVJlc3BvbnNlEicKB3Byb2ZpbGUYASABKAsyFi5lbmdyYW0uYXBwLnYxLlByb2ZpbGUi6gEKFENyZWF0ZVByb2ZpbGVSZXF1ZXN0EgwKBG5hbWUYASABKAkSEwoLZGVzY3JpcHRpb24YAiABKAkSDAoEaWNvbhgDIAEoCRIQCghpbWFnZV9pZBgEIAEoCRIbChNpbmNsdWRlX3VzZXJfdG9rZW5zGAUgASgIEkIKCGVudl92YXJzGAYgAygLMjAuZW5ncmFtLmFwcC52MS5DcmVhdGVQcm9maWxlUmVxdWVzdC5FbnZWYXJzRW50cnkaLgoMRW52VmFyc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiQAoVQ3JlYXRlUHJvZmlsZVJlc3BvbnNlEicKB3Byb2ZpbGUYASABKAsyFi5lbmdyYW0uYXBwLnYxLlByb2ZpbGUi9gEKFFVwZGF0ZVByb2ZpbGVSZXF1ZXN0EgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSDAoEaWNvbhgEIAEoCRIQCghpbWFnZV9pZBgFIAEoCRIbChNpbmNsdWRlX3VzZXJfdG9rZW5zGAYgASgIEkIKCGVudl92YXJzGAcgAygLMjAuZW5ncmFtLmFwcC52MS5VcGRhdGVQcm9maWxlUmVxdWVzdC5FbnZWYXJzRW50cnkaLgoMRW52VmFyc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiQAoVVXBkYXRlUHJvZmlsZVJlc3BvbnNlEicKB3Byb2ZpbGUYASABKAsyFi5lbmdyYW0uYXBwLnYxLlByb2ZpbGUiIgoURGVsZXRlUHJvZmlsZVJlcXVlc3QSCgoCaWQYASABKAkiFwoVRGVsZXRlUHJvZmlsZVJlc3BvbnNlMtADCg5Qcm9maWxlU2VydmljZRJXCgxMaXN0UHJvZmlsZXMSIi5lbmdyYW0uYXBwLnYxLkxpc3RQcm9maWxlc1JlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkxpc3RQcm9maWxlc1Jlc3BvbnNlElEKCkdldFByb2ZpbGUSIC5lbmdyYW0uYXBwLnYxLkdldFByb2ZpbGVSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5HZXRQcm9maWxlUmVzcG9uc2USWgoNQ3JlYXRlUHJvZmlsZRIjLmVuZ3JhbS5hcHAudjEuQ3JlYXRlUHJvZmlsZVJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXNwb25zZRJaCg1VcGRhdGVQcm9maWxlEiMuZW5ncmFtLmFwcC52MS5VcGRhdGVQcm9maWxlUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuVXBkYXRlUHJvZmlsZVJlc3BvbnNlEloKDURlbGV0ZVByb2ZpbGUSIy5lbmdyYW0uYXBwLnYxLkRlbGV0ZVByb2ZpbGVSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5EZWxldGVQcm9maWxlUmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Byb2ZpbGUucHJvdG8SDWVuZ3JhbS5hcHAudjEivAIKB1Byb2ZpbGUSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRpY29uGAQgASgJEhAKCGltYWdlX2lkGAUgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBiABKAgSNQoIZW52X3ZhcnMYByADKAsyIy5lbmdyYW0uYXBwLnYxLlByb2ZpbGUuRW52VmFyc0VudHJ5EhAKCGFyY2hpdmVkGAggASgIEhIKCmNyZWF0ZWRfYXQYCSABKAkSEgoKdXBkYXRlZF9hdBgKIAEoCRIOCgZza2lsbHMYCyADKAkSFAoMY2FwYWJpbGl0aWVzGAwgAygJGi4KDEVudlZhcnNFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIl4KD1Byb2ZpbGVTbmFwc2hvdBIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEgwKBGljb24YAyABKAkSEAoIYXJjaGl2ZWQYBCABKAgSEQoJaW1hZ2VfdXJpGAUgASgJIi8KE0xpc3RQcm9maWxlc1JlcXVlc3QSGAoQaW5jbHVkZV9hcmNoaXZlZBgBIAEoCCJAChRMaXN0UHJvZmlsZXNSZXNwb25zZRIoCghwcm9maWxlcxgBIAMoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSIfChFHZXRQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCSI9ChJHZXRQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSKQAgoUQ3JlYXRlUHJvZmlsZVJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIMCgRpY29uGAMgASgJEhAKCGltYWdlX2lkGAQgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBSABKAgSQgoIZW52X3ZhcnMYBiADKAsyMC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXF1ZXN0LkVudlZhcnNFbnRyeRIOCgZza2lsbHMYByADKAkSFAoMY2FwYWJpbGl0aWVzGAggAygJGi4KDEVudlZhcnNFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIkAKFUNyZWF0ZVByb2ZpbGVSZXNwb25zZRInCgdwcm9maWxlGAEgASgLMhYuZW5ncmFtLmFwcC52MS5Qcm9maWxlIpwCChRVcGRhdGVQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEgwKBGljb24YBCABKAkSEAoIaW1hZ2VfaWQYBSABKAkSGwoTaW5jbHVkZV91c2VyX3Rva2VucxgGIAEoCBJCCghlbnZfdmFycxgHIAMoCzIwLmVuZ3JhbS5hcHAudjEuVXBkYXRlUHJvZmlsZVJlcXVlc3QuRW52VmFyc0VudHJ5Eg4KBnNraWxscxgIIAMoCRIUCgxjYXBhYmlsaXRpZXMYCSADKAkaLgoMRW52VmFyc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiQAoVVXBkYXRlUHJvZmlsZVJlc3BvbnNlEicKB3Byb2ZpbGUYASABKAsyFi5lbmdyYW0uYXBwLnYxLlByb2ZpbGUiIgoURGVsZXRlUHJvZmlsZVJlcXVlc3QSCgoCaWQYASABKAkiFwoVRGVsZXRlUHJvZmlsZVJlc3BvbnNlMtADCg5Qcm9maWxlU2VydmljZRJXCgxMaXN0UHJvZmlsZXMSIi5lbmdyYW0uYXBwLnYxLkxpc3RQcm9maWxlc1JlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkxpc3RQcm9maWxlc1Jlc3BvbnNlElEKCkdldFByb2ZpbGUSIC5lbmdyYW0uYXBwLnYxLkdldFByb2ZpbGVSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5HZXRQcm9maWxlUmVzcG9uc2USWgoNQ3JlYXRlUHJvZmlsZRIjLmVuZ3JhbS5hcHAudjEuQ3JlYXRlUHJvZmlsZVJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXNwb25zZRJaCg1VcGRhdGVQcm9maWxlEiMuZW5ncmFtLmFwcC52MS5VcGRhdGVQcm9maWxlUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuVXBkYXRlUHJvZmlsZVJlc3BvbnNlEloKDURlbGV0ZVByb2ZpbGUSIy5lbmdyYW0uYXBwLnYxLkRlbGV0ZVByb2ZpbGVSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5EZWxldGVQcm9maWxlUmVzcG9uc2ViBnByb3RvMw");
 
 /**
  * An admin-curated bundle of session-launch inputs (ADR §1).
@@ -83,6 +83,25 @@ export type Profile = Message<"engram.app.v1.Profile"> & {
    * @generated from field: string updated_at = 10;
    */
   updatedAt: string;
+
+  /**
+   * ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
+   * ["skills", "playwright"]). The coordinator resolves each to a reserved-slot
+   * mount at session create. Empty = base session (no skills).
+   *
+   * @generated from field: repeated string skills = 11;
+   */
+  skills: string[];
+
+  /**
+   * ADR 0056: integration capabilities ("provider:action[@resource]") this
+   * profile grants. Threaded to CreateSessionRequest.capabilities; the
+   * coordinator binds + (later) clamps. Member-visible (describes granted
+   * access, like skills — not sensitive like env_vars).
+   *
+   * @generated from field: repeated string capabilities = 12;
+   */
+  capabilities: string[];
 };
 
 /**
@@ -235,6 +254,20 @@ export type CreateProfileRequest = Message<"engram.app.v1.CreateProfileRequest">
    * @generated from field: map<string, string> env_vars = 6;
    */
   envVars: { [key: string]: string };
+
+  /**
+   * ADR 0055: dynamic skill bundle names (see Profile.skills).
+   *
+   * @generated from field: repeated string skills = 7;
+   */
+  skills: string[];
+
+  /**
+   * ADR 0056: integration capabilities (see Profile.capabilities).
+   *
+   * @generated from field: repeated string capabilities = 8;
+   */
+  capabilities: string[];
 };
 
 /**
@@ -299,6 +332,20 @@ export type UpdateProfileRequest = Message<"engram.app.v1.UpdateProfileRequest">
    * @generated from field: map<string, string> env_vars = 7;
    */
   envVars: { [key: string]: string };
+
+  /**
+   * ADR 0055: dynamic skill bundle names (see Profile.skills).
+   *
+   * @generated from field: repeated string skills = 8;
+   */
+  skills: string[];
+
+  /**
+   * ADR 0056: integration capabilities (see Profile.capabilities).
+   *
+   * @generated from field: repeated string capabilities = 9;
+   */
+  capabilities: string[];
 };
 
 /**

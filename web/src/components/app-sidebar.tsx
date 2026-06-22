@@ -37,7 +37,7 @@ interface Dest extends NavItem {
 const DESTS: Dest[] = [
   {
     to: "/sessions",
-    label: "Sessions",
+    label: "Tasks",
     icon: SquareTerminal,
     adminOnly: false,
     match: (p) => p === "/" || p.startsWith("/sessions"),
@@ -66,7 +66,7 @@ export function MainSidebar() {
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton asChild size="lg">
-              <Link to="/sessions" aria-label="engrams — sessions">
+              <Link to="/sessions" aria-label="engrams — tasks">
                 <span className="flex aspect-square size-8 items-center justify-center">
                   <EngramMark size={26} mode="static" />
                 </span>

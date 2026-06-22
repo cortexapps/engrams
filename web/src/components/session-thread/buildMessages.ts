@@ -71,14 +71,19 @@ export interface FileChangeArgs {
  *  harness-register events that aren't agent messages. */
 export type SystemMarker =
   | { kind: "durability"; mark: "snapshot" | "resumed"; sizeBytes?: number; at: string }
+  // ADR 0056: a generic integration asset/action. Subsumes the old
+  // `pull_request` marker. The renderer keys on (provider, assetKind) with a
+  // generic fallback (SystemMessage.tsx) — no per-provider marker shape.
   | {
-      kind: "pull_request";
-      url: string;
-      repo: string;
-      title: string;
-      number: number;
-      headBranch: string;
-      baseBranch: string;
+      kind: "integration_asset";
+      provider: string;
+      assetKind: string;
+      surface: "action" | "asset";
+      data: Record<string, unknown>;
+      fetchable:
+        | { kind: "external"; url: string }
+        | { kind: "artifact"; artifactId: string; mediaType: string; sizeBytes: number }
+        | null;
       at: string;
     }
   | {
@@ -209,26 +214,26 @@ export function buildMessages(
   // that lands, so re-running yields identical text — no double-render).
   streamingText = "",
 ): BuildMessagesResult {
-  let out: Draft[] = [];
+  const out: Draft[] = [];
 
   // The assistant message currently accumulating this run's parts, or null
   // between runs / after a harness marker breaks the flow.
   let active: Draft | null = null;
   const openTools = new Map<string, ToolPart>(); // tool_call_id → part
   const openExecs = new Map<string, ToolPart>(); // exec_id → part
-  // Phase 1b: user-turn drafts keyed by prompt_id. A user message is
-  // rendered "pending" (greyed) from the moment its `role:user` echo
-  // lands until its `run_started{prompt_id}` consumes it — covering both
-  // the send→echo gap and a type-ahead message that's still queued.
-  const userDraftByPromptId = new Map<string, Draft>();
+  // The text of a user prompt that carried a client-minted prompt_id, held by
+  // id until its consuming `run_started{prompt_id}`. A prompt_id user message
+  // is NOT rendered inline at echo time: it enters the transcript at the
+  // CONSUMPTION position, so a message queued mid-run lands AFTER the turn it
+  // was queued during (not above it). While still queued it lives by the
+  // composer — `SessionThread` renders the `queue` there (Claude-Code style).
+  const heldUserText = new Map<string, { text: string; at: string }>();
 
   // ADR 0052: the harness-owned queue, mirrored from events. prompt_id →
-  // summary, insertion-ordered (oldest→newest). Entries leave on
-  // run_started (consumed), prompt_dequeued, or are updated by prompt_edited.
+  // summary, insertion-ordered (oldest→newest). Entries leave on run_started
+  // (consumed) or prompt_dequeued, or are updated by prompt_edited. Surfaced
+  // as `queue` for the composer's queued-message rail.
   const queued = new Map<string, string>();
-  // prompt_ids whose greyed user bubble was pulled out of the thread by a
-  // dequeue (recalled to the composer / cancelled) — filtered from `out`.
-  const dequeuedPromptIds = new Set<string>();
 
   // Is a run in flight (run_started seen, no run_completed/_interrupted yet)?
   let runOpen = false;
@@ -254,12 +259,21 @@ export function buildMessages(
     return null;
   };
 
+  // Assistant message ids MUST be position-independent. A previous `a:${out.length}`
+  // scheme keyed on array position, so inserting/removing an earlier bubble (a
+  // queued user message landing mid-run, or a `prompt_dequeued` filtering one out
+  // after the loop) re-numbered every later assistant turn — and assistant-ui keys
+  // messages by id, so a turn silently changing id throws "a message with the same
+  // id already exists in the parent tree" (the crash). A dedicated monotonic counter
+  // gives the Nth assistant turn a STABLE `a:N` regardless of what surrounds it.
+  let assistantSeq = 0;
+
   const ensureAssistant = (at?: string): Draft => {
     if (active) return active;
     active = {
       role: "assistant",
       content: [],
-      id: `a:${out.length}`,
+      id: `a:${assistantSeq++}`,
       createdAt: at ? new Date(at) : undefined,
       status: { type: "running" },
     };
@@ -321,10 +335,27 @@ export function buildMessages(
         runOpen = true;
         active = null;
         runStartLen = out.length;
-        // Most harnesses carry the prompt on a preceding user agent_message
-        // (our claude harness sends a null prompt_summary). When a summary
-        // IS present, surface it as the user turn.
-        if (ev.prompt_summary) {
+        if (ev.prompt_id) {
+          // The prompt that started this run enters the conversation HERE — its
+          // consumption position. For a message queued mid-run that's AFTER the
+          // turn it was queued during (the correct order); for an idle prompt
+          // it's right where it was sent. Text from the held echo (full text),
+          // falling back to the queue summary.
+          const held = heldUserText.get(ev.prompt_id);
+          const text = held?.text ?? queued.get(ev.prompt_id) ?? "";
+          if (text) {
+            out.push({
+              role: "user",
+              content: [{ type: "text", text }],
+              id: ev.prompt_id,
+              createdAt: held ? new Date(held.at) : new Date(ev.at),
+            });
+          }
+          heldUserText.delete(ev.prompt_id);
+          queued.delete(ev.prompt_id); // consumed → leaves the queue
+        } else if (ev.prompt_summary) {
+          // No prompt_id (env-seeded initial prompt) but a summary is present —
+          // surface it as the user turn at its run position.
           out.push({
             role: "user",
             content: [{ type: "text", text: ev.prompt_summary }],
@@ -332,35 +363,29 @@ export function buildMessages(
             createdAt: new Date(ev.at),
           });
         }
-        // Phase 1b: the prompt that started this run is now consumed —
-        // un-grey its pending user bubble (optimistic/queued → solid).
-        if (ev.prompt_id) {
-          const d = userDraftByPromptId.get(ev.prompt_id);
-          if (d?.metadata?.custom) delete d.metadata.custom.pending;
-          userDraftByPromptId.delete(ev.prompt_id);
-          queued.delete(ev.prompt_id); // consumed → leaves the queue
-        }
         break;
       }
 
       case "agent_message": {
         if (ev.role === "user") {
           active = null;
-          // Phase 1b: a `prompt_id` ties this echo to the optimistic
-          // bubble (dedup, same id) and marks it "pending" (greyed) until
-          // its run_started consumes it. Echoes without a prompt_id (e.g.
-          // the env-seeded initial prompt) render solid as before.
-          const draft: Draft = {
-            role: "user",
-            content: [{ type: "text", text: ev.text }],
-            id: ev.prompt_id ?? `m:${idx}`,
-            createdAt: new Date(ev.at),
-          };
           if (ev.prompt_id) {
-            draft.metadata = { custom: { pending: true } };
-            userDraftByPromptId.set(ev.prompt_id, draft);
+            // HOLD — don't render inline. The echo of a prompt_id user message
+            // is logged at send/queue time, which for a queued message is mid
+            // the PRIOR run; rendering it here would place it above that run's
+            // response. Instead we hold the text and emit the bubble at its
+            // `run_started{prompt_id}` (the consumption position). While still
+            // queued it shows by the composer, not in the thread.
+            heldUserText.set(ev.prompt_id, { text: ev.text, at: ev.at });
+          } else {
+            // No prompt_id (env-seeded initial prompt) — render inline.
+            out.push({
+              role: "user",
+              content: [{ type: "text", text: ev.text }],
+              id: `m:${idx}`,
+              createdAt: new Date(ev.at),
+            });
           }
-          out.push(draft);
         } else if (ev.role === "system") {
           pushSystem(`m:${idx}`, ev.text, { kind: "note", role: ev.role, at: ev.at });
         } else {
@@ -516,18 +541,35 @@ export function buildMessages(
         });
         break;
 
-      case "pull_request_opened":
-        pushSystem(`pr:${idx}`, `opened PR #${ev.number}: ${ev.title}`, {
-          kind: "pull_request",
-          url: ev.url,
-          repo: ev.repo,
-          title: ev.title,
-          number: ev.number,
-          headBranch: ev.head_branch,
-          baseBranch: ev.base_branch,
+      case "integration_asset": {
+        const f = ev.fetchable;
+        // Fallback text (single-part shape constraint) — a title if the
+        // payload carries one, else the provider/kind pair.
+        const fallback =
+          typeof ev.data?.title === "string"
+            ? (ev.data.title as string)
+            : `${ev.provider} ${ev.asset_kind}`;
+        pushSystem(`ia:${idx}`, fallback, {
+          kind: "integration_asset",
+          provider: ev.provider,
+          assetKind: ev.asset_kind,
+          surface: ev.surface,
+          data: ev.data ?? {},
+          fetchable:
+            f == null
+              ? null
+              : f.kind === "external"
+                ? { kind: "external", url: f.url }
+                : {
+                    kind: "artifact",
+                    artifactId: f.artifact_id,
+                    mediaType: f.media_type,
+                    sizeBytes: f.size_bytes,
+                  },
           at: ev.at,
         });
         break;
+      }
 
       case "file_shared":
         pushSystem(`art:${idx}`, ev.caption ?? "shared a file", {
@@ -597,9 +639,9 @@ export function buildMessages(
       }
       case "prompt_dequeued": {
         queued.delete(ev.prompt_id);
-        // The greyed bubble (keyed by prompt_id) leaves the thread — it's back
-        // in the composer being edited, or cancelled.
-        dequeuedPromptIds.add(ev.prompt_id);
+        // Recalled before consumption (back in the composer / cancelled) — drop
+        // the held text so it never enters the transcript.
+        heldUserText.delete(ev.prompt_id);
         break;
       }
 
@@ -618,12 +660,6 @@ export function buildMessages(
       for (let i = lenBefore; i < out.length; i++) markRewound(out[i]!);
       if (active) markRewound(active);
     }
-  }
-
-  // ADR 0052: drop greyed bubbles pulled out of the thread by a dequeue
-  // (recalled to the composer / cancelled). Their id IS the prompt_id.
-  if (dequeuedPromptIds.size) {
-    out = out.filter((d) => !dequeuedPromptIds.has(d.id));
   }
 
   // Bug fix (mid-turn eviction): the session's authoritative status wins over

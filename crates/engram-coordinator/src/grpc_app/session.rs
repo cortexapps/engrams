@@ -534,6 +534,9 @@ mod tests {
     fn create_request_from_proto_drops_harness_env() {
         use engram_protocol::app;
         let r = app::CreateSessionRequest {
+            selected_skills: Vec::new(),
+            capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: "localhost:5001/demo:warm".into(),
             mode: "agent".into(),
             prompt: None,
@@ -560,6 +563,9 @@ mod tests {
     fn harness_env_folds_into_identity_env_verbatim() {
         use engram_protocol::app;
         let r = app::CreateSessionRequest {
+            selected_skills: Vec::new(),
+            capabilities: Vec::new(),
+            integration_policy_json: String::new(),
             image_uri: "localhost:5001/demo:warm".into(),
             mode: "agent".into(),
             prompt: None,

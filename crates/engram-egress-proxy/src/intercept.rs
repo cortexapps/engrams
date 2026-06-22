@@ -31,8 +31,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+use engram_core::SessionId;
+
 use crate::cert_mint::CertMint;
-use crate::registry::SecretEntry;
+use crate::inject;
+use crate::observe::{self, ObserveSink};
+use crate::registry::{InjectEntry, ObserveEntry, SecretEntry};
 use crate::replayed::Replayed;
 use crate::resolver::{ResolveError, UpstreamResolver};
 use crate::substitute::{scan_for_violation, substitute};
@@ -50,7 +54,17 @@ pub enum InterceptError {
     Tls(rustls::Error),
     Mint(crate::cert_mint::MintError),
     Resolve(ResolveError),
-    Violation { placeholder: String },
+    Violation {
+        placeholder: String,
+    },
+    /// ADR 0056: an inject-gated host got a request whose (method, path)
+    /// matched no injection's `RequestPolicy` — the operation isn't permitted.
+    RequestRejected {
+        method: String,
+        path: String,
+    },
+    /// ADR 0056: an inject-gated request had no parseable HTTP/1.1 request line.
+    MalformedRequest,
     InvalidServerName(String),
 }
 
@@ -63,6 +77,12 @@ impl std::fmt::Display for InterceptError {
             Self::Resolve(e) => write!(f, "resolve: {e}"),
             Self::Violation { placeholder } => {
                 write!(f, "placeholder leak: {placeholder} sent to disallowed host")
+            }
+            Self::RequestRejected { method, path } => {
+                write!(f, "request rejected by integration policy: {method} {path}")
+            }
+            Self::MalformedRequest => {
+                write!(f, "malformed request line on an inject-gated host")
             }
             Self::InvalidServerName(s) => write!(f, "invalid SNI `{s}`"),
         }
@@ -216,6 +236,10 @@ pub async fn run<C>(
     port: u16,
     resolver: Arc<dyn UpstreamResolver>,
     secrets: &[&SecretEntry],
+    injects: &[&InjectEntry],
+    observes: &[&ObserveEntry],
+    session_id: SessionId,
+    sink: Option<&ObserveSink>,
     server_cfg: Arc<ServerConfig>,
     client_cfg: Arc<ClientConfig>,
 ) -> Result<(), InterceptError>
@@ -262,12 +286,69 @@ where
         }
     }
 
+    // Parse the request line once if any inject/observe gating needs it
+    // (method + path are stable across header injection + substitution).
+    let req_line = if !injects.is_empty() || !observes.is_empty() {
+        inject::request_line(&prefix)
+    } else {
+        None
+    };
+
+    // ADR 0056 (Plane B): an inject-gated host must satisfy a request
+    // policy (method + path). Add the matching injection's auth header(s);
+    // a request whose shape matches no injection is rejected — the
+    // operation isn't permitted on this host.
+    if !injects.is_empty() {
+        let (method, path) = req_line.clone().ok_or(InterceptError::MalformedRequest)?;
+        let matched: Vec<&InjectEntry> = injects
+            .iter()
+            .copied()
+            .filter(|i| i.policy.allows(&method, &path))
+            .collect();
+        if matched.is_empty() {
+            return Err(InterceptError::RequestRejected { method, path });
+        }
+        prefix = inject::inject_headers(prefix, &matched);
+    }
+
     if let Some(ph) = scan_for_violation(&prefix, sni, secrets) {
         return Err(InterceptError::Violation {
             placeholder: ph.to_string(),
         });
     }
-    let prefix = substitute(prefix, sni, secrets);
+    prefix = substitute(prefix, sni, secrets);
+
+    // ADR 0056 (Phase 4): observe the response for any observe spec whose
+    // request shape matches. Only when a sink is wired (the host-agent's
+    // bridge to the coordinator) — without a consumer there's no point
+    // buffering the response.
+    let firing: Vec<&ObserveEntry> = match (&req_line, sink) {
+        (Some((method, path)), Some(_)) => observes
+            .iter()
+            .copied()
+            .filter(|o| o.policy.allows(method, path))
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    if !firing.is_empty() {
+        let (method, path) = req_line.expect("firing observes imply a parsed request line");
+        let sink = sink.expect("firing observes imply a sink");
+        // Force identity encoding + a single, close-delimited response so the
+        // observation completes on upstream EOF without keep-alive bookkeeping.
+        prefix = observe::prepare_observed_request(prefix);
+        upstream_tls.write_all(&prefix).await?;
+        upstream_tls.flush().await?;
+
+        let resp_buf = pump_and_observe(client_tls, upstream_tls, OBSERVE_RESPONSE_BUDGET).await;
+        let parsed = observe::parse_response(&resp_buf);
+        for o in &firing {
+            if let Some(asset) = observe::evaluate(o, parsed.as_ref(), &method, &path) {
+                sink(session_id, asset);
+            }
+        }
+        return Ok(());
+    }
 
     upstream_tls.write_all(&prefix).await?;
     upstream_tls.flush().await?;
@@ -284,4 +365,53 @@ where
     let _ = client_tls.shutdown().await;
     let _ = upstream_tls.shutdown().await;
     Ok(())
+}
+
+/// Cap on the response prefix buffered for observation. Asset-bearing JSON
+/// responses (issue/PR/query metadata) are a few KiB; 256 KiB is generous.
+/// Bytes past the cap still stream to the client — only the *tapped* copy is
+/// bounded.
+const OBSERVE_RESPONSE_BUDGET: usize = 256 * 1024;
+
+/// Forward the response (upstream→client) while tapping a bounded copy for
+/// observation, and concurrently forward client→upstream so an upstream that
+/// withholds its response pending the request body can't deadlock us. Returns
+/// the tapped response bytes once the upstream closes (forced promptly by the
+/// `Connection: close` we set on the request).
+async fn pump_and_observe<C, U>(client_tls: C, upstream_tls: U, budget: usize) -> Vec<u8>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (client_rd, mut client_wr) = tokio::io::split(client_tls);
+    let (mut up_rd, up_wr) = tokio::io::split(upstream_tls);
+
+    // Detached: drain any remaining request body to upstream. Aborted once the
+    // response is in — by then upstream has the full request (it responded).
+    let c2u = tokio::spawn(async move {
+        let mut client_rd = client_rd;
+        let mut up_wr = up_wr;
+        let _ = tokio::io::copy(&mut client_rd, &mut up_wr).await;
+        let _ = up_wr.shutdown().await;
+    });
+
+    let mut resp_buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = match up_rd.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if client_wr.write_all(&tmp[..n]).await.is_err() {
+            break;
+        }
+        if resp_buf.len() < budget {
+            let take = (budget - resp_buf.len()).min(n);
+            resp_buf.extend_from_slice(&tmp[..take]);
+        }
+    }
+    let _ = client_wr.flush().await;
+    let _ = client_wr.shutdown().await;
+    c2u.abort();
+    resp_buf
 }

@@ -65,6 +65,27 @@ pub const SHELL_PIN_RENEW_INTERVAL: Duration = Duration::from_secs(60);
 /// surfaces an error in user-visible time.
 const SEND_PROMPT_ATTACH_WAIT_SECS: u64 = 10;
 
+/// ADR 0052 Phase 2 (clean-idle-shutdown): grace handed to the in-guest
+/// harness to drain `claude` before an idle-eviction snapshot. The
+/// `Shutdown { grace_secs }` closes claude's held stdin; an idle session
+/// has no in-flight turn, so it EOFs and exits 0 near-instantly. The
+/// window only bounds the rare tail-end turn still wrapping up as
+/// eviction fires (after grace the harness kills the child). Kept short:
+/// idle eviction shouldn't stall on a stuck agent.
+pub const IDLE_DRAIN_GRACE_SECS: u32 = 10;
+
+/// Slack added on top of [`IDLE_DRAIN_GRACE_SECS`] when waiting for the
+/// harness's vsock connection to drop after a drain — covers the harness
+/// reap + process exit + the host reader-loop observing EOF and tearing
+/// the connection down. If the connection is still up past grace+slack we
+/// give up waiting and capture anyway (a still-live child is reattached
+/// on resume, ADR 0045 C1).
+const DRAIN_DETACH_SLACK: Duration = Duration::from_secs(3);
+
+/// Poll cadence while waiting for the post-drain disconnect. Mirrors the
+/// `send_prompt` attach-wait loop; off the hot path (idle eviction).
+const DRAIN_DETACH_POLL: Duration = Duration::from_millis(50);
+
 /// Callback invoked for every `HarnessEvent` received on a connection.
 /// In production this is the host-agent's bridge into the coordinator's
 /// `session_events` log; tests pass a closure that just collects them.
@@ -677,6 +698,66 @@ impl HarnessHub {
     /// Number of currently-attached harnesses. Diagnostic / test helper.
     pub fn attached_count(&self) -> usize {
         self.inner.connections.lock().len()
+    }
+
+    /// Is a harness currently attached for `sandbox_id`? The entry is
+    /// removed when the harness's vsock connection drops (reader-loop EOF
+    /// teardown), so this flips false the moment the in-guest harness
+    /// exits — the signal [`drain`](Self::drain) waits on.
+    pub fn is_attached(&self, sandbox_id: SandboxId) -> bool {
+        self.inner.connections.lock().contains_key(&sandbox_id)
+    }
+
+    /// ADR 0052 Phase 2 (clean-idle-shutdown): gracefully stop the
+    /// in-guest `claude` before an idle-eviction snapshot, so the captured
+    /// memory image contains NO live agent process.
+    ///
+    /// Sends `Shutdown { grace_secs }` — the harness closes claude's held
+    /// stdin (the in-flight turn, if any, drains to a final `result` and
+    /// the process exits 0), emits nothing spurious when idle, then exits
+    /// itself. We then wait (bounded by `grace_secs` + [`DRAIN_DETACH_SLACK`])
+    /// for the harness's vsock connection to drop: its exit is the signal
+    /// that both claude and the harness are gone. On resume agentd respawns
+    /// a fresh harness which `--resume`s into the same on-disk session
+    /// (decision 1: respawn-with-resume), so nothing is lost.
+    ///
+    /// Best-effort — returns `true` if the snapshot will be agent-free:
+    /// either the harness detached in time, or there was nothing attached
+    /// to drain (`NotAttached`). Returns `false` if a harness stayed
+    /// attached past the deadline (a stuck/uncooperative agent); the caller
+    /// captures anyway and the still-live child is reattached on resume.
+    pub async fn drain(&self, sandbox_id: SandboxId, grace_secs: u32) -> bool {
+        match self.shutdown(sandbox_id, grace_secs).await {
+            Ok(()) => {}
+            // Nothing bound — already agent-free, no drain needed.
+            Err(HarnessError::NotAttached) => return true,
+            Err(e) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %e,
+                    "idle drain: Shutdown send failed; capturing without a clean drain",
+                );
+                return false;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(grace_secs as u64) + DRAIN_DETACH_SLACK;
+        while self.is_attached(sandbox_id) {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    grace_secs,
+                    "idle drain: harness still attached after grace; capturing with a live \
+                     claude (reattached on resume)",
+                );
+                return false;
+            }
+            tokio::time::sleep(DRAIN_DETACH_POLL).await;
+        }
+        tracing::debug!(
+            sandbox_id = %sandbox_id,
+            "idle drain: harness detached; snapshot will be claude-free",
+        );
+        true
     }
 
     /// Sandboxes due for idle eviction under the two-tier policy.
@@ -1447,6 +1528,66 @@ mod tests {
         hub.shutdown(sandbox_id, 1).await.expect("shutdown");
         let received = harness_task.await.unwrap();
         assert!(received, "harness should receive a Shutdown frame");
+    }
+
+    #[tokio::test]
+    async fn drain_sends_shutdown_then_waits_for_disconnect() {
+        // ADR 0052 Phase 2: `drain` must (a) deliver a Shutdown frame and
+        // (b) not return until the harness's connection drops — the signal
+        // that claude + the harness have exited and the snapshot is safe.
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+
+        // Harness side: handshake, read ONE Shutdown frame, then drop its
+        // end of the pipe (= a clean disconnect, the post-drain exit).
+        let harness_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(harness_side);
+            write_msg(
+                &mut hw,
+                &HarnessAttach {
+                    session_id,
+                    harness_version: "test/0.1".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: HarnessAttachAck = read_msg(&mut hr).await.unwrap();
+            let frame: HarnessFrame = read_msg(&mut hr).await.unwrap();
+            assert!(matches!(
+                frame,
+                HarnessFrame::Command(HarnessCommand::Shutdown { .. })
+            ));
+            // Returning drops `harness_side`, closing the connection.
+        });
+
+        assert!(
+            wait_until(|| hub.attached_count() == 1).await,
+            "harness should attach within the 1s deadline"
+        );
+
+        // drain() sends the Shutdown, the task reads it and disconnects,
+        // and drain() resolves true once the connection is gone.
+        let drained = hub.drain(sandbox_id, 2).await;
+        harness_task.await.unwrap();
+        assert!(drained, "drain should report a clean disconnect");
+        assert!(
+            !hub.is_attached(sandbox_id),
+            "connection must be torn down after the harness exits"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_unattached_is_a_noop() {
+        // No harness bound → nothing to drain → the snapshot is already
+        // claude-free, so drain succeeds immediately (no waiting).
+        let (sink, _) = collecting_sink();
+        let hub = HarnessHub::new(sink);
+        assert!(hub.drain(SandboxId::new(), 2).await);
     }
 
     #[tokio::test]

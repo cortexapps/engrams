@@ -107,8 +107,7 @@ impl BundleStore {
     }
 
     pub fn staged_path(&self, r: &AuxBundleRef) -> PathBuf {
-        self.dir
-            .join(AuxRoDrive::staged_file_name(&r.drive_id, &r.sha256))
+        self.dir.join(AuxRoDrive::staged_file_name(&r.sha256))
     }
 
     /// Idempotently publish each referenced generation's bytes to
@@ -175,7 +174,7 @@ impl BundleStore {
         let keep: std::collections::HashSet<String> = live
             .iter()
             .chain(current.iter())
-            .map(|r| AuxRoDrive::staged_file_name(&r.drive_id, &r.sha256))
+            .map(|r| AuxRoDrive::staged_file_name(&r.sha256))
             .collect();
         let mut dir = match tokio::fs::read_dir(&self.dir).await {
             Ok(d) => d,

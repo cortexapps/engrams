@@ -66,6 +66,7 @@ impl HostEgress {
     pub async fn spawn(
         ca_source: Arc<dyn CaSource>,
         bind_addr: SocketAddr,
+        observe_sink: Option<engram_egress_proxy::ObserveSink>,
     ) -> Result<Self, EgressError> {
         let ca = ca_source.load().await.map_err(EgressError::Ca)?;
         let ca_cert_pem = ca.cert_pem.clone();
@@ -80,7 +81,9 @@ impl HostEgress {
         let registry = Arc::new(Registry::new());
         let mint = Arc::new(CertMint::new(Arc::new(ca)));
 
-        let proxy = Proxy::new(ProxyConfig::new(bind_addr, registry.clone(), mint));
+        let mut proxy_cfg = ProxyConfig::new(bind_addr, registry.clone(), mint);
+        proxy_cfg.observe_sink = observe_sink;
+        let proxy = Proxy::new(proxy_cfg);
         let task = tokio::spawn(async move {
             if let Err(e) = proxy.run().await {
                 tracing::error!(error = %e, "egress proxy listener exited");
@@ -123,11 +126,130 @@ pub fn register_policy(
             allow,
         });
     }
+    // ADR 0056 Plane B: the coordinator already resolved each inject's
+    // secret_ref → real `secret` (host-side); translate into the proxy's
+    // InjectEntry + RequestPolicy.
+    let mut injects = Vec::with_capacity(policy.injects.len());
+    for i in policy.injects {
+        let allow =
+            engram_egress_proxy::HostList::from_manifest(&i.allow_hosts, &i.allow_host_patterns)?;
+        injects.push(engram_egress_proxy::InjectEntry {
+            secret: i.secret,
+            header_name: i.header_name,
+            header_template: i.header_template,
+            allow,
+            policy: engram_egress_proxy::RequestPolicy {
+                methods: i.methods,
+                path_prefixes: i.path_prefixes,
+            },
+        });
+    }
+    // ADR 0056 Phase 4: translate the policy's observe specs (no secret to
+    // resolve — the asset map is pure) into the proxy's ObserveEntry. The proxy
+    // emits an IntegrationAsset from a matching request's real response.
+    let mut observes = Vec::with_capacity(policy.observes.len());
+    for o in policy.observes {
+        let allow =
+            engram_egress_proxy::HostList::from_manifest(&o.allow_hosts, &o.allow_host_patterns)?;
+        observes.push(engram_egress_proxy::ObserveEntry {
+            allow,
+            policy: engram_egress_proxy::RequestPolicy {
+                methods: o.methods,
+                path_prefixes: o.path_prefixes,
+            },
+            provider: o.provider,
+            asset_kind: o.asset_kind,
+            surface: o.surface,
+            success: match o.success_status_class.as_deref() {
+                Some("2xx") => engram_egress_proxy::SuccessRule::StatusClass2xx,
+                _ => engram_egress_proxy::SuccessRule::Always,
+            },
+            data: o.data,
+            fetchable: o.fetchable,
+        });
+    }
     registry.register(engram_egress_proxy::SessionState {
         session_id: policy.session_id,
         guest_ip: policy.guest_ip,
         network_allow,
         secrets,
+        injects,
+        observes,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_core::types::egress::{EgressInjectEntry, EgressObserveEntry, SessionEgressPolicy};
+    use engram_core::types::image::SecretMode;
+    use engram_core::{SandboxId, SessionId};
+    use std::net::Ipv4Addr;
+
+    /// ADR 0056 (B′): `register_policy` translates a wire `EgressInjectEntry`
+    /// (secret already resolved by the coordinator) into the proxy's
+    /// `InjectEntry` + `RequestPolicy` the 3a engine enforces.
+    #[test]
+    fn register_policy_translates_injects_to_proxy_entries() {
+        let registry = Registry::new();
+        let guest_ip = Ipv4Addr::new(10, 200, 0, 2);
+        register_policy(
+            &registry,
+            SessionEgressPolicy {
+                session_id: SessionId::new(),
+                sandbox_id: SandboxId::new(),
+                guest_ip,
+                network_allow_hosts: vec![],
+                network_allow_host_patterns: vec![],
+                secrets: vec![],
+                injects: vec![EgressInjectEntry {
+                    secret: "dd-secret".into(),
+                    header_name: "DD-API-KEY".into(),
+                    header_template: "{}".into(),
+                    allow_hosts: vec!["api.datadoghq.com".into()],
+                    allow_host_patterns: vec![],
+                    methods: vec!["GET".into()],
+                    path_prefixes: vec!["/api/v2/logs".into()],
+                }],
+                observes: vec![EgressObserveEntry {
+                    allow_hosts: vec!["api.github.com".into()],
+                    allow_host_patterns: vec![],
+                    methods: vec!["POST".into()],
+                    path_prefixes: vec!["/repos/".into()],
+                    provider: "github".into(),
+                    asset_kind: "issue".into(),
+                    surface: "asset".into(),
+                    success_status_class: Some("2xx".into()),
+                    data: vec![("number".into(), "$.resp.number".into())],
+                    fetchable: Some("$.resp.html_url".into()),
+                }],
+                secret_mode: SecretMode::Broker,
+            },
+        )
+        .expect("register");
+
+        let state = registry.lookup(guest_ip).expect("session registered");
+        assert_eq!(state.injects.len(), 1);
+        let inj = &state.injects[0];
+        assert_eq!(inj.secret, "dd-secret");
+        assert_eq!(inj.header_name, "DD-API-KEY");
+        assert!(inj.allow.matches("api.datadoghq.com"));
+        assert!(inj.policy.allows("GET", "/api/v2/logs/events"));
+        assert!(!inj.policy.allows("POST", "/api/v2/logs/events"));
+
+        // ADR 0056 Phase 4: the observe spec translates into a proxy ObserveEntry.
+        assert_eq!(state.observes.len(), 1);
+        let obs = &state.observes[0];
+        assert_eq!(obs.provider, "github");
+        assert_eq!(obs.asset_kind, "issue");
+        assert_eq!(obs.surface, "asset");
+        assert!(obs.allow.matches("api.github.com"));
+        assert!(obs.policy.allows("POST", "/repos/x/issues"));
+        assert!(matches!(
+            obs.success,
+            engram_egress_proxy::SuccessRule::StatusClass2xx
+        ));
+        assert_eq!(obs.fetchable.as_deref(), Some("$.resp.html_url"));
+    }
 }

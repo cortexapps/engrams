@@ -14,14 +14,14 @@ export function ProfilePanel() {
   const isAdmin = principal.role === "admin";
   const can = isAdmin
     ? [
-        "Launch & manage your own sessions",
-        "Oversee every session across the fleet",
+        "Launch & manage your own tasks",
+        "Oversee every task across the fleet",
         "Inspect host capacity & drain hosts",
         "Read storage durability & snapshots",
         "Curate images & registry credentials",
         "Manage members & their roles",
       ]
-    : ["Launch & manage your own sessions", "Save your own Claude Code token"];
+    : ["Launch & manage your own tasks", "Save your own Claude Code token"];
   const cannot = isAdmin
     ? []
     : ["The Operator section (fleet, storage, images, registries): admin only"];

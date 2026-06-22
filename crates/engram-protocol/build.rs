@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/engram/app/v1/session.proto",
         "proto/engram/app/v1/fleet.proto",
         "proto/engram/app/v1/image.proto",
+        "proto/engram/app/v1/mount_catalog.proto",
         // secret.proto removed in ADR 0051 Drip A: the orchestrator owns the
         // user's harness token; it rides CreateSession.harness_env now.
         // task.proto is deliberately absent: orchestrator-native (ADR §3).

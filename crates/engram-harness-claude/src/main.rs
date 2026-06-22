@@ -91,6 +91,12 @@ mod adapter {
     pub const MAX_STDERR_TAIL_LINES: usize = 64;
     pub const MAX_STDERR_TAIL_BYTES: usize = 4096;
 
+    /// Phase 3 (ADR 0030): grace for the in-band `control_request` interrupt.
+    /// If claude doesn't abort the turn (emit a `result`) within this window —
+    /// a build that ignores the control frame — the engine escalates to
+    /// SIGINT so an interrupt can never wedge a run.
+    pub const INTERRUPT_GRACE_SECS: u64 = 8;
+
     #[derive(Parser, Debug, Clone)]
     #[command(
         name = "engram-harness-claude",
@@ -1161,6 +1167,12 @@ mod adapter {
     /// conversation file per message synchronously, so the session stays
     /// cleanly `--resume`-able after this. We escalate to SIGKILL only as
     /// a grace-timeout fallback in the reap below.
+    ///
+    /// Phase 3 (ADR 0030): this is now the interrupt FALLBACK only — the
+    /// primary path is the in-band `control_request` (`write_control_
+    /// interrupt`), which leaves the process alive. SIGINT is used if the
+    /// control frame can't be written, or if it isn't honored within
+    /// `INTERRUPT_GRACE_SECS` (a claude build lacking the frame).
     fn sigint_child(child: &tokio::process::Child) {
         if let Some(pid) = child.id() {
             if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGINT) {
@@ -1289,14 +1301,21 @@ mod adapter {
         let mut turn: Option<TurnState> = None;
         let mut shutting_down = false;
         let mut shutdown_deadline: Option<Instant> = None;
-        // Set when an operator Interrupt SIGINT'd the child mid-turn; the
-        // reap path closes that run as `RunInterrupted` (not a crash).
+        // Set when an operator Interrupt aborts the current turn; the
+        // `result`/reap path closes that run as `RunInterrupted` (not a
+        // crash or a clean completion).
         let mut interrupted_run: Option<String> = None;
         // ADR 0054: set when an `AnswerQuestion` SIGINT'd the child to
         // trigger an answer-resume; the reap path must NOT treat the exit as
         // a crash (no abnormal-exit System message) and returns
         // `ResumeForAnswer`.
         let mut resuming_for_answer = false;
+
+        // Phase 3: armed when a `control_request` interrupt is sent. If
+        // claude doesn't honor it within the grace window (a build lacking
+        // the control frame), the sleeper escalates to SIGINT. Cleared when
+        // the abort's `result` lands.
+        let mut interrupt_deadline: Option<Instant> = None;
 
         // ADR 0054: if an answer is stashed, claude WILL re-fire the
         // deferred AUQ on this `--resume` startup (id-stable, no stdin —
@@ -1334,10 +1353,14 @@ mod adapter {
             // The relevant deadline this iteration: the in-flight turn's
             // wall-clock cap and/or the shutdown grace window, whichever
             // is sooner. `None` → park forever (idle, no shutdown).
-            let next_deadline = [turn.as_ref().map(|t| t.deadline), shutdown_deadline]
-                .into_iter()
-                .flatten()
-                .min();
+            let next_deadline = [
+                turn.as_ref().map(|t| t.deadline),
+                shutdown_deadline,
+                interrupt_deadline,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let sleeper = async {
                 match next_deadline {
                     Some(d) => tokio::time::sleep_until(d).await,
@@ -1401,10 +1424,15 @@ mod adapter {
                                         );
                                     }
                                     if interrupted_run.as_deref() == Some(run_id.as_str()) {
-                                        // control_request-style abort that
-                                        // surfaced as a result (Phase 3);
-                                        // the process is still alive.
+                                        // Phase 3: the `control_request` abort
+                                        // surfaced as a `result error_during_
+                                        // execution` — the process is STILL
+                                        // ALIVE. Report RunInterrupted, disarm
+                                        // the SIGINT-escalation deadline, and
+                                        // fall through to consume the next
+                                        // queued prompt on the same process.
                                         interrupted_run = None;
+                                        interrupt_deadline = None;
                                         emit(evt_tx, HarnessEvent::RunInterrupted { run_id }).await;
                                     } else {
                                         emit(
@@ -1622,15 +1650,47 @@ mod adapter {
                         }
                         Some(HarnessCommand::Interrupt) => {
                             if let Some(t) = turn.as_ref() {
-                                // Phase 1: SIGINT the persistent child to
-                                // abort the turn. claude exits; the reap
-                                // path emits RunInterrupted and the engine
-                                // respawns `--resume`. Phase 3 upgrades
-                                // this to an in-band control_request that
-                                // leaves the process alive (no respawn).
-                                tracing::info!(run_id = %t.run_id, "interrupt mid-turn; SIGINT-ing claude");
-                                interrupted_run = Some(t.run_id.clone());
-                                sigint_child(&child);
+                                // Phase 3 (ADR 0030): the PRIMARY interrupt is
+                                // an in-band `control_request` on the held-open
+                                // stdin. claude aborts the in-flight turn
+                                // (surfacing as `result error_during_execution`)
+                                // and STAYS ALIVE — no SIGINT, no respawn — so
+                                // conversation context is preserved and the
+                                // next queued prompt runs on the SAME warm
+                                // process. (This is the root-cause fix for the
+                                // SIGINT-kills-the-persistent-process bug:
+                                // session ba3ae8d5, where interrupt + a queued
+                                // message respawned `--resume` into a fragile,
+                                // context-less process that the harness then
+                                // misread as a crash.) Mark the run so the
+                                // `result` handler reports RunInterrupted, and
+                                // arm a grace deadline: a build that ignores the
+                                // control frame is escalated to SIGINT (the
+                                // fallback) so an interrupt can never wedge.
+                                let run_id = t.run_id.clone();
+                                interrupted_run = Some(run_id.clone());
+                                let request_id = format!("int-{}", uuid::Uuid::new_v4());
+                                match stdin.as_mut() {
+                                    Some(s) => match write_control_interrupt(s, &request_id).await {
+                                        Ok(()) => {
+                                            tracing::info!(%run_id, "interrupt: sent control_request; awaiting abort");
+                                            interrupt_deadline = Some(
+                                                Instant::now()
+                                                    + Duration::from_secs(INTERRUPT_GRACE_SECS),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%run_id, error = %e, "control_request write failed; SIGINT fallback");
+                                            sigint_child(&child);
+                                        }
+                                    },
+                                    None => {
+                                        // stdin already closed (a Shutdown is
+                                        // draining) — fall back to SIGINT.
+                                        tracing::warn!(%run_id, "interrupt with no stdin; SIGINT fallback");
+                                        sigint_child(&child);
+                                    }
+                                }
                             } else {
                                 tracing::debug!("interrupt while idle; nothing to stop");
                             }
@@ -1670,13 +1730,25 @@ mod adapter {
                     }
                 }
                 _ = &mut sleeper => {
-                    if shutting_down {
+                    if interrupt_deadline.is_some_and(|d| Instant::now() >= d) && turn.is_some() {
+                        // Phase 3 fallback: the `control_request` interrupt
+                        // wasn't honored within grace (a claude build lacking
+                        // the control frame). Escalate to SIGINT — claude
+                        // exits, the reap reports RunInterrupted (interrupted_run
+                        // is set) and the engine respawns `--resume`. Disarm so
+                        // we don't re-fire; claude's stdout EOF breaks the loop.
+                        tracing::warn!("control_request interrupt not honored within grace; SIGINT escalation");
+                        interrupt_deadline = None;
+                        sigint_child(&child);
+                    } else if shutting_down {
                         tracing::warn!("shutdown grace elapsed; killing claude");
+                        let _ = child.start_kill();
+                        break;
                     } else {
                         tracing::warn!("max_run_secs elapsed; killing claude");
+                        let _ = child.start_kill();
+                        break;
                     }
-                    let _ = child.start_kill();
-                    break;
                 }
             }
         }
@@ -1884,6 +1956,28 @@ mod adapter {
             "message": { "role": "user", "content": text },
         });
         let mut line = serde_json::to_string(&msg).expect("serialize user message");
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await
+    }
+
+    /// Phase 3 (ADR 0030): the in-band interrupt. Writes a `control_request`
+    /// with `subtype:interrupt` to claude's held-open stdin. claude acks with
+    /// a `control_response` and ABORTS the in-flight turn (which surfaces as a
+    /// `result` with `subtype:error_during_execution`) while the process STAYS
+    /// ALIVE — so the next prompt runs on the same warm process: no respawn, no
+    /// lost context. We don't block on the `control_response` ack; the
+    /// subsequent `result` is the load-bearing signal the engine acts on.
+    async fn write_control_interrupt(
+        stdin: &mut tokio::process::ChildStdin,
+        request_id: &str,
+    ) -> std::io::Result<()> {
+        let msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": { "subtype": "interrupt" },
+        });
+        let mut line = serde_json::to_string(&msg).expect("serialize control_request");
         line.push('\n');
         stdin.write_all(line.as_bytes()).await?;
         stdin.flush().await
@@ -2835,11 +2929,251 @@ mod adapter {
             let _ = tokio::fs::remove_file(&script).await;
         }
 
+        // ADR 0052 Phase 4 (warm mid-turn teleport): a live host-to-host move
+        // drops + re-dials the vsock WHILE a turn is generating (agentd SIGUSR1s
+        // the moved harness → it reconnects). The engine is connection-decoupled
+        // (the `turn`/cmd loop + the persistent claude child outlive any
+        // connection), so the in-flight turn MUST survive the bounce: the
+        // reattach must NOT synthesize an `Idle` mid-turn, and the run that was
+        // open before the bounce is the same one that completes after it —
+        // exactly one RunStarted→RunCompleted, no restart. This is the
+        // engine-side guarantee behind the no-turn-restart-on-teleport promise
+        // (the FC-level pipe survival is proven by the two-host teleport suite).
+        #[tokio::test]
+        async fn connection_bounce_mid_turn_preserves_the_run() {
+            // One turn: sleep 300ms (stays in flight), then one assistant line
+            // + result.
+            let script = write_slow_fake_claude(
+                &[
+                    r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"ok"}]}}"#,
+                    r#"{"type":"result","subtype":"success","is_error":false}"#,
+                ],
+                300,
+            )
+            .await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                Some("first".into()), // initial prompt → turn 1 goes in flight
+            ));
+
+            // Turn 1 is now in flight (the fake sleeps 300ms before its result).
+            let r1 = expect_run_started(&mut evt_rx).await;
+
+            // The teleport connection bounce, mid-turn: a fresh connection
+            // attaches — exactly what the post-move SIGUSR1 re-dial drives. Fire
+            // it twice (re-dials can retry). While a turn is open the reattach
+            // arm must emit nothing.
+            reattach.notify_one();
+            reattach.notify_one();
+
+            // The very next events are the turn's own assistant line and its
+            // RunCompleted — NO `Idle` injected by the bounce. (If the reattach
+            // had synthesized one mid-turn, this `expect_agent_message` would see
+            // it and panic.)
+            expect_agent_message(&mut evt_rx, "ok").await;
+            let c1 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(
+                r1, c1,
+                "the run open before the bounce is the same one that completes after it — no restart",
+            );
+
+            // Now genuinely idle: the engine re-announces Idle. Clean shutdown.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+        }
+
         // ADR 0052: the host re-delivers un-confirmed prompts on every
         // reattach (command-side at-least-once, the twin of the `held`
         // event slot). A replay of a prompt the harness already accepted
         // must be a no-op — never a second run — so the engine dedupes on
         // prompt_id.
+        /// A fake `claude` that models the Phase 3 in-band interrupt: a
+        /// `user` line emits assistant text but NO result (the turn stays IN
+        /// FLIGHT — "generating"); a `control_request` line emits the abort
+        /// (a `control_response` ack + a `result error_during_execution`)
+        /// WITHOUT exiting — exactly claude's control-frame interrupt. It
+        /// records its PID on each launch so a test can prove whether the
+        /// process was respawned.
+        async fn write_interrupt_aware_fake_claude(pidfile: &str) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let mut body = String::from("#!/bin/sh\n");
+            body.push_str(&format!("echo $$ > '{pidfile}'\n"));
+            body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
+            body.push_str("while IFS= read -r line; do\n");
+            body.push_str("  case \"$line\" in\n");
+            body.push_str("    *control_request*)\n");
+            body.push_str("      printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\"}}'\n");
+            body.push_str("      printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'\n");
+            body.push_str("      ;;\n");
+            body.push_str("    *)\n");
+            body.push_str("      printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m\",\"content\":[{\"type\":\"text\",\"text\":\"working\"}]}}'\n");
+            body.push_str("      ;;\n");
+            body.push_str("  esac\n");
+            body.push_str("done\n");
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        fn temp_pidfile() -> String {
+            std::env::temp_dir()
+                .join(format!("fake-pid-{}", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        async fn read_pid(pidfile: &str) -> String {
+            tokio::fs::read_to_string(pidfile)
+                .await
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+
+        // Phase 3 (ADR 0030): an interrupt sends an in-band `control_request`;
+        // claude aborts the turn (`result error_during_execution`) and STAYS
+        // ALIVE. The engine reports RunInterrupted (not a crash) and does NOT
+        // respawn — proven by the unchanged claude PID.
+        #[tokio::test]
+        async fn control_request_interrupt_aborts_turn_without_respawn() {
+            let pidfile = temp_pidfile();
+            let script = write_interrupt_aware_fake_claude(&pidfile).await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                Some("first".into()),
+            ));
+
+            // Turn 1 is in flight: RunStarted + assistant text, no result yet.
+            let r1 = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "working").await;
+            let pid_before = read_pid(&pidfile).await;
+
+            // Interrupt → control_request → the abort `result` → RunInterrupted.
+            cmd_tx.send(HarnessCommand::Interrupt).await.unwrap();
+            match evt_rx.recv().await {
+                Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r1),
+                other => panic!("expected RunInterrupted, got {other:?}"),
+            }
+            // No queued prompt → Idle (NOT a crash / RunCompleted{ok:false}).
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // The decisive assertion: claude was NOT respawned — same warm
+            // process, so conversation context is intact.
+            assert_eq!(
+                pid_before,
+                read_pid(&pidfile).await,
+                "control_request interrupt must keep claude alive (no respawn)",
+            );
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), engine).await;
+            let _ = tokio::fs::remove_file(&script).await;
+            let _ = tokio::fs::remove_file(&pidfile).await;
+        }
+
+        // Phase 3 regression for session ba3ae8d5: interrupting WITH a queued
+        // message must abort the turn and run the queued message on the SAME
+        // warm process — RunInterrupted then RunStarted{queued}, no respawn,
+        // and crucially NO abnormal-exit / RunCompleted{ok:false}. (The old
+        // SIGINT path respawned `--resume` into a context-less process and
+        // misread its immediate exit as a crash — the "An error occurred".)
+        #[tokio::test]
+        async fn interrupt_with_queued_message_steers_on_same_process() {
+            let pidfile = temp_pidfile();
+            let script = write_interrupt_aware_fake_claude(&pidfile).await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(16);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                Some("first".into()),
+            ));
+
+            // Turn 1 in flight.
+            let r1 = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "working").await;
+            let pid_before = read_pid(&pidfile).await;
+
+            // Queue a message mid-turn, then interrupt.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p2".into(),
+                    text: "second".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+            ));
+            cmd_tx.send(HarnessCommand::Interrupt).await.unwrap();
+
+            // Turn 1 aborts cleanly...
+            match evt_rx.recv().await {
+                Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r1),
+                other => panic!("expected RunInterrupted, got {other:?}"),
+            }
+            // ...and the queued message runs as the NEXT turn — a fresh run_id
+            // carrying its prompt_id, on the same process. The very next events
+            // are RunStarted{p2} + its assistant text: no crash artifact, no
+            // RunCompleted{ok:false} ever appears (the bug).
+            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            assert_ne!(r1, r2, "the steered turn gets a fresh run_id");
+            assert_eq!(
+                pid2,
+                Some("p2".to_string()),
+                "the queued prompt is consumed"
+            );
+            expect_agent_message(&mut evt_rx, "working").await;
+
+            assert_eq!(
+                pid_before,
+                read_pid(&pidfile).await,
+                "interrupt + queued message must run on the same warm process",
+            );
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), engine).await;
+            let _ = tokio::fs::remove_file(&script).await;
+            let _ = tokio::fs::remove_file(&pidfile).await;
+        }
+
         #[tokio::test]
         async fn duplicate_prompt_replay_is_ignored() {
             let script = write_persistent_fake_claude(&[

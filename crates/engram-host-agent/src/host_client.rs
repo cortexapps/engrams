@@ -108,6 +108,33 @@ impl HostClient for LocalHostClient {
         &self,
         id: SandboxId,
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
+        // ADR 0052 Phase 2 (clean-idle-shutdown). The two-phase
+        // `snapshot_begin` is the IDLE-eviction capture entry: the
+        // coordinator only drives begin/wait/commit for
+        // `target_state == Idle` (live teleport goes through
+        // `migration_capture`; periodic + manual checkpoints through
+        // `snapshot`). So this is exactly where "gate strictly to the idle
+        // path" lands — no `CheckpointReason` plumbing needed.
+        //
+        // Before pausing+capturing, gracefully stop the in-guest `claude`
+        // so the snapshot holds NO live agent: `drain` sends
+        // `Shutdown { grace }` (closing claude's stdin → it drains the
+        // in-flight turn to a final `result` and exits 0, then the harness
+        // exits) and waits for the harness vsock to drop. On resume agentd
+        // respawns the harness, which `--resume`s into the same on-disk
+        // session (decision 1: respawn-with-resume). Best-effort: an
+        // un-drained harness still gets captured (and reattached on
+        // resume) — we never block an eviction on a stuck agent.
+        if !self
+            .harness_hub
+            .drain(id, crate::harness::IDLE_DRAIN_GRACE_SECS)
+            .await
+        {
+            tracing::warn!(
+                sandbox_id = %id,
+                "idle eviction: harness did not cleanly drain before capture",
+            );
+        }
         self.sandbox.snapshot_begin(id).await
     }
 
@@ -190,9 +217,10 @@ impl HostClient for LocalHostClient {
         &self,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
+        selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         self.sandbox
-            .restore_base_for_session(metadata, session_env)
+            .restore_base_for_session(metadata, session_env, selected_mounts)
             .await
     }
 

@@ -14,29 +14,20 @@ use crate::state::{SessionEvent, SharedState};
 pub(crate) const DEFAULT_VCPUS: u32 = 2;
 pub(crate) const DEFAULT_MEMORY_MIB: u32 = 4096;
 pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
-/// ADR 0027: memory floor for browser-enabled images. chromium-headless-shell
-/// needs ~250-400 MB resident; floor at 1 GiB for headroom. The 4 GiB default
-/// already exceeds this, so it only bites images that lowered
-/// `suggested_memory_mib`. Capture (base snapshot) and restore must agree on
-/// `mem_size_mib` (FC requires it), so both paths apply this same floor.
-pub(crate) const BROWSER_MEMORY_FLOOR_MIB: u32 = 1024;
 
 /// Resolved guest memory (MiB) for an image: its `suggested_memory_mib` (or
-/// the default), floored for `[browser] enabled` images (ADR 0027). The
-/// single source of truth shared by base-snapshot capture
+/// the default). The single source of truth shared by base-snapshot capture
 /// (`enabled_images`) and session restore — FC requires the restore
 /// `mem_size_mib` to equal the snapshot's, so they MUST compute it
-/// identically. Don't inline the floor; call this.
+/// identically. ADR 0055: the base snapshot is sized once per image and is
+/// skill-agnostic (skills bind via `patch_drive`, never resize memory), so
+/// memory-heavy tooling (e.g. browser) is an image-sizing concern —
+/// declare `suggested_memory_mib` on the image, not a per-session skill.
 pub(crate) fn resolved_memory_mib(manifest: &engram_core::types::ImageManifest) -> u32 {
     manifest
         .resources
         .suggested_memory_mib
         .unwrap_or(DEFAULT_MEMORY_MIB)
-        .max(if manifest.browser_enabled() {
-            BROWSER_MEMORY_FLOOR_MIB
-        } else {
-            0
-        })
 }
 
 /// ADR 0048: resolved guest vCPU count for an image. Enable-time
@@ -73,12 +64,13 @@ pub(crate) fn cold_boot_spec(
         .suggested_disk_gib
         .unwrap_or(DEFAULT_DISK_GIB);
 
-    // ADR 0027: the `skills` bundle is universal; `playwright` rides
-    // only when the image opted in.
-    let mut aux_ro_drives = vec![AuxRoDrive::skills()];
-    if manifest.browser_enabled() {
-        aux_ro_drives.push(AuxRoDrive::playwright());
-    }
+    // ADR 0055: capture reserves a fixed pool of dynamic-mount slots, each
+    // carrying the sentinel. Per-session creates `patch_drive` the selected
+    // skills into slots in the paused restore window, so the base snapshot
+    // stays skill-agnostic — one per image, not one per skill-combination.
+    let aux_ro_drives = (0..AuxRoDrive::RESERVED_SLOTS)
+        .map(AuxRoDrive::reserved_slot)
+        .collect();
 
     SandboxSpec {
         image: image_uri.to_string(),
@@ -104,11 +96,23 @@ pub(crate) fn cold_boot_spec(
 /// In `Literal` mode, real values land as env vars — fine for the dev
 /// loop, never use in production.
 ///
-/// In `Broker` mode, *placeholder* env vars land — the per-session
-/// network proxy substitutes the real value only on outbound HTTPS
-/// requests to the secret's `allow_hosts`. Today the proxy isn't
-/// wired yet, so Broker mode results in placeholders that don't
-/// authenticate anything; documented as next-round work in DESIGN.md.
+/// In `Broker` mode, *placeholder* env vars land. The host-agent's
+/// per-session egress proxy substitutes the real value on outbound
+/// HTTPS requests whose host matches the secret's `allow_hosts`
+/// (ADR 0006), so the agent process never sees the real credential and
+/// prompt-injection exfiltration fails. This is wired end to end:
+/// [`crate::session_boot::egress_secret_entries`] pairs each
+/// placeholder with its real value into a `SessionEgressPolicy`,
+/// `start_agent` ships it via `notify_session_policy` *before* the
+/// agent spawns (ADR 0013 atomicity), `engram_host_agent::egress::
+/// register_policy` registers it with the proxy, and
+/// `engram_egress_proxy::substitute` swaps placeholder→real after MITM.
+///
+/// The placeholder this function writes into the env is the **same**
+/// string `egress_secret_entries` reads back out as the
+/// `EgressSecretEntry.placeholder` — that coupling is what makes Broker
+/// mode authenticate, and is locked by the
+/// `broker_env_placeholder_matches_egress_entry` regression test.
 fn apply_secrets_to_env(
     env: &mut HashMap<String, String>,
     bundle: &SecretBundle,
@@ -122,11 +126,9 @@ fn apply_secrets_to_env(
             }
         }
         SecretMode::Broker => {
-            // Per-session, per-secret placeholder — the only way the
-            // real value can leak via process state is if the proxy
-            // is misconfigured. We log every placeholder issue with
-            // a SHA-256 prefix so audit logs can correlate without
-            // exposing the value.
+            // Per-session, per-secret placeholder. The real value never
+            // enters the guest env; the egress proxy substitutes it
+            // host-side (see the doc comment above).
             for name in bundle.secrets.keys() {
                 let placeholder = format!(
                     "engram_ph_{}_{}",
@@ -135,17 +137,11 @@ fn apply_secrets_to_env(
                 );
                 env.insert(name.clone(), placeholder);
             }
-            // TODO(secrets-broker): register the keyring with the
-            // per-session proxy here, and have the proxy substitute
-            // placeholders on outbound HTTPS requests whose host
-            // matches `schema.allow_hosts` / `schema.allow_host_patterns`.
-            // Until that lands, Broker-mode images will see
-            // unsubstituted placeholders and any real-API calls fail.
-            tracing::warn!(
+            tracing::debug!(
                 %session,
                 secret_count = bundle.secrets.len(),
-                "secret broker proxy is not yet implemented; \
-                 placeholders will not be substituted on outbound traffic",
+                "broker mode: installed secret placeholders; the egress proxy \
+                 substitutes real values on outbound traffic to allowed hosts",
             );
         }
     }
@@ -343,9 +339,33 @@ pub(crate) async fn build_resume_egress_policy(
     bundle: &SecretBundle,
     manifest: &ImageManifest,
     env_with_placeholders: &HashMap<String, String>,
+    image: &str,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
     let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    // ADR 0056: re-read the persisted integration policy once → injects
+    // (resolved host-side) + observes (pure), so a resumed session re-injects
+    // AND re-observes on the new host (same as the create path).
+    let policy = match state
+        .services
+        .meta
+        .get_session_integration_policy(session_id)
+        .await
+    {
+        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json).unwrap_or_else(|e| {
+            tracing::warn!(%session_id, error = %e,
+                "persisted integration policy failed to parse on resume; no injection/observation");
+            None
+        }),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e,
+                "integration policy lookup failed on resume; no injection/observation");
+            None
+        }
+    };
+    let injects = crate::session_boot::resolve_inject_entries(state, policy.as_ref(), image).await;
+    let observes = crate::session_boot::build_observe_entries(policy.as_ref());
     Some(assemble_resume_egress_policy(
         session_id,
         sandbox_id,
@@ -353,6 +373,8 @@ pub(crate) async fn build_resume_egress_policy(
         bundle,
         manifest,
         env_with_placeholders,
+        injects,
+        observes,
     ))
 }
 
@@ -362,6 +384,7 @@ pub(crate) async fn build_resume_egress_policy(
 /// without standing up a SharedState. The behaviour mirrors the
 /// create path's policy build (sessions.rs around line 635) by
 /// construction.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_resume_egress_policy(
     session_id: SessionId,
     sandbox_id: engram_core::SandboxId,
@@ -369,6 +392,8 @@ pub(crate) fn assemble_resume_egress_policy(
     bundle: &SecretBundle,
     manifest: &ImageManifest,
     env_with_placeholders: &HashMap<String, String>,
+    injects: Vec<engram_core::types::egress::EgressInjectEntry>,
+    observes: Vec<engram_core::types::egress::EgressObserveEntry>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     let mut secrets = Vec::new();
     for (name, resolved) in &bundle.secrets {
@@ -394,6 +419,12 @@ pub(crate) fn assemble_resume_egress_policy(
         network_allow_hosts: manifest.network.allow_hosts.clone(),
         network_allow_host_patterns: manifest.network.allow_host_patterns.clone(),
         secrets,
+        // ADR 0056 (B′): the resolved Plane-B injections (from the persisted
+        // policy), so a resumed session re-injects on the new host.
+        injects,
+        // ADR 0056 (Phase 4): observe specs (from the persisted policy), so a
+        // resumed session keeps emitting assets on the new host.
+        observes,
         secret_mode: manifest.secret_mode,
     }
 }
@@ -455,6 +486,22 @@ pub struct CreateSessionRequest {
     /// reject overrides.
     #[serde(default)]
     pub secrets: Option<HashMap<String, String>>,
+    /// ADR 0055: profile-selected skill bundle names; resolved to reserved-slot
+    /// mounts at `prepare_inner` against the fleet's staged bundles. Empty for
+    /// non-gRPC / legacy callers.
+    #[serde(default)]
+    pub selected_skills: Vec<String>,
+    /// ADR 0056: profile-granted "provider:action[@resource]" capability
+    /// strings, parsed + validated at `prepare_inner` and bound to the session
+    /// after its row exists. Empty for non-gRPC / legacy callers.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// ADR 0056 (B′): the orchestrator-compiled per-session integration policy
+    /// (gRPC path parses it from `integration_policy_json`). Its inject
+    /// `secret_ref`s are resolved host-side into the egress policy at boot.
+    /// `None` for non-gRPC / legacy callers.
+    #[serde(default)]
+    pub integration_policy: Option<engram_core::types::IntegrationPolicy>,
 }
 
 #[derive(Serialize)]
@@ -462,10 +509,11 @@ pub struct CreateSessionResponse {
     pub session_id: SessionId,
     pub status: &'static str,
     pub image_version: String,
-    /// `"warm"` if the session was satisfied by a pre-restored
-    /// warm-pool slot, `"cold"` if it took the full create path.
-    /// Used both by the dashboard (badge in session detail) and by
-    /// the metrics wrapper to label `engram_session_boot_seconds`
+    /// Coarse create disposition (ADR 0020: every create is a
+    /// base-snapshot restore): `"restored"` if the session booted,
+    /// `"queued"` if it found no capacity and was enqueued (ADR 0048),
+    /// `"unknown"` on a pre-boot error. Surfaced to the dashboard badge
+    /// and used as the `kind` label on `engram_session_boot_seconds`
     /// without re-running the scheduling decision.
     pub kind: &'static str,
 }
@@ -688,6 +736,26 @@ async fn enqueue_create(
                 "queued session secrets persist failed; resume/boot will lose overrides");
         }
     }
+    // ADR 0056: bind capabilities now the FK target exists, so they're durable
+    // while queued — the scanner's boot re-prepare carries an empty set and the
+    // boot-path bind is a no-op (it won't clobber these).
+    if let Err(e) = state
+        .services
+        .meta
+        .bind_session_capabilities(session_id, &inputs.capabilities)
+        .await
+    {
+        tracing::warn!(%session_id, error = %e,
+            "queued session capabilities bind failed; the broker will see none on boot");
+    }
+    // ADR 0056 (B′): persist the integration policy now the FK target exists, so
+    // the scanner's boot re-prepare (prepare_from_row) reads it back and injects.
+    crate::session_boot::persist_integration_policy(
+        state,
+        session_id,
+        inputs.integration_policy.as_ref(),
+    )
+    .await;
     if let Err(e) = state
         .emit(
             session_id,
@@ -753,6 +821,9 @@ pub(crate) async fn prepare_from_grpc(
         req.secrets.clone(),
         SessionId::new(),
         enabled,
+        req.selected_skills.clone(),
+        req.capabilities.clone(),
+        req.integration_policy.clone(),
     )
     .await
 }
@@ -786,6 +857,27 @@ pub(crate) async fn prepare_from_row(
                 session.id, session.image
             ))
         })?;
+    // ADR 0056 (B′): re-read the persisted integration policy so the queued
+    // boot re-injects (build_egress_policy resolves its refs again on the new
+    // host). A malformed/absent blob → None (no injection).
+    let integration_policy = match state
+        .services
+        .meta
+        .get_session_integration_policy(session.id)
+        .await
+    {
+        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json).unwrap_or_else(|e| {
+            tracing::warn!(session_id = %session.id, error = %e,
+                    "persisted integration policy failed to parse; booting without injection");
+            None
+        }),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(session_id = %session.id, error = %e,
+                "integration policy lookup failed; booting without injection");
+            None
+        }
+    };
     prepare_inner(
         state,
         HashMap::new(),
@@ -795,6 +887,17 @@ pub(crate) async fn prepare_from_row(
         overrides,
         session.id,
         enabled,
+        // ADR 0055 TODO(P1-D): queued sessions don't yet carry dynamic mounts
+        // (they'd need persisting in the queue row); the scanner boots them
+        // with base skills only.
+        Vec::new(),
+        // ADR 0056: a queued session's capabilities were already bound to
+        // `session_capabilities` at enqueue (the row existed); the re-prepare
+        // carries an empty set so the boot-path bind is a no-op, preserving them.
+        Vec::new(),
+        // ADR 0056 (B′): the integration policy persisted at create/enqueue,
+        // re-read above so the queued boot re-injects on the new host.
+        integration_policy,
     )
     .await
 }
@@ -807,6 +910,115 @@ pub(crate) async fn prepare_from_row(
 /// `CLAUDE_CODE_OAUTH_TOKEN`) folded into the session env — empty for the
 /// queue path, populated only on the gRPC create.
 #[allow(clippy::too_many_arguments)]
+/// ADR 0055: resolve profile-selected skill bundle names to reserved-slot mount
+/// specs. A name resolves against the **fleet stamp ∪ the org-shared upload
+/// catalog** (ADR 0055 P2): the fleet bakes identical bundles, so any active
+/// host's `current_bundles` (name -> staged sha) is the baked admin catalog, and
+/// a name the fleet doesn't carry is looked up in the `mount_catalog` table.
+/// Each skill gets a reserved slot (dyn_0..) + the staged sha the host
+/// `patch_drive`s in.
+async fn resolve_selected_skills(
+    state: &SharedState,
+    names: &[String],
+) -> Result<Vec<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
+    use engram_core::types::sandbox::AuxRoDrive;
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Cap up front so an over-cap request doesn't trigger N catalog lookups.
+    if names.len() > AuxRoDrive::RESERVED_SLOTS {
+        return Err(ApiError::BadRequest(format!(
+            "session requested {} skills but only {} reserved slots exist",
+            names.len(),
+            AuxRoDrive::RESERVED_SLOTS,
+        )));
+    }
+    // Start from the fleet stamp (baked admin bundles)…
+    let mut catalog = fleet_bundle_catalog(state).await?;
+    // …then fall through to the org-shared upload catalog for any selected name
+    // the fleet doesn't carry (ADR 0055 P2).
+    for name in names {
+        if catalog.contains_key(name) {
+            continue;
+        }
+        if let Some(skill) = state
+            .services
+            .meta
+            .get_skill_by_name(name)
+            .await
+            .map_err(|e| ApiError::Internal(format!("catalog lookup for skill `{name}`: {e}")))?
+        {
+            catalog.insert(name.clone(), skill.sha256);
+        }
+    }
+    let view: std::collections::HashMap<&str, &str> = catalog
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assign_skill_slots(&view, names)
+}
+
+/// The fleet's baked bundle catalog: any active host's `current_bundles`
+/// (name -> staged sha256). All hosts bake the same generations, so the first
+/// non-empty report is authoritative; empty if no host has reported yet. Shared
+/// by the session-create resolver and `RegisterSkill`'s fleet-name collision
+/// check (ADR 0055 P2: catalog names may not shadow a fleet bundle name).
+pub(crate) async fn fleet_bundle_catalog(
+    state: &SharedState,
+) -> Result<std::collections::HashMap<String, String>, ApiError> {
+    let hosts = state
+        .services
+        .meta
+        .list_active_hosts()
+        .await
+        .map_err(|e| ApiError::Internal(format!("list_active_hosts for skill resolve: {e}")))?;
+    Ok(hosts
+        .iter()
+        .find(|h| !h.current_bundles.is_empty())
+        .map(|h| {
+            h.current_bundles
+                .iter()
+                .map(|b| (b.drive_id.clone(), b.sha256.clone()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Pure half of skill resolution (no I/O): assign each selected skill name to a
+/// reserved slot (dyn_0..) carrying its staged content sha from `catalog` (the
+/// combined fleet ∪ upload-catalog view). Caps at `RESERVED_SLOTS`; a name in
+/// neither source is a 400.
+fn assign_skill_slots(
+    catalog: &std::collections::HashMap<&str, &str>,
+    names: &[String],
+) -> Result<Vec<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
+    use engram_core::types::sandbox::AuxRoDrive;
+    if names.len() > AuxRoDrive::RESERVED_SLOTS {
+        return Err(ApiError::BadRequest(format!(
+            "session requested {} skills but only {} reserved slots exist",
+            names.len(),
+            AuxRoDrive::RESERVED_SLOTS,
+        )));
+    }
+    let mut mounts = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let sha = catalog.get(name.as_str()).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "skill `{name}` is unknown (not a staged fleet bundle and not in the \
+                 upload catalog), or no host has reported its bundle yet"
+            ))
+        })?;
+        mounts.push(AuxRoDrive {
+            drive_id: AuxRoDrive::slot_drive_id(i),
+            guest_mount: AuxRoDrive::slot_guest_mount(i),
+            fs_type: "squashfs".into(),
+            sha256: Some((*sha).to_string()),
+        });
+    }
+    Ok(mounts)
+}
+
+#[allow(clippy::too_many_arguments)] // cohesive session-create inputs; threading a struct buys nothing
 async fn prepare_inner(
     state: &SharedState,
     identity_env: HashMap<String, String>,
@@ -816,6 +1028,12 @@ async fn prepare_inner(
     secret_overrides: Option<HashMap<String, String>>,
     session_id: SessionId,
     enabled: engram_core::types::EnabledImage,
+    // ADR 0055: profile-selected skill names; resolved to reserved-slot mounts.
+    selected_skills: Vec<String>,
+    // ADR 0056: profile-granted "provider:action[@resource]" capability strings.
+    capabilities: Vec<String>,
+    // ADR 0056 (B′): the orchestrator-compiled integration policy, if any.
+    integration_policy: Option<engram_core::types::IntegrationPolicy>,
 ) -> Result<crate::session_boot::PreparedBoot, ApiError> {
     // ADR 0021 P1.3: a dev-VM session leaves any baked harness undriven,
     // so a prompt is meaningless — reject it explicitly.
@@ -824,6 +1042,15 @@ async fn prepare_inner(
             "`prompt` requires `mode = agent` — a dev-VM session has no agent to receive it".into(),
         ));
     }
+
+    // ADR 0056: parse + validate the capability strings now (a malformed one
+    // is a create-time 400, mirroring the skills cap check). Nothing enforces
+    // them yet; they are bound to the session after its row exists.
+    let capabilities = capabilities
+        .iter()
+        .map(|s| engram_core::types::Capability::parse(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::BadRequest(format!("invalid capability: {e}")))?;
 
     let (image_repo, image_tag) = {
         let (r, t) = split_image_ref(image_uri);
@@ -949,6 +1176,10 @@ async fn prepare_inner(
              (POST /api/enabled-images) to capture one"
         ))
     })?;
+    // ADR 0055: resolve the profile's selected skill names to reserved-slot
+    // mounts against the fleet's staged bundles (name -> sha). Capped at
+    // RESERVED_SLOTS; an unknown skill name is a 400.
+    let selected_mounts = resolve_selected_skills(state, &selected_skills).await?;
     let memory_mib = resolved_memory_mib(&manifest);
     let cpu_budget_vcpus = resolved_vcpus(&manifest);
 
@@ -963,6 +1194,9 @@ async fn prepare_inner(
             session_env,
             secret_bundle,
             network,
+            selected_mounts,
+            capabilities,
+            integration_policy,
             secret_mode: manifest.secret_mode,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),
@@ -1328,7 +1562,9 @@ pub(crate) async fn inject_forge_env(
     git: Option<&engram_core::types::image::GitConfig>,
     env: &mut HashMap<String, String>,
 ) {
-    let (Some(_forge), Some(git)) = (state.forge.as_ref(), git) else {
+    // Forge env is injected only for a forge-configured deployment + a
+    // forge-bound image ([git]). ADR 0056: the github integration is the forge.
+    let (true, Some(git)) = (state.integrations.get("github").is_some(), git) else {
         return;
     };
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {
@@ -1479,39 +1715,121 @@ pub(crate) fn resolve_harness(
 mod tests {
     use super::*;
     use engram_core::traits::ResolvedSecret;
-    use engram_core::types::image::{BrowserConfig, NetworkPolicy, SecretSchema};
+    use engram_core::types::image::{NetworkPolicy, SecretSchema};
     use engram_core::types::ImageManifest;
     use engram_core::SandboxId;
 
-    /// ADR 0027: the browser memory floor is applied identically by base-
-    /// snapshot capture and session restore (both call `resolved_memory_mib`),
-    /// so FC's "restore mem_size must equal snapshot mem_size" holds. It only
-    /// raises memory for browser images that asked for less than the floor.
+    /// ADR 0055: memory is purely the image's `suggested_memory_mib` (or the
+    /// default) — the base snapshot is sized once per image and skills bind via
+    /// `patch_drive` without resizing it. Capture and restore both call this so
+    /// FC's "restore mem_size must equal snapshot mem_size" holds.
     #[test]
-    fn resolved_memory_mib_floors_only_browser_images_below_floor() {
-        let mk = |browser: bool, mem: Option<u32>| {
+    fn resolved_memory_mib_is_suggested_or_default() {
+        let mk = |mem: Option<u32>| {
             let mut m = ImageManifest {
                 name: "x".into(),
                 ..Default::default()
             };
             m.resources.suggested_memory_mib = mem;
-            if browser {
-                m.browser = Some(BrowserConfig { enabled: true });
-            }
             m
         };
-        // Non-browser: suggestion (or default) honored verbatim.
-        assert_eq!(resolved_memory_mib(&mk(false, None)), DEFAULT_MEMORY_MIB);
-        assert_eq!(resolved_memory_mib(&mk(false, Some(256))), 256);
-        // Browser + below floor: floored up.
-        assert_eq!(
-            resolved_memory_mib(&mk(true, Some(256))),
-            BROWSER_MEMORY_FLOOR_MIB
+        // Unset → default.
+        assert_eq!(resolved_memory_mib(&mk(None)), DEFAULT_MEMORY_MIB);
+        // Set → honored verbatim, both below and above the default.
+        assert_eq!(resolved_memory_mib(&mk(Some(256))), 256);
+        assert_eq!(resolved_memory_mib(&mk(Some(8192))), 8192);
+    }
+
+    /// ADR 0056 Step 0: Broker mode authenticates only because the placeholder
+    /// `apply_secrets_to_env` writes into the guest env is the SAME string
+    /// `egress_secret_entries` hands the proxy as the substitution target. This
+    /// locks that coupling across the two functions (which live in different
+    /// modules) so a change to the placeholder format in one can't silently break
+    /// the other. The proxy half (placeholder → real_value on an allowed host,
+    /// violation-close on a disallowed one) is covered by
+    /// `engram-egress-proxy/tests/intercept_e2e.rs`.
+    #[test]
+    fn broker_env_placeholder_matches_egress_entry() {
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(
+            "OPENAI_API_KEY".to_string(),
+            ResolvedSecret {
+                value: "sk-real-value".to_string(),
+                schema: SecretSchema {
+                    allow_hosts: vec!["api.openai.com".to_string()],
+                    ..Default::default()
+                },
+            },
         );
-        // Browser + already above floor: honored.
-        assert_eq!(resolved_memory_mib(&mk(true, Some(8192))), 8192);
-        // Browser + default (4 GiB): already above the floor.
-        assert_eq!(resolved_memory_mib(&mk(true, None)), DEFAULT_MEMORY_MIB);
+        let bundle = SecretBundle { secrets };
+        let session = SessionId::new();
+
+        // Broker mode: the env carries a placeholder, never the real value.
+        let mut env = HashMap::new();
+        apply_secrets_to_env(&mut env, &bundle, SecretMode::Broker, session);
+        let env_ph = env.get("OPENAI_API_KEY").expect("placeholder injected");
+        assert_ne!(
+            env_ph, "sk-real-value",
+            "broker mode must not leak the real value into the guest env"
+        );
+        assert!(env_ph.starts_with("engram_ph_"));
+
+        // The egress entry the proxy substitutes on must carry the SAME
+        // placeholder, the real value, and the secret's allow_hosts.
+        let entries = crate::session_boot::egress_secret_entries(&bundle, &env);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            &entries[0].placeholder, env_ph,
+            "the proxy's substitution target must equal the env placeholder"
+        );
+        assert_eq!(entries[0].real_value, "sk-real-value");
+        assert_eq!(entries[0].allow_hosts, vec!["api.openai.com".to_string()]);
+
+        // Literal mode: env carries the real value; entry placeholder ==
+        // real_value, so the proxy's substitution is a harmless no-op.
+        let mut env_lit = HashMap::new();
+        apply_secrets_to_env(&mut env_lit, &bundle, SecretMode::Literal, session);
+        assert_eq!(env_lit.get("OPENAI_API_KEY").unwrap(), "sk-real-value");
+        let lit = crate::session_boot::egress_secret_entries(&bundle, &env_lit);
+        assert_eq!(lit[0].placeholder, lit[0].real_value);
+    }
+
+    /// ADR 0055: the pure half of skill resolution assigns each selected name a
+    /// reserved slot (dyn_0..) carrying its staged sha, caps at RESERVED_SLOTS,
+    /// and rejects unknown names. The host-list → catalog half is exercised by
+    /// the e2e stack; this covers the slot-assignment + validation logic.
+    #[test]
+    fn assign_skill_slots_maps_caps_and_rejects() {
+        use engram_core::types::sandbox::AuxRoDrive;
+        let catalog: std::collections::HashMap<&str, &str> =
+            [("skills", "sha_a"), ("playwright", "sha_b")]
+                .into_iter()
+                .collect();
+
+        // Empty selection → empty mounts.
+        assert!(assign_skill_slots(&catalog, &[]).unwrap().is_empty());
+
+        // Two skills → two drives at dyn_0 / dyn_1 with the catalog shas, in
+        // request order.
+        let mounts = assign_skill_slots(&catalog, &["skills".into(), "playwright".into()]).unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].drive_id, AuxRoDrive::slot_drive_id(0));
+        assert_eq!(mounts[0].guest_mount, AuxRoDrive::slot_guest_mount(0));
+        assert_eq!(mounts[0].fs_type, "squashfs");
+        assert_eq!(mounts[0].sha256.as_deref(), Some("sha_a"));
+        assert_eq!(mounts[1].drive_id, AuxRoDrive::slot_drive_id(1));
+        assert_eq!(mounts[1].sha256.as_deref(), Some("sha_b"));
+
+        // Unknown skill → 400.
+        let err = assign_skill_slots(&catalog, &["nope".into()]).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+
+        // Over the reserved-slot cap → 400 (even if every name is known).
+        let too_many: Vec<String> = (0..AuxRoDrive::RESERVED_SLOTS + 1)
+            .map(|_| "skills".to_string())
+            .collect();
+        let err = assign_skill_slots(&catalog, &too_many).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
     }
 
     /// ADR 0039: the base-restore metadata points the host's memory-chunk
@@ -1589,7 +1907,6 @@ mod tests {
             secret_mode: SecretMode::Broker,
             harness: None,
             git: None,
-            browser: None,
             warm: None,
         };
 
@@ -1628,6 +1945,8 @@ mod tests {
             &bundle,
             &manifest,
             &env_with_ph,
+            Vec::new(),
+            Vec::new(),
         );
 
         // 1. Real IP, not UNSPECIFIED.
@@ -1673,7 +1992,6 @@ mod tests {
             secret_mode: SecretMode::Broker,
             harness: None,
             git: None,
-            browser: None,
             warm: None,
         };
 
@@ -1703,6 +2021,8 @@ mod tests {
             &bundle,
             &manifest,
             &env_with_ph,
+            Vec::new(),
+            Vec::new(),
         );
 
         assert_eq!(policy.guest_ip, guest_ip);

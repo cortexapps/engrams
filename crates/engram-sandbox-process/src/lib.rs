@@ -631,39 +631,43 @@ fn env_iter<'a>(env: &'a HashMap<String, String>) -> impl Iterator<Item = (&'a s
 /// `just bundles` populates the defaults; override per drive via
 /// `ENGRAM_<DRIVE_ID>_BUNDLE_DIR`.
 ///
-/// We stage the canonical set (`skills` always, `playwright` when its host
-/// dir exists) rather than reading `spec.aux_ro_drives`, because the
-/// ProcessBackend restore path synthesizes a spec without them — staging
-/// the same way for create and restore keeps a resumed dev session's
-/// symlinks valid. Best-effort + spec-independent is fine here: this is the
-/// non-isolated dev backend, and `activate` only wires what's actually
-/// present (the `[browser]` opt-in is still authoritative in production FC).
+/// ADR 0055 dev parity for the built-in skill bundles. Production FC reserves
+/// `dyn-*` slots and `patch_drive`s the selected skills in; the non-isolated
+/// dev backend has no drives, so it symlinks each available bundle tree (under
+/// `var/bundles/<name>`, populated by `just bundles`, or the
+/// `ENGRAM_<NAME>_BUNDLE_DIR` override) at its guest mount so
+/// `engram_session_bundles::activate(cwd, ..)` finds it. Spec-independent (the
+/// restore path synthesizes a spec without aux drives) so create and restore
+/// stage identically. The catalog-driven, per-session-selected dev staging
+/// lands with the rest of the ADR 0055 catalog; today it stages the known
+/// built-in bundles at their canonical guest mounts.
 async fn stage_aux_bundles(cwd: &Path) {
-    use engram_core::types::sandbox::AuxRoDrive;
-    for drive in [AuxRoDrive::skills(), AuxRoDrive::playwright()] {
-        let Some(host_dir) = bundle_host_dir(&drive.drive_id) else {
+    const DEV_BUNDLES: &[&str] = &["skills", "playwright"];
+    // Sequential slot index, mirroring the production init-shim's
+    // /opt/engram/dyn/<i> mounting so the shared `activate()` finds the bundles.
+    // A skipped (absent) bundle doesn't consume an index.
+    let mut i = 0usize;
+    for name in DEV_BUNDLES {
+        let Some(host_dir) = bundle_host_dir(name) else {
             continue;
         };
         if !host_dir.exists() {
             tracing::debug!(
-                drive = %drive.drive_id,
+                bundle = %name,
                 host_dir = %host_dir.display(),
-                "ADR 0027 dev: bundle dir absent; skipping (run `just bundles`)",
+                "ADR 0055 dev: bundle dir absent; skipping (run `just bundles`)",
             );
             continue;
         }
-        let rel = drive
-            .guest_mount
-            .strip_prefix("/")
-            .unwrap_or(&drive.guest_mount);
-        let link = cwd.join(rel);
+        let link = cwd.join(format!("opt/engram/dyn/{i}"));
         if let Some(parent) = link.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
         let _ = tokio::fs::remove_file(&link).await; // replace stale symlink
         if let Err(e) = tokio::fs::symlink(&host_dir, &link).await {
-            tracing::debug!(drive = %drive.drive_id, error = %e, "ADR 0027 dev: bundle symlink failed");
+            tracing::debug!(bundle = %name, error = %e, "ADR 0055 dev: bundle symlink failed");
         }
+        i += 1;
     }
 }
 

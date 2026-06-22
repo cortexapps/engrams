@@ -227,6 +227,7 @@ pub trait HostClient: Send + Sync {
         &self,
         _metadata: SnapshotMetadata,
         _session_env: std::collections::HashMap<String, String>,
+        _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this host doesn't support `restore_base_for_session`".into(),

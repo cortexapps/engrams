@@ -100,7 +100,7 @@ export function SessionProfiles() {
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <IdCard className="size-5" />
-          <h1 className="text-lg font-semibold">Session Profiles</h1>
+          <h1 className="text-lg font-semibold">Profiles</h1>
         </div>
         <Button asChild>
           <Link to="/settings/profiles/new">Create profile</Link>
@@ -110,7 +110,7 @@ export function SessionProfiles() {
       {isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
       {!isPending && active.length === 0 && (
         <div className="rounded-md border border-dashed p-8 text-center">
-          <p className="text-sm text-muted-foreground">No session profiles yet</p>
+          <p className="text-sm text-muted-foreground">No profiles yet</p>
           <Button asChild className="mt-3">
             <Link to="/settings/profiles/new">Create profile</Link>
           </Button>

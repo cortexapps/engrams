@@ -83,15 +83,20 @@ jobs:
 
       - uses: oras-project/setup-oras@v1
 
-      - name: Pull golden cli-tools (engram-cli + engram-agentd)
+      - name: Pull golden cli-tools (engram-cli + engram-agentd + mke2fs)
         env:
           REF: ${{ inputs.engrams_ref }}
         run: |
           set -euo pipefail
-          # Drops engram-cli + engram-agentd into the cwd verbatim.
+          # Drops engram-cli + engram-agentd + the pinned mke2fs into cwd. oras
+          # doesn't preserve the executable bit, so re-set it. ADR 0036: the
+          # bundled mke2fs (e2fsprogs >= 1.47.1) is what makes `engram-cli image
+          # build` byte-deterministic — engram-cli resolves it as a sibling, so
+          # no nix/apt setup step is needed here. (Determinism is a property of
+          # the tool, not this workflow.)
           oras pull "ghcr.io/cortexapps/engrams/cli-tools:${REF}"
-          chmod +x engram-cli engram-agentd
-          file engram-cli engram-agentd
+          chmod +x engram-cli engram-agentd mke2fs
+          file engram-cli engram-agentd mke2fs
 
       - name: Bake + push image
         env:

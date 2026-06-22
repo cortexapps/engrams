@@ -166,7 +166,7 @@ fn sandbox_spec() -> SandboxSpec {
         },
         aux_ro_drives: vec![AuxRoDrive {
             sha256: Some("a".repeat(64)),
-            ..AuxRoDrive::skills()
+            ..AuxRoDrive::reserved_slot(0)
         }],
     }
 }
@@ -215,6 +215,12 @@ fn session_egress_policy() -> SessionEgressPolicy {
             allow_hosts: vec!["api.anthropic.com".into()],
             allow_host_patterns: vec![],
         }],
+        // ADR 0056: injects (Phase 3b) + observes (Phase 4b) ride
+        // SessionEgressPolicy. Empty here — the golden pins their length
+        // prefixes so a field reorder/removal is caught. WIRE_VERSION was
+        // bumped for these additions (see wire.rs).
+        injects: vec![],
+        observes: vec![],
         secret_mode: SecretMode::Broker,
     }
 }
@@ -248,13 +254,13 @@ fn struct_payloads_golden() {
         "aux_ro_drive",
         &AuxRoDrive {
             sha256: Some("c".repeat(64)),
-            ..AuxRoDrive::playwright()
+            ..AuxRoDrive::reserved_slot(1)
         },
     );
     assert_golden(
         "aux_bundle_ref",
         &AuxBundleRef {
-            drive_id: "playwright".into(),
+            drive_id: "dyn_1".into(),
             sha256: "d".repeat(64),
         },
     );
@@ -318,7 +324,7 @@ fn wire_version_pinned() {
     // signal that a payload shape changed; pin it so a payload change
     // without a bump (or vice-versa) is a conscious decision.
     assert_eq!(
-        WIRE_VERSION, 2,
+        WIRE_VERSION, 4,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -344,13 +350,13 @@ fn regen_golden() {
         "aux_ro_drive",
         &AuxRoDrive {
             sha256: Some("c".repeat(64)),
-            ..AuxRoDrive::playwright()
+            ..AuxRoDrive::reserved_slot(1)
         },
     );
     write(
         "aux_bundle_ref",
         &AuxBundleRef {
-            drive_id: "playwright".into(),
+            drive_id: "dyn_1".into(),
             sha256: "d".repeat(64),
         },
     );

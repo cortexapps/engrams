@@ -17,11 +17,15 @@ describe("ProfileStore", () => {
       imageId: "img-1",
       includeUserTokens: false,
       envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
+      skills: ["skills"],
+      capabilities: ["github:issues:write", "datadog:logs:read"],
     };
     const created = await store.create(input);
     try {
       expect(created.id).toBeDefined();
       expect(created.deletedAt).toBeNull();
+      // ADR 0056: capabilities round-trip through the store.
+      expect(created.capabilities).toEqual(["github:issues:write", "datadog:logs:read"]);
 
       const active = await store.getActive(created.id);
       expect(active?.name).toBe(input.name);

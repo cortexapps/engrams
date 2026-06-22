@@ -58,6 +58,11 @@ pub struct ProxyConfig {
     /// Upstream resolver the DNS proxy forwards allowed queries to.
     /// Defaults to Cloudflare's 1.1.1.1:53.
     pub dns_upstream: SocketAddr,
+    /// ADR 0056 (Phase 4): sink for observed `IntegrationAsset`s. `None`
+    /// disables observation regardless of policy (no consumer to forward to).
+    /// The host-agent wires this to its coordinator bridge; tests pass a
+    /// collecting closure.
+    pub observe_sink: Option<crate::observe::ObserveSink>,
 }
 
 impl ProxyConfig {
@@ -79,6 +84,7 @@ impl ProxyConfig {
             dns_upstream: dns::DEFAULT_UPSTREAM
                 .parse()
                 .expect("dns upstream default parses"),
+            observe_sink: None,
         }
     }
 }
@@ -108,6 +114,7 @@ impl Proxy {
         let resolver = self.cfg.resolver.clone();
         let server_cfg = self.server_cfg.clone();
         let client_cfg = self.client_cfg.clone();
+        let observe_sink = self.cfg.observe_sink.clone();
 
         // Spawn the filtering DNS proxy. Bound on udp/53 + tcp/53
         // (via the same dns_bind_addr); iptables REDIRECTs guest
@@ -154,9 +161,18 @@ impl Proxy {
             let resolver = resolver.clone();
             let server_cfg = server_cfg.clone();
             let client_cfg = client_cfg.clone();
+            let observe_sink = observe_sink.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle(stream, peer, registry, resolver, server_cfg, client_cfg).await
+                if let Err(e) = handle(
+                    stream,
+                    peer,
+                    registry,
+                    resolver,
+                    server_cfg,
+                    client_cfg,
+                    observe_sink,
+                )
+                .await
                 {
                     tracing::debug!(peer = %peer, error = %e, "connection handler ended with error");
                 }
@@ -165,6 +181,7 @@ impl Proxy {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -172,6 +189,7 @@ async fn handle(
     resolver: Arc<dyn UpstreamResolver>,
     server_cfg: Arc<rustls::ServerConfig>,
     client_cfg: Arc<rustls::ClientConfig>,
+    observe_sink: Option<crate::observe::ObserveSink>,
 ) -> Result<(), HandleError> {
     let guest_ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
@@ -215,9 +233,24 @@ async fn handle(
             );
             Ok(())
         }
-        Decision::Intercept(secrets) => {
+        Decision::Intercept {
+            secrets,
+            injects,
+            observes,
+        } => {
             let result = intercept::run(
-                stream, peeked, &sni, port, resolver, &secrets, server_cfg, client_cfg,
+                stream,
+                peeked,
+                &sni,
+                port,
+                resolver,
+                &secrets,
+                &injects,
+                &observes,
+                session.session_id,
+                observe_sink.as_ref(),
+                server_cfg,
+                client_cfg,
             )
             .await;
             match result {
@@ -228,6 +261,17 @@ async fn handle(
                         sni = %sni,
                         placeholder,
                         "VIOLATION: placeholder sent to host outside its allow_hosts",
+                    );
+                    Ok(())
+                }
+                // ADR 0056: an inject-gated host got a request shape no policy
+                // permits — close it (the side effect never reaches upstream),
+                // same disposition as a placeholder leak.
+                Err(intercept::InterceptError::RequestRejected { method, path }) => {
+                    tracing::info!(
+                        session_id = %session.session_id,
+                        sni = %sni, %method, %path,
+                        "egress rejected — request shape not permitted by integration policy",
                     );
                     Ok(())
                 }

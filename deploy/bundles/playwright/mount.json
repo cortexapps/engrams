@@ -1,0 +1,6 @@
+{
+  "kind": "skill",
+  "skills": [
+    { "name": "show-your-work", "bins": ["bin/playwright-cli"] }
+  ]
+}

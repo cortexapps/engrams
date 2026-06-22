@@ -520,9 +520,15 @@ impl HostService for HostServiceImpl {
         async move {
             let inner = req.into_inner();
             let metadata = decode_bincode(&inner.metadata_bincode, "SnapshotMetadata")?;
+            // ADR 0055: empty bytes (old coord / no skills) decode to an empty Vec.
+            let selected_mounts = if inner.selected_mounts_bincode.is_empty() {
+                Vec::new()
+            } else {
+                decode_bincode(&inner.selected_mounts_bincode, "selected_mounts")?
+            };
             let id = self
                 .inner
-                .restore_base_for_session(metadata, inner.session_env)
+                .restore_base_for_session(metadata, inner.session_env, selected_mounts)
                 .await
                 .map_err(sandbox_to_status)?;
             Ok(Response::new(SandboxIdMessage {

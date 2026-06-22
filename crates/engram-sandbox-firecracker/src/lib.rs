@@ -909,7 +909,7 @@ impl FirecrackerBackend {
         Ok(self
             .config
             .bundle_dir
-            .join(AuxRoDrive::staged_file_name(&aux.drive_id, sha)))
+            .join(AuxRoDrive::staged_file_name(sha)))
     }
 
     /// Apply once-per-host networking setup: enable IP forwarding,
@@ -1016,6 +1016,7 @@ impl FirecrackerBackend {
             &src,
             &manifest,
             /*swap_aux_to_current=*/ false,
+            /*selected_mounts=*/ Vec::new(),
             self.effective_restore_mode(/*fresh=*/ false),
             // Reattach has no coordinator metadata; canonical falls back
             // to the session ref (unshared but correct — rare path).
@@ -1056,6 +1057,7 @@ impl FirecrackerBackend {
         &self,
         metadata: SnapshotMetadata,
         swap_aux_to_current: bool,
+        selected_mounts: Vec<AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         // ADR 0007 Phase 6: backend looks up its own staging dir.
         let src = self.snapshot_dir_for(metadata.id);
@@ -1103,6 +1105,7 @@ impl FirecrackerBackend {
                 &src,
                 &manifest,
                 swap_aux_to_current,
+                selected_mounts,
                 restore_mode,
                 metadata.base_memory_manifest,
             )
@@ -1963,20 +1966,25 @@ impl FirecrackerBackend {
         // this host currently stages") against the bake stamp BEFORE anything
         // embeds the spec — the manifest written below and FC's state.bin
         // must both carry the resolved, content-addressed form.
+        // ADR 0055: at capture every aux drive is a reserved slot carrying the
+        // sentinel, so resolve all symbolic drives to the host's staged sentinel
+        // generation (`current.json`'s `sentinel` key). Per-session skill
+        // selection happens later, at restore, by `patch_drive`-ing real skill
+        // shas into slots — never here.
         if spec.aux_ro_drives.iter().any(|d| d.sha256.is_none()) {
             let stamp = self.read_bundle_stamp().await?;
+            let sentinel_sha = stamp.get(AuxRoDrive::SENTINEL_STAMP_KEY).ok_or_else(|| {
+                SandboxError::InvalidSpec(format!(
+                    "reserved aux slots requested but this host's bundle stamp \
+                     ({}/{}) carries no `{}` entry — re-bake or roll the host image",
+                    self.config.bundle_dir.display(),
+                    AuxRoDrive::CURRENT_STAMP,
+                    AuxRoDrive::SENTINEL_STAMP_KEY,
+                ))
+            })?;
             for drive in &mut spec.aux_ro_drives {
                 if drive.sha256.is_none() {
-                    let sha = stamp.get(&drive.drive_id).ok_or_else(|| {
-                        SandboxError::InvalidSpec(format!(
-                            "aux RO drive `{}` requested but this host's bundle \
-                             stamp ({}/{}) doesn't carry it",
-                            drive.drive_id,
-                            self.config.bundle_dir.display(),
-                            AuxRoDrive::CURRENT_STAMP,
-                        ))
-                    })?;
-                    drive.sha256 = Some(sha.clone());
+                    drive.sha256 = Some(sentinel_sha.clone());
                 }
             }
         }
@@ -2495,6 +2503,10 @@ impl FirecrackerBackend {
         snapshot_dir: &Path,
         manifest: &FcSnapshotManifest,
         swap_aux_to_current: bool,
+        // ADR 0055: per-session skills the coordinator assigned to reserved
+        // slots (dyn_i + content sha), patch_drived in load-paused. Empty on
+        // resume / reattach.
+        selected_mounts: Vec<AuxRoDrive>,
         // ADR 0022: the effective memory backend for THIS restore
         // (base-create may be File while resume is UFFD). Computed by the
         // caller via `effective_restore_mode` rather than read from
@@ -2571,7 +2583,7 @@ impl FirecrackerBackend {
                             let current_path = self
                                 .config
                                 .bundle_dir
-                                .join(AuxRoDrive::staged_file_name(&aux.drive_id, current_sha));
+                                .join(AuxRoDrive::staged_file_name(current_sha));
                             if !tokio::fs::try_exists(&current_path).await.unwrap_or(false) {
                                 tracing::warn!(
                                     drive_id = %aux.drive_id,
@@ -2597,6 +2609,38 @@ impl FirecrackerBackend {
                         );
                     }
                 }
+            }
+        }
+        // ADR 0055: per-session skill selection. The coordinator assigned each
+        // selected skill to a reserved slot (dyn_i) + content sha; plan a
+        // `patch_drive` over that slot's sentinel and record it on the live spec
+        // so a later eviction snapshot pins the skill (resume re-attaches it).
+        // Only the fresh-create flavor carries selections; resume passes none.
+        for sel in &selected_mounts {
+            let staged = sel.staged_path().ok_or_else(|| {
+                SandboxError::Snapshot(format!(
+                    "ADR 0055 selected skill for slot {} has no content sha",
+                    sel.drive_id,
+                ))
+            })?;
+            if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
+                return Err(SandboxError::Snapshot(format!(
+                    "ADR 0055 selected skill {} for slot {} is not staged on this \
+                     host (catalog materialize gap?) — restore can't proceed",
+                    sel.sha256.as_deref().unwrap_or("?"),
+                    sel.drive_id,
+                )));
+            }
+            // Explicit per-session selection wins over any sentinel→current swap
+            // already planned for this slot.
+            aux_swap_plan.retain(|(id, _)| id != &sel.drive_id);
+            aux_swap_plan.push((sel.drive_id.clone(), staged));
+            if let Some(slot) = live_spec
+                .aux_ro_drives
+                .iter_mut()
+                .find(|d| d.drive_id == sel.drive_id)
+            {
+                slot.sha256 = sel.sha256.clone();
             }
         }
         // ADR 0045 C2: a post-copy destination starts restoring BEFORE
@@ -3244,6 +3288,21 @@ impl FirecrackerBackend {
 
 fn vm_err(msg: impl Into<String>) -> SandboxError {
     SandboxError::Vm(msg.into().into())
+}
+
+/// Timeout for `PUT /snapshot/create`. The call flushes the full guest
+/// memory to memory.bin synchronously, so its duration scales with guest
+/// RAM. A flat 60s fit small VMs but tripped on large warm images — the
+/// dev-brain 32 GiB capture failed with "PUT /snapshot/create timed out
+/// after 60s". Budget a 60s base (pause + device serialize; preserves the
+/// prior behavior for small VMs) plus a conservative 128 MiB/s flush-
+/// throughput floor (the host disk may be cold or shared), so a 32 GiB VM
+/// gets ~5min instead of 60s. A too-generous ceiling is harmless — a
+/// genuinely hung FC is caught by the process supervisor, not this timeout.
+fn snapshot_create_timeout(mem_mib: u32) -> Duration {
+    const BASE_SECS: u64 = 60;
+    const MIB_PER_SEC_FLOOR: u64 = 128;
+    Duration::from_secs(BASE_SECS + mem_mib as u64 / MIB_PER_SEC_FLOOR)
 }
 
 /// ADR 0014: re-install the canonical rootfs + harness symlinks for
@@ -4157,15 +4216,24 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        self.restore_with(metadata, /*swap_aux_to_current=*/ false)
+        self.restore_with(metadata, /*swap_aux_to_current=*/ false, Vec::new())
             .await
     }
 
-    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
-        // ADR 0035 §3: fresh creates track the host's current bundle
-        // generations; the swap happens load-paused inside restore_in_jail.
-        self.restore_with(metadata, /*swap_aux_to_current=*/ true)
-            .await
+    async fn restore_fresh(
+        &self,
+        metadata: SnapshotMetadata,
+        selected_mounts: Vec<AuxRoDrive>,
+    ) -> Result<SandboxId, SandboxError> {
+        // ADR 0035 §3 + 0055: fresh creates track the host's current bundle
+        // generations AND patch the per-session selected skills into reserved
+        // slots; both swaps happen load-paused inside restore_in_jail.
+        self.restore_with(
+            metadata,
+            /*swap_aux_to_current=*/ true,
+            selected_mounts,
+        )
+        .await
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -5087,11 +5155,12 @@ impl FirecrackerBackend {
         // pause → PUT /snapshot/create → resume happens inside the
         // client; a failure mid-sequence still tries to resume the
         // VM rather than leaving it stuck Paused.
-        // Snapshot duration scales with guest memory (every dirty page
-        // is flushed to memory.bin synchronously). The default 10s
-        // client timeout fits a 64 MiB VM but trips on larger ones —
-        // give the snapshot path 60s explicitly. Tune up for huge VMs.
-        let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
+        // Snapshot duration scales with guest memory (every dirty page is
+        // flushed to memory.bin synchronously), so the timeout scales with
+        // the VM's RAM — a flat 60s tripped on large warm images (dev-brain's
+        // 32 GiB capture). See `snapshot_create_timeout`.
+        let api = FirecrackerClient::new(&socket)
+            .with_timeout(snapshot_create_timeout(spec.memory.max_mib));
         let paths = match snapshot_type {
             client::SnapshotType::Full => api.create_snapshot(&dest).await?,
             client::SnapshotType::Diff => {
@@ -5235,6 +5304,22 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn snapshot_timeout_scales_with_guest_memory() {
+        // Small VMs keep the prior 60s floor (no regression).
+        assert_eq!(snapshot_create_timeout(64), Duration::from_secs(60));
+        assert_eq!(snapshot_create_timeout(4096), Duration::from_secs(60 + 32));
+        // The dev-brain 32 GiB capture that tripped the flat 60s now gets
+        // ~5min — comfortably more than 60s.
+        let big = snapshot_create_timeout(32 * 1024);
+        assert!(
+            big >= Duration::from_secs(300),
+            "32 GiB snapshot budget must be ample, got {big:?}"
+        );
+        // Monotonic in memory.
+        assert!(snapshot_create_timeout(16 * 1024) < big);
+    }
+
     // ADR 0044 K2: node-cgroup escape helpers. A tempdir stands in for the
     // cgroup parent — this exercises the leaf-path + pid-write + rmdir logic,
     // NOT the kernel process-migration (which needs a real cgroupfs and is
@@ -5312,11 +5397,11 @@ mod tests {
         }
     }
 
-    /// ADR 0035: a spec requesting aux drives on a host without a
-    /// bundle stamp must fail loudly at the resolve step — capturing a
-    /// skills-less snapshot silently is the incident's setup.
+    /// ADR 0055: a reserved slot requested on a host without a bundle stamp
+    /// (no `sentinel` entry) must fail loudly at the resolve step — capturing a
+    /// sentinel-less snapshot silently is the ADR 0035 incident's setup.
     #[tokio::test]
-    async fn create_with_aux_drives_requires_bundle_stamp() {
+    async fn create_with_reserved_slot_requires_sentinel_stamp() {
         let (b, d) = backend();
         // Satisfy the kernel + rootfs existence checks (they precede
         // the resolve step) so create reaches aux-drive resolution.
@@ -5325,19 +5410,19 @@ mod tests {
         std::fs::write(&rootfs, b"not-really-ext4").unwrap();
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
-        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
         match b.create(sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
-                assert!(msg.contains("bundle stamp"), "{msg}");
+                assert!(msg.contains("stages no bundles"), "{msg}");
             }
-            other => panic!("expected InvalidSpec(bundle stamp), got {other:?}"),
+            other => panic!("expected InvalidSpec(no stamp), got {other:?}"),
         }
     }
 
-    /// ADR 0035: a stamp that doesn't carry the requested drive_id is
-    /// equally loud (host image staged playwright but not skills, say).
+    /// ADR 0055: a stamp that doesn't carry the `sentinel` entry is equally
+    /// loud (the host image staged something else but not the sentinel).
     #[tokio::test]
-    async fn create_with_aux_drive_missing_from_stamp_errors() {
+    async fn create_with_missing_sentinel_stamp_errors() {
         let (b, d) = backend();
         std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
         let rootfs = d.path().join("rootfs.ext4");
@@ -5346,27 +5431,27 @@ mod tests {
         std::fs::create_dir_all(&bundle_dir).unwrap();
         std::fs::write(
             bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
-            br#"{"playwright": "aaaa"}"#,
+            br#"{"something-else": "aaaa"}"#,
         )
         .unwrap();
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
-        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
         match b.create(sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
-                assert!(msg.contains("doesn't carry it"), "{msg}");
+                assert!(msg.contains("sentinel"), "{msg}");
             }
-            other => panic!("expected InvalidSpec(missing entry), got {other:?}"),
+            other => panic!("expected InvalidSpec(missing sentinel), got {other:?}"),
         }
     }
 
-    /// ADR 0035: with a valid stamp entry the resolve step passes —
-    /// create proceeds past it (and fails much later on the
-    /// nonexistent firecracker binary, which is the negative-path
-    /// fixture's expected terminal error). Distinguishing the error
-    /// kind proves resolution consumed the stamp.
+    /// ADR 0055: with a valid `sentinel` stamp entry + staged file the resolve
+    /// step passes — create proceeds past it (and fails much later on the
+    /// nonexistent firecracker binary, the negative-path fixture's expected
+    /// terminal error). Distinguishing the error kind proves resolution
+    /// consumed the stamp.
     #[tokio::test]
-    async fn create_with_resolvable_aux_drive_passes_resolution() {
+    async fn create_with_resolvable_sentinel_passes_resolution() {
         let (b, d) = backend();
         std::fs::write(d.path().join("nonexistent-vmlinux"), b"vmlinux").unwrap();
         let rootfs = d.path().join("rootfs.ext4");
@@ -5376,17 +5461,17 @@ mod tests {
         let sha = "a".repeat(64);
         std::fs::write(
             bundle_dir.join(AuxRoDrive::CURRENT_STAMP),
-            format!("{{\"skills\": \"{sha}\"}}"),
+            format!("{{\"{}\": \"{sha}\"}}", AuxRoDrive::SENTINEL_STAMP_KEY),
         )
         .unwrap();
         std::fs::write(
-            bundle_dir.join(AuxRoDrive::staged_file_name("skills", &sha)),
+            bundle_dir.join(AuxRoDrive::staged_file_name(&sha)),
             b"squashfs-bytes",
         )
         .unwrap();
         let mut sp = spec();
         sp.rootfs_source = Some(rootfs);
-        sp.aux_ro_drives = vec![AuxRoDrive::skills()];
+        sp.aux_ro_drives = vec![AuxRoDrive::reserved_slot(0)];
         match b.create(sp).await {
             Err(SandboxError::InvalidSpec(msg)) => {
                 panic!("resolution should have passed, got InvalidSpec: {msg}")

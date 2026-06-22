@@ -14,6 +14,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use engram_core::traits::MetadataStore;
 use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::Capability;
 use engram_core::{SandboxId, SessionId, SnapshotId};
 
 async fn pg() -> Option<Arc<dyn MetadataStore>> {
@@ -254,8 +255,14 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
     .expect("append e1");
     meta.append_session_event(
         session_id,
-        "pull_request_opened",
-        serde_json::json!({"url": "https://github.com/x/y/pull/7", "number": 7}),
+        "integration_asset",
+        serde_json::json!({
+            "provider": "forge",
+            "asset_kind": "pull_request",
+            "surface": "asset",
+            "data": {"number": 7},
+            "fetchable": {"kind": "external", "url": "https://github.com/x/y/pull/7"},
+        }),
     )
     .await
     .expect("append PR");
@@ -345,4 +352,99 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
         "the post-recovery event (idx > cursor, still live) is rolled back",
     );
     assert_eq!(re.recovery_epoch, 2, "epoch bumps again: 1 → 2");
+}
+
+/// ADR 0056 Phase 2: a session's profile-granted capabilities round-trip
+/// through `session_capabilities` — covering the empty no-op, idempotent
+/// re-bind (ON CONFLICT DO NOTHING), and the `resource` '' <-> Option::None
+/// mapping. This is the data-plumbing the broker reads to clamp (no
+/// enforcement yet).
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn session_capabilities_bind_get_round_trip() {
+    let Some(meta) = pg().await else {
+        return;
+    };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    // Empty bind is a no-op; get returns nothing.
+    meta.bind_session_capabilities(session_id, &[])
+        .await
+        .expect("empty bind");
+    assert!(meta
+        .get_session_capabilities(session_id)
+        .await
+        .expect("get empty")
+        .is_empty());
+
+    let caps = vec![
+        Capability::parse("github:contents:write@cortexapps/engrams").unwrap(),
+        Capability::parse("datadog:logs:read").unwrap(),
+    ];
+    meta.bind_session_capabilities(session_id, &caps)
+        .await
+        .expect("bind");
+    // Idempotent: re-binding the same set must not error or duplicate.
+    meta.bind_session_capabilities(session_id, &caps)
+        .await
+        .expect("idempotent re-bind");
+
+    let got = meta
+        .get_session_capabilities(session_id)
+        .await
+        .expect("get");
+    assert_eq!(got.len(), 2, "two distinct capabilities, no duplicates");
+    assert!(
+        got.contains(&Capability::parse("github:contents:write@cortexapps/engrams").unwrap()),
+        "resource-scoped capability round-trips verbatim",
+    );
+    let dd = got
+        .iter()
+        .find(|c| c.provider == "datadog")
+        .expect("datadog cap present");
+    assert_eq!(
+        dd.resource, None,
+        "the '' resource sentinel maps back to Option::None",
+    );
+}
+
+/// ADR 0056 Phase 3b-2: the compiled integration policy round-trips through
+/// `session_integration_policy` (upsert + JSON verbatim), so a queued
+/// re-prepare / resume can re-resolve its inject refs without the orchestrator.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn session_integration_policy_round_trip() {
+    let Some(meta) = pg().await else {
+        return;
+    };
+    let (session_id, _sandbox) = seed_active(&meta).await;
+
+    // Absent → None.
+    assert!(meta
+        .get_session_integration_policy(session_id)
+        .await
+        .expect("get empty")
+        .is_none());
+
+    let json = r#"{"injects":[{"hosts":["api.datadoghq.com"],"header_name":"DD-API-KEY","header_template":"{}","secret_ref":"datadog-api-key","methods":["GET"],"path_prefixes":["/api/v2/logs"]}]}"#;
+    meta.bind_session_integration_policy(session_id, json)
+        .await
+        .expect("bind");
+    // Upsert: a re-bind replaces, no error.
+    meta.bind_session_integration_policy(session_id, json)
+        .await
+        .expect("re-bind");
+
+    let got = meta
+        .get_session_integration_policy(session_id)
+        .await
+        .expect("get")
+        .expect("policy present");
+    // Parses back to the typed policy the coordinator resolves.
+    let policy = engram_core::types::IntegrationPolicy::parse(&got)
+        .expect("valid json")
+        .expect("non-empty");
+    assert_eq!(policy.injects.len(), 1);
+    assert_eq!(policy.injects[0].secret_ref, "datadog-api-key");
+    assert_eq!(policy.injects[0].methods, vec!["GET".to_string()]);
 }

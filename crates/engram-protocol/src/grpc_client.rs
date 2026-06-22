@@ -17,7 +17,9 @@ use bytes::Bytes;
 use engram_core::traits::HostClient;
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
-use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{
+    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
+};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
 use futures::Stream;
@@ -550,10 +552,13 @@ impl GrpcHostClient {
         &self,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
+        selected_mounts: Vec<AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         let mut req = tonic::Request::new(RestoreBaseForSessionRequest {
             metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
             session_env,
+            // ADR 0055: per-session selected skills, assigned to reserved slots.
+            selected_mounts_bincode: encode_bincode(&selected_mounts, "selected_mounts")?,
         });
         req.set_timeout(restore_rpc_timeout());
         let resp = self
@@ -1272,8 +1277,9 @@ impl HostClient for GrpcHostClient {
         &self,
         metadata: SnapshotMetadata,
         session_env: std::collections::HashMap<String, String>,
+        selected_mounts: Vec<AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
-        Self::restore_base_for_session(self, metadata, session_env).await
+        Self::restore_base_for_session(self, metadata, session_env, selected_mounts).await
     }
 
     async fn start_agent(

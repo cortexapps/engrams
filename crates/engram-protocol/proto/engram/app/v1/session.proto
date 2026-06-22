@@ -118,6 +118,27 @@ message CreateSessionRequest {
   // silently lose its token). Honored regardless of SecretMode: this is NOT a
   // user override, it is the trusted orchestrator's identity injection. NEVER logged.
   map<string, string> harness_env = 6;
+  // ADR 0055: profile-selected skill bundle names (e.g. "skills", "playwright").
+  // The coordinator resolves each to its staged content sha (from the fleet's
+  // current bundles), assigns a reserved slot (dyn_0..), and patch_drives it in
+  // during the paused restore window; the guest reads each mount's mount.json to
+  // wire the skills. Capped at RESERVED_SLOTS. Empty = base session, no skills.
+  repeated string selected_skills = 8;
+  // ADR 0056: profile-granted integration capabilities, each
+  // "provider:action[@resource]" (e.g. "github:issues:write",
+  // "datadog:logs:read", "s3:read@bucket"). The coordinator parses +
+  // validates each (a malformed string is a create-time error), binds them
+  // to the session in Postgres (`session_capabilities`), and the broker
+  // clamps every guest credential/action request to this set. Empty = no
+  // third-party integration access. Bound this phase; enforced in a later one.
+  repeated string capabilities = 9;
+  // ADR 0056 (option B′): the per-session integration policy the orchestrator
+  // compiled from the profile's capabilities + its connector config, as a JSON
+  // string (an orchestrator-authored artifact, opaque to proto — like an event
+  // payload_json). The coordinator resolves each inject's `secret_ref`
+  // host-side and the host proxy enforces the gate + injection. Carries secret
+  // *refs*, never values. Empty = no integration policy.
+  string integration_policy_json = 10;
 }
 
 message CreateSessionResponse {

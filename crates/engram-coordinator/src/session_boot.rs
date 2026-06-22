@@ -61,6 +61,18 @@ pub(crate) struct BootInputs {
     /// entries.
     pub secret_bundle: engram_core::traits::SecretBundle,
     pub network: engram_core::types::image::NetworkPolicy,
+    /// ADR 0055: per-session skills resolved from the profile + assigned to
+    /// reserved slots (dyn_0..). Patched into the restored VM load-paused.
+    pub selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
+    /// ADR 0056: the profile-granted capabilities (parsed + validated), bound
+    /// to `session_capabilities` once the session row exists. Empty on the
+    /// queued re-prepare (those were bound at enqueue), so the bind is a no-op.
+    pub capabilities: Vec<engram_core::types::Capability>,
+    /// ADR 0056 (B′): the orchestrator-compiled integration policy, if any. Its
+    /// inject `secret_ref`s are resolved host-side into the egress policy's
+    /// inject entries at boot. `None` on the queued/resume re-prepare for now
+    /// (persistence + re-inject is Phase 3b-2).
+    pub integration_policy: Option<engram_core::types::IntegrationPolicy>,
     pub secret_mode: engram_core::types::image::SecretMode,
     /// Per-request `secrets` overrides to seal into `session_secrets`
     /// once the row exists (so resume rebuilds the harness env). `None`
@@ -122,12 +134,20 @@ pub(crate) async fn boot_on_reserved_host(
         session_env,
         secret_bundle,
         network,
+        selected_mounts,
+        capabilities,
+        integration_policy,
         secret_mode,
         deferred_session_secrets,
         prompt,
         memory_mib: _,
         cpu_budget_vcpus: _,
     } = inputs;
+
+    // ADR 0056: the image ref doubles as the SecretContext for resolving the
+    // integration policy's inject `secret_ref`s; capture it before `spec` is
+    // moved into `create_session_created` below.
+    let image_ref = spec.image.clone();
 
     // ---- restore the base snapshot on the reserved host ----
     let record = match state.services.meta.get_snapshot(base_snapshot_id).await {
@@ -166,7 +186,7 @@ pub(crate) async fn boot_on_reserved_host(
 
     let sandbox_id = match state
         .host_registry
-        .restore_base_on_host(host_id, metadata, spec_env.clone())
+        .restore_base_on_host(host_id, metadata, spec_env.clone(), selected_mounts)
         .await
     {
         Ok(sb) => sb,
@@ -207,6 +227,28 @@ pub(crate) async fn boot_on_reserved_host(
         }
     }
 
+    // ADR 0056: bind the profile-granted capabilities now the FK target row
+    // exists — same placement + rationale as the secret-persistence above. A
+    // no-op on an empty set (the queued-then-booted path: the rows were bound
+    // at enqueue), so this never clobbers them.
+    if let Err(e) = state
+        .services
+        .meta
+        .bind_session_capabilities(session_id, &capabilities)
+        .await
+    {
+        tracing::warn!(
+            %session_id, error = %e,
+            "session capabilities bind failed; the broker will see no granted capabilities",
+        );
+    }
+
+    // ADR 0056 (B′): persist the compiled integration policy now the FK target
+    // row exists, so a queued re-prepare / post-eviction resume rebuilds the
+    // egress injections without the orchestrator. Same placement + warn-not-
+    // fatal posture as the secret/capability persistence above.
+    persist_integration_policy(state, session_id, integration_policy.as_ref()).await;
+
     // Inject the per-spawn forge/upload broker tokens NOW the session row
     // exists. These mint a `session_broker_tokens` row that FKs to
     // `sessions.id`, so doing it any earlier (e.g. while `prepare_inner`
@@ -231,6 +273,8 @@ pub(crate) async fn boot_on_reserved_host(
         &spec_env,
         &network,
         secret_mode,
+        &image_ref,
+        integration_policy.as_ref(),
     )
     .await;
 
@@ -254,6 +298,8 @@ pub(crate) async fn boot_on_reserved_host(
         network_allow_hosts: network.allow_hosts.clone(),
         network_allow_host_patterns: network.allow_host_patterns.clone(),
         secrets: Vec::new(),
+        injects: Vec::new(),
+        observes: Vec::new(),
         secret_mode,
     });
 
@@ -360,6 +406,7 @@ fn map_restore_error(e: engram_core::SandboxError) -> ApiError {
 /// Build the per-session egress policy from the resolved guest IP, or
 /// `None` when the backend exposes no guest IP (process backend / some
 /// VZ configs) — the caller synthesizes an unspecified-IP fallback.
+#[allow(clippy::too_many_arguments)]
 async fn build_egress_policy(
     state: &SharedState,
     session_id: SessionId,
@@ -368,9 +415,162 @@ async fn build_egress_policy(
     spec_env: &HashMap<String, String>,
     network: &engram_core::types::image::NetworkPolicy,
     secret_mode: engram_core::types::image::SecretMode,
+    image: &str,
+    integration_policy: Option<&engram_core::types::IntegrationPolicy>,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
     let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    Some(engram_core::types::egress::SessionEgressPolicy {
+        session_id,
+        sandbox_id,
+        guest_ip,
+        network_allow_hosts: network.allow_hosts.clone(),
+        network_allow_host_patterns: network.allow_host_patterns.clone(),
+        secrets: egress_secret_entries(secret_bundle, spec_env),
+        injects: resolve_inject_entries(state, integration_policy, image).await,
+        observes: build_observe_entries(integration_policy),
+        secret_mode,
+    })
+}
+
+/// ADR 0056 (Phase 4): translate an integration policy's response-observation
+/// specs into host-side egress entries. Unlike injections these carry no
+/// secret (the asset map operates on the response), so this is a pure copy —
+/// no `SecretStore` lookup, hence sync.
+pub(crate) fn build_observe_entries(
+    integration_policy: Option<&engram_core::types::IntegrationPolicy>,
+) -> Vec<engram_core::types::egress::EgressObserveEntry> {
+    let Some(policy) = integration_policy else {
+        return Vec::new();
+    };
+    policy
+        .observes
+        .iter()
+        .map(|o| engram_core::types::egress::EgressObserveEntry {
+            allow_hosts: o.hosts.clone(),
+            allow_host_patterns: Vec::new(),
+            methods: o.methods.clone(),
+            path_prefixes: o.path_prefixes.clone(),
+            provider: o.provider.clone(),
+            asset_kind: o.asset_kind.clone(),
+            surface: o.surface.clone(),
+            success_status_class: o.success_status_class.clone(),
+            data: o.data.clone(),
+            fetchable: o.fetchable.clone(),
+        })
+        .collect()
+}
+
+/// ADR 0056 (B′): resolve an integration policy's Plane-B injections into
+/// host-side egress entries. Each inject's `secret_ref` is resolved via the
+/// deployment `SecretStore` (the session's image ref is the lookup context);
+/// the resolved value rides the policy to the host, never to the orchestrator
+/// or guest. A ref that doesn't resolve is skipped + logged (the connector
+/// gates the request regardless, but without a credential it would fail
+/// upstream — so we drop it rather than inject an empty header).
+pub(crate) async fn resolve_inject_entries(
+    state: &SharedState,
+    integration_policy: Option<&engram_core::types::IntegrationPolicy>,
+    image: &str,
+) -> Vec<engram_core::types::egress::EgressInjectEntry> {
+    let Some(policy) = integration_policy else {
+        return Vec::new();
+    };
+    let (repo, image_tag) = {
+        let (r, t) = engram_core::types::session::split_image_ref(image);
+        (r.to_string(), t.to_string())
+    };
+    let ctx = engram_core::traits::SecretContext {
+        repo: &repo,
+        image_tag: &image_tag,
+    };
+    let schema = engram_core::types::image::SecretSchema::default();
+    let mut out = Vec::with_capacity(policy.injects.len());
+    for inj in &policy.injects {
+        let secret = match state
+            .services
+            .secrets
+            .get(&ctx, &inj.secret_ref, &schema)
+            .await
+        {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                tracing::warn!(
+                    secret_ref = %inj.secret_ref,
+                    "integration inject secret_ref not resolvable; skipping injection",
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    secret_ref = %inj.secret_ref, error = %e,
+                    "integration inject secret_ref resolution failed; skipping injection",
+                );
+                continue;
+            }
+        };
+        out.push(engram_core::types::egress::EgressInjectEntry {
+            secret,
+            header_name: inj.header_name.clone(),
+            header_template: inj.header_template.clone(),
+            allow_hosts: inj.hosts.clone(),
+            allow_host_patterns: Vec::new(),
+            methods: inj.methods.clone(),
+            path_prefixes: inj.path_prefixes.clone(),
+        });
+    }
+    out
+}
+
+/// ADR 0056 (B′): persist the compiled integration policy (as its JSON) so a
+/// queued re-prepare or post-eviction resume can rebuild the egress injections
+/// without the orchestrator. No-op when the session has no policy. Warn-not-
+/// fatal: a persist miss only loses Plane-B injection on a later resume, not
+/// the live session. Shared by the boot + enqueue create paths.
+pub(crate) async fn persist_integration_policy(
+    state: &SharedState,
+    session_id: SessionId,
+    policy: Option<&engram_core::types::IntegrationPolicy>,
+) {
+    let Some(policy) = policy else {
+        return;
+    };
+    let json = match serde_json::to_string(policy) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e,
+                "serialize integration policy failed; not persisting");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .services
+        .meta
+        .bind_session_integration_policy(session_id, &json)
+        .await
+    {
+        tracing::warn!(%session_id, error = %e,
+            "integration policy persist failed; resume/queued boot will lose Plane-B injection");
+    }
+}
+
+/// Pair each resolved secret with the placeholder that
+/// [`crate::api::sessions::apply_secrets_to_env`] wrote into the guest
+/// env, producing the egress entries the host-agent proxy substitutes
+/// on (placeholder → `real_value`, gated by the secret's allow lists).
+///
+/// The placeholder is read back out of `spec_env` — so a secret whose
+/// env var was dropped is skipped, and the entry placeholder is by
+/// construction the *same* string the guest carries. In `Broker` mode
+/// `spec_env[name]` is the placeholder; in `Literal` mode it is the
+/// real value, so substitution is a harmless no-op (placeholder ==
+/// `real_value`). This env-placeholder ⇄ entry-placeholder coupling is
+/// what makes Broker mode authenticate; the
+/// `broker_env_placeholder_matches_egress_entry` test locks it.
+pub(crate) fn egress_secret_entries(
+    secret_bundle: &engram_core::traits::SecretBundle,
+    spec_env: &HashMap<String, String>,
+) -> Vec<engram_core::types::egress::EgressSecretEntry> {
     let mut secrets = Vec::new();
     for (name, resolved) in &secret_bundle.secrets {
         let Some(placeholder) = spec_env.get(name).cloned() else {
@@ -383,13 +583,5 @@ async fn build_egress_policy(
             allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
         });
     }
-    Some(engram_core::types::egress::SessionEgressPolicy {
-        session_id,
-        sandbox_id,
-        guest_ip,
-        network_allow_hosts: network.allow_hosts.clone(),
-        network_allow_host_patterns: network.allow_host_patterns.clone(),
-        secrets,
-        secret_mode,
-    })
+    secrets
 }

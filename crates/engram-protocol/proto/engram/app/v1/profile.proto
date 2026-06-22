@@ -38,6 +38,15 @@ message Profile {
   string created_at = 9;
   // ISO-8601.
   string updated_at = 10;
+  // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
+  // ["skills", "playwright"]). The coordinator resolves each to a reserved-slot
+  // mount at session create. Empty = base session (no skills).
+  repeated string skills = 11;
+  // ADR 0056: integration capabilities ("provider:action[@resource]") this
+  // profile grants. Threaded to CreateSessionRequest.capabilities; the
+  // coordinator binds + (later) clamps. Member-visible (describes granted
+  // access, like skills — not sensitive like env_vars).
+  repeated string capabilities = 12;
 }
 
 // Lightweight resolved identity embedded on TaskSessionRef for the chip
@@ -74,6 +83,10 @@ message CreateProfileRequest {
   string image_id = 4;
   bool include_user_tokens = 5;
   map<string, string> env_vars = 6;
+  // ADR 0055: dynamic skill bundle names (see Profile.skills).
+  repeated string skills = 7;
+  // ADR 0056: integration capabilities (see Profile.capabilities).
+  repeated string capabilities = 8;
 }
 
 message CreateProfileResponse {
@@ -88,6 +101,10 @@ message UpdateProfileRequest {
   string image_id = 5;
   bool include_user_tokens = 6;
   map<string, string> env_vars = 7;
+  // ADR 0055: dynamic skill bundle names (see Profile.skills).
+  repeated string skills = 8;
+  // ADR 0056: integration capabilities (see Profile.capabilities).
+  repeated string capabilities = 9;
 }
 
 message UpdateProfileResponse {

@@ -1,13 +1,15 @@
-# ADR 0027: the always-attached `skills` RO bundle. Content is our own
-# wrapper scripts (bin/) + SKILL.md (skills/) — the unpacked tree IS this
-# directory, so there's nothing external to pin. A skill edit ships
-# fleet-wide by rolling the bundle (new squashfs behind the stable symlink),
-# no session-image re-bake.
+# ADR 0027/0055: the built-in `skills` RO bundle. Content is our own wrapper
+# scripts (bin/) + SKILL.md (skills/) — the unpacked tree IS this directory, so
+# there's nothing external to pin. A skill edit ships fleet-wide by rolling the
+# bundle (new content-addressed squashfs staged on the fleet), no session-image
+# re-bake.
+#
+# ADR 0055: a profile-selected skill, not an always-attached bundle. At session
+# create the coordinator resolves the "skills" name to its staged content sha,
+# assigns a reserved slot, and `patch_drive`s it into a dynamic mount
+# (`/opt/engram/dyn/<i>`). The in-squashfs `mount.json` declares the skills +
+# the wrapper bins agentd symlinks onto PATH + the `git-askpass` the
+# agentd-written `/etc/gitconfig` references (by its resolved slot path). The
+# guest mount path is dynamic, not fixed here.
 name = "skills"
 description = "Built-in skill helpers: engram-share / engram-pr / git-askpass + SKILL.md."
-
-[guest]
-mount = "/opt/engram/skills"
-# Wrappers land on PATH (agentd symlinks them into /usr/local/bin); the
-# git-askpass path is referenced by the agentd-written /etc/gitconfig.
-bin = "/opt/engram/skills/bin"

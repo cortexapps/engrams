@@ -97,12 +97,10 @@ pub fn init(addr: SocketAddr) {
 ///   phases surfaces network and scheduler overhead.
 /// - `outcome`: `success` / `bad_request` / `image_not_enabled` /
 ///   `scheduling_rejected` / `internal`.
-/// - `kind`: `cold` (session took the full create path) or `warm`
-///   (warm-pool-leased) or `unknown` (errored before the path was
-///   chosen). Sourced from `CreateSessionResponse.kind` on success.
-///   The headline ADR 0014 win shows up as
-///   `engram_session_boot_seconds_sum{phase="total",kind="warm"}`
-///   trending toward sub-1s while `kind="cold"` stays at ~20-25s.
+/// - `kind`: `restored` (booted via base-snapshot restore — the
+///   normal path, ADR 0020) or `queued` (no capacity, enqueued per
+///   ADR 0048) or `unknown` (errored before the path was chosen).
+///   Sourced from `CreateSessionResponse.kind` on success.
 pub const SESSION_BOOT_SECONDS: &str = "engram_session_boot_seconds";
 
 /// Counter. Sessions that reached `Active`. Labels: `outcome`
@@ -161,6 +159,15 @@ pub const HARNESS_DESYNC_DETECTED_TOTAL: &str = "engram_harness_desync_detected_
 /// escalated to the eviction lane (counted under
 /// `engram_eviction_nominated_total{source="desync_watchdog"}`).
 pub const HARNESS_REHANDSHAKE_TOTAL: &str = "engram_harness_rehandshake_total";
+
+/// Counter (ADR 0034 Track A). In-place harness reattaches the desync
+/// watchdog issued when `rehandshake` returned `NotFound` (the harness vsock
+/// is dead but the FC VM is alive): re-issuing the resume `start_agent` drives
+/// agentd's reattach/respawn arm (SIGUSR1 a live-but-wedged harness, or respawn
+/// an exited one) without a snapshot/destroy/restore. A successful one re-emits
+/// `Idle` and the session leaves the flagged set; persistent failure still
+/// escalates to the eviction lane.
+pub const HARNESS_INPLACE_REATTACH_TOTAL: &str = "engram_harness_inplace_reattach_total";
 
 /// Counter (ADR 0034). Eviction scanner gave up after the retry
 /// budget (20 attempts ≈ 3 min) and fell the session back to

@@ -79,8 +79,8 @@ pub struct SnapshotMetadata {
     /// restores the just-taken snapshot, exercises mount(2) +
     /// execve(2) on a stub harness, lets the UFFD handler's
     /// recorder accumulate fault hashes for ~5s, then publishes.
-    /// Warm-pool refill consumes it to narrow M1.13's parallel
-    /// prefetch from "all chunks" to "just the working set,"
+    /// A fresh base-snapshot restore consumes it to narrow M1.13's
+    /// parallel prefetch from "all chunks" to "just the working set,"
     /// shrinking cold-cache refill from ~2s to ~500ms.
     ///
     /// `None` when bake didn't produce a trace. Restore falls back

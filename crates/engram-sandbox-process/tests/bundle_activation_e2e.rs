@@ -42,10 +42,20 @@ fn stage_fake_bundles(skills: &Path, browser: &Path) {
     std::fs::write(skills.join("skills/share-file/SKILL.md"), "---\n").unwrap();
     std::fs::create_dir_all(skills.join("skills/create-pull-request")).unwrap();
     std::fs::write(skills.join("skills/create-pull-request/SKILL.md"), "---\n").unwrap();
+    std::fs::write(
+        skills.join("mount.json"),
+        r#"{"kind":"skill","skills":[{"name":"share-file","bins":["bin/engram-share"]},{"name":"create-pull-request","bins":["bin/engram-pr"],"requires_env":"ENGRAM_FORGE_TOKEN"}],"provides_askpass":"bin/git-askpass"}"#,
+    )
+    .unwrap();
 
     write_exec(&browser.join("bin/playwright-cli"), "#!/bin/sh\n");
     std::fs::create_dir_all(browser.join("skills/show-your-work")).unwrap();
     std::fs::write(browser.join("skills/show-your-work/SKILL.md"), "---\n").unwrap();
+    std::fs::write(
+        browser.join("mount.json"),
+        r#"{"kind":"skill","skills":[{"name":"show-your-work","bins":["bin/playwright-cli"]}]}"#,
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -75,9 +85,9 @@ async fn generated_session_has_skills_and_browser_tooling() {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        // Dev staging is spec-independent, but pass them through anyway to
-        // mirror what coord capture records for a browser image.
-        aux_ro_drives: vec![AuxRoDrive::skills(), AuxRoDrive::playwright()],
+        // Dev staging is spec-independent, but pass reserved slots through to
+        // mirror what coord capture records (ADR 0055 sentinel device model).
+        aux_ro_drives: (0..2).map(AuxRoDrive::reserved_slot).collect(),
     };
     let id = backend.create(spec).await.expect("create session");
 
@@ -133,7 +143,8 @@ async fn generated_session_has_skills_and_browser_tooling() {
         "no MCP config should be written (CLI path)",
     );
 
-    // The bundle mounts themselves are symlinked under the session cwd.
-    assert!(cwd.join("opt/engram/skills").is_symlink());
-    assert!(cwd.join("opt/engram/browser").is_symlink());
+    // The bundle mounts themselves are symlinked under the session cwd at the
+    // ADR 0055 reserved-slot paths (skills -> dyn/0, playwright -> dyn/1).
+    assert!(cwd.join("opt/engram/dyn/0").is_symlink());
+    assert!(cwd.join("opt/engram/dyn/1").is_symlink());
 }

@@ -187,14 +187,21 @@ export type SessionEvent =
   | { type: "prompt_queued"; prompt_id: string; summary: string | null; at: string }
   | { type: "prompt_edited"; prompt_id: string; summary: string | null; at: string }
   | { type: "prompt_dequeued"; prompt_id: string; at: string }
+  // ADR 0056: a third-party integration surfaced a typed asset/action.
+  // Subsumes the old `pull_request_opened` (a PR is provider:"forge",
+  // asset_kind:"pull_request"). The wire is semantic-only — the web keys its
+  // renderer on (provider, asset_kind), with a generic fallback; the payload
+  // never carries rendering instructions.
   | {
-      type: "pull_request_opened";
-      url: string;
-      repo: string;
-      title: string;
-      number: number;
-      head_branch: string;
-      base_branch: string;
+      type: "integration_asset";
+      provider: string;
+      asset_kind: string;
+      surface: "action" | "asset";
+      data: Record<string, unknown>;
+      fetchable:
+        | { kind: "external"; url: string }
+        | { kind: "artifact"; artifact_id: string; media_type: string; size_bytes: number }
+        | null;
       at: string;
     }
   // ADR 0026: a file artifact (agent screenshot/recording, or an

@@ -27,6 +27,14 @@ export interface ComposerActions {
    * editing/cancelling. `null` if the queue is empty.
    */
   recall: () => string | null;
+  /**
+   * Queued-but-not-yet-consumed messages, oldest→newest — the composer's
+   * queued-message rail (Claude-Code style: they sit by the input, not in the
+   * transcript, until their run starts). Each carries its full text.
+   */
+  queued: { promptId: string; text: string }[];
+  /** Cancel one queued message (the rail's × button) — fires `DequeueQueued`. */
+  removeQueued: (promptId: string) => void;
 }
 
 export const ComposerActionsContext = createContext<ComposerActions>({
@@ -35,6 +43,8 @@ export const ComposerActionsContext = createContext<ComposerActions>({
   sendBlocked: false,
   canRecall: false,
   recall: () => null,
+  queued: [],
+  removeQueued: () => {},
 });
 
 export const useComposerActions = (): ComposerActions => useContext(ComposerActionsContext);

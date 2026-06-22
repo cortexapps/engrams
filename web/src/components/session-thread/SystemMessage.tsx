@@ -5,6 +5,7 @@ import {
   ExternalLinkIcon,
   GitPullRequestIcon,
   InfoIcon,
+  PuzzleIcon,
   RotateCcwIcon,
   XIcon,
 } from "lucide-react";
@@ -37,8 +38,8 @@ export function SystemMessage() {
   switch (marker.kind) {
     case "durability":
       return <Durability marker={marker} />;
-    case "pull_request":
-      return <PullRequest marker={marker} />;
+    case "integration_asset":
+      return <IntegrationAsset marker={marker} />;
     case "artifact":
       return <Artifact marker={marker} />;
     case "recovery":
@@ -108,7 +109,42 @@ function Durability({ marker }: { marker: Extract<SystemMarker, { kind: "durabil
   );
 }
 
-function PullRequest({ marker }: { marker: Extract<SystemMarker, { kind: "pull_request" }> }) {
+// ADR 0056: the wire carries only semantic data (provider, asset_kind, data,
+// fetchable) — never how to draw it. The web owns the
+// (provider, asset_kind) → renderer registry; a never-seen pair falls back to
+// a generic card so a new integration always surfaces *something* with no web
+// code. engrams-provided shapes are hand-crafted here; a future plugin layer
+// would register render treatment in this same layer, not on the wire.
+type IntegrationAssetMarker = Extract<SystemMarker, { kind: "integration_asset" }>;
+
+function IntegrationAsset({ marker }: { marker: IntegrationAssetMarker }) {
+  switch (`${marker.provider}/${marker.assetKind}`) {
+    case "forge/pull_request":
+      return <PullRequestCard marker={marker} />;
+    default:
+      return <GenericAsset marker={marker} />;
+  }
+}
+
+// Typed-but-opaque payload accessors — `data` is provider-shaped JSON.
+function dataStr(data: Record<string, unknown>, key: string): string | undefined {
+  const v = data[key];
+  return typeof v === "string" ? v : undefined;
+}
+function dataNum(data: Record<string, unknown>, key: string): number | undefined {
+  const v = data[key];
+  return typeof v === "number" ? v : undefined;
+}
+
+// Built-in renderer for `forge/pull_request` — the card the old
+// PullRequestOpened event rendered, now fed from `data` + `fetchable`.
+function PullRequestCard({ marker }: { marker: IntegrationAssetMarker }) {
+  const url = marker.fetchable?.kind === "external" ? marker.fetchable.url : undefined;
+  const repo = dataStr(marker.data, "repo");
+  const title = dataStr(marker.data, "title") ?? "pull request";
+  const number = dataNum(marker.data, "number");
+  const headBranch = dataStr(marker.data, "head_branch");
+  const baseBranch = dataStr(marker.data, "base_branch");
   return (
     <Card className="py-0">
       <CardContent className="flex flex-col gap-1.5 p-4">
@@ -117,30 +153,86 @@ function PullRequest({ marker }: { marker: Extract<SystemMarker, { kind: "pull_r
           <Text as="span" variant="label">
             pull request
           </Text>
-          <span aria-hidden>·</span>
-          <span className="font-mono">
-            {marker.repo} #{marker.number}
-          </span>
+          {repo != null && number != null && (
+            <>
+              <span aria-hidden>·</span>
+              <span className="font-mono">
+                {repo} #{number}
+              </span>
+            </>
+          )}
           <span className="ml-auto font-mono tabular-nums">{hms(marker.at)}</span>
         </div>
-        <a
-          href={marker.url}
-          target="_blank"
-          rel="noreferrer"
-          className="group inline-flex items-baseline gap-1 text-base font-medium hover:underline"
-        >
-          {marker.title}
-          <ExternalLinkIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
-        </a>
-        <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
-          <Badge variant="outline" className="font-normal">
-            {marker.headBranch}
-          </Badge>
-          <span aria-hidden>→</span>
-          <Badge variant="outline" className="font-normal">
-            {marker.baseBranch}
-          </Badge>
+        {url ? (
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="group inline-flex items-baseline gap-1 text-base font-medium hover:underline"
+          >
+            {title}
+            <ExternalLinkIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
+          </a>
+        ) : (
+          <span className="text-base font-medium">{title}</span>
+        )}
+        {headBranch != null && baseBranch != null && (
+          <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+            <Badge variant="outline" className="font-normal">
+              {headBranch}
+            </Badge>
+            <span aria-hidden>→</span>
+            <Badge variant="outline" className="font-normal">
+              {baseBranch}
+            </Badge>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// Generic fallback for any (provider, asset_kind) without a hand-crafted
+// renderer: a header + a key/value dump of the scalar `data` fields + a
+// fetchable link. No per-provider code — a polished card is an opt-in entry
+// in the registry above.
+function GenericAsset({ marker }: { marker: IntegrationAssetMarker }) {
+  const url = marker.fetchable?.kind === "external" ? marker.fetchable.url : undefined;
+  const entries = Object.entries(marker.data).filter(
+    ([, v]) => typeof v === "string" || typeof v === "number" || typeof v === "boolean",
+  );
+  return (
+    <Card className="py-0">
+      <CardContent className="flex flex-col gap-1.5 p-4">
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <PuzzleIcon className="size-3.5 text-primary" />
+          <Text as="span" variant="label">
+            {marker.provider}
+          </Text>
+          <span aria-hidden>·</span>
+          <span className="font-mono">{marker.assetKind}</span>
+          <span className="ml-auto font-mono tabular-nums">{hms(marker.at)}</span>
         </div>
+        {entries.length > 0 && (
+          <div className="flex flex-col gap-0.5 text-sm">
+            {entries.map(([k, v]) => (
+              <div key={k} className="flex gap-2">
+                <span className="shrink-0 font-mono text-xs text-muted-foreground">{k}</span>
+                <span className="truncate">{String(v)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {url && (
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 text-sm hover:underline"
+          >
+            <ExternalLinkIcon className="size-3.5" /> Open
+          </a>
+        )}
       </CardContent>
     </Card>
   );

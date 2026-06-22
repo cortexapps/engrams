@@ -493,7 +493,7 @@ pub struct Session {
     /// and `snapshots.disk_manifest` so the first resume after
     /// continuous flush is enabled doesn't silently roll back to
     /// the snapshot's stale disk lineage. `None` for sessions
-    /// that haven't gotten a publish (warm-pool / non-NBD hosts /
+    /// that haven't gotten a publish (non-NBD hosts /
     /// pre-Phase-B sessions).
     #[serde(default)]
     pub live_disk_manifest: Option<crate::types::manifest::ManifestRef>,

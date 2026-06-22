@@ -297,35 +297,28 @@ if [ -b /dev/vdb ]; then
     rmdir /run/engram/.ca-stage 2>/dev/null || true
 fi
 mark ca_staged
-# ADR 0027: mount read-only host bundles (skills / playwright squashfs)
-# the host attached as extra virtio-blk drives. The device letter
-# depends on attach order (and whether the legacy CA ext4 drive above
-# took /dev/vdb), so we PROBE the non-root block devices and identify
-# each bundle by a content marker rather than hard-coding a letter —
-# order-independent and robust across snapshot/restore. squashfs-only,
-# so a probe never accidentally mounts the ext4 CA drive. The mounts are
-# captured in the base snapshot's VFS; on a fresh-create restore the
-# host may patch_drive a bundle to a newer generation, and agentd
-# umount/remounts at session bind so the superblock re-parses the
-# swapped device (ADR 0035 §3). Best-effort: a missing/absent bundle
-# just leaves the mount point empty; agentd degrades gracefully.
-for dev in /dev/vdb /dev/vdc /dev/vdd /dev/vde; do
+# ADR 0055: mount each reserved dynamic-mount slot the host attached as an
+# extra read-only virtio-blk drive. Slots carry a sentinel squashfs at
+# base-snapshot capture; a per-session create patch_drives the profile-selected
+# skills into the slots' devices in the paused restore window. We mount every
+# squashfs device (squashfs-only, so the ext4 CA drive is never matched) at a
+# sequential /opt/engram/dyn/<i> — the index tracks the host's slot order (FC
+# preserves attach order). The mounts freeze into the base snapshot's VFS; on a
+# fresh-create restore the host has swapped some slots' devices, and agentd
+# umount/remounts /opt/engram/dyn/* at session bind so each superblock re-parses
+# its (possibly swapped) device (ADR 0035 §3). agentd then reads each mount's
+# mount.json to wire skills (sentinels are skipped). Best-effort.
+i=0
+for dev in /dev/vd*; do
     [ -b "$dev" ] || continue
-    mkdir -p /opt/engram/.probe 2>/dev/null || true
-    mount -t squashfs -o ro "$dev" /opt/engram/.probe 2>/dev/null || continue
-    if [ -x /opt/engram/.probe/bin/engram-share ]; then
-        umount /opt/engram/.probe 2>/dev/null || true
-        mkdir -p /opt/engram/skills 2>/dev/null || true
-        mount -t squashfs -o ro "$dev" /opt/engram/skills 2>/dev/null || true
-    elif [ -x /opt/engram/.probe/bin/playwright-cli ]; then
-        umount /opt/engram/.probe 2>/dev/null || true
-        mkdir -p /opt/engram/browser 2>/dev/null || true
-        mount -t squashfs -o ro "$dev" /opt/engram/browser 2>/dev/null || true
+    [ "$dev" = "/dev/vda" ] && continue  # rootfs
+    mkdir -p "/opt/engram/dyn/$i" 2>/dev/null || true
+    if mount -t squashfs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null; then
+        i=$((i + 1))
     else
-        umount /opt/engram/.probe 2>/dev/null || true
+        rmdir "/opt/engram/dyn/$i" 2>/dev/null || true  # not squashfs (e.g. CA ext4)
     fi
 done
-rmdir /opt/engram/.probe 2>/dev/null || true
 mark bundles_mounted
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
@@ -716,15 +709,6 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
         // `inject_share_helpers` / `inject_forge_helpers` bake step so a
         // skill edit ships fleet-wide by rolling the bundle, no re-bake.
         // The wrapper scripts + SKILL.md now live in `deploy/bundles/skills/`.
-
-        // ADR 0027: the playwright bundle is glibc-linked. If this image
-        // opted into browser tooling on a musl base (alpine), the bundle
-        // mounts fine but its binaries won't run. Warn loudly at bake — the
-        // rootfs is right here to probe. Best-effort: a missed detection
-        // doesn't fail the bake.
-        if effective_manifest.browser_enabled() {
-            warn_if_musl_base(&rootfs_dir).await;
-        }
 
         // Fold the built image's Docker config (its `ENV` + `WORKDIR`)
         // into the manifest as defaults — the author's `engram.toml`
@@ -1264,34 +1248,6 @@ async fn inject_agent(rootfs_dir: &Path, injection: &AgentInjection) -> Result<(
     }
 
     Ok(())
-}
-
-/// ADR 0027: best-effort musl-base detection for `[browser] enabled`
-/// images. The playwright bundle is glibc-linked; on a musl rootfs
-/// (alpine) the binaries won't run. We look for the musl dynamic loader
-/// (`lib/ld-musl-*.so.1`) under the usual locations; finding it means the
-/// browser bundle will be useless for this image. Warn, don't fail —
-/// detection is heuristic and a false negative shouldn't block a bake.
-async fn warn_if_musl_base(rootfs_dir: &Path) {
-    for dir in ["lib", "usr/lib"] {
-        let mut rd = match tokio::fs::read_dir(rootfs_dir.join(dir)).await {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("ld-musl-") {
-                tracing::warn!(
-                    loader = %name,
-                    "[browser] enabled on what looks like a musl base ({dir}/{name}); \
-                     the glibc-linked playwright bundle will mount but its binaries \
-                     won't run — use a glibc base (debian/ubuntu) for browser tooling",
-                );
-                return;
-            }
-        }
-    }
 }
 
 /// Copy `src` to `dst` and chmod 0755. `label` is a short tag ("agent",

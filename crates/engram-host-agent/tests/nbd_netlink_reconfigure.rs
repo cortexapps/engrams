@@ -42,6 +42,35 @@ use engram_core::types::manifest::ManifestRef;
 use engram_host_agent::disk_daemon::{attach_manifest, reattach_manifest, NbdSlotAllocator};
 use engram_storage_local::LocalBlobStorage;
 
+/// Containment (cascade fix, 2026-06-18): the NBD suite runs serially against a
+/// single SHARED `/dev/nbd0`. A test that panics mid-flight (e.g. a timing
+/// assertion) skips its teardown and leaves the device bound, so EVERY
+/// subsequent test fails with "NBD attach failed" — one flake amplifies into
+/// the whole suite. Clearing any stale binding at the START of each test
+/// breaks that chain: a prior leak is reaped here, not inherited. Idempotent —
+/// a no-op when nothing is bound (the ADR 0017 startup-recovery shape).
+fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
+    if let Some(idx) = nbd_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("nbd"))
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
+    }
+}
+
+/// Reap a spawned child even when the test panics (so nextest doesn't flag a
+/// LEAK and the process can't outlive the run). A bare `Command` child isn't
+/// killed on unwind; this is.
+struct KillOnDrop(std::process::Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn preflight() -> Option<PathBuf> {
     let nbd_path = PathBuf::from(
         std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
@@ -58,7 +87,10 @@ fn preflight() -> Option<PathBuf> {
         .write(true)
         .open(&nbd_path)
     {
-        Ok(_) => Some(nbd_path),
+        Ok(_) => {
+            clear_stale_nbd_binding(&nbd_path);
+            Some(nbd_path)
+        }
         Err(e) => {
             eprintln!(
                 "SKIP: cannot open {} R/W: {e} — run as root (`sudo -E`)",
@@ -166,10 +198,15 @@ async fn survivor_reconfigure_resumes_parked_io() {
     // successor's RECONFIGURE hits the kernel's silently-ACKed
     // ENOSPC (prod canary 2026-06-12). SOCK_CLOEXEC pins this; the
     // sleeper below would re-break it if that flag ever regresses.
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("spawn fd-inheritance sleeper");
+    // KillOnDrop so a panic below (e.g. the dead-window assertion) reaps this
+    // child during unwind instead of leaking it (the FAIL+LEAK nextest flagged,
+    // which kept /dev/nbd0 busy and cascaded into the rest of the suite).
+    let sleeper = KillOnDrop(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn fd-inheritance sleeper"),
+    );
 
     // 2. "Pod roll": the serve loop dies without a disconnect. The
     //    slot lease drops back to the pool (in prod the new process
@@ -183,23 +220,41 @@ async fn survivor_reconfigure_resumes_parked_io() {
     handle.abandon();
     drop(slot);
 
-    // A read issued DURING the dead window must PARK, not EIO. Run
-    // it on a blocking thread; it should still be pending after a
-    // couple of seconds.
-    let device_for_parked = device.clone();
-    let parked = tokio::task::spawn_blocking(move || {
-        // An offset past the first chunk so the chunk cache can't
-        // satisfy it without the daemon... (the read goes to the
-        // KERNEL, which has no daemon — the cache layer is never
-        // reached; O_DIRECT additionally defeats the page cache).
-        pread_direct(&device_for_parked, 4 * 1024 * 1024, 4096)
-    });
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(
-        !parked.is_finished(),
-        "read during the dead window must park under dead_conn_timeout, \
-         not complete or fail (EIO here = the pre-netlink prod failure)",
-    );
+    // A read issued DURING the dead window must PARK, not EIO. But `abandon()`
+    // aborts the serve task ASYNCHRONOUSLY (task.abort + mem::forget — it does
+    // NOT await the socket close), so there's a brief transition after the
+    // serve socket dies before the kernel marks the connection dead and starts
+    // parking I/O. A read issued mid-transition EIOs — the source of the
+    // 2.797s flake (green on the PR run, red under load on the main push).
+    //
+    // Poll instead of asserting on a single immediate read: a fresh O_DIRECT
+    // read (offset past the first chunk so the cache can't satisfy it — it goes
+    // to the KERNEL, which has no daemon) must transition to PARKED (still
+    // pending after a 2s settle) within a bounded window. A read that keeps
+    // completing/EIOing past the window is the real pre-netlink prod failure
+    // (never parks), and still fails the test.
+    let parked = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let device_for_parked = device.clone();
+            let probe = tokio::task::spawn_blocking(move || {
+                pread_direct(&device_for_parked, 4 * 1024 * 1024, 4096)
+            });
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !probe.is_finished() {
+                break probe; // parked under dead_conn_timeout — the asserted state
+            }
+            // Completed within the settle: during the abort→close transition the
+            // read EIOs; once dead_conn parking is active it blocks. Reap the
+            // finished probe and retry until the window closes.
+            let _ = probe.await;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reads never parked under dead_conn_timeout within 20s — the \
+                 pre-netlink prod failure (EIO/complete instead of parking)",
+            );
+        }
+    };
 
     // 3. Generation two: claim the SAME device + RECONFIGURE.
     let pool2 = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool2");
@@ -230,9 +285,8 @@ async fn survivor_reconfigure_resumes_parked_io() {
     );
 
     // Clean teardown (netlink disconnect) so the device is free for
-    // the next test run.
-    let _ = sleeper.kill();
-    let _ = sleeper.wait();
+    // the next test run. `drop(sleeper)` reaps the child via KillOnDrop.
+    drop(sleeper);
     drop(state2);
     tokio::time::sleep(Duration::from_millis(300)).await;
 }

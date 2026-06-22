@@ -405,14 +405,18 @@ pub trait SandboxBackend: Send + Sync {
     /// [`Self::restore_fresh`].
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError>;
 
-    /// ADR 0035: restore for a *fresh* session (the base-snapshot
-    /// path, incl. warm-pool refill) — identical to [`Self::restore`]
-    /// except aux RO bundles are swapped to the host's current
-    /// generation while the VM is load-paused, so new sessions always
-    /// run the latest fleet bundles (skills) without re-enabling the
-    /// image. Default delegates to `restore` for backends without
+    /// ADR 0035/0055: restore for a *fresh* session (the base-snapshot path) —
+    /// identical to [`Self::restore`] except, while the VM is load-paused,
+    /// (a) aux RO bundles swap to the host's current generation and (b) the
+    /// per-session `selected_mounts` (ADR 0055 skills) are `patch_drive`d into
+    /// reserved slots. Default delegates to `restore` for backends without
     /// aux-drive support (VZ, Process, mocks); the FC backend overrides.
-    async fn restore_fresh(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    /// `selected_mounts` is ignored by the default.
+    async fn restore_fresh(
+        &self,
+        metadata: SnapshotMetadata,
+        _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
+    ) -> Result<SandboxId, SandboxError> {
         self.restore(metadata).await
     }
 
@@ -532,6 +536,7 @@ pub trait SandboxBackend: Send + Sync {
         &self,
         _metadata: SnapshotMetadata,
         _session_env: std::collections::HashMap<String, String>,
+        _selected_mounts: Vec<crate::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
         Err(SandboxError::InvalidSpec(
             "this backend doesn't support `restore_base_for_session` (needs the pooled chunk-store wrapper)".into(),

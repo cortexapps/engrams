@@ -1,6 +1,8 @@
 # ADR 0052: Persistent streaming Claude harness session
 
-Status: 2026-06-16 — **Proposed**.
+Status: 2026-06-18 — **Accepted** (Phases 0–4 shipped; warm mid-turn teleport
+proven, gated in prod behind `ENGRAM_LIVE_TELEPORT=1`). See the Progress section
+for the per-phase bookends and the commit chain.
 
 ## Context
 
@@ -120,8 +122,9 @@ pipe survives a UFFD restore before Track C relies on it.
   wired into `ci.yml`.
 - **Phase 1** — streaming engine rewrite (`engram-harness-claude`), respawn-with-
   resume. **Phase 1b** — harness-owned queued/steered messages. **Phase 2** —
-  clean-idle-shutdown (drain stdin before the idle capture; gated to
-  `CheckpointReason::Idle`). **Phase 3** — `control_request` interrupt + crash
+  clean-idle-shutdown (drain stdin before the idle capture; gated structurally to
+  the idle-only `snapshot_begin` seam — see the Progress note). **Phase 3** —
+  `control_request` interrupt + crash
   recovery. **Phase 4** — warm mid-turn teleport (gated on Phase 0); its merge
   flips this ADR to **Accepted**.
 
@@ -243,6 +246,128 @@ pipe survives a UFFD restore before Track C relies on it.
   - *Deferred:* harness-side time-coalescing of chunks (the API's batching keeps
     volume reasonable for v1; revisit if a long turn lags the 256-slot bus) and a
     per-chunk `at` ordering guarantee (the durable message corrects any reorder).
+
+- **2026-06-17 — Phase 3 IMPLEMENTED: `control_request` interrupt** (this PR,
+  stacked on Phase 1c). Replaces the Phase-1 stopgap interrupt — *SIGINT the whole
+  persistent process, then respawn `--resume`* — with claude's **in-band
+  `control_request`** on the held-open stdin: claude acks (`control_response`),
+  aborts the in-flight turn (surfacing as `result subtype=error_during_execution`),
+  and **stays alive**. The engine's `result` handler already had the receiving
+  branch (interrupted_run → `RunInterrupted`, process alive); Phase 3 just flips the
+  `Interrupt` command from `sigint_child` to `write_control_interrupt` + arms a
+  grace deadline.
+
+  **This is the root-cause fix for the prod interrupt bug** (session `ba3ae8d5`):
+  interrupting *with a queued message* SIGINT-killed the persistent claude, the
+  engine respawned `--resume`, and the queued message was written into that
+  freshly-respawned process — which (a) had lost conversation context ("There's no
+  prior context in this conversation") because SIGINT-mid-turn kills claude before
+  it flushes its transcript, and (b) exited immediately, which the harness — with
+  its `interrupted_run` marker reset by the respawn — misread as an abnormal crash
+  (`RunCompleted{ok:false}` → the user's "An error occurred"). With `control_request`
+  there is no teardown and no respawn: context is preserved (it never leaves
+  claude's live memory) and the queued message runs as a clean next turn on the
+  same process (`RunInterrupted` → consume-on-result → `RunStarted{prompt_id}`). The
+  consume-on-result boundary already auto-runs a queued message after a turn ends,
+  so "interrupt auto-sends the queued message" is preserved — but now cleanly.
+
+  **Reliability — SIGINT demoted to a fallback, an interrupt can never wedge.** If
+  the control frame can't be written, or isn't honored within `INTERRUPT_GRACE_SECS`
+  (= 8s; a pinned build lacking the frame), the sleeper escalates to SIGINT +
+  respawn — the old path, now a safety net rather than the default. Empirically
+  grounded: Phase 0 confirmed on the baked `claude` 2.1.179 that the
+  `control_request` interrupt acks, aborts (`error_during_execution`), and the
+  process survives to process the next message.
+
+  Crash recovery (the other half of the plan's Phase 3) was already in place from
+  Phase 1 — unexpected EOF mid-turn ⇒ `describe_abnormal_exit` System message +
+  terminal `RunCompleted{ok:false}` + auto-respawn `--resume` with a bounded
+  fast-crash counter — so Phase 3 adds only the interrupt mechanism. No wire / coord
+  / web change: `RunInterrupted` already exists and the interrupt RPC path is wired
+  end-to-end (the Phase-1c composer's Esc → `Interrupt`). Pinned by two engine tests
+  using a control-frame-aware fake claude that records its PID: a bare interrupt
+  aborts with **no respawn** (PID unchanged), and interrupt-with-a-queued-message
+  steers onto the **same** process (`RunInterrupted` → `RunStarted{p2}`, PID
+  unchanged, no crash artifact) — a direct `ba3ae8d5` regression guard.
+  - *Retires:* the SIGINT-vs-persistent-process hazard ([[project_adr0030_operator_interrupt]])
+    on the normal path — no signal racing FC suspend/resume.
+
+- **2026-06-17 — Phase 2 IMPLEMENTED: clean-idle-shutdown** (this PR, stacked on
+  Phase 3). On idle eviction the snapshot now captures **no live `claude`**:
+  before the pause+capture we send the harness `Shutdown { grace }`, which closes
+  claude's held stdin so the in-flight turn (if any) drains to a final `result`
+  and the process exits 0, then the harness itself exits. On resume agentd
+  respawns a fresh harness that `--resume`s into the same on-disk session
+  (decision 1: respawn-with-resume). This decouples idle-resume correctness from
+  the warm-survival question — only Phase 4 (live teleport) needs claude to cross
+  a snapshot warm; the far-more-common idle path now gets a deterministic,
+  agent-free image and a fresh epoll each wake.
+
+  **The harness side was already complete** (the `Shutdown` arm landed with the
+  Phase-1 engine): `stdin = None` closes the FD, the reap path distinguishes a
+  clean drain (no in-flight turn ⇒ silent exit; mid-turn grace-expiry ⇒
+  `RunCompleted{ok:false}`, never a spurious crash artifact) from a real crash, and
+  returns `SessionOutcome::Shutdown` ⇒ `ExitCode::SUCCESS` with **no respawn**.
+  So Phase 2 is **purely host-side wiring** — no harness, proto, coord, or web
+  change.
+
+  **Divergence from the plan — the gate is structural, not a `CheckpointReason`.**
+  The plan proposed gating the drain on `CheckpointReason::Idle` plumbed to the
+  host. In the actual topology that plumbing is unnecessary: the host's two-phase
+  `snapshot_begin` (ADR 0045 D5) is called **only** for `target_state == Idle`
+  (`idle_evictor.rs`) — live teleport goes through `migration_capture` (keeps
+  claude warm, Phase 4) and periodic/manual checkpoints through single-shot
+  `snapshot`. So draining inside `LocalHostClient::snapshot_begin` — the one host
+  layer that composes both the `SandboxBackend` and the `HarnessHub` — *is* "gate
+  strictly to the idle path," with zero wire surface added. New `HarnessHub::drain`
+  sends the `Shutdown` then waits (bounded by `grace + slack`) for the harness
+  vsock to drop — its exit is the unambiguous signal claude is gone. Best-effort:
+  a `NotAttached` sandbox or one that won't drain within grace is captured anyway
+  (a still-live child is reattached on resume per ADR 0045 C1), so an eviction
+  never blocks on a stuck agent. Pinned by two hub unit tests
+  (`drain_sends_shutdown_then_waits_for_disconnect`, `drain_unattached_is_a_noop`).
+
+- **2026-06-18 — Phase 4 PROVEN: warm mid-turn teleport → ADR Accepted** (this
+  PR). The genuinely-novel piece — keep the persistent streaming `claude` warm
+  across a live host-to-host move, mid-turn, with no run restart. **The mechanism
+  was already in place** and needed no new code: the teleport capture path
+  (`migration_capture`) deliberately does NOT drain (Phase 2's `Shutdown` is gated
+  to the idle `snapshot_begin` only, so the harness + its in-flight turn freeze
+  warm in the UFFD memory image); the destination's `finish_resume_to_active` →
+  `start_agent` → `SpawnHarness` drives agentd's ADR 0045 C1 arm, which SIGUSR1s
+  the still-alive (`try_wait → None`) moved harness to drop+re-dial rather than
+  respawning it; and the harness engine is connection-decoupled (the `turn`/cmd
+  loop + the persistent claude child outlive any connection, and the reattach arm
+  emits an `Idle` only when no turn is open). What was missing was **proof**, and
+  Phase 4 supplies the two that matter:
+
+  1. **`two_host_live_teleport_held_stdin_pipe_survives`** (FC, `test-firecracker`)
+     — the Phase 0 spike, realized faithfully. A process parked in **`epoll_wait`**
+     on a held-open pipe (the `claude`/libuv shape: stdin held, an `eppoll_entry`
+     registered on the pipe wait queue, the event loop parked for the next user
+     line — a static C `epoll` reader, NOT a blocking `read()`, since epoll is the
+     **exact mechanism ADR 0037 found wedged under File-restore**) is teleported
+     across two real host stacks; a line written into that pipe AFTER the move
+     wakes the frozen `epoll_wait` (`ep_poll_callback` fires) and is consumed.
+     This answers the load-bearing UFFD-restore question the teleport-gate flagged
+     — epoll survives UFFD restore (identical guest RAM incl. the kernel
+     `eventpoll`/wait-queue structures, same resumed kernel → pointers stay
+     valid), so the ADR 0037 File-restore wedge does not occur on the teleport
+     path. (Complements the sibling reattach arm, which proved PID-survives.)
+  2. **`connection_bounce_mid_turn_preserves_the_run`** (harness engine unit,
+     `test-linux`) — a connection drop + re-dial mid-turn (what the post-move
+     SIGUSR1 drives) does not abort the in-flight turn: no spurious mid-turn
+     `Idle`, exactly one `RunStarted → RunCompleted`, same `run_id`.
+
+  Together with the pre-existing `two_host_live_teleport` reattach + NBD-rootfs
+  arms, the warm-cross is proven end to end. **No fallback needed** — the spike
+  did not fail, so the Decision-§2 tmux-buffer / accept-turn-restart contingency
+  is moot. Live teleport stays behind `ENGRAM_LIVE_TELEPORT=1` (off by default);
+  flipping it on in prod is an engrams-internal rollout step, not an OSS change.
+
+  This closes the ADR. **Status → Accepted**; commit chain: PR-A (Track A) → PR-0
+  (ADR + Phase 0) → PR-1/1b/1c (streaming engine, queue, token streaming) → PR-3
+  (interrupt) → PR-2 (clean-idle-shutdown) → PR-4 (this — warm-teleport proofs).
 
 ## Prior art
 

@@ -1,4 +1,4 @@
-# ADR 0052: Session profiles — admin-curated starting points replace the free-form new-session form
+# ADR 0053: Session profiles — admin-curated starting points replace the free-form new-session form
 
 Status: 2026-06-16 — **Proposed.** No code yet. Builds on ADR 0051 (the
 TypeScript orchestration tier: orchestrator-native `TaskService`, CASL

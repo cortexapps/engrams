@@ -7,23 +7,24 @@
 //! - [`HostClient`] — the coord↔host boundary; one impl wraps a local
 //!   `SandboxBackend` + `HarnessHub`, the other dispatches over WS.
 //! - [`SecretStore`] — pluggable secret resolution.
-//! - [`GitForge`] — provider-agnostic git credential + change-request
-//!   authority (ADR 0023).
+//! - [`Integration`] — provider integration seam: capability-scoped credential
+//!   mint + a hybrid mediated action (ADR 0056; subsumes the retired
+//!   `GitForge`).
 //! - [`BlobStorage`] — cold-tier snapshot storage (S3/GCS/local fs).
 //!   Reintroduced in Phase 6 / ADR 0005 as the disk-pressure flush
 //!   target — see `docs/adr/0005-disk-pressure-blob-tier.md`.
 
 pub mod cloud;
-pub mod git;
 pub mod host_client;
+pub mod integration;
 pub mod metadata;
 pub mod sandbox;
 pub mod secrets;
 pub mod storage;
 
 pub use cloud::{CloudBackend, PreemptionStream};
-pub use git::{ForgeKind, GitForge, PullRequest, PullRequestSpec, RepoRef, ScopedToken};
 pub use host_client::HostClient;
+pub use integration::{CredentialHint, Integration, ScopedCredential};
 pub use metadata::{
     DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, SnapshotTotals, StaleSessionLease,
     UpdateOutcome,

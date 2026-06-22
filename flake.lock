@@ -34,10 +34,27 @@
         "type": "github"
       }
     },
+    "nixpkgs-e2fsprogs": {
+      "locked": {
+        "lastModified": 1749250130,
+        "narHash": "sha256-vvRmxEp92D6CYKrgVxrhrzzLf68TVOLKtpchAv5AcQg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "c6729488de632cc9f8af5aa82edd7097ea506c36",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "c6729488de632cc9f8af5aa82edd7097ea506c36",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
+        "nixpkgs-e2fsprogs": "nixpkgs-e2fsprogs",
         "rust-overlay": "rust-overlay"
       }
     },

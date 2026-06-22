@@ -13,7 +13,9 @@
 # agnostic (any agent that runs commands), needs no per-harness MCP config,
 # and is more token-efficient. See ADR 0027 "Why not an MCP server".
 #
-# Layout produced (mounted at /opt/engram/browser in the guest):
+# Layout produced (ADR 0055: mounted at a dynamic reserved slot
+# `/opt/engram/dyn/<i>` — the wrapper self-locates its root from $0, so the
+# bundle is position-independent and never names a fixed mount path):
 #   node/                 pinned Node runtime + the @playwright/cli install
 #   ms-playwright/        chromium-headless-shell
 #   lib/                  collected .so deps (LD_LIBRARY_PATH target)
@@ -119,7 +121,10 @@ build_tree() {
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
-  <dir>/opt/engram/browser/fonts</dir>
+  <!-- ADR 0055: the bundle mounts at a dynamic slot, so the font dir is
+       resolved relative to this config file location via prefix=relative.
+       The wrapper points FONTCONFIG_FILE at the bundle fonts.conf. -->
+  <dir prefix="relative">fonts</dir>
   <cachedir>/tmp/engram-fontconfig-cache</cachedir>
   <config></config>
 </fontconfig>
@@ -162,9 +167,12 @@ CFG
         mkdir -p /out/bin
         cat > /out/bin/playwright-cli <<"WRAP"
 #!/bin/sh
-# ADR 0027 playwright bundle wrapper. Self-contained: runs on any glibc base
-# at or above the build base glibc (see manifest.toml).
-here="/opt/engram/browser"
+# ADR 0027/0055 playwright bundle wrapper. Self-contained: runs on any glibc
+# base at or above the build base glibc (see manifest.toml). ADR 0055: this
+# bundle mounts at a dynamic reserved slot (/opt/engram/dyn/<i>) and agentd
+# symlinks this wrapper onto PATH, so we resolve our real bundle root from $0
+# (readlink -f follows the PATH symlink) instead of hardcoding a mount path.
+here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
 export LD_LIBRARY_PATH="$here/lib:${LD_LIBRARY_PATH:-}"
 export PLAYWRIGHT_BROWSERS_PATH="$here/ms-playwright"
 export PLAYWRIGHT_MCP_CONFIG="$here/cli.config.json"
@@ -186,6 +194,7 @@ WRAP
 if [[ "${1:-}" == "--stage" ]]; then
     dest="${2:?usage: build.sh --stage <dir>}"
     build_tree "$dest"
+    cp "$here/mount.json" "$dest/"  # ADR 0055: activate() reads this
     echo "staged playwright bundle tree -> $dest"
     exit 0
 fi
@@ -198,6 +207,7 @@ command -v mksquashfs >/dev/null || {
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 build_tree "$tmp"
+cp "$here/mount.json" "$tmp/"  # ADR 0055: activate() reads this
 rm -f "$out"
 mksquashfs "$tmp" "$out" -comp zstd -all-root -noappend -no-xattrs >/dev/null
 sha="$(sha256sum "$out" | cut -d' ' -f1)"

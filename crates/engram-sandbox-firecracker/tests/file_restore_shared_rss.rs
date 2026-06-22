@@ -329,7 +329,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
     let mut latencies_ms = Vec::new();
     for i in 0..SIBLINGS {
         let t = Instant::now();
-        let id = match backend.restore_fresh(metadata.clone()).await {
+        let id = match backend.restore_fresh(metadata.clone(), Vec::new()).await {
             Ok(id) => id,
             Err(e) => {
                 dump_fc_logs(work.path());
@@ -526,7 +526,7 @@ async fn substrate_base_create_density_and_latency_parity() {
         let mut latencies_ms = Vec::new();
         for i in 0..SIBLINGS {
             let t = Instant::now();
-            let id = match backend.restore_fresh(metadata.clone()).await {
+            let id = match backend.restore_fresh(metadata.clone(), Vec::new()).await {
                 Ok(id) => id,
                 Err(e) => {
                     dump_fc_logs(work_path);

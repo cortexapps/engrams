@@ -392,6 +392,11 @@ message RestoreBaseForSessionRequest {
   // ENGRAM_SESSION_*) merged into the restored sandbox — the shared base
   // snapshot can't carry per-session values.
   map<string, string> session_env = 4;
+  // ADR 0055: bincode-encoded `Vec<engram_core::types::sandbox::AuxRoDrive>` —
+  // the per-session skills the coordinator resolved + assigned to reserved
+  // slots (dyn_0..). The host `patch_drive`s each over its sentinel slot in the
+  // paused restore window. Empty = no dynamic skills (slots stay sentinel).
+  bytes selected_mounts_bincode = 5;
 }
 
 // --- GuestIp ---

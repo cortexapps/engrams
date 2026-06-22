@@ -94,13 +94,13 @@ export function NewSessionDialog({
       {showTrigger && (
         <DialogTrigger asChild>
           <Button data-testid={triggerTestId} variant={variant} className={className}>
-            New session
+            New task
           </Button>
         </DialogTrigger>
       )}
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>New session</DialogTitle>
+          <DialogTitle>New task</DialogTitle>
           <DialogDescription>Pick a profile, then say what to run.</DialogDescription>
         </DialogHeader>
 
@@ -172,7 +172,7 @@ export function NewSessionDialog({
                 <Textarea
                   id="prompt"
                   rows={2}
-                  placeholder="Describe the task for this session…"
+                  placeholder="Describe the task…"
                   {...form.register("prompt")}
                 />
               </Field>
@@ -196,7 +196,7 @@ export function NewSessionDialog({
                 data-testid="start-session"
                 disabled={!selected || form.formState.isSubmitting}
               >
-                {form.formState.isSubmitting ? "Starting…" : "Start session"}
+                {form.formState.isSubmitting ? "Starting…" : "Start task"}
               </Button>
             </DialogFooter>
           </form>
