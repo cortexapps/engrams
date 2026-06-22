@@ -254,40 +254,44 @@ impl StdError for SecretError {
     }
 }
 
-// ---------- GitForgeError (GitForge) ----------
+// ---------- IntegrationError (ADR 0056 Integration trait) ----------
 
 #[derive(Debug)]
-pub enum GitForgeError {
-    /// The forge backend (HTTP API / SDK) failed.
+pub enum IntegrationError {
+    /// The provider backend (HTTP API / SDK) failed.
     Backend(BoxError),
-    /// The forge declined to authenticate (bad app key, missing
+    /// The provider declined to authenticate (bad app key, missing
     /// installation, expired/insufficient credential).
     Unauthorized(String),
-    /// The repo, installation, or branch does not exist.
+    /// The repo, installation, or resource does not exist.
     NotFound(String),
     /// Backend returned an unexpected response shape.
     Protocol(String),
-    /// The change request was rejected by the forge (e.g. head == base,
-    /// a PR already exists for this branch pair, base is protected).
+    /// The action was rejected by the provider (e.g. head == base, a PR
+    /// already exists for this branch pair, base is protected).
     Rejected(String),
-    /// The repo reference or request spec was malformed.
+    /// The request args / resource reference was malformed.
     InvalidSpec(String),
+    /// The integration does not implement this operation (e.g. an
+    /// inject-source provider has no `perform_action`).
+    Unsupported,
 }
 
-impl fmt::Display for GitForgeError {
+impl fmt::Display for IntegrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Backend(e) => write!(f, "git forge backend error: {e}"),
-            Self::Unauthorized(m) => write!(f, "git forge unauthorized: {m}"),
-            Self::NotFound(m) => write!(f, "git forge not found: {m}"),
-            Self::Protocol(m) => write!(f, "git forge protocol error: {m}"),
-            Self::Rejected(m) => write!(f, "git forge rejected change request: {m}"),
-            Self::InvalidSpec(m) => write!(f, "invalid git forge spec: {m}"),
+            Self::Backend(e) => write!(f, "integration backend error: {e}"),
+            Self::Unauthorized(m) => write!(f, "integration unauthorized: {m}"),
+            Self::NotFound(m) => write!(f, "integration resource not found: {m}"),
+            Self::Protocol(m) => write!(f, "integration protocol error: {m}"),
+            Self::Rejected(m) => write!(f, "integration action rejected: {m}"),
+            Self::InvalidSpec(m) => write!(f, "invalid integration request: {m}"),
+            Self::Unsupported => write!(f, "operation not supported by this integration"),
         }
     }
 }
 
-impl StdError for GitForgeError {
+impl StdError for IntegrationError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Backend(e) => Some(&**e),

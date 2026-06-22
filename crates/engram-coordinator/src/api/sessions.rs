@@ -1562,7 +1562,9 @@ pub(crate) async fn inject_forge_env(
     git: Option<&engram_core::types::image::GitConfig>,
     env: &mut HashMap<String, String>,
 ) {
-    let (Some(_forge), Some(git)) = (state.forge.as_ref(), git) else {
+    // Forge env is injected only for a forge-configured deployment + a
+    // forge-bound image ([git]). ADR 0056: the github integration is the forge.
+    let (true, Some(git)) = (state.integrations.get("github").is_some(), git) else {
         return;
     };
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {

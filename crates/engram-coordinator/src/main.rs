@@ -221,13 +221,14 @@ fn parse_secrets_choice(s: &str) -> Result<SecretsChoice, String> {
     }
 }
 
-/// ADR 0023: build the optional git forge authority from CLI flags.
-/// `none` → `None` (forge endpoints 501); `github` → a `GitHubApp`.
-fn build_forge(
+/// ADR 0056: build the provider integrations from CLI flags. `none` → empty
+/// (forge endpoints 501); `github` → a `GitHubApp` registered as `"github"`.
+fn build_integrations(
     cli: &Cli,
-) -> Result<Option<Arc<dyn engram_core::traits::GitForge>>, CoordinatorError> {
+) -> Result<engram_coordinator::integrations::IntegrationBroker, CoordinatorError> {
+    use engram_coordinator::integrations::IntegrationBroker;
     match cli.git_forge.as_str() {
-        "none" => Ok(None),
+        "none" => Ok(IntegrationBroker::new()),
         "github" => {
             let app_id = cli.github_app_id.clone().ok_or_else(|| {
                 CoordinatorError::Config("--git-forge=github requires --github-app-id".into())
@@ -249,8 +250,8 @@ fn build_forge(
                 }
             };
             let app = engram_git_github::GitHubApp::new(app_id, &pem)
-                .map_err(|e| CoordinatorError::Config(format!("github forge: {e}")))?;
-            Ok(Some(Arc::new(app)))
+                .map_err(|e| CoordinatorError::Config(format!("github integration: {e}")))?;
+            Ok(IntegrationBroker::with(Arc::new(app)))
         }
         other => Err(CoordinatorError::Config(format!(
             "invalid --git-forge `{other}` (expected none | github)"
@@ -863,7 +864,7 @@ async fn main() -> Result<(), CoordinatorError> {
         materialize_dir: coord_materialize_dir,
     };
 
-    let forge = build_forge(&cli)?;
+    let integrations = build_integrations(&cli)?;
 
     // ADR 0051: the coordinator no longer assembles a human auth runtime.
     // The orchestrator owns auth/authz; the coordinator authenticates only
@@ -875,7 +876,7 @@ async fn main() -> Result<(), CoordinatorError> {
         services,
         host_registry,
         in_proc_local_backend.map(|b| (in_proc_host, b)),
-        forge,
+        integrations,
     )
     .await
 }

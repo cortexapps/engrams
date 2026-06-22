@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::traits::ForgeKind;
-
 // ---------------------------------------------------------------------
 // ImageManifest — the per-image declarative spec.
 //
@@ -200,6 +198,17 @@ impl ImageManifest {
             }
         }
     }
+}
+
+/// Which forge a [`GitConfig`] binds to. (Moved here from the retired
+/// `GitForge` trait in ADR 0056 Phase 5b; it now only labels the image's
+/// `[git]` binding.)
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForgeKind {
+    GitHub,
+    GitLab,
+    Gitea,
 }
 
 /// Git forge binding for an image (ADR 0023). Declares which forge a
