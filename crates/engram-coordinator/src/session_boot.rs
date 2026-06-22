@@ -375,6 +375,34 @@ async fn build_egress_policy(
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip_str = state.services.host.guest_ip(sandbox_id).await?;
     let guest_ip = guest_ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+    Some(engram_core::types::egress::SessionEgressPolicy {
+        session_id,
+        sandbox_id,
+        guest_ip,
+        network_allow_hosts: network.allow_hosts.clone(),
+        network_allow_host_patterns: network.allow_host_patterns.clone(),
+        secrets: egress_secret_entries(secret_bundle, spec_env),
+        secret_mode,
+    })
+}
+
+/// Pair each resolved secret with the placeholder that
+/// [`crate::api::sessions::apply_secrets_to_env`] wrote into the guest
+/// env, producing the egress entries the host-agent proxy substitutes
+/// on (placeholder → `real_value`, gated by the secret's allow lists).
+///
+/// The placeholder is read back out of `spec_env` — so a secret whose
+/// env var was dropped is skipped, and the entry placeholder is by
+/// construction the *same* string the guest carries. In `Broker` mode
+/// `spec_env[name]` is the placeholder; in `Literal` mode it is the
+/// real value, so substitution is a harmless no-op (placeholder ==
+/// `real_value`). This env-placeholder ⇄ entry-placeholder coupling is
+/// what makes Broker mode authenticate; the
+/// `broker_env_placeholder_matches_egress_entry` test locks it.
+pub(crate) fn egress_secret_entries(
+    secret_bundle: &engram_core::traits::SecretBundle,
+    spec_env: &HashMap<String, String>,
+) -> Vec<engram_core::types::egress::EgressSecretEntry> {
     let mut secrets = Vec::new();
     for (name, resolved) in &secret_bundle.secrets {
         let Some(placeholder) = spec_env.get(name).cloned() else {
@@ -387,13 +415,5 @@ async fn build_egress_policy(
             allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
         });
     }
-    Some(engram_core::types::egress::SessionEgressPolicy {
-        session_id,
-        sandbox_id,
-        guest_ip,
-        network_allow_hosts: network.allow_hosts.clone(),
-        network_allow_host_patterns: network.allow_host_patterns.clone(),
-        secrets,
-        secret_mode,
-    })
+    secrets
 }
