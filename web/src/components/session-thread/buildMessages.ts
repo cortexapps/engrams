@@ -53,14 +53,19 @@ export interface ShellArgs {
  *  harness-register events that aren't agent messages. */
 export type SystemMarker =
   | { kind: "durability"; mark: "snapshot" | "resumed"; sizeBytes?: number; at: string }
+  // ADR 0056: a generic integration asset/action. Subsumes the old
+  // `pull_request` marker. The renderer keys on (provider, assetKind) with a
+  // generic fallback (SystemMessage.tsx) — no per-provider marker shape.
   | {
-      kind: "pull_request";
-      url: string;
-      repo: string;
-      title: string;
-      number: number;
-      headBranch: string;
-      baseBranch: string;
+      kind: "integration_asset";
+      provider: string;
+      assetKind: string;
+      surface: "action" | "asset";
+      data: Record<string, unknown>;
+      fetchable:
+        | { kind: "external"; url: string }
+        | { kind: "artifact"; artifactId: string; mediaType: string; sizeBytes: number }
+        | null;
       at: string;
     }
   | {
@@ -437,18 +442,35 @@ export function buildMessages(
         });
         break;
 
-      case "pull_request_opened":
-        pushSystem(`pr:${idx}`, `opened PR #${ev.number}: ${ev.title}`, {
-          kind: "pull_request",
-          url: ev.url,
-          repo: ev.repo,
-          title: ev.title,
-          number: ev.number,
-          headBranch: ev.head_branch,
-          baseBranch: ev.base_branch,
+      case "integration_asset": {
+        const f = ev.fetchable;
+        // Fallback text (single-part shape constraint) — a title if the
+        // payload carries one, else the provider/kind pair.
+        const fallback =
+          typeof ev.data?.title === "string"
+            ? (ev.data.title as string)
+            : `${ev.provider} ${ev.asset_kind}`;
+        pushSystem(`ia:${idx}`, fallback, {
+          kind: "integration_asset",
+          provider: ev.provider,
+          assetKind: ev.asset_kind,
+          surface: ev.surface,
+          data: ev.data ?? {},
+          fetchable:
+            f == null
+              ? null
+              : f.kind === "external"
+                ? { kind: "external", url: f.url }
+                : {
+                    kind: "artifact",
+                    artifactId: f.artifact_id,
+                    mediaType: f.media_type,
+                    sizeBytes: f.size_bytes,
+                  },
           at: ev.at,
         });
         break;
+      }
 
       case "file_shared":
         pushSystem(`art:${idx}`, ev.caption ?? "shared a file", {

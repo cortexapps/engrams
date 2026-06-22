@@ -268,26 +268,55 @@ describe("buildMessages — message/part shaping", () => {
     expect((msgs[0]!.content[0] as { type: string }).type).toBe("text");
   });
 
-  test("pull_request_opened becomes a pull_request system marker", () => {
+  test("integration_asset(forge/pull_request) becomes an integration_asset marker", () => {
     const { messages } = buildMessages(
       indexed([
         {
-          type: "pull_request_opened",
-          url: "https://gh/x/pull/7",
-          repo: "x/y",
-          title: "Fix it",
-          number: 7,
-          head_branch: "fix",
-          base_branch: "main",
+          type: "integration_asset",
+          provider: "forge",
+          asset_kind: "pull_request",
+          surface: "asset",
+          data: { repo: "x/y", title: "Fix it", number: 7, head_branch: "fix", base_branch: "main" },
+          fetchable: { kind: "external", url: "https://gh/x/pull/7" },
           at: AT,
         },
       ]),
       SID,
     );
     expect(customMarker(real(messages)[0]!)).toMatchObject({
-      kind: "pull_request",
-      number: 7,
-      repo: "x/y",
+      kind: "integration_asset",
+      provider: "forge",
+      assetKind: "pull_request",
+      surface: "asset",
+      data: { repo: "x/y", number: 7 },
+      fetchable: { kind: "external", url: "https://gh/x/pull/7" },
+    });
+  });
+
+  // ADR 0056: a provider the UI has no hand-crafted renderer for still
+  // surfaces as a generic integration_asset marker (rendered by the fallback
+  // card) with zero new web code — the "PRs aren't special" property.
+  test("a never-seen integration_asset provider still becomes a generic marker", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "integration_asset",
+          provider: "datadog",
+          asset_kind: "query_result",
+          surface: "action",
+          data: { query: "avg:system.cpu", p99: "812ms" },
+          fetchable: null,
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    expect(customMarker(real(messages)[0]!)).toMatchObject({
+      kind: "integration_asset",
+      provider: "datadog",
+      assetKind: "query_result",
+      surface: "action",
+      fetchable: null,
     });
   });
 

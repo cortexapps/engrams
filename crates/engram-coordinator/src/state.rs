@@ -170,18 +170,31 @@ pub enum SessionEvent {
         chunk: String,
         at: DateTime<Utc>,
     },
-    /// ADR 0023: the agent opened a change request (PR/MR) via the
-    /// in-session forge seam. Surfaces the title + URL to the web UI /
-    /// SSE subscribers so the session's output artifact is visible (the
-    /// web transcript renders this as a pull-request card). `number` is
-    /// the provider's PR number / MR iid.
-    PullRequestOpened {
-        url: String,
-        repo: String,
-        title: String,
-        number: u64,
-        head_branch: String,
-        base_branch: String,
+    /// ADR 0056: a third-party integration surfaced a typed asset/action
+    /// into the session. Subsumes the retired `PullRequestOpened` — an
+    /// opened PR is now `provider: "forge"`, `asset_kind: "pull_request"`.
+    /// `provider` + `asset_kind` discriminate; the web keys its renderer on
+    /// that pair (with a generic fallback). The wire carries NO rendering
+    /// instructions — presentation lives in the web/orchestrator layer
+    /// (ADR 0056 §4). `data` is the typed semantic payload the renderer
+    /// reads. Always emitted coordinator-side at the broker seam, never a
+    /// guest self-report of arbitrary metadata.
+    IntegrationAsset {
+        /// The integration that produced this, e.g. `"forge"`. Namespaces
+        /// `asset_kind` so two providers can't collide.
+        provider: String,
+        /// Provider-scoped type, e.g. `"pull_request"`.
+        asset_kind: String,
+        /// Durable asset (survives an ADR 0028 recovery rewind as a
+        /// side-effect) vs. transient action log.
+        surface: AssetSurface,
+        /// The typed semantic payload the web renderer reads — for a PR,
+        /// `{repo, title, number, head_branch, base_branch}`.
+        data: serde_json::Value,
+        /// Where the asset's bytes / URL live: an ADR 0026 artifact the
+        /// platform serves, or an external link it doesn't host (a PR page).
+        #[serde(default)]
+        fetchable: Option<FetchableRef>,
         at: DateTime<Utc>,
     },
     /// ADR 0026: a file artifact was shared into this session and
@@ -246,6 +259,39 @@ pub enum RecoveryCause {
     HostFailureRecovery,
 }
 
+/// ADR 0056: an [`SessionEvent::IntegrationAsset`] is either a durable noun
+/// (a PR, a shared file) that survives an ADR 0028 recovery rewind as a
+/// side-effect the platform can't undo, or a transient verb (a query the
+/// agent ran) that does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetSurface {
+    /// A verb the agent performed — a transient log line, not a surviving
+    /// side-effect on recovery.
+    Action,
+    /// A durable noun that persists in the session; counted as a surviving
+    /// side-effect on an ADR 0028 recovery rewind.
+    Asset,
+}
+
+/// ADR 0056: where an [`SessionEvent::IntegrationAsset`]'s bytes / URL live.
+/// `Artifact` reuses the ADR 0026 artifact serve endpoint
+/// (`GET /sessions/:id/artifacts/:artifact_id`); `External` is a link the
+/// platform doesn't host (a PR page). Serialized tagged on `kind` so the
+/// web can discriminate without positional knowledge.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FetchableRef {
+    External {
+        url: String,
+    },
+    Artifact {
+        artifact_id: String,
+        media_type: String,
+        size_bytes: u64,
+    },
+}
+
 impl SessionEvent {
     /// Discriminant string used both as the SSE `event:` field and as
     /// the `kind` column in `session_events`. Stable across
@@ -272,7 +318,7 @@ impl SessionEvent {
             Self::HarnessPromptEdited { .. } => "prompt_edited",
             Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
             Self::HarnessAgentMessageChunk { .. } => "agent_message_chunk",
-            Self::PullRequestOpened { .. } => "pull_request_opened",
+            Self::IntegrationAsset { .. } => "integration_asset",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
         }

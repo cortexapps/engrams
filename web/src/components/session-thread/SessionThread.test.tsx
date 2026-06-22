@@ -81,13 +81,18 @@ describe("SessionThread", () => {
         status="idle"
         events={indexed([
           {
-            type: "pull_request_opened",
-            url: "https://gh/x/pull/7",
-            repo: "x/y",
-            title: "Fix the flaky test",
-            number: 7,
-            head_branch: "fix",
-            base_branch: "main",
+            type: "integration_asset",
+            provider: "forge",
+            asset_kind: "pull_request",
+            surface: "asset",
+            data: {
+              repo: "x/y",
+              title: "Fix the flaky test",
+              number: 7,
+              head_branch: "fix",
+              base_branch: "main",
+            },
+            fetchable: { kind: "external", url: "https://gh/x/pull/7" },
             at: AT,
           },
           { type: "harness_idle", at: AT2 },

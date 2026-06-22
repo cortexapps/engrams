@@ -28,7 +28,7 @@ use engram_harness_proto::{read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResp
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::state::{SessionEvent, SharedState};
+use crate::state::{AssetSurface, FetchableRef, SessionEvent, SharedState};
 
 // ---- shared auth + dispatch core (HTTP + vsock) ------------------------
 
@@ -108,22 +108,33 @@ async fn op_create_pull_request(
         .create_pull_request(&repo_ref, &spec)
         .await
         .map_err(|e| format!("create pull request: {e}"))?;
+    // ADR 0056: a PR is one instance of the generic IntegrationAsset — a
+    // durable `forge`/`pull_request` asset whose URL is an external link.
+    // The wire stays semantic (provider + asset_kind + data); the web keys
+    // its renderer on (provider, asset_kind).
     if let Err(e) = state
         .emit(
             session,
-            SessionEvent::PullRequestOpened {
-                url: pr.url.clone(),
-                repo: repo.to_string(),
-                title: spec.title,
-                number: pr.id,
-                head_branch: spec.head_branch,
-                base_branch: spec.base_branch,
+            SessionEvent::IntegrationAsset {
+                provider: "forge".into(),
+                asset_kind: "pull_request".into(),
+                surface: AssetSurface::Asset,
+                data: serde_json::json!({
+                    "repo": repo,
+                    "title": spec.title,
+                    "number": pr.id,
+                    "head_branch": spec.head_branch,
+                    "base_branch": spec.base_branch,
+                }),
+                fetchable: Some(FetchableRef::External {
+                    url: pr.url.clone(),
+                }),
                 at: chrono::Utc::now(),
             },
         )
         .await
     {
-        tracing::warn!(session = %session, error = %e, "emit PullRequestOpened failed (PR was created)");
+        tracing::warn!(session = %session, error = %e, "emit IntegrationAsset(forge/pull_request) failed (PR was created)");
     }
     Ok(pr)
 }
