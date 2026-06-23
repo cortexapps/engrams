@@ -142,10 +142,23 @@ config-driven mint ADR 0056 §9 deferred).
   the two prod callers (`tasks.ts` create, `profiles.ts` capability-save) `await loadRegistry`.
   `parseConnector` is hardened into the admin-trust boundary (host wildcard/scheme/path checks,
   HTTP header-name + `{}`-template + no-CRLF validation, provider-id + count bounds).
-- **C2** — Mint-kind registry + GitHub cred migration (creds sourced from the org store;
-  retire `--git-forge`/`--github-app-*`).
-- **C3** — `IntegrationService` proto + orchestrator service (connector CRUD, `ListMintKinds`,
-  org-secret put/list/delete — all proxied).
+- **C2** — Mint-kind registry + GitHub App key sourced from the org store.
+  *As built:* `MintKindDescriptor`/`MintFieldSchema`/`MintFieldKind`/`ResolvedFields` in
+  `engram-core`; `engram_git_github::github_app_descriptor()`; `mint_kind_registry()` in the
+  coordinator. The `IntegrationBroker` builds engines **lazily from the composed `SecretStore`**
+  keyed `<kind>.<field>`, with a version-keyed cache that `pg_listener` invalidates on
+  `org_secret_changed` (A1 already `NOTIFY`s on write). `forge.rs` + `inject_forge_env` resolve the
+  engine async. **Boot-env kept as fallback, not retired**: the `--git-forge`/`--github-app-*`
+  values ride as a `StaticSecretStore` layered **org store → boot-env fallback → deployment
+  backend**. The fallback sits *ahead of* the deployment backend deliberately — GCP SM can't
+  resolve the synthetic `github_app.*` name (empty repo + a `.` → an invalid secret id → a `400`
+  the `LayeredSecretStore` would propagate *before* reaching the fallback), so layering it first
+  keeps minting working unchanged in prod. The org store still wins, so dropping the boot env is
+  the deliberate **post-C4 cutover** (you can't enter the PEM in a UI that doesn't exist yet).
+  `ListMintKinds` gRPC is **regrouped into C3** (with the `IntegrationService` proto + proxy) to
+  avoid a one-off coordinator proto with no caller.
+- **C3** — `IntegrationService` proto + orchestrator service (connector CRUD, `ListMintKinds`
+  over the coordinator `mint_kind_registry()`, org-secret put/list/delete — all proxied).
 - **C4** — Web `/settings/integrations` UI (Plane A/B).
 - **D1** — Catalog-driven capability picker in the profile editor.
 - **D2** — Retire `[git]`/`GitConfig` into capabilities; **ADR Accepted**.
@@ -158,9 +171,11 @@ config-driven mint ADR 0056 §9 deferred).
 - **Image re-bake migration**: stripping the manifest is a clean break — all images re-bake
   and default/dogfood profiles must be seeded with their network + secrets + `github:*`
   caps before sessions can reach anything (deny by default).
-- **GitHub cred migration (one-time)**: after C2, an admin enters the App ID + PEM once via
-  the UI; the `ENGRAM_GITHUB_APP_*` boot env is dropped. The empty-caps default-scope
-  fallback keeps existing profiles working.
+- **GitHub cred migration (one-time)**: C2 makes the App key resolvable from the org store but
+  keeps the boot-env values as a fallback layer, so nothing breaks mid-stack. The actual cutover
+  is **post-C4** (once the UI exists): an admin enters the App ID + PEM once via `/settings/integrations`
+  (org store wins over the fallback), then `ENGRAM_GITHUB_APP_*` is dropped from the coord Deployment.
+  The empty-caps default-scope fallback keeps existing profiles working.
 - **`parseConnector` becomes security-relevant** (admin-trust): an uploaded connector can
   open egress + inject org secrets. Hardened + tested. Same trust level as setting
   `env_vars` / uploading skills today.

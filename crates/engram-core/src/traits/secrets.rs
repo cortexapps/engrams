@@ -160,6 +160,36 @@ impl SecretStore for LayeredSecretStore {
     }
 }
 
+/// A fixed in-memory [`SecretStore`] over a known `name → value` map. Used to
+/// layer deployment-provided fallback values behind the org-secret store — e.g.
+/// during the ADR 0057 migration the coordinator seeds the boot-env GitHub App
+/// key (`<kind>.<field>` names) here, layered *behind the org store but ahead of
+/// the deployment backend*: an admin-entered org secret still takes precedence,
+/// while a deployment backend that errors on the synthetic name can't block the
+/// fallback (it's consulted first). Minting keeps working until the boot env is
+/// dropped. Ignores `SecretContext` (global, name-keyed values).
+pub struct StaticSecretStore {
+    map: HashMap<String, String>,
+}
+
+impl StaticSecretStore {
+    pub fn new(map: HashMap<String, String>) -> Self {
+        Self { map }
+    }
+}
+
+#[async_trait]
+impl SecretStore for StaticSecretStore {
+    async fn get(
+        &self,
+        _ctx: &SecretContext<'_>,
+        name: &str,
+        _schema: &SecretSchema,
+    ) -> Result<Option<String>, SecretError> {
+        Ok(self.map.get(name).cloned())
+    }
+}
+
 #[cfg(test)]
 mod layered_tests {
     use super::*;
@@ -249,5 +279,25 @@ mod layered_tests {
             .get(&ctx(), "A", &SecretSchema::default())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn an_earlier_hit_shields_a_later_erroring_backend() {
+        // ADR 0057 C2 safety: the boot-env mint-key fallback (a `StaticSecretStore`) is
+        // layered AHEAD of the deployment backend, so a deployment backend that *errors*
+        // on the synthetic `<kind>.<field>` name (e.g. GCP SM 400 on an invalid secret id)
+        // cannot break minting — an earlier hit wins before the erroring backend is ever
+        // consulted. This is the property that keeps git minting working on the C2 roll.
+        let layered = LayeredSecretStore::new(vec![
+            fixed(&[("github_app.app_id", "123")]),
+            Arc::new(AlwaysErr),
+        ]);
+        assert_eq!(
+            layered
+                .get(&ctx(), "github_app.app_id", &SecretSchema::default())
+                .await
+                .unwrap(),
+            Some("123".into())
+        );
     }
 }

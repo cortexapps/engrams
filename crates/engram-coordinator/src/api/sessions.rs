@@ -1585,7 +1585,14 @@ pub(crate) async fn inject_forge_env(
 ) {
     // Forge env is injected only for a forge-configured deployment + a
     // forge-bound image ([git]). ADR 0056: the github integration is the forge.
-    let (true, Some(git)) = (state.integrations.get("github").is_some(), git) else {
+    // ADR 0057 C2: "configured" now means the github mint engine resolves from
+    // the composed SecretStore (org store or boot-env fallback) — checked async.
+    let github_ready = state
+        .integrations
+        .resolve("github", &state.services.secrets)
+        .await
+        .is_some();
+    let (true, Some(git)) = (github_ready, git) else {
         return;
     };
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {

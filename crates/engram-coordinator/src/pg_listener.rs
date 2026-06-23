@@ -22,6 +22,7 @@ use serde::Deserialize;
 use sqlx::postgres::PgListener;
 
 use crate::host_registry::HostRegistry;
+use crate::integrations::IntegrationBroker;
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus};
 
 #[derive(Debug, Deserialize)]
@@ -50,9 +51,10 @@ pub fn spawn(
     meta: Arc<dyn MetadataStore>,
     events: Arc<SessionEventBus>,
     host_registry: Arc<HostRegistry>,
+    integrations: IntegrationBroker,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run(&database_url, meta, events, host_registry).await {
+        if let Err(e) = run(&database_url, meta, events, host_registry, integrations).await {
             tracing::error!(error = %e, "pg listener task exited");
         }
     })
@@ -63,12 +65,17 @@ async fn run(
     meta: Arc<dyn MetadataStore>,
     events: Arc<SessionEventBus>,
     host_registry: Arc<HostRegistry>,
+    integrations: IntegrationBroker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen("session_events").await?;
     listener.listen("session_event_deltas").await?;
     listener.listen("host_dead").await?;
-    tracing::info!("pg_listener subscribed to session_events + session_event_deltas + host_dead");
+    // ADR 0057 C2: org-secret writes/rotations invalidate the mint-engine cache.
+    listener.listen("org_secret_changed").await?;
+    tracing::info!(
+        "pg_listener subscribed to session_events + session_event_deltas + host_dead + org_secret_changed"
+    );
 
     loop {
         let notification = listener.recv().await?;
@@ -92,6 +99,18 @@ async fn run(
                         );
                     }
                 }
+                continue;
+            }
+            "org_secret_changed" => {
+                // ADR 0057 C2: an org secret was written or rotated (A1's write
+                // path NOTIFYs the secret name). Invalidate the broker's lazy
+                // mint-engine cache so the next mint rebuilds from the updated
+                // value. Fires on every replica, so each rebuilds independently.
+                integrations.invalidate();
+                tracing::info!(
+                    secret = notification.payload(),
+                    "org secret changed; invalidated mint-engine cache",
+                );
                 continue;
             }
             "session_event_deltas" => {

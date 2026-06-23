@@ -184,6 +184,7 @@ pub async fn run_with_registry_and_local(
         meta_for_listener.clone(),
         state.events.clone(),
         state.host_registry.clone(),
+        state.integrations.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Opens its own

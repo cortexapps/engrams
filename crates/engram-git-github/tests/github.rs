@@ -156,3 +156,51 @@ async fn rejects_invalid_private_key() {
         Err(IntegrationError::Unauthorized(_))
     ));
 }
+
+// --- ADR 0057 C2: the github_app mint-kind descriptor ----------------------
+
+#[test]
+fn github_app_descriptor_metadata() {
+    use engram_core::traits::MintFieldKind;
+    let d = engram_git_github::github_app_descriptor();
+    assert_eq!(d.kind, "github_app");
+    assert_eq!(d.provider, "github");
+    // The field names are the org-secret suffixes the coordinator resolves; the
+    // Plane-A form (C4) renders from this metadata, so pin the contract.
+    let names: Vec<&str> = d.fields.iter().map(|f| f.name).collect();
+    assert_eq!(names, vec!["app_id", "private_key_pem"]);
+    let pem = d
+        .fields
+        .iter()
+        .find(|f| f.name == "private_key_pem")
+        .unwrap();
+    assert_eq!(pem.field_kind, MintFieldKind::SealedSecret);
+    assert!(pem.required);
+    let app_id = d.fields.iter().find(|f| f.name == "app_id").unwrap();
+    assert_eq!(app_id.field_kind, MintFieldKind::Config);
+}
+
+#[test]
+fn github_app_descriptor_builds_engine_from_resolved_fields() {
+    use engram_core::traits::ResolvedFields;
+    let mut fields = ResolvedFields::new();
+    fields.insert("app_id".into(), "123".into());
+    fields.insert("private_key_pem".into(), test_key().to_string());
+    let engine = (engram_git_github::github_app_descriptor().build)(&fields).expect("build engine");
+    assert_eq!(engine.provider(), "github");
+}
+
+#[test]
+fn github_app_descriptor_rejects_missing_or_bad_fields() {
+    use engram_core::traits::ResolvedFields;
+    let d = engram_git_github::github_app_descriptor();
+    // Missing private_key_pem → build error.
+    let mut missing = ResolvedFields::new();
+    missing.insert("app_id".into(), "123".into());
+    assert!((d.build)(&missing).is_err());
+    // Present but invalid PEM → build error.
+    let mut bad = ResolvedFields::new();
+    bad.insert("app_id".into(), "123".into());
+    bad.insert("private_key_pem".into(), "not a pem".into());
+    assert!((d.build)(&bad).is_err());
+}
