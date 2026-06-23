@@ -1,6 +1,12 @@
 {
   "provider": "github",
   "protocol": "http",
+  "display": {
+    "name": "GitHub",
+    "category": "Source control",
+    "blurb": "Read code, open pull requests and issues — scoped to a per-session GitHub App token.",
+    "icon": { "mono": "GH", "color": "#1f2328" }
+  },
   "credential": { "source": "mint", "mint": { "kind": "github_app" } },
   "hosts": ["api.github.com"],
   "operations": [

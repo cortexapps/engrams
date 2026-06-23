@@ -18,6 +18,10 @@ import {
   connectorRegistry,
   loadRegistry,
   invalidateRegistry,
+  connectorStatus,
+  buildProviderCatalog,
+  defaultDisplayName,
+  defaultIconMono,
   type Connector,
 } from "../connectors/registry.ts";
 
@@ -434,5 +438,127 @@ describe("loadRegistry", () => {
     invalidateRegistry();
     const second = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
     expect(second.has("sentry")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Redesign #1: connector display identity, connected status, member catalog
+// ---------------------------------------------------------------------------
+
+describe("parseConnector — display metadata", () => {
+  test("defaults the whole identity off the provider when absent", () => {
+    const c = parseConnector(datadogRaw, "datadog");
+    expect(c.display.name).toBe(defaultDisplayName("datadog")); // "Datadog"
+    expect(c.display.category).toBe("Other");
+    expect(c.display.blurb).toBe("");
+    expect(c.display.icon.mono).toBe(defaultIconMono("datadog")); // "DA"
+    expect(c.display.icon.color).toMatch(/^#[0-9a-fA-F]{6}$/);
+    expect(c.display.icon.logo).toBeUndefined();
+  });
+
+  test("the default tint depends only on the provider id (deterministic)", () => {
+    expect(parseConnector(datadogRaw, "x").display.icon.color).toBe(parseConnector(datadogRaw, "y").display.icon.color);
+  });
+
+  test("title-cases a multi-word provider id", () => {
+    expect(defaultDisplayName("pager_duty")).toBe("Pager Duty");
+    expect(defaultIconMono("pager_duty")).toBe("PA");
+  });
+
+  test("accepts and normalizes an authored display block", () => {
+    const c = parseConnector(
+      {
+        ...datadogRaw,
+        display: { name: "Datadog", category: "Observability", blurb: "logs + metrics", icon: { mono: "dd", color: "#632ca6", logo: "/api/v1/integrations/datadog/logo" } },
+      },
+      "datadog",
+    );
+    expect(c.display).toEqual({
+      name: "Datadog",
+      category: "Observability",
+      blurb: "logs + metrics",
+      icon: { mono: "DD", color: "#632ca6", logo: "/api/v1/integrations/datadog/logo" },
+    });
+  });
+
+  test("fills only the missing display fields", () => {
+    const c = parseConnector({ ...datadogRaw, display: { category: "Observability" } }, "datadog");
+    expect(c.display.name).toBe(defaultDisplayName("datadog"));
+    expect(c.display.category).toBe("Observability");
+  });
+
+  test("rejects a non-hex icon color", () => {
+    expect(() => parseConnector({ ...datadogRaw, display: { icon: { color: "purple" } } }, "x")).toThrow(/hex color/);
+  });
+
+  test("rejects a monogram longer than two characters", () => {
+    expect(() => parseConnector({ ...datadogRaw, display: { icon: { mono: "DDD" } } }, "x")).toThrow(/monogram/);
+  });
+
+  test("rejects an over-long display name", () => {
+    expect(() => parseConnector({ ...datadogRaw, display: { name: "x".repeat(121) } }, "x")).toThrow(/display\.name/);
+  });
+
+  test("rejects a non-object display", () => {
+    expect(() => parseConnector({ ...datadogRaw, display: "nope" }, "x")).toThrow(/"display" must be an object/);
+  });
+
+  test("rejects a logo URL containing whitespace", () => {
+    expect(() => parseConnector({ ...datadogRaw, display: { icon: { logo: "/a b" } } }, "x")).toThrow(/logo/);
+  });
+
+  test("the shipped seeds carry curated identities", () => {
+    const reg = connectorRegistry();
+    expect(reg.get("github")!.display).toMatchObject({ name: "GitHub", category: "Source control", icon: { mono: "GH", color: "#1f2328" } });
+    expect(reg.get("datadog")!.display).toMatchObject({ name: "Datadog", category: "Observability", icon: { mono: "DD", color: "#632ca6" } });
+  });
+});
+
+describe("connectorStatus", () => {
+  const inject = parseConnector(datadogRaw, "datadog"); // secretRef datadog-api-key
+  const mint = parseConnector(githubRaw, "github"); // kind github_app
+  const required = ["github_app.app_id", "github_app.private_key_pem"];
+
+  test("inject is connected iff its secretRef exists in the org store", () => {
+    expect(connectorStatus(inject, new Set(["datadog-api-key"]))).toBe("connected");
+    expect(connectorStatus(inject, new Set())).toBe("available");
+  });
+
+  test("mint is connected iff every required field secret exists", () => {
+    expect(connectorStatus(mint, new Set(required), required)).toBe("connected");
+    expect(connectorStatus(mint, new Set(["github_app.app_id"]), required)).toBe("available");
+  });
+
+  test("mint with no required-name list is available (not configured)", () => {
+    expect(connectorStatus(mint, new Set(required))).toBe("available");
+  });
+});
+
+describe("buildProviderCatalog", () => {
+  const reg = registryOf(datadogRaw, githubRaw); // datadog logs:read (GET); github issues:write (POST)
+
+  test("derives a member-safe, secret-free catalog with read/write access", () => {
+    const cat = buildProviderCatalog(reg);
+    expect(cat.map((e) => e.provider)).toEqual(["datadog", "github"]); // sorted
+    const dd = cat.find((e) => e.provider === "datadog")!;
+    expect(dd.credentialSource).toBe("inject");
+    expect(dd.hosts).toEqual(["api.datadoghq.com"]);
+    expect(dd.capabilities).toEqual([{ action: "logs:read", access: "read" }]);
+    const gh = cat.find((e) => e.provider === "github")!;
+    expect(gh.credentialSource).toBe("mint");
+    expect(gh.capabilities).toEqual([{ action: "issues:write", access: "write" }]);
+    // No secret material (mint kind, secretRef, header, template) leaks to members.
+    expect(JSON.stringify(cat)).not.toMatch(/secretRef|header|template|github_app|datadog-api-key/);
+  });
+
+  test("carries the asset kind for an asset-bearing op (from the on-disk seeds)", () => {
+    const cat = buildProviderCatalog(connectorRegistry());
+    const gh = cat.find((e) => e.provider === "github")!;
+    expect(gh.capabilities.find((c) => c.action === "pulls:write")).toEqual({
+      action: "pulls:write",
+      access: "write",
+      asset: "pull_request",
+    });
+    expect(gh.display.icon.mono).toBe("GH");
   });
 });
