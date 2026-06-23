@@ -58,6 +58,16 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 /// panicking on.
 const SSE_WAIT_DEADLINE: Duration = Duration::from_secs(180);
 
+/// ADR 0057 (B2b, `0c66a4ae`): network egress is sourced from the session
+/// policy now — the image manifest no longer carries a network allow-list —
+/// and a session created with **no** policy gets **deny-all** egress. These
+/// e2e sessions are trusted debug sessions (same posture as `engram-cli`'s
+/// admin create), so they send an allow-all network policy. Without it the
+/// `agent`-mode Claude session can't reach api.anthropic.com, so the bogus-key
+/// auth-error test never sees the 401 and times out. (The `dev_vm` sessions
+/// make no external calls, but use the same policy for consistency.)
+const E2E_ALLOW_ALL_POLICY: &str = r#"{"network":{"default":"allow"}}"#;
+
 /// Auth-failure observation outcome.
 ///
 /// The Claude harness emits `run_completed { ok: false }` when Claude
@@ -149,7 +159,7 @@ impl Driver {
         let req = app::CreateSessionRequest {
             selected_skills: Vec::new(),
             capabilities: Vec::new(),
-            integration_policy_json: String::new(),
+            integration_policy_json: E2E_ALLOW_ALL_POLICY.to_string(),
             image_uri: image.to_string(),
             mode: "dev_vm".to_string(),
             prompt: None,
@@ -174,7 +184,7 @@ impl Driver {
         let req = app::CreateSessionRequest {
             selected_skills: skills.iter().map(|s| s.to_string()).collect(),
             capabilities: Vec::new(),
-            integration_policy_json: String::new(),
+            integration_policy_json: E2E_ALLOW_ALL_POLICY.to_string(),
             image_uri: image.to_string(),
             mode: "dev_vm".to_string(),
             prompt: None,
@@ -213,7 +223,7 @@ impl Driver {
         let req = app::CreateSessionRequest {
             selected_skills: Vec::new(),
             capabilities: Vec::new(),
-            integration_policy_json: String::new(),
+            integration_policy_json: E2E_ALLOW_ALL_POLICY.to_string(),
             image_uri: image.to_string(),
             mode: "agent".to_string(),
             prompt: prompt.map(str::to_string),
