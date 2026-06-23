@@ -125,8 +125,7 @@ pub(crate) async fn resolve_resume_agent_and_policy(
     )
     .ok()
     .flatten()?;
-    crate::api::sessions::inject_harness_env(state, id, b.manifest.git.as_ref(), &mut agent.env)
-        .await;
+    crate::api::sessions::inject_harness_env(state, id, &mut agent.env).await;
     // Rebuild the SessionEgressPolicy for `sandbox_id`. Falls back to the
     // legacy placeholder when the host has no guest IP (process backend, VZ in
     // some configs) or the IP is unparseable — same as the create path.

@@ -1,8 +1,12 @@
 # ADR 0057: Profiles as the unified session-policy object + first-class integrations
 
-Status: 2026-06-22 — **Proposed.** Implemented across the phase chain in §Phasing;
-this ADR is updated between phases and flipped to **Accepted** at the end (phase D2)
-with the commit chain.
+Status: 2026-06-23 — **Accepted.** Implemented across the phase chain in §Phasing.
+Commit chain (PRs): A1 #382 · B1 #383 · B2a #384 · B2b #385 · C0 #386 · C1 #387 ·
+C2 #388 · C3 #389 · C4 #390 · D1 #391 · D2 #392. The profile is now the single
+session-policy object (network + secrets + capabilities), org + image secrets resolve
+through one composed `SecretStore`, integrations are a runtime admin feature (DB-backed
+connector catalog + `/settings/integrations` Plane A/B), and the GitHub App key is
+org-store-managed (the boot-env fallback drop is the post-rollout ops step).
 
 Builds on ADR 0056 (generic integrations — the interceptor gate/inject/observe +
 connector config + the slim `Integration` trait), ADR 0053 (session profiles), ADR
@@ -180,6 +184,15 @@ config-driven mint ADR 0056 §9 deferred).
   write-only credential → org secret under the ref. Built-in connectors are read-only.
 - **D1** — Catalog-driven capability picker in the profile editor.
 - **D2** — Retire `[git]`/`GitConfig` into capabilities; **ADR Accepted**.
+  *As built:* `git`/`GitConfig`/`ForgeKind` removed from `ImageManifest` (a pre-strip `[git]`
+  block now parses + is ignored, like B2b's secrets/network). Forge-env injection
+  (`inject_forge_env`) re-gates from "manifest `[git]` present" to "the session holds a
+  `github:*` capability" (read from the persisted session capabilities) AND the github mint
+  engine resolves; `inject_harness_env`/`exec`/`snapshot` callers drop the `git` arg + the
+  `BootInputs.git` field is gone. `ENGRAM_FORGE_OWNER` now derives from a capability's
+  `@owner/repo` resource if present, else omitted (the single-installation App needs no hint).
+  Operational: the 3 prod profiles were seeded with `github:*` caps before this rolled (git
+  binding is capability-driven now). The askpass + mint flow are otherwise unchanged.
 
 ## Consequences and risks
 

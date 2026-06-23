@@ -49,10 +49,6 @@ pub(crate) struct BootInputs {
     /// exist until `create_session_created` runs in `boot_on_reserved_host`,
     /// so the injection is deferred to there (after the row materializes).
     pub agent: Option<AgentSpec>,
-    /// The image's `[git]` block, if any — carried so the deferred
-    /// broker-token injection (after the session row exists) can stamp the
-    /// forge owner. `None` for non-git images.
-    pub git: Option<engram_core::types::image::GitConfig>,
     /// The durable session env agentd applies to harness, `/exec`, and
     /// the shell. Used to synthesize the readiness-probe agent when
     /// `agent` is `None`.
@@ -133,7 +129,6 @@ pub(crate) async fn boot_on_reserved_host(
         base_snapshot_id,
         spec_env,
         mut agent,
-        git,
         session_env,
         egress_secrets,
         network,
@@ -260,7 +255,7 @@ pub(crate) async fn boot_on_reserved_host(
     // PG-backed broker tokens). Mirrors the secret-persistence above: same
     // row, same FK, same "after create_session_created" placement.
     if let Some(a) = agent.as_mut() {
-        crate::api::sessions::inject_harness_env(state, session_id, git.as_ref(), &mut a.env).await;
+        crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await;
     }
 
     // ADR 0047: the session→sandbox binding is persisted by
