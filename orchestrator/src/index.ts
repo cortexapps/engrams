@@ -14,6 +14,9 @@ import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
+import { registerOrgSecret } from "./rpc/org-secret.ts";
+import { registerMint } from "./rpc/mint.ts";
+import { registerIntegration } from "./rpc/integration.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
@@ -62,6 +65,20 @@ const server = buildServer(
     // wrapper over the coordinator's skill catalog. Registered before the
     // passthrough so it owns the MountCatalogService prefix.
     registerMountCatalog(router);
+
+    // Native OrgSecretService (ADR 0057 A1): admin-gated proxy over the
+    // coordinator's KEK-sealed org secret store. Registered before the
+    // passthrough so it owns the OrgSecretService prefix; values are sealed
+    // coordinator-side and never returned.
+    registerOrgSecret(router);
+
+    // Native MintService (ADR 0057 C3): admin-gated proxy over the coordinator's
+    // read-only mint-kind registry (Plane-A form metadata). Before passthrough.
+    registerMint(router);
+
+    // Native IntegrationService (ADR 0057 C3): admin-gated connector catalog CRUD
+    // (Plane B) over the orchestrator's own DB; built-ins are read-only seeds.
+    registerIntegration(router);
 
     // Generic passthrough: forwards SessionService, FleetService, ImageService
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).

@@ -18,9 +18,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/engram/app/v1/fleet.proto",
         "proto/engram/app/v1/image.proto",
         "proto/engram/app/v1/mount_catalog.proto",
+        "proto/engram/app/v1/org_secret.proto",
+        "proto/engram/app/v1/mint.proto",
         // secret.proto removed in ADR 0051 Drip A: the orchestrator owns the
         // user's harness token; it rides CreateSession.harness_env now.
         // task.proto is deliberately absent: orchestrator-native (ADR §3).
+        // integration.proto is deliberately absent: orchestrator-native connector
+        // catalog CRUD (ADR 0057 C3) — the coordinator never sees connectors.
     ];
     let includes = ["proto"];
     // Emit a serialized FileDescriptorSet covering the compiled protos so

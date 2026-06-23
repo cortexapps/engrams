@@ -71,6 +71,30 @@ export const taskSession = pgTable(
 // integrity is enforced in application code. Soft delete only (deleted_at).
 // ---------------------------------------------------------------------------
 
+// ADR 0057: profile-defined egress + secret policy, lifted off the image
+// manifest. Carried as jsonb on the profile and compiled into the per-session
+// SessionPolicy at create (B2). The org secret store holds the values; a
+// ProfileSecret only references one by `ref`.
+export interface ProfileNetwork {
+  default: "deny" | "allow"; // posture for hosts not matched by an allow entry
+  allowHosts: string[]; // exact hostnames
+  allowHostPatterns: string[]; // leading-wildcard globs (*.example.com)
+}
+
+export interface ProfileSecret {
+  ref: string; // org-secret name (the value-store key)
+  envVar: string; // env var the value is exposed as
+  mode: "broker" | "literal"; // broker = placeholder + proxy substitution
+  allowHosts: string[]; // broker-mode substitution hosts
+  allowHostPatterns: string[];
+}
+
+export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
+  default: "deny",
+  allowHosts: [],
+  allowHostPatterns: [],
+};
+
 export const profile = pgTable("profile", {
   id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
   name: text("name").notNull(),
@@ -88,12 +112,38 @@ export const profile = pgTable("profile", {
   // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
   // no third-party integration access.
   capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
+  // ADR 0057: egress network allow-list (deny by default) + secrets this
+  // profile's sessions get, lifted off the image manifest. Additive in B1;
+  // compiled into the per-session SessionPolicy + consumed at boot in B2.
+  network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
+  secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at")
     .notNull()
     .defaultNow()
     .$onUpdate(() => new Date()),
   deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
+});
+
+// ---------------------------------------------------------------------------
+// Connector catalog (ADR 0057 C1)
+// ---------------------------------------------------------------------------
+
+// A custom (admin-authored) connector. The built-ins (`github`/`datadog`) stay
+// as read-only file seeds (`src/connectors/*.json`); this table holds ONLY the
+// connectors an admin adds via the integrations UI (C3/C4). `config` is the raw
+// connector JSON, re-validated by `parseConnector` at load (the admin-trust
+// boundary) — never trusted verbatim. `provider` is the registry key; built-ins
+// take precedence, so a custom row can't shadow one. Hard delete (no history):
+// a removed connector should stop granting capabilities immediately.
+export const connector = pgTable("connector", {
+  provider: text("provider").primaryKey(),
+  config: jsonb("config").notNull(), // the raw Connector JSON (validated at load)
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at")
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
 });
 
 // ---------------------------------------------------------------------------

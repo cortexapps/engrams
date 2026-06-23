@@ -785,7 +785,12 @@ async fn session_create(
     let req = app::CreateSessionRequest {
         selected_skills: Vec::new(),
         capabilities: Vec::new(),
-        integration_policy_json: String::new(),
+        // ADR 0057: network + secrets are session policy now (no manifest
+        // fallback). The admin CLI creates a debug session with allow-all egress
+        // — it's a trusted operator tool, and there's no profile to source a
+        // network from on this direct create. (A `--allow-host` restriction flag
+        // can refine this later.)
+        integration_policy_json: r#"{"network":{"default":"allow"}}"#.to_string(),
         image_uri: image.to_string(),
         mode: if dev_vm { "dev_vm" } else { "agent" }.to_string(),
         prompt: prompt.map(str::to_string),

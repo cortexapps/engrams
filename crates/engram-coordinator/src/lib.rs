@@ -30,6 +30,7 @@ pub mod idle_evictor;
 pub mod integrations;
 pub mod live_migration;
 pub mod metrics;
+pub mod org_secrets;
 pub mod pg_listener;
 pub mod placement;
 pub mod preemption_drain;
@@ -183,6 +184,7 @@ pub async fn run_with_registry_and_local(
         meta_for_listener.clone(),
         state.events.clone(),
         state.host_registry.clone(),
+        state.integrations.clone(),
     );
 
     // Phase 3d follow-up: dead-host auto-detector. Opens its own

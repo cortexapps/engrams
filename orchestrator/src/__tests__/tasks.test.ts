@@ -189,6 +189,8 @@ function makeFakeProfiles(opts?: {
     envVars: opts?.envVars ?? {},
     skills: opts?.skills ?? [],
     capabilities: opts?.capabilities ?? [],
+    network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
+    secrets: [],
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,

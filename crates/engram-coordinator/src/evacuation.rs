@@ -149,10 +149,21 @@ pub async fn resolve_cold_boot_spec(
             return None;
         }
     };
+    // ADR 0057: disk-only recovery rebuilds the session's own egress network
+    // from its persisted policy (the manifest no longer carries network).
+    let network = match meta.get_session_integration_policy(session.id).await {
+        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json)
+            .ok()
+            .flatten()
+            .map(|p| p.network)
+            .unwrap_or_default(),
+        _ => Default::default(),
+    };
     Some(crate::api::sessions::cold_boot_spec(
         &session.image,
         &manifest,
         None,
+        network,
     ))
 }
 

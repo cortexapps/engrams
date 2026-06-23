@@ -101,9 +101,52 @@ export interface IntegrationObserveJson {
   data: [string, string][];
   fetchable: string | null;
 }
+/** ADR 0057: the profile's egress network allow-list (snake_case wire shape). */
+export interface IntegrationNetworkJson {
+  default: "deny" | "allow";
+  allow_hosts: string[];
+  allow_host_patterns: string[];
+}
+/** ADR 0057: one profile-defined secret (snake_case wire shape). Value-free. */
+export interface IntegrationSecretJson {
+  secret_ref: string;
+  env_var: string;
+  mode: "literal" | "broker";
+  allow_hosts: string[];
+  allow_host_patterns: string[];
+}
 export interface IntegrationPolicyJson {
   injects: IntegrationInjectJson[];
   observes: IntegrationObserveJson[];
+  // ADR 0057: the policy is now the full session policy — it also carries the
+  // profile's network + secrets (the coordinator sources the egress policy from
+  // these). Mirrors engram_core::types::IntegrationPolicy.
+  network: IntegrationNetworkJson;
+  secrets: IntegrationSecretJson[];
+}
+
+/** Profile-side inputs compiled into the policy's network + secrets (ADR 0057). */
+export interface SessionPolicyInputs {
+  network?: { default?: string; allowHosts?: string[]; allowHostPatterns?: string[] };
+  secrets?: ReadonlyArray<{
+    ref: string;
+    envVar: string;
+    mode?: string;
+    allowHosts?: string[];
+    allowHostPatterns?: string[];
+  }>;
+}
+
+/** Whether a compiled policy carries anything worth shipping on CreateSession. */
+export function policyHasContent(p: IntegrationPolicyJson): boolean {
+  return (
+    p.injects.length > 0 ||
+    p.observes.length > 0 ||
+    p.secrets.length > 0 ||
+    p.network.allow_hosts.length > 0 ||
+    p.network.allow_host_patterns.length > 0 ||
+    p.network.default === "allow"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -145,12 +188,45 @@ function asStringArray(where: string, field: string, v: unknown): string[] {
   return v as string[];
 }
 
+// --- Admin-trust hardening (ADR 0057 C1) -----------------------------------
+// parseConnector is no longer a dev-error guard for first-party files: an
+// admin-uploaded connector opens egress + injects org secrets, so it is
+// validated like a security boundary (same trust level as env_vars / skills
+// upload). These bounds + shape checks reject the obviously dangerous or
+// malformed before a connector can ever widen a session's reachability.
+const MAX_HOSTS = 50;
+const MAX_OPERATIONS = 200;
+const MAX_GRANTS = 50;
+/** RFC 7230 header field-name token (no spaces, colons, or CR/LF). */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+/** Provider id: a lowercase identifier (matches the built-ins). */
+const PROVIDER_RE = /^[a-z0-9][a-z0-9_-]*$/;
+
+/**
+ * Reject a host that isn't a bare hostname — optionally a single leading-label
+ * wildcard (`*.example.com`). No scheme/port/path/whitespace, no bare-TLD or
+ * naked `*` wildcard (which would open egress far wider than intended).
+ */
+function assertHost(where: string, h: string): void {
+  if (h.length === 0 || /\s/.test(h)) fail(where, `host "${h}" must be a non-empty hostname with no whitespace`);
+  if (/[/:?#@]/.test(h)) fail(where, `host "${h}" must be a bare hostname (no scheme, port, or path)`);
+  const wild = h.startsWith("*.");
+  const bare = wild ? h.slice(2) : h;
+  if (bare.includes("*")) fail(where, `host "${h}" may only wildcard a leading label ("*.example.com")`);
+  const labels = bare.split(".");
+  if (labels.length < 2) fail(where, `host "${h}" is too broad — need at least "domain.tld"`);
+  for (const l of labels) {
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(l)) fail(where, `host "${h}" has an invalid label "${l}"`);
+  }
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
 export function parseConnector(raw: unknown, where: string): Connector {
   if (typeof raw !== "object" || raw === null) fail(where, "must be a JSON object");
   const o = raw as Record<string, unknown>;
 
   if (typeof o.provider !== "string" || !o.provider) fail(where, '"provider" must be a non-empty string');
+  if (!PROVIDER_RE.test(o.provider)) fail(where, `"provider" "${o.provider}" must be a lowercase identifier ([a-z0-9][a-z0-9_-]*)`);
   if (o.protocol !== "http") fail(where, `"protocol" must be "http" (got ${JSON.stringify(o.protocol)}); grpc/graphql are not yet implemented`);
 
   const cred = o.credential as Record<string, unknown> | undefined;
@@ -160,26 +236,37 @@ export function parseConnector(raw: unknown, where: string): Connector {
     const inj = cred.inject as Record<string, unknown> | undefined;
     if (typeof inj !== "object" || inj === null) fail(where, '"credential.inject" must be an object');
     if (typeof inj.header !== "string" || !inj.header) fail(where, '"credential.inject.header" must be a non-empty string');
+    if (!HEADER_NAME_RE.test(inj.header)) fail(where, `"credential.inject.header" "${inj.header}" is not a valid HTTP header name`);
     if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(where, '"credential.inject.secretRef" must be a non-empty string');
-    if (inj.template !== undefined && typeof inj.template !== "string") fail(where, '"credential.inject.template" must be a string');
+    if (/\s/.test(inj.secretRef)) fail(where, '"credential.inject.secretRef" must not contain whitespace');
+    if (inj.template !== undefined) {
+      if (typeof inj.template !== "string") fail(where, '"credential.inject.template" must be a string');
+      if (/[\r\n]/.test(inj.template)) fail(where, '"credential.inject.template" must not contain newlines');
+      if (!inj.template.includes("{}")) fail(where, '"credential.inject.template" must contain the "{}" value placeholder');
+    }
     credential = { source: "inject", inject: { header: inj.header, secretRef: inj.secretRef, ...(typeof inj.template === "string" ? { template: inj.template } : {}) } };
   } else if (cred.source === "mint") {
     const mint = cred.mint as Record<string, unknown> | undefined;
     if (typeof mint !== "object" || mint === null) fail(where, '"credential.mint" must be an object');
     if (typeof mint.kind !== "string" || !mint.kind) fail(where, '"credential.mint.kind" must be a non-empty string');
+    if (/\s/.test(mint.kind)) fail(where, '"credential.mint.kind" must not contain whitespace');
     credential = { source: "mint", mint: { kind: mint.kind } };
   } else {
     fail(where, `"credential.source" must be "inject" or "mint" (got ${JSON.stringify(cred.source)})`);
   }
 
   const hosts = asStringArray(where, "hosts", o.hosts);
+  if (hosts.length > MAX_HOSTS) fail(where, `"hosts" has ${hosts.length} entries (max ${MAX_HOSTS})`);
+  for (const h of hosts) assertHost(where, h);
 
   if (!Array.isArray(o.operations)) fail(where, '"operations" must be an array');
+  if (o.operations.length > MAX_OPERATIONS) fail(where, `"operations" has ${o.operations.length} entries (max ${MAX_OPERATIONS})`);
   const operations: Operation[] = o.operations.map((rawOp, i): Operation => {
     const opWhere = `${where} operations[${i}]`;
     if (typeof rawOp !== "object" || rawOp === null) fail(opWhere, "must be an object");
     const op = rawOp as Record<string, unknown>;
     const grants = asStringArray(opWhere, "grants", op.grants);
+    if (grants.length > MAX_GRANTS) fail(opWhere, `"grants" has ${grants.length} entries (max ${MAX_GRANTS})`);
     let match: HttpMatch | undefined;
     if (op.match !== undefined) {
       if (typeof op.match !== "object" || op.match === null) fail(opWhere, '"match" must be an object');
@@ -239,10 +326,76 @@ function loadFromDisk(): Map<string, Connector> {
   return buildRegistry(connectors);
 }
 
-/** The loaded connector registry (parsed + validated once, then cached). */
+/** The built-in connector seeds (parsed + validated once, then cached). The
+ * sync, file-only registry — the default for the pure fns + the test fixtures.
+ * Production callers use {@link loadRegistry} so they also see admin-authored
+ * connectors. */
 export function connectorRegistry(): Map<string, Connector> {
   if (cachedRegistry === null) cachedRegistry = loadFromDisk();
   return cachedRegistry;
+}
+
+// ---------------------------------------------------------------------------
+// Full registry = built-in seeds ∪ admin-authored (DB) connectors (ADR 0057 C1)
+// ---------------------------------------------------------------------------
+
+/** Source of custom (DB-backed) connectors. `ConnectorStore` satisfies this;
+ * tests pass a fake. Kept structural so this module stays DB-agnostic. */
+export interface CustomConnectorSource {
+  list(): Promise<ReadonlyArray<{ provider: string; config: unknown }>>;
+}
+
+let mergedRegistry: Map<string, Connector> | null = null;
+
+/**
+ * The full connector registry: built-in file seeds ∪ admin-authored DB
+ * connectors, validated + cached until {@link invalidateRegistry}.
+ *
+ * Built-ins take precedence — a custom row whose provider collides with a seed
+ * is ignored (the write path rejects collisions up front; this is the defensive
+ * belt). A custom row that fails `parseConnector`, or whose `config.provider`
+ * mismatches its row key, is skipped + logged — never fatal, so one bad row
+ * can't break session-create fleet-wide. A DB-fetch failure degrades to
+ * seeds-only rather than failing the request.
+ */
+export async function loadRegistry(source: CustomConnectorSource): Promise<Map<string, Connector>> {
+  if (mergedRegistry !== null) return mergedRegistry;
+  // Copy the seed map so we never mutate the cached built-in registry.
+  const map = new Map(connectorRegistry());
+  let custom: ReadonlyArray<{ provider: string; config: unknown }>;
+  try {
+    custom = await source.list();
+  } catch (e) {
+    console.error(`loadRegistry: custom-connector fetch failed, using built-in seeds only — ${(e as Error).message}`);
+    mergedRegistry = map;
+    return map;
+  }
+  for (const row of custom) {
+    if (map.has(row.provider)) {
+      console.error(`loadRegistry: custom connector "${row.provider}" shadows a built-in seed; ignored`);
+      continue;
+    }
+    let parsed: Connector;
+    try {
+      parsed = parseConnector(row.config, `db:${row.provider}`);
+    } catch (e) {
+      console.error(`loadRegistry: skipping invalid custom connector "${row.provider}" — ${(e as Error).message}`);
+      continue;
+    }
+    if (parsed.provider !== row.provider) {
+      console.error(`loadRegistry: custom connector row "${row.provider}" has config.provider "${parsed.provider}"; ignored`);
+      continue;
+    }
+    map.set(parsed.provider, parsed);
+  }
+  mergedRegistry = map;
+  return mergedRegistry;
+}
+
+/** Drop the cached merged registry. Call after any connector write (C3) so the
+ * next {@link loadRegistry} re-reads the DB. The seed cache is untouched. */
+export function invalidateRegistry(): void {
+  mergedRegistry = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +437,7 @@ function pathPrefix(p: string): string {
 export function compileIntegrationPolicy(
   capabilities: string[],
   registry: Map<string, Connector> = connectorRegistry(),
+  inputs?: SessionPolicyInputs,
 ): IntegrationPolicyJson {
   const injects: IntegrationInjectJson[] = [];
   const observes: IntegrationObserveJson[] = [];
@@ -339,5 +493,20 @@ export function compileIntegrationPolicy(
       }
     }
   }
-  return { injects, observes };
+  // ADR 0057: carry the profile's network + secrets in the same policy. The
+  // coordinator sources the egress policy's network + secret injection from
+  // here (the secret VALUES are resolved host-side from `secret_ref`).
+  const network: IntegrationNetworkJson = {
+    default: inputs?.network?.default === "allow" ? "allow" : "deny",
+    allow_hosts: inputs?.network?.allowHosts ?? [],
+    allow_host_patterns: inputs?.network?.allowHostPatterns ?? [],
+  };
+  const secrets: IntegrationSecretJson[] = (inputs?.secrets ?? []).map((s) => ({
+    secret_ref: s.ref,
+    env_var: s.envVar,
+    mode: s.mode === "literal" ? "literal" : "broker",
+    allow_hosts: s.allowHosts ?? [],
+    allow_host_patterns: s.allowHostPatterns ?? [],
+  }));
+  return { injects, observes, network, secrets };
 }

@@ -66,8 +66,8 @@ async fn authorize(
 ) -> Result<Arc<dyn Integration>, Denied> {
     let integration = state
         .integrations
-        .get("github")
-        .cloned()
+        .resolve("github", &state.services.secrets)
+        .await
         .ok_or(Denied::NoForge)?;
     if crate::api::session_auth::authorize_broker_token(state, session, token).await {
         Ok(integration)
@@ -116,8 +116,9 @@ async fn op_create_pull_request(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     // ADR 0056 §4: PR creation is the mediated (server-performed) action. The
-    // capability isn't yet cap-gated here (the broker token + GitConfig gate
-    // it); synthesize the `pulls:write` action the GitHub integration matches.
+    // capability isn't yet cap-gated here (the broker token gates it; ADR 0057
+    // D2 retired the `[git]` block); synthesize the `pulls:write` action the
+    // GitHub integration matches.
     let cap = Capability {
         provider: "github".to_string(),
         action: "pulls:write".to_string(),

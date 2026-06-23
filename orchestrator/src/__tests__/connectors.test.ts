@@ -6,7 +6,7 @@
  * a smoke check that the real on-disk connectors (datadog, github) load.
  */
 
-import { expect, test, describe } from "bun:test";
+import { expect, test, describe, beforeEach } from "bun:test";
 
 import {
   parseConnector,
@@ -14,7 +14,10 @@ import {
   parseCapability,
   grantsCapability,
   compileIntegrationPolicy,
+  policyHasContent,
   connectorRegistry,
+  loadRegistry,
+  invalidateRegistry,
   type Connector,
 } from "../connectors/registry.ts";
 
@@ -176,6 +179,50 @@ describe("compileIntegrationPolicy", () => {
     expect(compileIntegrationPolicy(["datadog:logs:read"], reg).observes).toEqual([]);
     expect(compileIntegrationPolicy(["github:issues:write"], reg).observes).toEqual([]);
   });
+
+  test("ADR 0057: network + secrets compile from the profile inputs", () => {
+    const policy = compileIntegrationPolicy([], reg, {
+      network: { default: "deny", allowHosts: ["sentry.io"], allowHostPatterns: ["*.pypi.org"] },
+      secrets: [
+        { ref: "datadog-api-key", envVar: "DD_API_KEY", mode: "broker", allowHosts: ["api.datadoghq.com"] },
+        { ref: "db-url", envVar: "DATABASE_URL", mode: "literal" },
+      ],
+    });
+    expect(policy.network).toEqual({
+      default: "deny",
+      allow_hosts: ["sentry.io"],
+      allow_host_patterns: ["*.pypi.org"],
+    });
+    expect(policy.secrets).toEqual([
+      {
+        secret_ref: "datadog-api-key",
+        env_var: "DD_API_KEY",
+        mode: "broker",
+        allow_hosts: ["api.datadoghq.com"],
+        allow_host_patterns: [],
+      },
+      {
+        secret_ref: "db-url",
+        env_var: "DATABASE_URL",
+        mode: "literal",
+        allow_hosts: [],
+        allow_host_patterns: [],
+      },
+    ]);
+  });
+
+  test("ADR 0057: a default deny + empty profile yields a contentless policy", () => {
+    const empty = compileIntegrationPolicy([], reg);
+    expect(empty.network).toEqual({ default: "deny", allow_hosts: [], allow_host_patterns: [] });
+    expect(empty.secrets).toEqual([]);
+    expect(policyHasContent(empty)).toBe(false);
+    // ...but a profile with a network host (or a secret, or a cap) has content.
+    expect(
+      policyHasContent(
+        compileIntegrationPolicy([], reg, { network: { allowHosts: ["sentry.io"] } }),
+      ),
+    ).toBe(true);
+  });
 });
 
 // A mint connector whose op carries an asset spec (the GitHub-issue shape).
@@ -259,5 +306,133 @@ describe("on-disk registry", () => {
     expect(policy.observes[0]!.provider).toBe("github");
     expect(policy.observes[0]!.asset_kind).toBe("issue");
     expect(policy.observes[0]!.fetchable).toBe("$.resp.html_url");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0057 C1: admin-trust hardening of parseConnector
+// ---------------------------------------------------------------------------
+
+describe("parseConnector — admin-trust hardening", () => {
+  const sentryRaw = {
+    provider: "sentry",
+    protocol: "http",
+    credential: { source: "inject", inject: { header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" } },
+    hosts: ["sentry.io"],
+    operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
+  };
+
+  test("accepts a well-formed custom connector (and a leading-label wildcard host)", () => {
+    const c = parseConnector({ ...sentryRaw, hosts: ["sentry.io", "*.sentry.io"] }, "sentry");
+    expect(c.hosts).toEqual(["sentry.io", "*.sentry.io"]);
+  });
+
+  test("rejects a naked wildcard host", () => {
+    expect(() => parseConnector({ ...sentryRaw, hosts: ["*"] }, "x")).toThrow(/host/);
+  });
+
+  test("rejects a bare-TLD wildcard host (*.com)", () => {
+    expect(() => parseConnector({ ...sentryRaw, hosts: ["*.com"] }, "x")).toThrow(/too broad/);
+  });
+
+  test("rejects a host carrying a scheme or path", () => {
+    expect(() => parseConnector({ ...sentryRaw, hosts: ["https://sentry.io"] }, "x")).toThrow(/bare hostname/);
+    expect(() => parseConnector({ ...sentryRaw, hosts: ["sentry.io/api"] }, "x")).toThrow(/bare hostname/);
+  });
+
+  test("rejects an invalid HTTP header name", () => {
+    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Bad Header", secretRef: "r", template: "{}" } } };
+    expect(() => parseConnector(bad, "x")).toThrow(/header name/);
+  });
+
+  test("rejects an inject template missing the {} placeholder", () => {
+    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "r", template: "Bearer" } } };
+    expect(() => parseConnector(bad, "x")).toThrow(/placeholder/);
+  });
+
+  test("rejects an inject template with a newline (header injection)", () => {
+    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "r", template: "Bearer {}\r\nX: y" } } };
+    expect(() => parseConnector(bad, "x")).toThrow(/newline/);
+  });
+
+  test("rejects a secretRef with whitespace", () => {
+    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "a b", template: "{}" } } };
+    expect(() => parseConnector(bad, "x")).toThrow(/secretRef/);
+  });
+
+  test("rejects a non-identifier provider", () => {
+    expect(() => parseConnector({ ...sentryRaw, provider: "Sentry IO" }, "x")).toThrow(/provider/);
+  });
+
+  test("rejects too many hosts", () => {
+    const many = Array.from({ length: 51 }, (_, i) => `h${i}.sentry.io`);
+    expect(() => parseConnector({ ...sentryRaw, hosts: many }, "x")).toThrow(/max/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0057 C1: loadRegistry = built-in seeds ∪ admin-authored (DB) connectors
+// ---------------------------------------------------------------------------
+
+describe("loadRegistry", () => {
+  const sentryRaw = {
+    provider: "sentry",
+    protocol: "http",
+    credential: { source: "inject", inject: { header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" } },
+    hosts: ["sentry.io"],
+    operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
+  };
+  const source = (rows: Array<{ provider: string; config: unknown }>) => ({ list: async () => rows });
+
+  beforeEach(() => invalidateRegistry());
+
+  test("merges custom connectors with the built-in seeds", async () => {
+    const reg = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
+    expect(reg.has("datadog")).toBe(true); // built-in seed
+    expect(reg.has("github")).toBe(true); // built-in seed
+    expect(reg.has("sentry")).toBe(true); // custom
+    expect(grantsCapability("sentry", "issues:read", reg)).toBe(true);
+  });
+
+  test("built-in seeds take precedence — a custom row can't shadow one", async () => {
+    const evilGithub = { ...sentryRaw, provider: "github", hosts: ["evil.example.com"] };
+    const reg = await loadRegistry(source([{ provider: "github", config: evilGithub }]));
+    // The built-in github (mint) wins; the custom inject row is ignored.
+    expect(reg.get("github")!.credential.source).toBe("mint");
+  });
+
+  test("skips an invalid custom row without failing the whole load", async () => {
+    const reg = await loadRegistry(
+      source([
+        { provider: "bad", config: { provider: "bad", protocol: "ftp" } },
+        { provider: "sentry", config: sentryRaw },
+      ]),
+    );
+    expect(reg.has("bad")).toBe(false);
+    expect(reg.has("sentry")).toBe(true);
+  });
+
+  test("skips a row whose config.provider mismatches the row key", async () => {
+    const reg = await loadRegistry(source([{ provider: "sentry", config: { ...sentryRaw, provider: "other" } }]));
+    expect(reg.has("sentry")).toBe(false);
+    expect(reg.has("other")).toBe(false);
+  });
+
+  test("degrades to built-in seeds only when the DB fetch fails", async () => {
+    const reg = await loadRegistry({
+      list: async () => {
+        throw new Error("db down");
+      },
+    });
+    expect(reg.has("datadog")).toBe(true);
+    expect(reg.has("github")).toBe(true);
+  });
+
+  test("invalidateRegistry forces a re-read", async () => {
+    const first = await loadRegistry(source([]));
+    expect(first.has("sentry")).toBe(false);
+    invalidateRegistry();
+    const second = await loadRegistry(source([{ provider: "sentry", config: sentryRaw }]));
+    expect(second.has("sentry")).toBe(true);
   });
 });

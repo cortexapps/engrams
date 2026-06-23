@@ -669,6 +669,118 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    // ---- ADR 0057: org secret store (KEK-sealed, admin-managed) ----
+
+    async fn upsert_org_secret(
+        &self,
+        sealed: engram_core::types::org_secret::SealedOrgSecret,
+    ) -> Result<engram_core::types::org_secret::OrgSecret, MetaError> {
+        let (name, key_id, created_at, updated_at): (
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            r#"
+            INSERT INTO org_secrets (name, wrapped_dek, nonce, ciphertext, key_id, updated_at)
+            VALUES ($1, $2, $3, $4, $5, now())
+            ON CONFLICT (name) DO UPDATE SET
+                wrapped_dek = EXCLUDED.wrapped_dek,
+                nonce       = EXCLUDED.nonce,
+                ciphertext  = EXCLUDED.ciphertext,
+                key_id      = EXCLUDED.key_id,
+                updated_at  = now()
+            RETURNING name, key_id, created_at, updated_at
+            "#,
+        )
+        .bind(&sealed.name)
+        .bind(&sealed.wrapped_dek)
+        .bind(&sealed.nonce)
+        .bind(&sealed.ciphertext)
+        .bind(&sealed.key_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        // Wake every replica's mint broker so a rotated cred rebuilds its
+        // engine (ADR 0057 C2). Best-effort: the value is already committed,
+        // so a notify failure must not fail the write.
+        let _ = sqlx::query("SELECT pg_notify('org_secret_changed', $1)")
+            .bind(&sealed.name)
+            .execute(&self.pool)
+            .await;
+        Ok(engram_core::types::org_secret::OrgSecret {
+            name,
+            key_id,
+            created_at,
+            updated_at,
+        })
+    }
+
+    async fn get_org_secret_sealed(
+        &self,
+        name: &str,
+    ) -> Result<Option<engram_core::types::org_secret::SealedOrgSecret>, MetaError> {
+        let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT wrapped_dek, nonce, ciphertext, key_id FROM org_secrets WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|(wrapped_dek, nonce, ciphertext, key_id)| {
+            engram_core::types::org_secret::SealedOrgSecret {
+                name: name.to_string(),
+                wrapped_dek,
+                nonce,
+                ciphertext,
+                key_id,
+            }
+        }))
+    }
+
+    async fn list_org_secrets(
+        &self,
+    ) -> Result<Vec<engram_core::types::org_secret::OrgSecret>, MetaError> {
+        let rows: Vec<(
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            "SELECT name, key_id, created_at, updated_at FROM org_secrets ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, key_id, created_at, updated_at)| {
+                engram_core::types::org_secret::OrgSecret {
+                    name,
+                    key_id,
+                    created_at,
+                    updated_at,
+                }
+            })
+            .collect())
+    }
+
+    async fn delete_org_secret(&self, name: &str) -> Result<bool, MetaError> {
+        let res = sqlx::query("DELETE FROM org_secrets WHERE name = $1")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        let deleted = res.rows_affected() > 0;
+        if deleted {
+            let _ = sqlx::query("SELECT pg_notify('org_secret_changed', $1)")
+                .bind(name)
+                .execute(&self.pool)
+                .await;
+        }
+        Ok(deleted)
+    }
+
     async fn apply_missing_sandbox_strikes(
         &self,
         present: &[SessionId],

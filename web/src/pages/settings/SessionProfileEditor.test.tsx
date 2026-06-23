@@ -27,6 +27,16 @@ vi.mock("../../hooks/useSkills", () => ({
   }),
   useUploadSkill: () => ({ mutateAsync: uploadSkill, isPending: false }),
 }));
+// ADR 0057: the editor's secret-ref picker reads org-secret names; mock it so
+// the test doesn't need a QueryClient (it's a connect-query hook).
+vi.mock("../../hooks/useOrgSecrets", () => ({
+  useOrgSecretNames: () => ({ data: [] }),
+}));
+// ADR 0057 D1: the capability picker reads the connector catalog (a connect-query
+// hook); mock it so the editor test doesn't need a QueryClient/transport.
+vi.mock("../../hooks/useIntegrations", () => ({
+  useConnectors: () => ({ data: { connectors: [] }, isLoading: false }),
+}));
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => vi.fn(),
@@ -47,6 +57,37 @@ describe("SessionProfileEditor (create)", () => {
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
     expect(create.mock.calls[0][0]).toMatchObject({ name: "Backend Agent", imageId: "i1" });
+  });
+
+  it("includes network + secrets in the createProfile payload (ADR 0057)", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/^name$/i), { target: { value: "Net Agent" } });
+    fireEvent.change(screen.getByLabelText(/allowed hosts/i), {
+      target: { value: "sentry.io\napi.github.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /add secret/i }));
+    fireEvent.change(screen.getByLabelText(/org secret ref/i), {
+      target: { value: "sentry-token" },
+    });
+    fireEvent.change(screen.getByLabelText(/env var name/i), {
+      target: { value: "SENTRY_TOKEN" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const payload = create.mock.calls[0][0];
+    expect(payload.network).toMatchObject({
+      default: "deny",
+      allowHosts: ["sentry.io", "api.github.com"],
+    });
+    expect(payload.secrets).toEqual([
+      {
+        ref: "sentry-token",
+        envVar: "SENTRY_TOKEN",
+        mode: "broker",
+        allowHosts: [],
+        allowHostPatterns: [],
+      },
+    ]);
   });
 
   it("toggling a built-in skill includes it in the createProfile payload (ADR 0055)", async () => {

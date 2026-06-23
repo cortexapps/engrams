@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/profile.proto.
  */
 export const file_engram_app_v1_profile: GenFile = /*@__PURE__*/
-  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Byb2ZpbGUucHJvdG8SDWVuZ3JhbS5hcHAudjEivAIKB1Byb2ZpbGUSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRpY29uGAQgASgJEhAKCGltYWdlX2lkGAUgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBiABKAgSNQoIZW52X3ZhcnMYByADKAsyIy5lbmdyYW0uYXBwLnYxLlByb2ZpbGUuRW52VmFyc0VudHJ5EhAKCGFyY2hpdmVkGAggASgIEhIKCmNyZWF0ZWRfYXQYCSABKAkSEgoKdXBkYXRlZF9hdBgKIAEoCRIOCgZza2lsbHMYCyADKAkSFAoMY2FwYWJpbGl0aWVzGAwgAygJGi4KDEVudlZhcnNFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIl4KD1Byb2ZpbGVTbmFwc2hvdBIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEgwKBGljb24YAyABKAkSEAoIYXJjaGl2ZWQYBCABKAgSEQoJaW1hZ2VfdXJpGAUgASgJIi8KE0xpc3RQcm9maWxlc1JlcXVlc3QSGAoQaW5jbHVkZV9hcmNoaXZlZBgBIAEoCCJAChRMaXN0UHJvZmlsZXNSZXNwb25zZRIoCghwcm9maWxlcxgBIAMoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSIfChFHZXRQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCSI9ChJHZXRQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSKQAgoUQ3JlYXRlUHJvZmlsZVJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIMCgRpY29uGAMgASgJEhAKCGltYWdlX2lkGAQgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBSABKAgSQgoIZW52X3ZhcnMYBiADKAsyMC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXF1ZXN0LkVudlZhcnNFbnRyeRIOCgZza2lsbHMYByADKAkSFAoMY2FwYWJpbGl0aWVzGAggAygJGi4KDEVudlZhcnNFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIkAKFUNyZWF0ZVByb2ZpbGVSZXNwb25zZRInCgdwcm9maWxlGAEgASgLMhYuZW5ncmFtLmFwcC52MS5Qcm9maWxlIpwCChRVcGRhdGVQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEgwKBGljb24YBCABKAkSEAoIaW1hZ2VfaWQYBSABKAkSGwoTaW5jbHVkZV91c2VyX3Rva2VucxgGIAEoCBJCCghlbnZfdmFycxgHIAMoCzIwLmVuZ3JhbS5hcHAudjEuVXBkYXRlUHJvZmlsZVJlcXVlc3QuRW52VmFyc0VudHJ5Eg4KBnNraWxscxgIIAMoCRIUCgxjYXBhYmlsaXRpZXMYCSADKAkaLgoMRW52VmFyc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiQAoVVXBkYXRlUHJvZmlsZVJlc3BvbnNlEicKB3Byb2ZpbGUYASABKAsyFi5lbmdyYW0uYXBwLnYxLlByb2ZpbGUiIgoURGVsZXRlUHJvZmlsZVJlcXVlc3QSCgoCaWQYASABKAkiFwoVRGVsZXRlUHJvZmlsZVJlc3BvbnNlMtADCg5Qcm9maWxlU2VydmljZRJXCgxMaXN0UHJvZmlsZXMSIi5lbmdyYW0uYXBwLnYxLkxpc3RQcm9maWxlc1JlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkxpc3RQcm9maWxlc1Jlc3BvbnNlElEKCkdldFByb2ZpbGUSIC5lbmdyYW0uYXBwLnYxLkdldFByb2ZpbGVSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5HZXRQcm9maWxlUmVzcG9uc2USWgoNQ3JlYXRlUHJvZmlsZRIjLmVuZ3JhbS5hcHAudjEuQ3JlYXRlUHJvZmlsZVJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXNwb25zZRJaCg1VcGRhdGVQcm9maWxlEiMuZW5ncmFtLmFwcC52MS5VcGRhdGVQcm9maWxlUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuVXBkYXRlUHJvZmlsZVJlc3BvbnNlEloKDURlbGV0ZVByb2ZpbGUSIy5lbmdyYW0uYXBwLnYxLkRlbGV0ZVByb2ZpbGVSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5EZWxldGVQcm9maWxlUmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Byb2ZpbGUucHJvdG8SDWVuZ3JhbS5hcHAudjEimwMKB1Byb2ZpbGUSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRpY29uGAQgASgJEhAKCGltYWdlX2lkGAUgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBiABKAgSNQoIZW52X3ZhcnMYByADKAsyIy5lbmdyYW0uYXBwLnYxLlByb2ZpbGUuRW52VmFyc0VudHJ5EhAKCGFyY2hpdmVkGAggASgIEhIKCmNyZWF0ZWRfYXQYCSABKAkSEgoKdXBkYXRlZF9hdBgKIAEoCRIOCgZza2lsbHMYCyADKAkSFAoMY2FwYWJpbGl0aWVzGAwgAygJEi4KB25ldHdvcmsYDSABKAsyHS5lbmdyYW0uYXBwLnYxLlByb2ZpbGVOZXR3b3JrEi0KB3NlY3JldHMYDiADKAsyHC5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTZWNyZXQaLgoMRW52VmFyc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiUwoOUHJvZmlsZU5ldHdvcmsSDwoHZGVmYXVsdBgBIAEoCRITCgthbGxvd19ob3N0cxgCIAMoCRIbChNhbGxvd19ob3N0X3BhdHRlcm5zGAMgAygJIm0KDVByb2ZpbGVTZWNyZXQSCwoDcmVmGAEgASgJEg8KB2Vudl92YXIYAiABKAkSDAoEbW9kZRgDIAEoCRITCgthbGxvd19ob3N0cxgEIAMoCRIbChNhbGxvd19ob3N0X3BhdHRlcm5zGAUgAygJIl4KD1Byb2ZpbGVTbmFwc2hvdBIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEgwKBGljb24YAyABKAkSEAoIYXJjaGl2ZWQYBCABKAgSEQoJaW1hZ2VfdXJpGAUgASgJIi8KE0xpc3RQcm9maWxlc1JlcXVlc3QSGAoQaW5jbHVkZV9hcmNoaXZlZBgBIAEoCCJAChRMaXN0UHJvZmlsZXNSZXNwb25zZRIoCghwcm9maWxlcxgBIAMoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSIfChFHZXRQcm9maWxlUmVxdWVzdBIKCgJpZBgBIAEoCSI9ChJHZXRQcm9maWxlUmVzcG9uc2USJwoHcHJvZmlsZRgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuUHJvZmlsZSLvAgoUQ3JlYXRlUHJvZmlsZVJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIMCgRpY29uGAMgASgJEhAKCGltYWdlX2lkGAQgASgJEhsKE2luY2x1ZGVfdXNlcl90b2tlbnMYBSABKAgSQgoIZW52X3ZhcnMYBiADKAsyMC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXF1ZXN0LkVudlZhcnNFbnRyeRIOCgZza2lsbHMYByADKAkSFAoMY2FwYWJpbGl0aWVzGAggAygJEi4KB25ldHdvcmsYCSABKAsyHS5lbmdyYW0uYXBwLnYxLlByb2ZpbGVOZXR3b3JrEi0KB3NlY3JldHMYCiADKAsyHC5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTZWNyZXQaLgoMRW52VmFyc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiQAoVQ3JlYXRlUHJvZmlsZVJlc3BvbnNlEicKB3Byb2ZpbGUYASABKAsyFi5lbmdyYW0uYXBwLnYxLlByb2ZpbGUi+wIKFFVwZGF0ZVByb2ZpbGVSZXF1ZXN0EgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSDAoEaWNvbhgEIAEoCRIQCghpbWFnZV9pZBgFIAEoCRIbChNpbmNsdWRlX3VzZXJfdG9rZW5zGAYgASgIEkIKCGVudl92YXJzGAcgAygLMjAuZW5ncmFtLmFwcC52MS5VcGRhdGVQcm9maWxlUmVxdWVzdC5FbnZWYXJzRW50cnkSDgoGc2tpbGxzGAggAygJEhQKDGNhcGFiaWxpdGllcxgJIAMoCRIuCgduZXR3b3JrGAogASgLMh0uZW5ncmFtLmFwcC52MS5Qcm9maWxlTmV0d29yaxItCgdzZWNyZXRzGAsgAygLMhwuZW5ncmFtLmFwcC52MS5Qcm9maWxlU2VjcmV0Gi4KDEVudlZhcnNFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBIkAKFVVwZGF0ZVByb2ZpbGVSZXNwb25zZRInCgdwcm9maWxlGAEgASgLMhYuZW5ncmFtLmFwcC52MS5Qcm9maWxlIiIKFERlbGV0ZVByb2ZpbGVSZXF1ZXN0EgoKAmlkGAEgASgJIhcKFURlbGV0ZVByb2ZpbGVSZXNwb25zZTLQAwoOUHJvZmlsZVNlcnZpY2USVwoMTGlzdFByb2ZpbGVzEiIuZW5ncmFtLmFwcC52MS5MaXN0UHJvZmlsZXNSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5MaXN0UHJvZmlsZXNSZXNwb25zZRJRCgpHZXRQcm9maWxlEiAuZW5ncmFtLmFwcC52MS5HZXRQcm9maWxlUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuR2V0UHJvZmlsZVJlc3BvbnNlEloKDUNyZWF0ZVByb2ZpbGUSIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVByb2ZpbGVSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5DcmVhdGVQcm9maWxlUmVzcG9uc2USWgoNVXBkYXRlUHJvZmlsZRIjLmVuZ3JhbS5hcHAudjEuVXBkYXRlUHJvZmlsZVJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLlVwZGF0ZVByb2ZpbGVSZXNwb25zZRJaCg1EZWxldGVQcm9maWxlEiMuZW5ncmFtLmFwcC52MS5EZWxldGVQcm9maWxlUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuRGVsZXRlUHJvZmlsZVJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * An admin-curated bundle of session-launch inputs (ADR §1).
@@ -102,6 +102,24 @@ export type Profile = Message<"engram.app.v1.Profile"> & {
    * @generated from field: repeated string capabilities = 12;
    */
   capabilities: string[];
+
+  /**
+   * ADR 0057: egress network allow-list this profile's sessions may reach
+   * (deny by default). Lifted from the image manifest onto the profile; compiled
+   * into the per-session egress policy (not consumed at boot until B2).
+   *
+   * @generated from field: engram.app.v1.ProfileNetwork network = 13;
+   */
+  network?: ProfileNetwork;
+
+  /**
+   * ADR 0057: secrets injected into this profile's sessions, resolved from the
+   * org secret store by `ref` (the value lives there, never here). Lifted from
+   * the image manifest onto the profile; B2 consumes it at boot.
+   *
+   * @generated from field: repeated engram.app.v1.ProfileSecret secrets = 14;
+   */
+  secrets: ProfileSecret[];
 };
 
 /**
@@ -110,6 +128,93 @@ export type Profile = Message<"engram.app.v1.Profile"> & {
  */
 export const ProfileSchema: GenMessage<Profile> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_profile, 0);
+
+/**
+ * ADR 0057: a profile's egress network allow-list. `default` is the posture for
+ * hosts not matched by an allow entry ("deny" — the only sane default — or
+ * "allow" for a fully-open profile). Mirrors the manifest NetworkPolicy it lifts.
+ *
+ * @generated from message engram.app.v1.ProfileNetwork
+ */
+export type ProfileNetwork = Message<"engram.app.v1.ProfileNetwork"> & {
+  /**
+   * "deny" (default) | "allow"
+   *
+   * @generated from field: string default = 1;
+   */
+  default: string;
+
+  /**
+   * exact hostnames
+   *
+   * @generated from field: repeated string allow_hosts = 2;
+   */
+  allowHosts: string[];
+
+  /**
+   * leading-wildcard globs (*.example.com)
+   *
+   * @generated from field: repeated string allow_host_patterns = 3;
+   */
+  allowHostPatterns: string[];
+};
+
+/**
+ * Describes the message engram.app.v1.ProfileNetwork.
+ * Use `create(ProfileNetworkSchema)` to create a new message.
+ */
+export const ProfileNetworkSchema: GenMessage<ProfileNetwork> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_profile, 1);
+
+/**
+ * ADR 0057: one secret a profile injects. The value is NOT here — `ref` names an
+ * org secret resolved at session create. `mode` picks the injection style:
+ * "broker" (env placeholder + proxy substitution on allow_hosts; the guest never
+ * holds the value) or "literal" (raw value in the guest env).
+ *
+ * @generated from message engram.app.v1.ProfileSecret
+ */
+export type ProfileSecret = Message<"engram.app.v1.ProfileSecret"> & {
+  /**
+   * org-secret name (the value-store key)
+   *
+   * @generated from field: string ref = 1;
+   */
+  ref: string;
+
+  /**
+   * env var the value is exposed as
+   *
+   * @generated from field: string env_var = 2;
+   */
+  envVar: string;
+
+  /**
+   * "broker" (default) | "literal"
+   *
+   * @generated from field: string mode = 3;
+   */
+  mode: string;
+
+  /**
+   * broker-mode substitution hosts
+   *
+   * @generated from field: repeated string allow_hosts = 4;
+   */
+  allowHosts: string[];
+
+  /**
+   * @generated from field: repeated string allow_host_patterns = 5;
+   */
+  allowHostPatterns: string[];
+};
+
+/**
+ * Describes the message engram.app.v1.ProfileSecret.
+ * Use `create(ProfileSecretSchema)` to create a new message.
+ */
+export const ProfileSecretSchema: GenMessage<ProfileSecret> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_profile, 2);
 
 /**
  * Lightweight resolved identity embedded on TaskSessionRef for the chip
@@ -149,7 +254,7 @@ export type ProfileSnapshot = Message<"engram.app.v1.ProfileSnapshot"> & {
  * Use `create(ProfileSnapshotSchema)` to create a new message.
  */
 export const ProfileSnapshotSchema: GenMessage<ProfileSnapshot> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 1);
+  messageDesc(file_engram_app_v1_profile, 3);
 
 /**
  * @generated from message engram.app.v1.ListProfilesRequest
@@ -168,7 +273,7 @@ export type ListProfilesRequest = Message<"engram.app.v1.ListProfilesRequest"> &
  * Use `create(ListProfilesRequestSchema)` to create a new message.
  */
 export const ListProfilesRequestSchema: GenMessage<ListProfilesRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 2);
+  messageDesc(file_engram_app_v1_profile, 4);
 
 /**
  * @generated from message engram.app.v1.ListProfilesResponse
@@ -185,7 +290,7 @@ export type ListProfilesResponse = Message<"engram.app.v1.ListProfilesResponse">
  * Use `create(ListProfilesResponseSchema)` to create a new message.
  */
 export const ListProfilesResponseSchema: GenMessage<ListProfilesResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 3);
+  messageDesc(file_engram_app_v1_profile, 5);
 
 /**
  * @generated from message engram.app.v1.GetProfileRequest
@@ -202,7 +307,7 @@ export type GetProfileRequest = Message<"engram.app.v1.GetProfileRequest"> & {
  * Use `create(GetProfileRequestSchema)` to create a new message.
  */
 export const GetProfileRequestSchema: GenMessage<GetProfileRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 4);
+  messageDesc(file_engram_app_v1_profile, 6);
 
 /**
  * @generated from message engram.app.v1.GetProfileResponse
@@ -219,7 +324,7 @@ export type GetProfileResponse = Message<"engram.app.v1.GetProfileResponse"> & {
  * Use `create(GetProfileResponseSchema)` to create a new message.
  */
 export const GetProfileResponseSchema: GenMessage<GetProfileResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 5);
+  messageDesc(file_engram_app_v1_profile, 7);
 
 /**
  * @generated from message engram.app.v1.CreateProfileRequest
@@ -268,6 +373,18 @@ export type CreateProfileRequest = Message<"engram.app.v1.CreateProfileRequest">
    * @generated from field: repeated string capabilities = 8;
    */
   capabilities: string[];
+
+  /**
+   * ADR 0057: see Profile.network / Profile.secrets.
+   *
+   * @generated from field: engram.app.v1.ProfileNetwork network = 9;
+   */
+  network?: ProfileNetwork;
+
+  /**
+   * @generated from field: repeated engram.app.v1.ProfileSecret secrets = 10;
+   */
+  secrets: ProfileSecret[];
 };
 
 /**
@@ -275,7 +392,7 @@ export type CreateProfileRequest = Message<"engram.app.v1.CreateProfileRequest">
  * Use `create(CreateProfileRequestSchema)` to create a new message.
  */
 export const CreateProfileRequestSchema: GenMessage<CreateProfileRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 6);
+  messageDesc(file_engram_app_v1_profile, 8);
 
 /**
  * @generated from message engram.app.v1.CreateProfileResponse
@@ -292,7 +409,7 @@ export type CreateProfileResponse = Message<"engram.app.v1.CreateProfileResponse
  * Use `create(CreateProfileResponseSchema)` to create a new message.
  */
 export const CreateProfileResponseSchema: GenMessage<CreateProfileResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 7);
+  messageDesc(file_engram_app_v1_profile, 9);
 
 /**
  * @generated from message engram.app.v1.UpdateProfileRequest
@@ -346,6 +463,18 @@ export type UpdateProfileRequest = Message<"engram.app.v1.UpdateProfileRequest">
    * @generated from field: repeated string capabilities = 9;
    */
   capabilities: string[];
+
+  /**
+   * ADR 0057: see Profile.network / Profile.secrets.
+   *
+   * @generated from field: engram.app.v1.ProfileNetwork network = 10;
+   */
+  network?: ProfileNetwork;
+
+  /**
+   * @generated from field: repeated engram.app.v1.ProfileSecret secrets = 11;
+   */
+  secrets: ProfileSecret[];
 };
 
 /**
@@ -353,7 +482,7 @@ export type UpdateProfileRequest = Message<"engram.app.v1.UpdateProfileRequest">
  * Use `create(UpdateProfileRequestSchema)` to create a new message.
  */
 export const UpdateProfileRequestSchema: GenMessage<UpdateProfileRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 8);
+  messageDesc(file_engram_app_v1_profile, 10);
 
 /**
  * @generated from message engram.app.v1.UpdateProfileResponse
@@ -370,7 +499,7 @@ export type UpdateProfileResponse = Message<"engram.app.v1.UpdateProfileResponse
  * Use `create(UpdateProfileResponseSchema)` to create a new message.
  */
 export const UpdateProfileResponseSchema: GenMessage<UpdateProfileResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 9);
+  messageDesc(file_engram_app_v1_profile, 11);
 
 /**
  * @generated from message engram.app.v1.DeleteProfileRequest
@@ -387,7 +516,7 @@ export type DeleteProfileRequest = Message<"engram.app.v1.DeleteProfileRequest">
  * Use `create(DeleteProfileRequestSchema)` to create a new message.
  */
 export const DeleteProfileRequestSchema: GenMessage<DeleteProfileRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 10);
+  messageDesc(file_engram_app_v1_profile, 12);
 
 /**
  * @generated from message engram.app.v1.DeleteProfileResponse
@@ -400,7 +529,7 @@ export type DeleteProfileResponse = Message<"engram.app.v1.DeleteProfileResponse
  * Use `create(DeleteProfileResponseSchema)` to create a new message.
  */
 export const DeleteProfileResponseSchema: GenMessage<DeleteProfileResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_profile, 11);
+  messageDesc(file_engram_app_v1_profile, 13);
 
 /**
  * Session profiles (ADR 0052) — admin-curated session starting points.

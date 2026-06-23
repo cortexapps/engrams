@@ -16,6 +16,8 @@ import { SessionService, ShellRelayService } from "../gen/engram/app/v1/session_
 import { ImageService } from "../gen/engram/app/v1/image_pb.ts";
 import { FleetService } from "../gen/engram/app/v1/fleet_pb.ts";
 import { MountCatalogService } from "../gen/engram/app/v1/mount_catalog_pb.ts";
+import { OrgSecretService } from "../gen/engram/app/v1/org_secret_pb.ts";
+import { MintService } from "../gen/engram/app/v1/mint_pb.ts";
 
 /** SessionService client — session lifecycle (create/get/delete/stream/exec). */
 export const sessions = createClient(SessionService, controlPlaneTransport);
@@ -31,3 +33,9 @@ export const fleet = createClient(FleetService, controlPlaneTransport);
 
 /** MountCatalogService client — org-shared user-uploaded skill catalog (ADR 0055 P2). */
 export const mountCatalog = createClient(MountCatalogService, controlPlaneTransport);
+
+/** OrgSecretService client — admin-managed, KEK-sealed org secret store (ADR 0057). */
+export const orgSecret = createClient(OrgSecretService, controlPlaneTransport);
+
+/** MintService client — read-only mint-kind registry / Plane-A form metadata (ADR 0057 C3). */
+export const mint = createClient(MintService, controlPlaneTransport);

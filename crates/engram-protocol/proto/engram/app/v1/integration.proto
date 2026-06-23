@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// ADR 0057 C3: orchestrator-native connector catalog CRUD (Plane B). Connectors
+// live in the orchestrator DB (the `connector` table, C1); the built-ins
+// (github/datadog) are read-only file seeds surfaced alongside custom ones.
+// NOT compiled into the coordinator (orchestrator-native, like ProfileService /
+// TaskService). Admin-gated; `config_json` is the raw connector JSON, validated
+// by `parseConnector` (the admin-trust boundary) on write.
+service IntegrationService {
+  // Built-in seeds (read-only) ∪ admin-authored connectors.
+  rpc ListConnectors(ListConnectorsRequest) returns (ListConnectorsResponse);
+  // Create or replace a custom connector. Rejects a built-in provider id and
+  // any config `parseConnector` refuses. Invalidates the registry cache.
+  rpc UpsertConnector(UpsertConnectorRequest) returns (UpsertConnectorResponse);
+  // Delete a custom connector (idempotent). Rejects a built-in provider id.
+  rpc DeleteConnector(DeleteConnectorRequest) returns (DeleteConnectorResponse);
+}
+
+message Connector {
+  string provider = 1;
+  // The raw connector JSON (the same shape `parseConnector` validates).
+  string config_json = 2;
+  // True for the read-only built-in file seeds (github/datadog).
+  bool builtin = 3;
+  // ISO-8601; empty for built-in seeds.
+  string created_at = 4;
+  string updated_at = 5;
+}
+
+message ListConnectorsRequest {}
+
+message ListConnectorsResponse {
+  repeated Connector connectors = 1;
+}
+
+message UpsertConnectorRequest {
+  // Raw connector JSON; `provider` is read from it.
+  string config_json = 1;
+}
+
+message UpsertConnectorResponse {
+  Connector connector = 1;
+}
+
+message DeleteConnectorRequest {
+  string provider = 1;
+}
+
+message DeleteConnectorResponse {
+  bool deleted = 1;
+}

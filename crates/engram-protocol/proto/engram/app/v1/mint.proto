@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// ADR 0057 C3: the coordinator-owned mint-kind registry, surfaced read-only so
+// the orchestrator/web can render the Plane-A "add a mint integration" form
+// data-driven. The mint *logic* (building the engine) stays bespoke Rust in the
+// coordinator (`mint_kind_registry()`); this only exposes the form metadata.
+// Admin-gated at the orchestrator proxy (like OrgSecretService).
+service MintService {
+  // List every built-in mint kind the coordinator can build (e.g. github_app).
+  rpc ListMintKinds(ListMintKindsRequest) returns (ListMintKindsResponse);
+}
+
+// The input kind of a mint-config field — drives the form widget + whether the
+// value is sealed at rest. Mirrors `engram_core::traits::MintFieldKind`.
+enum MintFieldKind {
+  MINT_FIELD_KIND_UNSPECIFIED = 0;
+  // Non-sensitive configuration (e.g. an App ID) — plain text input.
+  MINT_FIELD_KIND_CONFIG = 1;
+  // A credential (e.g. a private-key PEM) — masked input, sealed in the org store.
+  MINT_FIELD_KIND_SEALED_SECRET = 2;
+}
+
+// One field an admin supplies to configure a mint kind. `name` is also the org
+// secret name suffix the coordinator resolves the value from (`<kind>.<name>`).
+message MintFieldDescriptor {
+  string name = 1;
+  string label = 2;
+  MintFieldKind field_kind = 3;
+  bool required = 4;
+}
+
+// One mint kind: the provider it backs + the fields an admin fills in.
+message MintKind {
+  string kind = 1;        // "github_app"
+  string provider = 2;    // "github"
+  string display_name = 3;
+  repeated MintFieldDescriptor fields = 4;
+}
+
+message ListMintKindsRequest {}
+
+message ListMintKindsResponse {
+  repeated MintKind mint_kinds = 1;
+}
