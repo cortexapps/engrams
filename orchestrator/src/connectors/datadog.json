@@ -1,6 +1,12 @@
 {
   "provider": "datadog",
   "protocol": "http",
+  "display": {
+    "name": "Datadog",
+    "category": "Observability",
+    "blurb": "Query logs and metrics during a run. The API key is brokered — substituted at the egress proxy, never seen by the agent.",
+    "icon": { "mono": "DD", "color": "#632ca6" }
+  },
   "credential": {
     "source": "inject",
     "inject": { "header": "DD-API-KEY", "secretRef": "datadog-api-key", "template": "{}" }

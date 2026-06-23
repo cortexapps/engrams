@@ -66,6 +66,31 @@ export interface Operation {
   asset?: AssetSpec;
 }
 
+/**
+ * Per-connector visual identity (the marketplace / profile / session-event icon).
+ * `mono` + `color` are always present after {@link parseConnector} (defaulted from
+ * the provider), so a connector is never iconless; `logo` is an optional serve URL
+ * for an uploaded image that the renderer falls back off of to the monogram.
+ */
+export interface ConnectorIcon {
+  /** 1–2 char uppercase monogram. */
+  mono: string;
+  /** Brand tint as a `#RGB` / `#RRGGBB` hex. */
+  color: string;
+  /** Optional uploaded-logo serve URL (renderer falls back to the monogram). */
+  logo?: string;
+}
+
+/** Display metadata for the marketplace + everywhere a provider renders. Always
+ * fully populated after {@link parseConnector} (missing fields default off the
+ * provider id). Authored in connector JSON; the slug stays canonical. */
+export interface ConnectorDisplay {
+  name: string;
+  category: string;
+  blurb: string;
+  icon: ConnectorIcon;
+}
+
 export interface Connector {
   provider: string;
   /** Only `"http"` is implemented; other values are rejected at load. */
@@ -73,6 +98,8 @@ export interface Connector {
   credential: Credential;
   hosts: string[];
   operations: Operation[];
+  /** Always defaulted from `provider` when absent (see {@link parseConnector}). */
+  display: ConnectorDisplay;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +247,108 @@ function assertHost(where: string, h: string): void {
   }
 }
 
+// --- Display identity (validated + defaulted from the provider id) ---------
+const MAX_DISPLAY_NAME = 120;
+const MAX_DISPLAY_CATEGORY = 60;
+const MAX_DISPLAY_BLURB = 280;
+/** Logo here is a serve URL/path (the bytes live in blob storage, ADR plan #4). */
+const MAX_DISPLAY_LOGO = 1024;
+const HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+/** Default tint palette — a stable, contrasty brand-ish color picked by hash so
+ * an un-themed connector still gets a distinct, deterministic monogram tile. */
+const DEFAULT_ICON_PALETTE = [
+  "#1f2328", "#632ca6", "#362d59", "#06ac38",
+  "#4a154b", "#0052cc", "#5e6ad2", "#4c4a73",
+  "#b8324f", "#c4622d", "#2a6f6f", "#3a5a40",
+];
+
+/** FNV-1a 32-bit — a small stable hash for deterministic default tints. */
+function hashString(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+/** Deterministic default tint for a provider (kept in sync with the web mirror). */
+export function defaultIconColor(provider: string): string {
+  return DEFAULT_ICON_PALETTE[hashString(provider) % DEFAULT_ICON_PALETTE.length]!;
+}
+/** Default monogram: the first two alphanumerics of the provider, uppercased. */
+export function defaultIconMono(provider: string): string {
+  const alnum = provider.replace(/[^a-z0-9]/gi, "");
+  return (alnum.slice(0, 2) || "?").toUpperCase();
+}
+/** Default display name: title-cased provider (`pager_duty` → `Pager Duty`). */
+export function defaultDisplayName(provider: string): string {
+  const words = provider.split(/[-_]+/).filter(Boolean);
+  return words.length === 0 ? provider : words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+/** The fully-defaulted identity for a provider with no authored `display`. */
+function defaultDisplay(provider: string): ConnectorDisplay {
+  return {
+    name: defaultDisplayName(provider),
+    category: "Other",
+    blurb: "",
+    icon: { mono: defaultIconMono(provider), color: defaultIconColor(provider) },
+  };
+}
+
+/** Validate the optional `display` block, filling any missing field from the
+ * provider id so the parsed connector always carries a complete identity. */
+function parseDisplay(where: string, raw: unknown, provider: string): ConnectorDisplay {
+  const base = defaultDisplay(provider);
+  if (raw === undefined) return base;
+  if (typeof raw !== "object" || raw === null) fail(where, '"display" must be an object');
+  const d = raw as Record<string, unknown>;
+
+  let name = base.name;
+  if (d.name !== undefined) {
+    if (typeof d.name !== "string") fail(where, '"display.name" must be a string');
+    const t = d.name.trim();
+    if (t.length === 0 || t.length > MAX_DISPLAY_NAME) fail(where, `"display.name" must be 1..${MAX_DISPLAY_NAME} characters`);
+    name = t;
+  }
+  let category = base.category;
+  if (d.category !== undefined) {
+    if (typeof d.category !== "string") fail(where, '"display.category" must be a string');
+    const t = d.category.trim();
+    if (t.length === 0 || t.length > MAX_DISPLAY_CATEGORY) fail(where, `"display.category" must be 1..${MAX_DISPLAY_CATEGORY} characters`);
+    category = t;
+  }
+  let blurb = base.blurb;
+  if (d.blurb !== undefined) {
+    if (typeof d.blurb !== "string") fail(where, '"display.blurb" must be a string');
+    if (d.blurb.length > MAX_DISPLAY_BLURB) fail(where, `"display.blurb" must be at most ${MAX_DISPLAY_BLURB} characters`);
+    blurb = d.blurb;
+  }
+  let icon: ConnectorIcon = base.icon;
+  if (d.icon !== undefined) {
+    if (typeof d.icon !== "object" || d.icon === null) fail(where, '"display.icon" must be an object');
+    const ic = d.icon as Record<string, unknown>;
+    const next: ConnectorIcon = { mono: base.icon.mono, color: base.icon.color };
+    if (ic.mono !== undefined) {
+      if (typeof ic.mono !== "string") fail(where, '"display.icon.mono" must be a string');
+      const m = ic.mono.trim().toUpperCase();
+      if (m.length < 1 || m.length > 2 || /\s/.test(m)) fail(where, '"display.icon.mono" must be a 1–2 character monogram');
+      next.mono = m;
+    }
+    if (ic.color !== undefined) {
+      if (typeof ic.color !== "string" || !HEX_COLOR_RE.test(ic.color)) fail(where, '"display.icon.color" must be a #RGB or #RRGGBB hex color');
+      next.color = ic.color;
+    }
+    if (ic.logo !== undefined) {
+      if (typeof ic.logo !== "string" || /\s/.test(ic.logo)) fail(where, '"display.icon.logo" must be a URL string with no whitespace');
+      if (ic.logo.length === 0 || ic.logo.length > MAX_DISPLAY_LOGO) fail(where, `"display.icon.logo" must be 1..${MAX_DISPLAY_LOGO} characters`);
+      next.logo = ic.logo;
+    }
+    icon = next;
+  }
+  return { name, category, blurb, icon };
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
 export function parseConnector(raw: unknown, where: string): Connector {
   if (typeof raw !== "object" || raw === null) fail(where, "must be a JSON object");
@@ -292,7 +421,9 @@ export function parseConnector(raw: unknown, where: string): Connector {
     return { grants, ...(match ? { match } : {}), ...(asset ? { asset } : {}) };
   });
 
-  return { provider: o.provider, protocol: "http", credential, hosts, operations };
+  const display = parseDisplay(where, o.display, o.provider);
+
+  return { provider: o.provider, protocol: "http", credential, hosts, operations, display };
 }
 
 /** Build the provider→connector map; throws on a duplicate provider. */
@@ -509,4 +640,93 @@ export function compileIntegrationPolicy(
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
   return { injects, observes, network, secrets };
+}
+
+// ---------------------------------------------------------------------------
+// Connected-status derivation + the member-safe provider catalog (redesign #1)
+// ---------------------------------------------------------------------------
+
+export type ConnectorStatus = "connected" | "available";
+
+/**
+ * Whether a connector's credential is configured (*connected*) or not yet
+ * (*available*). Pure — the caller supplies the org-secret name set and, for a
+ * mint connector, the org-secret names its mint kind requires:
+ *   - inject → connected ⇔ the `secretRef` exists in the org secret store.
+ *   - mint   → connected ⇔ every required mint field exists as an org secret
+ *              (caller derives the names as `${kind}.${field}` from the
+ *              coordinator's mint-kind registry). None given ⇒ available.
+ */
+export function connectorStatus(
+  connector: Connector,
+  orgSecretNames: ReadonlySet<string>,
+  requiredMintSecretNames: ReadonlyArray<string> = [],
+): ConnectorStatus {
+  if (connector.credential.source === "inject") {
+    return orgSecretNames.has(connector.credential.inject.secretRef) ? "connected" : "available";
+  }
+  if (requiredMintSecretNames.length === 0) return "available";
+  return requiredMintSecretNames.every((n) => orgSecretNames.has(n)) ? "connected" : "available";
+}
+
+export type CatalogAccess = "read" | "write";
+
+/** One grantable power, derived for display (the slug stays canonical). */
+export interface CatalogCapability {
+  /** The capability `action` (e.g. `issues:write`). */
+  action: string;
+  /** Derived from the op's HTTP method (GET/HEAD/OPTIONS → read, else write). */
+  access: CatalogAccess;
+  /** The asset kind this op surfaces, if any (e.g. `pull_request`). */
+  asset?: string;
+}
+
+/** Member-safe view of one connector — display identity + the powers it grants +
+ * the hosts it opens. Carries NO secretRef / header / template / mint kind, so it
+ * is safe to expose to non-admins (the Launch receipt + in-session provenance). */
+export interface ProviderCatalogEntry {
+  provider: string;
+  display: ConnectorDisplay;
+  credentialSource: "mint" | "inject";
+  hosts: string[];
+  capabilities: CatalogCapability[];
+}
+
+/** GET/HEAD/OPTIONS → read; otherwise write (a method-less op is conservatively write). */
+function accessOf(method: string | undefined): CatalogAccess {
+  const m = (method ?? "").trim().toUpperCase();
+  return m === "GET" || m === "HEAD" || m === "OPTIONS" ? "read" : "write";
+}
+
+/**
+ * Project the registry into the member-safe provider catalog. Powers are the
+ * union of every operation's `grants`, deduped by action (an asset spec on any
+ * op for that action is kept), each tagged with its derived read/write access.
+ * Sorted by provider.
+ */
+export function buildProviderCatalog(registry: Map<string, Connector>): ProviderCatalogEntry[] {
+  const entries: ProviderCatalogEntry[] = [];
+  for (const connector of registry.values()) {
+    const byAction = new Map<string, CatalogCapability>();
+    for (const op of connector.operations) {
+      const access = accessOf(op.match?.method);
+      for (const action of op.grants) {
+        const existing = byAction.get(action);
+        if (existing) {
+          if (existing.asset === undefined && op.asset) existing.asset = op.asset.kind;
+          continue;
+        }
+        byAction.set(action, { action, access, ...(op.asset ? { asset: op.asset.kind } : {}) });
+      }
+    }
+    entries.push({
+      provider: connector.provider,
+      display: connector.display,
+      credentialSource: connector.credential.source,
+      hosts: connector.hosts,
+      capabilities: [...byAction.values()],
+    });
+  }
+  entries.sort((a, b) => a.provider.localeCompare(b.provider));
+  return entries;
 }
