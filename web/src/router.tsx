@@ -37,6 +37,7 @@ import { Members } from "./pages/Members";
 import { ImagesPanel } from "./components/settings/ImagesPanel";
 import { ProfilePanel } from "./components/settings/ProfilePanel";
 import { RegistriesPanel } from "./components/settings/RegistriesPanel";
+import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
@@ -194,6 +195,12 @@ const membersRoute = createRoute({
   beforeLoad: requireAdmin,
   component: Members,
 });
+const secretsRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "secrets",
+  beforeLoad: requireAdmin,
+  component: SecretsPanel,
+});
 const profilesRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "profiles",
@@ -232,6 +239,7 @@ export const routeTree = rootRoute.addChildren([
       profileRoute,
       tokensRoute,
       membersRoute,
+      secretsRoute,
       profilesRoute,
       profilesNewRoute,
       profileEditRoute,
