@@ -95,9 +95,10 @@ async fn op_fetch_credential(
         .get_session_capabilities(session)
         .await
         .unwrap_or_default();
-    // The integration validates the host against its own (e.g. github.com).
+    // The git remote host (e.g. github.com); the integration validates it against
+    // its own served host. This is the one caller that legitimately sets it.
     let hint = CredentialHint {
-        host: host.filter(|s| !s.is_empty()),
+        served_host: host.filter(|s| !s.is_empty()),
         owner: owner.filter(|s| !s.is_empty()),
     };
     integration

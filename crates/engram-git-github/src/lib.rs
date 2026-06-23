@@ -353,7 +353,9 @@ impl Integration for GitHubApp {
         caps: &[Capability],
         hint: &CredentialHint,
     ) -> Result<ScopedCredential, IntegrationError> {
-        if let Some(h) = hint.host.as_deref().filter(|s| !s.is_empty()) {
+        // served_host is our git host (github.com), NOT the API endpoint
+        // (api.github.com); a caller that hands us the API host is mismatched.
+        if let Some(h) = hint.served_host.as_deref().filter(|s| !s.is_empty()) {
             if !h.eq_ignore_ascii_case(GITHUB_HOST) {
                 return Err(IntegrationError::InvalidSpec(format!(
                     "github integration does not serve host `{h}`"

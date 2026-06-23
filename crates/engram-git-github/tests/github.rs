@@ -66,7 +66,7 @@ async fn mints_and_caches_installation_token() {
         .with_base_url(server.uri());
 
     let hint = CredentialHint {
-        host: None,
+        served_host: None,
         owner: Some("cortexapps".into()),
     };
     let t1 = app.mint_credential(&[], &hint).await.unwrap();
@@ -83,6 +83,24 @@ async fn mints_and_caches_installation_token() {
     // verified `.expect(1)` on drop).
     let t2 = app.mint_credential(&[], &hint).await.unwrap();
     assert!(matches!(t2, ScopedCredential::Basic { password, .. } if password == "ghs_abc123"));
+}
+
+#[tokio::test]
+async fn mint_rejects_a_served_host_it_does_not_own() {
+    // served_host is our git host (github.com), NOT the API endpoint
+    // (api.github.com). Handing the connector's egress/API host is a namespace
+    // mismatch and is refused before any HTTP — the false negative a connector
+    // "test connection" hit before the mint hint was fixed.
+    let app = GitHubApp::new("123", test_key()).unwrap();
+    let hint = CredentialHint {
+        served_host: Some("api.github.com".into()),
+        owner: None,
+    };
+    let err = app.mint_credential(&[], &hint).await.unwrap_err();
+    assert!(
+        err.to_string().contains("does not serve host"),
+        "expected a served-host rejection, got: {err}"
+    );
 }
 
 #[tokio::test]
