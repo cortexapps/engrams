@@ -150,6 +150,14 @@ mod adapter {
         /// freshly-built `claude` outside the pack).
         #[arg(long, env = "ENGRAM_CLAUDE_BIN")]
         pub claude_bin: Option<String>,
+
+        /// Override the hook socket bind path. Production always uses the
+        /// fixed per-session in-VM path (`HOOK_SOCK_FILE`); this is a test
+        /// seam so a `run_engine` test can bind an isolated socket and fire
+        /// hooks against it without colliding with the shared production
+        /// path (parallel tests, nextest's process-per-test). Not a CLI arg.
+        #[arg(skip)]
+        pub hook_sock_path: Option<String>,
     }
 
     /// Resolve the `claude` binary path. If the user supplied
@@ -893,8 +901,13 @@ mod adapter {
         let duplicate_auq_ids: hook_server::DuplicateAuqIds =
             Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         write_hook_settings().await;
-        let _ = tokio::fs::remove_file(HOOK_SOCK_FILE).await; // clear a stale bind
-        let _sock_guard = match tokio::net::UnixListener::bind(HOOK_SOCK_FILE) {
+        // Production: the fixed in-VM path. Tests may inject an isolated one.
+        let hook_sock_path = cli
+            .hook_sock_path
+            .clone()
+            .unwrap_or_else(|| HOOK_SOCK_FILE.to_string());
+        let _ = tokio::fs::remove_file(&hook_sock_path).await; // clear a stale bind
+        let _sock_guard = match tokio::net::UnixListener::bind(&hook_sock_path) {
             Ok(listener) => {
                 let task = tokio::spawn(hook_server::serve(
                     listener,
@@ -905,7 +918,7 @@ mod adapter {
                     duplicate_auq_ids.clone(),
                 ));
                 Some(SockGuard {
-                    path: HOOK_SOCK_FILE.to_string(),
+                    path: hook_sock_path.clone(),
                     task,
                 })
             }
@@ -1333,7 +1346,10 @@ mod adapter {
             .env("BASH_MAX_TIMEOUT_MS", "7200000")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .env("IS_SANDBOX", "1")
-            .env("ENGRAM_HOOK_SOCK", HOOK_SOCK_FILE)
+            .env(
+                "ENGRAM_HOOK_SOCK",
+                cli.hook_sock_path.as_deref().unwrap_or(HOOK_SOCK_FILE),
+            )
             // Held open for the whole session: we write one newline-
             // delimited `user` message per prompt and close it (drop) to
             // signal a clean drain on Shutdown.
@@ -1551,6 +1567,22 @@ mod adapter {
                                             Vec::new()
                                         };
                                     if !stale.is_empty() {
+                                        // ADR 0054: this is an answer-delivery
+                                        // path the hook never reaches (claude
+                                        // narrate-past'd and abandoned the
+                                        // deferred tool, so its re-fire — and
+                                        // the hook's `question_outstanding`
+                                        // clear at the answer verdict — never
+                                        // happen). Clear the flag HERE, before
+                                        // the fallback turn starts, or it stays
+                                        // set for the rest of the session and
+                                        // every later genuine AUQ is wrongly
+                                        // deduped as a #64389 duplicate (no
+                                        // card, scrubbed → silently swallowed).
+                                        // Invariant: the flag is cleared on
+                                        // EVERY answer-delivery path, not just
+                                        // the hook's.
+                                        *question_outstanding.lock().await = false;
                                         if let Some(s) = stdin.as_mut() {
                                             let text = fallback_answer_message(&stale);
                                             let ft = start_turn(
@@ -2952,6 +2984,7 @@ mod adapter {
                 max_tool_call_secs: 600,
                 max_run_secs: 86_400,
                 claude_bin: Some(claude_bin),
+                hook_sock_path: None,
             }
         }
 
@@ -3856,6 +3889,129 @@ mod adapter {
                 .expect("engine should exit on shutdown")
                 .expect("engine task should not panic");
             let _ = tokio::fs::remove_file(&script).await;
+        }
+
+        /// ADR 0054 regression — the exact failure mode of session
+        /// `3b9b9dc5`: a narrate-past on the ANSWER-RESUME turn drops into the
+        /// Part B fallback, which delivers the answer as a fresh user message
+        /// but (before the fix) never cleared `question_outstanding` — the
+        /// hook's clear at the answer verdict (`HookVerdict::Answer`) is
+        /// unreachable on this path because the deferred tool was never
+        /// re-fired. The leaked flag then makes the NEXT genuine
+        /// AskUserQuestion look like a #64389 duplicate: deferred with NO
+        /// card, scrubbed, silently swallowed — re-introducing the very bug
+        /// this ADR fixed. In the live session that surfaced as a first
+        /// "red or green" card answered via the fallback (no
+        /// `tool_call_completed`), then a "cats or dogs" prompt that produced
+        /// `run_started`/`run_completed` with no `user_question` at all.
+        ///
+        /// This drives the real seam end to end — the engine's fallback and
+        /// the real hook server share ONE `question_outstanding` over an
+        /// isolated socket — so the assertion exercises the actual coupling,
+        /// not a stand-in: Q1 is carded, answered, narrate-past'd into the
+        /// fallback; then a distinct Q2 must STILL be carded.
+        #[tokio::test]
+        async fn fallback_clears_outstanding_so_later_question_still_cards() {
+            let script = write_answer_fallback_fake_claude().await;
+            // An isolated hook socket: this test FIRES real hooks, so it can't
+            // share the fixed production path the other `run_engine` tests bind
+            // (they never fire, so they tolerate the collision; we can't).
+            let sock = std::env::temp_dir()
+                .join(format!("engram-regr-{}.sock", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned();
+            let mut cli = test_cli(script.clone());
+            cli.hook_sock_path = Some(sock.clone());
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(cli, cmd_rx, reattach.clone(), evt_tx, None));
+
+            // Startup idle. The socket is bound before the first run, so once
+            // Idle lands a hook fire can connect.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // Q1: the hook cards it and sets `question_outstanding` true.
+            let q1 = vec![sample_q("Q?", false)];
+            assert!(matches!(
+                hook_fire(&sock, "toolu_1", &q1).await,
+                hook_server::HookVerdict::Defer
+            ));
+            match evt_rx.recv().await {
+                Some(HarnessEvent::UserQuestion { tool_call_id, .. }) => {
+                    assert_eq!(tool_call_id, "toolu_1", "Q1 is carded");
+                }
+                other => panic!("expected UserQuestion for Q1, got {other:?}"),
+            }
+
+            // Answer Q1. Claude narrate-past's on the resume (never re-fires
+            // the deferred tool → the hook never consumes the answer, so its
+            // flag-clear never runs), and the engine drops into the fallback.
+            let mut a = Answers::new();
+            a.insert("Q?".into(), vec!["A".into()]);
+            cmd_tx
+                .send(HarnessCommand::AnswerQuestion {
+                    tool_call_id: "toolu_1".into(),
+                    answers: a,
+                })
+                .await
+                .unwrap();
+
+            // The narrate-past resume turn: recap, no tool re-fire.
+            let (_rid, pid) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(pid, None, "continuation turn carries no prompt_id");
+            expect_agent_message(&mut evt_rx, "resumed").await;
+            let _ = expect_run_completed(&mut evt_rx).await;
+
+            // The Part B fallback delivers the answer as a fresh user message.
+            let (_fid, fpid) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(fpid, None, "the fallback answer delivery is not a prompt");
+            match evt_rx.recv().await {
+                Some(HarnessEvent::QuestionAnswered { tool_call_id, .. }) => {
+                    assert_eq!(tool_call_id, "toolu_1");
+                }
+                other => panic!("expected QuestionAnswered, got {other:?}"),
+            }
+            expect_agent_message(&mut evt_rx, "got your answer").await;
+            let _ = expect_run_completed(&mut evt_rx).await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // The regression: a brand-new, DISTINCT question. With the flag
+            // leaked it is deduped (Defer, no card) and swallowed; with the
+            // fallback's clear it cards again. Both outcomes return Defer, so
+            // only the EMITTED card distinguishes them — and on the buggy path
+            // no event is ever emitted, so we bound the wait to fail loudly
+            // instead of hanging.
+            let q2 = vec![sample_q("Q2?", false)];
+            assert!(matches!(
+                hook_fire(&sock, "toolu_2", &q2).await,
+                hook_server::HookVerdict::Defer
+            ));
+            match tokio::time::timeout(Duration::from_secs(5), evt_rx.recv()).await {
+                Ok(Some(HarnessEvent::UserQuestion { tool_call_id, .. })) => {
+                    assert_eq!(
+                        tool_call_id, "toolu_2",
+                        "the later genuine question must still be carded"
+                    );
+                }
+                Ok(other) => panic!("expected UserQuestion for Q2, got {other:?}"),
+                Err(_) => panic!(
+                    "Q2 was silently swallowed: no card emitted — \
+                     `question_outstanding` leaked across the Part B fallback"
+                ),
+            }
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+            let _ = tokio::fs::remove_file(&sock).await;
         }
     }
 }
