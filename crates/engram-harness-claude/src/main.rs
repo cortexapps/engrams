@@ -473,7 +473,20 @@ mod adapter {
         pub enum HookVerdict {
             Answer { answers: Answers },
             Defer,
+            /// Deny a DUPLICATE `AskUserQuestion` within a run (the #64389
+            /// stdin-continuation double-fire). `reason` is surfaced to the
+            /// model as the denied tool's result. `{"verdict":"deny","reason":…}`.
+            Deny { reason: String },
         }
+
+        /// Reason returned when denying a duplicate `AskUserQuestion`. claude
+        /// reads it as the denied tool's result and settles — validated in
+        /// held-open stdin: the turn still ends `tool_deferred` on the FIRST
+        /// (real) question, claude does not loop on re-calls.
+        const DUPLICATE_AUQ_REASON: &str =
+            "A question is already awaiting the user's answer (engram defers \
+             AskUserQuestion). Do not call AskUserQuestion again; stop and wait \
+             for the answer.";
 
         /// Accept loop: one transient hook client per connection, each
         /// handled on its own task so parallel AUQ fires (distinct
@@ -485,6 +498,14 @@ mod adapter {
             current_run_id: CurrentRunId,
             evt_tx: mpsc::Sender<HarnessEvent>,
         ) {
+            // ADR 0054: run_ids that have already DEFERRED an AskUserQuestion.
+            // A second AUQ in the same run is the #64389 stdin-continuation
+            // double-fire (claude re-calls the tool after deferring) — deny it
+            // (see `handle_one`) so it never becomes a second competing
+            // deferred tool. Owned by `serve` so it spans every connection for
+            // the engine's life; monotonic (one entry per asking-turn).
+            let deferred_auq_runs: Arc<Mutex<std::collections::HashSet<String>>> =
+                Arc::new(Mutex::new(std::collections::HashSet::new()));
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -493,6 +514,7 @@ mod adapter {
                             answers_in_hand.clone(),
                             current_run_id.clone(),
                             evt_tx.clone(),
+                            deferred_auq_runs.clone(),
                         ));
                     }
                     Err(e) => tracing::warn!(error = %e, "hook socket accept failed"),
@@ -505,6 +527,7 @@ mod adapter {
             answers_in_hand: AnswersInHand,
             current_run_id: CurrentRunId,
             evt_tx: mpsc::Sender<HarnessEvent>,
+            deferred_auq_runs: Arc<Mutex<std::collections::HashSet<String>>>,
         ) {
             let (r, mut w) = stream.into_split();
             let mut lines = BufReader::new(r).lines();
@@ -521,36 +544,64 @@ mod adapter {
             };
             let run_id = current_run_id.lock().await.clone().unwrap_or_default();
 
-            // Verdict: answer-in-hand → answer + QuestionAnswered; else
-            // defer + UserQuestion. `remove` (consume), not `get`, so a
-            // duplicate re-fire defers — the deferred tool yields exactly
-            // one tool_result (structural idempotency, ADR 0054). Compute
-            // under the lock, then DROP it before `emit` (which can block on
-            // backpressure while the host link is down).
-            let (verdict, event) = {
-                let mut map = answers_in_hand.lock().await;
-                match map.remove(&req.tool_use_id) {
+            // Verdict (+ optional event):
+            //   answer-in-hand → answer + QuestionAnswered (consume with
+            //     `remove`, so a re-fire of the SAME id after consumption
+            //     defers — one tool_result, structural idempotency, ADR 0054);
+            //   else first AUQ in this run → defer + UserQuestion (card);
+            //   else (a DISTINCT AUQ already deferred this run) → deny, NO card
+            //     — the #64389 stdin double-fire (see `deferred_auq_runs`).
+            // The answers-map lock is a temporary (dropped before the dedup
+            // lock — no lock-order coupling), and the event is emitted AFTER
+            // both locks drop (`emit` can block on host-link backpressure).
+            let (verdict, event): (HookVerdict, Option<HarnessEvent>) = {
+                let answer = answers_in_hand.lock().await.remove(&req.tool_use_id);
+                match answer {
                     Some(answers) => (
                         HookVerdict::Answer {
                             answers: answers.clone(),
                         },
-                        HarnessEvent::QuestionAnswered {
+                        Some(HarnessEvent::QuestionAnswered {
                             run_id,
                             tool_call_id: req.tool_use_id,
                             answers,
-                        },
+                        }),
                     ),
-                    None => (
-                        HookVerdict::Defer,
-                        HarnessEvent::UserQuestion {
-                            run_id,
-                            tool_call_id: req.tool_use_id,
-                            questions: req.questions,
-                        },
-                    ),
+                    None => {
+                        // `insert` returns false iff the run already deferred an
+                        // AUQ → this is the duplicate. Empty run_id (defensive)
+                        // never dedups: always defer.
+                        let duplicate = !run_id.is_empty()
+                            && !deferred_auq_runs.lock().await.insert(run_id.clone());
+                        if duplicate {
+                            tracing::warn!(
+                                %run_id,
+                                tool_use_id = %req.tool_use_id,
+                                "ADR 0054: duplicate AskUserQuestion in run (#64389 stdin \
+                                 double-fire); denying so it never becomes a second deferred tool"
+                            );
+                            (
+                                HookVerdict::Deny {
+                                    reason: DUPLICATE_AUQ_REASON.to_string(),
+                                },
+                                None,
+                            )
+                        } else {
+                            (
+                                HookVerdict::Defer,
+                                Some(HarnessEvent::UserQuestion {
+                                    run_id,
+                                    tool_call_id: req.tool_use_id,
+                                    questions: req.questions,
+                                }),
+                            )
+                        }
+                    }
                 }
             };
-            emit(&evt_tx, event).await;
+            if let Some(event) = event {
+                emit(&evt_tx, event).await;
+            }
 
             let mut out = serde_json::to_string(&verdict)
                 .unwrap_or_else(|_| r#"{"verdict":"defer"}"#.to_string());
@@ -643,6 +694,10 @@ mod adapter {
                     });
                     println!("{out}");
                 }
+                // ADR 0054: deny a duplicate AUQ (the #64389 double-fire) so it
+                // resolves now (deny tool_result) instead of becoming a second
+                // deferred tool. The reason is surfaced to the model.
+                Some(HookVerdict::Deny { reason }) => print_deny(&reason),
                 // Defer verdict, or any socket failure → defer. The turn
                 // ends `tool_deferred` and the VM can idle-evict.
                 _ => print_defer(),
@@ -659,6 +714,16 @@ mod adapter {
             println!(
                 r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"defer"}}}}"#
             );
+        }
+        fn print_deny(reason: &str) {
+            let out = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            });
+            println!("{out}");
         }
 
         async fn round_trip(
@@ -3401,7 +3466,7 @@ mod adapter {
                 hook_server::HookVerdict::Answer { answers } => {
                     assert_eq!(answers.get("Pick one?"), Some(&vec!["A".to_string()]));
                 }
-                hook_server::HookVerdict::Defer => panic!("expected answer after stash"),
+                _ => panic!("expected answer after stash"),
             }
             match evt_rx.recv().await {
                 Some(HarnessEvent::QuestionAnswered {
@@ -3478,6 +3543,50 @@ mod adapter {
                 answers.lock().await.is_empty(),
                 "the answer was consumed exactly once"
             );
+        }
+
+        // ADR 0054: per-run dedup of the #64389 stdin double-fire. The FIRST
+        // AUQ in a run defers (+ a card); a SECOND, DISTINCT AUQ in the SAME
+        // run (no answer in hand) is the re-call → DENY, no card. A new run
+        // defers again (the answer-resume re-fire is a fresh run, never wrongly
+        // deduped).
+        #[tokio::test]
+        async fn hook_denies_duplicate_auq_in_same_run() {
+            let (sock, _answers, run_id, mut evt_rx) = spawn_hook_server().await;
+            let questions = vec![sample_q("Color?", false)];
+
+            // First AUQ in run-x → defer + card.
+            assert!(matches!(
+                hook_fire(&sock, "toolu_a", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::UserQuestion { .. })
+            ));
+
+            // Second, distinct AUQ in the SAME run → deny, NO card.
+            match hook_fire(&sock, "toolu_b", &questions).await {
+                hook_server::HookVerdict::Deny { reason } => {
+                    assert!(reason.contains("already awaiting"), "deny carries a reason");
+                }
+                _ => panic!("expected Deny for the duplicate AUQ"),
+            }
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "the denied duplicate emits no card"
+            );
+
+            // A NEW run defers again (resume re-fire is never deduped).
+            *run_id.lock().await = Some("run-y".into());
+            assert!(matches!(
+                hook_fire(&sock, "toolu_c", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::UserQuestion { .. })
+            ));
         }
 
         // The hook-bridge's claude-specific denormalization (finding #6): a
