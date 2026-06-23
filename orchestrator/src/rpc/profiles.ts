@@ -34,7 +34,13 @@ import {
   selectableSkillNames,
   type MountCatalogClient,
 } from "../skills/catalog.ts";
-import { parseCapability, grantsCapability } from "../connectors/registry.ts";
+import {
+  parseCapability,
+  grantsCapability,
+  loadRegistry,
+  type Connector,
+} from "../connectors/registry.ts";
+import { makeConnectorStore, type ConnectorStore } from "../db/connectors.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -52,6 +58,7 @@ export interface ProfileDeps {
   store?: ProfileStore;
   images?: ImagesClient;
   mountCatalog?: MountCatalogClient;
+  connectors?: ConnectorStore;
 }
 
 function headersOf(ctx: HandlerContext): Headers {
@@ -167,6 +174,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   const store: ProfileStore = deps?.store ?? makeProfileStore(getDb());
   const images: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
   const mountCatalog: MountCatalogClient = deps?.mountCatalog ?? defaultCatalog();
+  // Lazy default: construct the store (and thus touch getDb()) only when a
+  // handler actually reads connectors, so importing/registering without a DB
+  // (tests) doesn't throw. loadRegistry degrades to built-in seeds if the read
+  // fails.
+  const connectors: ConnectorStore = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
 
   /** Validate image_id against the live catalog; throw InvalidArgument if absent. */
   async function assertImageEnabled(imageId: string): Promise<void> {
@@ -202,7 +214,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
    * re-validates authoritatively at session-create; rejecting here keeps a
    * profile from ever storing a grant no connector backs.
    */
-  function assertCapabilitiesValid(capabilities: string[]): void {
+  function assertCapabilitiesValid(capabilities: string[], registry: Map<string, Connector>): void {
     for (const c of capabilities) {
       const parsed = parseCapability(c);
       if (!parsed) {
@@ -211,7 +223,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
           Code.InvalidArgument,
         );
       }
-      if (!grantsCapability(parsed.provider, parsed.action)) {
+      if (!grantsCapability(parsed.provider, parsed.action, registry)) {
         throw new ConnectError(
           `capability "${c}" is not granted by any connector ` +
             `(no operation grants "${parsed.provider}:${parsed.action}")`,
@@ -253,7 +265,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
       await assertSkillsValid(req.skills ?? []);
-      assertCapabilitiesValid(req.capabilities ?? []);
+      assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
@@ -280,7 +292,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
       await assertSkillsValid(req.skills ?? []);
-      assertCapabilitiesValid(req.capabilities ?? []);
+      assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
