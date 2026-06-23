@@ -62,7 +62,7 @@ const DESTS: Dest[] = [
 export function CommandMenu() {
   const open = useKeyboardUi((s) => s.paletteOpen);
   const setPaletteOpen = useKeyboardUi((s) => s.setPaletteOpen);
-  const openNewSession = useKeyboardUi((s) => s.openNewSession);
+  const requestComposerFocus = useKeyboardUi((s) => s.requestComposerFocus);
   const navigate = useNavigate();
   const isAdmin = useIsAdmin();
   const { rows, isPending, error } = useRailSessions();
@@ -83,7 +83,15 @@ export function CommandMenu() {
         <CommandEmpty>No matching commands.</CommandEmpty>
 
         <CommandGroup heading="Actions">
-          <CommandItem value="start new task create launch" onSelect={() => run(openNewSession)}>
+          <CommandItem
+            value="start new task create launch"
+            onSelect={() =>
+              run(() => {
+                navigate({ to: "/sessions" });
+                requestComposerFocus();
+              })
+            }
+          >
             <SquarePlus />
             <span>Start new task</span>
             <CommandShortcut>

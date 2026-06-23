@@ -1,12 +1,12 @@
 import type { CSSProperties } from "react";
-import { Layers, ListChecks, TriangleAlert } from "lucide-react";
+import { Layers, ListChecks, Plus, TriangleAlert } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
 import { StatusGlyph } from "../../components/Glyph";
 import { useKeyboardUi } from "../../keyboard/store";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Kbd } from "@/components/ui/kbd";
 import {
   SidebarContent,
   SidebarFooter,
@@ -37,32 +37,44 @@ import { ProfileChip } from "../../components/profiles/ProfileChip";
 export function SessionsRail() {
   const isAdmin = useIsAdmin();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const openNewSession = useKeyboardUi((s) => s.openNewSession);
+  const requestComposerFocus = useKeyboardUi((s) => s.requestComposerFocus);
   const jumpHeld = useKeyboardUi((s) => s.jumpHeld);
 
-  const onMyList = pathname === "/sessions" || pathname === "/sessions/";
+  const onStart = pathname === "/sessions" || pathname === "/sessions/";
+  const onMyList = pathname.startsWith("/sessions/list");
   const onAllList = pathname.startsWith("/sessions/all");
 
   const { rows, openId, total, isPending, error } = useRailSessions();
 
   return (
     <>
-      <SidebarHeader className="gap-3 px-3 pt-3">
-        {/* "Recent" names what the list IS (my recent sessions, capped) so the
-            footer's "My sessions" can mean the full list without colliding. */}
-        <SidebarGroupLabel className="px-1">Recent</SidebarGroupLabel>
-        {/* Lime primary — the rail's one "go" verb and the product's racecar
-            action. Active rows use sidebar-accent (green), so no lime clash.
-            Drives the one global New Session dialog (shared with `c` + ⌘K). */}
-        <Button className="w-full" onClick={openNewSession}>
-          New task
-        </Button>
+      <SidebarHeader className="gap-2 px-3 pt-3">
+        {/* "New task" is now a destination, not a dialog: it leads to the start
+            screen (the canonical create surface). Lighter than the old lime CTA
+            — the composer there is the real "go" — but it still reads as the
+            rail's primary action via the leading +, and the active wash when
+            you're on it. Bumping the focus nonce drops the cursor in the
+            composer even when the start screen is already mounted. */}
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton asChild isActive={onStart} tooltip="New task">
+              <Link to="/sessions" onClick={() => requestComposerFocus()}>
+                <Plus />
+                <span>New task</span>
+                <Kbd className="ml-auto group-data-[collapsible=icon]:hidden">c</Kbd>
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
       </SidebarHeader>
 
       {/* SidebarContent is the scroll container (min-h-0 flex-1 overflow-auto
           by default), sitting between the pinned header and footer. */}
       <SidebarContent>
         <SidebarGroup className="py-1">
+          {/* "Recent" names what the list IS (my recent sessions, capped) so the
+              footer's "My tasks" can mean the full table without colliding. */}
+          <SidebarGroupLabel>Recent</SidebarGroupLabel>
           <SidebarGroupContent>
             {/* StatusGlyph reads content-surface vars (--ring, --muted-foreground)
                 which go near-invisible on the dark section rail. Remap them to
@@ -158,15 +170,15 @@ export function SessionsRail() {
         </SidebarGroup>
       </SidebarContent>
 
-      {/* Jump to the full lists, in the app's established vocabulary: My
-          sessions (mine, the full table) and All sessions (admin, fleet-wide),
-          each with the icon it carries in the spine + mobile strip. The badge
-          carries the true total, so the rail's 10-item cap stays honest. */}
+      {/* Jump to the full tables, in the app's established vocabulary: My tasks
+          (mine, the full table) and All tasks (admin, fleet-wide), each with the
+          icon it carries in the spine + mobile strip. The badge carries the true
+          total, so the rail's 10-item cap stays honest. */}
       <SidebarFooter className="gap-1">
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton asChild isActive={onMyList}>
-              <Link to="/sessions">
+              <Link to="/sessions/list">
                 <Layers />
                 <span>My tasks</span>
               </Link>

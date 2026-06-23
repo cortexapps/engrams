@@ -1,4 +1,4 @@
-import { Layers, ListChecks } from "lucide-react";
+import { Layers, ListChecks, SquarePlus } from "lucide-react";
 import { Link, Outlet, useRouterState, type LinkProps } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
 import { Sidebar, SidebarProvider } from "@/components/ui/sidebar";
@@ -16,14 +16,22 @@ export function SessionsLayout() {
   const isAdmin = useIsAdmin();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const seg = pathname.startsWith("/sessions/") ? pathname.split("/")[2] : undefined;
-  const onDetail = !!seg && seg !== "all";
+  // `list` and `all` are section pages (the full tables), not a transcript — the
+  // mobile scope strip stays up on them and only hides inside a session detail.
+  const onDetail = !!seg && seg !== "all" && seg !== "list";
 
   const scopes: (NavItem & { active: boolean })[] = [
     {
       to: "/sessions",
+      label: "Start",
+      icon: SquarePlus,
+      active: pathname === "/sessions" || pathname === "/sessions/",
+    },
+    {
+      to: "/sessions/list" as LinkProps["to"],
       label: "My tasks",
       icon: Layers,
-      active: pathname === "/sessions" || pathname === "/sessions/",
+      active: pathname.startsWith("/sessions/list"),
     },
     ...(isAdmin
       ? [

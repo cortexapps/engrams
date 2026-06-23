@@ -12,7 +12,8 @@ import { abilityFor } from "./lib/ability";
 import type { AuthState } from "./auth/AuthProvider";
 
 // Stub the app shell so the route tree resolves without AuthProvider or RPCs.
-// Outlet passthroughs let child routes (sessionsLayoutRoute → MySessions) render.
+// Outlet passthroughs let child routes (sessionsLayoutRoute → StartScreen, the
+// /sessions index) render.
 vi.mock("./pages/RootLayout", async () => {
   const { Outlet } = await import("@tanstack/react-router");
   return { RootLayout: () => <Outlet /> };
@@ -21,8 +22,8 @@ vi.mock("./pages/sessions/SessionsLayout", async () => {
   const { Outlet } = await import("@tanstack/react-router");
   return { SessionsLayout: () => <Outlet /> };
 });
-vi.mock("./pages/sessions/MySessions", () => ({
-  MySessions: () => <div data-testid="sessions" />,
+vi.mock("./pages/sessions/StartScreen", () => ({
+  StartScreen: () => <div data-testid="sessions" />,
 }));
 
 import { routeTree } from "./router";

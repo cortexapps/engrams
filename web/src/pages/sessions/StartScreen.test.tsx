@@ -1,28 +1,40 @@
-// Contract test for the full-page Launch picker (redesign §H): renders the
-// profile cards + the "this session will be able to" receipt, and launching
-// calls CreateTask with the selected profile + prompt.
+// Contract test for the task start screen (the /sessions landing): preselects
+// the last-launched profile, renders the collapsible "this session can" receipt,
+// and launching calls CreateTask with the selected profile + prompt.
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRouterTransport } from "@connectrpc/connect";
-import { renderWithProviders } from "../test-utils";
-import { LaunchPage } from "./LaunchPage";
-import { TaskService } from "../gen/engram/app/v1/task_pb";
-import { ProfileService } from "../gen/engram/app/v1/profile_pb";
-import { IntegrationService } from "../gen/engram/app/v1/integration_pb";
-import { ImageService } from "../gen/engram/app/v1/image_pb";
+import { renderWithProviders } from "../../test-utils";
+import { StartScreen } from "./StartScreen";
+import { TaskService } from "../../gen/engram/app/v1/task_pb";
+import { ProfileService } from "../../gen/engram/app/v1/profile_pb";
+import { IntegrationService } from "../../gen/engram/app/v1/integration_pb";
+import { ImageService } from "../../gen/engram/app/v1/image_pb";
 
-const PROFILE = {
+const BUGFIX = {
   id: "pf1",
   name: "Bug-fix agent",
   description: "Reproduce, fix, open a PR.",
-  icon: "Bot",
+  icon: "Bug",
   imageId: "img1",
   includeUserTokens: false,
   envVars: {},
   skills: [],
   capabilities: ["github:pulls:write"],
+  secrets: [],
+};
+const DOCS = {
+  id: "pf2",
+  name: "Docs agent",
+  description: "Edit docs, fully sandboxed.",
+  icon: "FileText",
+  imageId: "img1",
+  includeUserTokens: false,
+  envVars: {},
+  skills: [],
+  capabilities: [],
   secrets: [],
 };
 const CATALOG = [
@@ -61,7 +73,7 @@ function installTransport() {
       deleteTask: () => ({}),
     });
     router.service(ProfileService, {
-      listProfiles: () => ({ profiles: [PROFILE] }),
+      listProfiles: () => ({ profiles: [BUGFIX, DOCS] }),
       getProfile: () => ({ profile: undefined }),
       createProfile: () => ({ profile: undefined }),
       updateProfile: () => ({ profile: undefined }),
@@ -91,23 +103,28 @@ function installTransport() {
   return { transport, created };
 }
 
-describe("LaunchPage", () => {
-  afterEach(() => cleanup());
+describe("StartScreen", () => {
+  beforeEach(() => localStorage.clear());
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
 
-  test("renders the profile card + receipt and launches with the prompt", async () => {
+  test("preselects the first profile and launches with the prompt", async () => {
     const { transport, created } = installTransport();
-    renderWithProviders(<LaunchPage />, { transport });
+    renderWithProviders(<StartScreen />, { transport });
     const user = userEvent.setup();
 
+    // No stored preference → first profile is the default, shown in the switcher.
     expect(await screen.findByText("Bug-fix agent")).toBeTruthy();
-    // The default-selected profile's receipt derives a write power from the catalog.
-    expect(await screen.findByText(/this session will be able to/i)).toBeTruthy();
-    expect(screen.getByText(/write pulls/i)).toBeTruthy();
-    // api.github.com is opened by the granted power.
+
+    // The receipt summary is visible; expanding reveals the derived power + host.
+    await user.click(screen.getByText(/this session can/i));
+    expect(await screen.findByText(/write pulls/i)).toBeTruthy();
     expect(screen.getByText("api.github.com")).toBeTruthy();
 
     await user.type(screen.getByLabelText("Task"), "Fix the flaky test and open a PR.");
-    await user.click(screen.getByTestId("launch-session"));
+    await user.click(screen.getByTestId("launch-task"));
 
     await waitFor(() => expect(created).toHaveLength(1));
     expect(created[0]).toEqual({
@@ -115,5 +132,17 @@ describe("LaunchPage", () => {
       profileId: "pf1",
       prompt: "Fix the flaky test and open a PR.",
     });
+  });
+
+  test("preselects the last-launched profile from storage", async () => {
+    localStorage.setItem("engrams:lastProfileId", "pf2");
+    const { transport } = installTransport();
+    renderWithProviders(<StartScreen />, { transport });
+
+    // The stored profile wins over the first-in-list default.
+    expect(await screen.findByText("Docs agent")).toBeTruthy();
+    // Docs grants no powers — every session is sandboxed, so there's nothing to
+    // disclose and the reach receipt doesn't render.
+    expect(screen.queryByText(/this session can reach/i)).toBeNull();
   });
 });
