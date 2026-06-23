@@ -171,6 +171,13 @@ config-driven mint ADR 0056 §9 deferred).
   are not re-done here. The `connectors` dep in `tasks.ts`/`profiles.ts` narrows to the read-only
   `CustomConnectorSource`; the full-CRUD `ConnectorStore` backs `IntegrationService`.
 - **C4** — Web `/settings/integrations` UI (Plane A/B).
+  *As built:* `useIntegrations.ts` (connectors CRUD + `useMintKinds`); `IntegrationsPanel` at
+  `/settings/integrations` (admin) + a Settings → Org nav entry. **Plane A** is a data-driven mint
+  form from `ListMintKinds` — each field is written as an org secret named `<kind>.<field>`, so the
+  GitHub App ID + PEM land exactly where C2 resolves them (this is the cred-migration entry point).
+  **Plane B** is a connector form-builder (provider / hosts / header / secret-ref / template +
+  repeatable operation rows) → `UpsertConnector` (server-validated by `parseConnector`) plus the
+  write-only credential → org secret under the ref. Built-in connectors are read-only.
 - **D1** — Catalog-driven capability picker in the profile editor.
 - **D2** — Retire `[git]`/`GitConfig` into capabilities; **ADR Accepted**.
 
