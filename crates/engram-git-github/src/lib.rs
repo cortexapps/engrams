@@ -12,12 +12,16 @@
 //! the coordinator.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use engram_core::error::IntegrationError;
-use engram_core::traits::{CredentialHint, Integration, ScopedCredential};
+use engram_core::traits::{
+    CredentialHint, Integration, MintFieldKind, MintFieldSchema, MintKindDescriptor,
+    ResolvedFields, ScopedCredential,
+};
 use engram_core::types::Capability;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use parking_lot::Mutex;
@@ -452,6 +456,43 @@ async fn ensure_ok(
         422 => IntegrationError::Rejected(msg),
         _ => IntegrationError::Protocol(msg),
     })
+}
+
+/// The `github_app` mint kind (ADR 0057 C2): a GitHub App authenticated by App
+/// ID + RSA private-key PEM. An admin supplies both via the integrations UI (the
+/// PEM sealed in the org-secret store); the coordinator resolves the two fields
+/// (org secrets `github_app.app_id` / `github_app.private_key_pem`, name =
+/// `<kind>.<field>`) and calls `build` to construct the engine lazily. This is
+/// the data-driven frame around minting — the mint logic stays in [`GitHubApp`].
+pub fn github_app_descriptor() -> MintKindDescriptor {
+    MintKindDescriptor {
+        kind: "github_app",
+        provider: "github",
+        display_name: "GitHub App",
+        fields: vec![
+            MintFieldSchema {
+                name: "app_id",
+                label: "App ID",
+                field_kind: MintFieldKind::Config,
+                required: true,
+            },
+            MintFieldSchema {
+                name: "private_key_pem",
+                label: "Private key (PEM)",
+                field_kind: MintFieldKind::SealedSecret,
+                required: true,
+            },
+        ],
+        build: |fields: &ResolvedFields| {
+            let app_id = fields.get("app_id").ok_or_else(|| {
+                IntegrationError::InvalidSpec("github_app mint: missing app_id".into())
+            })?;
+            let pem = fields.get("private_key_pem").ok_or_else(|| {
+                IntegrationError::InvalidSpec("github_app mint: missing private_key_pem".into())
+            })?;
+            Ok(Arc::new(GitHubApp::new(app_id.clone(), pem)?) as Arc<dyn Integration>)
+        },
+    }
 }
 
 #[cfg(test)]

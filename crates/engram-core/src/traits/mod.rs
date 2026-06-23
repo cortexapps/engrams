@@ -24,7 +24,10 @@ pub mod storage;
 
 pub use cloud::{CloudBackend, PreemptionStream};
 pub use host_client::HostClient;
-pub use integration::{CredentialHint, Integration, ScopedCredential};
+pub use integration::{
+    CredentialHint, Integration, MintFieldKind, MintFieldSchema, MintKindDescriptor,
+    ResolvedFields, ScopedCredential,
+};
 pub use metadata::{
     DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, SnapshotTotals, StaleSessionLease,
     UpdateOutcome,
@@ -32,5 +35,7 @@ pub use metadata::{
 pub use sandbox::{
     ForgeSink, HarnessByteStream, HarnessDial, HarnessSink, SandboxBackend, UploadSink,
 };
-pub use secrets::{LayeredSecretStore, ResolvedSecret, SecretBundle, SecretContext, SecretStore};
+pub use secrets::{
+    LayeredSecretStore, ResolvedSecret, SecretBundle, SecretContext, SecretStore, StaticSecretStore,
+};
 pub use storage::{BlobObjectMeta, BlobStorage, ByteStream};

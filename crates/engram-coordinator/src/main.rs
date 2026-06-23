@@ -221,14 +221,21 @@ fn parse_secrets_choice(s: &str) -> Result<SecretsChoice, String> {
     }
 }
 
-/// ADR 0056: build the provider integrations from CLI flags. `none` → empty
-/// (forge endpoints 501); `github` → a `GitHubApp` registered as `"github"`.
-fn build_integrations(
+/// ADR 0057 C2: the boot-env GitHub App credential, surfaced as a **fallback
+/// secret layer** (canonical `github_app.*` names) behind the org-secret store
+/// rather than an eagerly-built engine. Returns `None` for `--git-forge=none`.
+///
+/// The mint engine is built lazily by [`IntegrationBroker::resolve`] from the
+/// composed `SecretStore`: an admin-entered org secret (`github_app.app_id` /
+/// `github_app.private_key_pem`) wins; otherwise these boot-env values keep
+/// minting working unchanged. Dropping the boot env (`ENGRAM_GITHUB_APP_*`) is
+/// the deliberate post-C4 cutover once the key is entered via the UI. The PEM is
+/// validated here so a bad key still fails boot (as before).
+fn github_boot_fallback(
     cli: &Cli,
-) -> Result<engram_coordinator::integrations::IntegrationBroker, CoordinatorError> {
-    use engram_coordinator::integrations::IntegrationBroker;
+) -> Result<Option<std::collections::HashMap<String, String>>, CoordinatorError> {
     match cli.git_forge.as_str() {
-        "none" => Ok(IntegrationBroker::new()),
+        "none" => Ok(None),
         "github" => {
             let app_id = cli.github_app_id.clone().ok_or_else(|| {
                 CoordinatorError::Config("--git-forge=github requires --github-app-id".into())
@@ -249,9 +256,13 @@ fn build_integrations(
                     ))
                 }
             };
-            let app = engram_git_github::GitHubApp::new(app_id, &pem)
+            // Fail fast on a malformed key (preserves the old eager-build check).
+            engram_git_github::GitHubApp::new(app_id.clone(), &pem)
                 .map_err(|e| CoordinatorError::Config(format!("github integration: {e}")))?;
-            Ok(IntegrationBroker::with(Arc::new(app)))
+            Ok(Some(std::collections::HashMap::from([
+                ("github_app.app_id".to_string(), app_id),
+                ("github_app.private_key_pem".to_string(), pem),
+            ])))
         }
         other => Err(CoordinatorError::Config(format!(
             "invalid --git-forge `{other}` (expected none | github)"
@@ -841,11 +852,29 @@ async fn main() -> Result<(), CoordinatorError> {
     // PG-authoritative (ADR 0047) — resume re-resolves with no orchestrator hop.
     let org_secret_backend =
         engram_coordinator::org_secrets::OrgSecretBackend::new(meta_arc.clone(), kek.clone());
-    let secrets: Arc<dyn SecretStore> =
-        Arc::new(engram_core::traits::LayeredSecretStore::new(vec![
-            Arc::new(org_secret_backend) as Arc<dyn SecretStore>,
-            deployment_secrets,
-        ]));
+    let mut secret_backends: Vec<Arc<dyn SecretStore>> =
+        vec![Arc::new(org_secret_backend) as Arc<dyn SecretStore>];
+    // ADR 0057 C2: the boot-env GitHub App key (if `--git-forge=github`) rides as a
+    // `StaticSecretStore` under canonical `github_app.*` names, layered AHEAD of the
+    // deployment backend. The order is load-bearing: the deployment backend (GCP SM)
+    // can't resolve the synthetic mint-key name — an empty repo + a `.` build an invalid
+    // Secret Manager id, which it maps to a `400`/`Err` that `LayeredSecretStore`
+    // PROPAGATES before reaching a later layer. A fallback placed *after* it would never
+    // be consulted and git minting would break on the coord roll. Placed first, the
+    // `github_app.*` names resolve here and never touch the deployment backend. The org
+    // store (layered first of all) still wins, so an admin-entered key takes precedence;
+    // dropping the boot env is the post-C4 cutover. The static layer holds ONLY
+    // `github_app.*`, so it can't shadow any real image/profile secret (those fall
+    // through to the deployment backend below).
+    if let Some(fallback) = github_boot_fallback(&cli)? {
+        secret_backends.push(
+            Arc::new(engram_core::traits::StaticSecretStore::new(fallback)) as Arc<dyn SecretStore>,
+        );
+    }
+    secret_backends.push(deployment_secrets);
+    let secrets: Arc<dyn SecretStore> = Arc::new(engram_core::traits::LayeredSecretStore::new(
+        secret_backends,
+    ));
 
     // KEK + meta_arc + blob were constructed up-front so the OCI
     // auth resolver / chunk store could reference them. They flow
@@ -878,7 +907,10 @@ async fn main() -> Result<(), CoordinatorError> {
         materialize_dir: coord_materialize_dir,
     };
 
-    let integrations = build_integrations(&cli)?;
+    // ADR 0057 C2: the broker carries the static mint-kind registry; engines are
+    // built lazily from `services.secrets` (org store → deployment → the boot-env
+    // fallback layered above), so no eager GitHub App build at boot.
+    let integrations = engram_coordinator::integrations::IntegrationBroker::new();
 
     // ADR 0051: the coordinator no longer assembles a human auth runtime.
     // The orchestrator owns auth/authz; the coordinator authenticates only

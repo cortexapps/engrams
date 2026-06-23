@@ -165,6 +165,7 @@ async fn build_app_state(
         meta,
         state.events.clone(),
         state.host_registry.clone(),
+        state.integrations.clone(),
     ));
     state
 }

@@ -19,6 +19,9 @@
 //! interceptor + connector config — NOT here. This trait is only the bespoke,
 //! security-critical residue.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -88,4 +91,55 @@ pub trait Integration: Send + Sync {
     ) -> Result<serde_json::Value, IntegrationError> {
         Err(IntegrationError::Unsupported)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mint-kind registry (ADR 0057 C2) — the data-driven frame around Plane-A mint
+// ---------------------------------------------------------------------------
+
+/// The input kind of a mint-config field — drives the Plane-A admin form widget
+/// and whether the value is sealed at rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MintFieldKind {
+    /// Non-sensitive configuration (e.g. an App ID) — plain text input.
+    Config,
+    /// A credential (e.g. a private-key PEM) — masked input, stored sealed in
+    /// the org-secret store.
+    SealedSecret,
+}
+
+/// One field an admin supplies to configure a mint kind. `name` is also the
+/// suffix of the org secret the coordinator resolves the value from at mint time
+/// (`<kind>.<name>`), so the Plane-A write and the mint-time read agree on the
+/// key without a side channel.
+#[derive(Clone, Debug)]
+pub struct MintFieldSchema {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub field_kind: MintFieldKind,
+    pub required: bool,
+}
+
+/// Resolved field values (field `name` → value) used to build a mint engine.
+pub type ResolvedFields = HashMap<String, String>;
+
+/// Describes one mint kind (Plane A): the provider it backs, the form fields an
+/// admin supplies, and how to build the [`Integration`] engine from resolved
+/// field values. Each built-in mint crate (e.g. `engram-git-github`) exports one;
+/// the coordinator assembles them into a registry it surfaces over gRPC
+/// (`ListMintKinds`, C3) so the admin form is data-driven. The mint *logic* stays
+/// bespoke Rust — this is the frame around it, not a generic config-driven mint.
+#[derive(Clone)]
+pub struct MintKindDescriptor {
+    /// Stable kind id matching a connector's `credential.mint.kind` (e.g. `"github_app"`).
+    pub kind: &'static str,
+    /// The provider this mint kind serves (e.g. `"github"`).
+    pub provider: &'static str,
+    /// Human-readable label for the admin UI.
+    pub display_name: &'static str,
+    /// The config fields an admin fills in (also the org-secret name suffixes).
+    pub fields: Vec<MintFieldSchema>,
+    /// Build the engine from resolved field values. Pure (no I/O) — the
+    /// coordinator resolves the values first.
+    pub build: fn(&ResolvedFields) -> Result<Arc<dyn Integration>, IntegrationError>,
 }

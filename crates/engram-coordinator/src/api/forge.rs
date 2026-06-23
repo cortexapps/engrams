@@ -66,8 +66,8 @@ async fn authorize(
 ) -> Result<Arc<dyn Integration>, Denied> {
     let integration = state
         .integrations
-        .get("github")
-        .cloned()
+        .resolve("github", &state.services.secrets)
+        .await
         .ok_or(Denied::NoForge)?;
     if crate::api::session_auth::authorize_broker_token(state, session, token).await {
         Ok(integration)
