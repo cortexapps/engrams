@@ -130,17 +130,10 @@ pub(crate) async fn resolve_resume_agent_and_policy(
     // Rebuild the SessionEgressPolicy for `sandbox_id`. Falls back to the
     // legacy placeholder when the host has no guest IP (process backend, VZ in
     // some configs) or the IP is unparseable — same as the create path.
-    let policy = crate::api::sessions::build_resume_egress_policy(
-        state,
-        id,
-        sandbox_id,
-        &b.bundle,
-        &b.manifest,
-        &b.env,
-        &session.image,
-    )
-    .await
-    .unwrap_or_else(|| placeholder_egress_policy(id, sandbox_id));
+    let policy =
+        crate::api::sessions::build_resume_egress_policy(state, id, sandbox_id, &session.image)
+            .await
+            .unwrap_or_else(|| placeholder_egress_policy(id, sandbox_id));
     Some((agent, policy))
 }
 

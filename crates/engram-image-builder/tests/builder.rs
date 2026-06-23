@@ -746,11 +746,10 @@ async fn manifest_round_trips_full_engram_toml_through_baker() {
 
     assert_eq!(parsed.name, "cortex-api");
     assert_eq!(parsed.description.as_deref(), Some("API service"));
-    assert_eq!(parsed.secret_mode, engram_core::types::SecretMode::Broker);
     assert_eq!(parsed.env["NODE_ENV"], "production");
-    assert!(parsed.secrets.contains_key("GITHUB_TOKEN"));
-    assert_eq!(parsed.network.allow_hosts, vec!["api.github.com"]);
     assert_eq!(parsed.resources.suggested_memory_mib, Some(4096));
+    // ADR 0057: secret_mode / [secrets] / [network] are no longer manifest
+    // fields — the source engram.toml's sections are ignored and not rendered.
 }
 
 // ---------------------------------------------------------------------

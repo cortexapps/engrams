@@ -112,11 +112,20 @@ config-driven mint ADR 0056 §9 deferred).
     `IntegrationPolicy` name + the `integration_policy_json` wire field — the cosmetic rename
     to `SessionPolicy` is a deferred follow-up (cf. ADR 0056's deferred `ForgeOp`→
     `IntegrationOp` rename).
-  - **B2b** *(the clean break)*: the coordinator sources network + secrets from the policy
-    (per-secret resolution: literal→env, broker→placeholder+egress entry) with a manifest
-    fallback, then **strip** `secrets`/`secret_mode`/`network` from `ImageManifest` (drop
-    `deny_unknown_fields` so pre-strip manifests still parse), seed default/dogfood profiles,
-    re-bake images.
+  - **B2b** *(the clean break)*: the coordinator sources network + secrets **solely** from
+    the policy — no manifest fallback — on both create and resume (per-secret resolution:
+    literal→env, broker→placeholder+egress entry; resume re-reads the persisted policy via
+    `load_session_policy`). A session with no policy gets deny-all + no secrets (the secure
+    default). **Strip** `secrets`/`secret_mode`/`network` from `ImageManifest` (drop
+    `deny_unknown_fields` so pre-strip stored manifests still parse during rollout). Edges:
+    `cold_boot_spec` takes an explicit `network` — base-snapshot **capture** uses allow-all
+    (trusted build step; the snapshot is network-agnostic), disk-only **recovery** rebuilds
+    from the session's persisted policy; the session-level `SessionEgressPolicy.secret_mode`
+    is now vestigial (per-entry substitution). Policy-less callers updated: `engram-cli`
+    sends an allow-all policy; e2e/lifecycle creates run deny-all (they don't assert egress).
+    Operational: default/dogfood **profiles must be seeded** (≥ `api.anthropic.com`) before
+    this rolls, and images re-bake. The `IntegrationPolicy`→`SessionPolicy` rename stays
+    deferred (cosmetic).
 - **C1** — DB-back the connector catalog (orchestrator-only; built-ins as read-only seeds).
 - **C2** — Mint-kind registry + GitHub cred migration (creds sourced from the org store;
   retire `--git-forge`/`--github-app-*`).
