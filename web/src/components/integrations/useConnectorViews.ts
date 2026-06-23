@@ -8,6 +8,7 @@
 import { useConnectors, useIntegrationCatalog } from "@/hooks/useIntegrations";
 import { useProfiles } from "@/hooks/useProfiles";
 import { fallbackIdentity, type Access } from "@/lib/connectorModel";
+import type { ProviderCatalogEntry } from "@/gen/engram/app/v1/integration_pb";
 
 export interface ConnectorCapabilityView {
   action: string;
@@ -81,4 +82,38 @@ export function useConnectorViews(): ConnectorViewsResult {
 /** Write-count helper shared by the cards + detail. */
 export function writeCount(caps: ConnectorCapabilityView[]): number {
   return caps.filter((c) => c.access === "write").length;
+}
+
+/**
+ * Map the member catalog (GetIntegrationCatalog) into `ConnectorView`s without
+ * the admin-only connector list — for member-facing surfaces (the Launch receipt,
+ * session-event icons) where `status`/`builtin`/`usedBy` don't apply. Status is
+ * reported "available" (unused by these surfaces).
+ */
+export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView[] {
+  return providers.map((e) => {
+    const fb = fallbackIdentity(e.provider);
+    return {
+      provider: e.provider,
+      name: e.display?.name || fb.name,
+      category: e.display?.category || fb.category,
+      blurb: e.display?.blurb ?? "",
+      icon: {
+        mono: e.display?.icon?.mono || fb.icon.mono,
+        color: e.display?.icon?.color || fb.icon.color,
+        ...(e.display?.icon?.logo ? { logo: e.display.icon.logo } : {}),
+      },
+      credentialSource: e.credentialSource === "mint" ? "mint" : "inject",
+      hosts: e.hosts,
+      capabilities: e.capabilities.map((c) => ({
+        action: c.action,
+        access: c.access === "write" ? "write" : "read",
+        ...(c.asset ? { asset: c.asset } : {}),
+      })),
+      status: "available" as const,
+      builtin: false,
+      usedBy: 0,
+      usedByProfiles: [],
+    };
+  });
 }
