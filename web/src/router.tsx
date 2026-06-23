@@ -43,6 +43,7 @@ import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
+import { LaunchPage } from "./pages/LaunchPage";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -106,6 +107,13 @@ const indexRoute = createRoute({
   beforeLoad: () => {
     throw redirect({ to: "/sessions" });
   },
+});
+
+// /launch — the full-page new-session picker (redesign §H).
+const launchRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: "/launch",
+  component: LaunchPage,
 });
 
 // /sessions layout route (second sidebar) ----------------------------------
@@ -240,6 +248,7 @@ export const routeTree = rootRoute.addChildren([
   // Authenticated app shell — all authenticated routes nested here
   appLayoutRoute.addChildren([
     indexRoute,
+    launchRoute,
     sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
     operatorLayoutRoute.addChildren([
       operatorIndexRoute,

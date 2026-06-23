@@ -1,4 +1,5 @@
-import { useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { Rocket } from "lucide-react";
 import { useTasksAsSessionList } from "../../hooks/useTasks";
 import { useAuth } from "../../auth/AuthProvider";
 import { Card, CardContent } from "@/components/ui/card";
@@ -19,10 +20,18 @@ export function MySessions() {
         title="Tasks"
         description="Bounded units of agent work: launch, watch, resume."
         actions={
-          <NewSessionDialog
-            triggerTestId="new-session"
-            onCreated={(id) => navigate({ to: "/sessions/$id", params: { id } })}
-          />
+          <div className="flex items-center gap-2">
+            <Button asChild variant="outline">
+              <Link to="/launch">
+                <Rocket className="size-4" />
+                Launch
+              </Link>
+            </Button>
+            <NewSessionDialog
+              triggerTestId="new-session"
+              onCreated={(id) => navigate({ to: "/sessions/$id", params: { id } })}
+            />
+          </div>
         }
       />
 

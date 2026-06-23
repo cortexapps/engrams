@@ -3,9 +3,7 @@ import {
   CameraIcon,
   DownloadIcon,
   ExternalLinkIcon,
-  GitPullRequestIcon,
   InfoIcon,
-  PuzzleIcon,
   RotateCcwIcon,
   XIcon,
 } from "lucide-react";
@@ -15,6 +13,8 @@ import { Badge } from "@/components/ui/badge";
 import { Text } from "@/components/ui/text";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
+import { ProviderTile } from "@/components/integrations/ProviderTile";
+import { useProviderIdentity } from "../../hooks/useIntegrations";
 import { API_BASE } from "../../lib/base";
 import { fmtBytes, hms } from "../transcriptFmt";
 import type { SystemMarker } from "./buildMessages";
@@ -118,12 +118,10 @@ function Durability({ marker }: { marker: Extract<SystemMarker, { kind: "durabil
 type IntegrationAssetMarker = Extract<SystemMarker, { kind: "integration_asset" }>;
 
 function IntegrationAsset({ marker }: { marker: IntegrationAssetMarker }) {
-  switch (`${marker.provider}/${marker.assetKind}`) {
-    case "forge/pull_request":
-      return <PullRequestCard marker={marker} />;
-    default:
-      return <GenericAsset marker={marker} />;
-  }
+  // pull_request is GitHub-shaped regardless of the provider id minting it
+  // (the legacy "forge" name and the current "github" both map here).
+  if (marker.assetKind === "pull_request") return <PullRequestCard marker={marker} />;
+  return <GenericAsset marker={marker} />;
 }
 
 // Typed-but-opaque payload accessors — `data` is provider-shaped JSON.
@@ -139,6 +137,7 @@ function dataNum(data: Record<string, unknown>, key: string): number | undefined
 // Built-in renderer for `forge/pull_request` — the card the old
 // PullRequestOpened event rendered, now fed from `data` + `fetchable`.
 function PullRequestCard({ marker }: { marker: IntegrationAssetMarker }) {
+  const identity = useProviderIdentity(marker.provider);
   const url = marker.fetchable?.kind === "external" ? marker.fetchable.url : undefined;
   const repo = dataStr(marker.data, "repo");
   const title = dataStr(marker.data, "title") ?? "pull request";
@@ -149,7 +148,7 @@ function PullRequestCard({ marker }: { marker: IntegrationAssetMarker }) {
     <Card className="py-0">
       <CardContent className="flex flex-col gap-1.5 p-4">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <GitPullRequestIcon className="size-3.5 text-primary" />
+          <ProviderTile {...identity.icon} name={identity.name} size={16} />
           <Text as="span" variant="label">
             pull request
           </Text>
@@ -197,6 +196,7 @@ function PullRequestCard({ marker }: { marker: IntegrationAssetMarker }) {
 // fetchable link. No per-provider code — a polished card is an opt-in entry
 // in the registry above.
 function GenericAsset({ marker }: { marker: IntegrationAssetMarker }) {
+  const identity = useProviderIdentity(marker.provider);
   const url = marker.fetchable?.kind === "external" ? marker.fetchable.url : undefined;
   const entries = Object.entries(marker.data).filter(
     ([, v]) => typeof v === "string" || typeof v === "number" || typeof v === "boolean",
@@ -205,9 +205,9 @@ function GenericAsset({ marker }: { marker: IntegrationAssetMarker }) {
     <Card className="py-0">
       <CardContent className="flex flex-col gap-1.5 p-4">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <PuzzleIcon className="size-3.5 text-primary" />
+          <ProviderTile {...identity.icon} name={identity.name} size={16} />
           <Text as="span" variant="label">
-            {marker.provider}
+            {identity.name}
           </Text>
           <span aria-hidden>·</span>
           <span className="font-mono">{marker.assetKind}</span>
