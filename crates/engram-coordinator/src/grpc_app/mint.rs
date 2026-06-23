@@ -96,8 +96,16 @@ impl app::mint_service_server::MintService for AppMintService {
                         .await
                         .ok_or_else(|| "mint credentials are not configured".to_string())?
                 };
+                // served_host is the integration's OWN host identity (e.g.
+                // github.com, the git host a multi-host provider validates
+                // against) — a different namespace from the connector's egress/API
+                // host we GET below (api.github.com). The real mint paths pass the
+                // git host (forge.rs) or None (egress broker), never the API host,
+                // so do NOT derive it from spec.host or the provider rejects the
+                // request ("does not serve host `api.github.com`"). Mint the
+                // default credential; the probe still targets spec.host via `url`.
                 let hint = CredentialHint {
-                    host: Some(spec.host.clone()),
+                    served_host: None,
                     owner: None,
                 };
                 let cred = engine
