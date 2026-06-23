@@ -8,6 +8,7 @@ import { useProfile, useCreateProfile, useUpdateProfile } from "../../hooks/useP
 import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { IconPicker } from "../../components/profiles/IconPicker";
+import { CapabilityPicker } from "../../components/profiles/CapabilityPicker";
 import {
   EnvVarsEditor,
   envRowsToMap,
@@ -77,10 +78,10 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const create = useCreateProfile();
   const update = useUpdateProfile();
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
-  // ADR 0056: capabilities are a free-form list (no catalog) — one
-  // "provider:action[@resource]" per line. Local state like envRows; parsed +
-  // validated into the payload at submit.
-  const [capsText, setCapsText] = useState("");
+  // ADR 0057 D1: capabilities are picked from the connector catalog
+  // (provider:action[@resource]); local state assembled into the payload at
+  // submit. The orchestrator + coordinator re-validate against the registry.
+  const [capabilities, setCapabilities] = useState<string[]>([]);
 
   // ADR 0057: profile-defined egress network policy + injected secrets (lifted
   // off the image manifest). Local state like envRows/capsText, assembled into
@@ -149,7 +150,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         skills: p.skills ?? [],
       });
       setEnvRows(mapToEnvRows(p.envVars));
-      setCapsText((p.capabilities ?? []).join("\n"));
+      setCapabilities(p.capabilities ?? []);
       setNetworkDefault(p.network?.default === "allow" ? "allow" : "deny");
       setAllowHostsText((p.network?.allowHosts ?? []).join("\n"));
       setAllowPatternsText((p.network?.allowHostPatterns ?? []).join("\n"));
@@ -166,10 +167,6 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   }, [mode, imageId, images, form]);
 
   const onSubmit = async (v: Values) => {
-    const capabilities = capsText
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
     const badCap = capabilities.find((c) => !isValidCapability(c));
     if (badCap) {
       form.setError("root", {
@@ -441,20 +438,11 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             <EnvVarsEditor rows={envRows} onChange={setEnvRows} />
           </Field>
           <Field>
-            <FieldLabel htmlFor="capabilities">Integration capabilities</FieldLabel>
-            <Textarea
-              id="capabilities"
-              value={capsText}
-              onChange={(e) => setCapsText(e.target.value)}
-              rows={3}
-              placeholder={
-                "github:contents:write@cortexapps/engrams\ngithub:issues:write\ndatadog:logs:read"
-              }
-              className="font-mono text-sm"
-            />
+            <FieldLabel>Integration capabilities</FieldLabel>
+            <CapabilityPicker value={capabilities} onChange={setCapabilities} />
             <FieldDescription>
-              One per line, <code>provider:action[@resource]</code>. Sessions from this profile are
-              granted these third-party integration capabilities (ADR 0056). Empty = none.
+              Toggle the third-party capabilities sessions from this profile are granted (ADR 0056).
+              Options come from the connector catalog (Settings → Integrations). Empty = none.
             </FieldDescription>
           </Field>
         </FieldGroup>
