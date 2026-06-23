@@ -39,8 +39,9 @@ import {
   grantsCapability,
   loadRegistry,
   type Connector,
+  type CustomConnectorSource,
 } from "../connectors/registry.ts";
-import { makeConnectorStore, type ConnectorStore } from "../db/connectors.ts";
+import { makeConnectorStore } from "../db/connectors.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -58,7 +59,7 @@ export interface ProfileDeps {
   store?: ProfileStore;
   images?: ImagesClient;
   mountCatalog?: MountCatalogClient;
-  connectors?: ConnectorStore;
+  connectors?: CustomConnectorSource;
 }
 
 function headersOf(ctx: HandlerContext): Headers {
@@ -178,7 +179,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   // handler actually reads connectors, so importing/registering without a DB
   // (tests) doesn't throw. loadRegistry degrades to built-in seeds if the read
   // fails.
-  const connectors: ConnectorStore = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
+  const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
 
   /** Validate image_id against the live catalog; throw InvalidArgument if absent. */
   async function assertImageEnabled(imageId: string): Promise<void> {

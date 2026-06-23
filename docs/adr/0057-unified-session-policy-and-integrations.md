@@ -157,8 +157,19 @@ config-driven mint ADR 0056 §9 deferred).
   the deliberate **post-C4 cutover** (you can't enter the PEM in a UI that doesn't exist yet).
   `ListMintKinds` gRPC is **regrouped into C3** (with the `IntegrationService` proto + proxy) to
   avoid a one-off coordinator proto with no caller.
-- **C3** — `IntegrationService` proto + orchestrator service (connector CRUD, `ListMintKinds`
-  over the coordinator `mint_kind_registry()`, org-secret put/list/delete — all proxied).
+- **C3** — Connector catalog CRUD + the mint-kind registry over gRPC.
+  *As built:* two services. **`MintService`** (coordinator `mint.proto`, build.rs-compiled like
+  `OrgSecretService`): `ListMintKinds` maps the coordinator's `mint_kind_registry()` → proto; an
+  admin-gated orchestrator proxy (`rpc/mint.ts`) + web hooks expose it for the Plane-A form.
+  **`IntegrationService`** (orchestrator-native `integration.proto`, NOT build.rs-compiled, like
+  `ProfileService`): `ListConnectors` (built-in file seeds read-only ∪ DB) / `UpsertConnector` /
+  `DeleteConnector` over the C1 `connector` table — admin-gated, `config_json` validated by
+  `parseConnector` (the admin-trust boundary) + `invalidateRegistry()` on write; built-in providers
+  are rejected. Deviation from the plan's "IntegrationService.ListMintKinds": `ListMintKinds` lives
+  on its own `MintService` (coordinator-sourced, proxied) to avoid cross-proto message imports.
+  Org-secret put/list/delete already shipped in C0 (the `OrgSecretService` proxy + panel), so they
+  are not re-done here. The `connectors` dep in `tasks.ts`/`profiles.ts` narrows to the read-only
+  `CustomConnectorSource`; the full-CRUD `ConnectorStore` backs `IntegrationService`.
 - **C4** — Web `/settings/integrations` UI (Plane A/B).
 - **D1** — Catalog-driven capability picker in the profile editor.
 - **D2** — Retire `[git]`/`GitConfig` into capabilities; **ADR Accepted**.

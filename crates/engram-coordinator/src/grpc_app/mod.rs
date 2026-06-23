@@ -14,6 +14,7 @@ pub mod auth;
 mod convert;
 mod fleet;
 mod image;
+mod mint;
 mod mount_catalog;
 mod org_secret;
 mod session;
@@ -28,6 +29,7 @@ use tonic::Status;
 
 pub use fleet::AppFleetService;
 pub use image::AppImageService;
+pub use mint::AppMintService;
 pub use mount_catalog::AppMountCatalogService;
 pub use org_secret::AppOrgSecretService;
 pub use session::AppSessionService;
@@ -172,6 +174,10 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
                 },
             ),
         )
+        // ADR 0057 C3: the read-only mint-kind registry (Plane-A form metadata).
+        .add_service(app::mint_service_server::MintServiceServer::new(
+            AppMintService { auth: auth.clone() },
+        ))
         // ADR 0057: the admin-managed, KEK-sealed org secret store.
         .add_service(app::org_secret_service_server::OrgSecretServiceServer::new(
             AppOrgSecretService { state, auth },
@@ -382,6 +388,7 @@ mod convention {
         ("image.rs", include_str!("image.rs")),
         ("mount_catalog.rs", include_str!("mount_catalog.rs")),
         ("org_secret.rs", include_str!("org_secret.rs")),
+        ("mint.rs", include_str!("mint.rs")),
     ];
 
     /// Files under `src/grpc_app/` that are deliberately NOT listed in

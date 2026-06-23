@@ -64,8 +64,13 @@ import {
 } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
-import { compileIntegrationPolicy, policyHasContent, loadRegistry } from "../connectors/registry.ts";
-import { makeConnectorStore, type ConnectorStore } from "../db/connectors.ts";
+import {
+  compileIntegrationPolicy,
+  policyHasContent,
+  loadRegistry,
+  type CustomConnectorSource,
+} from "../connectors/registry.ts";
+import { makeConnectorStore } from "../db/connectors.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -121,7 +126,7 @@ export interface TaskDeps {
   /** Enabled-image catalog client (ADR 0052) — resolves image_id → image_uri. */
   images?: ImagesClient;
   /** Connector catalog (ADR 0057) — custom connectors merged with built-in seeds. */
-  connectors?: ConnectorStore;
+  connectors?: CustomConnectorSource;
   db?: Db;
 }
 
@@ -364,7 +369,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
   const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
   // Lazy default (see profiles.ts): touch getDb() only when a handler reads
   // connectors, so registering without a DB doesn't throw.
-  const connectors: ConnectorStore = deps?.connectors ?? { list: () => makeConnectorStore(getDbFn()).list() };
+  const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDbFn()).list() };
 
   router.service(TaskService, {
     // -------------------------------------------------------------------------
