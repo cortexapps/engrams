@@ -437,7 +437,7 @@ mod adapter {
     pub mod hook_server {
         use super::{emit, BufReader, HarnessEvent};
         use engram_harness_proto::{Answers, Question};
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         use tokio::net::{UnixListener, UnixStream};
@@ -456,6 +456,19 @@ mod adapter {
         /// `UserQuestion`/`QuestionAnswered` events. Set by
         /// `start_turn`/`start_continuation_turn`.
         pub type CurrentRunId = Arc<Mutex<Option<String>>>;
+        /// ADR 0054: SESSION-level "an AskUserQuestion card is awaiting an
+        /// answer right now." Set true when the hook cards the first AUQ;
+        /// cleared when that answer is delivered. While true, EVERY further AUQ
+        /// — same run or a later one (the #64389 double-fire fires both ways) —
+        /// is a duplicate: no card, recorded in `DuplicateAuqIds` for the scrub.
+        /// Session-scoped (not per-run) so a cross-run sibling is still caught.
+        pub type QuestionOutstanding = Arc<Mutex<bool>>;
+        /// ADR 0054: `tool_use_id`s of duplicate AUQs the hook suppressed.
+        /// Drained at the answer-resume and handed to `scrub_transcript`, which
+        /// deletes each duplicate's `tool_use` from claude's transcript so the
+        /// resume re-fires exactly one question. Owned by `run_engine` so the
+        /// hook (which populates it) and the scrub (which drains it) share it.
+        pub type DuplicateAuqIds = Arc<Mutex<HashSet<String>>>;
 
         /// hook → harness (request). One line.
         #[derive(serde::Deserialize)]
@@ -473,20 +486,7 @@ mod adapter {
         pub enum HookVerdict {
             Answer { answers: Answers },
             Defer,
-            /// Deny a DUPLICATE `AskUserQuestion` within a run (the #64389
-            /// stdin-continuation double-fire). `reason` is surfaced to the
-            /// model as the denied tool's result. `{"verdict":"deny","reason":…}`.
-            Deny { reason: String },
         }
-
-        /// Reason returned when denying a duplicate `AskUserQuestion`. claude
-        /// reads it as the denied tool's result and settles — validated in
-        /// held-open stdin: the turn still ends `tool_deferred` on the FIRST
-        /// (real) question, claude does not loop on re-calls.
-        const DUPLICATE_AUQ_REASON: &str =
-            "A question is already awaiting the user's answer (engram defers \
-             AskUserQuestion). Do not call AskUserQuestion again; stop and wait \
-             for the answer.";
 
         /// Accept loop: one transient hook client per connection, each
         /// handled on its own task so parallel AUQ fires (distinct
@@ -497,15 +497,9 @@ mod adapter {
             answers_in_hand: AnswersInHand,
             current_run_id: CurrentRunId,
             evt_tx: mpsc::Sender<HarnessEvent>,
+            question_outstanding: QuestionOutstanding,
+            duplicate_auq_ids: DuplicateAuqIds,
         ) {
-            // ADR 0054: run_ids that have already DEFERRED an AskUserQuestion.
-            // A second AUQ in the same run is the #64389 stdin-continuation
-            // double-fire (claude re-calls the tool after deferring) — deny it
-            // (see `handle_one`) so it never becomes a second competing
-            // deferred tool. Owned by `serve` so it spans every connection for
-            // the engine's life; monotonic (one entry per asking-turn).
-            let deferred_auq_runs: Arc<Mutex<std::collections::HashSet<String>>> =
-                Arc::new(Mutex::new(std::collections::HashSet::new()));
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -514,7 +508,8 @@ mod adapter {
                             answers_in_hand.clone(),
                             current_run_id.clone(),
                             evt_tx.clone(),
-                            deferred_auq_runs.clone(),
+                            question_outstanding.clone(),
+                            duplicate_auq_ids.clone(),
                         ));
                     }
                     Err(e) => tracing::warn!(error = %e, "hook socket accept failed"),
@@ -527,7 +522,8 @@ mod adapter {
             answers_in_hand: AnswersInHand,
             current_run_id: CurrentRunId,
             evt_tx: mpsc::Sender<HarnessEvent>,
-            deferred_auq_runs: Arc<Mutex<std::collections::HashSet<String>>>,
+            question_outstanding: QuestionOutstanding,
+            duplicate_auq_ids: DuplicateAuqIds,
         ) {
             let (r, mut w) = stream.into_split();
             let mut lines = BufReader::new(r).lines();
@@ -547,45 +543,62 @@ mod adapter {
             // Verdict (+ optional event):
             //   answer-in-hand → answer + QuestionAnswered (consume with
             //     `remove`, so a re-fire of the SAME id after consumption
-            //     defers — one tool_result, structural idempotency, ADR 0054);
-            //   else first AUQ in this run → defer + UserQuestion (card);
-            //   else (a DISTINCT AUQ already deferred this run) → deny, NO card
-            //     — the #64389 stdin double-fire (see `deferred_auq_runs`).
-            // The answers-map lock is a temporary (dropped before the dedup
-            // lock — no lock-order coupling), and the event is emitted AFTER
-            // both locks drop (`emit` can block on host-link backpressure).
+            //     defers — one tool_result, structural idempotency, ADR 0054).
+            //     Clear `question_outstanding`: this card is now answered, so
+            //     the NEXT genuine question is carded afresh.
+            //   else, no question outstanding → defer + UserQuestion (card),
+            //     mark a question outstanding.
+            //   else (a question is ALREADY outstanding) → defer with NO card —
+            //     the #64389 stdin double-fire, WITHIN this run or a LATER one
+            //     (claude, held open on stdin, re-asks either way). We DEFER
+            //     rather than deny: a deny leaves a "stop and wait" tool_result
+            //     in claude's transcript that the model retries after the real
+            //     answer lands (re-ask + a second card). The duplicate stays a
+            //     parked tool; its id goes to `duplicate_auq_ids` so the
+            //     answer-resume scrub drops it, leaving exactly one question.
+            // The answers-map lock is a temporary (dropped before the
+            // outstanding lock — no lock-order coupling), and the event is
+            // emitted AFTER the locks drop (`emit` can block on host-link
+            // backpressure).
             let (verdict, event): (HookVerdict, Option<HarnessEvent>) = {
                 let answer = answers_in_hand.lock().await.remove(&req.tool_use_id);
                 match answer {
-                    Some(answers) => (
-                        HookVerdict::Answer {
-                            answers: answers.clone(),
-                        },
-                        Some(HarnessEvent::QuestionAnswered {
-                            run_id,
-                            tool_call_id: req.tool_use_id,
-                            answers,
-                        }),
-                    ),
+                    Some(answers) => {
+                        *question_outstanding.lock().await = false;
+                        (
+                            HookVerdict::Answer {
+                                answers: answers.clone(),
+                            },
+                            Some(HarnessEvent::QuestionAnswered {
+                                run_id,
+                                tool_call_id: req.tool_use_id,
+                                answers,
+                            }),
+                        )
+                    }
                     None => {
-                        // `insert` returns false iff the run already deferred an
-                        // AUQ → this is the duplicate. Empty run_id (defensive)
-                        // never dedups: always defer.
-                        let duplicate = !run_id.is_empty()
-                            && !deferred_auq_runs.lock().await.insert(run_id.clone());
+                        // Atomic check-and-set under one lock: the first AUQ
+                        // since the last answer flips the flag and is carded;
+                        // any AUQ while it is already set is the duplicate.
+                        let duplicate = {
+                            let mut outstanding = question_outstanding.lock().await;
+                            let was_set = *outstanding;
+                            *outstanding = true;
+                            was_set
+                        };
                         if duplicate {
+                            duplicate_auq_ids
+                                .lock()
+                                .await
+                                .insert(req.tool_use_id.clone());
                             tracing::warn!(
                                 %run_id,
                                 tool_use_id = %req.tool_use_id,
-                                "ADR 0054: duplicate AskUserQuestion in run (#64389 stdin \
-                                 double-fire); denying so it never becomes a second deferred tool"
+                                "ADR 0054: duplicate AskUserQuestion while one is outstanding \
+                                 (#64389 double-fire); deferring with no card (scrubbed before resume)"
                             );
-                            (
-                                HookVerdict::Deny {
-                                    reason: DUPLICATE_AUQ_REASON.to_string(),
-                                },
-                                None,
-                            )
+                            // Defer (keep it parked) but emit no card.
+                            (HookVerdict::Defer, None)
                         } else {
                             (
                                 HookVerdict::Defer,
@@ -694,12 +707,9 @@ mod adapter {
                     });
                     println!("{out}");
                 }
-                // ADR 0054: deny a duplicate AUQ (the #64389 double-fire) so it
-                // resolves now (deny tool_result) instead of becoming a second
-                // deferred tool. The reason is surfaced to the model.
-                Some(HookVerdict::Deny { reason }) => print_deny(&reason),
-                // Defer verdict, or any socket failure → defer. The turn
-                // ends `tool_deferred` and the VM can idle-evict.
+                // Defer verdict (incl. a no-card duplicate, ADR 0054), or any
+                // socket failure → defer. The turn ends `tool_deferred` and the
+                // VM can idle-evict.
                 _ => print_defer(),
             }
             std::process::ExitCode::SUCCESS
@@ -714,16 +724,6 @@ mod adapter {
             println!(
                 r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"defer"}}}}"#
             );
-        }
-        fn print_deny(reason: &str) {
-            let out = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            });
-            println!("{out}");
         }
 
         async fn round_trip(
@@ -882,6 +882,16 @@ mod adapter {
         // respawn (populated during the defer turn, drained at ResumeForAnswer).
         let scrub_msg_ids: Arc<tokio::sync::Mutex<HashSet<String>>> =
             Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        // ADR 0054: session-level AskUserQuestion dedup of the #64389 double-fire
+        // (within- OR cross-run). `question_outstanding` is set when the hook
+        // cards a question and cleared when its answer is delivered; while set,
+        // every further AUQ is a duplicate with no card. `duplicate_auq_ids`
+        // collects those duplicates' tool_use ids so the answer-resume scrub
+        // deletes them from the transcript. Owned here so both span respawns.
+        let question_outstanding: hook_server::QuestionOutstanding =
+            Arc::new(tokio::sync::Mutex::new(false));
+        let duplicate_auq_ids: hook_server::DuplicateAuqIds =
+            Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         write_hook_settings().await;
         let _ = tokio::fs::remove_file(HOOK_SOCK_FILE).await; // clear a stale bind
         let _sock_guard = match tokio::net::UnixListener::bind(HOOK_SOCK_FILE) {
@@ -891,6 +901,8 @@ mod adapter {
                     answers_in_hand.clone(),
                     current_run_id.clone(),
                     evt_tx.clone(),
+                    question_outstanding.clone(),
+                    duplicate_auq_ids.clone(),
                 ));
                 Some(SockGuard {
                     path: HOOK_SOCK_FILE.to_string(),
@@ -918,6 +930,7 @@ mod adapter {
                 &answers_in_hand,
                 &current_run_id,
                 &scrub_msg_ids,
+                &question_outstanding,
             )
             .await
             {
@@ -935,28 +948,35 @@ mod adapter {
                     fast_crashes = 0;
                     // ADR 0054 Part C: claude was SIGINT'd by the AnswerQuestion
                     // arm and is dead now → its transcript is quiescent and safe
-                    // to edit. Remove any narrate-past poison so the resumed
-                    // model sees a clean defer (`tool_use`, nothing after) and
-                    // delivers the real answer instead of re-asking. Fail-safe:
-                    // on any miss/error we skip — the Part B fallback still
+                    // to edit. Remove both poisons so the resumed model sees a
+                    // clean defer (one `tool_use`, nothing after) and delivers
+                    // the real answer instead of re-asking: (a) narrate-past
+                    // assistant text (`scrub_msg_ids`), and (b) duplicate AUQ
+                    // tool_uses the hook suppressed (`duplicate_auq_ids`, the
+                    // #64389 double-fire — within- or cross-run). Fail-safe: on
+                    // any miss/error we skip — the Part B fallback still
                     // delivers the answer as a user message.
                     let ids: HashSet<String> = {
                         let mut g = scrub_msg_ids.lock().await;
                         std::mem::take(&mut *g)
                     };
-                    if !ids.is_empty() {
+                    let dup_ids: HashSet<String> = {
+                        let mut g = duplicate_auq_ids.lock().await;
+                        std::mem::take(&mut *g)
+                    };
+                    if !ids.is_empty() || !dup_ids.is_empty() {
                         if let Some(sid) = read_claude_session_id().await {
                             match find_claude_transcript(&sid) {
                                 Some(tr) => {
                                     let res = tokio::task::spawn_blocking(move || {
-                                        scrub_transcript(&tr, &ids)
+                                        scrub_transcript(&tr, &ids, &dup_ids)
                                     })
                                     .await;
                                     match res {
                                         Ok(Ok(n)) => tracing::info!(
                                             removed = n,
                                             %sid,
-                                            "ADR 0054 Part C: scrubbed narrate-past from transcript before resume"
+                                            "ADR 0054 Part C: scrubbed narrate-past + duplicate AUQs from transcript before resume"
                                         ),
                                         Ok(Err(e)) => tracing::warn!(
                                             error = %e,
@@ -1272,6 +1292,11 @@ mod adapter {
         // scrub from the transcript before the next answer-resume. Owned by
         // `run_engine` so it survives a respawn; populated at turn-end here.
         scrub_msg_ids: &Arc<tokio::sync::Mutex<HashSet<String>>>,
+        // ADR 0054: set true while an AskUserQuestion card is awaiting an
+        // answer (the hook owns it). While set, a further AUQ is the #64389
+        // duplicate — its card is already suppressed at the hook, so we also
+        // drop its `ToolCallStarted` here (no phantom tool-call in the UI).
+        question_outstanding: &hook_server::QuestionOutstanding,
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
         let argv = build_claude_argv(&resume_id);
@@ -1580,6 +1605,25 @@ mod adapter {
                                     &mut t.suppressed_msg_ids,
                                 ) {
                                     for ev in translated {
+                                        // ADR 0054: drop a duplicate AUQ's
+                                        // tool-log entry (the #64389 double-fire,
+                                        // within- or cross-run). A question is
+                                        // already outstanding, so the hook gave
+                                        // this AUQ no card; suppress its
+                                        // ToolCallStarted too so no phantom tool
+                                        // call flickers in the UI. (The first,
+                                        // carded question's card stands regardless
+                                        // — the UI renders that, not this entry.)
+                                        if let HarnessEvent::ToolCallStarted {
+                                            tool_name, ..
+                                        } = &ev
+                                        {
+                                            if tool_name == "AskUserQuestion"
+                                                && *question_outstanding.lock().await
+                                            {
+                                                continue;
+                                            }
+                                        }
                                         emit(evt_tx, ev).await;
                                     }
                                 }
@@ -2124,11 +2168,18 @@ mod adapter {
     /// lands in claude's own `.jsonl`; on `--resume` the model reads its own
     /// stale text and re-asks regardless of the real answer we deliver. We
     /// remove exactly the assistant messages whose ids Part A suppressed
-    /// (matched by `message.id`, never a content heuristic), re-link the
+    /// (matched by `message.id`, never a content heuristic), AND any assistant
+    /// message carrying a `tool_use` whose id is a suppressed DUPLICATE AUQ
+    /// (`dup_tool_ids` — the #64389 double-fire, within- or cross-run; matched
+    /// by the tool_use id the hook recorded, not a heuristic). Re-link the
     /// `parentUuid` of any survivor that pointed at a removed line, and write
-    /// atomically. The result is byte-equivalent to a clean defer, which
-    /// resumes correctly (validated 10/10 locally). Returns messages removed.
-    fn scrub_transcript(path: &Path, suppressed_ids: &HashSet<String>) -> std::io::Result<usize> {
+    /// atomically. The result is byte-equivalent to a clean single-question
+    /// defer, which resumes correctly. Returns messages removed.
+    fn scrub_transcript(
+        path: &Path,
+        suppressed_ids: &HashSet<String>,
+        dup_tool_ids: &HashSet<String>,
+    ) -> std::io::Result<usize> {
         let content = std::fs::read_to_string(path)?;
         // uuid -> parentUuid of each removed line, for re-linking survivors.
         let mut removed_parent: HashMap<String, Option<String>> = HashMap::new();
@@ -2149,7 +2200,26 @@ mod adapter {
                 .get("message")
                 .and_then(|m| m.get("id"))
                 .and_then(|s| s.as_str());
-            if is_assistant && id.map(|i| suppressed_ids.contains(i)).unwrap_or(false) {
+            // A duplicate-AUQ message: an assistant line whose content holds a
+            // `tool_use` block with an id the hook flagged as a duplicate.
+            let carries_dup_tool = is_assistant
+                && !dup_tool_ids.is_empty()
+                && v.get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks.iter().any(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                                && b.get("id")
+                                    .and_then(|s| s.as_str())
+                                    .map(|i| dup_tool_ids.contains(i))
+                                    .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+            let drop_by_msg_id =
+                is_assistant && id.map(|i| suppressed_ids.contains(i)).unwrap_or(false);
+            if drop_by_msg_id || carries_dup_tool {
                 if let Some(uuid) = v.get("uuid").and_then(|s| s.as_str()) {
                     let parent = v
                         .get("parentUuid")
@@ -2157,7 +2227,7 @@ mod adapter {
                         .map(str::to_string);
                     removed_parent.insert(uuid.to_string(), parent);
                 }
-                continue; // drop the narrate-past message
+                continue; // drop the narrate-past / duplicate-AUQ message
             }
             kept.push(line.to_string());
         }
@@ -2702,7 +2772,7 @@ mod adapter {
 
             let mut ids = HashSet::new();
             ids.insert("msg_BBB".to_string());
-            let removed = scrub_transcript(&path, &ids).unwrap();
+            let removed = scrub_transcript(&path, &ids, &HashSet::new()).unwrap();
             assert_eq!(removed, 1, "exactly one narrate-past message removed");
 
             let after = std::fs::read_to_string(&path).unwrap();
@@ -2745,12 +2815,55 @@ mod adapter {
 
             let mut ids = HashSet::new();
             ids.insert("msg_NOPE".to_string());
-            let removed = scrub_transcript(&path, &ids).unwrap();
+            let removed = scrub_transcript(&path, &ids, &HashSet::new()).unwrap();
             assert_eq!(removed, 0);
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
                 body,
                 "file is untouched on a no-op scrub",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ADR 0054: the scrub also drops a DUPLICATE AUQ's assistant message
+        // — matched by the suppressed `tool_use` id, even in a different run
+        // (the cross-run #64389 double-fire) — keeping the FIRST question's
+        // tool_use and re-linking survivors, so resume re-fires exactly one.
+        #[test]
+        fn scrub_removes_duplicate_auq_tool_use() {
+            let dir = std::env::temp_dir().join(format!("engram-scrub-dup-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("sess.jsonl");
+            let lines = [
+                r#"{"type":"user","uuid":"u-prompt","parentUuid":null,"message":{"role":"user","content":[{"type":"text","text":"ask me red or green"}]}}"#,
+                // run A: the carded (first) question — kept.
+                r#"{"type":"assistant","uuid":"u-A","parentUuid":"u-prompt","message":{"id":"msg_AAA","role":"assistant","content":[{"type":"tool_use","id":"toolu_FIRST","name":"AskUserQuestion","input":{"questions":[]}}]}}"#,
+                // run B: the cross-run duplicate — dropped by its tool_use id.
+                r#"{"type":"assistant","uuid":"u-B","parentUuid":"u-A","message":{"id":"msg_BBB","role":"assistant","content":[{"type":"tool_use","id":"toolu_DUP","name":"AskUserQuestion","input":{"questions":[]}}]}}"#,
+                r#"{"type":"assistant","uuid":"u-C","parentUuid":"u-B","message":{"id":"msg_CCC","role":"assistant","content":[{"type":"text","text":"trailing"}]}}"#,
+            ];
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+            let mut dup = HashSet::new();
+            dup.insert("toolu_DUP".to_string());
+            let removed = scrub_transcript(&path, &HashSet::new(), &dup).unwrap();
+            assert_eq!(removed, 1, "exactly the duplicate AUQ message removed");
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(!after.contains("toolu_DUP"), "duplicate tool_use gone");
+            assert!(
+                after.contains("toolu_FIRST"),
+                "the first (carded) question is preserved"
+            );
+            let c = after
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .find(|v| v["uuid"] == "u-C")
+                .unwrap();
+            assert_eq!(
+                c["parentUuid"], "u-A",
+                "survivor re-linked past the removed duplicate"
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -3394,6 +3507,7 @@ mod adapter {
             hook_server::AnswersInHand,
             hook_server::CurrentRunId,
             mpsc::Receiver<HarnessEvent>,
+            hook_server::DuplicateAuqIds,
         ) {
             let sock = std::env::temp_dir()
                 .join(format!("engram-hooktest-{}.sock", uuid::Uuid::new_v4()))
@@ -3403,6 +3517,10 @@ mod adapter {
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let run_id: hook_server::CurrentRunId =
                 Arc::new(tokio::sync::Mutex::new(Some("run-x".into())));
+            let outstanding: hook_server::QuestionOutstanding =
+                Arc::new(tokio::sync::Mutex::new(false));
+            let dup_ids: hook_server::DuplicateAuqIds =
+                Arc::new(tokio::sync::Mutex::new(HashSet::new()));
             let (evt_tx, evt_rx) = mpsc::channel::<HarnessEvent>(16);
             let listener = tokio::net::UnixListener::bind(&sock).unwrap();
             tokio::spawn(hook_server::serve(
@@ -3410,8 +3528,10 @@ mod adapter {
                 answers.clone(),
                 run_id.clone(),
                 evt_tx,
+                outstanding.clone(),
+                dup_ids.clone(),
             ));
-            (sock, answers, run_id, evt_rx)
+            (sock, answers, run_id, evt_rx, dup_ids)
         }
 
         /// A fake `PreToolUse` hook client: one request line, one verdict.
@@ -3437,7 +3557,7 @@ mod adapter {
         // QuestionAnswered.
         #[tokio::test]
         async fn hook_defers_then_answers_after_stash() {
-            let (sock, answers, _rid, mut evt_rx) = spawn_hook_server().await;
+            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
             let questions = vec![sample_q("Pick one?", false)];
 
             let v = hook_fire(&sock, "toolu_1", &questions).await;
@@ -3485,7 +3605,7 @@ mod adapter {
         // request, one answers map keyed by question text (finding #8).
         #[tokio::test]
         async fn hook_multi_question_one_roundtrip() {
-            let (sock, answers, _rid, mut evt_rx) = spawn_hook_server().await;
+            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
             let questions = vec![sample_q("Languages?", true), sample_q("Editor?", false)];
             {
                 let mut m = answers.lock().await;
@@ -3515,7 +3635,7 @@ mod adapter {
         // a duplicate re-fire after consumption DEFERS (consumed once).
         #[tokio::test]
         async fn hook_duplicate_refire_defers_after_consumption() {
-            let (sock, answers, _rid, mut evt_rx) = spawn_hook_server().await;
+            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
             let questions = vec![sample_q("One?", false)];
             {
                 let mut m = answers.lock().await;
@@ -3545,14 +3665,15 @@ mod adapter {
             );
         }
 
-        // ADR 0054: per-run dedup of the #64389 stdin double-fire. The FIRST
-        // AUQ in a run defers (+ a card); a SECOND, DISTINCT AUQ in the SAME
-        // run (no answer in hand) is the re-call → DENY, no card. A new run
-        // defers again (the answer-resume re-fire is a fresh run, never wrongly
-        // deduped).
+        // ADR 0054: SESSION-level dedup of the #64389 double-fire. The first
+        // AUQ defers + cards and marks a question outstanding; any further AUQ
+        // while one is outstanding — INCLUDING one in a different run (the
+        // cross-run double-fire) — still DEFERS (parked, no deny poison) but
+        // emits NO card and is recorded for the scrub. Once the outstanding
+        // question is ANSWERED, the next genuine question is carded afresh.
         #[tokio::test]
-        async fn hook_denies_duplicate_auq_in_same_run() {
-            let (sock, _answers, run_id, mut evt_rx) = spawn_hook_server().await;
+        async fn hook_dedups_duplicate_auq_session_wide() {
+            let (sock, answers, run_id, mut evt_rx, dup_ids) = spawn_hook_server().await;
             let questions = vec![sample_q("Color?", false)];
 
             // First AUQ in run-x → defer + card.
@@ -3565,28 +3686,57 @@ mod adapter {
                 Some(HarnessEvent::UserQuestion { .. })
             ));
 
-            // Second, distinct AUQ in the SAME run → deny, NO card.
-            match hook_fire(&sock, "toolu_b", &questions).await {
-                hook_server::HookVerdict::Deny { reason } => {
-                    assert!(reason.contains("already awaiting"), "deny carries a reason");
-                }
-                _ => panic!("expected Deny for the duplicate AUQ"),
-            }
+            // Second, distinct AUQ in the SAME run → defer (parked), NO card,
+            // and its id is recorded for the scrub.
+            assert!(matches!(
+                hook_fire(&sock, "toolu_b", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
             assert!(
                 evt_rx.try_recv().is_err(),
-                "the denied duplicate emits no card"
+                "the same-run duplicate emits no card"
             );
 
-            // A NEW run defers again (resume re-fire is never deduped).
+            // A duplicate in a DIFFERENT run (the cross-run double-fire) is
+            // STILL deduped — the invariant is session-wide, not per-run.
             *run_id.lock().await = Some("run-y".into());
             assert!(matches!(
                 hook_fire(&sock, "toolu_c", &questions).await,
                 hook_server::HookVerdict::Defer
             ));
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "the cross-run duplicate emits no card either"
+            );
+            assert_eq!(
+                *dup_ids.lock().await,
+                HashSet::from(["toolu_b".to_string(), "toolu_c".to_string()]),
+                "both duplicates (same- and cross-run) are recorded for the scrub"
+            );
+
+            // Answer the outstanding question (its id is the carded toolu_a) →
+            // clears `question_outstanding`, so the NEXT genuine question cards.
+            {
+                let mut a = Answers::new();
+                a.insert("Color?".into(), vec!["A".into()]);
+                answers.lock().await.insert("toolu_a".to_string(), a);
+            }
+            assert!(matches!(
+                hook_fire(&sock, "toolu_a", &questions).await,
+                hook_server::HookVerdict::Answer { .. }
+            ));
             assert!(matches!(
                 evt_rx.recv().await,
-                Some(HarnessEvent::UserQuestion { .. })
+                Some(HarnessEvent::QuestionAnswered { .. })
             ));
+            assert!(matches!(
+                hook_fire(&sock, "toolu_d", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(
+                matches!(evt_rx.recv().await, Some(HarnessEvent::UserQuestion { .. })),
+                "after the answer, a fresh question is carded again"
+            );
         }
 
         // The hook-bridge's claude-specific denormalization (finding #6): a

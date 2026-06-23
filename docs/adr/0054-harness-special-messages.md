@@ -540,6 +540,26 @@ No new id space; no control `request_id` (the control protocol is not used).
   as a user message. Unit-tested (`scrub_*`, `suppressed_narrate_past_id_is_recorded`);
   the locate+resume integration is exercised by the local repro, not engine-tested
   (same constraint as Part B's hook-dependent path).
+  **Part D (duplicate-AUQ dedup, 2026-06-23):** the tool-call sibling of the narrate-past
+  text — with stdin held open, the same #64389 continuation sometimes re-CALLS
+  `AskUserQuestion` for one logical question, yielding a second question card. Observed in
+  two shapes: *within a run* (sessions `b63a8cbf`, `76207d3c`) and, distinctly, *across a
+  run boundary* — the deferred turn ends `tool_deferred`, claude (still resident) then
+  spontaneously starts a NEW run and re-asks (session `709008e4`). A first cut deferred-or-
+  **denied** the duplicate (briefly committed), but a deny is itself transcript poison: it
+  writes a "stop and wait" `tool_result` the model RETRIES after the real answer lands
+  (session `691828f6`) — and per-run dedup misses the cross-run shape. **Fix:** a SESSION-
+  level invariant — *at most one outstanding (carded, unanswered) question per session*.
+  The hook owns a `question_outstanding` flag (set when it cards the first AUQ, cleared when
+  that answer is delivered); while set, every further AUQ — same run or a later one — DEFERS
+  with no card (no deny poison) and its `tool_use_id` is recorded in `duplicate_auq_ids`.
+  `scrub_transcript` (Part C) is extended to also drop any assistant message carrying a
+  duplicate `tool_use` (matched by that id, so it reaches a cross-run sibling), leaving the
+  resumed transcript with exactly one pending question. The duplicate's `ToolCallStarted` is
+  also suppressed at the emit site (a transient phantom tool-call otherwise flickered in the
+  UI). Unit-tested (`hook_dedups_duplicate_auq_session_wide`, `scrub_removes_duplicate_auq_
+  tool_use`); validated live (session `34eccff9`: one card, scrub `removed=1`, clean answer +
+  haiku, zero re-ask) across both the within-run and cross-run double-fire in a single run.
 - **Truncation** of large diffs is surfaced in the UI (no silent caps); MultiEdit
   overflow clips trailing hunks and logs the count dropped.
 
