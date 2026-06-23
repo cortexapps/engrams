@@ -67,17 +67,6 @@ pub struct ImageManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<HarnessManifest>,
 
-    /// Optional git forge binding (ADR 0023). When set, sessions of this
-    /// image get a per-session credential broker + the
-    /// `create-pull-request` capability for `provider`, reached via the
-    /// in-session forge seam. The minted credential works across *all*
-    /// repos the forge installation can access — repos are not pinned
-    /// here; PR targets are chosen per request. The coordinator must have
-    /// a matching `GitForge` configured (e.g. `--git-forge=github`); a
-    /// mismatch fails the forge request, not session create.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git: Option<GitConfig>,
-
     /// Optional capture-time prewarm hook. When set, base-snapshot
     /// capture runs `[warm] command` inside the capture VM AFTER agentd
     /// is ready and BEFORE the memory snapshot is frozen — so any
@@ -188,37 +177,6 @@ impl ImageManifest {
             }
         }
     }
-}
-
-/// Which forge a [`GitConfig`] binds to. (Moved here from the retired
-/// `GitForge` trait in ADR 0056 Phase 5b; it now only labels the image's
-/// `[git]` binding.)
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ForgeKind {
-    GitHub,
-    GitLab,
-    Gitea,
-}
-
-/// Git forge binding for an image (ADR 0023). Declares which forge a
-/// session talks to (and, optionally, which installation), so the
-/// coordinator can mint installation-scoped credentials. Deliberately
-/// does **not** pin a repo: one image / session commonly operates across
-/// several repos in an org, and a GitHub App installation token already
-/// spans every repo it can access.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GitConfig {
-    /// Which forge: `github` today (later `gitlab` / `gitea`). Must match
-    /// the coordinator's configured `GitForge`.
-    pub provider: ForgeKind,
-    /// Optional installation owner (org/user) the credential targets.
-    /// The minted token works across *all* repos that installation can
-    /// access. Omit when the forge has a single installation (the common
-    /// case); set it to disambiguate a multi-org app.
-    #[serde(default)]
-    pub owner: Option<String>,
 }
 
 /// The harness baked into an image — both the source-authored `[harness]`
@@ -449,23 +407,13 @@ mod tests {
         assert!(m.env.is_empty());
     }
 
+    /// ADR 0057: `[git]` was retired (D2) along with `secrets`/`secret_mode`/
+    /// `network` (B2b) — all session policy now. A manifest baked BEFORE the
+    /// strip with any of those sections must still parse (the fields are gone +
+    /// `deny_unknown_fields` is off), the sections simply ignored.
     #[test]
-    fn manifest_parses_git_block() {
-        // Minimal: just a provider (single-installation app).
+    fn manifest_ignores_retired_git_block() {
         let m: ImageManifest = toml::from_str(
-            r#"
-            name = "dev-engrams"
-            [git]
-            provider = "github"
-        "#,
-        )
-        .unwrap();
-        let g = m.git.expect("git block parsed");
-        assert_eq!(g.provider, ForgeKind::GitHub);
-        assert!(g.owner.is_none());
-
-        // Explicit installation owner.
-        let m2: ImageManifest = toml::from_str(
             r#"
             name = "dev-engrams"
             [git]
@@ -473,20 +421,8 @@ mod tests {
             owner = "cortexapps"
         "#,
         )
-        .unwrap();
-        assert_eq!(m2.git.unwrap().owner.as_deref(), Some("cortexapps"));
-
-        // `repo` is intentionally NOT a field — a stale `repo =` fails
-        // (deny_unknown_fields) so nobody accidentally pins one repo.
-        assert!(toml::from_str::<ImageManifest>(
-            r#"
-            name = "x"
-            [git]
-            provider = "github"
-            repo = "cortexapps/engrams"
-        "#
-        )
-        .is_err());
+        .expect("a pre-strip [git] block must still parse (ignored)");
+        assert_eq!(m.name, "dev-engrams");
     }
 
     /// ADR 0057: `secrets`/`secret_mode`/`network` were removed from the

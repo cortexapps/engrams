@@ -1212,7 +1212,6 @@ async fn prepare_inner(
             base_snapshot_id,
             spec_env,
             agent,
-            git: manifest.git.clone(),
             session_env,
             egress_secrets,
             network,
@@ -1568,10 +1567,9 @@ fn loopback_endpoint(state: &SharedState) -> Option<String> {
 pub(crate) async fn inject_harness_env(
     state: &SharedState,
     session_id: SessionId,
-    git: Option<&engram_core::types::image::GitConfig>,
     env: &mut HashMap<String, String>,
 ) {
-    inject_forge_env(state, session_id, git, env).await;
+    inject_forge_env(state, session_id, env).await;
     // ADR 0026: artifact-upload token, injected for every image
     // (not git-gated) so the baked `engram-share` skill always works.
     inject_upload_env(state, session_id, env).await;
@@ -1580,34 +1578,52 @@ pub(crate) async fn inject_harness_env(
 pub(crate) async fn inject_forge_env(
     state: &SharedState,
     session_id: SessionId,
-    git: Option<&engram_core::types::image::GitConfig>,
     env: &mut HashMap<String, String>,
 ) {
-    // Forge env is injected only for a forge-configured deployment + a
-    // forge-bound image ([git]). ADR 0056: the github integration is the forge.
-    // ADR 0057 C2: "configured" now means the github mint engine resolves from
-    // the composed SecretStore (org store or boot-env fallback) — checked async.
+    // ADR 0057 D2: forge env is injected when the github mint engine resolves AND
+    // the session holds a `github:*` capability. The manifest `[git]` block is
+    // retired — git binding now rides the profile's capabilities (ADR 0056). The
+    // engine "resolves" from the composed SecretStore (org store or boot-env
+    // fallback), checked async (ADR 0057 C2).
     let github_ready = state
         .integrations
         .resolve("github", &state.services.secrets)
         .await
         .is_some();
-    let (true, Some(git)) = (github_ready, git) else {
+    if !github_ready {
         return;
-    };
+    }
+    let caps = state
+        .services
+        .meta
+        .get_session_capabilities(session_id)
+        .await
+        .unwrap_or_default();
+    let github_caps: Vec<_> = caps.iter().filter(|c| c.provider == "github").collect();
+    if github_caps.is_empty() {
+        return;
+    }
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {
-        // A forge-bound image with no broker token means the in-guest
+        // A github-capable session with no broker token means the in-guest
         // gitconfig gets no credential helper and every git op fails with
         // "could not read Username". This used to be silent (the mint FK-failed
         // before the session row existed); it must never be quiet again.
         tracing::error!(
             %session_id,
-            "forge-bound session got no broker token; git credentials will be UNAVAILABLE in-guest",
+            "github-capable session got no broker token; git credentials will be UNAVAILABLE in-guest",
         );
         return;
     };
     env.insert("ENGRAM_FORGE_TOKEN".into(), token);
-    if let Some(owner) = git.owner.as_deref() {
+    // Owner hint: the org segment of the first capability that scopes a resource
+    // (`github:contents:write@owner/repo` → `owner`). Omitted otherwise — the
+    // single-installation App resolves the installation without it.
+    if let Some(owner) = github_caps.iter().find_map(|c| {
+        c.resource
+            .as_deref()
+            .and_then(|r| r.split('/').next())
+            .filter(|o| !o.is_empty())
+    }) {
         env.insert("ENGRAM_FORGE_OWNER".into(), owner.to_string());
     }
     // Where the in-guest helper reaches the forge endpoints. HostTcp
