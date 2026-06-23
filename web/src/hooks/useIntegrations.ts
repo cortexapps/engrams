@@ -13,12 +13,21 @@ import {
   listConnectors,
   upsertConnector,
   deleteConnector,
+  getIntegrationCatalog,
+  setMintCredential,
+  uploadConnectorLogo,
 } from "../gen/engram/app/v1/integration-IntegrationService_connectquery";
 import { listMintKinds } from "../gen/engram/app/v1/mint-MintService_connectquery";
+import { fallbackIdentity, type ProviderIdentity } from "../lib/connectorModel";
 
-/** Built-in seeds (read-only) + admin-authored connectors. */
+/** Built-in seeds (read-only) + admin-authored connectors. Each carries `status`. */
 export function useConnectors() {
   return useQuery(listConnectors, {}, { staleTime: 10_000 });
+}
+
+/** The member-readable provider catalog (display + powers + hosts; no secrets). */
+export function useIntegrationCatalog() {
+  return useQuery(getIntegrationCatalog, {}, { staleTime: 30_000 });
 }
 
 /** The coordinator's mint-kind registry (Plane-A form metadata). */
@@ -34,6 +43,18 @@ function useInvalidateConnectors() {
     });
 }
 
+function useInvalidateCatalog() {
+  const qc = useQueryClient();
+  return () =>
+    qc.invalidateQueries({
+      queryKey: createConnectQueryKey({
+        schema: getIntegrationCatalog,
+        input: {},
+        cardinality: "finite",
+      }),
+    });
+}
+
 /** Create or replace a custom connector (validated coordinator-side at load + server-side here). */
 export function useUpsertConnector() {
   const invalidate = useInvalidateConnectors();
@@ -43,5 +64,55 @@ export function useUpsertConnector() {
 /** Delete a custom connector (idempotent; built-ins are rejected server-side). */
 export function useDeleteConnector() {
   const invalidate = useInvalidateConnectors();
-  return useMutation(deleteConnector, { onSuccess: invalidate });
+  const invalidateCatalog = useInvalidateCatalog();
+  return useMutation(deleteConnector, {
+    onSuccess: () => {
+      invalidate();
+      invalidateCatalog();
+    },
+  });
+}
+
+/** Store a mint kind's credentials (seals `<kind>.<field>` org secrets). Admin-only.
+ * Refreshes connectors so the derived connected/available status updates. */
+export function useSetMintCredential() {
+  const invalidate = useInvalidateConnectors();
+  return useMutation(setMintCredential, { onSuccess: invalidate });
+}
+
+/** Upload/replace (or, with empty bytes, clear) a connector's logo. Admin-only.
+ * Refreshes the catalog so the `icon.logo` overlay updates. */
+export function useUploadConnectorLogo() {
+  const invalidateCatalog = useInvalidateCatalog();
+  return useMutation(uploadConnectorLogo, { onSuccess: invalidateCatalog });
+}
+
+/** Pre-bundled built-in brand logos (provider → asset URL). Extension point: drop
+ * a curated SVG in and map it here; until then built-ins use the monogram. */
+const BUILTIN_LOGOS: Record<string, string> = {};
+
+/**
+ * Resolve a provider's full display identity from the member catalog, falling
+ * back to the deterministic monogram identity for an unknown provider (e.g. a
+ * session event naming a since-removed connector). Logo precedence:
+ * bundled built-in → uploaded (catalog serve URL) → monogram.
+ */
+export function useProviderIdentity(provider: string): ProviderIdentity {
+  const { data } = useIntegrationCatalog();
+  const entry = data?.providers.find((p) => p.provider === provider);
+  const fallback = fallbackIdentity(provider);
+  if (!entry) return fallback;
+  const d = entry.display;
+  const logo = BUILTIN_LOGOS[provider] ?? (d?.icon?.logo || undefined);
+  return {
+    provider,
+    name: d?.name || fallback.name,
+    category: d?.category || fallback.category,
+    blurb: d?.blurb ?? "",
+    icon: {
+      mono: d?.icon?.mono || fallback.icon.mono,
+      color: d?.icon?.color || fallback.icon.color,
+      ...(logo ? { logo } : {}),
+    },
+  };
 }
