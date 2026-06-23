@@ -5,7 +5,8 @@
 import { IntegrationService } from "./integration_pb";
 
 /**
- * Built-in seeds (read-only) ∪ admin-authored connectors.
+ * Built-in seeds (read-only) ∪ admin-authored connectors. Admin-only; each row
+ * carries the derived connected/available `status`.
  *
  * @generated from rpc engram.app.v1.IntegrationService.ListConnectors
  */
@@ -25,3 +26,22 @@ export const upsertConnector = IntegrationService.method.upsertConnector;
  * @generated from rpc engram.app.v1.IntegrationService.DeleteConnector
  */
 export const deleteConnector = IntegrationService.method.deleteConnector;
+
+/**
+ * Member-readable provider catalog: per-connector display identity + the
+ * powers it grants + the hosts it opens, derived from the merged registry.
+ * Carries NO secret material (no secretRef / header / template / mint kind) —
+ * safe for the Launch receipt + in-session provider icons (redesign).
+ *
+ * @generated from rpc engram.app.v1.IntegrationService.GetIntegrationCatalog
+ */
+export const getIntegrationCatalog = IntegrationService.method.getIntegrationCatalog;
+
+/**
+ * Admin-only: store a mint kind's credentials, sealing each field as an org
+ * secret `<kind>.<field>` (the coordinator resolves them by that name). The
+ * GitHub App private key is a secret; the App ID is config — both are sealed.
+ *
+ * @generated from rpc engram.app.v1.IntegrationService.SetMintCredential
+ */
+export const setMintCredential = IntegrationService.method.setMintCredential;
