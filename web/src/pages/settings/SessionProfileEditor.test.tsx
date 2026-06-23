@@ -20,27 +20,28 @@ const uploadSkill = vi.hoisted(() => vi.fn().mockResolvedValue({ skill: { name: 
 vi.mock("../../hooks/useSkills", () => ({
   useSkills: () => ({
     data: [
-      { name: "skills", label: "Built-in skills", description: "wrappers", builtin: true },
       { name: "playwright", label: "Browser (Playwright)", description: "browser", builtin: true },
       { name: "my-linter", label: "my-linter", description: "lint", builtin: false },
     ],
   }),
   useUploadSkill: () => ({ mutateAsync: uploadSkill, isPending: false }),
 }));
-// ADR 0057: the editor's secret-ref picker reads org-secret names; mock it so
-// the test doesn't need a QueryClient (it's a connect-query hook).
-vi.mock("../../hooks/useOrgSecrets", () => ({
-  useOrgSecretNames: () => ({ data: [] }),
-}));
-// ADR 0057 D1: the capability picker reads the connector catalog (a connect-query
-// hook); mock it so the editor test doesn't need a QueryClient/transport.
-vi.mock("../../hooks/useIntegrations", () => ({
-  useConnectors: () => ({ data: { connectors: [] }, isLoading: false }),
+vi.mock("../../hooks/useOrgSecrets", () => ({ useOrgSecretNames: () => ({ data: [] }) }));
+// The editor derives its policy rail + connected-connector cards from the joined
+// catalog; mock it so the test needs no QueryClient/transport.
+vi.mock("../../components/integrations/useConnectorViews", () => ({
+  useConnectorViews: () => ({ views: [], isLoading: false, error: null }),
 }));
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => vi.fn(),
   useParams: () => ({}),
+  Link: ({
+    children,
+    to: _to,
+    params: _params,
+    ...rest
+  }: Record<string, unknown> & { children: React.ReactNode }) => <a {...rest}>{children}</a>,
 }));
 
 beforeEach(() => {
@@ -50,49 +51,40 @@ beforeEach(() => {
   uploadSkill.mockClear();
 });
 
+const openAdvanced = () => fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
+
 describe("SessionProfileEditor (create)", () => {
-  it("requires a name and image, then calls createProfile", async () => {
+  it("requires a name, then calls createProfile with the default image", async () => {
     render(<SessionProfileEditor mode="create" />);
-    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "Backend Agent" } });
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Backend Agent" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
     expect(create.mock.calls[0][0]).toMatchObject({ name: "Backend Agent", imageId: "i1" });
   });
 
-  it("includes network + secrets in the createProfile payload (ADR 0057)", async () => {
+  it("includes the deny-default network + extra allowed hosts in the payload (ADR 0057)", async () => {
     render(<SessionProfileEditor mode="create" />);
-    fireEvent.change(screen.getByLabelText(/^name$/i), { target: { value: "Net Agent" } });
+    fireEvent.change(screen.getByLabelText(/profile name/i), { target: { value: "Net Agent" } });
+    fireEvent.click(screen.getByRole("button", { name: /add extra hosts/i }));
     fireEvent.change(screen.getByLabelText(/allowed hosts/i), {
       target: { value: "sentry.io\napi.github.com" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /add secret/i }));
-    fireEvent.change(screen.getByLabelText(/org secret ref/i), {
-      target: { value: "sentry-token" },
-    });
-    fireEvent.change(screen.getByLabelText(/env var name/i), {
-      target: { value: "SENTRY_TOKEN" },
-    });
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
-    const payload = create.mock.calls[0][0];
-    expect(payload.network).toMatchObject({
+    expect(create.mock.calls[0][0].network).toMatchObject({
       default: "deny",
       allowHosts: ["sentry.io", "api.github.com"],
     });
-    expect(payload.secrets).toEqual([
-      {
-        ref: "sentry-token",
-        envVar: "SENTRY_TOKEN",
-        mode: "broker",
-        allowHosts: [],
-        allowHostPatterns: [],
-      },
-    ]);
   });
 
-  it("toggling a built-in skill includes it in the createProfile payload (ADR 0055)", async () => {
+  it("toggling a skill includes it in the payload (ADR 0055)", async () => {
     render(<SessionProfileEditor mode="create" />);
-    fireEvent.change(screen.getByLabelText(/name/i), { target: { value: "Browser Agent" } });
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Browser Agent" },
+    });
+    openAdvanced();
     fireEvent.click(screen.getByTestId("skill-playwright"));
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
@@ -101,12 +93,13 @@ describe("SessionProfileEditor (create)", () => {
 
   it("renders an uploaded catalog skill as a selectable toggle (ADR 0055 P2)", () => {
     render(<SessionProfileEditor mode="create" />);
-    // getByTestId throws if absent, so a truthy assertion is the check.
+    openAdvanced();
     expect(screen.getByTestId("skill-my-linter")).toBeTruthy();
   });
 
   it("uploads a SKILL.md via the inline control (ADR 0055 P2)", async () => {
     render(<SessionProfileEditor mode="create" />);
+    openAdvanced();
     fireEvent.change(screen.getByTestId("skill-upload-name"), { target: { value: "my-skill" } });
     const file = new File(["# Hi\n"], "SKILL.md", { type: "text/markdown" });
     fireEvent.change(screen.getByTestId("skill-upload-file"), { target: { files: [file] } });
@@ -117,7 +110,7 @@ describe("SessionProfileEditor (create)", () => {
 });
 
 describe("SessionProfileEditor (edit)", () => {
-  it("hydrates the form from the existing profile in edit mode", async () => {
+  it("hydrates from the existing profile in edit mode", async () => {
     profileHolder.value = {
       profile: {
         id: "p1",
@@ -127,13 +120,15 @@ describe("SessionProfileEditor (edit)", () => {
         imageId: "i1",
         includeUserTokens: true,
         envVars: { ANTHROPIC_MODEL: "claude-x" },
+        capabilities: [],
+        skills: [],
       },
     };
     render(<SessionProfileEditor mode="edit" />);
-    // The hydration useEffect resets the form from existing.profile.
-    const nameInput = await screen.findByLabelText(/name/i);
+    const nameInput = await screen.findByLabelText(/profile name/i);
     await waitFor(() => expect((nameInput as HTMLInputElement).value).toBe("Backend Agent"));
-    // mapToEnvRows populated a KEY input with the env var key.
+    // env vars live under Advanced; opening it reveals the hydrated KEY input.
+    fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
     expect((screen.getByDisplayValue("ANTHROPIC_MODEL") as HTMLInputElement).value).toBe(
       "ANTHROPIC_MODEL",
     );
