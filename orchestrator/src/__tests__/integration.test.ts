@@ -17,6 +17,7 @@ import { buildServer } from "../server.ts";
 import { registerIntegration } from "../rpc/integration.ts";
 import type { IntegrationDeps, GetSession, MintAccess, OrgSecretAccess } from "../rpc/integration.ts";
 import type { ConnectorStore, ConnectorRow } from "../db/connectors.ts";
+import type { ConnectorLogoStore } from "../db/connector-logos.ts";
 import { invalidateRegistry } from "../connectors/registry.ts";
 import { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
 import type { MintKind } from "../gen/engram/app/v1/mint_pb.ts";
@@ -55,6 +56,30 @@ function fakeOrgSecret(names: string[] = []) {
   };
   return { client, puts };
 }
+
+function fakeLogoStore(seed: Record<string, { mediaType: string; data: Buffer }> = {}) {
+  const rows = new Map(Object.entries(seed));
+  const store: ConnectorLogoStore = {
+    async get(provider) {
+      const r = rows.get(provider);
+      return r ? { provider, mediaType: r.mediaType, data: r.data, updatedAt: new Date(0) } : null;
+    },
+    async put(provider, mediaType, data) {
+      rows.set(provider, { mediaType, data });
+    },
+    async delete(provider) {
+      return rows.delete(provider);
+    },
+    async listProviders() {
+      return [...rows.keys()];
+    },
+  };
+  return { store, rows };
+}
+
+// Minimal valid magic-byte fixtures for the logo sniff.
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+const SVG_BYTES = new TextEncoder().encode('<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>');
 
 interface Recorded {
   upserts: Array<{ provider: string; config: unknown }>;
@@ -101,7 +126,10 @@ const SENTRY = JSON.stringify({
 async function spawn(deps: IntegrationDeps) {
   const app = new Hono();
   app.notFound((c) => c.json({ error: "not found" }, 404));
-  const srv = buildServer(app, (router) => registerIntegration(router, deps));
+  // Default a fake logo store so tests that don't exercise logos never hit the
+  // real getDb() default (no DB in unit tests). An explicit dep overrides it.
+  const withDefaults: IntegrationDeps = { connectorLogos: fakeLogoStore().store, ...deps };
+  const srv = buildServer(app, (router) => registerIntegration(router, withDefaults));
   const url = await new Promise<string>((res) =>
     srv.listen(0, "127.0.0.1", () => res(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`)),
   );
@@ -350,6 +378,80 @@ describe("SetMintCredential", () => {
       await expectErr(s.client.setMintCredential({ provider: "github", kind: "github_app", values: { bogus: "x" } }), Code.InvalidArgument);
       await expectErr(s.client.setMintCredential({ provider: "gitlab", kind: "github_app", values: { app_id: "1" } }), Code.InvalidArgument);
       expect(os.puts).toHaveLength(0);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe("UploadConnectorLogo + catalog overlay", () => {
+  test("anon → Unauthenticated; member → PermissionDenied", async () => {
+    const anon = await spawn({ getSession: makeGetSession(null), connectors: fakeStore().store });
+    try {
+      await expectErr(anon.client.uploadConnectorLogo({ provider: "github", data: PNG_BYTES, mediaType: "" }), Code.Unauthenticated);
+    } finally {
+      await anon.close();
+    }
+    const mem = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store });
+    try {
+      await expectErr(mem.client.uploadConnectorLogo({ provider: "github", data: PNG_BYTES, mediaType: "" }), Code.PermissionDenied);
+    } finally {
+      await mem.close();
+    }
+  });
+
+  test("stores a sniffed PNG / SVG for an existing connector + returns the serve URL", async () => {
+    invalidateRegistry();
+    const fl = fakeLogoStore();
+    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore().store, connectorLogos: fl.store });
+    try {
+      const r = await s.client.uploadConnectorLogo({ provider: "github", data: PNG_BYTES, mediaType: "" });
+      expect(r.logoUrl).toBe("/api/v1/integrations/github/logo");
+      expect(fl.rows.get("github")?.mediaType).toBe("image/png");
+      await s.client.uploadConnectorLogo({ provider: "datadog", data: SVG_BYTES, mediaType: "" });
+      expect(fl.rows.get("datadog")?.mediaType).toBe("image/svg+xml");
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("rejects unknown provider / non-image / oversized; empty data clears", async () => {
+    invalidateRegistry();
+    const fl = fakeLogoStore({ github: { mediaType: "image/png", data: Buffer.from(PNG_BYTES) } });
+    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore().store, connectorLogos: fl.store });
+    try {
+      await expectErr(s.client.uploadConnectorLogo({ provider: "nope", data: PNG_BYTES, mediaType: "" }), Code.InvalidArgument);
+      await expectErr(s.client.uploadConnectorLogo({ provider: "github", data: new TextEncoder().encode("not an image"), mediaType: "" }), Code.InvalidArgument);
+      await expectErr(s.client.uploadConnectorLogo({ provider: "github", data: new Uint8Array(512 * 1024 + 1), mediaType: "" }), Code.InvalidArgument);
+      const cleared = await s.client.uploadConnectorLogo({ provider: "github", data: new Uint8Array(0), mediaType: "" });
+      expect(cleared.logoUrl).toBe("");
+      expect(fl.rows.has("github")).toBe(false);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("getIntegrationCatalog overlays icon.logo only for providers that have one", async () => {
+    invalidateRegistry();
+    const fl = fakeLogoStore({ github: { mediaType: "image/png", data: Buffer.from(PNG_BYTES) } });
+    const s = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store, connectorLogos: fl.store });
+    try {
+      const by = new Map((await s.client.getIntegrationCatalog({})).providers.map((p) => [p.provider, p]));
+      expect(by.get("github")?.display?.icon?.logo).toBe("/api/v1/integrations/github/logo");
+      expect(by.get("datadog")?.display?.icon?.logo).toBe(""); // no uploaded logo → monogram
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("deleteConnector also clears the connector's logo", async () => {
+    invalidateRegistry();
+    const custom: ConnectorRow = { provider: "sentry", config: JSON.parse(SENTRY), createdAt: new Date(), updatedAt: new Date() };
+    const fl = fakeLogoStore({ sentry: { mediaType: "image/png", data: Buffer.from(PNG_BYTES) } });
+    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore([custom]).store, connectorLogos: fl.store });
+    try {
+      await s.client.deleteConnector({ provider: "sentry" });
+      expect(fl.rows.has("sentry")).toBe(false);
     } finally {
       await s.close();
     }

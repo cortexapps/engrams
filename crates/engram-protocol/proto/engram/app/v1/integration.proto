@@ -26,6 +26,11 @@ service IntegrationService {
   // secret `<kind>.<field>` (the coordinator resolves them by that name). The
   // GitHub App private key is a secret; the App ID is config — both are sealed.
   rpc SetMintCredential(SetMintCredentialRequest) returns (SetMintCredentialResponse);
+  // Admin-only: upload (or replace) a connector's logo — orchestrator-owned
+  // (the coordinator never sees connectors). Bytes land in the connector_logo
+  // table (≤512 KB, SVG or square PNG, sniffed) and are served at
+  // GET /api/v1/integrations/<provider>/logo. Empty `data` clears the logo.
+  rpc UploadConnectorLogo(UploadConnectorLogoRequest) returns (UploadConnectorLogoResponse);
 }
 
 message Connector {
@@ -123,4 +128,17 @@ message SetMintCredentialRequest {
 message SetMintCredentialResponse {
   // The org-secret names written (the `<kind>.<field>` keys), for confirmation.
   repeated string secret_names = 1;
+}
+
+message UploadConnectorLogoRequest {
+  string provider = 1;
+  // Logo bytes (SVG or square PNG; ≤512 KB). Empty clears any existing logo.
+  bytes data = 2;
+  // Optional MIME hint ("image/svg+xml" | "image/png"); the server also sniffs.
+  string media_type = 3;
+}
+
+message UploadConnectorLogoResponse {
+  // The serve URL the catalog now points `icon.logo` at, or "" when cleared.
+  string logo_url = 1;
 }

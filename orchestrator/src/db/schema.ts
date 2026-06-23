@@ -24,7 +24,15 @@ import {
   boolean,
   primaryKey,
   index,
+  customType,
 } from "drizzle-orm/pg-core";
+
+/** Raw binary column (Postgres `bytea`). node-postgres maps `bytea` ⇄ Buffer. */
+const bytea = customType<{ data: Buffer }>({
+  dataType() {
+    return "bytea";
+  },
+});
 
 // ---------------------------------------------------------------------------
 // Task model (Task 15)
@@ -140,6 +148,26 @@ export const connector = pgTable("connector", {
   provider: text("provider").primaryKey(),
   config: jsonb("config").notNull(), // the raw Connector JSON (validated at load)
   createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at")
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+});
+
+// ---------------------------------------------------------------------------
+// Connector logo (redesign): optional uploaded brand mark, keyed by provider.
+//
+// Orchestrator-owned (the coordinator never sees connectors) — a presentation
+// overlay on the connector catalog, deliberately NOT part of the connector
+// config. One row per provider (built-in or custom) that has an uploaded logo;
+// absence ⇒ the renderer falls back to the deterministic monogram. Bytes are
+// small (≤512 KB, SVG or square PNG, enforced at the upload RPC) so a `bytea`
+// column is the right home — no blob bucket, transactional with the catalog.
+// Served via GET /api/v1/integrations/:provider/logo.
+export const connectorLogo = pgTable("connector_logo", {
+  provider: text("provider").primaryKey(),
+  mediaType: text("media_type").notNull(), // "image/svg+xml" | "image/png"
+  data: bytea("data").notNull(),
   updatedAt: timestamp("updated_at")
     .notNull()
     .defaultNow()

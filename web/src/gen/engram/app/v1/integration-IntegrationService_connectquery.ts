@@ -45,3 +45,13 @@ export const getIntegrationCatalog = IntegrationService.method.getIntegrationCat
  * @generated from rpc engram.app.v1.IntegrationService.SetMintCredential
  */
 export const setMintCredential = IntegrationService.method.setMintCredential;
+
+/**
+ * Admin-only: upload (or replace) a connector's logo — orchestrator-owned
+ * (the coordinator never sees connectors). Bytes land in the connector_logo
+ * table (≤512 KB, SVG or square PNG, sniffed) and are served at
+ * GET /api/v1/integrations/<provider>/logo. Empty `data` clears the logo.
+ *
+ * @generated from rpc engram.app.v1.IntegrationService.UploadConnectorLogo
+ */
+export const uploadConnectorLogo = IntegrationService.method.uploadConnectorLogo;
