@@ -55,3 +55,14 @@ export const setMintCredential = IntegrationService.method.setMintCredential;
  * @generated from rpc engram.app.v1.IntegrationService.UploadConnectorLogo
  */
 export const uploadConnectorLogo = IntegrationService.method.uploadConnectorLogo;
+
+/**
+ * Admin-only: test a connector's credential. Builds the resolved spec from the
+ * registry and delegates the actual unseal/mint + benign GET to the coordinator
+ * (MintService.RunConnectorTest). `draft_values` carries an about-to-be-saved
+ * credential to test before sealing (inject: the single value under any key;
+ * mint: the field map); empty tests the stored credential.
+ *
+ * @generated from rpc engram.app.v1.IntegrationService.TestConnector
+ */
+export const testConnector = IntegrationService.method.testConnector;

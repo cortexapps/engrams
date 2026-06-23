@@ -176,7 +176,10 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
         )
         // ADR 0057 C3: the read-only mint-kind registry (Plane-A form metadata).
         .add_service(app::mint_service_server::MintServiceServer::new(
-            AppMintService { auth: auth.clone() },
+            AppMintService {
+                state: state.clone(),
+                auth: auth.clone(),
+            },
         ))
         // ADR 0057: the admin-managed, KEK-sealed org secret store.
         .add_service(app::org_secret_service_server::OrgSecretServiceServer::new(

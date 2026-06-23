@@ -64,6 +64,8 @@ tar.workspace = true
 flate2.workspace = true
 zip.workspace = true
 sqlx.workspace = true
+# Outbound HTTP for the connector "test connection" probe (MintService.RunConnectorTest).
+reqwest.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-tungstenite.workspace = true

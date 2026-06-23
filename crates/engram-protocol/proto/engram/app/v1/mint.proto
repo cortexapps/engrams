@@ -10,6 +10,12 @@ package engram.app.v1;
 service MintService {
   // List every built-in mint kind the coordinator can build (e.g. github_app).
   rpc ListMintKinds(ListMintKindsRequest) returns (ListMintKindsResponse);
+  // Test an integration credential: resolve it (from the org store, or a
+  // just-entered draft) and make ONE benign authenticated GET to the host,
+  // reporting whether the credential was accepted. The orchestrator (which owns
+  // the connector registry) supplies the resolved spec; the coordinator is the
+  // only tier that can unseal secrets + run the mint engine. Admin-gated there.
+  rpc RunConnectorTest(RunConnectorTestRequest) returns (RunConnectorTestResponse);
 }
 
 // The input kind of a mint-config field — drives the form widget + whether the
@@ -43,4 +49,28 @@ message ListMintKindsRequest {}
 
 message ListMintKindsResponse {
   repeated MintKind mint_kinds = 1;
+}
+
+// A resolved connector test spec, built by the orchestrator from the connector
+// registry. Carries the inject header/template/secret_ref OR the mint kind, plus
+// an optional draft (the about-to-be-saved credential, tested before sealing).
+message RunConnectorTestRequest {
+  string provider = 1;      // "github" / "datadog"
+  string host = 2;          // hosts[0], e.g. "api.github.com"
+  string source = 3;        // "inject" | "mint"
+
+  // inject:
+  string header = 4;        // header name (default Authorization)
+  string template = 5;      // "Bearer {}" / "{}"
+  string secret_ref = 6;    // org secret to resolve when no draft is given
+  string draft_secret = 7;  // test this value instead of the stored secret_ref
+
+  // mint:
+  string kind = 8;                   // mint kind id (e.g. github_app)
+  map<string, string> draft_fields = 9; // build the engine from these instead of the stored secrets
+}
+
+message RunConnectorTestResponse {
+  bool ok = 1;        // the credential was accepted (not a 401/403)
+  string message = 2; // short human summary
 }

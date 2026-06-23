@@ -12,19 +12,27 @@ import { toast } from "sonner";
 import {
   ArrowUpRightIcon,
   ChevronLeftIcon,
+  CircleCheckIcon,
   ExternalLinkIcon,
   LayersIcon,
+  Loader2Icon,
   LockIcon,
   RotateCcwIcon,
   ShieldCheckIcon,
   Trash2Icon,
   TriangleAlertIcon,
+  ZapIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { MintFieldKind } from "@/gen/engram/app/v1/mint_pb";
-import { useConnectors, useDeleteConnector, useMintKinds } from "@/hooks/useIntegrations";
+import {
+  useConnectors,
+  useDeleteConnector,
+  useMintKinds,
+  useTestConnector,
+} from "@/hooks/useIntegrations";
 import { humanizeAction, parseConnectorConfig } from "@/lib/connectorModel";
 import { ProviderTile } from "./ProviderTile";
 import { AccessTag, HostChip, StatusDot } from "./chips";
@@ -64,8 +72,24 @@ function DetailBody({ view }: { view: ConnectorView }) {
   const conns = useConnectors();
   const mintKinds = useMintKinds();
   const del = useDeleteConnector();
+  const test = useTestConnector();
   const [replacing, setReplacing] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
+  const [testState, setTestState] = useState<"idle" | "ok" | "fail">("idle");
+  const [testMessage, setTestMessage] = useState("");
+
+  const runTest = async () => {
+    setTestState("idle");
+    try {
+      // Empty draft → the coordinator tests the stored credential.
+      const r = await test.mutateAsync({ provider: view.provider, draftValues: {} });
+      setTestState(r.ok ? "ok" : "fail");
+      setTestMessage(r.message);
+    } catch (e) {
+      setTestState("fail");
+      setTestMessage(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const row = conns.data?.connectors.find((c) => c.provider === view.provider);
   const cfg = row ? parseConnectorConfig(row.configJson, view.provider) : undefined;
@@ -110,7 +134,36 @@ function DetailBody({ view }: { view: ConnectorView }) {
               <span>· {view.builtin ? "built-in" : "custom"}</span>
             </div>
           </div>
+          <Button variant="outline" size="sm" onClick={runTest} disabled={test.isPending}>
+            {test.isPending ? (
+              <>
+                <Loader2Icon className="size-3.5 animate-spin" />
+                Testing…
+              </>
+            ) : (
+              <>
+                <ZapIcon className="size-3.5" />
+                Test
+              </>
+            )}
+          </Button>
         </div>
+        {testState !== "idle" && (
+          <div
+            className={`mt-2.5 flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${
+              testState === "ok"
+                ? "border-instrument-nominal/45 bg-instrument-nominal/[0.09]"
+                : "border-destructive/45 bg-destructive/[0.06]"
+            }`}
+          >
+            {testState === "ok" ? (
+              <CircleCheckIcon className="size-3.5 shrink-0 text-instrument-nominal" />
+            ) : (
+              <TriangleAlertIcon className="size-3.5 shrink-0 text-destructive" />
+            )}
+            <span className="font-mono text-muted-foreground">{testMessage}</span>
+          </div>
+        )}
       </div>
 
       {/* credential */}

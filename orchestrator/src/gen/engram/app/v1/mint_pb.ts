@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/mint.proto.
  */
 export const file_engram_app_v1_mint: GenFile = /*@__PURE__*/
-  fileDesc("ChhlbmdyYW0vYXBwL3YxL21pbnQucHJvdG8SDWVuZ3JhbS5hcHAudjEidgoTTWludEZpZWxkRGVzY3JpcHRvchIMCgRuYW1lGAEgASgJEg0KBWxhYmVsGAIgASgJEjAKCmZpZWxkX2tpbmQYAyABKA4yHC5lbmdyYW0uYXBwLnYxLk1pbnRGaWVsZEtpbmQSEAoIcmVxdWlyZWQYBCABKAgidAoITWludEtpbmQSDAoEa2luZBgBIAEoCRIQCghwcm92aWRlchgCIAEoCRIUCgxkaXNwbGF5X25hbWUYAyABKAkSMgoGZmllbGRzGAQgAygLMiIuZW5ncmFtLmFwcC52MS5NaW50RmllbGREZXNjcmlwdG9yIhYKFExpc3RNaW50S2luZHNSZXF1ZXN0IkQKFUxpc3RNaW50S2luZHNSZXNwb25zZRIrCgptaW50X2tpbmRzGAEgAygLMhcuZW5ncmFtLmFwcC52MS5NaW50S2luZCpvCg1NaW50RmllbGRLaW5kEh8KG01JTlRfRklFTERfS0lORF9VTlNQRUNJRklFRBAAEhoKFk1JTlRfRklFTERfS0lORF9DT05GSUcQARIhCh1NSU5UX0ZJRUxEX0tJTkRfU0VBTEVEX1NFQ1JFVBACMmkKC01pbnRTZXJ2aWNlEloKDUxpc3RNaW50S2luZHMSIy5lbmdyYW0uYXBwLnYxLkxpc3RNaW50S2luZHNSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5MaXN0TWludEtpbmRzUmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("ChhlbmdyYW0vYXBwL3YxL21pbnQucHJvdG8SDWVuZ3JhbS5hcHAudjEidgoTTWludEZpZWxkRGVzY3JpcHRvchIMCgRuYW1lGAEgASgJEg0KBWxhYmVsGAIgASgJEjAKCmZpZWxkX2tpbmQYAyABKA4yHC5lbmdyYW0uYXBwLnYxLk1pbnRGaWVsZEtpbmQSEAoIcmVxdWlyZWQYBCABKAgidAoITWludEtpbmQSDAoEa2luZBgBIAEoCRIQCghwcm92aWRlchgCIAEoCRIUCgxkaXNwbGF5X25hbWUYAyABKAkSMgoGZmllbGRzGAQgAygLMiIuZW5ncmFtLmFwcC52MS5NaW50RmllbGREZXNjcmlwdG9yIhYKFExpc3RNaW50S2luZHNSZXF1ZXN0IkQKFUxpc3RNaW50S2luZHNSZXNwb25zZRIrCgptaW50X2tpbmRzGAEgAygLMhcuZW5ncmFtLmFwcC52MS5NaW50S2luZCKmAgoXUnVuQ29ubmVjdG9yVGVzdFJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSDAoEaG9zdBgCIAEoCRIOCgZzb3VyY2UYAyABKAkSDgoGaGVhZGVyGAQgASgJEhAKCHRlbXBsYXRlGAUgASgJEhIKCnNlY3JldF9yZWYYBiABKAkSFAoMZHJhZnRfc2VjcmV0GAcgASgJEgwKBGtpbmQYCCABKAkSTQoMZHJhZnRfZmllbGRzGAkgAygLMjcuZW5ncmFtLmFwcC52MS5SdW5Db25uZWN0b3JUZXN0UmVxdWVzdC5EcmFmdEZpZWxkc0VudHJ5GjIKEERyYWZ0RmllbGRzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASI3ChhSdW5Db25uZWN0b3JUZXN0UmVzcG9uc2USCgoCb2sYASABKAgSDwoHbWVzc2FnZRgCIAEoCSpvCg1NaW50RmllbGRLaW5kEh8KG01JTlRfRklFTERfS0lORF9VTlNQRUNJRklFRBAAEhoKFk1JTlRfRklFTERfS0lORF9DT05GSUcQARIhCh1NSU5UX0ZJRUxEX0tJTkRfU0VBTEVEX1NFQ1JFVBACMs4BCgtNaW50U2VydmljZRJaCg1MaXN0TWludEtpbmRzEiMuZW5ncmFtLmFwcC52MS5MaXN0TWludEtpbmRzUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuTGlzdE1pbnRLaW5kc1Jlc3BvbnNlEmMKEFJ1bkNvbm5lY3RvclRlc3QSJi5lbmdyYW0uYXBwLnYxLlJ1bkNvbm5lY3RvclRlc3RSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5SdW5Db25uZWN0b3JUZXN0UmVzcG9uc2ViBnByb3RvMw");
 
 /**
  * One field an admin supplies to configure a mint kind. `name` is also the org
@@ -116,6 +116,115 @@ export const ListMintKindsResponseSchema: GenMessage<ListMintKindsResponse> = /*
   messageDesc(file_engram_app_v1_mint, 3);
 
 /**
+ * A resolved connector test spec, built by the orchestrator from the connector
+ * registry. Carries the inject header/template/secret_ref OR the mint kind, plus
+ * an optional draft (the about-to-be-saved credential, tested before sealing).
+ *
+ * @generated from message engram.app.v1.RunConnectorTestRequest
+ */
+export type RunConnectorTestRequest = Message<"engram.app.v1.RunConnectorTestRequest"> & {
+  /**
+   * "github" / "datadog"
+   *
+   * @generated from field: string provider = 1;
+   */
+  provider: string;
+
+  /**
+   * hosts[0], e.g. "api.github.com"
+   *
+   * @generated from field: string host = 2;
+   */
+  host: string;
+
+  /**
+   * "inject" | "mint"
+   *
+   * @generated from field: string source = 3;
+   */
+  source: string;
+
+  /**
+   * inject:
+   *
+   * header name (default Authorization)
+   *
+   * @generated from field: string header = 4;
+   */
+  header: string;
+
+  /**
+   * "Bearer {}" / "{}"
+   *
+   * @generated from field: string template = 5;
+   */
+  template: string;
+
+  /**
+   * org secret to resolve when no draft is given
+   *
+   * @generated from field: string secret_ref = 6;
+   */
+  secretRef: string;
+
+  /**
+   * test this value instead of the stored secret_ref
+   *
+   * @generated from field: string draft_secret = 7;
+   */
+  draftSecret: string;
+
+  /**
+   * mint:
+   *
+   * mint kind id (e.g. github_app)
+   *
+   * @generated from field: string kind = 8;
+   */
+  kind: string;
+
+  /**
+   * build the engine from these instead of the stored secrets
+   *
+   * @generated from field: map<string, string> draft_fields = 9;
+   */
+  draftFields: { [key: string]: string };
+};
+
+/**
+ * Describes the message engram.app.v1.RunConnectorTestRequest.
+ * Use `create(RunConnectorTestRequestSchema)` to create a new message.
+ */
+export const RunConnectorTestRequestSchema: GenMessage<RunConnectorTestRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_mint, 4);
+
+/**
+ * @generated from message engram.app.v1.RunConnectorTestResponse
+ */
+export type RunConnectorTestResponse = Message<"engram.app.v1.RunConnectorTestResponse"> & {
+  /**
+   * the credential was accepted (not a 401/403)
+   *
+   * @generated from field: bool ok = 1;
+   */
+  ok: boolean;
+
+  /**
+   * short human summary
+   *
+   * @generated from field: string message = 2;
+   */
+  message: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RunConnectorTestResponse.
+ * Use `create(RunConnectorTestResponseSchema)` to create a new message.
+ */
+export const RunConnectorTestResponseSchema: GenMessage<RunConnectorTestResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_mint, 5);
+
+/**
  * The input kind of a mint-config field — drives the form widget + whether the
  * value is sealed at rest. Mirrors `engram_core::traits::MintFieldKind`.
  *
@@ -167,6 +276,20 @@ export const MintService: GenService<{
     methodKind: "unary";
     input: typeof ListMintKindsRequestSchema;
     output: typeof ListMintKindsResponseSchema;
+  },
+  /**
+   * Test an integration credential: resolve it (from the org store, or a
+   * just-entered draft) and make ONE benign authenticated GET to the host,
+   * reporting whether the credential was accepted. The orchestrator (which owns
+   * the connector registry) supplies the resolved spec; the coordinator is the
+   * only tier that can unseal secrets + run the mint engine. Admin-gated there.
+   *
+   * @generated from rpc engram.app.v1.MintService.RunConnectorTest
+   */
+  runConnectorTest: {
+    methodKind: "unary";
+    input: typeof RunConnectorTestRequestSchema;
+    output: typeof RunConnectorTestResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_mint, 0);
