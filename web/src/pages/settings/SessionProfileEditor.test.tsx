@@ -32,6 +32,11 @@ vi.mock("../../hooks/useSkills", () => ({
 vi.mock("../../hooks/useOrgSecrets", () => ({
   useOrgSecretNames: () => ({ data: [] }),
 }));
+// ADR 0057 D1: the capability picker reads the connector catalog (a connect-query
+// hook); mock it so the editor test doesn't need a QueryClient/transport.
+vi.mock("../../hooks/useIntegrations", () => ({
+  useConnectors: () => ({ data: { connectors: [] }, isLoading: false }),
+}));
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => vi.fn(),

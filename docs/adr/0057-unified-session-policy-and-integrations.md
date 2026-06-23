@@ -179,6 +179,12 @@ config-driven mint ADR 0056 §9 deferred).
   repeatable operation rows) → `UpsertConnector` (server-validated by `parseConnector`) plus the
   write-only credential → org secret under the ref. Built-in connectors are read-only.
 - **D1** — Catalog-driven capability picker in the profile editor.
+  *As built:* `CapabilityPicker` replaces the free-text capabilities textarea — it derives the
+  grantable `provider:action` set from the connector catalog (`useConnectors`, the connectors'
+  operation `grants`), toggles them per provider with an optional `@resource` scope, and keeps
+  orphan caps (granted by no current connector) visible + removable rather than silently dropped.
+  The orchestrator's `assertCapabilitiesValid` still re-checks server-side. The profile editor is
+  now the single place for image + env + network + secrets + capabilities + skills.
 - **D2** — Retire `[git]`/`GitConfig` into capabilities; **ADR Accepted**.
 
 ## Consequences and risks
