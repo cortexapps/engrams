@@ -560,6 +560,28 @@ No new id space; no control `request_id` (the control protocol is not used).
   UI). Unit-tested (`hook_dedups_duplicate_auq_session_wide`, `scrub_removes_duplicate_auq_
   tool_use`); validated live (session `34eccff9`: one card, scrub `removed=1`, clean answer +
   haiku, zero re-ask) across both the within-run and cross-run double-fire in a single run.
+  **Part D follow-up (`question_outstanding` leak across the Part B fallback, 2026-06-23):**
+  Part D's flag was cleared in exactly ONE place — the hook's answer verdict
+  (`HookVerdict::Answer`), which fires only when the deferred tool is re-fired on `--resume`.
+  But Part B's fallback exists precisely for when that re-fire never happens (the answer-resume
+  itself narrate-past's): there the answer is delivered as a fresh user message and the hook
+  never runs, so the flag was never cleared — it leaked `true` for the rest of the session.
+  Every later genuine `AskUserQuestion` then hit the duplicate branch (flag already set) →
+  deferred with no card → scrubbed → **silently swallowed**, re-introducing the exact "user
+  never sees the question" failure this ADR set out to fix. Narrow trigger (a narrate-past on
+  an *answered* question — ~1/8 — plus a later question in the same session) but silent. Caught
+  in the wild: session `3b9b9dc5` carded "red or green", answered it via the fallback (zero
+  `tool_call_completed`), then a "cats or dogs" prompt produced `run_started`/`run_completed`
+  with no `user_question` at all (harness log: `duplicate AskUserQuestion while one is
+  outstanding` on the fresh tool id). Three sibling sessions (`bc4d01d2`, `8da67dff`,
+  `a6a814dd`) narrate-past'd only on the *question-asking* runs (benign Part A) — their
+  answer-resumes cleanly re-fired the tool (`tool_call_completed` present, both questions
+  carded) — confirming the trigger is specifically a narrate-past on the answer-resume.
+  **Fix:** clear `question_outstanding` on the Part B fallback path too — the invariant is
+  now "the flag is cleared on EVERY answer-delivery path, not just the hook's." Regression
+  test `fallback_clears_outstanding_so_later_question_still_cards` drives the real seam end to
+  end (engine fallback + the live hook server sharing one flag over an isolated socket) and is
+  red without the one-line clear.
 - **Truncation** of large diffs is surfaced in the UI (no silent caps); MultiEdit
   overflow clips trailing hunks and logs the count dropped.
 
