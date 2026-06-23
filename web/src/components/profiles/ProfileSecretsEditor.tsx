@@ -1,6 +1,7 @@
 import { Plus, TriangleAlert, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { OrgSecretCombobox } from "@/components/integrations/OrgSecretCombobox";
 import { FieldDescription } from "@/components/ui/field";
 import {
   Select,
@@ -85,7 +86,7 @@ export function ProfileSecretsEditor({
 }: {
   rows: SecretRow[];
   onChange: (rows: SecretRow[]) => void;
-  /** Existing org-secret names for the ref typeahead (datalist). */
+  /** Existing org-secret names for the ref typeahead. */
   secretNames: string[];
 }) {
   const set = (id: string, patch: Partial<SecretRow>) =>
@@ -102,11 +103,6 @@ export function ProfileSecretsEditor({
 
   return (
     <div className="flex flex-col gap-2">
-      <datalist id="org-secret-names">
-        {secretNames.map((n) => (
-          <option key={n} value={n} />
-        ))}
-      </datalist>
       {rows.map((r) => (
         <div
           key={r.id}
@@ -114,15 +110,12 @@ export function ProfileSecretsEditor({
           data-testid="secret-row"
         >
           <div className="flex items-center gap-2">
-            <Input
-              className="font-mono"
-              list="org-secret-names"
-              placeholder="org-secret name (ref)"
+            <OrgSecretCombobox
               value={r.ref}
-              spellCheck={false}
-              autoCapitalize="off"
-              aria-label="Org secret ref"
-              onChange={(e) => set(r.id, { ref: e.target.value })}
+              onChange={(v) => set(r.id, { ref: v })}
+              secretNames={secretNames}
+              placeholder="org-secret name (ref)"
+              className="flex-1"
             />
             <Input
               className="font-mono"

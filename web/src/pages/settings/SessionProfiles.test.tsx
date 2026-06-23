@@ -16,8 +16,7 @@ vi.mock("../../hooks/useProfiles", () => ({
               description: "",
               icon: "Bot",
               imageId: "i",
-              includeUserTokens: false,
-              envVars: {},
+              capabilities: [],
               archived: true,
             },
           ]
@@ -28,8 +27,7 @@ vi.mock("../../hooks/useProfiles", () => ({
               description: "Node API",
               icon: "Server",
               imageId: "i",
-              includeUserTokens: true,
-              envVars: {},
+              capabilities: [],
               archived: false,
             },
           ],
@@ -38,17 +36,26 @@ vi.mock("../../hooks/useProfiles", () => ({
   }),
   useDeleteProfile: () => ({ mutateAsync: del, isPending: false }),
 }));
+vi.mock("../../hooks/useEnabledImages", () => ({
+  useEnabledImages: () => ({
+    data: [{ id: "i", image_uri: "registry/api:latest" }],
+    isLoading: false,
+  }),
+}));
+vi.mock("../../components/integrations/useConnectorViews", () => ({
+  useConnectorViews: () => ({ views: [], isLoading: false, error: null }),
+}));
 
-beforeEach(() => {
-  del.mockClear();
-});
+beforeEach(() => del.mockClear());
 
 describe("SessionProfiles list", () => {
   it("renders active profiles with a create affordance", async () => {
     renderWithProviders(<SessionProfiles />);
     expect(await screen.findByText("Backend")).toBeTruthy();
-    expect(screen.getByText("carries your token")).toBeTruthy();
-    expect(screen.getByRole("link", { name: /create profile/i })).toBeTruthy();
+    expect(screen.getByText("Node API")).toBeTruthy();
+    // Capability-less profile reads as fully sandboxed in the meta strip.
+    expect(screen.getAllByText(/fully sandboxed/i).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByRole("link", { name: /new profile/i })).toBeTruthy();
   });
 
   it("archives an active profile via the confirm dialog", async () => {
