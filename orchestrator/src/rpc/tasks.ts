@@ -64,7 +64,8 @@ import {
 } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
-import { compileIntegrationPolicy, policyHasContent } from "../connectors/registry.ts";
+import { compileIntegrationPolicy, policyHasContent, loadRegistry } from "../connectors/registry.ts";
+import { makeConnectorStore, type ConnectorStore } from "../db/connectors.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -119,6 +120,8 @@ export interface TaskDeps {
   profiles?: ProfileStore;
   /** Enabled-image catalog client (ADR 0052) — resolves image_id → image_uri. */
   images?: ImagesClient;
+  /** Connector catalog (ADR 0057) — custom connectors merged with built-in seeds. */
+  connectors?: ConnectorStore;
   db?: Db;
 }
 
@@ -359,6 +362,9 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
     deps?.secrets ?? makeUserSecretStore(getDbFn());
   const profiles: ProfileStore = deps?.profiles ?? makeProfileStore(getDbFn());
   const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
+  // Lazy default (see profiles.ts): touch getDb() only when a handler reads
+  // connectors, so registering without a DB doesn't throw.
+  const connectors: ConnectorStore = deps?.connectors ?? { list: () => makeConnectorStore(getDbFn()).list() };
 
   router.service(TaskService, {
     // -------------------------------------------------------------------------
@@ -428,7 +434,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       // the profile's network allow-list + injected secrets, which the
       // coordinator sources the egress policy from. Shipped whenever it carries
       // anything (caps OR secrets OR a non-trivial network).
-      const policy = compileIntegrationPolicy(profile.capabilities, undefined, {
+      const policy = compileIntegrationPolicy(profile.capabilities, await loadRegistry(connectors), {
         network: profile.network,
         secrets: profile.secrets,
       });

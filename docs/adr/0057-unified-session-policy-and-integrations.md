@@ -133,6 +133,15 @@ config-driven mint ADR 0056 §9 deferred).
   echoed (List is metadata only). Pulled in before C1 so admins can author the secrets that
   profiles + connectors reference. (Distinct from C4's connector UI, but a sibling under it.)
 - **C1** — DB-back the connector catalog (orchestrator-only; built-ins as read-only seeds).
+  *As built:* a `connector` Drizzle table (migration `0007_connector_catalog.sql`) holds only
+  admin-authored connectors; `github`/`datadog` stay as file seeds (read-only). The sync
+  `connectorRegistry()` (file seeds) stays as the pure fns' default + test fixture; a new async
+  `loadRegistry(source)` = seeds ∪ DB, validated + cached (`invalidateRegistry()` for C3), with
+  **built-in precedence** (a custom row can't shadow a seed), per-row skip-on-invalid, and
+  degrade-to-seeds if the DB read fails. `compileIntegrationPolicy`/`grantsCapability` stay sync;
+  the two prod callers (`tasks.ts` create, `profiles.ts` capability-save) `await loadRegistry`.
+  `parseConnector` is hardened into the admin-trust boundary (host wildcard/scheme/path checks,
+  HTTP header-name + `{}`-template + no-CRLF validation, provider-id + count bounds).
 - **C2** — Mint-kind registry + GitHub cred migration (creds sourced from the org store;
   retire `--git-forge`/`--github-app-*`).
 - **C3** — `IntegrationService` proto + orchestrator service (connector CRUD, `ListMintKinds`,
