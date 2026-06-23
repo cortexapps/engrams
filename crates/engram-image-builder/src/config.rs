@@ -199,19 +199,14 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.manifest.description.as_deref(), Some("API service"));
         assert_eq!(
-            cfg.manifest.secret_mode,
-            engram_core::types::SecretMode::Broker
-        );
-        assert_eq!(
             cfg.manifest.env.get("NODE_ENV").map(String::as_str),
             Some("production")
         );
-        // Top-level `workdir` routes into the manifest (ImageManifest
-        // has deny_unknown_fields, so this also guards the key name).
+        // Top-level `workdir` routes into the manifest.
         assert_eq!(cfg.manifest.workdir.as_deref(), Some("/workspace"));
-        assert!(cfg.manifest.secrets.contains_key("GITHUB_TOKEN"));
-        assert_eq!(cfg.manifest.network.allow_hosts, vec!["api.github.com"]);
         assert_eq!(cfg.manifest.resources.suggested_memory_mib, Some(4096));
+        // ADR 0057: the `secret_mode` / `[secrets]` / `[network]` sections in the
+        // TOML above are accepted-and-ignored (no longer manifest fields).
     }
 
     #[test]
@@ -228,16 +223,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_unknown_field_in_manifest_section() {
-        // ImageManifest's deny_unknown_fields still catches manifest
-        // typos because we round-trip through it.
-        let res = EngramRepoConfig::parse(
+    fn parse_tolerates_legacy_manifest_sections() {
+        // ADR 0057: ImageManifest dropped `deny_unknown_fields` so the
+        // coordinator can still parse manifests baked BEFORE the strip (which
+        // carry `[secrets]`/`[network]`/`secret_mode`) during the rollout window.
+        // The baker shares that type, so legacy sections (and, as a tradeoff,
+        // unknown top-level fields) are accepted-and-ignored rather than rejected.
+        let cfg = EngramRepoConfig::parse(
             r#"
             name = "x"
-            enviroment = { FOO = "bar" }
+            secret_mode = "broker"
+            [secrets.GITHUB_TOKEN]
+            allow_hosts = ["api.github.com"]
+            [network]
+            allow_hosts = ["api.github.com"]
             "#,
-        );
-        assert!(res.is_err(), "unknown manifest field must be rejected");
+        )
+        .expect("legacy manifest sections are ignored, not rejected");
+        assert_eq!(cfg.manifest.name, "x");
     }
 
     #[test]

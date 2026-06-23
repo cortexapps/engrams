@@ -57,9 +57,13 @@ pub(crate) struct BootInputs {
     /// the shell. Used to synthesize the readiness-probe agent when
     /// `agent` is `None`.
     pub session_env: HashMap<String, String>,
-    /// Resolved secrets, for building the egress secret-substitution
-    /// entries.
-    pub secret_bundle: engram_core::traits::SecretBundle,
+    /// ADR 0057: the broker secret-substitution entries the proxy enforces
+    /// (placeholder → real value, gated by allow_hosts), precomputed in
+    /// `prepare_inner` from the session policy's secrets. Literal secrets are
+    /// already folded into `spec_env`/`session_env` and don't appear here.
+    pub egress_secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
+    /// ADR 0057: the egress network allow-list, sourced from the session
+    /// policy (deny-all when the session has no policy). No longer the manifest.
     pub network: engram_core::types::image::NetworkPolicy,
     /// ADR 0055: per-session skills resolved from the profile + assigned to
     /// reserved slots (dyn_0..). Patched into the restored VM load-paused.
@@ -73,7 +77,6 @@ pub(crate) struct BootInputs {
     /// inject entries at boot. `None` on the queued/resume re-prepare for now
     /// (persistence + re-inject is Phase 3b-2).
     pub integration_policy: Option<engram_core::types::IntegrationPolicy>,
-    pub secret_mode: engram_core::types::image::SecretMode,
     /// Per-request `secrets` overrides to seal into `session_secrets`
     /// once the row exists (so resume rebuilds the harness env). `None`
     /// when there are none.
@@ -132,12 +135,11 @@ pub(crate) async fn boot_on_reserved_host(
         mut agent,
         git,
         session_env,
-        secret_bundle,
+        egress_secrets,
         network,
         selected_mounts,
         capabilities,
         integration_policy,
-        secret_mode,
         deferred_session_secrets,
         prompt,
         memory_mib: _,
@@ -269,10 +271,8 @@ pub(crate) async fn boot_on_reserved_host(
         state,
         session_id,
         sandbox_id,
-        &secret_bundle,
-        &spec_env,
+        egress_secrets,
         &network,
-        secret_mode,
         &image_ref,
         integration_policy.as_ref(),
     )
@@ -300,7 +300,8 @@ pub(crate) async fn boot_on_reserved_host(
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
-        secret_mode,
+        // ADR 0057: vestigial wire field; substitution is per-entry.
+        secret_mode: engram_core::types::image::SecretMode::Broker,
     });
 
     // Emit pending → created (the row materialized at Created above).
@@ -406,15 +407,12 @@ fn map_restore_error(e: engram_core::SandboxError) -> ApiError {
 /// Build the per-session egress policy from the resolved guest IP, or
 /// `None` when the backend exposes no guest IP (process backend / some
 /// VZ configs) — the caller synthesizes an unspecified-IP fallback.
-#[allow(clippy::too_many_arguments)]
 async fn build_egress_policy(
     state: &SharedState,
     session_id: SessionId,
     sandbox_id: SandboxId,
-    secret_bundle: &engram_core::traits::SecretBundle,
-    spec_env: &HashMap<String, String>,
+    egress_secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
     network: &engram_core::types::image::NetworkPolicy,
-    secret_mode: engram_core::types::image::SecretMode,
     image: &str,
     integration_policy: Option<&engram_core::types::IntegrationPolicy>,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
@@ -426,10 +424,15 @@ async fn build_egress_policy(
         guest_ip,
         network_allow_hosts: network.allow_hosts.clone(),
         network_allow_host_patterns: network.allow_host_patterns.clone(),
-        secrets: egress_secret_entries(secret_bundle, spec_env),
+        // ADR 0057: precomputed in `prepare_inner`/resume from the policy secrets
+        // (broker entries only; literals are already in the guest env).
+        secrets: egress_secrets,
         injects: resolve_inject_entries(state, integration_policy, image).await,
         observes: build_observe_entries(integration_policy),
-        secret_mode,
+        // ADR 0057: per-secret mode replaces a session-level mode; the proxy
+        // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
+        // wire field — substitution is driven by the entries, not this flag.
+        secret_mode: engram_core::types::image::SecretMode::Broker,
     })
 }
 
@@ -554,34 +557,6 @@ pub(crate) async fn persist_integration_policy(
     }
 }
 
-/// Pair each resolved secret with the placeholder that
-/// [`crate::api::sessions::apply_secrets_to_env`] wrote into the guest
-/// env, producing the egress entries the host-agent proxy substitutes
-/// on (placeholder → `real_value`, gated by the secret's allow lists).
-///
-/// The placeholder is read back out of `spec_env` — so a secret whose
-/// env var was dropped is skipped, and the entry placeholder is by
-/// construction the *same* string the guest carries. In `Broker` mode
-/// `spec_env[name]` is the placeholder; in `Literal` mode it is the
-/// real value, so substitution is a harmless no-op (placeholder ==
-/// `real_value`). This env-placeholder ⇄ entry-placeholder coupling is
-/// what makes Broker mode authenticate; the
-/// `broker_env_placeholder_matches_egress_entry` test locks it.
-pub(crate) fn egress_secret_entries(
-    secret_bundle: &engram_core::traits::SecretBundle,
-    spec_env: &HashMap<String, String>,
-) -> Vec<engram_core::types::egress::EgressSecretEntry> {
-    let mut secrets = Vec::new();
-    for (name, resolved) in &secret_bundle.secrets {
-        let Some(placeholder) = spec_env.get(name).cloned() else {
-            continue;
-        };
-        secrets.push(engram_core::types::egress::EgressSecretEntry {
-            placeholder,
-            real_value: resolved.value.clone(),
-            allow_hosts: resolved.schema.allow_hosts.clone(),
-            allow_host_patterns: resolved.schema.allow_host_patterns.clone(),
-        });
-    }
-    secrets
-}
+// ADR 0057: `egress_secret_entries` (manifest-secret → egress pairing) is
+// retired — the per-secret broker entries are built in
+// `crate::api::sessions::resolve_policy_secrets` from the session policy.

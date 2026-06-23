@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// ADR 0057: NO `deny_unknown_fields`. Manifests baked before the strip still
+// carry `[secrets]`/`[network]`/`secret_mode`; the coordinator parses those
+// manifests fine and ignores those sections — session network/secrets now come
+// from the profile-compiled policy, not the image.
 pub struct ImageManifest {
     pub name: String,
     #[serde(default)]
@@ -42,27 +45,14 @@ pub struct ImageManifest {
     #[serde(default)]
     pub workdir: Option<String>,
 
-    /// Secrets this image expects. Session creation fails if a
-    /// required secret is not provided by the SecretStore. Each
-    /// secret's `allow_hosts` list constrains where the value may be
-    /// substituted in `broker` mode (see SecretMode).
-    #[serde(default)]
-    pub secrets: HashMap<String, SecretSchema>,
-
-    /// Defense-in-depth network policy. Today purely declarative;
-    /// enforcement (egress filtering) lands with the Firecracker
-    /// network namespace work in Phase 2.
-    #[serde(default)]
-    pub network: NetworkPolicy,
-
+    // ADR 0057: `secrets`, `network`, and `secret_mode` are REMOVED from the
+    // manifest. Egress network + injected secrets are now session policy, set on
+    // the profile and compiled into the per-session IntegrationPolicy (the
+    // coordinator's sole source). The image declares only what it *is* (env,
+    // workdir, resources, harness); not what a session may *reach* or *hold*.
     /// Resource hints used as defaults when a session doesn't override.
     #[serde(default)]
     pub resources: ResourceHints,
-
-    /// How secret values are surfaced inside the sandbox. See
-    /// [`SecretMode`] for the security tradeoff.
-    #[serde(default)]
-    pub secret_mode: SecretMode,
 
     /// The single agent harness baked into this image, if any (ADR
     /// 0021). `None` → a harness-less template (a pure dev VM, driven
@@ -457,9 +447,6 @@ mod tests {
         let m: ImageManifest = toml::from_str(src).unwrap();
         assert_eq!(m.name, "cortex-api");
         assert!(m.env.is_empty());
-        assert!(m.secrets.is_empty());
-        assert_eq!(m.secret_mode, SecretMode::Literal);
-        assert_eq!(m.network.default, NetworkDefault::Deny);
     }
 
     #[test]
@@ -502,8 +489,14 @@ mod tests {
         .is_err());
     }
 
+    /// ADR 0057: `secrets`/`secret_mode`/`network` were removed from the
+    /// manifest (they're session policy now). A manifest baked BEFORE the strip
+    /// still carries those sections; with `deny_unknown_fields` dropped, such a
+    /// manifest must still parse — the coordinator ignores the stripped sections
+    /// (session network/secrets come from the profile-compiled policy). The kept
+    /// fields (name/description/env/resources) still parse normally.
     #[test]
-    fn manifest_parses_full_toml_with_secrets_and_network() {
+    fn manifest_ignores_pre_strip_secrets_and_network_sections() {
         let src = r#"
             name = "cortex-api"
             description = "Backend API service"
@@ -517,33 +510,19 @@ mod tests {
             allow_host_patterns = ["*.githubusercontent.com"]
             description = "Read+write to org cortex/"
 
-            [secrets.OPENAI_API_KEY]
-            allow_hosts = ["api.openai.com"]
-            required = false
-
             [network]
             default = "deny"
             allow_hosts = ["api.github.com", "registry.npmjs.org"]
-            allow_host_patterns = ["*.pypi.org"]
 
             [resources]
             suggested_memory_mib = 4096
             suggested_vcpus = 2
         "#;
+        // The stripped sections are ignored, not rejected (no deny_unknown_fields).
         let m: ImageManifest = toml::from_str(src).unwrap();
         assert_eq!(m.name, "cortex-api");
         assert_eq!(m.description.as_deref(), Some("Backend API service"));
-        assert_eq!(m.secret_mode, SecretMode::Broker);
-
-        let gh = m.secrets.get("GITHUB_TOKEN").unwrap();
-        assert_eq!(gh.allow_hosts, vec!["api.github.com"]);
-        assert_eq!(gh.allow_host_patterns, vec!["*.githubusercontent.com"]);
-        assert!(gh.required, "secrets default to required");
-
-        let openai = m.secrets.get("OPENAI_API_KEY").unwrap();
-        assert!(!openai.required, "explicit required=false honored");
-
-        assert_eq!(m.network.allow_hosts.len(), 2);
+        assert_eq!(m.env.get("PYTHONUNBUFFERED").map(String::as_str), Some("1"));
         assert_eq!(m.resources.suggested_memory_mib, Some(4096));
         assert_eq!(m.resources.suggested_vcpus, Some(2));
     }
@@ -785,16 +764,19 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_unknown_top_level_keys() {
-        // deny_unknown_fields catches typos like `enviroment` or
-        // forgotten config sections — surfaces them at parse time
-        // rather than silently dropping config.
+    fn manifest_ignores_unknown_top_level_keys() {
+        // ADR 0057: `deny_unknown_fields` was dropped so the coordinator can
+        // parse manifests baked BEFORE the secrets/network/secret_mode strip
+        // (those carry the now-removed sections) during the rollout window. The
+        // tradeoff: unknown/legacy top-level keys are silently ignored, not
+        // rejected — so a baker-side typo no longer fails the parse here.
         let src = r#"
             name = "cortex-api"
+            secret_mode = "broker"
             enviroment = { FOO = "bar" }
         "#;
-        let res: Result<ImageManifest, _> = toml::from_str(src);
-        assert!(res.is_err(), "typo `enviroment` must be rejected");
+        let m: ImageManifest = toml::from_str(src).expect("legacy/unknown keys are ignored");
+        assert_eq!(m.name, "cortex-api");
     }
 
     #[test]

@@ -414,7 +414,16 @@ pub(crate) async fn capture_and_record_base_snapshot(
         &row.image_uri,
         &engram_oci::Digest256(row.manifest_digest.clone()),
     );
-    let spec = crate::api::sessions::cold_boot_spec(&capture_uri, manifest, None);
+    // ADR 0057: base-snapshot capture is a trusted, ephemeral build step (it may
+    // run a `[warm]` hook that needs egress), and the captured snapshot is
+    // network-agnostic — every session that later restores it gets its own
+    // policy network. So capture boots with allow-all egress.
+    let capture_network = engram_core::types::image::NetworkPolicy {
+        default: engram_core::types::image::NetworkDefault::Allow,
+        allow_hosts: Vec::new(),
+        allow_host_patterns: Vec::new(),
+    };
+    let spec = crate::api::sessions::cold_boot_spec(&capture_uri, manifest, None, capture_network);
 
     let (host_id, host) =
         crate::placement::pick_capture_host(state.services.meta.as_ref(), &state.host_registry)
