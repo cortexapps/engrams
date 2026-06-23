@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/integration.proto.
  */
 export const file_engram_app_v1_integration: GenFile = /*@__PURE__*/
-  fileDesc("Ch9lbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uLnByb3RvEg1lbmdyYW0uYXBwLnYxImsKCUNvbm5lY3RvchIQCghwcm92aWRlchgBIAEoCRITCgtjb25maWdfanNvbhgCIAEoCRIPCgdidWlsdGluGAMgASgIEhIKCmNyZWF0ZWRfYXQYBCABKAkSEgoKdXBkYXRlZF9hdBgFIAEoCSIXChVMaXN0Q29ubmVjdG9yc1JlcXVlc3QiRgoWTGlzdENvbm5lY3RvcnNSZXNwb25zZRIsCgpjb25uZWN0b3JzGAEgAygLMhguZW5ncmFtLmFwcC52MS5Db25uZWN0b3IiLQoWVXBzZXJ0Q29ubmVjdG9yUmVxdWVzdBITCgtjb25maWdfanNvbhgBIAEoCSJGChdVcHNlcnRDb25uZWN0b3JSZXNwb25zZRIrCgljb25uZWN0b3IYASABKAsyGC5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvciIqChZEZWxldGVDb25uZWN0b3JSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJIioKF0RlbGV0ZUNvbm5lY3RvclJlc3BvbnNlEg8KB2RlbGV0ZWQYASABKAgytwIKEkludGVncmF0aW9uU2VydmljZRJdCg5MaXN0Q29ubmVjdG9ycxIkLmVuZ3JhbS5hcHAudjEuTGlzdENvbm5lY3RvcnNSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdG9yc1Jlc3BvbnNlEmAKD1Vwc2VydENvbm5lY3RvchIlLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USYAoPRGVsZXRlQ29ubmVjdG9yEiUuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("Ch9lbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uLnByb3RvEg1lbmdyYW0uYXBwLnYxInsKCUNvbm5lY3RvchIQCghwcm92aWRlchgBIAEoCRITCgtjb25maWdfanNvbhgCIAEoCRIPCgdidWlsdGluGAMgASgIEhIKCmNyZWF0ZWRfYXQYBCABKAkSEgoKdXBkYXRlZF9hdBgFIAEoCRIOCgZzdGF0dXMYBiABKAkiFwoVTGlzdENvbm5lY3RvcnNSZXF1ZXN0IkYKFkxpc3RDb25uZWN0b3JzUmVzcG9uc2USLAoKY29ubmVjdG9ycxgBIAMoCzIYLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yIi0KFlVwc2VydENvbm5lY3RvclJlcXVlc3QSEwoLY29uZmlnX2pzb24YASABKAkiRgoXVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USKwoJY29ubmVjdG9yGAEgASgLMhguZW5ncmFtLmFwcC52MS5Db25uZWN0b3IiKgoWRGVsZXRlQ29ubmVjdG9yUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCSIqChdEZWxldGVDb25uZWN0b3JSZXNwb25zZRIPCgdkZWxldGVkGAEgASgIIjoKDUNvbm5lY3Rvckljb24SDAoEbW9ubxgBIAEoCRINCgVjb2xvchgCIAEoCRIMCgRsb2dvGAMgASgJIm0KEENvbm5lY3RvckRpc3BsYXkSDAoEbmFtZRgBIAEoCRIQCghjYXRlZ29yeRgCIAEoCRINCgVibHVyYhgDIAEoCRIqCgRpY29uGAQgASgLMhwuZW5ncmFtLmFwcC52MS5Db25uZWN0b3JJY29uIkIKEUNhdGFsb2dDYXBhYmlsaXR5Eg4KBmFjdGlvbhgBIAEoCRIOCgZhY2Nlc3MYAiABKAkSDQoFYXNzZXQYAyABKAkivAEKFFByb3ZpZGVyQ2F0YWxvZ0VudHJ5EhAKCHByb3ZpZGVyGAEgASgJEjAKB2Rpc3BsYXkYAiABKAsyHy5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvckRpc3BsYXkSGQoRY3JlZGVudGlhbF9zb3VyY2UYAyABKAkSDQoFaG9zdHMYBCADKAkSNgoMY2FwYWJpbGl0aWVzGAUgAygLMiAuZW5ncmFtLmFwcC52MS5DYXRhbG9nQ2FwYWJpbGl0eSIeChxHZXRJbnRlZ3JhdGlvbkNhdGFsb2dSZXF1ZXN0IlcKHUdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEjYKCXByb3ZpZGVycxgBIAMoCzIjLmVuZ3JhbS5hcHAudjEuUHJvdmlkZXJDYXRhbG9nRW50cnkirgEKGFNldE1pbnRDcmVkZW50aWFsUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRIMCgRraW5kGAIgASgJEkMKBnZhbHVlcxgDIAMoCzIzLmVuZ3JhbS5hcHAudjEuU2V0TWludENyZWRlbnRpYWxSZXF1ZXN0LlZhbHVlc0VudHJ5Gi0KC1ZhbHVlc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiMQoZU2V0TWludENyZWRlbnRpYWxSZXNwb25zZRIUCgxzZWNyZXRfbmFtZXMYASADKAkykwQKEkludGVncmF0aW9uU2VydmljZRJdCg5MaXN0Q29ubmVjdG9ycxIkLmVuZ3JhbS5hcHAudjEuTGlzdENvbm5lY3RvcnNSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdG9yc1Jlc3BvbnNlEmAKD1Vwc2VydENvbm5lY3RvchIlLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USYAoPRGVsZXRlQ29ubmVjdG9yEiUuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXNwb25zZRJyChVHZXRJbnRlZ3JhdGlvbkNhdGFsb2cSKy5lbmdyYW0uYXBwLnYxLkdldEludGVncmF0aW9uQ2F0YWxvZ1JlcXVlc3QaLC5lbmdyYW0uYXBwLnYxLkdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEmYKEVNldE1pbnRDcmVkZW50aWFsEicuZW5ncmFtLmFwcC52MS5TZXRNaW50Q3JlZGVudGlhbFJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLlNldE1pbnRDcmVkZW50aWFsUmVzcG9uc2ViBnByb3RvMw");
 
 /**
  * @generated from message engram.app.v1.Connector
@@ -46,6 +46,15 @@ export type Connector = Message<"engram.app.v1.Connector"> & {
    * @generated from field: string updated_at = 5;
    */
   updatedAt: string;
+
+  /**
+   * Derived credential posture: "connected" (configured) | "available". For an
+   * inject connector, connected ⇔ its secretRef exists in the org store; for a
+   * mint connector, connected ⇔ every required `<kind>.<field>` secret exists.
+   *
+   * @generated from field: string status = 6;
+   */
+  status: string;
 };
 
 /**
@@ -156,6 +165,227 @@ export const DeleteConnectorResponseSchema: GenMessage<DeleteConnectorResponse> 
   messageDesc(file_engram_app_v1_integration, 6);
 
 /**
+ * Per-connector visual identity. `mono` + `color` are always set; `logo` is a
+ * serve URL when an uploaded logo exists (the renderer falls back to `mono`).
+ *
+ * @generated from message engram.app.v1.ConnectorIcon
+ */
+export type ConnectorIcon = Message<"engram.app.v1.ConnectorIcon"> & {
+  /**
+   * @generated from field: string mono = 1;
+   */
+  mono: string;
+
+  /**
+   * @generated from field: string color = 2;
+   */
+  color: string;
+
+  /**
+   * "" when none
+   *
+   * @generated from field: string logo = 3;
+   */
+  logo: string;
+};
+
+/**
+ * Describes the message engram.app.v1.ConnectorIcon.
+ * Use `create(ConnectorIconSchema)` to create a new message.
+ */
+export const ConnectorIconSchema: GenMessage<ConnectorIcon> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 7);
+
+/**
+ * @generated from message engram.app.v1.ConnectorDisplay
+ */
+export type ConnectorDisplay = Message<"engram.app.v1.ConnectorDisplay"> & {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string category = 2;
+   */
+  category: string;
+
+  /**
+   * @generated from field: string blurb = 3;
+   */
+  blurb: string;
+
+  /**
+   * @generated from field: engram.app.v1.ConnectorIcon icon = 4;
+   */
+  icon?: ConnectorIcon;
+};
+
+/**
+ * Describes the message engram.app.v1.ConnectorDisplay.
+ * Use `create(ConnectorDisplaySchema)` to create a new message.
+ */
+export const ConnectorDisplaySchema: GenMessage<ConnectorDisplay> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 8);
+
+/**
+ * One grantable power, derived for display (the slug stays canonical).
+ *
+ * @generated from message engram.app.v1.CatalogCapability
+ */
+export type CatalogCapability = Message<"engram.app.v1.CatalogCapability"> & {
+  /**
+   * e.g. "issues:write"
+   *
+   * @generated from field: string action = 1;
+   */
+  action: string;
+
+  /**
+   * "read" | "write" (derived from the op's HTTP method)
+   *
+   * @generated from field: string access = 2;
+   */
+  access: string;
+
+  /**
+   * asset kind this op surfaces, or "" when none
+   *
+   * @generated from field: string asset = 3;
+   */
+  asset: string;
+};
+
+/**
+ * Describes the message engram.app.v1.CatalogCapability.
+ * Use `create(CatalogCapabilitySchema)` to create a new message.
+ */
+export const CatalogCapabilitySchema: GenMessage<CatalogCapability> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 9);
+
+/**
+ * @generated from message engram.app.v1.ProviderCatalogEntry
+ */
+export type ProviderCatalogEntry = Message<"engram.app.v1.ProviderCatalogEntry"> & {
+  /**
+   * @generated from field: string provider = 1;
+   */
+  provider: string;
+
+  /**
+   * @generated from field: engram.app.v1.ConnectorDisplay display = 2;
+   */
+  display?: ConnectorDisplay;
+
+  /**
+   * "mint" | "inject"
+   *
+   * @generated from field: string credential_source = 3;
+   */
+  credentialSource: string;
+
+  /**
+   * @generated from field: repeated string hosts = 4;
+   */
+  hosts: string[];
+
+  /**
+   * @generated from field: repeated engram.app.v1.CatalogCapability capabilities = 5;
+   */
+  capabilities: CatalogCapability[];
+};
+
+/**
+ * Describes the message engram.app.v1.ProviderCatalogEntry.
+ * Use `create(ProviderCatalogEntrySchema)` to create a new message.
+ */
+export const ProviderCatalogEntrySchema: GenMessage<ProviderCatalogEntry> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 10);
+
+/**
+ * @generated from message engram.app.v1.GetIntegrationCatalogRequest
+ */
+export type GetIntegrationCatalogRequest = Message<"engram.app.v1.GetIntegrationCatalogRequest"> & {
+};
+
+/**
+ * Describes the message engram.app.v1.GetIntegrationCatalogRequest.
+ * Use `create(GetIntegrationCatalogRequestSchema)` to create a new message.
+ */
+export const GetIntegrationCatalogRequestSchema: GenMessage<GetIntegrationCatalogRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 11);
+
+/**
+ * @generated from message engram.app.v1.GetIntegrationCatalogResponse
+ */
+export type GetIntegrationCatalogResponse = Message<"engram.app.v1.GetIntegrationCatalogResponse"> & {
+  /**
+   * @generated from field: repeated engram.app.v1.ProviderCatalogEntry providers = 1;
+   */
+  providers: ProviderCatalogEntry[];
+};
+
+/**
+ * Describes the message engram.app.v1.GetIntegrationCatalogResponse.
+ * Use `create(GetIntegrationCatalogResponseSchema)` to create a new message.
+ */
+export const GetIntegrationCatalogResponseSchema: GenMessage<GetIntegrationCatalogResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 12);
+
+/**
+ * @generated from message engram.app.v1.SetMintCredentialRequest
+ */
+export type SetMintCredentialRequest = Message<"engram.app.v1.SetMintCredentialRequest"> & {
+  /**
+   * e.g. "github"
+   *
+   * @generated from field: string provider = 1;
+   */
+  provider: string;
+
+  /**
+   * e.g. "github_app"
+   *
+   * @generated from field: string kind = 2;
+   */
+  kind: string;
+
+  /**
+   * field name → value (e.g. app_id, private_key_pem). Each non-empty value is
+   * sealed as the org secret `<kind>.<field>`; values are never returned.
+   *
+   * @generated from field: map<string, string> values = 3;
+   */
+  values: { [key: string]: string };
+};
+
+/**
+ * Describes the message engram.app.v1.SetMintCredentialRequest.
+ * Use `create(SetMintCredentialRequestSchema)` to create a new message.
+ */
+export const SetMintCredentialRequestSchema: GenMessage<SetMintCredentialRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 13);
+
+/**
+ * @generated from message engram.app.v1.SetMintCredentialResponse
+ */
+export type SetMintCredentialResponse = Message<"engram.app.v1.SetMintCredentialResponse"> & {
+  /**
+   * The org-secret names written (the `<kind>.<field>` keys), for confirmation.
+   *
+   * @generated from field: repeated string secret_names = 1;
+   */
+  secretNames: string[];
+};
+
+/**
+ * Describes the message engram.app.v1.SetMintCredentialResponse.
+ * Use `create(SetMintCredentialResponseSchema)` to create a new message.
+ */
+export const SetMintCredentialResponseSchema: GenMessage<SetMintCredentialResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 14);
+
+/**
  * ADR 0057 C3: orchestrator-native connector catalog CRUD (Plane B). Connectors
  * live in the orchestrator DB (the `connector` table, C1); the built-ins
  * (github/datadog) are read-only file seeds surfaced alongside custom ones.
@@ -167,7 +397,8 @@ export const DeleteConnectorResponseSchema: GenMessage<DeleteConnectorResponse> 
  */
 export const IntegrationService: GenService<{
   /**
-   * Built-in seeds (read-only) ∪ admin-authored connectors.
+   * Built-in seeds (read-only) ∪ admin-authored connectors. Admin-only; each row
+   * carries the derived connected/available `status`.
    *
    * @generated from rpc engram.app.v1.IntegrationService.ListConnectors
    */
@@ -196,6 +427,31 @@ export const IntegrationService: GenService<{
     methodKind: "unary";
     input: typeof DeleteConnectorRequestSchema;
     output: typeof DeleteConnectorResponseSchema;
+  },
+  /**
+   * Member-readable provider catalog: per-connector display identity + the
+   * powers it grants + the hosts it opens, derived from the merged registry.
+   * Carries NO secret material (no secretRef / header / template / mint kind) —
+   * safe for the Launch receipt + in-session provider icons (redesign).
+   *
+   * @generated from rpc engram.app.v1.IntegrationService.GetIntegrationCatalog
+   */
+  getIntegrationCatalog: {
+    methodKind: "unary";
+    input: typeof GetIntegrationCatalogRequestSchema;
+    output: typeof GetIntegrationCatalogResponseSchema;
+  },
+  /**
+   * Admin-only: store a mint kind's credentials, sealing each field as an org
+   * secret `<kind>.<field>` (the coordinator resolves them by that name). The
+   * GitHub App private key is a secret; the App ID is config — both are sealed.
+   *
+   * @generated from rpc engram.app.v1.IntegrationService.SetMintCredential
+   */
+  setMintCredential: {
+    methodKind: "unary";
+    input: typeof SetMintCredentialRequestSchema;
+    output: typeof SetMintCredentialResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_integration, 0);

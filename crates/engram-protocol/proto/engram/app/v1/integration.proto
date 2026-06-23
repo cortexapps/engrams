@@ -9,13 +9,23 @@ package engram.app.v1;
 // TaskService). Admin-gated; `config_json` is the raw connector JSON, validated
 // by `parseConnector` (the admin-trust boundary) on write.
 service IntegrationService {
-  // Built-in seeds (read-only) ∪ admin-authored connectors.
+  // Built-in seeds (read-only) ∪ admin-authored connectors. Admin-only; each row
+  // carries the derived connected/available `status`.
   rpc ListConnectors(ListConnectorsRequest) returns (ListConnectorsResponse);
   // Create or replace a custom connector. Rejects a built-in provider id and
   // any config `parseConnector` refuses. Invalidates the registry cache.
   rpc UpsertConnector(UpsertConnectorRequest) returns (UpsertConnectorResponse);
   // Delete a custom connector (idempotent). Rejects a built-in provider id.
   rpc DeleteConnector(DeleteConnectorRequest) returns (DeleteConnectorResponse);
+  // Member-readable provider catalog: per-connector display identity + the
+  // powers it grants + the hosts it opens, derived from the merged registry.
+  // Carries NO secret material (no secretRef / header / template / mint kind) —
+  // safe for the Launch receipt + in-session provider icons (redesign).
+  rpc GetIntegrationCatalog(GetIntegrationCatalogRequest) returns (GetIntegrationCatalogResponse);
+  // Admin-only: store a mint kind's credentials, sealing each field as an org
+  // secret `<kind>.<field>` (the coordinator resolves them by that name). The
+  // GitHub App private key is a secret; the App ID is config — both are sealed.
+  rpc SetMintCredential(SetMintCredentialRequest) returns (SetMintCredentialResponse);
 }
 
 message Connector {
@@ -27,6 +37,10 @@ message Connector {
   // ISO-8601; empty for built-in seeds.
   string created_at = 4;
   string updated_at = 5;
+  // Derived credential posture: "connected" (configured) | "available". For an
+  // inject connector, connected ⇔ its secretRef exists in the org store; for a
+  // mint connector, connected ⇔ every required `<kind>.<field>` secret exists.
+  string status = 6;
 }
 
 message ListConnectorsRequest {}
@@ -50,4 +64,63 @@ message DeleteConnectorRequest {
 
 message DeleteConnectorResponse {
   bool deleted = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Member-readable provider catalog (redesign): display identity + derived
+// powers + hosts. Mirrors `buildProviderCatalog()` in connectors/registry.ts.
+// ---------------------------------------------------------------------------
+
+// Per-connector visual identity. `mono` + `color` are always set; `logo` is a
+// serve URL when an uploaded logo exists (the renderer falls back to `mono`).
+message ConnectorIcon {
+  string mono = 1;
+  string color = 2;
+  string logo = 3; // "" when none
+}
+
+message ConnectorDisplay {
+  string name = 1;
+  string category = 2;
+  string blurb = 3;
+  ConnectorIcon icon = 4;
+}
+
+// One grantable power, derived for display (the slug stays canonical).
+message CatalogCapability {
+  string action = 1;  // e.g. "issues:write"
+  string access = 2;  // "read" | "write" (derived from the op's HTTP method)
+  string asset = 3;   // asset kind this op surfaces, or "" when none
+}
+
+message ProviderCatalogEntry {
+  string provider = 1;
+  ConnectorDisplay display = 2;
+  string credential_source = 3; // "mint" | "inject"
+  repeated string hosts = 4;
+  repeated CatalogCapability capabilities = 5;
+}
+
+message GetIntegrationCatalogRequest {}
+
+message GetIntegrationCatalogResponse {
+  repeated ProviderCatalogEntry providers = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Mint-credential write path (redesign): seal a mint kind's fields as org
+// secrets so the coordinator can mint a token per session.
+// ---------------------------------------------------------------------------
+
+message SetMintCredentialRequest {
+  string provider = 1; // e.g. "github"
+  string kind = 2;     // e.g. "github_app"
+  // field name → value (e.g. app_id, private_key_pem). Each non-empty value is
+  // sealed as the org secret `<kind>.<field>`; values are never returned.
+  map<string, string> values = 3;
+}
+
+message SetMintCredentialResponse {
+  // The org-secret names written (the `<kind>.<field>` keys), for confirmation.
+  repeated string secret_names = 1;
 }

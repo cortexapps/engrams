@@ -15,12 +15,45 @@ import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
 import { registerIntegration } from "../rpc/integration.ts";
-import type { IntegrationDeps, GetSession } from "../rpc/integration.ts";
+import type { IntegrationDeps, GetSession, MintAccess, OrgSecretAccess } from "../rpc/integration.ts";
 import type { ConnectorStore, ConnectorRow } from "../db/connectors.ts";
+import { invalidateRegistry } from "../connectors/registry.ts";
 import { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
+import type { MintKind } from "../gen/engram/app/v1/mint_pb.ts";
 
 function makeGetSession(userId: string | null, role: "user" | "admin" = "user"): GetSession {
   return async () => (userId ? { user: { id: userId, role } } : null);
+}
+
+// The github_app mint kind (shape mirrors mint.test.ts; only name/required are read).
+const GITHUB_MINT_KIND = {
+  kind: "github_app",
+  provider: "github",
+  displayName: "GitHub App",
+  fields: [
+    { name: "app_id", label: "App ID", fieldKind: 1, required: true },
+    { name: "private_key_pem", label: "Private key (PEM)", fieldKind: 2, required: true },
+  ],
+} as unknown as MintKind;
+
+function fakeMint(): MintAccess {
+  return { async listMintKinds() { return { mintKinds: [GITHUB_MINT_KIND] }; } };
+}
+
+function fakeOrgSecret(names: string[] = []) {
+  const set = new Set(names);
+  const puts: Array<{ name: string; value: string }> = [];
+  const client: OrgSecretAccess = {
+    async listSecrets() {
+      return { secrets: [...set].map((name) => ({ name })) };
+    },
+    async putSecret(req) {
+      puts.push(req);
+      set.add(req.name);
+      return {};
+    },
+  };
+  return { client, puts };
 }
 
 interface Recorded {
@@ -181,6 +214,142 @@ describe("IntegrationService (native)", () => {
       expect(r.deleted).toBe(true);
       expect(rec.deletes).toEqual(["sentry"]);
       await expectErr(s.client.deleteConnector({ provider: "github" }), Code.InvalidArgument);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe("IntegrationService — connector status (redesign)", () => {
+  const adminDeps = (names: string[]): IntegrationDeps => ({
+    getSession: makeGetSession("a", "admin"),
+    connectors: fakeStore().store,
+    orgSecret: fakeOrgSecret(names).client,
+    mint: fakeMint(),
+  });
+
+  test("inject connected ⇔ secretRef present; mint connected ⇔ all required fields present", async () => {
+    const s = await spawn(adminDeps(["datadog-api-key", "github_app.app_id", "github_app.private_key_pem"]));
+    try {
+      const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
+      expect(by.get("datadog")?.status).toBe("connected"); // inject secretRef present
+      expect(by.get("github")?.status).toBe("connected"); // both mint fields present
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("available when credentials are absent", async () => {
+    const s = await spawn(adminDeps([]));
+    try {
+      const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
+      expect(by.get("datadog")?.status).toBe("available");
+      expect(by.get("github")?.status).toBe("available");
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("mint stays available until EVERY required field is present", async () => {
+    const s = await spawn(adminDeps(["github_app.app_id"])); // missing private_key_pem
+    try {
+      const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
+      expect(by.get("github")?.status).toBe("available");
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe("GetIntegrationCatalog (member-readable)", () => {
+  test("anon → Unauthenticated; a member gets the derived catalog", async () => {
+    invalidateRegistry();
+    const anon = await spawn({ getSession: makeGetSession(null), connectors: fakeStore().store });
+    try {
+      await expectErr(anon.client.getIntegrationCatalog({}), Code.Unauthenticated);
+    } finally {
+      await anon.close();
+    }
+    const mem = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store });
+    try {
+      const r = await mem.client.getIntegrationCatalog({});
+      const by = new Map(r.providers.map((p) => [p.provider, p]));
+      expect(by.get("github")?.display?.name).toBe("GitHub");
+      expect(by.get("github")?.display?.icon?.mono).toBe("GH");
+      expect(by.get("datadog")?.credentialSource).toBe("inject");
+      const ghCaps = new Map(by.get("github")!.capabilities.map((c) => [c.action, c]));
+      expect(ghCaps.get("pulls:write")?.access).toBe("write");
+      expect(ghCaps.get("pulls:write")?.asset).toBe("pull_request");
+      expect(ghCaps.get("contents:read")?.access).toBe("read");
+    } finally {
+      await mem.close();
+    }
+  });
+
+  test("carries no secret material", async () => {
+    invalidateRegistry();
+    const mem = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store });
+    try {
+      const r = await mem.client.getIntegrationCatalog({});
+      expect(JSON.stringify(r)).not.toMatch(/secretRef|datadog-api-key|github_app|DD-API-KEY|template/);
+    } finally {
+      await mem.close();
+    }
+  });
+});
+
+describe("SetMintCredential", () => {
+  test("anon → Unauthenticated; member → PermissionDenied", async () => {
+    const anon = await spawn({ getSession: makeGetSession(null), connectors: fakeStore().store, mint: fakeMint() });
+    try {
+      await expectErr(anon.client.setMintCredential({ provider: "github", kind: "github_app", values: {} }), Code.Unauthenticated);
+    } finally {
+      await anon.close();
+    }
+    const mem = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store, mint: fakeMint() });
+    try {
+      await expectErr(mem.client.setMintCredential({ provider: "github", kind: "github_app", values: {} }), Code.PermissionDenied);
+    } finally {
+      await mem.close();
+    }
+  });
+
+  test("seals each non-blank field as `<kind>.<field>`", async () => {
+    const os = fakeOrgSecret();
+    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore().store, orgSecret: os.client, mint: fakeMint() });
+    try {
+      const r = await s.client.setMintCredential({
+        provider: "github",
+        kind: "github_app",
+        values: { app_id: "1357924", private_key_pem: "-----BEGIN RSA PRIVATE KEY-----" },
+      });
+      expect(new Set(r.secretNames)).toEqual(new Set(["github_app.app_id", "github_app.private_key_pem"]));
+      expect(os.puts.map((p) => p.name).sort()).toEqual(["github_app.app_id", "github_app.private_key_pem"]);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("skips blank values (leave-unchanged for the Replace flow)", async () => {
+    const os = fakeOrgSecret();
+    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore().store, orgSecret: os.client, mint: fakeMint() });
+    try {
+      const r = await s.client.setMintCredential({ provider: "github", kind: "github_app", values: { app_id: "1357924", private_key_pem: "" } });
+      expect(r.secretNames).toEqual(["github_app.app_id"]);
+      expect(os.puts).toHaveLength(1);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("rejects unknown kind / unknown field / provider mismatch", async () => {
+    const os = fakeOrgSecret();
+    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore().store, orgSecret: os.client, mint: fakeMint() });
+    try {
+      await expectErr(s.client.setMintCredential({ provider: "github", kind: "nope", values: {} }), Code.InvalidArgument);
+      await expectErr(s.client.setMintCredential({ provider: "github", kind: "github_app", values: { bogus: "x" } }), Code.InvalidArgument);
+      await expectErr(s.client.setMintCredential({ provider: "gitlab", kind: "github_app", values: { app_id: "1" } }), Code.InvalidArgument);
+      expect(os.puts).toHaveLength(0);
     } finally {
       await s.close();
     }
