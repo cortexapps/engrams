@@ -38,8 +38,9 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod adapter {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
     use std::process::{ExitCode, ExitStatus, Stdio};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -47,8 +48,8 @@ mod adapter {
     use clap::Parser;
     use engram_core::SessionId;
     use engram_harness_proto::{
-        read_msg, write_msg, AgentRole, HarnessAttach, HarnessAttachAck, HarnessCommand,
-        HarnessEvent, HarnessFrame,
+        read_msg, write_msg, AgentRole, EditHunk, FileChange, HarnessAttach, HarnessAttachAck,
+        HarnessCommand, HarnessEvent, HarnessFrame, MAX_FILE_CHANGE_BYTES,
     };
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
@@ -59,6 +60,15 @@ mod adapter {
     use tokio::time::{timeout, Instant};
 
     pub const CLAUDE_SESSION_ID_FILE: &str = "/workspace/.engram/claude-session-id";
+
+    /// ADR 0054 Flavor B: the per-session hook↔harness unix socket and the
+    /// generated `--settings` file. Both live under `/workspace/.engram`
+    /// (already per-session, like the claude session-id file), so the names
+    /// are fixed yet collision-free across sessions and correct on every
+    /// backend (FC / VZ / Process). The harness binds the socket
+    /// before spawning claude; the hook reaches it via `ENGRAM_HOOK_SOCK`.
+    pub const HOOK_SOCK_FILE: &str = "/workspace/.engram/hook.sock";
+    pub const HOOK_SETTINGS_FILE: &str = "/workspace/.engram/claude-settings.json";
 
     /// Truncation budgets used when building summary fields. Adapter-
     /// local enforcement of the wire docs.
@@ -415,6 +425,397 @@ mod adapter {
         }
     }
 
+    /// ADR 0054 Flavor B: the hook↔harness socket server and its shared
+    /// state. The harness is a long-lived **server**; each `PreToolUse`
+    /// hook invocation (the `hook-bridge` subcommand) is a transient
+    /// **client**. The runtime process tree is three deep —
+    /// `engram-harness-claude` → `claude` → a per-PreToolUse hook — and the
+    /// hook's stdio is claimed by claude, so a unix socket is the only
+    /// out-of-band channel from the hook back to the harness (its
+    /// grandparent). NDJSON, one line each way; the connection is never
+    /// held open.
+    pub mod hook_server {
+        use super::{emit, BufReader, HarnessEvent};
+        use engram_harness_proto::{Answers, Question};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::{UnixListener, UnixStream};
+        use tokio::sync::{mpsc, Mutex};
+
+        /// `tool_use_id → canonical Answers`, owned by `run_engine` so it
+        /// survives a claude respawn: an answer is stashed by the live
+        /// process's `AnswerQuestion` arm and consumed by the hook of the
+        /// *next*, resumed process (findings #11/#12 — the answer can only
+        /// land on the resumed re-fire). `tokio::sync::Mutex` (not std)
+        /// because the accept handler holds it across an `.await`, and it is
+        /// touched concurrently by the accept task and the `cmd_rx` arm.
+        pub type AnswersInHand = Arc<Mutex<HashMap<String, Answers>>>;
+        /// The most-recently-started turn's `run_id`, so a hook (which only
+        /// ever fires inside an in-flight turn) can tag its
+        /// `UserQuestion`/`QuestionAnswered` events. Set by
+        /// `start_turn`/`start_continuation_turn`.
+        pub type CurrentRunId = Arc<Mutex<Option<String>>>;
+        /// ADR 0054: SESSION-level "an AskUserQuestion card is awaiting an
+        /// answer right now." Set true when the hook cards the first AUQ;
+        /// cleared when that answer is delivered. While true, EVERY further AUQ
+        /// — same run or a later one (the #64389 double-fire fires both ways) —
+        /// is a duplicate: no card, recorded in `DuplicateAuqIds` for the scrub.
+        /// Session-scoped (not per-run) so a cross-run sibling is still caught.
+        pub type QuestionOutstanding = Arc<Mutex<bool>>;
+        /// ADR 0054: `tool_use_id`s of duplicate AUQs the hook suppressed.
+        /// Drained at the answer-resume and handed to `scrub_transcript`, which
+        /// deletes each duplicate's `tool_use` from claude's transcript so the
+        /// resume re-fires exactly one question. Owned by `run_engine` so the
+        /// hook (which populates it) and the scrub (which drains it) share it.
+        pub type DuplicateAuqIds = Arc<Mutex<HashSet<String>>>;
+
+        /// hook → harness (request). One line.
+        #[derive(serde::Deserialize)]
+        pub struct HookRequest {
+            pub tool_use_id: String,
+            pub questions: Vec<Question>,
+        }
+
+        /// harness → hook (verdict). One line. `#[serde(tag = "verdict")]`
+        /// gives the exact `{"verdict":"answer","answers":{…}}` /
+        /// `{"verdict":"defer"}` wire shape. Shared by both ends (compiled
+        /// once → client and server can never be a version apart).
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(tag = "verdict", rename_all = "snake_case")]
+        pub enum HookVerdict {
+            Answer { answers: Answers },
+            Defer,
+        }
+
+        /// Accept loop: one transient hook client per connection, each
+        /// handled on its own task so parallel AUQ fires (distinct
+        /// `tool_use_id`s) never block one another. Runs for the whole
+        /// engine lifetime (outlives any single claude process).
+        pub async fn serve(
+            listener: UnixListener,
+            answers_in_hand: AnswersInHand,
+            current_run_id: CurrentRunId,
+            evt_tx: mpsc::Sender<HarnessEvent>,
+            question_outstanding: QuestionOutstanding,
+            duplicate_auq_ids: DuplicateAuqIds,
+        ) {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        tokio::spawn(handle_one(
+                            stream,
+                            answers_in_hand.clone(),
+                            current_run_id.clone(),
+                            evt_tx.clone(),
+                            question_outstanding.clone(),
+                            duplicate_auq_ids.clone(),
+                        ));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "hook socket accept failed"),
+                }
+            }
+        }
+
+        async fn handle_one(
+            stream: UnixStream,
+            answers_in_hand: AnswersInHand,
+            current_run_id: CurrentRunId,
+            evt_tx: mpsc::Sender<HarnessEvent>,
+            question_outstanding: QuestionOutstanding,
+            duplicate_auq_ids: DuplicateAuqIds,
+        ) {
+            let (r, mut w) = stream.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let line = match lines.next_line().await {
+                Ok(Some(l)) => l,
+                _ => return,
+            };
+            let req: HookRequest = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "malformed hook request; ignoring");
+                    return;
+                }
+            };
+            let run_id = current_run_id.lock().await.clone().unwrap_or_default();
+
+            // Verdict (+ optional event):
+            //   answer-in-hand → answer + QuestionAnswered (consume with
+            //     `remove`, so a re-fire of the SAME id after consumption
+            //     defers — one tool_result, structural idempotency, ADR 0054).
+            //     Clear `question_outstanding`: this card is now answered, so
+            //     the NEXT genuine question is carded afresh.
+            //   else, no question outstanding → defer + UserQuestion (card),
+            //     mark a question outstanding.
+            //   else (a question is ALREADY outstanding) → defer with NO card —
+            //     the #64389 stdin double-fire, WITHIN this run or a LATER one
+            //     (claude, held open on stdin, re-asks either way). We DEFER
+            //     rather than deny: a deny leaves a "stop and wait" tool_result
+            //     in claude's transcript that the model retries after the real
+            //     answer lands (re-ask + a second card). The duplicate stays a
+            //     parked tool; its id goes to `duplicate_auq_ids` so the
+            //     answer-resume scrub drops it, leaving exactly one question.
+            // The answers-map lock is a temporary (dropped before the
+            // outstanding lock — no lock-order coupling), and the event is
+            // emitted AFTER the locks drop (`emit` can block on host-link
+            // backpressure).
+            let (verdict, event): (HookVerdict, Option<HarnessEvent>) = {
+                let answer = answers_in_hand.lock().await.remove(&req.tool_use_id);
+                match answer {
+                    Some(answers) => {
+                        *question_outstanding.lock().await = false;
+                        (
+                            HookVerdict::Answer {
+                                answers: answers.clone(),
+                            },
+                            Some(HarnessEvent::QuestionAnswered {
+                                run_id,
+                                tool_call_id: req.tool_use_id,
+                                answers,
+                            }),
+                        )
+                    }
+                    None => {
+                        // Atomic check-and-set under one lock: the first AUQ
+                        // since the last answer flips the flag and is carded;
+                        // any AUQ while it is already set is the duplicate.
+                        let duplicate = {
+                            let mut outstanding = question_outstanding.lock().await;
+                            let was_set = *outstanding;
+                            *outstanding = true;
+                            was_set
+                        };
+                        if duplicate {
+                            duplicate_auq_ids
+                                .lock()
+                                .await
+                                .insert(req.tool_use_id.clone());
+                            tracing::warn!(
+                                %run_id,
+                                tool_use_id = %req.tool_use_id,
+                                "ADR 0054: duplicate AskUserQuestion while one is outstanding \
+                                 (#64389 double-fire); deferring with no card (scrubbed before resume)"
+                            );
+                            // Defer (keep it parked) but emit no card.
+                            (HookVerdict::Defer, None)
+                        } else {
+                            (
+                                HookVerdict::Defer,
+                                Some(HarnessEvent::UserQuestion {
+                                    run_id,
+                                    tool_call_id: req.tool_use_id,
+                                    questions: req.questions,
+                                }),
+                            )
+                        }
+                    }
+                }
+            };
+            if let Some(event) = event {
+                emit(&evt_tx, event).await;
+            }
+
+            let mut out = serde_json::to_string(&verdict)
+                .unwrap_or_else(|_| r#"{"verdict":"defer"}"#.to_string());
+            out.push('\n');
+            let _ = w.write_all(out.as_bytes()).await;
+            let _ = w.flush().await;
+            // drop closes the connection; the hook reads its one line and exits.
+        }
+    }
+
+    /// ADR 0054 Flavor B: the `engram-harness-claude hook-bridge`
+    /// subcommand — the transient `PreToolUse` hook client. Re-invoking the
+    /// harness binary as its own hook (git/busybox style) means one
+    /// artifact, no extra guest runtime (no node/jq), and no protocol drift
+    /// (client & server share `hook_server`'s serde types). Reads the
+    /// PreToolUse payload on stdin, decides, writes claude's hook output on
+    /// stdout.
+    pub mod hook_bridge {
+        use super::hook_server::HookVerdict;
+        use super::BufReader;
+        use engram_harness_proto::{Answers, Question};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        pub async fn run() -> std::process::ExitCode {
+            let mut input = String::new();
+            if tokio::io::stdin().read_to_string(&mut input).await.is_err() {
+                print_allow();
+                return std::process::ExitCode::SUCCESS;
+            }
+            let v: serde_json::Value =
+                serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+            let tool_name = v.get("tool_name").and_then(|s| s.as_str()).unwrap_or("");
+
+            // Ordinary tool → allow. THIS is the
+            // `--dangerously-skip-permissions` replacement: the VM is still
+            // the safety boundary, but the decision is now explicit and
+            // auditable. No socket round-trip needed.
+            if tool_name != "AskUserQuestion" {
+                print_allow();
+                return std::process::ExitCode::SUCCESS;
+            }
+
+            let tool_use_id = v
+                .get("tool_use_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_input = v
+                .get("tool_input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            // Parse into the SHARED `Question` type so we keep `multi_select`
+            // per question for denormalization (its `#[serde(rename)]` makes
+            // this byte-faithful to claude's `tool_input.questions`).
+            let questions: Vec<Question> = tool_input
+                .get("questions")
+                .and_then(|q| serde_json::from_value(q.clone()).ok())
+                .unwrap_or_default();
+            let sock = std::env::var("ENGRAM_HOOK_SOCK").unwrap_or_default();
+
+            match round_trip(&sock, &tool_use_id, &questions).await {
+                Some(HookVerdict::Answer { answers }) => {
+                    // Denormalize canonical Vec<String> → claude's
+                    // updatedInput.answers: a bare string for single-select,
+                    // an array for multiSelect (finding #6), using each
+                    // question's multi_select flag. The claude arity quirk
+                    // stays isolated here. claude wants the full updatedInput
+                    // echoed (questions + answers), so graft `answers` onto
+                    // the original tool_input.
+                    let updated_answers = denormalize(&questions, &answers);
+                    let mut updated_input = tool_input;
+                    match updated_input {
+                        serde_json::Value::Object(ref mut map) => {
+                            map.insert("answers".to_string(), updated_answers);
+                        }
+                        _ => {
+                            updated_input = serde_json::json!({
+                                "questions": questions_to_json(&questions),
+                                "answers": updated_answers,
+                            });
+                        }
+                    }
+                    let out = serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "updatedInput": updated_input,
+                        }
+                    });
+                    println!("{out}");
+                }
+                // Defer verdict (incl. a no-card duplicate, ADR 0054), or any
+                // socket failure → defer. The turn ends `tool_deferred` and the
+                // VM can idle-evict.
+                _ => print_defer(),
+            }
+            std::process::ExitCode::SUCCESS
+        }
+
+        fn print_allow() {
+            println!(
+                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
+            );
+        }
+        fn print_defer() {
+            println!(
+                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"defer"}}}}"#
+            );
+        }
+
+        async fn round_trip(
+            sock: &str,
+            tool_use_id: &str,
+            questions: &[Question],
+        ) -> Option<HookVerdict> {
+            if sock.is_empty() {
+                return None;
+            }
+            let stream = UnixStream::connect(sock).await.ok()?;
+            let (r, mut w) = stream.into_split();
+            let req = serde_json::json!({ "tool_use_id": tool_use_id, "questions": questions });
+            let mut line = serde_json::to_string(&req).ok()?;
+            line.push('\n');
+            w.write_all(line.as_bytes()).await.ok()?;
+            w.flush().await.ok()?;
+            let mut lines = BufReader::new(r).lines();
+            let resp = lines.next_line().await.ok()??;
+            serde_json::from_str(&resp).ok()
+        }
+
+        /// Build claude's `updatedInput.answers` map. Keyed by question text
+        /// (finding #8); value is a bare string (single-select) or an array
+        /// (multiSelect) per the paired `Question.multi_select`. `pub` for
+        /// unit testing — the binary has no external API to keep narrow.
+        pub fn denormalize(questions: &[Question], answers: &Answers) -> serde_json::Value {
+            let mut out = serde_json::Map::new();
+            for q in questions {
+                if let Some(labels) = answers.get(&q.question) {
+                    let val = if q.multi_select {
+                        serde_json::Value::Array(
+                            labels
+                                .iter()
+                                .cloned()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        )
+                    } else {
+                        serde_json::Value::String(labels.first().cloned().unwrap_or_default())
+                    };
+                    out.insert(q.question.clone(), val);
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+
+        fn questions_to_json(questions: &[Question]) -> serde_json::Value {
+            serde_json::to_value(questions).unwrap_or(serde_json::Value::Null)
+        }
+    }
+
+    /// Aborts the hook-socket accept task and unlinks the socket file when
+    /// `run_engine` returns (any path). The VM teardown reclaims the tmpfs
+    /// anyway; this matters for the ProcessBackend (dev), where the harness
+    /// process exits but the host persists — a stale bind would otherwise
+    /// `EADDRINUSE` the next harness.
+    struct SockGuard {
+        path: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for SockGuard {
+        fn drop(&mut self) {
+            self.task.abort();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// ADR 0054 Flavor B: generate the `--settings` file claude is launched
+    /// with — a `PreToolUse` command hook that re-invokes THIS binary as
+    /// `hook-bridge`. Written at startup (not baked) from `current_exe()`
+    /// so the hook command is always the path of the running binary,
+    /// correct across FC / VZ / Process (where `resolve_claude_bin`'s
+    /// sibling layout — and thus this binary's path — varies).
+    async fn write_hook_settings() {
+        let self_exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "engram-harness-claude".to_string());
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{ "type": "command", "command": format!("{self_exe} hook-bridge") }]
+                }]
+            }
+        });
+        let _ = tokio::fs::create_dir_all("/workspace/.engram").await;
+        if let Err(e) = tokio::fs::write(HOOK_SETTINGS_FILE, settings.to_string()).await {
+            tracing::warn!(error = %e, "couldn't write claude hook settings");
+        }
+    }
+
     /// The long-lived run engine. Owns the persistent `claude` process
     /// and the pending-prompt queue; spawned once and never torn down by
     /// a connection drop. Each iteration runs ONE `claude` process
@@ -466,6 +867,57 @@ mod adapter {
         const MAX_RESPAWN_BACKOFF_SECS: u64 = 10;
         let mut fast_crashes: u32 = 0;
 
+        // ADR 0054 Flavor B: the answer bridge. `answers_in_hand` and
+        // `current_run_id` are owned here so they survive a claude respawn
+        // (the answer is stashed by one process and consumed by the hook of
+        // the next, resumed one — findings #11/#12). The hook socket is
+        // bound ONCE, before the first spawn (bind-before-spawn → no hook
+        // can fire before the listener exists), and shared across respawns;
+        // the accept task outlives any single claude process.
+        let answers_in_hand: hook_server::AnswersInHand =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let current_run_id: hook_server::CurrentRunId = Arc::new(tokio::sync::Mutex::new(None));
+        // ADR 0054 Part C: narrate-past message-ids to scrub from claude's
+        // transcript at the next answer-resume. Owned here so it survives a
+        // respawn (populated during the defer turn, drained at ResumeForAnswer).
+        let scrub_msg_ids: Arc<tokio::sync::Mutex<HashSet<String>>> =
+            Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        // ADR 0054: session-level AskUserQuestion dedup of the #64389 double-fire
+        // (within- OR cross-run). `question_outstanding` is set when the hook
+        // cards a question and cleared when its answer is delivered; while set,
+        // every further AUQ is a duplicate with no card. `duplicate_auq_ids`
+        // collects those duplicates' tool_use ids so the answer-resume scrub
+        // deletes them from the transcript. Owned here so both span respawns.
+        let question_outstanding: hook_server::QuestionOutstanding =
+            Arc::new(tokio::sync::Mutex::new(false));
+        let duplicate_auq_ids: hook_server::DuplicateAuqIds =
+            Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        write_hook_settings().await;
+        let _ = tokio::fs::remove_file(HOOK_SOCK_FILE).await; // clear a stale bind
+        let _sock_guard = match tokio::net::UnixListener::bind(HOOK_SOCK_FILE) {
+            Ok(listener) => {
+                let task = tokio::spawn(hook_server::serve(
+                    listener,
+                    answers_in_hand.clone(),
+                    current_run_id.clone(),
+                    evt_tx.clone(),
+                    question_outstanding.clone(),
+                    duplicate_auq_ids.clone(),
+                ));
+                Some(SockGuard {
+                    path: HOOK_SOCK_FILE.to_string(),
+                    task,
+                })
+            }
+            Err(e) => {
+                // Degraded, not fatal: ordinary tools still auto-allow (the
+                // hook never connects for them); only AskUserQuestion would
+                // perpetually defer (the bridge's connect fails → defer).
+                tracing::error!(error = %e, "bind hook socket failed; AskUserQuestion will always defer");
+                None
+            }
+        };
+
         loop {
             let spawned_at = Instant::now();
             match run_claude_session(
@@ -475,6 +927,10 @@ mod adapter {
                 &evt_tx,
                 &mut pending,
                 &mut seen_prompt_ids,
+                &answers_in_hand,
+                &current_run_id,
+                &scrub_msg_ids,
+                &question_outstanding,
             )
             .await
             {
@@ -482,6 +938,66 @@ mod adapter {
                 // connection loop exited = process teardown).
                 SessionOutcome::Shutdown | SessionOutcome::ChannelClosed => {
                     return ExitCode::SUCCESS;
+                }
+                // ADR 0054: an intentional answer-resume — NOT a crash. The
+                // `AnswerQuestion` arm stashed the answer and SIGINT'd
+                // claude; respawn with `--resume` like `Respawn`, but reset
+                // the fast-crash budget (proof of liveness) and never sleep.
+                // The deferred AUQ re-fires on startup and is answered.
+                SessionOutcome::ResumeForAnswer => {
+                    fast_crashes = 0;
+                    // ADR 0054 Part C: claude was SIGINT'd by the AnswerQuestion
+                    // arm and is dead now → its transcript is quiescent and safe
+                    // to edit. Remove both poisons so the resumed model sees a
+                    // clean defer (one `tool_use`, nothing after) and delivers
+                    // the real answer instead of re-asking: (a) narrate-past
+                    // assistant text (`scrub_msg_ids`), and (b) duplicate AUQ
+                    // tool_uses the hook suppressed (`duplicate_auq_ids`, the
+                    // #64389 double-fire — within- or cross-run). Fail-safe: on
+                    // any miss/error we skip — the Part B fallback still
+                    // delivers the answer as a user message.
+                    let ids: HashSet<String> = {
+                        let mut g = scrub_msg_ids.lock().await;
+                        std::mem::take(&mut *g)
+                    };
+                    let dup_ids: HashSet<String> = {
+                        let mut g = duplicate_auq_ids.lock().await;
+                        std::mem::take(&mut *g)
+                    };
+                    if !ids.is_empty() || !dup_ids.is_empty() {
+                        if let Some(sid) = read_claude_session_id().await {
+                            match find_claude_transcript(&sid) {
+                                Some(tr) => {
+                                    let res = tokio::task::spawn_blocking(move || {
+                                        scrub_transcript(&tr, &ids, &dup_ids)
+                                    })
+                                    .await;
+                                    match res {
+                                        Ok(Ok(n)) => tracing::info!(
+                                            removed = n,
+                                            %sid,
+                                            "ADR 0054 Part C: scrubbed narrate-past + duplicate AUQs from transcript before resume"
+                                        ),
+                                        Ok(Err(e)) => tracing::warn!(
+                                            error = %e,
+                                            %sid,
+                                            "Part C scrub failed; relying on Part B answer-as-message fallback"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            %sid,
+                                            "Part C scrub task panicked; relying on Part B fallback"
+                                        ),
+                                    }
+                                }
+                                None => tracing::warn!(
+                                    %sid,
+                                    "Part C: claude transcript not found; relying on Part B fallback"
+                                ),
+                            }
+                        }
+                    }
+                    // loop → respawn with --resume, no backoff
                 }
                 // claude died unexpectedly (crash / interrupt / per-turn
                 // timeout) or couldn't be spawned. Any in-flight run's
@@ -664,6 +1180,13 @@ mod adapter {
         Respawn,
         /// claude could not be spawned at all. Back off and retry.
         SpawnFailed,
+        /// ADR 0054: an `AnswerQuestion` arrived; the answer is stashed in
+        /// `answers_in_hand` and we SIGINT'd claude so the deferred AUQ
+        /// re-fires on a `--resume` re-spawn (findings #11/#12 — the live
+        /// process must NOT be fed, it would re-infer a new id). A sibling
+        /// of `Respawn` that is INTENTIONAL: no fast-crash backoff, no
+        /// abnormal-exit System message.
+        ResumeForAnswer,
     }
 
     /// The single in-flight turn, owned by the session loop. `run_id` is
@@ -682,6 +1205,32 @@ mod adapter {
         /// terminal `AgentMessage` will use — the UI keys the live bubble
         /// on it and reconciles in place when the durable message lands.
         current_message_id: Option<String>,
+        /// ADR 0054 Flavor A: file changes parsed from a `Write`/`Edit`/
+        /// `MultiEdit` tool_use, keyed by tool_use_id and held until the
+        /// matching `tool_result` — so a `FileChanged` is emitted only on a
+        /// SUCCESSFUL result (never a phantom diff for a failed edit). Value
+        /// is `(path, change)`.
+        pending_file_changes: HashMap<String, (String, FileChange)>,
+        /// ADR 0054: `AskUserQuestion` tool_use_ids seen this turn that have
+        /// NOT yet received a `tool_result` — i.e. questions the hook deferred
+        /// and that are still pending. While this is non-empty, any assistant
+        /// text/chunk is the "narrate-past" hallucination (claude talking past
+        /// a deferred tool) and is suppressed; an answer-resume that delivers
+        /// the `tool_result` clears the id and re-enables normal output.
+        auq_pending: HashSet<String>,
+        /// ADR 0054 Part B: set for a `start_continuation_turn` (answer-resume).
+        /// If such a turn ENDS with an answer still in `answers_in_hand`, the
+        /// deferred tool was never re-fired — claude narrate-past'd and
+        /// abandoned it (a `--resume` does not re-present an abandoned tool).
+        /// The engine then delivers the answer as a fresh user message rather
+        /// than leaving the question hanging.
+        is_answer_resume: bool,
+        /// ADR 0054 Part C: message-ids of the narrate-past assistant messages
+        /// suppressed THIS turn (Part A hid them from the UI). Copied into the
+        /// session-level scrub set at turn-end so they survive the kill→resume
+        /// gap, then removed from claude's transcript before `--resume` (see
+        /// `scrub_transcript`).
+        suppressed_msg_ids: Vec<String>,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -729,6 +1278,7 @@ mod adapter {
     /// in-flight turn's terminal event is always emitted here (paired
     /// with the `RunStarted` we synthesized on prompt-accept), even when
     /// the process dies mid-turn.
+    #[allow(clippy::too_many_arguments)]
     async fn run_claude_session(
         cli: &Cli,
         cmd_rx: &mut mpsc::Receiver<HarnessCommand>,
@@ -736,6 +1286,17 @@ mod adapter {
         evt_tx: &mpsc::Sender<HarnessEvent>,
         pending: &mut VecDeque<QueuedPrompt>,
         seen_prompt_ids: &mut HashSet<String>,
+        answers_in_hand: &hook_server::AnswersInHand,
+        current_run_id: &hook_server::CurrentRunId,
+        // ADR 0054 Part C: session-level set of narrate-past message-ids to
+        // scrub from the transcript before the next answer-resume. Owned by
+        // `run_engine` so it survives a respawn; populated at turn-end here.
+        scrub_msg_ids: &Arc<tokio::sync::Mutex<HashSet<String>>>,
+        // ADR 0054: set true while an AskUserQuestion card is awaiting an
+        // answer (the hook owns it). While set, a further AUQ is the #64389
+        // duplicate — its card is already suppressed at the hook, so we also
+        // drop its `ToolCallStarted` here (no phantom tool-call in the UI).
+        question_outstanding: &hook_server::QuestionOutstanding,
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
         let argv = build_claude_argv(&resume_id);
@@ -759,14 +1320,20 @@ mod adapter {
             // typically has no outbound to those endpoints anyway,
             // and they cause spurious failures on long runs.
             // `IS_SANDBOX=1` is the documented escape hatch for
-            // Claude's root-check: with --dangerously-skip-permissions
-            // the CLI otherwise refuses to start as root, which is
-            // exactly how it runs inside our VM. The VM itself is
+            // Claude's root-check: the CLI otherwise refuses to start as
+            // root, which is exactly how it runs inside our VM. Kept after
+            // ADR 0054 dropped `--dangerously-skip-permissions` — the
+            // root-check is independent of that flag, and the VM itself is
             // the security boundary.
+            // `ENGRAM_HOOK_SOCK` (ADR 0054): claude inherits it and the
+            // PreToolUse hook inherits it from claude (finding #7), so the
+            // hook finds the per-session socket while the `--settings`
+            // artifact stays path-agnostic.
             .env("BASH_DEFAULT_TIMEOUT_MS", "1800000")
             .env("BASH_MAX_TIMEOUT_MS", "7200000")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .env("IS_SANDBOX", "1")
+            .env("ENGRAM_HOOK_SOCK", HOOK_SOCK_FILE)
             // Held open for the whole session: we write one newline-
             // delimited `user` message per prompt and close it (drop) to
             // signal a clean drain on Shutdown.
@@ -828,22 +1395,48 @@ mod adapter {
         // `result`/reap path closes that run as `RunInterrupted` (not a
         // crash or a clean completion).
         let mut interrupted_run: Option<String> = None;
+        // ADR 0054: set when an `AnswerQuestion` SIGINT'd the child to
+        // trigger an answer-resume; the reap path must NOT treat the exit as
+        // a crash (no abnormal-exit System message) and returns
+        // `ResumeForAnswer`.
+        let mut resuming_for_answer = false;
+
         // Phase 3: armed when a `control_request` interrupt is sent. If
         // claude doesn't honor it within the grace window (a build lacking
         // the control frame), the sleeper escalates to SIGINT. Cleared when
         // the abort's `result` lands.
         let mut interrupt_deadline: Option<Instant> = None;
 
-        // Kick off the first queued prompt (an initial prompt, or a queue
-        // that survived a respawn) with no leading Idle; otherwise
-        // announce Idle so the host's soft TTL arms.
-        match pending.pop_front() {
-            Some(qp) => {
-                if let Some(s) = stdin.as_mut() {
-                    turn = Some(start_turn(evt_tx, s, cli, qp.prompt_id, &qp.text).await);
+        // ADR 0054: if an answer is stashed, claude WILL re-fire the
+        // deferred AUQ on this `--resume` startup (id-stable, no stdin —
+        // findings #9/#12). Establish a CONTINUATION turn (fresh run_id,
+        // `RunStarted` with no `prompt_id`, no user-echo, no
+        // `write_user_message`) so the re-fired `tool_result` and the
+        // model's continuation are captured by the in-flight-turn branch
+        // instead of dropped by the "line outside any turn" / "result with
+        // no in-flight turn" branches. This takes precedence over the
+        // pending queue — an outstanding answer must be delivered first.
+        // (Edge: a stale answer with no matching pending tool — e.g. a
+        // duplicate after full consumption — leaves a continuation turn with
+        // no output until `max_run_secs` or the next command; rare, and the
+        // session stays command-responsive.)
+        if !answers_in_hand.lock().await.is_empty() {
+            turn = Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
+        } else {
+            // Kick off the first queued prompt (an initial prompt, or a
+            // queue that survived a respawn) with no leading Idle; otherwise
+            // announce Idle so the host's soft TTL arms.
+            match pending.pop_front() {
+                Some(qp) => {
+                    if let Some(s) = stdin.as_mut() {
+                        turn = Some(
+                            start_turn(evt_tx, s, cli, qp.prompt_id, &qp.text, current_run_id)
+                                .await,
+                        );
+                    }
                 }
+                None => emit(evt_tx, HarnessEvent::Idle).await,
             }
-            None => emit(evt_tx, HarnessEvent::Idle).await,
         }
 
         loop {
@@ -875,13 +1468,51 @@ mod adapter {
                                 // run, then run the next queued prompt
                                 // back-to-back (no Idle gap) or announce Idle.
                                 if let Some(t) = turn.take() {
+                                    // ADR 0054 Part C: carry this turn's
+                                    // suppressed narrate-past ids into the
+                                    // session-level scrub set so they survive
+                                    // the kill→resume gap (empty for a clean
+                                    // defer — nothing was suppressed).
+                                    if !t.suppressed_msg_ids.is_empty() {
+                                        scrub_msg_ids
+                                            .lock()
+                                            .await
+                                            .extend(t.suppressed_msg_ids.iter().cloned());
+                                    }
+                                    // ADR 0054: a turn that left an AUQ pending
+                                    // but ended `terminal_reason != "tool_deferred"`
+                                    // is a narrate-past — claude abandoned the
+                                    // deferred question instead of suspending. The
+                                    // hallucinated reply was already suppressed in
+                                    // `translate_jsonl`; surface the event for
+                                    // observability. The UserQuestion card the hook
+                                    // emitted stands, so the session stays
+                                    // awaiting-answer.
+                                    let narrated_past = marker.terminal_reason.as_deref()
+                                        != Some("tool_deferred")
+                                        && !t.auq_pending.is_empty();
+                                    let pending_questions = t.auq_pending.len();
+                                    let is_answer_resume = t.is_answer_resume;
                                     let run_id = t.run_id;
                                     tracing::info!(
                                         %run_id,
                                         subtype = %marker.subtype,
                                         is_error = marker.is_error,
+                                        terminal_reason =
+                                            marker.terminal_reason.as_deref().unwrap_or(""),
                                         "turn result"
                                     );
+                                    if narrated_past {
+                                        tracing::warn!(
+                                            %run_id,
+                                            pending_questions,
+                                            terminal_reason =
+                                                marker.terminal_reason.as_deref().unwrap_or(""),
+                                            "AskUserQuestion narrate-past: claude ended the turn \
+                                             without suspending on a deferred question; suppressed \
+                                             the hallucinated reply, question card stands (ADR 0054)"
+                                        );
+                                    }
                                     if interrupted_run.as_deref() == Some(run_id.as_str()) {
                                         // Phase 3: the `control_request` abort
                                         // surfaced as a `result error_during_
@@ -903,18 +1534,61 @@ mod adapter {
                                         )
                                         .await;
                                     }
-                                    match pending.pop_front() {
-                                        Some(qp) => {
-                                            if let Some(s) = stdin.as_mut() {
-                                                turn = Some(
-                                                    start_turn(
-                                                        evt_tx, s, cli, qp.prompt_id, &qp.text,
-                                                    )
-                                                    .await,
-                                                );
+                                    // ADR 0054 Part B: an answer-resume that ends
+                                    // with the answer STILL in hand means the
+                                    // deferred tool was never re-fired — claude
+                                    // narrate-past'd and abandoned it (a `--resume`
+                                    // does NOT re-present an abandoned tool, verified
+                                    // empirically). The stash→resume→re-fire path is
+                                    // a dead end here, so deliver the answer as a
+                                    // fresh user message (claude asked for it
+                                    // conversationally) and mark the card answered —
+                                    // never leave the question hanging.
+                                    let stale: Vec<(String, engram_harness_proto::Answers)> =
+                                        if is_answer_resume {
+                                            answers_in_hand.lock().await.drain().collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    if !stale.is_empty() {
+                                        if let Some(s) = stdin.as_mut() {
+                                            let text = fallback_answer_message(&stale);
+                                            let ft = start_turn(
+                                                evt_tx, s, cli, None, &text, current_run_id,
+                                            )
+                                            .await;
+                                            for (tool_call_id, answers) in stale {
+                                                emit(
+                                                    evt_tx,
+                                                    HarnessEvent::QuestionAnswered {
+                                                        run_id: ft.run_id.clone(),
+                                                        tool_call_id,
+                                                        answers,
+                                                    },
+                                                )
+                                                .await;
                                             }
+                                            turn = Some(ft);
                                         }
-                                        None => emit(evt_tx, HarnessEvent::Idle).await,
+                                    } else {
+                                        match pending.pop_front() {
+                                            Some(qp) => {
+                                                if let Some(s) = stdin.as_mut() {
+                                                    turn = Some(
+                                                        start_turn(
+                                                            evt_tx,
+                                                            s,
+                                                            cli,
+                                                            qp.prompt_id,
+                                                            &qp.text,
+                                                            current_run_id,
+                                                        )
+                                                        .await,
+                                                    );
+                                                }
+                                            }
+                                            None => emit(evt_tx, HarnessEvent::Idle).await,
+                                        }
                                     }
                                 } else {
                                     tracing::warn!("result line with no in-flight turn; ignoring");
@@ -926,8 +1600,30 @@ mod adapter {
                                     &mut t.tool_calls,
                                     cli.max_tool_calls,
                                     &mut t.current_message_id,
+                                    &mut t.pending_file_changes,
+                                    &mut t.auq_pending,
+                                    &mut t.suppressed_msg_ids,
                                 ) {
                                     for ev in translated {
+                                        // ADR 0054: drop a duplicate AUQ's
+                                        // tool-log entry (the #64389 double-fire,
+                                        // within- or cross-run). A question is
+                                        // already outstanding, so the hook gave
+                                        // this AUQ no card; suppress its
+                                        // ToolCallStarted too so no phantom tool
+                                        // call flickers in the UI. (The first,
+                                        // carded question's card stands regardless
+                                        // — the UI renders that, not this entry.)
+                                        if let HarnessEvent::ToolCallStarted {
+                                            tool_name, ..
+                                        } = &ev
+                                        {
+                                            if tool_name == "AskUserQuestion"
+                                                && *question_outstanding.lock().await
+                                            {
+                                                continue;
+                                            }
+                                        }
                                         emit(evt_tx, ev).await;
                                     }
                                 }
@@ -945,6 +1641,9 @@ mod adapter {
                                     &mut sink,
                                     cli.max_tool_calls,
                                     &mut None,
+                                    &mut HashMap::new(),
+                                    &mut HashSet::new(),
+                                    &mut Vec::new(),
                                 );
                             }
                         }
@@ -968,7 +1667,15 @@ mod adapter {
                                 // Idle: start the run immediately.
                                 if let Some(s) = stdin.as_mut() {
                                     turn = Some(
-                                        start_turn(evt_tx, s, cli, Some(prompt_id), &text).await,
+                                        start_turn(
+                                            evt_tx,
+                                            s,
+                                            cli,
+                                            Some(prompt_id),
+                                            &text,
+                                            current_run_id,
+                                        )
+                                        .await,
                                     );
                                 }
                             } else {
@@ -990,6 +1697,30 @@ mod adapter {
                                     text,
                                 });
                             }
+                        }
+                        Some(HarnessCommand::AnswerQuestion { tool_call_id, answers }) => {
+                            // ADR 0054: stash the answer for the hook of the
+                            // NEXT (resumed) process — it can ONLY land on the
+                            // resumed re-fire, never on this live process
+                            // (feeding the live stream re-infers a new
+                            // tool_use_id, finding #11). Then end THIS claude
+                            // and re-enter via `--resume`.
+                            tracing::info!(
+                                %tool_call_id,
+                                "answer received; resuming claude to re-fire the deferred AUQ"
+                            );
+                            answers_in_hand.lock().await.insert(tool_call_id, answers);
+                            resuming_for_answer = true;
+                            // claude flushes its transcript per-message, so the
+                            // session stays cleanly `--resume`-able after SIGINT.
+                            sigint_child(&child);
+                            // `break` (NOT `return`): the existing `None =>
+                            // return ChannelClosed` arm skips the reap block,
+                            // but we MUST reap (wait the child, drain stderr,
+                            // close any defensively-in-flight turn). Breaking
+                            // the loop runs the reap, which returns
+                            // `ResumeForAnswer`.
+                            break;
                         }
                         Some(HarnessCommand::EditQueued { prompt_id, text }) => {
                             // Single-writer: mutate only while still queued
@@ -1170,6 +1901,16 @@ mod adapter {
             } else if shutting_down {
                 // Grace expired mid-turn before claude could drain.
                 emit(evt_tx, HarnessEvent::RunCompleted { run_id, ok: false }).await;
+            } else if resuming_for_answer {
+                // ADR 0054: an `AnswerQuestion` tore down a turn that was
+                // (defensively) still in flight — the deferred-question turn
+                // normally already ended `tool_deferred` (so `turn` is
+                // None), but a racing answer is handled here. This is NOT a
+                // crash: close the run quietly (no abnormal-exit System
+                // message); the resumed process establishes the continuation
+                // turn. Branch ordering matters — this MUST precede the
+                // generic crash `else`.
+                emit(evt_tx, HarnessEvent::RunCompleted { run_id, ok: false }).await;
             } else {
                 // Unexpected crash mid-turn. Surface the durable artifact
                 // (bracketed by the run's RunStarted), close the run, and
@@ -1199,6 +1940,11 @@ mod adapter {
 
         if shutting_down {
             SessionOutcome::Shutdown
+        } else if resuming_for_answer {
+            // ADR 0054: intentional answer-resume — checked before the
+            // generic `Respawn` so it never trips fast-crash backoff or
+            // reads as a crash.
+            SessionOutcome::ResumeForAnswer
         } else {
             SessionOutcome::Respawn
         }
@@ -1213,8 +1959,12 @@ mod adapter {
         cli: &Cli,
         prompt_id: Option<String>,
         text: &str,
+        current_run_id: &hook_server::CurrentRunId,
     ) -> TurnState {
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        // ADR 0054: publish the run_id so a hook firing within this turn
+        // tags its UserQuestion/QuestionAnswered with the right run.
+        *current_run_id.lock().await = Some(run_id.clone());
         // `RunStarted{prompt_id}` is the "queued prompt consumed" signal:
         // a UI that drew a greyed type-ahead item with this id moves it
         // into the conversation now. `None` for the env-seeded initial
@@ -1245,7 +1995,63 @@ mod adapter {
             tool_calls: 0,
             deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
             current_message_id: None,
+            pending_file_changes: HashMap::new(),
+            auq_pending: HashSet::new(),
+            is_answer_resume: false,
+            suppressed_msg_ids: Vec::new(),
         }
+    }
+
+    /// ADR 0054: start a CONTINUATION turn for an answer-resume. Like
+    /// `start_turn` it mints a `run_id`, publishes it to `current_run_id`,
+    /// and emits `RunStarted` BEFORE any output — but with **no `prompt_id`**
+    /// (this turn was not started by a user prompt) and **no
+    /// `write_user_message`** (the deferred AUQ re-fires from claude's
+    /// persisted state on `--resume`; the stream's sole `user` event is the
+    /// deferred `tool_result` = the answer). So no synthetic user turn ever
+    /// becomes an engram `session_event`. Reuses `max_run_secs` — the model
+    /// can grind arbitrarily long once unblocked; the defer-spin never arms
+    /// because the answer is in hand on the first re-fire.
+    async fn start_continuation_turn(
+        evt_tx: &mpsc::Sender<HarnessEvent>,
+        cli: &Cli,
+        current_run_id: &hook_server::CurrentRunId,
+    ) -> TurnState {
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        *current_run_id.lock().await = Some(run_id.clone());
+        emit(
+            evt_tx,
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                prompt_id: None,
+                prompt_summary: None,
+            },
+        )
+        .await;
+        TurnState {
+            run_id,
+            tool_calls: 0,
+            deadline: Instant::now() + Duration::from_secs(cli.max_run_secs),
+            current_message_id: None,
+            pending_file_changes: HashMap::new(),
+            auq_pending: HashSet::new(),
+            is_answer_resume: true,
+            suppressed_msg_ids: Vec::new(),
+        }
+    }
+
+    /// ADR 0054 Part B: render the canonical answer map(s) as a plain user
+    /// message — used when a narrate-past abandoned the deferred tool, so the
+    /// answer can't ride a re-fired `tool_result`. claude asked the question
+    /// conversationally, so an ordinary message is exactly what it awaits.
+    fn fallback_answer_message(stale: &[(String, engram_harness_proto::Answers)]) -> String {
+        let mut lines = vec!["Here are my answers to the question(s) you just asked:".to_string()];
+        for (_tool_call_id, answers) in stale {
+            for (question, labels) in answers {
+                lines.push(format!("- {}: {}", question, labels.join(", ")));
+            }
+        }
+        lines.join("\n")
     }
 
     /// Write one prompt to claude's stdin as a stream-json `user` message.
@@ -1306,11 +2112,13 @@ mod adapter {
             // for live-typing. The complete message is still emitted and
             // remains the durable record.
             "--include-partial-messages".into(),
-            // No human in the VM to approve tool calls; `--print`
-            // aborts with exit 1 the first time a tool needs
-            // approval otherwise. The VM itself is the safety
-            // boundary.
-            "--dangerously-skip-permissions".into(),
+            // ADR 0054: a PreToolUse hook replaces
+            // `--dangerously-skip-permissions`. The hook (written by
+            // `write_hook_settings`, run as `hook-bridge`) auto-allows
+            // ordinary tools — explicit and auditable, the VM is still the
+            // safety boundary — and defers AskUserQuestion to the harness.
+            "--settings".into(),
+            HOOK_SETTINGS_FILE.into(),
         ];
         if let Some(id) = resume_id {
             argv.push("--resume".into());
@@ -1340,6 +2148,153 @@ mod adapter {
         }
     }
 
+    /// ADR 0054 Part C — remove the narrate-past poison from claude's
+    /// transcript so an answer-resume starts from a clean defer.
+    ///
+    /// This only fires **once in a while.** A PreToolUse `defer` is *supposed*
+    /// to end the turn right at the `tool_use` (transcript byte-identical,
+    /// nothing after it). But nondeterministically — ~1-in-6 in local repros,
+    /// independent of model/tool/permission-mode — claude instead runs a
+    /// continuation inference, hands *itself* `tool_result{is_error:true,
+    /// content:"[Tool result missing due to internal error]"}` for the deferred
+    /// tool, and narrates an error / "I'll ask again." That is an **upstream
+    /// claude-code bug**, tracked at
+    /// <https://github.com/anthropics/claude-code/issues/64389> — NOT our hook
+    /// (the hook-bridge returns a clean `defer`, exit 0; the error placeholder
+    /// is synthesized inside claude on the continuation request, never on the
+    /// wire we control).
+    ///
+    /// Part A already hides that assistant text from the UI, but it still
+    /// lands in claude's own `.jsonl`; on `--resume` the model reads its own
+    /// stale text and re-asks regardless of the real answer we deliver. We
+    /// remove exactly the assistant messages whose ids Part A suppressed
+    /// (matched by `message.id`, never a content heuristic), AND any assistant
+    /// message carrying a `tool_use` whose id is a suppressed DUPLICATE AUQ
+    /// (`dup_tool_ids` — the #64389 double-fire, within- or cross-run; matched
+    /// by the tool_use id the hook recorded, not a heuristic). Re-link the
+    /// `parentUuid` of any survivor that pointed at a removed line, and write
+    /// atomically. The result is byte-equivalent to a clean single-question
+    /// defer, which resumes correctly. Returns messages removed.
+    fn scrub_transcript(
+        path: &Path,
+        suppressed_ids: &HashSet<String>,
+        dup_tool_ids: &HashSet<String>,
+    ) -> std::io::Result<usize> {
+        let content = std::fs::read_to_string(path)?;
+        // uuid -> parentUuid of each removed line, for re-linking survivors.
+        let mut removed_parent: HashMap<String, Option<String>> = HashMap::new();
+        let mut kept: Vec<String> = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    kept.push(line.to_string());
+                    continue;
+                }
+            };
+            let is_assistant = v.get("type").and_then(|t| t.as_str()) == Some("assistant");
+            let id = v
+                .get("message")
+                .and_then(|m| m.get("id"))
+                .and_then(|s| s.as_str());
+            // A duplicate-AUQ message: an assistant line whose content holds a
+            // `tool_use` block with an id the hook flagged as a duplicate.
+            let carries_dup_tool = is_assistant
+                && !dup_tool_ids.is_empty()
+                && v.get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks.iter().any(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                                && b.get("id")
+                                    .and_then(|s| s.as_str())
+                                    .map(|i| dup_tool_ids.contains(i))
+                                    .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+            let drop_by_msg_id =
+                is_assistant && id.map(|i| suppressed_ids.contains(i)).unwrap_or(false);
+            if drop_by_msg_id || carries_dup_tool {
+                if let Some(uuid) = v.get("uuid").and_then(|s| s.as_str()) {
+                    let parent = v
+                        .get("parentUuid")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string);
+                    removed_parent.insert(uuid.to_string(), parent);
+                }
+                continue; // drop the narrate-past / duplicate-AUQ message
+            }
+            kept.push(line.to_string());
+        }
+        let removed = removed_parent.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        // Re-link any survivor whose parent we removed (defensive — the
+        // narrate-past is normally the trailing message of the turn, so this is
+        // usually a no-op, but it keeps the parentUuid chain intact regardless).
+        let out: Vec<String> = kept
+            .into_iter()
+            .map(|line| {
+                let mut v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => return line,
+                };
+                let reparent = v
+                    .get("parentUuid")
+                    .and_then(|s| s.as_str())
+                    .and_then(|p| removed_parent.get(p))
+                    .cloned();
+                if let Some(grandparent) = reparent {
+                    v["parentUuid"] = match grandparent {
+                        Some(gp) => Value::String(gp),
+                        None => Value::Null,
+                    };
+                    return v.to_string();
+                }
+                line
+            })
+            .collect();
+        // Atomic replace: write a sibling temp file, then rename over the
+        // original (claude is dead at the resume gap, so nothing races us).
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".scrubtmp");
+        let tmp = PathBuf::from(tmp);
+        let mut body = out.join("\n");
+        body.push('\n');
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(removed)
+    }
+
+    /// Locate claude's on-disk transcript for `sid`. claude writes it under
+    /// `<config>/projects/<encoded-cwd>/<sid>.jsonl`, where `<config>` is
+    /// `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`. We glob by session id rather
+    /// than recompute the cwd-encoding, so the lookup is robust to changes in
+    /// that scheme.
+    fn find_claude_transcript(sid: &str) -> Option<PathBuf> {
+        let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME").unwrap_or_else(|| "/root".into());
+                PathBuf::from(home).join(".claude")
+            });
+        let projects = config.join("projects");
+        let target = format!("{sid}.jsonl");
+        for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+            let candidate = entry.path().join(&target);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     /// The terminal `result` line claude emits at the end of every
     /// completed turn. `subtype` is `success` or a handled-error variant
     /// (`error_max_turns`, an API error it surfaced, …); `is_error`
@@ -1350,6 +2305,14 @@ mod adapter {
     pub struct ResultMarker {
         pub subtype: String,
         pub is_error: bool,
+        /// ADR 0054: `tool_deferred` vs `completed` — the ONLY discriminator
+        /// between a genuinely-deferred `AskUserQuestion` (turn suspends,
+        /// awaiting an answer) and a "narrate-past" (claude abandons the
+        /// deferred tool and ends the turn). Both are `subtype:"success"`,
+        /// `is_error:false`, so neither of those can tell them apart. Mirrors
+        /// the Agent SDK's `SDKResultSuccess.terminal_reason`. `None` on older
+        /// CLIs that don't emit the field.
+        pub terminal_reason: Option<String>,
     }
 
     /// Detect claude's terminal `result` line. Substring-gated so we
@@ -1372,6 +2335,10 @@ mod adapter {
                 .unwrap_or("")
                 .to_string(),
             is_error: v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false),
+            terminal_reason: v
+                .get("terminal_reason")
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
         })
     }
 
@@ -1425,6 +2392,10 @@ mod adapter {
     /// lifecycle); it only captures claude's session id for `--resume`.
     /// The terminal `result` line is handled by the session loop via
     /// `detect_result_marker`, so it's a no-op here.
+    // The params are the per-turn mutable state threaded from the session loop
+    // (TurnState fields + the line); bundling them into a struct would obscure
+    // more than it clarifies, and the throwaway call site has no TurnState.
+    #[allow(clippy::too_many_arguments)]
     pub fn translate_jsonl(
         line: &str,
         run_id: &str,
@@ -1434,6 +2405,19 @@ mod adapter {
         // turn (set by `stream_event`/`message_start`) so token chunks carry
         // the same id as the terminal `assistant` message.
         current_message_id: &mut Option<String>,
+        // ADR 0054 Flavor A: file changes parsed from a tool_use, keyed by
+        // tool_use_id and held until the matching tool_result (so we emit a
+        // `FileChanged` only on success). Tracked across lines within a turn.
+        pending_file_changes: &mut HashMap<String, (String, FileChange)>,
+        // ADR 0054: pending (no-result) `AskUserQuestion` tool_use_ids for this
+        // turn. We add an id on a deferred AUQ tool_use and remove it on the
+        // matching tool_result; while the set is non-empty, assistant
+        // text/chunks are the narrate-past hallucination and are suppressed.
+        auq_pending: &mut HashSet<String>,
+        // ADR 0054 Part C: ids of assistant messages suppressed as narrate-past
+        // this turn, recorded here so `scrub_transcript` can delete them from
+        // claude's transcript before the answer-resume.
+        suppressed_msg_ids: &mut Vec<String>,
     ) -> Option<Vec<HarnessEvent>> {
         let v: Value = serde_json::from_str(line).ok()?;
         let ty = v.get("type")?.as_str()?;
@@ -1464,7 +2448,11 @@ mod adapter {
                         if let Some(delta) = event.get("delta") {
                             if delta.get("type").and_then(|s| s.as_str()) == Some("text_delta") {
                                 if let Some(chunk) = delta.get("text").and_then(|s| s.as_str()) {
-                                    if !chunk.is_empty() {
+                                    // ADR 0054: while an AUQ is pending (deferred,
+                                    // no result), live token chunks are the
+                                    // narrate-past hallucination streaming out —
+                                    // drop them so the bogus reply never types out.
+                                    if !chunk.is_empty() && auq_pending.is_empty() {
                                         out.push(HarnessEvent::AgentMessageChunk {
                                             run_id: run_id.to_string(),
                                             message_id: current_message_id
@@ -1500,6 +2488,13 @@ mod adapter {
             }
             "assistant" => {
                 let rid = run_id.to_string();
+                // ADR 0054: snapshot BEFORE the block loop. If an EARLIER
+                // message in this turn left an AUQ pending (the hook deferred
+                // it), any assistant text in THIS later message is the
+                // narrate-past hallucination → drop it. A preamble in the SAME
+                // message as the AUQ tool_use survives: that id is only inserted
+                // during this loop, after this snapshot.
+                let suppress_text = !auq_pending.is_empty();
                 let msg = v.get("message")?;
                 let msg_id = msg
                     .get("id")
@@ -1535,9 +2530,24 @@ mod adapter {
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("?")
                                     .to_string();
-                                let args_summary = b
-                                    .get("input")
+                                let input = b.get("input");
+                                // ADR 0054 Flavor A: stash a parsed file change
+                                // for a Write/Edit/MultiEdit, keyed by id, to
+                                // emit on the SUCCESSFUL tool_result. The
+                                // generic ToolCallStarted still fires (the UI
+                                // dedups it against the FileChanged card).
+                                if let Some(fc) = input.and_then(|i| parse_file_change(&name, i)) {
+                                    pending_file_changes.insert(tcid.clone(), fc);
+                                }
+                                let args_summary = input
                                     .map(|v| truncate_str(&v.to_string(), MAX_ARGS_SUMMARY_BYTES));
+                                // ADR 0054: an `AskUserQuestion` is deferred by
+                                // the hook — no `tool_result` follows unless an
+                                // answer-resume delivers one. Mark it pending so
+                                // a subsequent narrate-past message is suppressed.
+                                if name == "AskUserQuestion" {
+                                    auq_pending.insert(tcid.clone());
+                                }
                                 out.push(HarnessEvent::ToolCallStarted {
                                     run_id: rid.clone(),
                                     tool_call_id: tcid,
@@ -1549,12 +2559,23 @@ mod adapter {
                         }
                     }
                     if !text_buf.is_empty() {
-                        out.push(HarnessEvent::AgentMessage {
-                            run_id: rid,
-                            message_id: msg_id,
-                            role: AgentRole::Assistant,
-                            text: truncate_str(&text_buf, MAX_AGENT_MESSAGE_BYTES),
-                        });
+                        if suppress_text {
+                            // ADR 0054 Part C: this assistant message is the
+                            // narrate-past hallucination (already dropped from
+                            // the UI by Part A). Record its id so the scrub can
+                            // remove it from claude's transcript before the
+                            // answer-resume — otherwise claude reads its own
+                            // stale "I'll try again" text on `--resume` and
+                            // re-asks regardless of the real answer.
+                            suppressed_msg_ids.push(msg_id);
+                        } else {
+                            out.push(HarnessEvent::AgentMessage {
+                                run_id: rid,
+                                message_id: msg_id,
+                                role: AgentRole::Assistant,
+                                text: truncate_str(&text_buf, MAX_AGENT_MESSAGE_BYTES),
+                            });
+                        }
                     }
                 }
             }
@@ -1570,6 +2591,11 @@ mod adapter {
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("toolu-?")
                                 .to_string();
+                            // ADR 0054: a tool_result resolves a pending AUQ
+                            // (the answer-resume path), so following assistant
+                            // text is legitimate ("You selected …") and must
+                            // not be suppressed.
+                            auq_pending.remove(&tcid);
                             let is_error =
                                 b.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
                             let result_text = match b.get("content") {
@@ -1585,7 +2611,7 @@ mod adapter {
                             };
                             out.push(HarnessEvent::ToolCallCompleted {
                                 run_id: rid.clone(),
-                                tool_call_id: tcid,
+                                tool_call_id: tcid.clone(),
                                 tool_name: String::new(),
                                 ok: !is_error,
                                 duration_ms: 0,
@@ -1594,6 +2620,20 @@ mod adapter {
                                     MAX_RESULT_SUMMARY_BYTES,
                                 )),
                             });
+                            // ADR 0054 Flavor A: a Write/Edit/MultiEdit landed
+                            // its result. Emit the rich diff ONLY on success;
+                            // drop the stashed change on failure (truthful —
+                            // no phantom diff for a failed edit).
+                            if let Some((path, change)) = pending_file_changes.remove(&tcid) {
+                                if !is_error {
+                                    out.push(HarnessEvent::FileChanged {
+                                        run_id: rid.clone(),
+                                        tool_call_id: tcid,
+                                        path,
+                                        change,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -1605,6 +2645,50 @@ mod adapter {
             _ => {}
         }
         Some(out)
+    }
+
+    /// ADR 0054 Flavor A: map a Claude `Write`/`Edit`/`MultiEdit` tool input
+    /// into a normalized `(path, FileChange)`. Returns `None` for any other
+    /// tool or a malformed input. Each inner string is truncated to
+    /// `MAX_FILE_CHANGE_BYTES` *here* (per-string, before serialization) so a
+    /// single huge write can't blow the frame — the 1 KB `args_summary` cap is
+    /// untouched and still applies to every tool's generic event.
+    pub fn parse_file_change(name: &str, input: &Value) -> Option<(String, FileChange)> {
+        let path = input.get("file_path")?.as_str()?.to_string();
+        let clip = |s: &str| truncate_str(s, MAX_FILE_CHANGE_BYTES);
+        match name {
+            "Write" => {
+                let content = clip(input.get("content")?.as_str()?);
+                Some((path, FileChange::Write { content }))
+            }
+            "Edit" => {
+                let old = clip(input.get("old_string")?.as_str()?);
+                let new = clip(input.get("new_string")?.as_str()?);
+                Some((
+                    path,
+                    FileChange::Edit {
+                        hunks: vec![EditHunk { old, new }],
+                    },
+                ))
+            }
+            "MultiEdit" => {
+                let edits = input.get("edits")?.as_array()?;
+                let hunks: Vec<EditHunk> = edits
+                    .iter()
+                    .filter_map(|e| {
+                        Some(EditHunk {
+                            old: clip(e.get("old_string")?.as_str()?),
+                            new: clip(e.get("new_string")?.as_str()?),
+                        })
+                    })
+                    .collect();
+                if hunks.is_empty() {
+                    return None;
+                }
+                Some((path, FileChange::Edit { hunks }))
+            }
+            _ => None,
+        }
     }
 
     pub fn truncate_str(s: &str, max_bytes: usize) -> String {
@@ -1623,6 +2707,7 @@ mod adapter {
     #[cfg(test)]
     mod engine_tests {
         use super::*;
+        use engram_harness_proto::{Answers, Question, QuestionOption};
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
@@ -1667,6 +2752,120 @@ mod adapter {
                 Some(HarnessEvent::Idle),
                 "the un-acked event must be parked for the next connection",
             );
+        }
+
+        // ADR 0054 Part C: the scrub removes exactly the suppressed
+        // narrate-past message(s) by id, keeps the deferred tool_use, and
+        // re-links any survivor whose parent it removed.
+        #[test]
+        fn scrub_removes_narrate_past_and_relinks() {
+            let dir = std::env::temp_dir().join(format!("engram-scrub-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("sess.jsonl");
+            let lines = [
+                r#"{"type":"user","uuid":"u-prompt","parentUuid":null,"message":{"role":"user","content":[{"type":"text","text":"ask me red or green"}]}}"#,
+                r#"{"type":"assistant","uuid":"u-A","parentUuid":"u-prompt","message":{"id":"msg_AAA","role":"assistant","content":[{"type":"tool_use","id":"toolu_X","name":"AskUserQuestion","input":{"questions":[]}}]}}"#,
+                r#"{"type":"assistant","uuid":"u-B","parentUuid":"u-A","message":{"id":"msg_BBB","role":"assistant","content":[{"type":"text","text":"It seems the tool encountered an internal error."}]}}"#,
+                r#"{"type":"assistant","uuid":"u-C","parentUuid":"u-B","message":{"id":"msg_CCC","role":"assistant","content":[{"type":"text","text":"trailing"}]}}"#,
+            ];
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+            let mut ids = HashSet::new();
+            ids.insert("msg_BBB".to_string());
+            let removed = scrub_transcript(&path, &ids, &HashSet::new()).unwrap();
+            assert_eq!(removed, 1, "exactly one narrate-past message removed");
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(!after.contains("msg_BBB"), "narrate-past message gone");
+            assert!(!after.contains("internal error"), "narration text gone");
+            assert!(
+                after.contains("msg_AAA"),
+                "the tool_use message is preserved"
+            );
+            assert!(
+                after.contains("toolu_X"),
+                "the deferred tool_use_id is preserved"
+            );
+
+            // u-C pointed at the removed u-B → must be re-linked to u-B's parent (u-A).
+            let c = after
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .find(|v| v["uuid"] == "u-C")
+                .unwrap();
+            assert_eq!(
+                c["parentUuid"], "u-A",
+                "survivor re-linked past the removed line"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A transcript with none of the suppressed ids is left byte-for-byte
+        // untouched (clean defer / nothing to scrub).
+        #[test]
+        fn scrub_is_noop_when_nothing_matches() {
+            let dir =
+                std::env::temp_dir().join(format!("engram-scrub-noop-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("sess.jsonl");
+            let body = "{\"type\":\"assistant\",\"uuid\":\"u-A\",\"parentUuid\":null,\"message\":{\"id\":\"msg_AAA\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_X\",\"name\":\"AskUserQuestion\"}]}}\n";
+            std::fs::write(&path, body).unwrap();
+
+            let mut ids = HashSet::new();
+            ids.insert("msg_NOPE".to_string());
+            let removed = scrub_transcript(&path, &ids, &HashSet::new()).unwrap();
+            assert_eq!(removed, 0);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                body,
+                "file is untouched on a no-op scrub",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ADR 0054: the scrub also drops a DUPLICATE AUQ's assistant message
+        // — matched by the suppressed `tool_use` id, even in a different run
+        // (the cross-run #64389 double-fire) — keeping the FIRST question's
+        // tool_use and re-linking survivors, so resume re-fires exactly one.
+        #[test]
+        fn scrub_removes_duplicate_auq_tool_use() {
+            let dir = std::env::temp_dir().join(format!("engram-scrub-dup-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("sess.jsonl");
+            let lines = [
+                r#"{"type":"user","uuid":"u-prompt","parentUuid":null,"message":{"role":"user","content":[{"type":"text","text":"ask me red or green"}]}}"#,
+                // run A: the carded (first) question — kept.
+                r#"{"type":"assistant","uuid":"u-A","parentUuid":"u-prompt","message":{"id":"msg_AAA","role":"assistant","content":[{"type":"tool_use","id":"toolu_FIRST","name":"AskUserQuestion","input":{"questions":[]}}]}}"#,
+                // run B: the cross-run duplicate — dropped by its tool_use id.
+                r#"{"type":"assistant","uuid":"u-B","parentUuid":"u-A","message":{"id":"msg_BBB","role":"assistant","content":[{"type":"tool_use","id":"toolu_DUP","name":"AskUserQuestion","input":{"questions":[]}}]}}"#,
+                r#"{"type":"assistant","uuid":"u-C","parentUuid":"u-B","message":{"id":"msg_CCC","role":"assistant","content":[{"type":"text","text":"trailing"}]}}"#,
+            ];
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+            let mut dup = HashSet::new();
+            dup.insert("toolu_DUP".to_string());
+            let removed = scrub_transcript(&path, &HashSet::new(), &dup).unwrap();
+            assert_eq!(removed, 1, "exactly the duplicate AUQ message removed");
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(!after.contains("toolu_DUP"), "duplicate tool_use gone");
+            assert!(
+                after.contains("toolu_FIRST"),
+                "the first (carded) question is preserved"
+            );
+            let c = after
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .find(|v| v["uuid"] == "u-C")
+                .unwrap();
+            assert_eq!(
+                c["parentUuid"], "u-A",
+                "survivor re-linked past the removed duplicate"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         // The next connection re-sends the parked event first (at-least-once).
@@ -1981,139 +3180,6 @@ mod adapter {
         // event slot). A replay of a prompt the harness already accepted
         // must be a no-op — never a second run — so the engine dedupes on
         // prompt_id.
-        #[tokio::test]
-        async fn duplicate_prompt_replay_is_ignored() {
-            let script = write_persistent_fake_claude(&[
-                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"ok"}]}}"#,
-                r#"{"type":"result","subtype":"success","is_error":false}"#,
-            ])
-            .await;
-
-            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
-            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
-            let reattach = Arc::new(Notify::new());
-            let engine = tokio::spawn(run_engine(
-                test_cli(script.clone()),
-                cmd_rx,
-                reattach.clone(),
-                evt_tx,
-                None, // no initial prompt → starts Idle
-            ));
-
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            // p1 runs to completion.
-            cmd_tx
-                .send(HarnessCommand::Prompt {
-                    prompt_id: "p1".into(),
-                    text: "hi".into(),
-                })
-                .await
-                .unwrap();
-            let (_r1, pid1) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(pid1.as_deref(), Some("p1"));
-            expect_agent_message(&mut evt_rx, "ok").await;
-            let _ = expect_run_completed(&mut evt_rx).await;
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            // Replay p1 (a duplicate from the host's at-least-once path),
-            // then send a fresh p2. The duplicate must NOT start a run — the
-            // next RunStarted we observe must be p2's, proving p1 was deduped.
-            cmd_tx
-                .send(HarnessCommand::Prompt {
-                    prompt_id: "p1".into(),
-                    text: "hi".into(),
-                })
-                .await
-                .unwrap();
-            cmd_tx
-                .send(HarnessCommand::Prompt {
-                    prompt_id: "p2".into(),
-                    text: "yo".into(),
-                })
-                .await
-                .unwrap();
-            let (_r2, pid2) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(
-                pid2.as_deref(),
-                Some("p2"),
-                "the duplicate p1 must be ignored; the next run is p2",
-            );
-
-            // Closing the command channel ends the engine cleanly.
-            drop(cmd_tx);
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit when the command channel closes")
-                .expect("engine task should not panic");
-            let _ = tokio::fs::remove_file(&script).await;
-        }
-
-        // The core Phase-1 contract: TWO prompts over ONE persistent
-        // process, each turn cleanly bracketed by RunStarted→…→
-        // RunCompleted→Idle with a DISTINCT run_id (no inference from
-        // EOF). A reattach while idle re-announces Idle; Shutdown drains
-        // the process and the engine exits.
-        #[tokio::test]
-        async fn engine_runs_two_prompts_over_one_process() {
-            let script = write_persistent_fake_claude(&[
-                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hello"}]}}"#,
-                r#"{"type":"result","subtype":"success","is_error":false}"#,
-            ])
-            .await;
-
-            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
-            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
-            let reattach = Arc::new(Notify::new());
-            let engine = tokio::spawn(run_engine(
-                test_cli(script.clone()),
-                cmd_rx,
-                reattach.clone(),
-                evt_tx,
-                Some("first".into()),
-            ));
-
-            // Turn 1 (the initial prompt): RunStarted, AgentMessage,
-            // RunCompleted, Idle — the run_id shared start-to-end.
-            let r1 = expect_run_started(&mut evt_rx).await;
-            expect_agent_message(&mut evt_rx, "hello").await;
-            let c1 = expect_run_completed(&mut evt_rx).await;
-            assert_eq!(r1, c1, "RunStarted and RunCompleted share the run_id");
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            // Turn 2 over the SAME process — a fresh, distinct run_id.
-            cmd_tx
-                .send(HarnessCommand::Prompt {
-                    prompt_id: "p-second".into(),
-                    text: "second".into(),
-                })
-                .await
-                .unwrap();
-            let r2 = expect_run_started(&mut evt_rx).await;
-            assert_ne!(r1, r2, "each turn gets a fresh run_id");
-            expect_agent_message(&mut evt_rx, "hello").await;
-            let c2 = expect_run_completed(&mut evt_rx).await;
-            assert_eq!(r2, c2);
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            // A reconnect while idle re-announces Idle so the host's soft
-            // TTL re-arms; a mid-run reattach emits none.
-            reattach.notify_one();
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            // Shutdown closes claude's stdin; the fake drains and exits,
-            // and the engine returns.
-            cmd_tx
-                .send(HarnessCommand::Shutdown { grace_secs: 5 })
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
-            let _ = tokio::fs::remove_file(&script).await;
-        }
-
         /// A fake `claude` that models the Phase 3 in-band interrupt: a
         /// `user` line emits assistant text but NO result (the turn stays IN
         /// FLIGHT — "generating"); a `control_request` line emits the abort
@@ -2285,19 +3351,533 @@ mod adapter {
             let _ = tokio::fs::remove_file(&script).await;
             let _ = tokio::fs::remove_file(&pidfile).await;
         }
+
+        #[tokio::test]
+        async fn duplicate_prompt_replay_is_ignored() {
+            let script = write_persistent_fake_claude(&[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false}"#,
+            ])
+            .await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                None, // no initial prompt → starts Idle
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // p1 runs to completion.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "hi".into(),
+                })
+                .await
+                .unwrap();
+            let (_r1, pid1) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(pid1.as_deref(), Some("p1"));
+            expect_agent_message(&mut evt_rx, "ok").await;
+            let _ = expect_run_completed(&mut evt_rx).await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // Replay p1 (a duplicate from the host's at-least-once path),
+            // then send a fresh p2. The duplicate must NOT start a run — the
+            // next RunStarted we observe must be p2's, proving p1 was deduped.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "hi".into(),
+                })
+                .await
+                .unwrap();
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p2".into(),
+                    text: "yo".into(),
+                })
+                .await
+                .unwrap();
+            let (_r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(
+                pid2.as_deref(),
+                Some("p2"),
+                "the duplicate p1 must be ignored; the next run is p2",
+            );
+
+            // Closing the command channel ends the engine cleanly.
+            drop(cmd_tx);
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit when the command channel closes")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+        }
+
+        // The core Phase-1 contract: TWO prompts over ONE persistent
+        // process, each turn cleanly bracketed by RunStarted→…→
+        // RunCompleted→Idle with a DISTINCT run_id (no inference from
+        // EOF). A reattach while idle re-announces Idle; Shutdown drains
+        // the process and the engine exits.
+        #[tokio::test]
+        async fn engine_runs_two_prompts_over_one_process() {
+            let script = write_persistent_fake_claude(&[
+                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hello"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false}"#,
+            ])
+            .await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                Some("first".into()),
+            ));
+
+            // Turn 1 (the initial prompt): RunStarted, AgentMessage,
+            // RunCompleted, Idle — the run_id shared start-to-end.
+            let r1 = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "hello").await;
+            let c1 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(r1, c1, "RunStarted and RunCompleted share the run_id");
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // Turn 2 over the SAME process — a fresh, distinct run_id.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-second".into(),
+                    text: "second".into(),
+                })
+                .await
+                .unwrap();
+            let r2 = expect_run_started(&mut evt_rx).await;
+            assert_ne!(r1, r2, "each turn gets a fresh run_id");
+            expect_agent_message(&mut evt_rx, "hello").await;
+            let c2 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(r2, c2);
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // A reconnect while idle re-announces Idle so the host's soft
+            // TTL re-arms; a mid-run reattach emits none.
+            reattach.notify_one();
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // Shutdown closes claude's stdin; the fake drains and exits,
+            // and the engine returns.
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+        }
+
+        // ── ADR 0054 Flavor B: hook↔harness socket + answer-resume ──────
+
+        fn sample_q(text: &str, multi: bool) -> Question {
+            Question {
+                question: text.into(),
+                header: "H".into(),
+                multi_select: multi,
+                options: vec![QuestionOption {
+                    label: "A".into(),
+                    description: "a".into(),
+                }],
+            }
+        }
+
+        /// Spin up `hook_server::serve` on a fresh, isolated temp socket (NOT
+        /// the production `/workspace` path — tests run in parallel). Returns
+        /// the path plus the shared state and the event receiver.
+        async fn spawn_hook_server() -> (
+            String,
+            hook_server::AnswersInHand,
+            hook_server::CurrentRunId,
+            mpsc::Receiver<HarnessEvent>,
+            hook_server::DuplicateAuqIds,
+        ) {
+            let sock = std::env::temp_dir()
+                .join(format!("engram-hooktest-{}.sock", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned();
+            let answers: hook_server::AnswersInHand =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let run_id: hook_server::CurrentRunId =
+                Arc::new(tokio::sync::Mutex::new(Some("run-x".into())));
+            let outstanding: hook_server::QuestionOutstanding =
+                Arc::new(tokio::sync::Mutex::new(false));
+            let dup_ids: hook_server::DuplicateAuqIds =
+                Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+            let (evt_tx, evt_rx) = mpsc::channel::<HarnessEvent>(16);
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            tokio::spawn(hook_server::serve(
+                listener,
+                answers.clone(),
+                run_id.clone(),
+                evt_tx,
+                outstanding.clone(),
+                dup_ids.clone(),
+            ));
+            (sock, answers, run_id, evt_rx, dup_ids)
+        }
+
+        /// A fake `PreToolUse` hook client: one request line, one verdict.
+        async fn hook_fire(
+            sock: &str,
+            tool_use_id: &str,
+            questions: &[Question],
+        ) -> hook_server::HookVerdict {
+            let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let req = serde_json::json!({ "tool_use_id": tool_use_id, "questions": questions });
+            let mut line = serde_json::to_string(&req).unwrap();
+            line.push('\n');
+            w.write_all(line.as_bytes()).await.unwrap();
+            w.flush().await.unwrap();
+            let mut lines = BufReader::new(r).lines();
+            let resp = lines.next_line().await.unwrap().unwrap();
+            serde_json::from_str(&resp).unwrap()
+        }
+
+        // No answer in hand → defer + UserQuestion. After an answer is
+        // stashed, a re-fire of the SAME tool_use_id → answer +
+        // QuestionAnswered.
+        #[tokio::test]
+        async fn hook_defers_then_answers_after_stash() {
+            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
+            let questions = vec![sample_q("Pick one?", false)];
+
+            let v = hook_fire(&sock, "toolu_1", &questions).await;
+            assert!(matches!(v, hook_server::HookVerdict::Defer));
+            match evt_rx.recv().await {
+                Some(HarnessEvent::UserQuestion {
+                    run_id,
+                    tool_call_id,
+                    questions: qs,
+                }) => {
+                    assert_eq!(run_id, "run-x");
+                    assert_eq!(tool_call_id, "toolu_1");
+                    assert_eq!(qs.len(), 1);
+                }
+                other => panic!("expected UserQuestion, got {other:?}"),
+            }
+
+            {
+                let mut m = answers.lock().await;
+                let mut a = Answers::new();
+                a.insert("Pick one?".into(), vec!["A".into()]);
+                m.insert("toolu_1".into(), a);
+            }
+            let v = hook_fire(&sock, "toolu_1", &questions).await;
+            match v {
+                hook_server::HookVerdict::Answer { answers } => {
+                    assert_eq!(answers.get("Pick one?"), Some(&vec!["A".to_string()]));
+                }
+                _ => panic!("expected answer after stash"),
+            }
+            match evt_rx.recv().await {
+                Some(HarnessEvent::QuestionAnswered {
+                    tool_call_id,
+                    answers,
+                    ..
+                }) => {
+                    assert_eq!(tool_call_id, "toolu_1");
+                    assert_eq!(answers.get("Pick one?"), Some(&vec!["A".to_string()]));
+                }
+                other => panic!("expected QuestionAnswered, got {other:?}"),
+            }
+        }
+
+        // One AUQ call carrying TWO questions (one multi, one single) → one
+        // request, one answers map keyed by question text (finding #8).
+        #[tokio::test]
+        async fn hook_multi_question_one_roundtrip() {
+            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
+            let questions = vec![sample_q("Languages?", true), sample_q("Editor?", false)];
+            {
+                let mut m = answers.lock().await;
+                let mut a = Answers::new();
+                a.insert("Languages?".into(), vec!["Python".into(), "Rust".into()]);
+                a.insert("Editor?".into(), vec!["VS Code".into()]);
+                m.insert("toolu_multi".into(), a);
+            }
+            match hook_fire(&sock, "toolu_multi", &questions).await {
+                hook_server::HookVerdict::Answer { answers } => {
+                    assert_eq!(answers.len(), 2, "one answers map for N questions");
+                    assert_eq!(answers.get("Languages?").unwrap().len(), 2);
+                    assert_eq!(
+                        answers.get("Editor?").unwrap(),
+                        &vec!["VS Code".to_string()]
+                    );
+                }
+                _ => panic!("expected answer"),
+            }
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::QuestionAnswered { .. })
+            ));
+        }
+
+        // Idempotency: the deferred tool yields exactly one tool_result, so
+        // a duplicate re-fire after consumption DEFERS (consumed once).
+        #[tokio::test]
+        async fn hook_duplicate_refire_defers_after_consumption() {
+            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
+            let questions = vec![sample_q("One?", false)];
+            {
+                let mut m = answers.lock().await;
+                let mut a = Answers::new();
+                a.insert("One?".into(), vec!["A".into()]);
+                m.insert("toolu_dup".into(), a);
+            }
+            assert!(matches!(
+                hook_fire(&sock, "toolu_dup", &questions).await,
+                hook_server::HookVerdict::Answer { .. }
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::QuestionAnswered { .. })
+            ));
+            assert!(matches!(
+                hook_fire(&sock, "toolu_dup", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::UserQuestion { .. })
+            ));
+            assert!(
+                answers.lock().await.is_empty(),
+                "the answer was consumed exactly once"
+            );
+        }
+
+        // ADR 0054: SESSION-level dedup of the #64389 double-fire. The first
+        // AUQ defers + cards and marks a question outstanding; any further AUQ
+        // while one is outstanding — INCLUDING one in a different run (the
+        // cross-run double-fire) — still DEFERS (parked, no deny poison) but
+        // emits NO card and is recorded for the scrub. Once the outstanding
+        // question is ANSWERED, the next genuine question is carded afresh.
+        #[tokio::test]
+        async fn hook_dedups_duplicate_auq_session_wide() {
+            let (sock, answers, run_id, mut evt_rx, dup_ids) = spawn_hook_server().await;
+            let questions = vec![sample_q("Color?", false)];
+
+            // First AUQ in run-x → defer + card.
+            assert!(matches!(
+                hook_fire(&sock, "toolu_a", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::UserQuestion { .. })
+            ));
+
+            // Second, distinct AUQ in the SAME run → defer (parked), NO card,
+            // and its id is recorded for the scrub.
+            assert!(matches!(
+                hook_fire(&sock, "toolu_b", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "the same-run duplicate emits no card"
+            );
+
+            // A duplicate in a DIFFERENT run (the cross-run double-fire) is
+            // STILL deduped — the invariant is session-wide, not per-run.
+            *run_id.lock().await = Some("run-y".into());
+            assert!(matches!(
+                hook_fire(&sock, "toolu_c", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "the cross-run duplicate emits no card either"
+            );
+            assert_eq!(
+                *dup_ids.lock().await,
+                HashSet::from(["toolu_b".to_string(), "toolu_c".to_string()]),
+                "both duplicates (same- and cross-run) are recorded for the scrub"
+            );
+
+            // Answer the outstanding question (its id is the carded toolu_a) →
+            // clears `question_outstanding`, so the NEXT genuine question cards.
+            {
+                let mut a = Answers::new();
+                a.insert("Color?".into(), vec!["A".into()]);
+                answers.lock().await.insert("toolu_a".to_string(), a);
+            }
+            assert!(matches!(
+                hook_fire(&sock, "toolu_a", &questions).await,
+                hook_server::HookVerdict::Answer { .. }
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::QuestionAnswered { .. })
+            ));
+            assert!(matches!(
+                hook_fire(&sock, "toolu_d", &questions).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(
+                matches!(evt_rx.recv().await, Some(HarnessEvent::UserQuestion { .. })),
+                "after the answer, a fresh question is carded again"
+            );
+        }
+
+        // The hook-bridge's claude-specific denormalization (finding #6): a
+        // single-select answer is a bare string, a multiSelect answer is an
+        // array, keyed by question text — driven by each question's flag.
+        #[test]
+        fn denormalize_single_is_string_multi_is_array() {
+            let questions = vec![sample_q("M?", true), sample_q("S?", false)];
+            let mut a = Answers::new();
+            a.insert("M?".into(), vec!["x".into(), "y".into()]);
+            a.insert("S?".into(), vec!["z".into()]);
+            let out = hook_bridge::denormalize(&questions, &a);
+            assert_eq!(out["M?"], serde_json::json!(["x", "y"]), "multi → array");
+            assert_eq!(out["S?"], serde_json::json!("z"), "single → bare string");
+        }
+
+        /// A fake claude for the answer-resume + Part B fallback cycle. The
+        /// first turn it emits (init + "resumed" + `result`) models the
+        /// NARRATE-PAST: on the `--resume` it does NOT re-fire the deferred
+        /// tool — it just recaps and ends — so the stashed answer is left
+        /// UNCONSUMED in `answers_in_hand`. Then (unlike the old fake) it
+        /// RESPONDS to each stdin line with "got your answer" + `result`, so
+        /// the harness's fallback delivery (a fresh user message) produces a
+        /// completing turn. On the first (idle) spawn there's no in-flight
+        /// turn so the recap is dropped and only the startup `Idle` surfaces;
+        /// the continuation turn after `AnswerQuestion` captures the recap.
+        async fn write_answer_fallback_fake_claude() -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let body = "#!/bin/sh\n\
+                printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n\
+                printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"content\":[{\"type\":\"text\",\"text\":\"resumed\"}]}}'\n\
+                printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                while IFS= read -r _l; do\n\
+                  printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m3\",\"content\":[{\"type\":\"text\",\"text\":\"got your answer\"}]}}'\n\
+                  printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+                done\n";
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        // ADR 0054 Part B: an `AnswerQuestion` stashes the answer, SIGINTs
+        // claude, and respawns `--resume` into a CONTINUATION turn (RunStarted
+        // with NO prompt_id). When claude NARRATE-PASTs, it does NOT re-fire
+        // the deferred tool on resume (verified: an abandoned tool is not
+        // re-presented), so the answer is left UNCONSUMED in `answers_in_hand`
+        // after the continuation turn. The engine must then DELIVER the answer
+        // as a fresh user message (a new no-prompt_id turn) and mark the card
+        // answered (`QuestionAnswered`), instead of going idle with the
+        // question hanging. (The fake never consumes the answer, exactly like
+        // the abandoned-tool case; the first idle spawn's recap is dropped.)
+        #[tokio::test]
+        async fn answer_resume_unconsumed_falls_back_to_user_message() {
+            let script = write_answer_fallback_fake_claude().await;
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+                None, // no initial prompt → Idle
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            let mut a = Answers::new();
+            a.insert("Q?".into(), vec!["A".into()]);
+            cmd_tx
+                .send(HarnessCommand::AnswerQuestion {
+                    tool_call_id: "toolu_1".into(),
+                    answers: a,
+                })
+                .await
+                .unwrap();
+
+            // 1) the answer-resume continuation turn — claude recaps ("resumed")
+            //    and ends WITHOUT re-firing the deferred tool: answer unconsumed.
+            let (_rid, pid) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(pid, None, "continuation turn carries no prompt_id");
+            expect_agent_message(&mut evt_rx, "resumed").await;
+            let _ = expect_run_completed(&mut evt_rx).await;
+
+            // 2) Part B fallback: a fresh turn (no prompt_id) delivers the answer
+            //    as a user message, and the card is marked answered.
+            let (_fid, fpid) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(
+                fpid, None,
+                "the fallback answer delivery is not a user prompt"
+            );
+            match evt_rx.recv().await {
+                Some(HarnessEvent::QuestionAnswered {
+                    tool_call_id,
+                    answers,
+                    ..
+                }) => {
+                    assert_eq!(tool_call_id, "toolu_1");
+                    assert_eq!(answers.get("Q?"), Some(&vec!["A".to_string()]));
+                }
+                other => panic!("expected QuestionAnswered, got {other:?}"),
+            }
+            expect_agent_message(&mut evt_rx, "got your answer").await;
+            let _ = expect_run_completed(&mut evt_rx).await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine should exit on shutdown")
+                .expect("engine task should not panic");
+            let _ = tokio::fs::remove_file(&script).await;
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // ADR 0054: git/busybox argv dispatch — the SAME binary is the socket
+    // SERVER (normal mode) and the transient PreToolUse hook CLIENT. Peek
+    // argv[1] BEFORE clap sees it: `Cli` requires `--session-id`, which a
+    // hook invocation never has, so a hook must bypass the parser entirely.
+    if std::env::args().nth(1).as_deref() == Some("hook-bridge") {
+        return adapter::hook_bridge::run().await;
+    }
     adapter::entry().await
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::adapter::*;
-    use engram_harness_proto::HarnessEvent;
+    use engram_harness_proto::{FileChange, HarnessEvent};
+    use std::collections::HashMap;
 
     #[test]
     fn system_init_emits_nothing_and_assistant_text_carries_run_id() {
@@ -2307,10 +3887,31 @@ mod tests {
         let init = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
         let asst = r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"hi there"}]}}"#;
         let mut tc = 0u32;
-        let evs = translate_jsonl(init, "run-1", &mut tc, 50, &mut None).unwrap();
+        let mut fc = HashMap::new();
+        let evs = translate_jsonl(
+            init,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(evs.is_empty(), "init emits no HarnessEvent");
 
-        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None).unwrap();
+        let evs = translate_jsonl(
+            asst,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::AgentMessage { text, run_id, .. } => {
@@ -2336,20 +3937,49 @@ mod tests {
 
         let mut tc = 0u32;
         let mut mid: Option<String> = None;
+        let mut fc = HashMap::new();
 
         // message_start: no event, but the id is now tracked.
-        assert!(translate_jsonl(msg_start, "run-9", &mut tc, 50, &mut mid)
-            .unwrap()
-            .is_empty());
+        assert!(translate_jsonl(
+            msg_start,
+            "run-9",
+            &mut tc,
+            50,
+            &mut mid,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new()
+        )
+        .unwrap()
+        .is_empty());
         assert_eq!(mid.as_deref(), Some("msg_42"));
 
         // content_block_start: no chunk (empty text), no event.
-        assert!(translate_jsonl(block_start, "run-9", &mut tc, 50, &mut mid)
-            .unwrap()
-            .is_empty());
+        assert!(translate_jsonl(
+            block_start,
+            "run-9",
+            &mut tc,
+            50,
+            &mut mid,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new()
+        )
+        .unwrap()
+        .is_empty());
 
         for (line, want) in [(d1, "hel"), (d2, "lo")] {
-            let evs = translate_jsonl(line, "run-9", &mut tc, 50, &mut mid).unwrap();
+            let evs = translate_jsonl(
+                line,
+                "run-9",
+                &mut tc,
+                50,
+                &mut mid,
+                &mut fc,
+                &mut std::collections::HashSet::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
             assert_eq!(evs.len(), 1);
             match &evs[0] {
                 HarnessEvent::AgentMessageChunk {
@@ -2367,7 +3997,17 @@ mod tests {
 
         // The terminal `assistant` message uses the SAME id — the durable
         // record that supersedes the chunks downstream.
-        let evs = translate_jsonl(complete, "run-9", &mut tc, 50, &mut mid).unwrap();
+        let evs = translate_jsonl(
+            complete,
+            "run-9",
+            &mut tc,
+            50,
+            &mut mid,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         match &evs[0] {
             HarnessEvent::AgentMessage {
                 message_id, text, ..
@@ -2385,12 +4025,33 @@ mod tests {
         let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1.txt\nfile2.py","is_error":false}]}}"#;
 
         let mut tc = 0u32;
-        let evs = translate_jsonl(asst, "run-1", &mut tc, 50, &mut None).unwrap();
+        let mut fc = HashMap::new();
+        let evs = translate_jsonl(
+            asst,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(evs.len(), 1);
         assert!(matches!(evs[0], HarnessEvent::ToolCallStarted { .. }));
         assert_eq!(tc, 1);
 
-        let evs = translate_jsonl(user, "run-1", &mut tc, 50, &mut None).unwrap();
+        let evs = translate_jsonl(
+            user,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             HarnessEvent::ToolCallCompleted {
@@ -2405,6 +4066,114 @@ mod tests {
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
         }
+        // A non-file tool stashes no pending change.
+        assert!(fc.is_empty());
+    }
+
+    // ADR 0054 Flavor A: an Edit whose tool_result succeeds emits a
+    // FileChanged (alongside ToolCallCompleted), carrying the normalized hunk.
+    #[test]
+    fn successful_edit_emits_file_changed_with_hunks() {
+        let asst = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_e","name":"Edit","input":{"file_path":"src/main.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}]}}"#;
+        let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_e","content":"ok","is_error":false}]}}"#;
+
+        let mut tc = 0u32;
+        let mut fc = HashMap::new();
+        // tool_use stashes the pending change; only ToolCallStarted is emitted.
+        let evs = translate_jsonl(
+            asst,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            evs.as_slice(),
+            [HarnessEvent::ToolCallStarted { .. }]
+        ));
+        assert_eq!(fc.len(), 1);
+
+        // The successful tool_result emits ToolCallCompleted THEN FileChanged,
+        // and retires the pending entry.
+        let evs = translate_jsonl(
+            user,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0], HarnessEvent::ToolCallCompleted { .. }));
+        match &evs[1] {
+            HarnessEvent::FileChanged {
+                tool_call_id,
+                path,
+                change,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "toolu_e");
+                assert_eq!(path, "src/main.rs");
+                match change {
+                    FileChange::Edit { hunks } => {
+                        assert_eq!(hunks.len(), 1);
+                        assert_eq!(hunks[0].old, "let x = 1;");
+                        assert_eq!(hunks[0].new, "let x = 2;");
+                    }
+                    other => panic!("expected Edit, got {other:?}"),
+                }
+            }
+            other => panic!("expected FileChanged, got {other:?}"),
+        }
+        assert!(fc.is_empty(), "pending change retired on result");
+    }
+
+    // ADR 0054 Flavor A: a FAILED edit emits no FileChanged (no phantom diff)
+    // but still drops the stashed change.
+    #[test]
+    fn failed_edit_emits_no_file_changed() {
+        let asst = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_w","name":"Write","input":{"file_path":"a.txt","content":"hello"}}]}}"#;
+        let user = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_w","content":"String to replace not found","is_error":true}]}}"#;
+
+        let mut tc = 0u32;
+        let mut fc = HashMap::new();
+        translate_jsonl(
+            asst,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(fc.len(), 1);
+
+        let evs = translate_jsonl(
+            user,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut fc,
+            &mut std::collections::HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        // Only the (failed) ToolCallCompleted — no FileChanged.
+        assert!(matches!(
+            evs.as_slice(),
+            [HarnessEvent::ToolCallCompleted { ok: false, .. }]
+        ));
+        assert!(fc.is_empty(), "stashed change dropped on failure");
     }
 
     #[test]
@@ -2426,6 +4195,250 @@ mod tests {
         let err = r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
         let m = detect_result_marker(err).expect("error result still detected");
         assert!(m.is_error);
+    }
+
+    #[test]
+    fn detect_result_marker_captures_terminal_reason() {
+        // ADR 0054: a genuinely deferred AUQ ends the turn subtype=success
+        // but terminal_reason="tool_deferred"; a narrate-past ends
+        // terminal_reason="completed". `subtype`/`is_error` are identical in
+        // both, so `terminal_reason` is the only discriminator (matches the
+        // Agent SDK's SDKResultSuccess contract).
+        let deferred = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"tool_deferred"}"#;
+        assert_eq!(
+            detect_result_marker(deferred)
+                .unwrap()
+                .terminal_reason
+                .as_deref(),
+            Some("tool_deferred")
+        );
+        let completed = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}"#;
+        assert_eq!(
+            detect_result_marker(completed)
+                .unwrap()
+                .terminal_reason
+                .as_deref(),
+            Some("completed")
+        );
+        // Absent (older CLI / non-AUQ paths) → None.
+        let bare = r#"{"type":"result","subtype":"success","is_error":false}"#;
+        assert_eq!(detect_result_marker(bare).unwrap().terminal_reason, None);
+    }
+
+    #[test]
+    fn narrate_past_assistant_text_after_deferred_auq_is_suppressed() {
+        // ADR 0054 (observed on claude-sonnet-4-6, ~1/8): after an
+        // AskUserQuestion is deferred (the hook returns `defer`, no
+        // tool_result follows), claude sometimes narrates a bogus "internal
+        // error retrieving your answer" in a LATER assistant message and ends
+        // the turn `completed` instead of `tool_deferred`. That hallucination
+        // must NOT reach the UI — the UserQuestion card (emitted by the hook)
+        // is the source of truth and the session stays awaiting-answer.
+        let mut tc = 0u32;
+        let mut auq = std::collections::HashSet::new();
+
+        // 1) claude proposes the AUQ; the hook defers it (no tool_result).
+        let auq_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{"questions":[]}}]}}"#;
+        let evs = translate_jsonl(
+            auq_use,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, HarnessEvent::ToolCallStarted { .. })),
+            "the AUQ tool call still surfaces (the UI dedups it against UserQuestion)"
+        );
+
+        // 2) the narrate-past: a NEW assistant message with bogus error text.
+        let bogus = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"It seems there was an internal error retrieving your answer."}]}}"#;
+        let evs = translate_jsonl(
+            bogus,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, HarnessEvent::AgentMessage { .. })),
+            "the hallucinated post-defer message must be suppressed, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn suppressed_narrate_past_id_is_recorded_for_scrub() {
+        // ADR 0054 Part C: when a post-defer assistant message is suppressed,
+        // its message-id is recorded so `scrub_transcript` can remove that
+        // exact line from claude's transcript before the answer-resume.
+        let mut tc = 0u32;
+        let mut auq = std::collections::HashSet::new();
+        let mut suppressed: Vec<String> = Vec::new();
+
+        let auq_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{}}]}}"#;
+        translate_jsonl(
+            auq_use,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut suppressed,
+        )
+        .unwrap();
+        assert!(
+            suppressed.is_empty(),
+            "the AUQ message itself is not a narrate-past, so nothing recorded yet"
+        );
+
+        let bogus = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"It seems there was an internal error."}]}}"#;
+        translate_jsonl(
+            bogus,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut suppressed,
+        )
+        .unwrap();
+        assert_eq!(
+            suppressed,
+            vec!["m2".to_string()],
+            "the suppressed narrate-past message-id is recorded for the scrub"
+        );
+    }
+
+    #[test]
+    fn narrate_past_chunks_after_deferred_auq_are_suppressed() {
+        // The hallucinated message also streams as live token chunks
+        // (`--include-partial-messages`); those must be suppressed too, or the
+        // user watches the bogus error type out live.
+        let mut tc = 0u32;
+        let mut mid: Option<String> = None;
+        let mut auq = std::collections::HashSet::new();
+
+        let auq_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{}}]}}"#;
+        translate_jsonl(
+            auq_use,
+            "run-1",
+            &mut tc,
+            50,
+            &mut mid,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let chunk = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"internal error"}}}"#;
+        let evs = translate_jsonl(
+            chunk,
+            "run-1",
+            &mut tc,
+            50,
+            &mut mid,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, HarnessEvent::AgentMessageChunk { .. })),
+            "post-defer chunks must be suppressed, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn answered_auq_does_not_suppress_following_text() {
+        // Regression guard: the LEGIT answer path is AUQ tool_use →
+        // tool_result (the answer) → assistant text ("You selected Red").
+        // The tool_result clears the pending AUQ, so the text MUST be emitted.
+        let mut tc = 0u32;
+        let mut auq = std::collections::HashSet::new();
+
+        let auq_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{}}]}}"#;
+        translate_jsonl(
+            auq_use,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_AUQ","content":"Do you prefer red or blue?=Red","is_error":false}]}}"#;
+        translate_jsonl(
+            result,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let after = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"You selected Red."}]}}"#;
+        let evs = translate_jsonl(
+            after,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, HarnessEvent::AgentMessage { text, .. } if text == "You selected Red.")),
+            "text after an ANSWERED AUQ must be emitted, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn preamble_in_same_message_as_deferred_auq_is_kept() {
+        // Regression guard: a preamble in the SAME assistant message as the
+        // AUQ tool_use is a legitimate "I have a question:" — only LATER
+        // messages (after the defer) are the hallucination. The suppress flag
+        // is captured at line start, so same-message text survives.
+        let mut tc = 0u32;
+        let mut auq = std::collections::HashSet::new();
+        let line = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"Let me ask:"},{"type":"tool_use","id":"toolu_AUQ","name":"AskUserQuestion","input":{}}]}}"#;
+        let evs = translate_jsonl(
+            line,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut auq,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, HarnessEvent::AgentMessage { text, .. } if text == "Let me ask:")
+            ),
+            "same-message preamble must be kept, got {evs:?}"
+        );
     }
 
     #[test]

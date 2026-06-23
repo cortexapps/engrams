@@ -66,6 +66,44 @@ test *ARGS:
 test-pkg pkg *ARGS:
     cargo test -p {{pkg}} -- --nocapture {{ARGS}}
 
+# Run a crate's Linux-gated tests (the `#[cfg(target_os = "linux")]` ones —
+# e.g. engram-harness-claude's hook/socket/resume suite). On Linux this is
+# just `cargo test`. On macOS those tests don't compile or run natively, so
+# this builds + runs them inside a `rust` Docker container — on Apple
+# Silicon that's the native arch (no emulation). The host cargo registry is
+# mounted so crates aren't re-downloaded, and a container-local
+# CARGO_TARGET_DIR keeps the macOS `target/` (a different target triple)
+# untouched. Uses `cargo test` (not nextest) so the container needs no extra
+# tooling. `rust:bookworm` tracks the latest stable, matching our pinned
+# `channel = "stable"`. Example: `just test-linux engram-harness-claude`.
+test-linux pkg='engram-harness-claude' *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -s)" in
+        Linux)
+            cargo test -p {{pkg}} {{ARGS}} ;;
+        Darwin)
+            if ! command -v docker >/dev/null 2>&1; then
+                echo "test-linux on macOS needs Docker — the cfg(target_os=\"linux\") tests can't run on darwin." >&2
+                exit 1
+            fi
+            echo ">> macOS host: running {{pkg}} Linux tests in a rust:bookworm container (native arch)…" >&2
+            # Target dir is a named volume (lives in Docker's VM on a native
+            # fs — fast incremental rebuilds, persists across runs — unlike a
+            # virtiofs bind mount). Registry is bind-mounted from the host so
+            # crates aren't re-downloaded.
+            docker run --rm \
+                -v "$PWD":/work \
+                -v "$HOME/.cargo/registry":/usr/local/cargo/registry \
+                -v engram-linux-target:/lxtarget \
+                -w /work \
+                -e CARGO_TARGET_DIR=/lxtarget \
+                rust:bookworm \
+                bash -c "cargo test -p {{pkg}} {{ARGS}}" ;;
+        *)
+            echo "unsupported host: $(uname -s)" >&2; exit 1 ;;
+    esac
+
 # ------------------------------------------------------------------
 # Local stack — Postgres in docker, coordinator in cargo.
 # ------------------------------------------------------------------

@@ -21,6 +21,40 @@ export interface ExecRusage {
   [k: string]: unknown;
 }
 
+// ADR 0054: one clarifying question the agent asked via `AskUserQuestion`,
+// carried on a `user_question` event. Mirrors `engram_harness_proto::Question`
+// — note `multiSelect` is camelCase on the wire (the Rust field carries
+// `#[serde(rename = "multiSelect")]` to stay byte-faithful to Claude's
+// `tool_input.questions[]`).
+export interface UserQuestionOption {
+  label: string;
+  description: string;
+}
+export interface UserQuestion {
+  /** The full question text — ALSO the key in the answers map (finding #8). */
+  question: string;
+  /** Short column header (a few words) labelling this question. */
+  header: string;
+  /** true → the user may pick several options; false → exactly one. */
+  multiSelect: boolean;
+  options: UserQuestionOption[];
+}
+
+// ADR 0054 Flavor A: what changed about a file, carried on a `file_changed`
+// event. Mirrors `engram_harness_proto::FileChange` — **externally tagged**
+// (a single `write`/`edit` key), NOT an `op` discriminant, because the Rust
+// type rides the bincode harness wire where internally-tagged enums panic at
+// decode. The web discriminates by which key is present.
+export interface EditHunk {
+  /** The replaced text (Claude's `old_string`); empty for a pure insertion. */
+  old: string;
+  /** The replacement text (Claude's `new_string`). */
+  new: string;
+}
+export type FileChange =
+  | { write: { content: string }; edit?: undefined }
+  | { edit: { hunks: EditHunk[] }; write?: undefined };
+
 // `serde(tag = "type", rename_all = "snake_case")` produces a discriminated
 // union with `type` as the discriminant.
 export type SessionEvent =
@@ -112,6 +146,41 @@ export type SessionEvent =
   // transcript renders an "interrupted" receipt and the run closes.
   | { type: "run_interrupted"; run_id: string; at: string }
   | { type: "harness_idle"; at: string }
+  // ADR 0054: the agent called `AskUserQuestion`; the harness deferred it
+  // (the turn ends so the VM can idle-evict) and emitted this durable
+  // "awaiting input" card. The web renders an interactive question form and
+  // POSTs the answer back via `SessionService.AnswerQuestion`, keyed on
+  // `tool_call_id` (Claude's tool_use_id). Survives eviction — it's in the log.
+  | {
+      type: "user_question";
+      run_id: string;
+      tool_call_id: string;
+      questions: UserQuestion[];
+      at: string;
+    }
+  // ADR 0054: the deferred question was answered — the harness holds the
+  // answer and is feeding it back on the `--resume` re-fire. Resolves the
+  // card (same `tool_call_id`); `answers` is keyed by question text, values
+  // are the selected option labels (1 for single-select, N for multi).
+  | {
+      type: "question_answered";
+      run_id: string;
+      tool_call_id: string;
+      answers: Record<string, string[]>;
+      at: string;
+    }
+  // ADR 0054 Flavor A: the agent successfully changed a file via a
+  // Write/Edit/MultiEdit tool. Correlated to the originating tool call by
+  // `tool_call_id`; the web renders a rich diff (Pierre) in place of that
+  // tool's generic card.
+  | {
+      type: "file_changed";
+      run_id: string;
+      tool_call_id: string;
+      path: string;
+      change: FileChange;
+      at: string;
+    }
   // Phase 1b (ADR 0052): a prompt arrived mid-run and was queued
   // (type-ahead / steering). Rendered as a greyed, editable composer
   // item keyed on prompt_id until run_started{prompt_id} consumes it.

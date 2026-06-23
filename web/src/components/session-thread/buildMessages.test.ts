@@ -4,8 +4,15 @@
 // system markers, the run footer, and the derived isRunning flag.
 
 import { describe, expect, test } from "vitest";
-import { buildMessages, SHELL_TOOL, type RunFooter, type SystemMarker } from "./buildMessages";
-import type { IndexedEvent, SessionEvent } from "../../lib/types";
+import {
+  buildMessages,
+  FILE_CHANGE_TOOL,
+  SHELL_TOOL,
+  type FileChangeArgs,
+  type RunFooter,
+  type SystemMarker,
+} from "./buildMessages";
+import type { IndexedEvent, SessionEvent, UserQuestion } from "../../lib/types";
 
 const AT = "2026-06-02T12:00:00.000Z";
 const AT2 = "2026-06-02T12:00:18.000Z";
@@ -276,7 +283,13 @@ describe("buildMessages — message/part shaping", () => {
           provider: "forge",
           asset_kind: "pull_request",
           surface: "asset",
-          data: { repo: "x/y", title: "Fix it", number: 7, head_branch: "fix", base_branch: "main" },
+          data: {
+            repo: "x/y",
+            title: "Fix it",
+            number: 7,
+            head_branch: "fix",
+            base_branch: "main",
+          },
           fetchable: { kind: "external", url: "https://gh/x/pull/7" },
           at: AT,
         },
@@ -804,5 +817,331 @@ describe("buildMessages — stable assistant ids (crash regression, session 59cb
       );
       expect(new Set(ids).size).toBe(ids.length);
     }
+  });
+});
+
+describe("buildMessages — ADR 0054 interactive AskUserQuestion", () => {
+  const Q: UserQuestion = {
+    question: "Which database?",
+    header: "Database",
+    multiSelect: false,
+    options: [
+      { label: "Postgres", description: "Relational, default" },
+      { label: "MySQL", description: "Also relational" },
+    ],
+  };
+
+  const toolParts = (messages: ReturnType<typeof buildMessages>["messages"]) =>
+    real(messages).flatMap((m) =>
+      ((m.content as ReadonlyArray<{ type: string }>) ?? []).filter((p) => p.type === "tool-call"),
+    ) as Array<{ toolName?: string; toolCallId?: string }>;
+
+  test("a deferred question becomes a user_question system card (unanswered)", () => {
+    const { messages, isRunning } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "I need to confirm a detail",
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "AskUserQuestion",
+          args_summary: '{"questions":[]}',
+          at: AT,
+        },
+        { type: "user_question", run_id: "r1", tool_call_id: "t1", questions: [Q], at: AT },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
+    expect(card.role).toBe("system");
+    const marker = customMarker(card) as Extract<SystemMarker, { kind: "user_question" }>;
+    expect(marker).toMatchObject({ kind: "user_question", toolCallId: "t1", answers: null });
+    expect(marker.questions).toEqual([Q]);
+    // Awaiting input is NOT "working" — the composer must not show a spinner.
+    expect(isRunning).toBe(false);
+  });
+
+  test("the generic AskUserQuestion tool part is suppressed (deduped against the card)", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "thinking",
+          at: AT,
+        },
+        // A real tool call in the same run must still render…
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tr",
+          tool_name: "Read",
+          args_summary: '{"file_path":"a.rs"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tr",
+          tool_name: "Read",
+          ok: true,
+          duration_ms: 3,
+          result_summary: "ok",
+          at: AT,
+        },
+        // …but the AskUserQuestion tool call must NOT.
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "AskUserQuestion",
+          args_summary: '{"questions":[]}',
+          at: AT,
+        },
+        { type: "user_question", run_id: "r1", tool_call_id: "t1", questions: [Q], at: AT },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const parts = toolParts(messages);
+    expect(parts.some((p) => p.toolName === "AskUserQuestion")).toBe(false);
+    expect(parts.some((p) => p.toolCallId === "t1")).toBe(false);
+    // The real Read call survives.
+    expect(parts.some((p) => p.toolName === "Read")).toBe(true);
+    // The question isn't tallied as a tool run (only the Read is).
+    const footer = real(messages).find((m) => m.role === "assistant")!.metadata?.custom
+      ?.run as RunFooter;
+    expect(footer).toMatchObject({ reads: 1, other: 0, ok: false });
+  });
+
+  test("a run that ONLY deferred a question leaves no stray empty assistant bubble", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "AskUserQuestion",
+          args_summary: null,
+          at: AT,
+        },
+        { type: "user_question", run_id: "r1", tool_call_id: "t1", questions: [Q], at: AT },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const msgs = real(messages);
+    // No empty assistant message synthesized just to hold a footer.
+    expect(msgs.filter((m) => m.role === "assistant")).toHaveLength(0);
+    expect(msgs.filter((m) => customMarker(m)?.kind === "user_question")).toHaveLength(1);
+  });
+
+  test("the answer (arriving in a later resume run) folds onto the card and suppresses its tool_result", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t1",
+          tool_name: "AskUserQuestion",
+          args_summary: null,
+          at: AT,
+        },
+        { type: "user_question", run_id: "r1", tool_call_id: "t1", questions: [Q], at: AT },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+        // The deferred tool re-fires on `--resume` in a fresh run; its
+        // tool_result + the QuestionAnswered land here.
+        { type: "run_started", run_id: "r2", prompt_summary: null, at: AT2 },
+        {
+          type: "tool_call_completed",
+          run_id: "r2",
+          tool_call_id: "t1",
+          tool_name: "",
+          ok: true,
+          duration_ms: 0,
+          result_summary: "Postgres",
+          at: AT2,
+        },
+        {
+          type: "question_answered",
+          run_id: "r2",
+          tool_call_id: "t1",
+          answers: { "Which database?": ["Postgres"] },
+          at: AT2,
+        },
+        {
+          type: "agent_message",
+          run_id: "r2",
+          message_id: "a2",
+          role: "assistant",
+          text: "Great — using Postgres.",
+          at: AT2,
+        },
+        { type: "run_completed", run_id: "r2", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
+    const marker = customMarker(card) as Extract<SystemMarker, { kind: "user_question" }>;
+    expect(marker.answers).toEqual({ "Which database?": ["Postgres"] });
+    // The re-fired tool_result for the question is NOT rendered as a tool part.
+    expect(toolParts(messages).some((p) => p.toolCallId === "t1")).toBe(false);
+    // The resume run's own assistant reply still renders.
+    expect(real(messages).some((m) => m.role === "assistant")).toBe(true);
+  });
+});
+
+describe("buildMessages — ADR 0054 Flavor A file changes", () => {
+  // All tool-call parts across the assistant messages.
+  const parts = (messages: ReturnType<typeof buildMessages>["messages"]) =>
+    real(messages).flatMap((m) =>
+      ((m.content as ReadonlyArray<{ type: string }>) ?? []).filter((p) => p.type === "tool-call"),
+    ) as Array<{
+      toolName?: string;
+      toolCallId?: string;
+      args?: FileChangeArgs;
+      isError?: boolean;
+    }>;
+
+  test("a successful edit renders a rich file-change part in place of the generic card", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "te",
+          tool_name: "Edit",
+          args_summary: '{"file_path":"src/a.rs"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "te",
+          tool_name: "",
+          ok: true,
+          duration_ms: 5,
+          result_summary: "ok",
+          at: AT,
+        },
+        {
+          type: "file_changed",
+          run_id: "r1",
+          tool_call_id: "te",
+          path: "src/a.rs",
+          change: { edit: { hunks: [{ old: "let x = 1;", new: "let x = 2;" }] } },
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const tps = parts(messages);
+    // No generic "Edit" card — it was swapped for the rich diff.
+    expect(tps.some((p) => p.toolName === "Edit")).toBe(false);
+    const fc = tps.find((p) => p.toolName === FILE_CHANGE_TOOL)!;
+    expect(fc.toolCallId).toBe("te");
+    expect(fc.args?.path).toBe("src/a.rs");
+    expect(fc.args?.change.edit?.hunks).toEqual([{ old: "let x = 1;", new: "let x = 2;" }]);
+    // Still tallied as an edit in the run footer.
+    const footer = real(messages).find((m) => m.role === "assistant")!.metadata?.custom
+      ?.run as RunFooter;
+    expect(footer.edits).toBe(1);
+  });
+
+  test("a write renders a file-change part carrying the content", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tw",
+          tool_name: "Write",
+          args_summary: null,
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tw",
+          tool_name: "",
+          ok: true,
+          duration_ms: 1,
+          result_summary: "ok",
+          at: AT,
+        },
+        {
+          type: "file_changed",
+          run_id: "r1",
+          tool_call_id: "tw",
+          path: "new.txt",
+          change: { write: { content: "hello\nworld\n" } },
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const fc = parts(messages).find((p) => p.toolName === FILE_CHANGE_TOOL)!;
+    expect(fc.args?.path).toBe("new.txt");
+    expect(fc.args?.change.write?.content).toBe("hello\nworld\n");
+  });
+
+  test("a FAILED edit (no file_changed) keeps its generic error card", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tf",
+          tool_name: "Edit",
+          args_summary: '{"file_path":"a.rs"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tf",
+          tool_name: "",
+          ok: false,
+          duration_ms: 1,
+          result_summary: "String to replace not found",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const tps = parts(messages);
+    // No rich diff (no file_changed was emitted); the generic Edit card shows
+    // the failure.
+    expect(tps.some((p) => p.toolName === FILE_CHANGE_TOOL)).toBe(false);
+    const edit = tps.find((p) => p.toolCallId === "tf")!;
+    expect(edit.toolName).toBe("Edit");
+    expect(edit.isError).toBe(true);
   });
 });

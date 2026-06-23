@@ -12,10 +12,12 @@ import {
   sendPrompt as sendPromptMethod,
   interrupt as interruptMethod,
   dequeueQueuedPrompt as dequeueQueuedPromptMethod,
+  answerQuestion as answerQuestionMethod,
 } from "../../gen/engram/app/v1/session-SessionService_connectquery";
 import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
 import { ComposerActionsContext } from "./composer-actions";
+import { QuestionActionsContext } from "./question-actions";
 import type { IndexedEvent, SessionState } from "../../lib/types";
 
 // The transcript tab, on assistant-ui. The session's SSE event stream is the
@@ -176,6 +178,39 @@ export function SessionThread({
   const sendPromptMutation = useMutation(sendPromptMethod);
   const interruptMutation = useMutation(interruptMethod);
   const dequeueQueuedMutation = useMutation(dequeueQueuedPromptMethod);
+  const answerQuestionMutation = useMutation(answerQuestionMethod);
+
+  // ADR 0054: optimistic answered-question state. A submitted answer shows its
+  // receipt immediately (greyed) — the session resumes and the authoritative
+  // `question_answered` event round-trips over SSE seconds later. On a send
+  // failure we drop the id so the card returns to its form (selections kept).
+  const [answeredToolCallIds, setAnsweredToolCallIds] = useState<Set<string>>(new Set());
+
+  const sendBlocked = status ? SEND_BLOCKED.has(status) : false;
+
+  const submitAnswer = useCallback(
+    (toolCallId: string, answers: Record<string, string[]>) => {
+      if (sendBlocked) return;
+      setAnsweredToolCallIds((prev) => new Set(prev).add(toolCallId));
+      // proto3 maps can't hold a `repeated` value, so each answer is wrapped in
+      // a StringList (the init shape is a plain `{ values }`).
+      const answersInit: Record<string, { values: string[] }> = {};
+      for (const [question, labels] of Object.entries(answers)) {
+        answersInit[question] = { values: labels };
+      }
+      answerQuestionMutation
+        .mutateAsync({ sessionId, toolCallId, answers: answersInit })
+        .catch((err) => {
+          setAnsweredToolCallIds((prev) => {
+            const next = new Set(prev);
+            next.delete(toolCallId);
+            return next;
+          });
+          console.warn("answerQuestion failed", err);
+        });
+    },
+    [sessionId, sendBlocked, answerQuestionMutation],
+  );
 
   // ADR 0052: ↑-in-empty-composer recall. Pull the most-recent still-queued
   // prompt OUT of the queue (DequeueQueued, so it can't be claimed mid-edit)
@@ -243,7 +278,7 @@ export function SessionThread({
   const runtime = useExternalStoreRuntime({
     messages,
     isRunning,
-    isSendDisabled: status ? SEND_BLOCKED.has(status) : false,
+    isSendDisabled: sendBlocked,
     convertMessage: (m: ThreadMessageLike) => m,
     // The composer drives submit/interrupt through ComposerActionsContext (so
     // it can enqueue mid-run); these adapters keep any assistant-ui-internal
@@ -259,16 +294,20 @@ export function SessionThread({
           value={{
             submit,
             interrupt,
-            sendBlocked: status ? SEND_BLOCKED.has(status) : false,
+            sendBlocked,
             canRecall: queue.length > 0,
             recall: recallQueued,
             queued: railItems,
             removeQueued,
           }}
         >
-          <TooltipProvider>
-            <Thread />
-          </TooltipProvider>
+          <QuestionActionsContext.Provider
+            value={{ submitAnswer, answeredToolCallIds, sendBlocked }}
+          >
+            <TooltipProvider>
+              <Thread />
+            </TooltipProvider>
+          </QuestionActionsContext.Provider>
         </ComposerActionsContext.Provider>
       </SessionStatusContext.Provider>
     </AssistantRuntimeProvider>

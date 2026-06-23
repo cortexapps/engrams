@@ -745,6 +745,18 @@ impl HostClient for HostRegistry {
         backend.dequeue_queued_prompt(sandbox_id, prompt_id).await
     }
 
+    async fn answer_question(
+        &self,
+        sandbox_id: SandboxId,
+        tool_call_id: String,
+        answers: std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend
+            .answer_question(sandbox_id, tool_call_id, answers)
+            .await
+    }
+
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend.interrupt(sandbox_id).await

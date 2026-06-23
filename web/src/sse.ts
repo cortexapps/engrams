@@ -77,6 +77,11 @@ export function subscribeSession(sessionId: string, handlers: SseHandlers, since
     "integration_asset",
     "file_shared",
     "recovered_from_checkpoint",
+    // ADR 0054: interactive AskUserQuestion round-trip.
+    "user_question",
+    "question_answered",
+    // ADR 0054 Flavor A: rich file-change diffs.
+    "file_changed",
   ];
 
   for (const kind of kinds) {

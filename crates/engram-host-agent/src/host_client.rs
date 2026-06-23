@@ -289,6 +289,18 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
+    async fn answer_question(
+        &self,
+        sandbox_id: SandboxId,
+        tool_call_id: String,
+        answers: std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<(), SandboxError> {
+        self.harness_hub
+            .answer_question(sandbox_id, tool_call_id, answers)
+            .await
+            .map_err(harness_err_to_sandbox)
+    }
+
     async fn interrupt(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         self.harness_hub
             .interrupt(sandbox_id)

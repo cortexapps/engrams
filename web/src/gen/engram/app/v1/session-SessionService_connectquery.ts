@@ -51,6 +51,15 @@ export const editQueuedPrompt = SessionService.method.editQueuedPrompt;
 export const dequeueQueuedPrompt = SessionService.method.dequeueQueuedPrompt;
 
 /**
+ * ADR 0054: answer a deferred AskUserQuestion (the `user_question` event).
+ * Resumes an idle session exactly as SendPrompt does, then feeds the
+ * answer back to the agent via a `--resume` re-fire.
+ *
+ * @generated from rpc engram.app.v1.SessionService.AnswerQuestion
+ */
+export const answerQuestion = SessionService.method.answerQuestion;
+
+/**
  * @generated from rpc engram.app.v1.SessionService.GetLog
  */
 export const getLog = SessionService.method.getLog;

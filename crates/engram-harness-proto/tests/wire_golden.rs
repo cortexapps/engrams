@@ -36,8 +36,8 @@ use std::path::PathBuf;
 
 use engram_core::SessionId;
 use engram_harness_proto::{
-    AgentRole, CheckpointReason, ForgeOp, ForgeResponse, HarnessCommand, HarnessEvent,
-    HarnessFrame, UploadOp, UploadResponse,
+    AgentRole, Answers, CheckpointReason, EditHunk, FileChange, ForgeOp, ForgeResponse,
+    HarnessCommand, HarnessEvent, HarnessFrame, Question, QuestionOption, UploadOp, UploadResponse,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -172,6 +172,101 @@ fn ev_run_interrupted() -> HarnessEvent {
         run_id: "r1".into(),
     }
 }
+/// Two questions in one call (one multi-select, one single) — the
+/// finding-#8 shape. Pins the `Question`/`QuestionOption` field order.
+fn sample_questions() -> Vec<Question> {
+    vec![
+        Question {
+            question: "Which languages?".into(),
+            header: "Languages".into(),
+            multi_select: true,
+            options: vec![
+                QuestionOption {
+                    label: "Python".into(),
+                    description: "snek".into(),
+                },
+                QuestionOption {
+                    label: "Rust".into(),
+                    description: "crab".into(),
+                },
+            ],
+        },
+        Question {
+            question: "Which editor?".into(),
+            header: "Editor".into(),
+            multi_select: false,
+            options: vec![QuestionOption {
+                label: "VS Code".into(),
+                description: "the one".into(),
+            }],
+        },
+    ]
+}
+/// A **mixed-arity** answer map — a multi-element vec AND a 1-element vec
+/// in the same map. This is the regression guard: a future change to an
+/// untagged / `deserialize_any` encoding panics at decode and fails the
+/// golden here loudly (ADR 0054).
+fn sample_answers() -> Answers {
+    let mut m = Answers::new();
+    m.insert(
+        "Which languages?".into(),
+        vec!["Python".into(), "Rust".into()],
+    );
+    m.insert("Which editor?".into(), vec!["VS Code".into()]);
+    m
+}
+fn ev_user_question() -> HarnessEvent {
+    HarnessEvent::UserQuestion {
+        run_id: "r1".into(),
+        tool_call_id: "toolu_1".into(),
+        questions: sample_questions(),
+    }
+}
+fn ev_question_answered() -> HarnessEvent {
+    HarnessEvent::QuestionAnswered {
+        run_id: "r1".into(),
+        tool_call_id: "toolu_1".into(),
+        answers: sample_answers(),
+    }
+}
+fn cmd_answer_question() -> HarnessCommand {
+    HarnessCommand::AnswerQuestion {
+        tool_call_id: "toolu_1".into(),
+        answers: sample_answers(),
+    }
+}
+/// An edit with two hunks — one replacement and one pure insertion (empty
+/// `old`) — pins the `FileChange::Edit` + `EditHunk` field order (ADR 0054).
+fn ev_file_changed_edit() -> HarnessEvent {
+    HarnessEvent::FileChanged {
+        run_id: "r1".into(),
+        tool_call_id: "toolu_1".into(),
+        path: "src/main.rs".into(),
+        change: FileChange::Edit {
+            hunks: vec![
+                EditHunk {
+                    old: "let x = 1;".into(),
+                    new: "let x = 2;".into(),
+                },
+                EditHunk {
+                    old: String::new(),
+                    new: "// added".into(),
+                },
+            ],
+        },
+    }
+}
+/// A whole-file write — pins the `FileChange::Write` arm (the second `op`).
+fn ev_file_changed_write() -> HarnessEvent {
+    HarnessEvent::FileChanged {
+        run_id: "r1".into(),
+        tool_call_id: "toolu_2".into(),
+        path: "README.md".into(),
+        change: FileChange::Write {
+            content: "# Title\n\nbody\n".into(),
+        },
+    }
+}
 
 fn cmd_checkpoint() -> HarnessCommand {
     HarnessCommand::Checkpoint {
@@ -225,6 +320,10 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_prompt_edited", &ev_prompt_edited());
     assert_golden("event_prompt_dequeued", &ev_prompt_dequeued());
     assert_golden("event_agent_message_chunk", &ev_agent_message_chunk());
+    assert_golden("event_user_question", &ev_user_question());
+    assert_golden("event_question_answered", &ev_question_answered());
+    assert_golden("event_file_changed_edit", &ev_file_changed_edit());
+    assert_golden("event_file_changed_write", &ev_file_changed_write());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -246,6 +345,17 @@ fn harness_event_golden_and_variant_indices() {
         10,
         "HarnessEvent::AgentMessageChunk",
     );
+    // ADR 0054 interactive events — APPENDED after AgentMessageChunk (11,12).
+    assert_variant_index(&ev_user_question(), 11, "HarnessEvent::UserQuestion");
+    assert_variant_index(
+        &ev_question_answered(),
+        12,
+        "HarnessEvent::QuestionAnswered",
+    );
+    // ADR 0054 Flavor A file change — APPENDED after QuestionAnswered (13).
+    // Both `op` arms are the same enum variant, so both pin index 13.
+    assert_variant_index(&ev_file_changed_edit(), 13, "HarnessEvent::FileChanged");
+    assert_variant_index(&ev_file_changed_write(), 13, "HarnessEvent::FileChanged");
 }
 
 #[test]
@@ -267,6 +377,7 @@ fn harness_command_golden_and_variant_indices() {
     assert_golden("command_rehandshake", &HarnessCommand::Rehandshake);
     assert_golden("command_edit_queued", &cmd_edit_queued());
     assert_golden("command_dequeue_queued", &cmd_dequeue_queued());
+    assert_golden("command_answer_question", &cmd_answer_question());
 
     assert_variant_index(&cmd_checkpoint(), 0, "HarnessCommand::Checkpoint");
     assert_variant_index(&cmd_shutdown(), 1, "HarnessCommand::Shutdown");
@@ -281,6 +392,8 @@ fn harness_command_golden_and_variant_indices() {
     );
     assert_variant_index(&cmd_edit_queued(), 5, "HarnessCommand::EditQueued");
     assert_variant_index(&cmd_dequeue_queued(), 6, "HarnessCommand::DequeueQueued");
+    // ADR 0054 interactive answer — APPENDED after DequeueQueued (7).
+    assert_variant_index(&cmd_answer_question(), 7, "HarnessCommand::AnswerQuestion");
 }
 
 #[test]
@@ -443,6 +556,10 @@ fn regen_golden() {
     write("event_prompt_edited", &ev_prompt_edited());
     write("event_prompt_dequeued", &ev_prompt_dequeued());
     write("event_agent_message_chunk", &ev_agent_message_chunk());
+    write("event_user_question", &ev_user_question());
+    write("event_question_answered", &ev_question_answered());
+    write("event_file_changed_edit", &ev_file_changed_edit());
+    write("event_file_changed_write", &ev_file_changed_write());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);
@@ -455,6 +572,7 @@ fn regen_golden() {
     write("command_rehandshake", &HarnessCommand::Rehandshake);
     write("command_edit_queued", &cmd_edit_queued());
     write("command_dequeue_queued", &cmd_dequeue_queued());
+    write("command_answer_question", &cmd_answer_question());
 
     write("checkpoint_reason_idle", &CheckpointReason::Idle);
     write("checkpoint_reason_preempt", &CheckpointReason::Preempt);

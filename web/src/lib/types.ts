@@ -252,10 +252,14 @@ export interface SessionCowStateResponse {
 // so existing consumers need no import changes.
 export type {
   AgentRole,
+  EditHunk,
   ExecRusage,
+  FileChange,
   IndexedEvent,
   SessionEvent,
   SessionEventKind,
+  UserQuestion,
+  UserQuestionOption,
 } from "../events";
 
 // ADR 0028 A.log: one checkpoint in a session's chain.

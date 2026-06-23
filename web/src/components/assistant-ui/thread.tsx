@@ -30,9 +30,10 @@ import {
 } from "lucide-react";
 import type { FC } from "react";
 import { ShellToolPart } from "@/components/session-thread/ShellToolPart";
+import { FileChangePart } from "@/components/session-thread/FileChangePart";
 import { SystemMessage } from "@/components/session-thread/SystemMessage";
 import { RunFooter } from "@/components/session-thread/RunFooter";
-import { SHELL_TOOL } from "@/components/session-thread/buildMessages";
+import { FILE_CHANGE_TOOL, SHELL_TOOL } from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
 import type { SessionState } from "@/lib/types";
@@ -189,7 +190,11 @@ const AssistantMessage: FC = () => {
                   // `tools.by_name` registration relied on) so neither branch
                   // needs a value cast. Both renderers read args defensively.
                   const Tool: ToolCallMessagePartComponent =
-                    part.toolName === SHELL_TOOL ? ShellToolPart : ToolFallback;
+                    part.toolName === SHELL_TOOL
+                      ? ShellToolPart
+                      : part.toolName === FILE_CHANGE_TOOL
+                        ? FileChangePart
+                        : ToolFallback;
                   return <Tool {...part} />;
                 }
                 case "indicator":
