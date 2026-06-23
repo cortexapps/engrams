@@ -108,6 +108,10 @@ function installTransport(): Caps {
         return { secretNames: Object.keys(req.values).map((k) => `${req.kind}.${k}`) };
       },
       uploadConnectorLogo: () => ({ logoUrl: "" }),
+      testConnector: () => ({
+        ok: true,
+        message: "Reached api.github.com · HTTP 200 · credential accepted",
+      }),
     });
     router.service(MintService, {
       listMintKinds: () => ({
@@ -170,6 +174,10 @@ describe("IntegrationsPanel (marketplace)", () => {
     await user.click(await screen.findByRole("button", { name: /^connect$/i }));
     await user.type(await screen.findByLabelText(/app id/i), "1357924");
     await user.type(screen.getByLabelText(/private key/i), "-----BEGIN KEY-----");
+    // Authenticate → Test → Review → Add.
+    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(await screen.findByRole("button", { name: /test connection/i }));
+    await screen.findByText(/connection verified/i);
     await user.click(screen.getByRole("button", { name: /continue/i }));
     await user.click(await screen.findByRole("button", { name: /add github/i }));
 

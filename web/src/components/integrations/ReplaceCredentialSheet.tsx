@@ -2,19 +2,32 @@
  * ReplaceCredentialSheet — rotate a connected provider's credential (right Sheet).
  * mint → re-seal the kind's fields (blank = keep); inject → overwrite the org
  * secret. The new value is used from the next session on; running sessions keep
- * their current credential. (A "Test new credential" affordance lands with the
- * coordinator TestConnector RPC.)
+ * their current credential. "Test new credential" runs a real authenticated
+ * probe with the just-entered draft before sealing.
  */
 
 import { useState } from "react";
 import { toast } from "sonner";
-import { CheckIcon, InfoIcon, LockIcon, ShieldCheckIcon } from "lucide-react";
+import {
+  CheckIcon,
+  CircleCheckIcon,
+  InfoIcon,
+  Loader2Icon,
+  LockIcon,
+  ShieldCheckIcon,
+  ZapIcon,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { MintFieldKind } from "@/gen/engram/app/v1/mint_pb";
-import { useConnectors, useMintKinds, useSetMintCredential } from "@/hooks/useIntegrations";
+import {
+  useConnectors,
+  useMintKinds,
+  useSetMintCredential,
+  useTestConnector,
+} from "@/hooks/useIntegrations";
 import { usePutOrgSecret } from "@/hooks/useOrgSecrets";
 import { parseConnectorConfig } from "@/lib/connectorModel";
 import { ProviderTile } from "./ProviderTile";
@@ -34,6 +47,7 @@ export function ReplaceCredentialSheet({
   const mintKinds = useMintKinds();
   const setMint = useSetMintCredential();
   const putSecret = usePutOrgSecret();
+  const test = useTestConnector();
 
   const isMint = view.credentialSource === "mint";
   const row = conns.data?.connectors.find((c) => c.provider === view.provider);
@@ -46,12 +60,27 @@ export function ReplaceCredentialSheet({
 
   const [values, setValues] = useState<Record<string, string>>({});
   const [injectSecret, setInjectSecret] = useState("");
+  const [testState, setTestState] = useState<"idle" | "ok" | "fail">("idle");
+  const [testMessage, setTestMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const canSave = isMint
     ? Object.values(values).some((v) => v.trim().length > 0)
     : injectSecret.trim().length > 0;
   const pending = setMint.isPending || putSecret.isPending;
+
+  const runTest = async () => {
+    setTestState("idle");
+    const draftValues = isMint ? values : { credential: injectSecret };
+    try {
+      const r = await test.mutateAsync({ provider: view.provider, draftValues });
+      setTestState(r.ok ? "ok" : "fail");
+      setTestMessage(r.message);
+    } catch (e) {
+      setTestState("fail");
+      setTestMessage(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const save = async () => {
     setError(null);
@@ -148,6 +177,31 @@ export function ReplaceCredentialSheet({
               </span>
             </div>
           )}
+          <div className="flex items-center gap-3">
+            <Button variant="outline" onClick={runTest} disabled={!canSave || test.isPending}>
+              {test.isPending ? (
+                <>
+                  <Loader2Icon className="size-4 animate-spin" />
+                  Testing…
+                </>
+              ) : (
+                <>
+                  <ZapIcon className="size-4" />
+                  Test new credential
+                </>
+              )}
+            </Button>
+            {testState === "ok" && (
+              <span className="inline-flex items-center gap-1.5 text-[0.78rem] text-instrument-nominal">
+                <CircleCheckIcon className="size-3.5" />
+                <span className="font-mono text-muted-foreground">{testMessage}</span>
+              </span>
+            )}
+            {testState === "fail" && (
+              <span className="text-[0.78rem] text-destructive">{testMessage}</span>
+            )}
+          </div>
+
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
 

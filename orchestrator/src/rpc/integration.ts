@@ -59,9 +59,22 @@ export interface OrgSecretAccess {
   listSecrets(req: Record<string, never>): Promise<{ secrets: Array<{ name: string }> }>;
   putSecret(req: { name: string; value: string }): Promise<unknown>;
 }
-/** The slice of the coordinator MintService this service reads (form metadata). */
+/** Resolved connector test spec sent to the coordinator (mirrors RunConnectorTestRequest). */
+export interface RunConnectorTestSpec {
+  provider: string;
+  host: string;
+  source: string;
+  header?: string;
+  template?: string;
+  secretRef?: string;
+  draftSecret?: string;
+  kind?: string;
+  draftFields?: Record<string, string>;
+}
+/** The slice of the coordinator MintService this service reads/calls. */
 export interface MintAccess {
   listMintKinds(req: Record<string, never>): Promise<{ mintKinds: MintKind[] }>;
+  runConnectorTest(req: RunConnectorTestSpec): Promise<{ ok: boolean; message: string }>;
 }
 
 export interface IntegrationDeps {
@@ -304,6 +317,35 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       }
       await connectorLogos.put(req.provider, mediaType, Buffer.from(req.data));
       return { logoUrl: logoUrl(req.provider) };
+    },
+
+    // Admin-only: test a connector's credential. Build the resolved spec from the
+    // registry (host + inject header/template/secretRef OR mint kind, ± draft)
+    // and delegate the unseal/mint + benign GET to the coordinator. A failed test
+    // is `{ ok: false, message }`, not an RPC error.
+    async testConnector(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const registry = await loadRegistry(connectors);
+      const c = registry.get(req.provider);
+      if (!c) throw new ConnectError(`unknown connector "${req.provider}"`, Code.InvalidArgument);
+      const host = c.hosts[0];
+      if (!host) throw new ConnectError(`connector "${req.provider}" has no host`, Code.InvalidArgument);
+      const draft = req.draftValues ?? {};
+      const spec: RunConnectorTestSpec =
+        c.credential.source === "mint"
+          ? { provider: req.provider, host, source: "mint", kind: c.credential.mint.kind, draftFields: draft }
+          : {
+              provider: req.provider,
+              host,
+              source: "inject",
+              header: c.credential.inject.header,
+              template: c.credential.inject.template ?? "{}",
+              secretRef: c.credential.inject.secretRef,
+              // inject has a single secret; the web sends it under any key.
+              draftSecret: Object.values(draft)[0] ?? "",
+            };
+      const { ok, message } = await mint.runConnectorTest(spec);
+      return { ok, message };
     },
   });
 }

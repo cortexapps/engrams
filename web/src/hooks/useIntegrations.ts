@@ -16,6 +16,7 @@ import {
   getIntegrationCatalog,
   setMintCredential,
   uploadConnectorLogo,
+  testConnector,
 } from "../gen/engram/app/v1/integration-IntegrationService_connectquery";
 import { listMintKinds } from "../gen/engram/app/v1/mint-MintService_connectquery";
 import { fallbackIdentity, type ProviderIdentity } from "../lib/connectorModel";
@@ -85,6 +86,12 @@ export function useSetMintCredential() {
 export function useUploadConnectorLogo() {
   const invalidateCatalog = useInvalidateCatalog();
   return useMutation(uploadConnectorLogo, { onSuccess: invalidateCatalog });
+}
+
+/** Test a connector's credential (admin). Draft values test an about-to-be-saved
+ * credential before sealing; empty tests the stored one. Returns {ok, message}. */
+export function useTestConnector() {
+  return useMutation(testConnector);
 }
 
 /** Pre-bundled built-in brand logos (provider → asset URL). Extension point: drop
