@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/integration.proto.
  */
 export const file_engram_app_v1_integration: GenFile = /*@__PURE__*/
-  fileDesc("Ch9lbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uLnByb3RvEg1lbmdyYW0uYXBwLnYxInsKCUNvbm5lY3RvchIQCghwcm92aWRlchgBIAEoCRITCgtjb25maWdfanNvbhgCIAEoCRIPCgdidWlsdGluGAMgASgIEhIKCmNyZWF0ZWRfYXQYBCABKAkSEgoKdXBkYXRlZF9hdBgFIAEoCRIOCgZzdGF0dXMYBiABKAkiFwoVTGlzdENvbm5lY3RvcnNSZXF1ZXN0IkYKFkxpc3RDb25uZWN0b3JzUmVzcG9uc2USLAoKY29ubmVjdG9ycxgBIAMoCzIYLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yIi0KFlVwc2VydENvbm5lY3RvclJlcXVlc3QSEwoLY29uZmlnX2pzb24YASABKAkiRgoXVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USKwoJY29ubmVjdG9yGAEgASgLMhguZW5ncmFtLmFwcC52MS5Db25uZWN0b3IiKgoWRGVsZXRlQ29ubmVjdG9yUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCSIqChdEZWxldGVDb25uZWN0b3JSZXNwb25zZRIPCgdkZWxldGVkGAEgASgIIjoKDUNvbm5lY3Rvckljb24SDAoEbW9ubxgBIAEoCRINCgVjb2xvchgCIAEoCRIMCgRsb2dvGAMgASgJIm0KEENvbm5lY3RvckRpc3BsYXkSDAoEbmFtZRgBIAEoCRIQCghjYXRlZ29yeRgCIAEoCRINCgVibHVyYhgDIAEoCRIqCgRpY29uGAQgASgLMhwuZW5ncmFtLmFwcC52MS5Db25uZWN0b3JJY29uIkIKEUNhdGFsb2dDYXBhYmlsaXR5Eg4KBmFjdGlvbhgBIAEoCRIOCgZhY2Nlc3MYAiABKAkSDQoFYXNzZXQYAyABKAkivAEKFFByb3ZpZGVyQ2F0YWxvZ0VudHJ5EhAKCHByb3ZpZGVyGAEgASgJEjAKB2Rpc3BsYXkYAiABKAsyHy5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvckRpc3BsYXkSGQoRY3JlZGVudGlhbF9zb3VyY2UYAyABKAkSDQoFaG9zdHMYBCADKAkSNgoMY2FwYWJpbGl0aWVzGAUgAygLMiAuZW5ncmFtLmFwcC52MS5DYXRhbG9nQ2FwYWJpbGl0eSIeChxHZXRJbnRlZ3JhdGlvbkNhdGFsb2dSZXF1ZXN0IlcKHUdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEjYKCXByb3ZpZGVycxgBIAMoCzIjLmVuZ3JhbS5hcHAudjEuUHJvdmlkZXJDYXRhbG9nRW50cnkirgEKGFNldE1pbnRDcmVkZW50aWFsUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRIMCgRraW5kGAIgASgJEkMKBnZhbHVlcxgDIAMoCzIzLmVuZ3JhbS5hcHAudjEuU2V0TWludENyZWRlbnRpYWxSZXF1ZXN0LlZhbHVlc0VudHJ5Gi0KC1ZhbHVlc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiMQoZU2V0TWludENyZWRlbnRpYWxSZXNwb25zZRIUCgxzZWNyZXRfbmFtZXMYASADKAkykwQKEkludGVncmF0aW9uU2VydmljZRJdCg5MaXN0Q29ubmVjdG9ycxIkLmVuZ3JhbS5hcHAudjEuTGlzdENvbm5lY3RvcnNSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdG9yc1Jlc3BvbnNlEmAKD1Vwc2VydENvbm5lY3RvchIlLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USYAoPRGVsZXRlQ29ubmVjdG9yEiUuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5EZWxldGVDb25uZWN0b3JSZXNwb25zZRJyChVHZXRJbnRlZ3JhdGlvbkNhdGFsb2cSKy5lbmdyYW0uYXBwLnYxLkdldEludGVncmF0aW9uQ2F0YWxvZ1JlcXVlc3QaLC5lbmdyYW0uYXBwLnYxLkdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEmYKEVNldE1pbnRDcmVkZW50aWFsEicuZW5ncmFtLmFwcC52MS5TZXRNaW50Q3JlZGVudGlhbFJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLlNldE1pbnRDcmVkZW50aWFsUmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("Ch9lbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uLnByb3RvEg1lbmdyYW0uYXBwLnYxInsKCUNvbm5lY3RvchIQCghwcm92aWRlchgBIAEoCRITCgtjb25maWdfanNvbhgCIAEoCRIPCgdidWlsdGluGAMgASgIEhIKCmNyZWF0ZWRfYXQYBCABKAkSEgoKdXBkYXRlZF9hdBgFIAEoCRIOCgZzdGF0dXMYBiABKAkiFwoVTGlzdENvbm5lY3RvcnNSZXF1ZXN0IkYKFkxpc3RDb25uZWN0b3JzUmVzcG9uc2USLAoKY29ubmVjdG9ycxgBIAMoCzIYLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yIi0KFlVwc2VydENvbm5lY3RvclJlcXVlc3QSEwoLY29uZmlnX2pzb24YASABKAkiRgoXVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USKwoJY29ubmVjdG9yGAEgASgLMhguZW5ncmFtLmFwcC52MS5Db25uZWN0b3IiKgoWRGVsZXRlQ29ubmVjdG9yUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCSIqChdEZWxldGVDb25uZWN0b3JSZXNwb25zZRIPCgdkZWxldGVkGAEgASgIIjoKDUNvbm5lY3Rvckljb24SDAoEbW9ubxgBIAEoCRINCgVjb2xvchgCIAEoCRIMCgRsb2dvGAMgASgJIm0KEENvbm5lY3RvckRpc3BsYXkSDAoEbmFtZRgBIAEoCRIQCghjYXRlZ29yeRgCIAEoCRINCgVibHVyYhgDIAEoCRIqCgRpY29uGAQgASgLMhwuZW5ncmFtLmFwcC52MS5Db25uZWN0b3JJY29uIkIKEUNhdGFsb2dDYXBhYmlsaXR5Eg4KBmFjdGlvbhgBIAEoCRIOCgZhY2Nlc3MYAiABKAkSDQoFYXNzZXQYAyABKAkivAEKFFByb3ZpZGVyQ2F0YWxvZ0VudHJ5EhAKCHByb3ZpZGVyGAEgASgJEjAKB2Rpc3BsYXkYAiABKAsyHy5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvckRpc3BsYXkSGQoRY3JlZGVudGlhbF9zb3VyY2UYAyABKAkSDQoFaG9zdHMYBCADKAkSNgoMY2FwYWJpbGl0aWVzGAUgAygLMiAuZW5ncmFtLmFwcC52MS5DYXRhbG9nQ2FwYWJpbGl0eSIeChxHZXRJbnRlZ3JhdGlvbkNhdGFsb2dSZXF1ZXN0IlcKHUdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEjYKCXByb3ZpZGVycxgBIAMoCzIjLmVuZ3JhbS5hcHAudjEuUHJvdmlkZXJDYXRhbG9nRW50cnkirgEKGFNldE1pbnRDcmVkZW50aWFsUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRIMCgRraW5kGAIgASgJEkMKBnZhbHVlcxgDIAMoCzIzLmVuZ3JhbS5hcHAudjEuU2V0TWludENyZWRlbnRpYWxSZXF1ZXN0LlZhbHVlc0VudHJ5Gi0KC1ZhbHVlc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiMQoZU2V0TWludENyZWRlbnRpYWxSZXNwb25zZRIUCgxzZWNyZXRfbmFtZXMYASADKAkiUAoaVXBsb2FkQ29ubmVjdG9yTG9nb1JlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSDAoEZGF0YRgCIAEoDBISCgptZWRpYV90eXBlGAMgASgJIi8KG1VwbG9hZENvbm5lY3RvckxvZ29SZXNwb25zZRIQCghsb2dvX3VybBgBIAEoCTKBBQoSSW50ZWdyYXRpb25TZXJ2aWNlEl0KDkxpc3RDb25uZWN0b3JzEiQuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdG9yc1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkxpc3RDb25uZWN0b3JzUmVzcG9uc2USYAoPVXBzZXJ0Q29ubmVjdG9yEiUuZW5ncmFtLmFwcC52MS5VcHNlcnRDb25uZWN0b3JSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5VcHNlcnRDb25uZWN0b3JSZXNwb25zZRJgCg9EZWxldGVDb25uZWN0b3ISJS5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3RvclJlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3RvclJlc3BvbnNlEnIKFUdldEludGVncmF0aW9uQ2F0YWxvZxIrLmVuZ3JhbS5hcHAudjEuR2V0SW50ZWdyYXRpb25DYXRhbG9nUmVxdWVzdBosLmVuZ3JhbS5hcHAudjEuR2V0SW50ZWdyYXRpb25DYXRhbG9nUmVzcG9uc2USZgoRU2V0TWludENyZWRlbnRpYWwSJy5lbmdyYW0uYXBwLnYxLlNldE1pbnRDcmVkZW50aWFsUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuU2V0TWludENyZWRlbnRpYWxSZXNwb25zZRJsChNVcGxvYWRDb25uZWN0b3JMb2dvEikuZW5ncmFtLmFwcC52MS5VcGxvYWRDb25uZWN0b3JMb2dvUmVxdWVzdBoqLmVuZ3JhbS5hcHAudjEuVXBsb2FkQ29ubmVjdG9yTG9nb1Jlc3BvbnNlYgZwcm90bzM");
 
 /**
  * @generated from message engram.app.v1.Connector
@@ -386,6 +386,56 @@ export const SetMintCredentialResponseSchema: GenMessage<SetMintCredentialRespon
   messageDesc(file_engram_app_v1_integration, 14);
 
 /**
+ * @generated from message engram.app.v1.UploadConnectorLogoRequest
+ */
+export type UploadConnectorLogoRequest = Message<"engram.app.v1.UploadConnectorLogoRequest"> & {
+  /**
+   * @generated from field: string provider = 1;
+   */
+  provider: string;
+
+  /**
+   * Logo bytes (SVG or square PNG; ≤512 KB). Empty clears any existing logo.
+   *
+   * @generated from field: bytes data = 2;
+   */
+  data: Uint8Array;
+
+  /**
+   * Optional MIME hint ("image/svg+xml" | "image/png"); the server also sniffs.
+   *
+   * @generated from field: string media_type = 3;
+   */
+  mediaType: string;
+};
+
+/**
+ * Describes the message engram.app.v1.UploadConnectorLogoRequest.
+ * Use `create(UploadConnectorLogoRequestSchema)` to create a new message.
+ */
+export const UploadConnectorLogoRequestSchema: GenMessage<UploadConnectorLogoRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 15);
+
+/**
+ * @generated from message engram.app.v1.UploadConnectorLogoResponse
+ */
+export type UploadConnectorLogoResponse = Message<"engram.app.v1.UploadConnectorLogoResponse"> & {
+  /**
+   * The serve URL the catalog now points `icon.logo` at, or "" when cleared.
+   *
+   * @generated from field: string logo_url = 1;
+   */
+  logoUrl: string;
+};
+
+/**
+ * Describes the message engram.app.v1.UploadConnectorLogoResponse.
+ * Use `create(UploadConnectorLogoResponseSchema)` to create a new message.
+ */
+export const UploadConnectorLogoResponseSchema: GenMessage<UploadConnectorLogoResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 16);
+
+/**
  * ADR 0057 C3: orchestrator-native connector catalog CRUD (Plane B). Connectors
  * live in the orchestrator DB (the `connector` table, C1); the built-ins
  * (github/datadog) are read-only file seeds surfaced alongside custom ones.
@@ -452,6 +502,19 @@ export const IntegrationService: GenService<{
     methodKind: "unary";
     input: typeof SetMintCredentialRequestSchema;
     output: typeof SetMintCredentialResponseSchema;
+  },
+  /**
+   * Admin-only: upload (or replace) a connector's logo — orchestrator-owned
+   * (the coordinator never sees connectors). Bytes land in the connector_logo
+   * table (≤512 KB, SVG or square PNG, sniffed) and are served at
+   * GET /api/v1/integrations/<provider>/logo. Empty `data` clears the logo.
+   *
+   * @generated from rpc engram.app.v1.IntegrationService.UploadConnectorLogo
+   */
+  uploadConnectorLogo: {
+    methodKind: "unary";
+    input: typeof UploadConnectorLogoRequestSchema;
+    output: typeof UploadConnectorLogoResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_integration, 0);

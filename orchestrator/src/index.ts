@@ -6,6 +6,7 @@ import health from "./routes/health.ts";
 import authRoute from "./routes/auth.ts";
 import eventsRoute from "./routes/events.ts";
 import artifactsRoute from "./routes/artifacts.ts";
+import connectorLogoRoute from "./routes/connector-logo.ts";
 import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
 import { makeShellRoute } from "./routes/shell.ts";
@@ -39,6 +40,8 @@ app.route("/", authRoute);
 // ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/claude-token).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
+// Connector logos (redesign): orchestrator-owned brand marks, served for <img>.
+app.route("/", connectorLogoRoute);
 app.route("/", meRoute);
 // ADR 0051 Task 28: admin REST proxy (pause/resume session — no gRPC equiv yet).
 app.route("/", adminRoute);

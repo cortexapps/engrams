@@ -19,6 +19,7 @@ import type { MintKind } from "../gen/engram/app/v1/mint_pb.ts";
 import { auth } from "../auth/better-auth.ts";
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore, type ConnectorStore } from "../db/connectors.ts";
+import { makeConnectorLogoStore, type ConnectorLogoStore } from "../db/connector-logos.ts";
 import {
   connectorRegistry,
   parseConnector,
@@ -29,6 +30,25 @@ import {
   type Connector,
 } from "../connectors/registry.ts";
 import { orgSecret as defaultOrgSecret, mint as defaultMint } from "../control-plane/client.ts";
+
+/** Logo upload cap — comfortably fits an SVG (KBs) or a square PNG at icon size. */
+const LOGO_MAX_BYTES = 512 * 1024;
+
+/** Same-origin serve path for a provider's uploaded logo (rendered via <img>). */
+function logoUrl(provider: string): string {
+  return `/api/v1/integrations/${encodeURIComponent(provider)}/logo`;
+}
+
+/** Sniff the logo's MIME from its bytes (we accept only SVG or PNG). Null = reject. */
+function sniffLogoMediaType(data: Uint8Array): string | null {
+  // PNG magic: 89 50 4E 47 0D 0A 1A 0A
+  const PNG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (data.length >= 8 && PNG.every((b, i) => data[i] === b)) return "image/png";
+  // SVG: XML text whose first element is <svg> (allow a leading <?xml?>/BOM/space).
+  const head = new TextDecoder().decode(data.slice(0, 512)).replace(/^﻿/, "").toLowerCase();
+  if (head.includes("<svg")) return "image/svg+xml";
+  return null;
+}
 
 export type GetSession = (
   headers: Headers,
@@ -47,6 +67,7 @@ export interface MintAccess {
 export interface IntegrationDeps {
   getSession?: GetSession;
   connectors?: ConnectorStore;
+  connectorLogos?: ConnectorLogoStore;
   orgSecret?: OrgSecretAccess;
   mint?: MintAccess;
 }
@@ -108,6 +129,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
     deps?.getSession ??
     ((headers) => auth.api.getSession({ headers } as Parameters<typeof auth.api.getSession>[0]));
   const connectors: ConnectorStore = deps?.connectors ?? makeConnectorStore(getDb());
+  const connectorLogos: ConnectorLogoStore = deps?.connectorLogos ?? makeConnectorLogoStore(getDb());
   const orgSecret: OrgSecretAccess = deps?.orgSecret ?? (defaultOrgSecret as unknown as OrgSecretAccess);
   const mint: MintAccess = deps?.mint ?? (defaultMint as unknown as MintAccess);
 
@@ -195,21 +217,31 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       }
       const deleted = await connectors.delete(req.provider);
       if (deleted) invalidateRegistry();
+      // A removed connector keeps no orphaned logo (custom-only path).
+      await connectorLogos.delete(req.provider);
       return { deleted };
     },
 
     // Member-readable: the derived provider catalog (display + powers + hosts).
     // Drives the Launch receipt + in-session provider icons. No secret material.
+    // `icon.logo` is overlaid with the serve URL for providers that have an
+    // uploaded logo (the orchestrator-owned overlay); "" otherwise → the web
+    // falls back to the deterministic monogram.
     async getIntegrationCatalog(_req, ctx) {
       await requireUser(ctx, getSession);
       const registry = await loadRegistry(connectors);
+      const withLogo = new Set(await connectorLogos.listProviders());
       const providers = buildProviderCatalog(registry).map((e) => ({
         provider: e.provider,
         display: {
           name: e.display.name,
           category: e.display.category,
           blurb: e.display.blurb,
-          icon: { mono: e.display.icon.mono, color: e.display.icon.color, logo: e.display.icon.logo ?? "" },
+          icon: {
+            mono: e.display.icon.mono,
+            color: e.display.icon.color,
+            logo: withLogo.has(e.provider) ? logoUrl(e.provider) : "",
+          },
         },
         credentialSource: e.credentialSource,
         hosts: e.hosts,
@@ -245,6 +277,33 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         written.push(name);
       }
       return { secretNames: written };
+    },
+
+    // Admin-only: upload/replace (or, with empty bytes, clear) a connector's
+    // logo. Orchestrator-owned overlay; the provider must exist in the merged
+    // registry. Bytes are sniffed (SVG or PNG only) and capped at 512 KB.
+    async uploadConnectorLogo(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const registry = await loadRegistry(connectors);
+      if (!registry.has(req.provider)) {
+        throw new ConnectError(`unknown connector "${req.provider}"`, Code.InvalidArgument);
+      }
+      if (req.data.length === 0) {
+        await connectorLogos.delete(req.provider);
+        return { logoUrl: "" };
+      }
+      if (req.data.length > LOGO_MAX_BYTES) {
+        throw new ConnectError(
+          `logo is ${req.data.length} bytes (max ${LOGO_MAX_BYTES}); upload an SVG or a ≤512px square PNG`,
+          Code.InvalidArgument,
+        );
+      }
+      const mediaType = sniffLogoMediaType(req.data);
+      if (!mediaType) {
+        throw new ConnectError("logo must be an SVG or PNG image", Code.InvalidArgument);
+      }
+      await connectorLogos.put(req.provider, mediaType, Buffer.from(req.data));
+      return { logoUrl: logoUrl(req.provider) };
     },
   });
 }

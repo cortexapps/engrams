@@ -57,6 +57,13 @@
       "when": 1782178543770,
       "tag": "0007_connector_catalog",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1782243095734,
+      "tag": "0008_orange_slayback",
+      "breakpoints": true
     }
   ]
 }

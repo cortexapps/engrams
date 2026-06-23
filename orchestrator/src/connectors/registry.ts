@@ -69,16 +69,15 @@ export interface Operation {
 /**
  * Per-connector visual identity (the marketplace / profile / session-event icon).
  * `mono` + `color` are always present after {@link parseConnector} (defaulted from
- * the provider), so a connector is never iconless; `logo` is an optional serve URL
- * for an uploaded image that the renderer falls back off of to the monogram.
+ * the provider), so a connector is never iconless. An uploaded logo is NOT part of
+ * the connector config — it's a separate orchestrator overlay (the `connector_logo`
+ * store), surfaced as `icon.logo` on the wire by the catalog/listing layer.
  */
 export interface ConnectorIcon {
   /** 1–2 char uppercase monogram. */
   mono: string;
   /** Brand tint as a `#RGB` / `#RRGGBB` hex. */
   color: string;
-  /** Optional uploaded-logo serve URL (renderer falls back to the monogram). */
-  logo?: string;
 }
 
 /** Display metadata for the marketplace + everywhere a provider renders. Always
@@ -251,8 +250,6 @@ function assertHost(where: string, h: string): void {
 const MAX_DISPLAY_NAME = 120;
 const MAX_DISPLAY_CATEGORY = 60;
 const MAX_DISPLAY_BLURB = 280;
-/** Logo here is a serve URL/path (the bytes live in blob storage, ADR plan #4). */
-const MAX_DISPLAY_LOGO = 1024;
 const HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 /** Default tint palette — a stable, contrasty brand-ish color picked by hash so
  * an un-themed connector still gets a distinct, deterministic monogram tile. */
@@ -338,11 +335,6 @@ function parseDisplay(where: string, raw: unknown, provider: string): ConnectorD
     if (ic.color !== undefined) {
       if (typeof ic.color !== "string" || !HEX_COLOR_RE.test(ic.color)) fail(where, '"display.icon.color" must be a #RGB or #RRGGBB hex color');
       next.color = ic.color;
-    }
-    if (ic.logo !== undefined) {
-      if (typeof ic.logo !== "string" || /\s/.test(ic.logo)) fail(where, '"display.icon.logo" must be a URL string with no whitespace');
-      if (ic.logo.length === 0 || ic.logo.length > MAX_DISPLAY_LOGO) fail(where, `"display.icon.logo" must be 1..${MAX_DISPLAY_LOGO} characters`);
-      next.logo = ic.logo;
     }
     icon = next;
   }

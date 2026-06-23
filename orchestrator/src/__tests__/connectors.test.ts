@@ -453,7 +453,6 @@ describe("parseConnector — display metadata", () => {
     expect(c.display.blurb).toBe("");
     expect(c.display.icon.mono).toBe(defaultIconMono("datadog")); // "DA"
     expect(c.display.icon.color).toMatch(/^#[0-9a-fA-F]{6}$/);
-    expect(c.display.icon.logo).toBeUndefined();
   });
 
   test("the default tint depends only on the provider id (deterministic)", () => {
@@ -469,7 +468,7 @@ describe("parseConnector — display metadata", () => {
     const c = parseConnector(
       {
         ...datadogRaw,
-        display: { name: "Datadog", category: "Observability", blurb: "logs + metrics", icon: { mono: "dd", color: "#632ca6", logo: "/api/v1/integrations/datadog/logo" } },
+        display: { name: "Datadog", category: "Observability", blurb: "logs + metrics", icon: { mono: "dd", color: "#632ca6" } },
       },
       "datadog",
     );
@@ -477,7 +476,7 @@ describe("parseConnector — display metadata", () => {
       name: "Datadog",
       category: "Observability",
       blurb: "logs + metrics",
-      icon: { mono: "DD", color: "#632ca6", logo: "/api/v1/integrations/datadog/logo" },
+      icon: { mono: "DD", color: "#632ca6" },
     });
   });
 
@@ -501,10 +500,6 @@ describe("parseConnector — display metadata", () => {
 
   test("rejects a non-object display", () => {
     expect(() => parseConnector({ ...datadogRaw, display: "nope" }, "x")).toThrow(/"display" must be an object/);
-  });
-
-  test("rejects a logo URL containing whitespace", () => {
-    expect(() => parseConnector({ ...datadogRaw, display: { icon: { logo: "/a b" } } }, "x")).toThrow(/logo/);
   });
 
   test("the shipped seeds carry curated identities", () => {
