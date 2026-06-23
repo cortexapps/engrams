@@ -97,7 +97,7 @@ config-driven mint ADR 0056 §9 deferred).
 
 ## Phasing (each phase = one PR on its own worktree; linear stack)
 
-`main → A1 → B1 → B2 → C1 → C2 → C3 → C4 → D1 → D2`
+`main → A1 → B1 → B2 → C0 → C1 → C2 → C3 → C4 → D1 → D2`
 
 - **A1** — Org-secret store: `MetadataStore` org-secret methods + `engram-postgres` impl
   (migration `0072_org_secrets.sql`, `pg_notify('org_secret_changed')`), a `SecretStore`
@@ -126,6 +126,12 @@ config-driven mint ADR 0056 §9 deferred).
     Operational: default/dogfood **profiles must be seeded** (≥ `api.anthropic.com`) before
     this rolls, and images re-bake. The `IntegrationPolicy`→`SessionPolicy` rename stays
     deferred (cosmetic).
+- **C0** — Org-secrets management UI (web-only): a `/settings/secrets` admin panel
+  (list / add / replace / delete) over the A1 `OrgSecretService` proxy — so org secrets are
+  UI-manageable ahead of the integration catalog (the profile secret-ref picker already reads
+  their names). Write-only credential surface: values are sealed coordinator-side and never
+  echoed (List is metadata only). Pulled in before C1 so admins can author the secrets that
+  profiles + connectors reference. (Distinct from C4's connector UI, but a sibling under it.)
 - **C1** — DB-back the connector catalog (orchestrator-only; built-ins as read-only seeds).
 - **C2** — Mint-kind registry + GitHub cred migration (creds sourced from the org store;
   retire `--git-forge`/`--github-app-*`).
