@@ -39,6 +39,7 @@ import { ProfilePanel } from "./components/settings/ProfilePanel";
 import { RegistriesPanel } from "./components/settings/RegistriesPanel";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { IntegrationsPanel } from "./components/settings/IntegrationsPanel";
+import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
@@ -208,6 +209,12 @@ const integrationsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: IntegrationsPanel,
 });
+const integrationDetailRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "integrations/$provider",
+  beforeLoad: requireAdmin,
+  component: IntegrationDetail,
+});
 const profilesRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "profiles",
@@ -248,6 +255,7 @@ export const routeTree = rootRoute.addChildren([
       membersRoute,
       secretsRoute,
       integrationsRoute,
+      integrationDetailRoute,
       profilesRoute,
       profilesNewRoute,
       profileEditRoute,

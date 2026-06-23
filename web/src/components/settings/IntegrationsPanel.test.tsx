@@ -1,10 +1,11 @@
-// Contract tests for the integrations panel (ADR 0057 C4).
+// Contract tests for the integrations marketplace (redesign).
 //
-// Pins the two writes that matter:
-//   - Plane A (mint): the GitHub form stores its fields as org secrets named
-//     `github_app.<field>` — exactly where the coordinator resolves them (C2).
-//   - Plane B (connector): the form-builder sends UpsertConnector with a config
-//     whose provider it parses, plus PutSecret for the write-only credential.
+//   - the catalog renders Connected vs Available provider cards (Connect /
+//     Manage affordances);
+//   - the Connect sheet for a mint provider calls SetMintCredential
+//     (provider + kind + field values) — the orchestrator seals the org secrets;
+//   - the custom-connector modal sends UpsertConnector + PutSecret for the
+//     write-only credential.
 // A custom router transport captures the proto-shaped requests; no fetch mocks.
 
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -16,19 +17,78 @@ import { IntegrationsPanel } from "./IntegrationsPanel";
 import { IntegrationService, type Connector } from "../../gen/engram/app/v1/integration_pb";
 import { MintService } from "../../gen/engram/app/v1/mint_pb";
 import { OrgSecretService } from "../../gen/engram/app/v1/org_secret_pb";
+import { ProfileService } from "../../gen/engram/app/v1/profile_pb";
 
 interface Caps {
   transport: ReturnType<typeof createRouterTransport>;
   puts: Array<{ name: string; value: string }>;
-  upserts: string[]; // config_json
+  upserts: string[];
+  mints: Array<{ provider: string; kind: string; values: Record<string, string> }>;
 }
 
-function installCapturingTransport(connectors: Connector[] = []): Caps {
-  const puts: Array<{ name: string; value: string }> = [];
+const CATALOG = [
+  {
+    provider: "github",
+    credentialSource: "mint",
+    hosts: ["api.github.com"],
+    display: {
+      name: "GitHub",
+      category: "Source control",
+      blurb: "Read code, open pull requests.",
+      icon: { mono: "GH", color: "#1f2328", logo: "" },
+    },
+    capabilities: [
+      { action: "contents:read", access: "read", asset: "" },
+      { action: "pulls:write", access: "write", asset: "pull_request" },
+    ],
+  },
+  {
+    provider: "datadog",
+    credentialSource: "inject",
+    hosts: ["api.datadoghq.com"],
+    display: {
+      name: "Datadog",
+      category: "Observability",
+      blurb: "Query logs and metrics.",
+      icon: { mono: "DD", color: "#632ca6", logo: "" },
+    },
+    capabilities: [{ action: "logs:read", access: "read", asset: "query_result" }],
+  },
+];
+
+// github available (needs connecting), datadog connected.
+const CONNECTORS: Connector[] = [
+  {
+    provider: "github",
+    configJson: JSON.stringify({ credential: { source: "mint", mint: { kind: "github_app" } } }),
+    builtin: true,
+    createdAt: "",
+    updatedAt: "",
+    status: "available",
+  },
+  {
+    provider: "datadog",
+    configJson: JSON.stringify({
+      credential: {
+        source: "inject",
+        inject: { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" },
+      },
+    }),
+    builtin: true,
+    createdAt: "",
+    updatedAt: "",
+    status: "connected",
+  },
+] as Connector[];
+
+function installTransport(): Caps {
+  const puts: Caps["puts"] = [];
   const upserts: string[] = [];
+  const mints: Caps["mints"] = [];
   const transport = createRouterTransport((router) => {
     router.service(IntegrationService, {
-      listConnectors: () => ({ connectors }),
+      listConnectors: () => ({ connectors: CONNECTORS }),
+      getIntegrationCatalog: () => ({ providers: CATALOG }),
       upsertConnector: (req) => {
         upserts.push(req.configJson);
         return {
@@ -38,10 +98,16 @@ function installCapturingTransport(connectors: Connector[] = []): Caps {
             builtin: false,
             createdAt: "",
             updatedAt: "",
+            status: "available",
           },
         };
       },
       deleteConnector: () => ({ deleted: true }),
+      setMintCredential: (req) => {
+        mints.push({ provider: req.provider, kind: req.kind, values: { ...req.values } });
+        return { secretNames: Object.keys(req.values).map((k) => `${req.kind}.${k}`) };
+      },
+      uploadConnectorLogo: () => ({ logoUrl: "" }),
     });
     router.service(MintService, {
       listMintKinds: () => ({
@@ -66,83 +132,76 @@ function installCapturingTransport(connectors: Connector[] = []): Caps {
       },
       deleteSecret: () => ({ deleted: true }),
     });
+    router.service(ProfileService, {
+      listProfiles: () => ({ profiles: [] }),
+      getProfile: () => ({ profile: undefined }),
+      createProfile: () => ({ profile: undefined }),
+      updateProfile: () => ({ profile: undefined }),
+      deleteProfile: () => ({}),
+    });
   });
-  return { transport, puts, upserts };
+  return { transport, puts, upserts, mints };
 }
 
-const seedConnector = (over: Partial<Connector>): Connector =>
-  ({
-    provider: "github",
-    configJson: "{}",
-    builtin: true,
-    createdAt: "",
-    updatedAt: "",
-    ...over,
-  }) as Connector;
-
-describe("IntegrationsPanel", () => {
+describe("IntegrationsPanel (marketplace)", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
   });
 
-  test("Plane A: GitHub mint form stores fields as github_app.<field> org secrets", async () => {
-    const { transport, puts } = installCapturingTransport();
+  test("renders Connected and Available provider cards", async () => {
+    const { transport } = installTransport();
     renderWithProviders(<IntegrationsPanel />, { transport });
-    const user = userEvent.setup();
 
-    await user.click(await screen.findByRole("button", { name: /add mint provider/i }));
-    // Fields render once ListMintKinds resolves.
-    const appId = await screen.findByLabelText(/app id/i);
-    await user.type(appId, "12345");
-    await user.type(screen.getByLabelText(/private key/i), "-----BEGIN KEY-----");
-    await user.click(screen.getByRole("button", { name: /^save$/i }));
-
-    await waitFor(() => expect(puts.length).toBeGreaterThanOrEqual(2));
-    const names = puts.map((p) => p.name);
-    expect(names).toContain("github_app.app_id");
-    expect(names).toContain("github_app.private_key_pem");
-    expect(puts.find((p) => p.name === "github_app.app_id")?.value).toBe("12345");
+    await screen.findByText("GitHub");
+    expect(screen.getByText("Datadog")).toBeTruthy();
+    expect(screen.getByText("Connected")).toBeTruthy();
+    expect(screen.getByText("Available")).toBeTruthy();
+    // github is available → Connect; datadog connected → Manage.
+    expect(screen.getByRole("button", { name: /^connect$/i })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /manage/i })).toBeTruthy();
   });
 
-  test("Plane B: connector form sends UpsertConnector + PutSecret for the credential", async () => {
-    const { transport, puts, upserts } = installCapturingTransport();
+  test("Connect (mint) calls SetMintCredential with the kind + field values", async () => {
+    const { transport, mints } = installTransport();
     renderWithProviders(<IntegrationsPanel />, { transport });
     const user = userEvent.setup();
 
-    await user.click(await screen.findByRole("button", { name: /add connector/i }));
-    await user.type(screen.getByLabelText(/^provider$/i), "sentry");
-    await user.type(screen.getByLabelText(/^hosts$/i), "sentry.io");
+    await user.click(await screen.findByRole("button", { name: /^connect$/i }));
+    await user.type(await screen.findByLabelText(/app id/i), "1357924");
+    await user.type(screen.getByLabelText(/private key/i), "-----BEGIN KEY-----");
+    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(await screen.findByRole("button", { name: /add github/i }));
+
+    await waitFor(() => expect(mints.length).toBe(1));
+    expect(mints[0]).toEqual({
+      provider: "github",
+      kind: "github_app",
+      values: { app_id: "1357924", private_key_pem: "-----BEGIN KEY-----" },
+    });
+  });
+
+  test("Custom connector sends UpsertConnector + PutSecret for the credential", async () => {
+    const { transport, puts, upserts } = installTransport();
+    renderWithProviders(<IntegrationsPanel />, { transport });
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /custom connector/i }));
+    await user.type(await screen.findByLabelText(/^provider$/i), "sentry");
+    await user.type(screen.getByLabelText(/hosts/i), "sentry.io");
     await user.type(screen.getByLabelText(/org-secret name/i), "sentry-token");
     await user.type(screen.getByLabelText(/credential value/i), "sk-live-abc");
-    await user.type(screen.getByLabelText("grants"), "issues:read");
+    await user.type(screen.getByLabelText("action slug"), "issues:read");
     await user.type(screen.getByLabelText("path"), "/api/0/projects/*/issues/");
-    await user.click(screen.getByRole("button", { name: /save connector/i }));
+    await user.click(screen.getByRole("button", { name: /add connector/i }));
 
-    await waitFor(() => expect(upserts.length).toBeGreaterThan(0));
-    const cfg = JSON.parse(upserts.at(-1)!);
+    await waitFor(() => expect(upserts.length).toBe(1));
+    const cfg = JSON.parse(upserts[0]!);
     expect(cfg.provider).toBe("sentry");
     expect(cfg.hosts).toEqual(["sentry.io"]);
+    expect(cfg.credential.source).toBe("inject");
     expect(cfg.credential.inject.secretRef).toBe("sentry-token");
     expect(cfg.operations[0].grants).toEqual(["issues:read"]);
-    // The write-only credential rides to the org secret store under the ref.
     expect(puts).toContainEqual({ name: "sentry-token", value: "sk-live-abc" });
-  });
-
-  test("built-in connectors are read-only (no Remove)", async () => {
-    const { transport } = installCapturingTransport([
-      seedConnector({ provider: "github", builtin: true }),
-      seedConnector({
-        provider: "sentry",
-        builtin: false,
-        configJson: '{"credential":{"source":"inject"}}',
-      }),
-    ]);
-    renderWithProviders(<IntegrationsPanel />, { transport });
-
-    // The github (built-in) row shows read-only; sentry (custom) has a Remove.
-    await screen.findByText("github");
-    expect(screen.getAllByText(/read-only/i).length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByRole("button", { name: /^remove$/i })).toBeTruthy();
   });
 });
