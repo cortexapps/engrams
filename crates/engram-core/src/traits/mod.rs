@@ -25,8 +25,8 @@ pub mod storage;
 pub use cloud::{CloudBackend, PreemptionStream};
 pub use host_client::HostClient;
 pub use integration::{
-    CredentialHint, Integration, MintFieldKind, MintFieldSchema, MintKindDescriptor,
-    ResolvedFields, ScopedCredential,
+    default_inject_header, CredentialHint, InjectHeader, Integration, MintFieldKind,
+    MintFieldSchema, MintKindDescriptor, ResolvedFields, ScopedCredential,
 };
 pub use metadata::{
     DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, SnapshotTotals, StaleSessionLease,

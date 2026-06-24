@@ -541,11 +541,20 @@ async fn substrate_base_create_density_and_latency_parity() {
             latencies_ms.push(ms);
             vms.push(id);
         }
-        // Settle until every sibling's working set is faulted in (RSS >
-        // blob) or RSS stops growing — prints distinguish "slow fault
-        // throughput" from "wedged fault" if the gate trips.
-        let mut last_rss: Vec<u64> = vec![0; vms.len()];
-        for round in 0..6 {
+        // Settle until every sibling's working set is faulted in (RSS > blob).
+        //
+        // Do NOT bail early on a flat-but-low reading. A sibling whose UFFD
+        // page-in ramps slowly, or whose resumed read-loop is briefly stalled
+        // under concurrent restore + CI load, can sit at a stable low RSS for a
+        // sample or two before catching up. The old `rss == last_rss` early-break
+        // read that single flat sample as "wedged" and flaked this test; we now
+        // let the full budget play out (only the all-faulted-in success case
+        // exits early). A genuinely-wedged sibling still trips the post-loop
+        // assertion below — so this distinguishes "slow to ramp" from "wedged"
+        // by waiting it out, rather than guessing from one sample. The budget is
+        // generous (60s) because it only matters for the slow/failing case; the
+        // common case breaks out the moment every sibling crosses the blob.
+        for round in 0..12 {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let rss: Vec<u64> = vms
                 .iter()
@@ -555,11 +564,6 @@ async fn substrate_base_create_density_and_latency_parity() {
             if rss.iter().all(|r| *r > BLOB_MIB * 1024) {
                 break;
             }
-            if rss == last_rss {
-                eprintln!("SPIKE: {label} rss plateaued below the blob — wedged?");
-                break;
-            }
-            last_rss = rss;
         }
         let (mut total_rss, mut total_pss) = (0u64, 0u64);
         let mut failures = Vec::new();

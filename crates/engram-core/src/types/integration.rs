@@ -83,8 +83,18 @@ pub struct IntegrationInject {
     /// `{}` is replaced by the resolved secret (e.g. `"Bearer {}"`, `"{}"`).
     pub header_template: String,
     /// A `SecretStore` reference (e.g. `"datadog-api-key"`) the coordinator
-    /// resolves to a value host-side. NEVER a secret value itself.
+    /// resolves to a value host-side. NEVER a secret value itself. Empty when
+    /// this is a `mint_provider` entry (the value is minted, not stored).
+    #[serde(default)]
     pub secret_ref: String,
+    /// ADR 0056 amendment: when non-empty, the inject value is **minted** — the
+    /// coordinator resolves it via the `IntegrationBroker` for this provider,
+    /// scoped to the session's bound capabilities, instead of from `secret_ref`.
+    /// This is how a *mint* provider (e.g. github) rides the same egress inject
+    /// plane as a static-secret (*inject*) provider; the scoped token never
+    /// enters the guest. Mutually exclusive with `secret_ref`. NEVER a value.
+    #[serde(default)]
+    pub mint_provider: String,
     /// Request shapes this injection gates + applies to. Empty = any.
     #[serde(default)]
     pub methods: Vec<String>,
@@ -149,6 +159,7 @@ mod tests {
                 header_name: "DD-API-KEY".into(),
                 header_template: "{}".into(),
                 secret_ref: "datadog-api-key".into(),
+                mint_provider: String::new(),
                 methods: vec!["GET".into()],
                 path_prefixes: vec!["/api/v2/logs".into()],
             }],

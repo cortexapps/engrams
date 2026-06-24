@@ -1132,6 +1132,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
           header_name: "DD-API-KEY",
           header_template: "{}",
           secret_ref: "datadog-api-key",
+          mint_provider: "",
           methods: ["GET"],
           path_prefixes: ["/api/v2/logs/events"],
         },
@@ -1144,7 +1145,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     }
   });
 
-  test("a mint capability with an asset ships observes, no inject (ADR 0056 Phase 4c)", async () => {
+  test("a mint capability with an asset ships a minted inject + an observe (ADR 0056 amendment)", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("gh-sess")], existing: [] });
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
@@ -1159,7 +1160,10 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
       expect(json).toBeDefined();
       const policy = JSON.parse(json!);
-      expect(policy.injects).toEqual([]); // mint → proxy injects nothing
+      // mint now rides the inject plane (ADR 0056 amendment): a minted inject +
+      // its observe. The coordinator fills the header from the integration.
+      expect(policy.injects).toHaveLength(1);
+      expect(policy.injects[0].mint_provider).toBe("github");
       expect(policy.observes).toHaveLength(1);
       expect(policy.observes[0].provider).toBe("github");
       expect(policy.observes[0].asset_kind).toBe("issue");
