@@ -69,10 +69,11 @@ export interface RailSessions {
 export function useRailSessions(): RailSessions {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
 
-  // `/sessions/<id>` → the open session; `/sessions/all` is the fleet list, not
-  // a detail.
+  // `/sessions/<id>` → the open session; `/sessions/all` (fleet list) and
+  // `/sessions/list` (my-tasks table) are section pages, not a detail — treating
+  // either as a session id would poll GetSession({ sessionId: "list" }) on a loop.
   const seg = pathname.startsWith("/sessions/") ? pathname.split("/")[2] : undefined;
-  const openId = seg && seg !== "all" ? seg : undefined;
+  const openId = seg && seg !== "all" && seg !== "list" ? seg : undefined;
 
   // ADR 0051 Task 28: use TaskService-backed list instead of REST /sessions.
   const { data, isPending, error } = useTasksAsSessionList();

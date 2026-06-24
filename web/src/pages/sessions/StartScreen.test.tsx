@@ -37,6 +37,21 @@ const DOCS = {
   capabilities: [],
   secrets: [],
 };
+// No connector powers, but raw network egress to an internal host: capCount 0
+// yet reachable > 0 — the receipt must still disclose it.
+const NETONLY = {
+  id: "pf3",
+  name: "Egress agent",
+  description: "Reaches an internal host, no connectors.",
+  icon: "Server",
+  imageId: "img1",
+  includeUserTokens: false,
+  envVars: {},
+  skills: [],
+  capabilities: [],
+  network: { default: "deny", allowHosts: ["internal.acme.test"], allowHostPatterns: [] },
+  secrets: [],
+};
 const CATALOG = [
   {
     provider: "github",
@@ -73,7 +88,7 @@ function installTransport() {
       deleteTask: () => ({}),
     });
     router.service(ProfileService, {
-      listProfiles: () => ({ profiles: [BUGFIX, DOCS] }),
+      listProfiles: () => ({ profiles: [BUGFIX, DOCS, NETONLY] }),
       getProfile: () => ({ profile: undefined }),
       createProfile: () => ({ profile: undefined }),
       updateProfile: () => ({ profile: undefined }),
@@ -141,8 +156,20 @@ describe("StartScreen", () => {
 
     // The stored profile wins over the first-in-list default.
     expect(await screen.findByText("Docs agent")).toBeTruthy();
-    // Docs grants no powers — every session is sandboxed, so there's nothing to
-    // disclose and the reach receipt doesn't render.
+    // Docs grants no powers and no egress — every session is sandboxed, so
+    // there's nothing to disclose and the reach receipt doesn't render.
     expect(screen.queryByText(/this session can reach/i)).toBeNull();
+  });
+
+  test("discloses a network-only profile's egress (no connector powers)", async () => {
+    localStorage.setItem("engrams:lastProfileId", "pf3");
+    const { transport } = installTransport();
+    renderWithProviders(<StartScreen />, { transport });
+    const user = userEvent.setup();
+
+    expect(await screen.findByText("Egress agent")).toBeTruthy();
+    // capCount 0 but reachable > 0 → the receipt still discloses the host.
+    await user.click(screen.getByText(/this session can reach/i));
+    expect(await screen.findByText("internal.acme.test")).toBeTruthy();
   });
 });

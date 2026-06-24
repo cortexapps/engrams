@@ -61,6 +61,7 @@ import {
 } from "@/components/ui/command";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 // The profile you launched last is the sticky default — written on a successful
@@ -89,7 +90,12 @@ export function StartScreen() {
   const { principal } = useAuth();
   const isAdmin = principal.is_admin;
 
-  const { data: profilesData, isPending: profilesPending } = useProfiles(false);
+  const {
+    data: profilesData,
+    isPending: profilesPending,
+    error: profilesError,
+    refetch: refetchProfiles,
+  } = useProfiles(false);
   const { data: catalog } = useIntegrationCatalog();
   const { data: images } = useEnabledImages(true);
   const { data: taskList } = useTasksAsSessionList();
@@ -180,8 +186,20 @@ export function StartScreen() {
     }
   };
 
+  // A failed ListProfiles (no cached data) surfaces as a toast with a retry, not
+  // a silent fall-through to the empty state — which would wrongly tell the user
+  // to create a profile while the only launch path is blocked. Keyed on the
+  // boolean so a background refetch failing again doesn't stack toasts.
+  const hasProfilesError = !!profilesError;
+  useEffect(() => {
+    if (!hasProfilesError) return;
+    toast.error("Couldn’t load profiles.", {
+      action: { label: "Retry", onClick: () => void refetchProfiles() },
+    });
+  }, [hasProfilesError, refetchProfiles]);
+
   const showTokenNudge = !isAdmin && !principal.has_claude_token;
-  const noProfiles = !profilesPending && profiles.length === 0;
+  const noProfiles = !profilesPending && !profilesError && profiles.length === 0;
 
   return (
     <div className="flex-1 overflow-auto">
@@ -283,10 +301,12 @@ export function StartScreen() {
             </div>
           </div>
 
-          {/* The receipt only earns its place when the profile grants outside
-              reach — every session is sandboxed, so there's nothing to disclose
-              for a no-powers profile. */}
-          {policy && policy.capCount > 0 && <PolicyReceipt policy={policy} imageName={imageName} />}
+          {/* The receipt earns its place when the profile grants outside reach —
+              connector powers OR raw network egress. A profile with neither has
+              nothing to disclose (every session is sandboxed by default). */}
+          {policy && (policy.capCount > 0 || policy.reachable.length > 0) && (
+            <PolicyReceipt policy={policy} imageName={imageName} />
+          )}
 
           {noProfiles &&
             (isAdmin ? (
@@ -436,22 +456,26 @@ function PolicyReceipt({
         <ShieldCheck className="size-3.5 shrink-0 text-instrument-nominal" />
         <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-[0.78rem]">
           <span className="text-muted-foreground">This session can reach</span>
-          <span className="flex items-center gap-1">
-            {policy.providers.map((pr) => (
-              <ProviderTile
-                key={pr.view.provider}
-                {...pr.view.icon}
-                name={pr.view.name}
-                size={14}
-              />
-            ))}
-          </span>
-          <span className="font-mono text-[0.7rem] text-muted-foreground">
-            {policy.capCount} {policy.capCount === 1 ? "power" : "powers"}
-          </span>
+          {policy.providers.length > 0 && (
+            <span className="flex items-center gap-1">
+              {policy.providers.map((pr) => (
+                <ProviderTile
+                  key={pr.view.provider}
+                  {...pr.view.icon}
+                  name={pr.view.name}
+                  size={14}
+                />
+              ))}
+            </span>
+          )}
+          {policy.capCount > 0 && (
+            <span className="font-mono text-[0.7rem] text-muted-foreground">
+              {policy.capCount} {policy.capCount === 1 ? "power" : "powers"}
+            </span>
+          )}
           {policy.reachable.length > 0 && (
             <span className="text-[0.7rem] text-muted-foreground">
-              · {policy.reachable.length} {policy.reachable.length === 1 ? "host" : "hosts"}
+              {policy.reachable.length} {policy.reachable.length === 1 ? "host" : "hosts"}
             </span>
           )}
         </span>
@@ -486,7 +510,12 @@ function PolicyReceipt({
             </div>
           ))}
           {policy.reachable.length > 0 && (
-            <div className="flex flex-col gap-1.5 border-t pt-2.5">
+            <div
+              className={cn(
+                "flex flex-col gap-1.5",
+                policy.providers.length > 0 && "border-t pt-2.5",
+              )}
+            >
               <Text variant="label" tone="muted" className="text-[0.6rem]">
                 Reaches
               </Text>
