@@ -48,5 +48,10 @@
         "fetchable": { "external": "$.resp.html_url" }
       }
     }
-  ]
+  ],
+  "cli": {
+    "bins": ["gh"],
+    "dummyEnv": { "GH_TOKEN": "x-engrams-managed" },
+    "doc": "Use `gh` to open pull requests and issues from this session. Authentication is automatic — `GH_TOKEN` is a managed placeholder the egress proxy replaces with a short-lived, capability-scoped GitHub App token on every request to api.github.com. Do NOT run `gh auth login` or set a real token.\n\nOpen a PR:\n1. Re-anchor on the live base (the baked checkout may be stale): `git fetch origin && git checkout -b my-feature origin/main`.\n2. Commit + push — git auth is brokered via GIT_ASKPASS, nothing to configure: `git add -A && git commit -m \"...\" && git push -u origin my-feature`.\n3. `gh pr create --base main --title \"...\" --body \"...\"` (add `--draft` for a draft). Requires the `pulls:write` capability.\n\nIssues: `gh issue create --title \"...\" --body \"...\"` (requires `issues:write`). Images in a PR body must be absolute URLs anchored to a commit SHA — relative repo paths do not render."
+  }
 }

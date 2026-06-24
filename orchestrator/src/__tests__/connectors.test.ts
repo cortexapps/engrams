@@ -639,4 +639,14 @@ describe("cli facet (ADR 0058)", () => {
     const plan2 = compileCliIntegrations(["github:nonexistent:write"], registryOf(githubCli));
     expect(plan2.enabled).toEqual([]);
   });
+
+  test("the on-disk github + datadog connectors expose their cli facet", () => {
+    const plan = compileCliIntegrations(["github:pulls:write", "datadog:logs:read"], connectorRegistry());
+    expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
+    expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
+    expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");
+    expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
+    // gh's doc folds the create-pull-request guidance.
+    expect(plan.enabled.find((e) => e.provider === "github")?.doc).toMatch(/gh pr create/);
+  });
 });

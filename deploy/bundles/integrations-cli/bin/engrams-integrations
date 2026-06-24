@@ -1,0 +1,39 @@
+#!/bin/sh
+# ADR 0058: list the integration CLIs authenticated in THIS session.
+#
+# The orchestrator sets ENGRAM_CLI_INTEGRATIONS to a JSON array of the enabled
+# connectors' CLI facets — `[{provider, displayName, bins, doc}, ...]` — derived
+# from the profile's granted capabilities. The real credential is injected
+# host-side by the egress proxy (ADR 0056/0057), so each CLI carries only a
+# harmless placeholder. See ~/.agents/skills/integrations/SKILL.md.
+#
+# Pure-POSIX with graceful fallback: prefer jq, then python3, else print the raw
+# JSON (the agent can read it directly either way).
+set -eu
+
+val="${ENGRAM_CLI_INTEGRATIONS:-}"
+if [ -z "$val" ]; then
+    echo "No integration CLIs are enabled in this session."
+    exit 0
+fi
+
+echo "Integration CLIs available in this session"
+echo "(auth is brokered by the platform — no tokens to paste or set):"
+echo
+
+if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$val" | jq -r '.[] | "• \(.displayName) — commands: \(.bins | join(", "))\n\(.doc)\n"'
+elif command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$val" | python3 -c '
+import sys, json
+for e in json.load(sys.stdin):
+    print("• %s — commands: %s" % (e.get("displayName", e.get("provider", "?")), ", ".join(e.get("bins", []))))
+    doc = e.get("doc")
+    if doc:
+        print(doc)
+    print()
+'
+else
+    echo "(install jq or python3 for formatted output; raw enabled-integration list:)"
+    printf '%s\n' "$val"
+fi
