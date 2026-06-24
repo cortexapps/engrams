@@ -679,6 +679,23 @@ describe("cli facet (ADR 0058)", () => {
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
   });
 
+  test("the built-in slack seed ships the slack CLI + an auth.test gate", () => {
+    const slack = connectorRegistry().get("slack")!;
+    expect(slack.cli?.bins).toEqual(["slack"]);
+    expect(slack.cli?.binSource).toBe("bundled");
+    expect(slack.cli?.dummyEnv).toEqual({ SLACK_TOKEN: "x-engrams-managed" });
+    // `slack whoami` hits /api/auth.test — gated so the token is injected there too.
+    expect(slack.operations.some((o) => o.match?.path === "/api/auth.test")).toBe(true);
+  });
+
+  test("granting a slack power enables the slack CLI + the shared bundle", () => {
+    const plan = compileCliIntegrations(["slack:chat:write"], connectorRegistry());
+    const slack = plan.enabled.find((e) => e.provider === "slack");
+    expect(slack?.bins).toEqual(["slack"]);
+    expect(plan.dummyEnv.SLACK_TOKEN).toBe("x-engrams-managed");
+    expect(plan.bundles).toContain(INTEGRATIONS_CLI_BUNDLE);
+  });
+
   test("UB2: an uploaded CLI routes BOTH the shared bundle and its own catalog bundle", () => {
     const plan = compileCliIntegrations(["datadog:logs:read"], registryOf(uploadedCli));
     expect(plan.enabled.map((e) => e.provider)).toEqual(["datadog"]);
