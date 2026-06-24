@@ -55,11 +55,22 @@ impl MountManifest {
     /// a single markdown/file skill (no bins, no env gate, no askpass) whose
     /// content lives under `skills/<name>/` in the squashfs.
     pub fn single_skill(name: impl Into<String>) -> Self {
+        Self::single_skill_with_bins(name, Vec::new())
+    }
+
+    /// As [`Self::single_skill`], but the skill also contributes PATH binaries
+    /// (ADR 0058 uploaded-binary arm). `bins` are squashfs-root-relative paths —
+    /// `skills/<name>/<bin>` — that `activate()` symlinks onto PATH. No env gate:
+    /// an uploaded binary bundle is mounted only when a connector referencing it is
+    /// granted, so `selected_skills` membership *is* the gate. Empty `bins`
+    /// serializes byte-for-byte like [`Self::single_skill`] (bins are skipped).
+    pub fn single_skill_with_bins(name: impl Into<String>, bins: Vec<String>) -> Self {
         Self {
             kind: Self::KIND_SKILL.to_string(),
             skills: vec![SkillEntry {
                 name: name.into(),
-                ..Default::default()
+                bins,
+                requires_env: None,
             }],
             provides_askpass: None,
         }
@@ -104,6 +115,24 @@ mod tests {
         );
         assert_eq!(m.provides_askpass.as_deref(), Some("bin/git-askpass"));
         assert!(!m.is_sentinel());
+    }
+
+    #[test]
+    fn single_skill_with_bins_carries_path_binaries() {
+        let m = MountManifest::single_skill_with_bins(
+            "mytool",
+            vec!["skills/mytool/bin/mytool".to_string()],
+        );
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"skill","skills":[{"name":"mytool","bins":["skills/mytool/bin/mytool"]}]}"#
+        );
+        // Empty bins is byte-identical to single_skill (the markdown shape).
+        assert_eq!(
+            serde_json::to_string(&MountManifest::single_skill_with_bins("x", vec![])).unwrap(),
+            serde_json::to_string(&MountManifest::single_skill("x")).unwrap(),
+        );
     }
 
     #[test]

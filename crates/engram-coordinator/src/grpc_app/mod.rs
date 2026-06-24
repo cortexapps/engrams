@@ -165,14 +165,18 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
                 auth: auth.clone(),
             },
         ))
-        // ADR 0055 P2: the org-shared user-uploaded skill catalog.
+        // ADR 0055 P2: the org-shared user-uploaded skill catalog. ADR 0058
+        // uploaded-binary arm: raise the decode cap above tonic's 4 MiB default so
+        // a CLI-binary upload (`skill_pack` caps it at MAX_SKILL_UPLOAD_BYTES) is
+        // admitted on the wire — the binding limit for `RegisterSkill.payload_tar`.
         .add_service(
             app::mount_catalog_service_server::MountCatalogServiceServer::new(
                 AppMountCatalogService {
                     state: state.clone(),
                     auth: auth.clone(),
                 },
-            ),
+            )
+            .max_decoding_message_size(80 * 1024 * 1024),
         )
         // ADR 0057 C3: the read-only mint-kind registry (Plane-A form metadata).
         .add_service(app::mint_service_server::MintServiceServer::new(

@@ -18,22 +18,26 @@ use std::process::Command;
 use engram_mount_manifest::MountManifest;
 use sha2::{Digest, Sha256};
 
-/// Cap on the *compressed* upload (tar / tar.gz / zip). Markdown skills are KiB;
-/// this is generous headroom and stays under the 4 MiB gRPC default decode cap.
-/// Checked before any decompression, so it bounds the work an attacker's bytes
-/// can trigger up front.
-pub const MAX_SKILL_UPLOAD_BYTES: usize = 2 * 1024 * 1024;
+/// Cap on the *compressed* upload (tar / tar.gz / zip). Sized for a CLI binary
+/// (ADR 0058 uploaded-binary arm: `gh`/`kubectl`-class compress to tens of MiB),
+/// not just KiB markdown. The MountCatalogService server raises its gRPC decode
+/// cap to match (the 4 MiB default would reject this). Checked before any
+/// decompression, so it bounds the work an attacker's bytes can trigger up front.
+pub const MAX_SKILL_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cap on the *decompressed* total written across all entries — the
 /// decompression-bomb (zip/gzip bomb) defense. Enforced by streaming each entry
 /// through this budget in fixed chunks, so memory never exceeds it regardless of
-/// an entry's *claimed* size (zip/tar headers can lie), and a 2 MiB upload that
-/// would expand to gigabytes is aborted partway.
-const MAX_SKILL_UNPACKED_BYTES: u64 = 16 * 1024 * 1024;
+/// an entry's *claimed* size (zip/tar headers can lie), and an upload that would
+/// expand past this is aborted partway.
+const MAX_SKILL_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Largest number of files one skill may carry — a metadata/inode-bomb bound
 /// (many tiny entries) on top of the byte budget.
 const MAX_SKILL_FILES: usize = 4096;
+
+/// Largest number of PATH binaries one uploaded bundle may declare (ADR 0058).
+const MAX_SKILL_BINS: usize = 32;
 
 /// Magic bytes for a zip local-file header (`PK\x03\x04`).
 const ZIP_MAGIC: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
@@ -103,8 +107,9 @@ pub fn validate_skill_name(name: &str) -> Result<(), PackError> {
 
 /// Pack `payload` — a tar, gzipped tar, or zip of the skill dir, or a lone
 /// `SKILL.md` (all sniffed by magic bytes) — into a content-addressed squashfs
-/// for skill `name`.
-pub fn pack_skill(name: &str, payload: &[u8]) -> Result<PackedSkill, PackError> {
+/// for skill `name`. `bins` declares PATH binaries the bundle contributes (ADR
+/// 0058 uploaded-binary arm); empty is the markdown-skill case, unchanged.
+pub fn pack_skill(name: &str, payload: &[u8], bins: &[String]) -> Result<PackedSkill, PackError> {
     validate_skill_name(name)?;
     if payload.len() > MAX_SKILL_UPLOAD_BYTES {
         return Err(PackError::Invalid(format!(
@@ -128,8 +133,12 @@ pub fn pack_skill(name: &str, payload: &[u8]) -> Result<PackedSkill, PackError> 
         ));
     }
 
+    // Validate + mark the declared binaries executable, and resolve them to the
+    // root-relative paths activate() symlinks onto PATH.
+    let manifest_bins = prepare_bins(name, &skill_dir, bins)?;
+
     // Generate the mount.json the guest's activate() reads.
-    let manifest = MountManifest::single_skill(name);
+    let manifest = MountManifest::single_skill_with_bins(name, manifest_bins);
     let mount_json = serde_json::to_string(&manifest)
         .map_err(|e| PackError::Internal(format!("serialize mount.json: {e}")))?;
     std::fs::write(root.join("mount.json"), &mount_json)
@@ -144,6 +153,47 @@ pub fn pack_skill(name: &str, payload: &[u8]) -> Result<PackedSkill, PackError> 
         mount_json,
         size_bytes,
     })
+}
+
+/// Validate the declared `bins` against the extracted tree, mark each executable,
+/// and return their squashfs-root-relative manifest paths (`skills/<name>/<bin>`).
+/// Each declared bin is a path *within* the uploaded skill dir (e.g. `bin/mytool`)
+/// and must resolve to a regular file the upload actually carries (extraction
+/// already rejected symlinks/devices). We chmod it 0755 so the packed squashfs
+/// carries the executable bit (`mksquashfs` preserves tree mode; `-all-root` only
+/// rewrites ownership). Empty `bins` → empty out (the markdown-skill case).
+fn prepare_bins(name: &str, skill_dir: &Path, bins: &[String]) -> Result<Vec<String>, PackError> {
+    use std::os::unix::fs::PermissionsExt;
+    if bins.len() > MAX_SKILL_BINS {
+        return Err(PackError::Invalid(format!(
+            "{} declared bins exceeds the {MAX_SKILL_BINS} cap",
+            bins.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(bins.len());
+    for bin in bins {
+        let rel = sanitize_rel(Path::new(bin))?;
+        let rel_str = rel
+            .to_str()
+            .ok_or_else(|| PackError::Invalid(format!("bin path `{bin}` is not valid UTF-8")))?;
+        let abs = skill_dir.join(&rel);
+        // symlink_metadata (not metadata) so a symlinked path can't masquerade as a
+        // regular file — defense in depth on top of the extraction-time rejection.
+        let meta = std::fs::symlink_metadata(&abs).map_err(|_| {
+            PackError::Invalid(format!(
+                "declared bin `{bin}` is not in the upload (expected a regular file there)"
+            ))
+        })?;
+        if !meta.file_type().is_file() {
+            return Err(PackError::Invalid(format!(
+                "declared bin `{bin}` is not a regular file"
+            )));
+        }
+        std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| PackError::Internal(format!("chmod bin {bin}: {e}")))?;
+        out.push(format!("skills/{name}/{rel_str}"));
+    }
+    Ok(out)
 }
 
 /// Normalize an upload into the staging `dest`. Sniffed by **magic bytes**, never
@@ -400,7 +450,7 @@ mod tests {
     #[test]
     fn pack_requires_skill_md() {
         let tar = tar_with(&[("README.md", b"no skill doc here")]);
-        let err = pack_skill("my-skill", &tar).unwrap_err();
+        let err = pack_skill("my-skill", &tar, &[]).unwrap_err();
         assert!(matches!(err, PackError::Invalid(_)), "got {err:?}");
     }
 
@@ -408,7 +458,7 @@ mod tests {
     fn pack_rejects_oversize() {
         let big = vec![0u8; MAX_SKILL_UPLOAD_BYTES + 1];
         assert!(matches!(
-            pack_skill("my-skill", &big),
+            pack_skill("my-skill", &big, &[]),
             Err(PackError::Invalid(_))
         ));
     }
@@ -443,7 +493,7 @@ mod tests {
             bomb.len() < MAX_SKILL_UPLOAD_BYTES,
             "bomb clears the input cap"
         );
-        match pack_skill("bomb", &bomb) {
+        match pack_skill("bomb", &bomb, &[]) {
             Err(PackError::Invalid(m)) => assert!(m.contains("unpacked cap"), "got {m}"),
             other => panic!("expected an unpacked-cap rejection, got {other:?}"),
         }
@@ -457,7 +507,7 @@ mod tests {
             bomb.len() < MAX_SKILL_UPLOAD_BYTES,
             "zip bomb clears the input cap"
         );
-        match pack_skill("zbomb", &bomb) {
+        match pack_skill("zbomb", &bomb, &[]) {
             Err(PackError::Invalid(m)) => assert!(m.contains("unpacked cap"), "got {m}"),
             other => panic!("expected an unpacked-cap rejection, got {other:?}"),
         }
@@ -473,15 +523,18 @@ mod tests {
         // packs identically to a one-entry tar carrying the same SKILL.md — so
         // the orchestrator can forward raw bytes and dedup still holds.
         let doc = b"# My Skill\nDo the thing.\n";
-        let lone = pack_skill("x", doc).expect("lone");
-        let tarred = pack_skill("x", &tar_with(&[("SKILL.md", doc)])).expect("tar");
+        let lone = pack_skill("x", doc, &[]).expect("lone");
+        let tarred = pack_skill("x", &tar_with(&[("SKILL.md", doc)]), &[]).expect("tar");
         assert_eq!(lone.sha256, tarred.sha256);
         assert_eq!(&lone.squashfs[0..4], b"hsqs");
     }
 
     #[test]
     fn rejects_an_empty_payload() {
-        assert!(matches!(pack_skill("x", b""), Err(PackError::Invalid(_))));
+        assert!(matches!(
+            pack_skill("x", b"", &[]),
+            Err(PackError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -500,8 +553,8 @@ mod tests {
             ("reference/notes.md", b"notes\n"),
         ];
         let from_zip =
-            pack_skill("z", &zip_with(files, zip::CompressionMethod::Stored)).expect("zip");
-        let from_tar = pack_skill("z", &tar_with(files)).expect("tar");
+            pack_skill("z", &zip_with(files, zip::CompressionMethod::Stored), &[]).expect("zip");
+        let from_tar = pack_skill("z", &tar_with(files), &[]).expect("tar");
         assert_eq!(from_zip.sha256, from_tar.sha256);
         assert_eq!(&from_zip.squashfs[0..4], b"hsqs");
     }
@@ -525,8 +578,8 @@ mod tests {
             ("SKILL.md", b"# My Skill\nDo the thing.\n"),
             ("reference/notes.md", b"notes\n"),
         ]);
-        let a = pack_skill("my-skill", &tar).expect("pack a");
-        let b = pack_skill("my-skill", &tar).expect("pack b");
+        let a = pack_skill("my-skill", &tar, &[]).expect("pack a");
+        let b = pack_skill("my-skill", &tar, &[]).expect("pack b");
         // Idempotent by content: identical input → identical sha256.
         assert_eq!(a.sha256, b.sha256);
         assert_eq!(a.sha256.len(), 64);
@@ -539,5 +592,45 @@ mod tests {
         );
         // squashfs superblock magic ("hsqs", little-endian 0x73717368).
         assert_eq!(&a.squashfs[0..4], b"hsqs");
+    }
+
+    #[test]
+    fn pack_with_declared_bins_lists_them_root_relative() {
+        if !mksquashfs_available() {
+            eprintln!("skipping pack_with_declared_bins_lists_them_root_relative: no mksquashfs");
+            return;
+        }
+        // A bundle carrying a (fake) binary + its SKILL.md, declaring the bin. The
+        // generated manifest lists it root-relative (`skills/<name>/<bin>`) — what
+        // activate() joins against the mounted slot to symlink onto PATH.
+        let tar = tar_with(&[
+            ("SKILL.md", b"# Tool\nUse mytool.\n"),
+            ("bin/mytool", b"#!/bin/sh\necho hi\n"),
+        ]);
+        let packed = pack_skill("mytool", &tar, &["bin/mytool".to_string()]).expect("pack");
+        assert_eq!(
+            packed.mount_json,
+            r#"{"kind":"skill","skills":[{"name":"mytool","bins":["skills/mytool/bin/mytool"]}]}"#
+        );
+        assert_eq!(&packed.squashfs[0..4], b"hsqs");
+    }
+
+    #[test]
+    fn pack_rejects_a_declared_bin_not_in_the_upload() {
+        // Bin validation runs before mksquashfs, so this needs no squashfs-tools.
+        let tar = tar_with(&[("SKILL.md", b"# Tool\n")]);
+        match pack_skill("mytool", &tar, &["bin/ghost".to_string()]) {
+            Err(PackError::Invalid(m)) => assert!(m.contains("not in the upload"), "got {m}"),
+            other => panic!("expected an invalid-bin rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_rejects_a_traversing_bin_path() {
+        let tar = tar_with(&[("SKILL.md", b"# Tool\n")]);
+        assert!(matches!(
+            pack_skill("mytool", &tar, &["../escape".to_string()]),
+            Err(PackError::Invalid(_))
+        ));
     }
 }
