@@ -161,6 +161,16 @@ export interface ParsedInject {
   template: string;
 }
 
+/** ADR 0058: the optional CLI facet a connector drives (display posture). */
+export interface ParsedCli {
+  /** PATH command names this connector contributes. */
+  bins: string[];
+  /** `bundled` (shared bundle), `uploaded` (admin-uploaded catalog bundle), `npx`. */
+  binSource: "bundled" | "uploaded" | "npx";
+  /** uploaded only: the mount_catalog bundle carrying the binary. */
+  bundle?: string;
+}
+
 export interface ParsedConnectorConfig {
   provider: string;
   credentialSource: "mint" | "inject";
@@ -171,6 +181,8 @@ export interface ParsedConnectorConfig {
   /** mint only */
   mintKind?: string;
   capabilities: ParsedCapability[];
+  /** ADR 0058: the CLI this connector drives, if any. */
+  cli?: ParsedCli;
 }
 
 interface RawOp {
@@ -221,6 +233,17 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     }
   }
 
+  const rawCli = raw.cli as Record<string, unknown> | undefined;
+  const cli: ParsedCli | undefined =
+    rawCli && Array.isArray(rawCli.bins)
+      ? {
+          bins: (rawCli.bins as unknown[]).filter((b): b is string => typeof b === "string"),
+          binSource:
+            rawCli.binSource === "uploaded" || rawCli.binSource === "npx" ? rawCli.binSource : "bundled",
+          ...(typeof rawCli.bundle === "string" ? { bundle: rawCli.bundle } : {}),
+        }
+      : undefined;
+
   return {
     provider,
     credentialSource,
@@ -244,5 +267,6 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
         }
       : { mintKind: cred.mint?.kind }),
     capabilities,
+    ...(cli ? { cli } : {}),
   };
 }
