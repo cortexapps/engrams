@@ -1,0 +1,45 @@
+{
+  "provider": "slack",
+  "protocol": "http",
+  "display": {
+    "name": "Slack",
+    "category": "Communication",
+    "blurb": "Post messages, read channels, and upload files — authenticated with a workspace bot token obtained via OAuth (\"Add to Slack\").",
+    "icon": { "mono": "SL", "color": "#611f69" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "slack.bot_token" }
+    ]
+  },
+  "hosts": ["slack.com"],
+  "test": { "path": "/api/auth.test" },
+  "operations": [
+    {
+      "grants": ["chat:write"],
+      "match": { "path": "/api/chat.*" }
+    },
+    {
+      "grants": ["channels:read"],
+      "match": { "path": "/api/conversations.*" }
+    },
+    {
+      "grants": ["users:read"],
+      "match": { "path": "/api/users.*" }
+    },
+    {
+      "grants": ["files:write"],
+      "match": { "path": "/api/files.*" }
+    }
+  ],
+  "oauth": {
+    "authorizeUrl": "https://slack.com/oauth/v2/authorize",
+    "tokenUrl": "https://slack.com/api/oauth.v2.access",
+    "scopes": ["chat:write", "channels:read", "groups:read", "users:read", "files:write", "files:read"],
+    "clientIdRef": "slack.client_id",
+    "clientSecretRef": "slack.client_secret",
+    "tokenSecretRef": "slack.bot_token",
+    "tokenResponsePath": "access_token"
+  }
+}

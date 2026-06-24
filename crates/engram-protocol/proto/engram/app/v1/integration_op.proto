@@ -27,6 +27,43 @@ service IntegrationOpService {
   // drive an off-the-shelf SDK. Returns a typed ResolvedCredential.
   rpc ResolveIntegrationCredential(ResolveIntegrationCredentialRequest)
       returns (ResolveIntegrationCredentialResponse);
+  // OAuth 2.0 authorization-code acquisition (e.g. Slack "Add to Slack"). The
+  // orchestrator owns the browser redirect + CSRF state; the coordinator — the
+  // only tier that can read/write org secrets — builds the authorize URL from the
+  // stored client id, and (on callback) runs the code->token exchange and writes
+  // the obtained access token to the org store.
+  rpc BeginIntegrationOauth(BeginIntegrationOauthRequest) returns (BeginIntegrationOauthResponse);
+  rpc CompleteIntegrationOauth(CompleteIntegrationOauthRequest)
+      returns (CompleteIntegrationOauthResponse);
+}
+
+message BeginIntegrationOauthRequest {
+  string provider = 1;
+  string authorize_url = 2;   // base authorize endpoint (host validated in the connector)
+  repeated string scopes = 3;
+  string client_id_ref = 4;   // org secret holding the OAuth app's client id
+  string redirect_uri = 5;    // the orchestrator's callback URL
+  string state = 6;           // CSRF state (orchestrator-generated)
+}
+
+message BeginIntegrationOauthResponse {
+  string authorize_url = 1;   // full URL: base + client_id + scope + redirect_uri + state
+}
+
+message CompleteIntegrationOauthRequest {
+  string provider = 1;
+  string token_url = 2;           // token endpoint (host validated in the connector)
+  string client_id_ref = 3;
+  string client_secret_ref = 4;
+  string redirect_uri = 5;        // must match the authorize step
+  string code = 6;                // the authorization code from the callback
+  string token_secret_ref = 7;    // org secret to write the obtained access token to
+  string token_response_path = 8; // top-level field holding the token (e.g. access_token)
+}
+
+message CompleteIntegrationOauthResponse {
+  bool ok = 1;
+  string message = 2;
 }
 
 // One header a connector injects, resolved from an org secret coordinator-side.

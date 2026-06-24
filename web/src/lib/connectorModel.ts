@@ -171,6 +171,13 @@ export interface ParsedCli {
   bundle?: string;
 }
 
+/** OAuth acquisition facet — the app-credential org secrets the "Add to X" flow
+ * seeds before redirecting (the access token itself is obtained server-side). */
+export interface ParsedOauth {
+  clientIdRef: string;
+  clientSecretRef: string;
+}
+
 export interface ParsedConnectorConfig {
   provider: string;
   credentialSource: "mint" | "inject";
@@ -180,6 +187,8 @@ export interface ParsedConnectorConfig {
   injects?: ParsedInject[];
   /** mint only */
   mintKind?: string;
+  /** present when the connector is connected via an OAuth flow (e.g. Slack). */
+  oauth?: ParsedOauth;
   capabilities: ParsedCapability[];
   /** ADR 0058: the CLI this connector drives, if any. */
   cli?: ParsedCli;
@@ -209,6 +218,11 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     mint?: { kind?: string };
   };
   const credentialSource: "mint" | "inject" = cred.source === "mint" ? "mint" : "inject";
+  const oauthRaw = raw.oauth as { clientIdRef?: string; clientSecretRef?: string } | undefined;
+  const oauth =
+    oauthRaw?.clientIdRef && oauthRaw?.clientSecretRef
+      ? { clientIdRef: oauthRaw.clientIdRef, clientSecretRef: oauthRaw.clientSecretRef }
+      : undefined;
   const d = (raw.display ?? {}) as {
     name?: string;
     category?: string;
@@ -266,6 +280,7 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
           })),
         }
       : { mintKind: cred.mint?.kind }),
+    ...(oauth ? { oauth } : {}),
     capabilities,
     ...(cli ? { cli } : {}),
   };
