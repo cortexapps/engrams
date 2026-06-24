@@ -98,12 +98,17 @@ pub struct IntegrationInject {
     /// Request shapes this injection gates + applies to. Empty = any.
     #[serde(default)]
     pub methods: Vec<String>,
+    /// Glob patterns (a `*` matches any run of chars, incl. `/`) matched against
+    /// the whole request path — e.g. `/repos/*/pulls`. Empty = any path. The name
+    /// is historical: these used to be literal prefixes (see the egress proxy's
+    /// `RequestPolicy`). Carries the connector op's full `match.path`.
     #[serde(default)]
     pub path_prefixes: Vec<String>,
 }
 
 /// One response-observation spec. On an outbound request to `hosts` matching
-/// `methods` + `path_prefixes`, the proxy parses the response and emits an
+/// `methods` + `path_prefixes` (path globs — see `IntegrationInject`), the proxy
+/// parses the response and emits an
 /// `IntegrationAsset` (`provider`/`asset_kind`/`surface`) built from the `data`
 /// extractor map + optional `fetchable` URL extractor, gated by `success`.
 /// Extractor paths are `$.resp.<dotted>` / `$.req.method|path` / `$.status`.
@@ -161,7 +166,7 @@ mod tests {
                 secret_ref: "datadog-api-key".into(),
                 mint_provider: String::new(),
                 methods: vec!["GET".into()],
-                path_prefixes: vec!["/api/v2/logs".into()],
+                path_prefixes: vec!["/api/v2/logs*".into()],
             }],
             observes: vec![],
             ..Default::default()
@@ -186,7 +191,7 @@ mod tests {
             observes: vec![IntegrationObserve {
                 hosts: vec!["api.github.com".into()],
                 methods: vec!["POST".into()],
-                path_prefixes: vec!["/repos/".into()],
+                path_prefixes: vec!["/repos/*/issues".into()],
                 provider: "github".into(),
                 asset_kind: "issue".into(),
                 surface: "asset".into(),

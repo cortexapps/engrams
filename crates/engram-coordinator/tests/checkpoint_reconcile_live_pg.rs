@@ -426,7 +426,7 @@ async fn session_integration_policy_round_trip() {
         .expect("get empty")
         .is_none());
 
-    let json = r#"{"injects":[{"hosts":["api.datadoghq.com"],"header_name":"DD-API-KEY","header_template":"{}","secret_ref":"datadog-api-key","methods":["GET"],"path_prefixes":["/api/v2/logs"]}]}"#;
+    let json = r#"{"injects":[{"hosts":["api.datadoghq.com"],"header_name":"DD-API-KEY","header_template":"{}","secret_ref":"datadog-api-key","methods":["GET"],"path_prefixes":["/api/v2/logs*"]}]}"#;
     meta.bind_session_integration_policy(session_id, json)
         .await
         .expect("bind");

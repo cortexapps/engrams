@@ -168,14 +168,29 @@ mod tests {
 
     #[test]
     fn request_policy_allows_method_and_path() {
+        // A trailing `*` lets the glob swallow the query string + sub-paths —
+        // the shape the orchestrator emits for read ops (e.g. datadog logs).
         let p = RequestPolicy {
             methods: vec!["GET".into()],
-            path_prefixes: vec!["/api/v2/logs".into()],
+            path_prefixes: vec!["/api/v2/logs*".into()],
         };
         assert!(p.allows("GET", "/api/v2/logs/events"));
+        assert!(p.allows("GET", "/api/v2/logs/events?query=x")); // query swallowed by `*`
         assert!(p.allows("get", "/api/v2/logs/events")); // case-insensitive method
         assert!(!p.allows("POST", "/api/v2/logs/events")); // method not allowed
-        assert!(!p.allows("GET", "/api/v2/metrics")); // path prefix not allowed
+        assert!(!p.allows("GET", "/api/v2/metrics")); // path doesn't match
+
+        // The granularity fix: a write op pinned to `/repos/*/pulls` must match
+        // the create-PR call but NOT a sibling `/repos/o/r/git/refs` (the coarse
+        // `/repos/` prefix used to over-match both — injecting the token and
+        // emitting a junk asset on branch creation).
+        let pulls = RequestPolicy {
+            methods: vec!["POST".into()],
+            path_prefixes: vec!["/repos/*/pulls".into()],
+        };
+        assert!(pulls.allows("POST", "/repos/octo/repo/pulls"));
+        assert!(!pulls.allows("POST", "/repos/octo/repo/git/refs"));
+        assert!(!pulls.allows("POST", "/repos/octo/repo/pulls/1/merge")); // deeper, no trailing `*`
 
         // Empty policy = any method / any path.
         let any = RequestPolicy::default();

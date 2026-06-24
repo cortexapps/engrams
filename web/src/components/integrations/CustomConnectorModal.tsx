@@ -77,11 +77,6 @@ const splitList = (t: string) =>
     .split(/[\s,]+/)
     .map((s) => s.trim())
     .filter(Boolean);
-const pathPrefix = (p: string) => {
-  const i = p.indexOf("*");
-  return i === -1 ? p : p.slice(0, i);
-};
-
 export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
   const upsert = useUpsertConnector();
@@ -375,11 +370,11 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                       </code>
                       <span className="text-[0.74rem]">"{humanizeAction(g)}"</span>
                       <AccessTag access={accessOf(o.method)} />
-                      {pathPrefix(o.path) && (
+                      {o.path && (
                         <span className="text-[0.72rem]">
                           · gate{" "}
                           <code className="font-mono">
-                            {(o.method || "GET").toUpperCase()} {pathPrefix(o.path)}*
+                            {(o.method || "GET").toUpperCase()} {o.path}
                           </code>
                         </span>
                       )}
