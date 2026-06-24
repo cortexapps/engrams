@@ -39,28 +39,32 @@ Authentication happens automatically: git's `GIT_ASKPASS` helper fetches a
 fresh credential from the host for each operation. **Do not** set
 `GITHUB_TOKEN` or edit git credentials — it's already wired.
 
-## 3. Open the change request
+## 3. Open the pull request
 
-Run `engram-pr` — it is provider-agnostic (GitHub PR, GitLab MR, …) and
-routes through the platform. **Do not** use `gh` or `glab`.
+Use `gh pr create` the normal way. Your requests to `api.github.com` are
+authenticated automatically: the engrams egress proxy substitutes a
+short-lived, capability-scoped token on every request, so you never hold or
+paste a real one. `gh` only needs *some* value in `GH_TOKEN` to proceed — a
+placeholder is fine, the platform replaces it on the wire:
 
 ```bash
-engram-pr --repo owner/name \
-  --head my-feature \
+GH_TOKEN=engrams-brokered gh pr create \
   --base main \
   --title "Short, imperative summary" \
   --body "What changed and why. Reference any issue."
 ```
 
-It prints the URL of the created PR/MR. Notes:
+`gh` prints the URL of the created PR. Notes:
 
-- `--repo` is `owner/name`; any repo the platform's installation can access
-  works (you are not pinned to one repo).
-- `--base` defaults to `main`.
+- It opens the PR for the branch you pushed in step 2; pass `--head` to override.
+- `--base` is the target branch.
 - add `--draft` to open a draft.
+- The platform's installation must have access to the repo, and your session's
+  granted capabilities must include `pulls:write` for it.
 
-The opened PR is also surfaced on the session's event stream, so whoever
-launched the session sees the link.
+The opened PR is also surfaced on the session's event stream — the egress proxy
+observes the create-PR response and emits it — so whoever launched the session
+sees the link.
 
 ## Images in the PR body
 
