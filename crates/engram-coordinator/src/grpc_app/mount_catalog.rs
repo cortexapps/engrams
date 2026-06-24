@@ -57,6 +57,7 @@ impl app::mount_catalog_service_server::MountCatalogService for AppMountCatalogS
             description,
             owner,
             payload_tar,
+            bins,
         } = req.into_inner();
         let name = name.trim().to_string();
 
@@ -72,8 +73,8 @@ impl app::mount_catalog_service_server::MountCatalogService for AppMountCatalogS
         }
 
         // Pack into a content-addressed squashfs (validates name + SKILL.md +
-        // size; shells to mksquashfs).
-        let packed = skill_pack::pack_skill(&name, &payload_tar).map_err(pack_to_status)?;
+        // size + declared bins; shells to mksquashfs).
+        let packed = skill_pack::pack_skill(&name, &payload_tar, &bins).map_err(pack_to_status)?;
 
         // Publish the squashfs (content-addressed; re-registering identical bytes
         // overwrites the same key — idempotent).
