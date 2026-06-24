@@ -80,6 +80,16 @@ pub struct InjectEntry {
 /// ADR 0056: the request shapes a Plane-B injection gates + applies to.
 /// Layered on top of the SNI host match. `methods` empty = any method;
 /// `path_prefixes` empty = any path.
+///
+/// `path_prefixes` are **glob patterns** — a `*` matches any run of characters
+/// (including `/`) — matched against the whole request path. The name is
+/// historical: the orchestrator used to truncate the connector match path at the
+/// first `*` and prefix-match the literal head, so `/repos/*/pulls` collapsed to
+/// `/repos/` and the gate + observe fired on *any* `/repos/…` request (a coarse
+/// over-match — e.g. a branch-creation `POST /repos/o/r/git/refs` got the token
+/// injected and emitted a junk `pull_request` asset). It now carries the whole
+/// pattern and globs it, so `POST /repos/o/r/pulls` matches `/repos/*/pulls`
+/// while `POST /repos/o/r/git/refs` does not.
 #[derive(Clone, Debug, Default)]
 pub struct RequestPolicy {
     pub methods: Vec<String>,
@@ -87,16 +97,47 @@ pub struct RequestPolicy {
 }
 
 impl RequestPolicy {
-    /// Is `(method, path)` permitted? Method match is case-insensitive;
-    /// path match is prefix. An empty list means "any".
+    /// Is `(method, path)` permitted? Method match is case-insensitive; path
+    /// match is a glob over the whole path (`*` = any chars). Empty list = "any".
     pub fn allows(&self, method: &str, path: &str) -> bool {
         (self.methods.is_empty() || self.methods.iter().any(|m| m.eq_ignore_ascii_case(method)))
             && (self.path_prefixes.is_empty()
-                || self
-                    .path_prefixes
-                    .iter()
-                    .any(|p| path.starts_with(p.as_str())))
+                || self.path_prefixes.iter().any(|p| glob_match(p, path)))
     }
+}
+
+/// Glob match: `*` matches any run of characters (including `/`); the pattern
+/// must match the ENTIRE `text`. Iterative with backtracking (O(n·m), no
+/// recursion blow-up). `*` is the only metacharacter — connector match paths use
+/// nothing else.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Backtrack point: the last `*` seen, and where in `text` we resumed it.
+    let (mut star, mut star_ti) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(s) = star {
+            // Mismatch under a `*`: let the `*` swallow one more char of `text`.
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    // Trailing `*`s in the pattern match the empty remainder.
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// ADR 0056 (Phase 4): when does an observed response count as a successful
@@ -280,14 +321,14 @@ mod tests {
                 allow: HostList::from_manifest(&["api.datadoghq.com".into()], &[]).unwrap(),
                 policy: RequestPolicy {
                     methods: vec!["GET".into()],
-                    path_prefixes: vec!["/api/v2/logs".into()],
+                    path_prefixes: vec!["/api/v2/logs*".into()],
                 },
             }],
             observes: vec![ObserveEntry {
                 allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
                 policy: RequestPolicy {
                     methods: vec!["POST".into()],
-                    path_prefixes: vec!["/repos/".into()],
+                    path_prefixes: vec!["/repos/*/issues".into()],
                 },
                 provider: "github".into(),
                 asset_kind: "issue".into(),
@@ -393,5 +434,41 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert!(p.contains(&"engram_ph_xxx_yyy"));
         assert!(p.contains(&"engram_ph_aaa_bbb"));
+    }
+
+    #[test]
+    fn glob_match_semantics() {
+        // No metacharacter → exact, whole-string match (the granularity fix:
+        // `/repos/*/pulls` must NOT leak into `/repos/o/r/git/refs`).
+        assert!(glob_match("/repos/o/r/pulls", "/repos/o/r/pulls"));
+        assert!(!glob_match("/repos/o/r/pulls", "/repos/o/r/pulls/1"));
+        assert!(!glob_match("/repos/o/r/pulls", "/repos/o/r"));
+
+        // `*` swallows any run of chars, including `/`.
+        assert!(glob_match("/repos/*/pulls", "/repos/octo/repo/pulls"));
+        assert!(glob_match("/repos/*/pulls", "/repos/a/b/c/pulls")); // owner segment can contain slashes
+        assert!(!glob_match("/repos/*/pulls", "/repos/octo/repo/git/refs"));
+
+        // Trailing `*` matches the empty remainder AND query strings / sub-paths.
+        assert!(glob_match("/api/v2/logs*", "/api/v2/logs"));
+        assert!(glob_match("/api/v2/logs*", "/api/v2/logs/events?query=x"));
+        assert!(glob_match(
+            "/repos/*/issues*",
+            "/repos/o/r/issues?state=open"
+        ));
+        assert!(glob_match("/repos/*/issues*", "/repos/o/r/issues/42")); // issue comments etc.
+
+        // Multiple `*` and leading `*`.
+        assert!(glob_match(
+            "/repos/*/contents/*",
+            "/repos/o/r/contents/path/to/file"
+        ));
+        assert!(!glob_match("/repos/*/contents/*", "/repos/o/r/contents")); // needs the trailing segment
+        assert!(glob_match("*", "/anything/at/all"));
+        assert!(glob_match("*", ""));
+
+        // A bare `*` mid-pattern that must backtrack to a later literal.
+        assert!(glob_match("/a/*/b", "/a/x/y/b"));
+        assert!(!glob_match("/a/*/b", "/a/x/y/c"));
     }
 }

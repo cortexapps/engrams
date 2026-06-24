@@ -341,7 +341,7 @@ async fn injects_header_on_allowed_request() {
     let upstream_addr = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
-    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs"]);
+    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
     let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {
         let injects: Vec<&InjectEntry> = vec![&inj];
@@ -409,7 +409,7 @@ async fn rejects_request_shape_outside_policy() {
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     // Only GET /api/v2/logs* is allowed; the client tries POST /api/v2/metrics.
-    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs"]);
+    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
     let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {
         let injects: Vec<&InjectEntry> = vec![&inj];
@@ -527,7 +527,7 @@ async fn observes_response_and_emits_asset() {
         allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
         policy: RequestPolicy {
             methods: vec!["POST".into()],
-            path_prefixes: vec!["/repos/".into()],
+            path_prefixes: vec!["/repos/*/issues".into()],
         },
         provider: "github".into(),
         asset_kind: "issue".into(),
@@ -630,7 +630,7 @@ async fn failed_status_emits_no_asset() {
         allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
         policy: RequestPolicy {
             methods: vec!["POST".into()],
-            path_prefixes: vec!["/repos/".into()],
+            path_prefixes: vec!["/repos/*/issues".into()],
         },
         provider: "github".into(),
         asset_kind: "issue".into(),

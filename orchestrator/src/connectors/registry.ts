@@ -545,12 +545,6 @@ export function grantsCapability(
   return c.operations.some((op) => op.grants.includes(action));
 }
 
-/** Glob `path` → prefix the proxy can match (everything before the first `*`). */
-function pathPrefix(p: string): string {
-  const star = p.indexOf("*");
-  return star === -1 ? p : p.slice(0, star);
-}
-
 /**
  * Compile a profile's bound capabilities → the per-session IntegrationPolicy.
  *
@@ -583,7 +577,11 @@ export function compileIntegrationPolicy(
     for (const op of connector.operations) {
       if (!op.grants.includes(cap.action)) continue;
       const methods = op.match?.method ? [op.match.method.toUpperCase()] : [];
-      const path_prefixes = op.match?.path ? [pathPrefix(op.match.path)] : [];
+      // Emit the connector match path as a whole glob (the proxy globs `*` over
+      // the full request path). Previously this was truncated at the first `*`
+      // and prefix-matched, which over-matched siblings — e.g. `/repos/*/pulls`
+      // collapsed to `/repos/` and fired the gate/observe on `/repos/o/r/git/refs`.
+      const path_prefixes = op.match?.path ? [op.match.path] : [];
 
       if (connector.credential.source === "inject") {
         const inj = connector.credential.inject;

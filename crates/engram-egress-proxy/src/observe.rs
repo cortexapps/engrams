@@ -284,7 +284,7 @@ mod tests {
             allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
             policy: RequestPolicy {
                 methods: vec!["POST".into()],
-                path_prefixes: vec!["/repos/".into()],
+                path_prefixes: vec!["/repos/*/issues".into()],
             },
             provider: "github".into(),
             asset_kind: "issue".into(),

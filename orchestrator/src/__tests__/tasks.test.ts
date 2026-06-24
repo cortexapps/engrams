@@ -1134,7 +1134,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
           secret_ref: "datadog-api-key",
           mint_provider: "",
           methods: ["GET"],
-          path_prefixes: ["/api/v2/logs/events"],
+          path_prefixes: ["/api/v2/logs/events*"],
         },
       ]);
       expect(policy.observes).toHaveLength(1);
