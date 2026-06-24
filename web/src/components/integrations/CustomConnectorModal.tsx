@@ -114,7 +114,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
       provider,
       protocol: "http",
       display: { name: name.trim(), category, icon: { mono: monogram, color } },
-      credential: { source: "inject", inject: { header: header.trim(), secretRef: ref, template } },
+      credential: { source: "inject", injects: [{ header: header.trim(), secretRef: ref, template }] },
       hosts: splitList(hosts),
       operations: ops
         .filter((o) => o.grant.trim())

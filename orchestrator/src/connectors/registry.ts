@@ -33,10 +33,19 @@ import { join } from "node:path";
 // Connector types (the static JSON shape)
 // ---------------------------------------------------------------------------
 
-/** `{}` is replaced by the resolved secret value host-side (e.g. `"Bearer {}"`). */
+/** One injected auth header. `{}` in `template` is replaced by the resolved
+ * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`). */
+export interface InjectHeader {
+  header: string;
+  secretRef: string;
+  template?: string;
+}
+/** ADR 0058: a connector may inject ONE OR MORE headers. Most need one (e.g.
+ * Datadog's `DD-API-KEY`); some need several (Datadog `pup` needs `DD-API-KEY`
+ * AND `DD-APPLICATION-KEY`). Each header resolves its own org secret host-side. */
 export interface InjectCredential {
   source: "inject";
-  inject: { header: string; secretRef: string; template?: string };
+  injects: InjectHeader[];
 }
 export interface MintCredential {
   source: "mint";
@@ -295,6 +304,7 @@ function asStringArray(where: string, field: string, v: unknown): string[] {
 const MAX_HOSTS = 50;
 const MAX_OPERATIONS = 200;
 const MAX_GRANTS = 50;
+const MAX_INJECTS = 10;
 /** RFC 7230 header field-name token (no spaces, colons, or CR/LF). */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 /** Provider id: a lowercase identifier (matches the built-ins). */
@@ -527,18 +537,26 @@ export function parseConnector(raw: unknown, where: string): Connector {
   if (typeof cred !== "object" || cred === null) fail(where, '"credential" must be an object');
   let credential: Credential;
   if (cred.source === "inject") {
-    const inj = cred.inject as Record<string, unknown> | undefined;
-    if (typeof inj !== "object" || inj === null) fail(where, '"credential.inject" must be an object');
-    if (typeof inj.header !== "string" || !inj.header) fail(where, '"credential.inject.header" must be a non-empty string');
-    if (!HEADER_NAME_RE.test(inj.header)) fail(where, `"credential.inject.header" "${inj.header}" is not a valid HTTP header name`);
-    if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(where, '"credential.inject.secretRef" must be a non-empty string');
-    if (/\s/.test(inj.secretRef)) fail(where, '"credential.inject.secretRef" must not contain whitespace');
-    if (inj.template !== undefined) {
-      if (typeof inj.template !== "string") fail(where, '"credential.inject.template" must be a string');
-      if (/[\r\n]/.test(inj.template)) fail(where, '"credential.inject.template" must not contain newlines');
-      if (!inj.template.includes("{}")) fail(where, '"credential.inject.template" must contain the "{}" value placeholder');
+    if (!Array.isArray(cred.injects) || cred.injects.length === 0) {
+      fail(where, '"credential.injects" must be a non-empty array of {header, secretRef, template?}');
     }
-    credential = { source: "inject", inject: { header: inj.header, secretRef: inj.secretRef, ...(typeof inj.template === "string" ? { template: inj.template } : {}) } };
+    if (cred.injects.length > MAX_INJECTS) fail(where, `"credential.injects" has ${cred.injects.length} entries (max ${MAX_INJECTS})`);
+    const injects: InjectHeader[] = cred.injects.map((raw, i): InjectHeader => {
+      const iw = `${where} credential.injects[${i}]`;
+      if (typeof raw !== "object" || raw === null) fail(iw, "must be an object");
+      const inj = raw as Record<string, unknown>;
+      if (typeof inj.header !== "string" || !inj.header) fail(iw, '"header" must be a non-empty string');
+      if (!HEADER_NAME_RE.test(inj.header)) fail(iw, `"header" "${inj.header}" is not a valid HTTP header name`);
+      if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(iw, '"secretRef" must be a non-empty string');
+      if (/\s/.test(inj.secretRef)) fail(iw, '"secretRef" must not contain whitespace');
+      if (inj.template !== undefined) {
+        if (typeof inj.template !== "string") fail(iw, '"template" must be a string');
+        if (/[\r\n]/.test(inj.template)) fail(iw, '"template" must not contain newlines');
+        if (!inj.template.includes("{}")) fail(iw, '"template" must contain the "{}" value placeholder');
+      }
+      return { header: inj.header, secretRef: inj.secretRef, ...(typeof inj.template === "string" ? { template: inj.template } : {}) };
+    });
+    credential = { source: "inject", injects };
   } else if (cred.source === "mint") {
     const mint = cred.mint as Record<string, unknown> | undefined;
     if (typeof mint !== "object" || mint === null) fail(where, '"credential.mint" must be an object');
@@ -749,20 +767,23 @@ export function compileIntegrationPolicy(
       const path_globs = op.match?.path ? [op.match.path] : [];
 
       if (connector.credential.source === "inject") {
-        const inj = connector.credential.inject;
-        const entry: IntegrationInjectJson = {
-          hosts: connector.hosts,
-          header_name: inj.header,
-          header_template: inj.template ?? "{}",
-          secret_ref: inj.secretRef,
-          mint_provider: "",
-          methods,
-          path_globs,
-        };
-        const key = JSON.stringify(entry);
-        if (!seenInject.has(key)) {
-          seenInject.add(key);
-          injects.push(entry);
+        // One egress inject per declared header (most connectors have one; e.g.
+        // Datadog `pup` injects DD-API-KEY AND DD-APPLICATION-KEY).
+        for (const inj of connector.credential.injects) {
+          const entry: IntegrationInjectJson = {
+            hosts: connector.hosts,
+            header_name: inj.header,
+            header_template: inj.template ?? "{}",
+            secret_ref: inj.secretRef,
+            mint_provider: "",
+            methods,
+            path_globs,
+          };
+          const key = JSON.stringify(entry);
+          if (!seenInject.has(key)) {
+            seenInject.add(key);
+            injects.push(entry);
+          }
         }
       }
 
@@ -925,7 +946,8 @@ export function connectorStatus(
   requiredMintSecretNames: ReadonlyArray<string> = [],
 ): ConnectorStatus {
   if (connector.credential.source === "inject") {
-    return orgSecretNames.has(connector.credential.inject.secretRef) ? "connected" : "available";
+    // Connected ⇔ every injected header's secret is present in the org store.
+    return connector.credential.injects.every((i) => orgSecretNames.has(i.secretRef)) ? "connected" : "available";
   }
   if (requiredMintSecretNames.length === 0) return "available";
   return requiredMintSecretNames.every((n) => orgSecretNames.has(n)) ? "connected" : "available";

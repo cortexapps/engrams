@@ -187,7 +187,7 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
   }
   const cred = (raw.credential ?? {}) as {
     source?: string;
-    inject?: Record<string, string>;
+    injects?: Array<Record<string, string>>;
     mint?: { kind?: string };
   };
   const credentialSource: "mint" | "inject" = cred.source === "mint" ? "mint" : "inject";
@@ -230,9 +230,11 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     },
     ...(credentialSource === "inject"
       ? {
-          header: cred.inject?.header,
-          template: cred.inject?.template ?? "{}",
-          secretRef: cred.inject?.secretRef,
+          // A connector may inject several headers; the detail view shows the
+          // primary (first). Multi-header display is a follow-up.
+          header: cred.injects?.[0]?.header,
+          template: cred.injects?.[0]?.template ?? "{}",
+          secretRef: cred.injects?.[0]?.secretRef,
         }
       : { mintKind: cred.mint?.kind }),
     capabilities,

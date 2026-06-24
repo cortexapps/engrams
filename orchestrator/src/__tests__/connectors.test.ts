@@ -30,7 +30,7 @@ import {
 const datadogRaw = {
   provider: "datadog",
   protocol: "http",
-  credential: { source: "inject", inject: { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" } },
+  credential: { source: "inject", injects: [{ header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" }] },
   hosts: ["api.datadoghq.com"],
   operations: [
     { grants: ["logs:read"], match: { method: "GET", path: "/api/v2/logs/events*" } },
@@ -57,8 +57,8 @@ describe("parseConnector", () => {
     expect(c.provider).toBe("datadog");
     expect(c.credential.source).toBe("inject");
     if (c.credential.source === "inject") {
-      expect(c.credential.inject.header).toBe("DD-API-KEY");
-      expect(c.credential.inject.secretRef).toBe("datadog-api-key");
+      expect(c.credential.injects[0]!.header).toBe("DD-API-KEY");
+      expect(c.credential.injects[0]!.secretRef).toBe("datadog-api-key");
     }
   });
 
@@ -72,8 +72,13 @@ describe("parseConnector", () => {
   });
 
   test("rejects inject without a header", () => {
-    const bad = { ...datadogRaw, credential: { source: "inject", inject: { secretRef: "r" } } };
+    const bad = { ...datadogRaw, credential: { source: "inject", injects: [{ secretRef: "r" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/header/);
+  });
+
+  test("rejects an inject credential with an empty injects array", () => {
+    const bad = { ...datadogRaw, credential: { source: "inject", injects: [] } };
+    expect(() => parseConnector(bad, "x")).toThrow(/non-empty array/);
   });
 
   test("rejects a mint without a kind", () => {
@@ -308,17 +313,11 @@ describe("on-disk registry", () => {
     expect(reg.get("github")!.credential.source).toBe("mint");
   });
 
-  test("the shipped datadog connector compiles a logs:read inject", () => {
-    const policy = compileIntegrationPolicy(["datadog:logs:read"]);
-    expect(policy.injects).toHaveLength(1);
-    expect(policy.injects[0]!.header_name).toBe("DD-API-KEY");
-  });
-
-  test("the shipped datadog logs:read also compiles a query_result observe", () => {
-    const policy = compileIntegrationPolicy(["datadog:logs:read"]);
-    expect(policy.observes).toHaveLength(1);
-    expect(policy.observes[0]!.provider).toBe("datadog");
-    expect(policy.observes[0]!.asset_kind).toBe("query_result");
+  test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {
+    const policy = compileIntegrationPolicy(["datadog:read"]);
+    expect(policy.injects).toHaveLength(2);
+    expect(policy.injects.map((i) => i.header_name).sort()).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
+    expect(policy.injects.map((i) => i.secret_ref).sort()).toEqual(["datadog-api-key", "datadog-app-key"]);
   });
 
   test("the shipped github issues:write compiles a minted inject + an issue observe", () => {
@@ -340,7 +339,7 @@ describe("parseConnector — admin-trust hardening", () => {
   const sentryRaw = {
     provider: "sentry",
     protocol: "http",
-    credential: { source: "inject", inject: { header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" } },
+    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
     hosts: ["sentry.io"],
     operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
   };
@@ -364,22 +363,22 @@ describe("parseConnector — admin-trust hardening", () => {
   });
 
   test("rejects an invalid HTTP header name", () => {
-    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Bad Header", secretRef: "r", template: "{}" } } };
+    const bad = { ...sentryRaw, credential: { source: "inject", injects: [{ header: "Bad Header", secretRef: "r", template: "{}" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/header name/);
   });
 
   test("rejects an inject template missing the {} placeholder", () => {
-    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "r", template: "Bearer" } } };
+    const bad = { ...sentryRaw, credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "r", template: "Bearer" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/placeholder/);
   });
 
   test("rejects an inject template with a newline (header injection)", () => {
-    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "r", template: "Bearer {}\r\nX: y" } } };
+    const bad = { ...sentryRaw, credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "r", template: "Bearer {}\r\nX: y" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/newline/);
   });
 
   test("rejects a secretRef with whitespace", () => {
-    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "a b", template: "{}" } } };
+    const bad = { ...sentryRaw, credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "a b", template: "{}" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/secretRef/);
   });
 
@@ -401,7 +400,7 @@ describe("loadRegistry", () => {
   const sentryRaw = {
     provider: "sentry",
     protocol: "http",
-    credential: { source: "inject", inject: { header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" } },
+    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
     hosts: ["sentry.io"],
     operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
   };
@@ -581,9 +580,9 @@ describe("cli facet (ADR 0058)", () => {
   const datadogCli = {
     ...datadogRaw,
     cli: {
-      bins: ["datadog-ci"],
+      bins: ["pup"],
       dummyEnv: { DD_API_KEY: "x-engrams-managed", DD_APP_KEY: "x-engrams-managed" },
-      doc: "Use `datadog-ci` to query logs.",
+      doc: "Use `pup` to query Datadog.",
     },
   };
   const githubCli = {
@@ -593,7 +592,7 @@ describe("cli facet (ADR 0058)", () => {
 
   test("parses a valid cli facet, defaulting binSource + credentialDelivery", () => {
     const c = parseConnector(datadogCli, "datadog");
-    expect(c.cli?.bins).toEqual(["datadog-ci"]);
+    expect(c.cli?.bins).toEqual(["pup"]);
     expect(c.cli?.binSource).toBe("bundled"); // defaulted
     expect(c.cli?.credentialDelivery).toBe("inject"); // defaulted
     expect(c.cli?.dummyEnv).toEqual({ DD_API_KEY: "x-engrams-managed", DD_APP_KEY: "x-engrams-managed" });
@@ -641,10 +640,12 @@ describe("cli facet (ADR 0058)", () => {
   });
 
   test("the on-disk github + datadog connectors expose their cli facet", () => {
-    const plan = compileCliIntegrations(["github:pulls:write", "datadog:logs:read"], connectorRegistry());
+    const plan = compileCliIntegrations(["github:pulls:write", "datadog:read"], connectorRegistry());
     expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
     expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");
+    expect(plan.dummyEnv.DD_APP_KEY).toBe("x-engrams-managed");
+    expect(plan.enabled.find((e) => e.provider === "datadog")?.bins).toEqual(["pup"]);
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
     // gh's doc carries the PR-open guidance.
     expect(plan.enabled.find((e) => e.provider === "github")?.doc).toMatch(/gh pr create/);
