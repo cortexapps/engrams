@@ -20,13 +20,18 @@ import { Toaster } from "@/components/ui/sonner";
 // screen), not a modal — `c` and the palette navigate there + focus the composer.
 export function RootLayout() {
   return (
-    <SidebarProvider>
+    // Fixed-height app shell: the wrapper is pinned to the viewport and clips
+    // its own overflow, so the primary rail and each section's second rail stay
+    // put while only the section's content region scrolls. Every level down to
+    // the Outlet is `min-h-0` so that bound propagates and the section layout's
+    // own `overflow-auto` container is what actually scrolls.
+    <SidebarProvider className="h-svh overflow-hidden">
       <MainSidebar />
-      <SidebarInset>
+      <SidebarInset className="min-h-0 overflow-hidden">
         <header className="flex h-12 shrink-0 items-center border-b px-3 md:hidden">
           <SidebarTrigger className="-ml-1" />
         </header>
-        <div className="flex flex-1 flex-col">
+        <div className="flex min-h-0 flex-1 flex-col">
           <Outlet />
         </div>
       </SidebarInset>

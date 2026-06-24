@@ -14,15 +14,19 @@ import { ProfileIcon, PROFILE_ICON_CHOICES } from "./ProfileIcon";
 export function IconPicker({
   value,
   onChange,
+  id,
 }: {
   value: string;
   onChange: (name: string) => void;
+  /** Binds a <label htmlFor> to the trigger (buttons are labelable). */
+  id?: string;
 }) {
   const [open, setOpen] = useState(false);
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button
+          id={id}
           type="button"
           variant="outline"
           className="w-full justify-start gap-2"
