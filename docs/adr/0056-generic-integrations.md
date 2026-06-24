@@ -507,3 +507,87 @@ at the end with the commit chain.
 - **Generic/config-driven (or WASM) mint so *all* providers are codeless.**
   Deferred (§9): minting is bespoke + security-critical; config covers gating,
   injection, and assets, which is most of the surface.
+
+## Amendment (2026-06-23): mint is a credential *source* on the inject plane — github stops being special
+
+**This realizes the placement this ADR already argued for** ("only the credential
+*source* differs"; the inject type's `// Phase 5 adds mint scopes`). It was found by
+a prod e2e of the Integrations redesign (see ADR 0057 follow-ups).
+
+### The gap
+
+The Decision says gating/injection/observation are universal at the interceptor and
+*only the credential source differs*. But the implementation never put **mint**
+providers on the inject plane: `compileIntegrationPolicy` emits an `IntegrationInject`
+only when `credential.source === "inject"` (a static `secret_ref`). So github (mint)
+got **no egress injection at all**. Its API credential instead rode the bespoke
+ADR-0023 **forge seam** — `engram-agentd forge-credential` over the vsock bridge —
+which *returns the raw `ghs_…` token to the guest*. That both (a) makes github
+special for ordinary API calls, and (b) **violates the brokering property this design
+advertises** (the datadog catalog blurb: "substituted at the egress proxy, never seen
+by the agent") — for github the agent *does* see the credential.
+
+### Decision
+
+Mint becomes a credential **source** behind the *same* `IntegrationInject`, resolved
+at the *same* coordinator seam:
+
+- `IntegrationInject` gains `mint_provider: String` (`#[serde(default)]`, empty ⇒ the
+  existing static `secret_ref` path). `compileIntegrationPolicy` emits an inject entry
+  for **mint** connectors too — but only the **gating** (the connector's hosts + the
+  operation's `methods`/`path_prefixes`) + `mint_provider`. It does **not** set the
+  header: the auth scheme is the provider's, not the policy compiler's.
+- `session_boot::resolve_inject_entries` (the one place that turns a policy inject into
+  an `EgressInjectEntry{secret, header_name, header_template}`) gains a branch: when
+  `mint_provider` is set, resolve the value by **minting** via the `IntegrationBroker`
+  (scoped to the session's bound `session_capabilities`, owner derived from a cap's
+  `@resource` or the sole installation) instead of `SecretStore::get`, and fill the
+  header from the integration.
+- **The header is integration-owned**, via a new `Integration::inject_header(&cred)
+  -> Option<InjectHeader{name,value}>`. The default derives from the
+  `ScopedCredential` variant (`Bearer`/`Basic` → `Authorization`; `AwsSts` → `None`,
+  the SigV4-signing seam). A provider with a non-standard header overrides it — e.g.
+  github injects its installation token as `Authorization: Bearer …` (the
+  `Basic{x-access-token,…}` shape is for git askpass). This is what makes the plane
+  truly generic: adding GCP/AWS/an odd-header SaaS is a trait override, not a policy-
+  compiler edit.
+- **The host-agent and egress proxy are unchanged** — they inject whatever value the
+  coordinator resolved. The scoped token now **never enters the guest**, matching the
+  brokering property. Resume-safe: rebuilt by `build_egress_policy` from the persisted
+  policy + caps, exactly like a static inject.
+
+This **retires `forge-credential` for API access** and folds **PR-open** off
+`perform_action` onto inject + observe: with the token injected, the agent does a
+normal `POST /pulls` and the existing observe plane emits the `pull_request` asset
+(the `issue` path already works this way). `perform_action` remains only as the
+genuine pre-effect-mediation exception (per the original Decision).
+
+### Generic askpass (the one delivery the HTTP interceptor can't do)
+
+git clone/push speaks a credential-*helper* protocol, not a header-injectable HTTP
+API, so it keeps a credential-helper seam. But that seam becomes a **generic
+`Integration` property** — the trait declares its git-remote host(s) + that they need
+helper delivery; the guest's `git` credential config is wired from that declaration,
+not hardcoded to `github.com`. `forge-credential` survives **only** as that generic
+git-askpass primitive (a future gitlab/gitea integration reuses it unchanged).
+
+### Genuine wrinkles (not blockers)
+
+- **Owner/installation resolution.** A static secret has no "account"; a GitHub App
+  token does. Derive the owner from a cap's `@resource` (`provider:action@owner/repo`),
+  else the session's sole installation. Path-based per-request owner (multi-install in
+  one session) is deferred — the proxy already path-matches, so it's a later refinement.
+- **Token refresh.** The minted value is resolved at boot/resume; GitHub App tokens
+  live ~1h. Short and resumed sessions are fine; a long-lived un-resumed session needs
+  the coordinator to re-push the egress policy (or the proxy to re-resolve). Deferred,
+  tracked.
+
+### Phasing
+
+- **P1** — minted inject plane: `mint_provider` on `IntegrationInject` + orchestrator
+  emit + `resolve_inject_entries` mint branch + tests. (github API = egress-injected;
+  token out of the guest.)
+- **P2** — generic git-askpass: trait-declared git-remote delivery; de-hardcode
+  github; `forge-credential` scoped to that primitive.
+- **P3** — retire `forge-credential` for API + move PR-open to inject+observe; update
+  the `create-pull-request` skill to a plain authenticated `POST /pulls`.

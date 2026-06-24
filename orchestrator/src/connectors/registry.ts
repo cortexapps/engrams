@@ -110,7 +110,16 @@ export interface IntegrationInjectJson {
   hosts: string[];
   header_name: string;
   header_template: string;
+  /** Static-secret source (inject connectors). Empty for a mint entry. */
   secret_ref: string;
+  /**
+   * ADR 0056 amendment: when non-empty, the coordinator MINTS this inject's value
+   * via the IntegrationBroker for this provider (scoped to the session's caps)
+   * instead of resolving `secret_ref`. This is how a *mint* connector rides the
+   * same egress inject plane as a static-secret one; the token never enters the
+   * guest. Mutually exclusive with `secret_ref`.
+   */
+  mint_provider: string;
   methods: string[];
   path_prefixes: string[];
 }
@@ -583,6 +592,29 @@ export function compileIntegrationPolicy(
           header_name: inj.header,
           header_template: inj.template ?? "{}",
           secret_ref: inj.secretRef,
+          mint_provider: "",
+          methods,
+          path_prefixes,
+        };
+        const key = JSON.stringify(entry);
+        if (!seenInject.has(key)) {
+          seenInject.add(key);
+          injects.push(entry);
+        }
+      }
+
+      // ADR 0056 amendment: a mint connector rides the SAME egress inject plane —
+      // the coordinator mints the value (scoped to caps) instead of resolving a
+      // static secret, and the *integration* renders the header (scheme is the
+      // provider's, not hardcoded here). So we emit only the GATING + the mint
+      // marker; `header_name`/`header_template` are filled coordinator-side.
+      if (connector.credential.source === "mint") {
+        const entry: IntegrationInjectJson = {
+          hosts: connector.hosts,
+          header_name: "",
+          header_template: "",
+          secret_ref: "",
+          mint_provider: connector.provider,
           methods,
           path_prefixes,
         };

@@ -422,7 +422,7 @@ async fn build_egress_policy(
         // ADR 0057: precomputed in `prepare_inner`/resume from the policy secrets
         // (broker entries only; literals are already in the guest env).
         secrets: egress_secrets,
-        injects: resolve_inject_entries(state, integration_policy, image).await,
+        injects: resolve_inject_entries(state, session_id, integration_policy, image).await,
         observes: build_observe_entries(integration_policy),
         // ADR 0057: per-secret mode replaces a session-level mode; the proxy
         // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
@@ -468,6 +468,7 @@ pub(crate) fn build_observe_entries(
 /// upstream — so we drop it rather than inject an empty header).
 pub(crate) async fn resolve_inject_entries(
     state: &SharedState,
+    session_id: SessionId,
     integration_policy: Option<&engram_core::types::IntegrationPolicy>,
     image: &str,
 ) -> Vec<engram_core::types::egress::EgressInjectEntry> {
@@ -483,41 +484,124 @@ pub(crate) async fn resolve_inject_entries(
         image_tag: &image_tag,
     };
     let schema = engram_core::types::image::SecretSchema::default();
+    // ADR 0056 amendment: mint entries scope their token to the session's bound
+    // capabilities. Fetch them once, only when a mint entry is actually present.
+    let caps = if policy.injects.iter().any(|i| !i.mint_provider.is_empty()) {
+        state
+            .services
+            .meta
+            .get_session_capabilities(session_id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut out = Vec::with_capacity(policy.injects.len());
     for inj in &policy.injects {
-        let secret = match state
-            .services
-            .secrets
-            .get(&ctx, &inj.secret_ref, &schema)
-            .await
-        {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                tracing::warn!(
-                    secret_ref = %inj.secret_ref,
-                    "integration inject secret_ref not resolvable; skipping injection",
-                );
-                continue;
+        let entry = if !inj.mint_provider.is_empty() {
+            // Minted: the GATING is policy-owned (this entry's hosts/methods/paths),
+            // but the HEADER (name + rendered value) is the integration's — so the
+            // auth scheme is the provider's, not hardcoded by the policy compiler.
+            // The scoped credential never enters the guest.
+            match mint_inject_header(state, &inj.mint_provider, &caps).await {
+                Some(h) => engram_core::types::egress::EgressInjectEntry {
+                    secret: h.value,
+                    header_name: h.name,
+                    header_template: "{}".to_string(),
+                    allow_hosts: inj.hosts.clone(),
+                    allow_host_patterns: Vec::new(),
+                    methods: inj.methods.clone(),
+                    path_prefixes: inj.path_prefixes.clone(),
+                },
+                None => continue, // mint_inject_header logged the reason
             }
-            Err(e) => {
-                tracing::warn!(
-                    secret_ref = %inj.secret_ref, error = %e,
-                    "integration inject secret_ref resolution failed; skipping injection",
-                );
-                continue;
+        } else {
+            // Static secret: value from the SecretStore, header from the config.
+            let secret = match state
+                .services
+                .secrets
+                .get(&ctx, &inj.secret_ref, &schema)
+                .await
+            {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    tracing::warn!(
+                        secret_ref = %inj.secret_ref,
+                        "integration inject secret_ref not resolvable; skipping injection",
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        secret_ref = %inj.secret_ref, error = %e,
+                        "integration inject secret_ref resolution failed; skipping injection",
+                    );
+                    continue;
+                }
+            };
+            engram_core::types::egress::EgressInjectEntry {
+                secret,
+                header_name: inj.header_name.clone(),
+                header_template: inj.header_template.clone(),
+                allow_hosts: inj.hosts.clone(),
+                allow_host_patterns: Vec::new(),
+                methods: inj.methods.clone(),
+                path_prefixes: inj.path_prefixes.clone(),
             }
         };
-        out.push(engram_core::types::egress::EgressInjectEntry {
-            secret,
-            header_name: inj.header_name.clone(),
-            header_template: inj.header_template.clone(),
-            allow_hosts: inj.hosts.clone(),
-            allow_host_patterns: Vec::new(),
-            methods: inj.methods.clone(),
-            path_prefixes: inj.path_prefixes.clone(),
-        });
+        out.push(entry);
     }
     out
+}
+
+/// ADR 0056 amendment: resolve a *mint* provider's egress inject header — mint a
+/// credential scoped to the session's caps, then let the integration render it
+/// into a header (`Integration::inject_header`, e.g. github → `Bearer`). The
+/// scoped credential never enters the guest. `None` (logged) when the provider
+/// isn't resolvable, minting fails, or the credential isn't header-injectable
+/// (e.g. AWS SigV4).
+async fn mint_inject_header(
+    state: &SharedState,
+    provider: &str,
+    caps: &[engram_core::types::Capability],
+) -> Option<engram_core::traits::InjectHeader> {
+    let engine = state
+        .integrations
+        .resolve(provider, &state.services.secrets)
+        .await?;
+    // Scope the mint to this provider's caps; owner from a cap's `@owner/repo`.
+    let scoped: Vec<engram_core::types::Capability> = caps
+        .iter()
+        .filter(|c| c.provider == provider)
+        .cloned()
+        .collect();
+    let owner = scoped
+        .iter()
+        .find_map(|c| c.resource.as_deref())
+        .map(|r| r.split('/').next().unwrap_or(r).to_string());
+    let hint = engram_core::traits::CredentialHint {
+        // API injection: the integration's served-host check (e.g. github.com, NOT
+        // api.github.com) skips on None — see the ADR 0056 amendment + #404.
+        served_host: None,
+        owner,
+    };
+    let cred = match engine.mint_credential(&scoped, &hint).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(provider, error = %e, "mint inject: minting failed; skipping injection");
+            return None;
+        }
+    };
+    match engine.inject_header(&cred) {
+        Some(h) => Some(h),
+        None => {
+            tracing::warn!(
+                provider,
+                "mint inject: credential is not header-injectable (e.g. SigV4); skipping"
+            );
+            None
+        }
+    }
 }
 
 /// ADR 0056 (B′): persist the compiled integration policy (as its JSON) so a

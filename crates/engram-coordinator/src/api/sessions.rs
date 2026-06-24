@@ -409,7 +409,9 @@ pub(crate) async fn build_resume_egress_policy(
         .as_ref()
         .map(|p| p.network.clone())
         .unwrap_or_default();
-    let injects = crate::session_boot::resolve_inject_entries(state, policy.as_ref(), image).await;
+    let injects =
+        crate::session_boot::resolve_inject_entries(state, session_id, policy.as_ref(), image)
+            .await;
     let observes = crate::session_boot::build_observe_entries(policy.as_ref());
     Some(assemble_resume_egress_policy(
         session_id,

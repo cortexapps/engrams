@@ -366,6 +366,24 @@ impl Integration for GitHubApp {
             .await
     }
 
+    /// The github installation token is canonically a **bearer** for the REST API
+    /// (the `Basic{username:"x-access-token", …}` shape exists for the git askpass
+    /// helper). Inject it as `Authorization: Bearer <token>` so the same minted
+    /// credential authenticates API calls on the egress inject plane (ADR 0056
+    /// amendment) — and as a worked example of a per-provider header override.
+    fn inject_header(
+        &self,
+        cred: &engram_core::traits::ScopedCredential,
+    ) -> Option<engram_core::traits::InjectHeader> {
+        if let engram_core::traits::ScopedCredential::Basic { password, .. } = cred {
+            return Some(engram_core::traits::InjectHeader {
+                name: "Authorization".to_string(),
+                value: format!("Bearer {password}"),
+            });
+        }
+        engram_core::traits::default_inject_header(cred)
+    }
+
     /// The one mediated action today: open a pull request (`pulls:write`).
     /// `args` = `{repo, head_branch, base_branch, title, body, draft}`; the
     /// reply carries `{url, id, number, state}` the coordinator emits as an

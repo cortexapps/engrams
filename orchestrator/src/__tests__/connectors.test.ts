@@ -152,6 +152,7 @@ describe("compileIntegrationPolicy", () => {
         header_name: "DD-API-KEY",
         header_template: "{}",
         secret_ref: "datadog-api-key",
+        mint_provider: "",
         methods: ["GET"],
         path_prefixes: ["/api/v2/logs/events"],
       },
@@ -164,8 +165,21 @@ describe("compileIntegrationPolicy", () => {
     expect(b).toEqual(a);
   });
 
-  test("a mint capability compiles to no injects (Phase 5)", () => {
-    expect(compileIntegrationPolicy(["github:issues:write"], reg).injects).toEqual([]);
+  test("a mint capability compiles to a minted inject (ADR 0056 amendment)", () => {
+    // A mint connector now rides the SAME egress inject plane as an inject one;
+    // the coordinator resolves the value by minting (scoped to caps) instead of a
+    // static secret. The marker is `mint_provider` + an empty `secret_ref`.
+    const injects = compileIntegrationPolicy(["github:issues:write"], reg).injects;
+    expect(injects).toHaveLength(1);
+    // Gating + the mint marker are policy-owned; the header is filled
+    // coordinator-side from the integration (scheme is the provider's), so it's
+    // empty in the compiled policy.
+    expect(injects[0]).toMatchObject({
+      mint_provider: "github",
+      secret_ref: "",
+      header_name: "",
+      header_template: "",
+    });
   });
 
   test("an empty / unknown capability set compiles to no injects", () => {
@@ -253,9 +267,11 @@ const githubAssetRaw = {
 describe("compileIntegrationPolicy — observes", () => {
   const reg = registryOf(githubAssetRaw);
 
-  test("an op with an asset compiles to an observe — even for a mint connector", () => {
+  test("an op with an asset compiles to both an inject and an observe — even for a mint connector", () => {
     const policy = compileIntegrationPolicy(["github:issues:write"], reg);
-    expect(policy.injects).toEqual([]); // mint → no inject
+    // mint now rides the inject plane too (ADR 0056 amendment), plus its observe.
+    expect(policy.injects).toHaveLength(1);
+    expect(policy.injects[0]).toMatchObject({ mint_provider: "github" });
     expect(policy.observes).toEqual([
       {
         hosts: ["api.github.com"],
@@ -303,9 +319,10 @@ describe("on-disk registry", () => {
     expect(policy.observes[0]!.asset_kind).toBe("query_result");
   });
 
-  test("the shipped github issues:write compiles an issue observe (mint, no inject)", () => {
+  test("the shipped github issues:write compiles a minted inject + an issue observe", () => {
     const policy = compileIntegrationPolicy(["github:issues:write"]);
-    expect(policy.injects).toEqual([]);
+    expect(policy.injects).toHaveLength(1);
+    expect(policy.injects[0]!.mint_provider).toBe("github");
     expect(policy.observes).toHaveLength(1);
     expect(policy.observes[0]!.provider).toBe("github");
     expect(policy.observes[0]!.asset_kind).toBe("issue");

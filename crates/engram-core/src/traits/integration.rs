@@ -98,6 +98,78 @@ pub trait Integration: Send + Sync {
     ) -> Result<serde_json::Value, IntegrationError> {
         Err(IntegrationError::Unsupported)
     }
+
+    /// ADR 0056 amendment: how this provider's minted credential is applied to an
+    /// outbound request to its API host(s). This is what lets a *mint* provider
+    /// ride the same egress inject plane as a static-secret one **without the
+    /// policy compiler hardcoding a scheme**: the gating (which requests) is
+    /// policy-owned; the header (how the credential is applied) is the provider's.
+    ///
+    /// The default derives from the `ScopedCredential` variant (Bearer/Basic →
+    /// `Authorization`). A provider with a non-standard header (custom name, odd
+    /// template) overrides this. `None` ⇒ the credential is not a simple header
+    /// (e.g. AWS SigV4 signs the request) and is not egress-injectable by header
+    /// substitution today — a deliberate seam, not a silent drop.
+    fn inject_header(&self, cred: &ScopedCredential) -> Option<InjectHeader> {
+        default_inject_header(cred)
+    }
+}
+
+/// A complete request-auth header — `name: value`, value already rendered (the
+/// egress proxy substitutes it verbatim). The output of [`Integration::inject_header`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InjectHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Default credential→header mapping by `ScopedCredential` variant. Bearer and
+/// Basic render the standard `Authorization` header; AwsSts is `None` (SigV4 is
+/// request signing, not a header). Providers override [`Integration::inject_header`]
+/// for non-standard schemes.
+pub fn default_inject_header(cred: &ScopedCredential) -> Option<InjectHeader> {
+    match cred {
+        ScopedCredential::Bearer { token, .. } => Some(InjectHeader {
+            name: "Authorization".to_string(),
+            value: format!("Bearer {token}"),
+        }),
+        ScopedCredential::Basic {
+            username, password, ..
+        } => Some(InjectHeader {
+            name: "Authorization".to_string(),
+            value: format!(
+                "Basic {}",
+                base64_std(format!("{username}:{password}").as_bytes())
+            ),
+        }),
+        // SigV4 isn't a static header — a future signing seam, not header-injectable.
+        ScopedCredential::AwsSts { .. } => None,
+    }
+}
+
+/// Minimal standard base64 (RFC 4648, `+/`, `=` padding) — avoids a crate dep for
+/// the one place engram-core needs it (the Basic `inject_header` default).
+fn base64_std(input: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(A[(b0 >> 2) as usize] as char);
+        out.push(A[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            A[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -149,4 +221,58 @@ pub struct MintKindDescriptor {
     /// Build the engine from resolved field values. Pure (no I/O) — the
     /// coordinator resolves the values first.
     pub build: fn(&ResolvedFields) -> Result<Arc<dyn Integration>, IntegrationError>,
+}
+
+#[cfg(test)]
+mod inject_header_tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn base64_std_matches_rfc4648() {
+        assert_eq!(base64_std(b""), "");
+        assert_eq!(base64_std(b"f"), "Zg==");
+        assert_eq!(base64_std(b"fo"), "Zm8=");
+        assert_eq!(base64_std(b"foo"), "Zm9v");
+        assert_eq!(
+            base64_std(b"Aladdin:open sesame"),
+            "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+    }
+
+    #[test]
+    fn default_inject_header_by_variant() {
+        let exp = Utc::now();
+        assert_eq!(
+            default_inject_header(&ScopedCredential::Bearer {
+                token: "tok".into(),
+                expires_at: exp,
+            }),
+            Some(InjectHeader {
+                name: "Authorization".into(),
+                value: "Bearer tok".into(),
+            })
+        );
+        assert_eq!(
+            default_inject_header(&ScopedCredential::Basic {
+                username: "u".into(),
+                password: "p".into(),
+                expires_at: exp,
+            }),
+            Some(InjectHeader {
+                name: "Authorization".into(),
+                value: "Basic dTpw".into(),
+            })
+        );
+        // SigV4 is request signing, not a header — not egress-injectable today.
+        assert_eq!(
+            default_inject_header(&ScopedCredential::AwsSts {
+                access_key_id: "a".into(),
+                secret_access_key: "s".into(),
+                session_token: "t".into(),
+                expires_at: exp,
+            }),
+            None
+        );
+    }
 }
