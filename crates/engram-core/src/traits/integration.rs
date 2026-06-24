@@ -55,11 +55,18 @@ pub enum ScopedCredential {
     },
 }
 
-/// What a credential is being minted for. `host` lets a multi-host provider
-/// reject a mismatched request; `owner` selects the installation/org/user.
+/// What a credential is being minted for.
+///
+/// `served_host` is the provider's OWN host identity (e.g. `github.com` — the
+/// git host), letting a multi-host provider reject a request meant for a host it
+/// doesn't serve. It is **not** the API endpoint the credential is used against
+/// (e.g. `api.github.com`) — those are different namespaces. Only the git-forge
+/// seam sets it (to the git remote host); every other caller — the egress broker
+/// and the connector "test connection" probe — passes `None`. `owner` selects the
+/// installation/org/user.
 #[derive(Clone, Debug, Default)]
 pub struct CredentialHint {
-    pub host: Option<String>,
+    pub served_host: Option<String>,
     pub owner: Option<String>,
 }
 

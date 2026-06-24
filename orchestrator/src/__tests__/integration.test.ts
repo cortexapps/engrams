@@ -37,8 +37,15 @@ const GITHUB_MINT_KIND = {
   ],
 } as unknown as MintKind;
 
-function fakeMint(): MintAccess {
-  return { async listMintKinds() { return { mintKinds: [GITHUB_MINT_KIND] }; } };
+function fakeMint(onTest?: (spec: unknown) => { ok: boolean; message: string }): MintAccess {
+  return {
+    async listMintKinds() {
+      return { mintKinds: [GITHUB_MINT_KIND] };
+    },
+    async runConnectorTest(spec) {
+      return onTest?.(spec) ?? { ok: true, message: "ok" };
+    },
+  };
 }
 
 function fakeOrgSecret(names: string[] = []) {
@@ -452,6 +459,78 @@ describe("UploadConnectorLogo + catalog overlay", () => {
     try {
       await s.client.deleteConnector({ provider: "sentry" });
       expect(fl.rows.has("sentry")).toBe(false);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe("TestConnector", () => {
+  test("anon → Unauthenticated; member → PermissionDenied", async () => {
+    const anon = await spawn({ getSession: makeGetSession(null), connectors: fakeStore().store, mint: fakeMint() });
+    try {
+      await expectErr(anon.client.testConnector({ provider: "datadog", draftValues: {} }), Code.Unauthenticated);
+    } finally {
+      await anon.close();
+    }
+    const mem = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store, mint: fakeMint() });
+    try {
+      await expectErr(mem.client.testConnector({ provider: "datadog", draftValues: {} }), Code.PermissionDenied);
+    } finally {
+      await mem.close();
+    }
+  });
+
+  test("builds the inject spec (header/template/secretRef + draft) from the registry", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      mint: fakeMint((spec) => {
+        captured = spec as Record<string, unknown>;
+        return { ok: true, message: "Reached api.datadoghq.com" };
+      }),
+    });
+    try {
+      const r = await s.client.testConnector({ provider: "datadog", draftValues: { credential: "dd-key" } });
+      expect(r.ok).toBe(true);
+      expect(r.message).toContain("datadoghq");
+      expect(captured).toMatchObject({
+        provider: "datadog",
+        host: "api.datadoghq.com",
+        source: "inject",
+        header: "DD-API-KEY",
+        secretRef: "datadog-api-key",
+        draftSecret: "dd-key",
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("builds the mint spec (kind + draft fields) from the registry", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      mint: fakeMint((spec) => {
+        captured = spec as Record<string, unknown>;
+        return { ok: true, message: "Minted" };
+      }),
+    });
+    try {
+      await s.client.testConnector({ provider: "github", draftValues: { app_id: "1357924" } });
+      expect(captured).toMatchObject({ provider: "github", source: "mint", kind: "github_app" });
+      expect((captured!.draftFields as Record<string, string>).app_id).toBe("1357924");
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("rejects an unknown connector", async () => {
+    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore().store, mint: fakeMint() });
+    try {
+      await expectErr(s.client.testConnector({ provider: "nope", draftValues: {} }), Code.InvalidArgument);
     } finally {
       await s.close();
     }

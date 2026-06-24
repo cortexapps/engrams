@@ -1,24 +1,39 @@
 /**
  * ConnectSheet — the guided "connect a provider" flow (right-side Sheet).
  *
- * Two steps, Authenticate → Review. (A "Test connection" step lands with the
- * coordinator TestConnector RPC; it slots between these without reshaping them.)
+ * Three steps, Authenticate → Test → Review:
  *  - mint   → collect the mint kind's fields → SetMintCredential (seals
  *             `<kind>.<field>` org secrets).
  *  - inject → collect one secret → PutOrgSecret(secretRef).
- * Review shows the powers this unlocks + the egress hosts it opens.
+ * Test makes one real authenticated request (the just-entered draft) and gates
+ * Continue; Review shows the powers this unlocks + the egress hosts it opens.
  */
 
 import { useState } from "react";
 import { toast } from "sonner";
-import { ArrowRightIcon, CheckIcon, InfoIcon, LockIcon, ShieldCheckIcon } from "lucide-react";
+import {
+  ArrowRightIcon,
+  CheckIcon,
+  CircleCheckIcon,
+  InfoIcon,
+  Loader2Icon,
+  LockIcon,
+  ShieldCheckIcon,
+  TriangleAlertIcon,
+  ZapIcon,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { MintFieldKind } from "@/gen/engram/app/v1/mint_pb";
-import { useConnectors, useMintKinds, useSetMintCredential } from "@/hooks/useIntegrations";
+import {
+  useConnectors,
+  useMintKinds,
+  useSetMintCredential,
+  useTestConnector,
+} from "@/hooks/useIntegrations";
 import { usePutOrgSecret } from "@/hooks/useOrgSecrets";
 import { humanizeAction, parseConnectorConfig } from "@/lib/connectorModel";
 import { ProviderTile } from "./ProviderTile";
@@ -39,6 +54,7 @@ export function ConnectSheet({
   const mintKinds = useMintKinds();
   const setMint = useSetMintCredential();
   const putSecret = usePutOrgSecret();
+  const test = useTestConnector();
 
   const isMint = view.credentialSource === "mint";
   const row = conns.data?.connectors.find((c) => c.provider === view.provider);
@@ -52,12 +68,27 @@ export function ConnectSheet({
   const [step, setStep] = useState(0);
   const [values, setValues] = useState<Record<string, string>>({});
   const [injectSecret, setInjectSecret] = useState("");
+  const [testState, setTestState] = useState<"idle" | "ok" | "fail">("idle");
+  const [testMessage, setTestMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const filled = isMint
     ? (mintKind?.fields ?? []).filter((f) => f.required).every((f) => (values[f.name] ?? "").trim())
     : injectSecret.trim().length > 0;
   const pending = setMint.isPending || putSecret.isPending;
+
+  const runTest = async () => {
+    setTestState("idle");
+    const draftValues = isMint ? values : { credential: injectSecret };
+    try {
+      const r = await test.mutateAsync({ provider: view.provider, draftValues });
+      setTestState(r.ok ? "ok" : "fail");
+      setTestMessage(r.message);
+    } catch (e) {
+      setTestState("fail");
+      setTestMessage(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const finish = async () => {
     setError(null);
@@ -76,7 +107,7 @@ export function ConnectSheet({
     }
   };
 
-  const steps = ["Authenticate", "Review"];
+  const steps = ["Authenticate", "Test", "Review"];
 
   return (
     <Sheet open onOpenChange={(o) => !o && onClose()}>
@@ -115,7 +146,7 @@ export function ConnectSheet({
         </div>
 
         <div className="flex-1 overflow-y-auto p-5">
-          {step === 0 ? (
+          {step === 0 && (
             <div className="flex flex-col gap-4">
               <div className="flex gap-3 rounded-lg border bg-secondary p-3">
                 {isMint ? (
@@ -187,7 +218,50 @@ export function ConnectSheet({
                 )}
               </p>
             </div>
-          ) : (
+          )}
+
+          {step === 1 && (
+            <div className="flex flex-col gap-4">
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                We'll make one real request to <code className="font-mono">{view.hosts[0]}</code>{" "}
+                with the credential you entered — just an authenticated ping, no scopes exercised.
+              </p>
+              <div className="flex justify-center py-1">
+                <Button onClick={runTest} disabled={test.isPending}>
+                  {test.isPending ? (
+                    <>
+                      <Loader2Icon className="size-4 animate-spin" />
+                      Testing…
+                    </>
+                  ) : (
+                    <>
+                      <ZapIcon className="size-4" />
+                      {testState === "ok" ? "Test again" : "Test connection"}
+                    </>
+                  )}
+                </Button>
+              </div>
+              {testState === "ok" && (
+                <div className="flex gap-3 rounded-lg border border-instrument-nominal/45 bg-instrument-nominal/[0.09] p-3.5">
+                  <CircleCheckIcon className="mt-0.5 size-4 shrink-0 text-instrument-nominal" />
+                  <div>
+                    <div className="text-sm font-semibold">Connection verified</div>
+                    <div className="mt-0.5 font-mono text-xs leading-relaxed text-muted-foreground">
+                      {testMessage}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {testState === "fail" && (
+                <div className="flex gap-3 rounded-lg border border-destructive/45 bg-destructive/[0.06] p-3.5">
+                  <TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
+                  <div className="text-sm">{testMessage}</div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {step === 2 && (
             <div className="flex flex-col gap-5">
               <div className="flex flex-col gap-2">
                 <Text variant="label">Powers this unlocks</Text>
@@ -226,7 +300,13 @@ export function ConnectSheet({
             {step === 0 ? "Cancel" : "Back"}
           </Button>
           {step < steps.length - 1 ? (
-            <Button onClick={() => setStep(step + 1)} disabled={!filled}>
+            <Button
+              onClick={() => {
+                if (step === 0) setTestState("idle"); // re-test after any cred edit
+                setStep(step + 1);
+              }}
+              disabled={step === 0 ? !filled : testState !== "ok"}
+            >
               Continue
               <ArrowRightIcon className="size-3.5" />
             </Button>

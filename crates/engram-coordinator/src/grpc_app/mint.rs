@@ -1,17 +1,24 @@
-//! ADR 0057 C3: `MintService` over app-gRPC — the read-only mint-kind registry.
-//! The caller is the trusted orchestrator (bearer-authed); per-user authz
-//! (admin-only) lives there. This exposes only the Plane-A *form metadata* from
-//! the coordinator's `mint_kind_registry()`; the mint *logic* (building engines)
-//! stays bespoke Rust in [`crate::integrations`].
+//! ADR 0057 C3: `MintService` over app-gRPC — the read-only mint-kind registry,
+//! plus `RunConnectorTest` (redesign): the actual unseal/mint + benign GET that
+//! backs the Connect/Replace "Test connection" step. The caller is the trusted
+//! orchestrator (bearer-authed); per-user authz (admin-only) lives there. The
+//! coordinator is the only tier that can unseal org secrets + run the mint
+//! engine, so the test executes here from a resolved spec the orchestrator built.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use engram_protocol::app;
 use tonic::{Request, Response, Status};
 
+use engram_core::traits::{CredentialHint, ScopedCredential, SecretContext};
+use engram_core::types::SecretSchema;
+
 use super::auth;
+use crate::state::SharedState;
 
 pub struct AppMintService {
+    pub state: SharedState,
     pub auth: Arc<auth::BearerAuth>,
 }
 
@@ -50,5 +57,131 @@ impl app::mint_service_server::MintService for AppMintService {
             })
             .collect();
         Ok(Response::new(app::ListMintKindsResponse { mint_kinds }))
+    }
+
+    async fn run_connector_test(
+        &self,
+        req: Request<app::RunConnectorTestRequest>,
+    ) -> Result<Response<app::RunConnectorTestResponse>, Status> {
+        self.auth.check(&req)?;
+        let spec = req.into_inner();
+        let state = &self.state;
+        // Resolve the credential (stored or draft) and make one benign GET. The
+        // inner block yields Ok(msg)=accepted / Err(msg)=rejected; a failed test
+        // is a normal {ok:false} result, not a transport-level Status. (Inlined
+        // rather than a free `async fn` so the grpc_app auth-convention test —
+        // which counts one `self.auth.check` per `async fn` — stays satisfied.)
+        let outcome: Result<String, String> = async {
+            let http = reqwest::Client::builder()
+                .user_agent("engram-connector-test")
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("http client: {e}"))?;
+            let url = format!("https://{}/", spec.host);
+
+            let request = if spec.source == "mint" {
+                // Build the engine from the draft fields, or resolve it from the
+                // stored org secrets; minting itself validates the credentials.
+                let engine = if !spec.draft_fields.is_empty() {
+                    let desc = crate::integrations::mint_kind_registry()
+                        .into_iter()
+                        .find(|d| d.kind == spec.kind)
+                        .ok_or_else(|| format!("unknown mint kind \"{}\"", spec.kind))?;
+                    (desc.build)(&spec.draft_fields)
+                        .map_err(|e| format!("invalid credentials: {e}"))?
+                } else {
+                    state
+                        .integrations
+                        .resolve(&spec.provider, &state.services.secrets)
+                        .await
+                        .ok_or_else(|| "mint credentials are not configured".to_string())?
+                };
+                // served_host is the integration's OWN host identity (e.g.
+                // github.com, the git host a multi-host provider validates
+                // against) — a different namespace from the connector's egress/API
+                // host we GET below (api.github.com). The real mint paths pass the
+                // git host (forge.rs) or None (egress broker), never the API host,
+                // so do NOT derive it from spec.host or the provider rejects the
+                // request ("does not serve host `api.github.com`"). Mint the
+                // default credential; the probe still targets spec.host via `url`.
+                let hint = CredentialHint {
+                    served_host: None,
+                    owner: None,
+                };
+                let cred = engine
+                    .mint_credential(&[], &hint)
+                    .await
+                    .map_err(|e| format!("could not mint a token: {e}"))?;
+                match cred {
+                    ScopedCredential::Bearer { token, .. } => http.get(&url).bearer_auth(token),
+                    ScopedCredential::Basic {
+                        username, password, ..
+                    } => http.get(&url).basic_auth(username, Some(password)),
+                    // STS isn't simple header auth; minting succeeded, so that's the test.
+                    ScopedCredential::AwsSts { .. } => {
+                        return Ok(format!(
+                            "Minted scoped AWS credentials for {}",
+                            spec.provider
+                        ));
+                    }
+                }
+            } else {
+                // inject: use the draft value, else resolve the stored org secret.
+                let value = if !spec.draft_secret.is_empty() {
+                    spec.draft_secret.clone()
+                } else {
+                    let ctx = SecretContext {
+                        repo: "",
+                        image_tag: "",
+                    };
+                    let schema = SecretSchema {
+                        required: true,
+                        ..Default::default()
+                    };
+                    state
+                        .services
+                        .secrets
+                        .get(&ctx, &spec.secret_ref, &schema)
+                        .await
+                        .map_err(|e| format!("could not resolve org secret: {e}"))?
+                        .ok_or_else(|| format!("org secret \"{}\" is not set", spec.secret_ref))?
+                };
+                let header_name = if spec.header.is_empty() {
+                    "Authorization"
+                } else {
+                    &spec.header
+                };
+                let template = if spec.template.is_empty() {
+                    "{}"
+                } else {
+                    &spec.template
+                };
+                http.get(&url)
+                    .header(header_name, template.replace("{}", &value))
+            };
+
+            let resp = request
+                .send()
+                .await
+                .map_err(|e| format!("request to {} failed: {e}", spec.host))?;
+            let code = resp.status().as_u16();
+            if code == 401 || code == 403 {
+                Err(format!(
+                    "{} rejected the credential (HTTP {code})",
+                    spec.host
+                ))
+            } else {
+                Ok(format!(
+                    "Reached {} · HTTP {code} · credential accepted",
+                    spec.host
+                ))
+            }
+        }
+        .await;
+        let (ok, message) = match outcome {
+            Ok(m) => (true, m),
+            Err(m) => (false, m),
+        };
+        Ok(Response::new(app::RunConnectorTestResponse { ok, message }))
     }
 }
