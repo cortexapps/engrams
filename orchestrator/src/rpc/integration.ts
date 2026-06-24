@@ -64,10 +64,8 @@ export interface RunConnectorTestSpec {
   provider: string;
   host: string;
   source: string;
-  header?: string;
-  template?: string;
-  secretRef?: string;
-  draftSecret?: string;
+  /** inject source: every header the connector injects (ADR 0058). */
+  injects?: Array<{ header: string; template: string; secretRef: string; draftSecret: string }>;
   kind?: string;
   draftFields?: Record<string, string>;
 }
@@ -338,14 +336,15 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
               provider: req.provider,
               host,
               source: "inject",
-              // A connector may inject several headers; the credential-test UI
-              // probes the PRIMARY (first) one. `injects` is non-empty
-              // (parseConnector enforces it). Testing every header is a follow-up.
-              header: c.credential.injects[0]!.header,
-              template: c.credential.injects[0]!.template ?? "{}",
-              secretRef: c.credential.injects[0]!.secretRef,
-              // the web sends the single drafted secret under any key.
-              draftSecret: Object.values(draft)[0] ?? "",
+              // ADR 0058: probe EVERY injected header. The web sends the drafted
+              // values keyed by org-secret ref (`draft[secretRef]`); a header with
+              // no draft falls back to its stored secret coordinator-side.
+              injects: c.credential.injects.map((inj) => ({
+                header: inj.header,
+                template: inj.template ?? "{}",
+                secretRef: inj.secretRef,
+                draftSecret: draft[inj.secretRef] ?? "",
+              })),
             };
       const { ok, message } = await mint.runConnectorTest(spec);
       return { ok, message };
