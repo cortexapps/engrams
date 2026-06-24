@@ -5,10 +5,21 @@
  * Session-policy rail shows the receipts. Network is automatic (deny-by-default,
  * derived from the granted powers); skills / env / custom secrets / user-token
  * live under Advanced.
+ *
+ * Form stack matches the house pattern (SecretsPanel, ImagesPanel): a single
+ * react-hook-form `useForm` + zodResolver drives the draft; scalar fields are
+ * labeled `Field`s; the collection editors (powers, skills, env, secrets) are
+ * controlled via watch/setValue. Layout is the house shadcn settings shape —
+ * each section a `Card`, the policy rail a `Card` that sticks via a wrapper
+ * (never `position: sticky` on the rounded/overflow-hidden card itself — that
+ * combo clips the corners in Chromium).
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, Link } from "@tanstack/react-router";
+import { Controller, useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import * as z from "zod";
 import { toast } from "sonner";
 import {
   CheckIcon,
@@ -18,6 +29,7 @@ import {
   LockIcon,
   PlusIcon,
   ShieldCheckIcon,
+  TagIcon,
 } from "lucide-react";
 
 import { useProfile, useCreateProfile, useUpdateProfile } from "../../hooks/useProfiles";
@@ -47,6 +59,8 @@ import {
 } from "../../components/profiles/ProfileSecretsEditor";
 import { derivePolicy } from "../../lib/profilePolicy";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
@@ -65,6 +79,35 @@ const linesOf = (text: string) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
+const schema = z.object({
+  name: z.string().trim().min(1, "Name the profile first"),
+  description: z.string(),
+  icon: z.string(),
+  imageId: z.string().min(1, "Select an image"),
+  includeUserTokens: z.boolean(),
+  skills: z.array(z.string()),
+  capabilities: z.array(z.string()),
+  envRows: z.array(z.custom<EnvRow>()),
+  allowHostsText: z.string(),
+  allowPatternsText: z.string(),
+  secretRows: z.array(z.custom<SecretRow>()),
+});
+type ProfileFormValues = z.infer<typeof schema>;
+
+const EMPTY: ProfileFormValues = {
+  name: "",
+  description: "",
+  icon: "Bot",
+  imageId: "",
+  includeUserTokens: false,
+  skills: [],
+  capabilities: [],
+  envRows: [],
+  allowHostsText: "",
+  allowPatternsText: "",
+  secretRows: [],
+};
+
 export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const navigate = useNavigate();
   const params = useParams({ strict: false }) as { id?: string };
@@ -77,44 +120,51 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const create = useCreateProfile();
   const update = useUpdateProfile();
 
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [icon, setIcon] = useState("Bot");
-  const [imageId, setImageId] = useState("");
-  const [includeUserTokens, setIncludeUserTokens] = useState(false);
-  const [skills, setSkills] = useState<string[]>([]);
-  const [capabilities, setCapabilities] = useState<string[]>([]);
-  const [envRows, setEnvRows] = useState<EnvRow[]>([]);
-  const [allowHostsText, setAllowHostsText] = useState("");
-  const [allowPatternsText, setAllowPatternsText] = useState("");
-  const [secretRows, setSecretRows] = useState<SecretRow[]>([]);
   const [netOpen, setNetOpen] = useState(false);
   const [advanced, setAdvanced] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+
+  const form = useForm<ProfileFormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: EMPTY,
+  });
+  const { control, setValue, watch, reset, handleSubmit, formState } = form;
+
+  // Live draft — the policy rail and derived network recompute as these change.
+  const capabilities = watch("capabilities");
+  const skills = watch("skills");
+  const includeUserTokens = watch("includeUserTokens");
+  const imageId = watch("imageId");
+  const envRows = watch("envRows");
+  const secretRows = watch("secretRows");
+  const allowHostsText = watch("allowHostsText");
+  const allowPatternsText = watch("allowPatternsText");
 
   // Hydrate when editing.
   useEffect(() => {
     const p = existing?.profile;
     if (!p) return;
-    setName(p.name);
-    setDescription(p.description);
-    setIcon(p.icon);
-    setImageId(p.imageId);
-    setIncludeUserTokens(p.includeUserTokens);
-    setSkills(p.skills ?? []);
-    setCapabilities(p.capabilities ?? []);
-    setEnvRows(mapToEnvRows(p.envVars));
-    setAllowHostsText((p.network?.allowHosts ?? []).join("\n"));
-    setAllowPatternsText((p.network?.allowHostPatterns ?? []).join("\n"));
-    setSecretRows(wireToSecretRows(p.secrets ?? []));
+    reset({
+      name: p.name,
+      description: p.description,
+      icon: p.icon,
+      imageId: p.imageId,
+      includeUserTokens: p.includeUserTokens,
+      skills: p.skills ?? [],
+      capabilities: p.capabilities ?? [],
+      envRows: mapToEnvRows(p.envVars),
+      allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
+      allowPatternsText: (p.network?.allowHostPatterns ?? []).join("\n"),
+      secretRows: wireToSecretRows(p.secrets ?? []),
+    });
     if ((p.network?.allowHosts ?? []).length || (p.network?.allowHostPatterns ?? []).length)
       setNetOpen(true);
-  }, [existing]);
+  }, [existing, reset]);
 
-  // Default to the first enabled image in create mode.
+  // Default to the first enabled image in create mode (don't clobber a choice).
   useEffect(() => {
-    if (mode === "create" && !imageId && images && images.length > 0) setImageId(images[0]!.id);
-  }, [mode, imageId, images]);
+    if (mode === "create" && !form.getValues("imageId") && images && images.length > 0)
+      setValue("imageId", images[0]!.id);
+  }, [mode, images, form, setValue]);
 
   const network = useMemo(
     () => ({
@@ -124,7 +174,6 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     }),
     [allowHostsText, allowPatternsText],
   );
-  const secretsWire = useMemo(() => secretRowsToWire(secretRows), [secretRows]);
   const policy = useMemo(
     () =>
       derivePolicy(
@@ -141,48 +190,42 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;
 
   // --- capability helpers (enable→select) -----------------------------------
+  const setCaps = (next: string[]) => setValue("capabilities", next, { shouldDirty: true });
   const capOn = (provider: string, action: string) => {
     const cap = `${provider}:${action}`;
     return capabilities.some((x) => x === cap || x.startsWith(`${cap}@`));
   };
   const toggleCap = (provider: string, action: string, on: boolean) => {
     const cap = `${provider}:${action}`;
-    setCapabilities((caps) => {
-      const without = caps.filter((x) => x !== cap && !x.startsWith(`${cap}@`));
-      return on ? [...without, cap] : without;
-    });
+    const without = capabilities.filter((x) => x !== cap && !x.startsWith(`${cap}@`));
+    setCaps(on ? [...without, cap] : without);
   };
   const enableProvider = (v: ConnectorView) => {
     const reads = v.capabilities.filter((c) => c.access === "read");
     const pick = (reads.length ? reads : v.capabilities.slice(0, 1)).map(
       (c) => `${v.provider}:${c.action}`,
     );
-    setCapabilities((caps) => [...new Set([...caps, ...pick])]);
+    setCaps([...new Set([...capabilities, ...pick])]);
   };
   const disableProvider = (v: ConnectorView) =>
-    setCapabilities((caps) => caps.filter((x) => !x.startsWith(`${v.provider}:`)));
+    setCaps(capabilities.filter((x) => !x.startsWith(`${v.provider}:`)));
 
-  const save = async () => {
-    if (!name.trim()) {
-      setError("Name the profile first");
-      return;
-    }
-    if (!imageId) {
-      setError("Select an image");
-      return;
-    }
-    setError(null);
+  const onSubmit = async (vals: ProfileFormValues) => {
     const payload = {
-      name: name.trim(),
-      description,
-      icon,
-      imageId,
-      includeUserTokens,
-      skills,
-      capabilities,
-      envVars: envRowsToMap(envRows),
-      network,
-      secrets: secretsWire,
+      name: vals.name.trim(),
+      description: vals.description,
+      icon: vals.icon,
+      imageId: vals.imageId,
+      includeUserTokens: vals.includeUserTokens,
+      skills: vals.skills,
+      capabilities: vals.capabilities,
+      envVars: envRowsToMap(vals.envRows),
+      network: {
+        default: "deny" as const,
+        allowHosts: linesOf(vals.allowHostsText),
+        allowHostPatterns: linesOf(vals.allowPatternsText),
+      },
+      secrets: secretRowsToWire(vals.secretRows),
     };
     try {
       if (mode === "edit" && editingId) {
@@ -190,68 +233,120 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         toast.success("Saved changes");
       } else {
         await create.mutateAsync(payload);
-        toast.success(`Profile "${name.trim()}" created`);
+        toast.success(`Profile "${vals.name.trim()}" created`);
       }
       navigate({ to: "/settings/profiles" });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      form.setError("root", { message: e instanceof Error ? e.message : String(e) });
     }
   };
 
   const busy = create.isPending || update.isPending;
 
   return (
-    <div className="mx-auto max-w-5xl">
-      <Button asChild variant="ghost" size="sm" className="-ml-2 mb-3 text-muted-foreground">
+    <form onSubmit={handleSubmit(onSubmit)} className="mx-auto w-full max-w-5xl pb-4">
+      <Button asChild variant="ghost" size="sm" className="-ml-2 mb-2 text-muted-foreground">
         <Link to="/settings/profiles">
           <ChevronLeftIcon className="size-4" />
           Profiles
         </Link>
       </Button>
 
-      <div className="grid items-start gap-7 lg:grid-cols-[minmax(0,1fr)_312px]">
+      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+        {/* left: the configuration spine */}
         <div className="flex flex-col gap-6">
-          {/* identity */}
-          <div className="flex items-start gap-3.5">
-            <IconPicker value={icon} onChange={setIcon} />
-            <div className="flex flex-1 flex-col gap-2">
-              <Input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Profile name"
-                aria-label="Profile name"
-                className="h-auto py-2 font-display text-lg font-semibold"
+          <Section
+            icon={<TagIcon className="size-4" />}
+            title="Identity"
+            sub="Name and badge this profile so it's easy to pick later."
+          >
+            <FieldGroup className="gap-4">
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
+                <Controller
+                  control={control}
+                  name="icon"
+                  render={({ field }) => (
+                    <Field className="sm:w-44 sm:shrink-0">
+                      <FieldLabel htmlFor="profile-icon">Icon</FieldLabel>
+                      <IconPicker id="profile-icon" value={field.value} onChange={field.onChange} />
+                    </Field>
+                  )}
+                />
+                <Controller
+                  control={control}
+                  name="name"
+                  render={({ field, fieldState }) => (
+                    <Field className="flex-1" data-invalid={fieldState.invalid}>
+                      <FieldLabel htmlFor="name">Name</FieldLabel>
+                      <Input
+                        {...field}
+                        id="name"
+                        aria-label="Profile name"
+                        aria-invalid={fieldState.invalid}
+                        placeholder="Backend Agent"
+                        className="font-display text-base font-semibold"
+                      />
+                      {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                    </Field>
+                  )}
+                />
+              </div>
+              <Controller
+                control={control}
+                name="description"
+                render={({ field }) => (
+                  <Field>
+                    <FieldLabel htmlFor="description">Description</FieldLabel>
+                    <Input
+                      {...field}
+                      id="description"
+                      aria-label="Description"
+                      placeholder="What is this profile for?"
+                    />
+                    <FieldDescription>
+                      Optional — shown wherever this profile is offered.
+                    </FieldDescription>
+                  </Field>
+                )}
               />
-              <Input
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder="What is this profile for?"
-                aria-label="Description"
-                className="text-sm"
-              />
-            </div>
-          </div>
+            </FieldGroup>
+          </Section>
 
-          <Block
+          <Section
             icon={<GlobeIcon className="size-4" />}
             title="Launches"
             sub="The image every session from this profile boots."
           >
-            <Select value={imageId} onValueChange={setImageId}>
-              <SelectTrigger data-testid="image-select" className="max-w-md font-mono">
-                <SelectValue placeholder="Select an image" />
-              </SelectTrigger>
-              <SelectContent>
-                {(images ?? []).map((i) => (
-                  <SelectItem key={i.id} value={i.id} className="font-mono">
-                    {i.image_uri}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </Block>
+            <Controller
+              control={control}
+              name="imageId"
+              render={({ field, fieldState }) => (
+                <Field data-invalid={fieldState.invalid}>
+                  <FieldLabel htmlFor="image-select">Image</FieldLabel>
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <SelectTrigger
+                      id="image-select"
+                      data-testid="image-select"
+                      aria-invalid={fieldState.invalid}
+                      className="w-full font-mono"
+                    >
+                      <SelectValue placeholder="Select an image" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(images ?? []).map((i) => (
+                        <SelectItem key={i.id} value={i.id} className="font-mono">
+                          {i.image_uri}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                </Field>
+              )}
+            />
+          </Section>
 
-          <Block
+          <Section
             icon={<ShieldCheckIcon className="size-4" />}
             title="Integrations"
             sub="Enable an integration to bind its credential and open its egress — then choose exactly which powers sessions get."
@@ -268,7 +363,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   return (
                     <div
                       key={v.provider}
-                      className={`overflow-hidden rounded-lg border ${on ? "border-ring/40" : "border-border"}`}
+                      className={`overflow-hidden rounded-md border ${on ? "border-ring/40" : "bg-background"}`}
                     >
                       <div
                         className={`flex items-center gap-3 px-3.5 py-3 ${on ? "bg-primary/[0.06]" : ""}`}
@@ -339,16 +434,15 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 </Button>
               </div>
             )}
-          </Block>
+          </Section>
 
-          {/* network */}
-          <Block
+          <Section
             icon={<LockIcon className="size-4" />}
             title="Network"
             sub="Deny by default. Sessions reach only what their powers open — add extra hosts only if a power can't."
           >
-            <div className="flex items-center gap-2.5 rounded-md border bg-card px-3.5 py-2.5">
-              <LockIcon className="size-4 text-instrument-nominal" />
+            <div className="flex items-center gap-2.5 rounded-md border bg-background px-3.5 py-2.5">
+              <LockIcon className="size-4 shrink-0 text-instrument-nominal" />
               <div className="flex-1 text-[0.82rem]">
                 <strong>Automatic egress.</strong>{" "}
                 <span className="text-muted-foreground">
@@ -358,18 +452,22 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 </span>
               </div>
             </div>
-            <div className="mt-2.5 flex flex-wrap gap-1.5">
-              {policy.derivedHosts.map((h) => (
-                <HostChip key={h} host={h} derived />
-              ))}
-              {[...policy.extraHosts, ...policy.extraPatterns].map((h) => (
-                <HostChip key={h} host={h} />
-              ))}
-            </div>
+            {(policy.derivedHosts.length > 0 ||
+              policy.extraHosts.length > 0 ||
+              policy.extraPatterns.length > 0) && (
+              <div className="mt-2.5 flex flex-wrap gap-1.5">
+                {policy.derivedHosts.map((h) => (
+                  <HostChip key={h} host={h} derived />
+                ))}
+                {[...policy.extraHosts, ...policy.extraPatterns].map((h) => (
+                  <HostChip key={h} host={h} />
+                ))}
+              </div>
+            )}
             <button
               type="button"
               onClick={() => setNetOpen((v) => !v)}
-              className="mt-3 inline-flex items-center gap-1.5 text-[0.78rem] text-muted-foreground"
+              className="mt-3 inline-flex items-center gap-1.5 text-[0.78rem] text-muted-foreground hover:text-foreground"
             >
               <ChevronDownIcon
                 className={`size-3.5 transition-transform ${netOpen ? "rotate-180" : ""}`}
@@ -377,37 +475,49 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               Add extra hosts
             </button>
             {netOpen && (
-              <div className="mt-2.5 grid grid-cols-2 gap-3">
-                <label className="flex flex-col gap-1.5">
-                  <Text variant="label">Allowed hosts</Text>
-                  <Textarea
-                    rows={3}
-                    value={allowHostsText}
-                    onChange={(e) => setAllowHostsText(e.target.value)}
-                    placeholder={"db.internal\nregistry.npmjs.org"}
-                    className="font-mono text-sm"
-                  />
-                </label>
-                <label className="flex flex-col gap-1.5">
-                  <Text variant="label">Host patterns</Text>
-                  <Textarea
-                    rows={3}
-                    value={allowPatternsText}
-                    onChange={(e) => setAllowPatternsText(e.target.value)}
-                    placeholder={"*.githubusercontent.com\n*.pypi.org"}
-                    className="font-mono text-sm"
-                  />
-                </label>
+              <div className="mt-2.5 grid gap-3 sm:grid-cols-2">
+                <Controller
+                  control={control}
+                  name="allowHostsText"
+                  render={({ field }) => (
+                    <Field>
+                      <FieldLabel htmlFor="allow-hosts">Allowed hosts</FieldLabel>
+                      <Textarea
+                        {...field}
+                        id="allow-hosts"
+                        rows={3}
+                        placeholder={"db.internal\nregistry.npmjs.org"}
+                        className="font-mono text-sm"
+                      />
+                    </Field>
+                  )}
+                />
+                <Controller
+                  control={control}
+                  name="allowPatternsText"
+                  render={({ field }) => (
+                    <Field>
+                      <FieldLabel htmlFor="allow-patterns">Host patterns</FieldLabel>
+                      <Textarea
+                        {...field}
+                        id="allow-patterns"
+                        rows={3}
+                        placeholder={"*.githubusercontent.com\n*.pypi.org"}
+                        className="font-mono text-sm"
+                      />
+                    </Field>
+                  )}
+                />
               </div>
             )}
-          </Block>
+          </Section>
 
-          {/* advanced */}
-          <div>
+          {/* advanced — a disclosure card, de-emphasized beneath the spine */}
+          <Card className="gap-0 py-0">
             <button
               type="button"
               onClick={() => setAdvanced((v) => !v)}
-              className="flex w-full items-center gap-2 border-t py-2.5 text-left"
+              className="flex w-full items-center gap-2 px-6 py-4 text-left"
             >
               <ChevronDownIcon
                 className={`size-4 text-muted-foreground transition-transform ${advanced ? "rotate-180" : ""}`}
@@ -418,76 +528,87 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               </span>
             </button>
             {advanced && (
-              <Advanced
-                skillCatalog={skillCatalog ?? []}
-                skills={skills}
-                setSkills={setSkills}
-                envRows={envRows}
-                setEnvRows={setEnvRows}
-                secretRows={secretRows}
-                setSecretRows={setSecretRows}
-                orgSecretNames={orgSecretNames ?? []}
-                includeUserTokens={includeUserTokens}
-                setIncludeUserTokens={setIncludeUserTokens}
-              />
+              <CardContent className="border-t pt-6 pb-6">
+                <Advanced
+                  skillCatalog={skillCatalog ?? []}
+                  skills={skills}
+                  setSkills={(s) => setValue("skills", s, { shouldDirty: true })}
+                  envRows={envRows}
+                  setEnvRows={(r) => setValue("envRows", r, { shouldDirty: true })}
+                  secretRows={secretRows}
+                  setSecretRows={(r) => setValue("secretRows", r, { shouldDirty: true })}
+                  orgSecretNames={orgSecretNames ?? []}
+                  includeUserTokens={includeUserTokens}
+                  setIncludeUserTokens={(b) =>
+                    setValue("includeUserTokens", b, { shouldDirty: true })
+                  }
+                />
+              </CardContent>
             )}
-          </div>
+          </Card>
 
-          {error && <p className="text-sm text-destructive">{error}</p>}
+          {formState.errors.root && <FieldError errors={[formState.errors.root]} />}
         </div>
 
-        <PolicyRail
-          policy={policy}
-          imageUri={imageUri}
-          skillsCount={skills.length}
-          includeUserTokens={includeUserTokens}
-        />
+        {/* right: live policy receipts. Sticky lives on the wrapper so the
+            rounded/overflow-hidden card never clips its own corners. */}
+        <div className="lg:sticky lg:top-6">
+          <PolicyRail
+            policy={policy}
+            imageUri={imageUri}
+            skillsCount={skills.length}
+            includeUserTokens={includeUserTokens}
+          />
+        </div>
       </div>
 
-      {/* sticky save bar */}
-      <div className="sticky bottom-0 mt-7 flex justify-end gap-2.5 bg-gradient-to-t from-background to-transparent py-3.5">
+      {/* sticky save bar — solid, hairline-topped (no gradient fade) */}
+      <div className="sticky bottom-0 z-10 mt-6 flex justify-end gap-2.5 border-t bg-background py-3.5">
         <Button
+          type="button"
           variant="ghost"
           onClick={() => navigate({ to: "/settings/profiles" })}
           disabled={busy}
         >
           Cancel
         </Button>
-        <Button onClick={save} disabled={busy}>
+        <Button type="submit" disabled={busy}>
           <CheckIcon className="size-4" />
           {mode === "edit" ? "Save changes" : "Create profile"}
         </Button>
       </div>
-    </div>
+    </form>
   );
 }
 
-function Block({
+function Section({
   icon,
   title,
   sub,
   children,
 }: {
-  icon: React.ReactNode;
+  icon?: React.ReactNode;
   title: string;
   sub: string;
   children: React.ReactNode;
 }) {
   return (
-    <section>
-      <div className="mb-1 flex items-center gap-2 text-muted-foreground">
-        {icon}
-        <h2 className="font-display text-base font-semibold text-foreground">{title}</h2>
-      </div>
-      <p className="mb-3 ml-6 text-[0.8rem] leading-relaxed text-muted-foreground">{sub}</p>
-      <div className="ml-6">{children}</div>
-    </section>
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          {icon && <span className="text-muted-foreground">{icon}</span>}
+          {title}
+        </CardTitle>
+        <CardDescription className="leading-relaxed">{sub}</CardDescription>
+      </CardHeader>
+      <CardContent>{children}</CardContent>
+    </Card>
   );
 }
 
 function EmptyIntegrations() {
   return (
-    <div className="rounded-lg border border-dashed p-6 text-center">
+    <div className="rounded-md border border-dashed p-6 text-center">
       <p className="text-[0.84rem] text-muted-foreground">
         No integrations connected yet — there are no powers to grant.
       </p>
@@ -557,7 +678,7 @@ function Advanced({
   };
 
   return (
-    <div className="ml-6 mt-4 flex flex-col gap-6">
+    <div className="flex flex-col gap-6">
       {/* skills */}
       <div>
         <Text variant="label">Skills</Text>
@@ -567,7 +688,7 @@ function Advanced({
             return (
               <div
                 key={s.name}
-                className="flex items-center gap-3 rounded-md border bg-card px-3 py-2"
+                className="flex items-center gap-3 rounded-md border bg-background px-3 py-2"
               >
                 <Switch
                   checked={on}
@@ -648,7 +769,7 @@ function Advanced({
       </div>
 
       {/* user token */}
-      <div className="flex items-center gap-3 rounded-md border bg-card px-3 py-2.5">
+      <div className="flex items-center gap-3 rounded-md border bg-background px-3 py-2.5">
         <Switch
           checked={includeUserTokens}
           onCheckedChange={setIncludeUserTokens}

@@ -15,6 +15,7 @@ import {
   UserIcon,
 } from "lucide-react";
 
+import { Card } from "@/components/ui/card";
 import { Text } from "@/components/ui/text";
 import { ProviderTile } from "@/components/integrations/ProviderTile";
 import type { DerivedPolicy } from "@/lib/profilePolicy";
@@ -31,7 +32,7 @@ export function PolicyRail({
   includeUserTokens: boolean;
 }) {
   return (
-    <aside className="sticky top-4 flex flex-col overflow-hidden rounded-lg border bg-card shadow-xs">
+    <Card className="gap-0 overflow-hidden py-0 shadow-xs">
       <div className="flex items-center gap-2 border-b bg-secondary px-4 py-3">
         <ShieldCheckIcon className="size-3.5 text-instrument-nominal" />
         <Text variant="label" className="text-[0.64rem]">
@@ -131,7 +132,7 @@ export function PolicyRail({
           </span>
         </div>
       </div>
-    </aside>
+    </Card>
   );
 }
 
