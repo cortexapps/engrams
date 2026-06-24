@@ -89,18 +89,20 @@ Firecracker path; VZ exists to exercise that path on macOS, not to fork it.
 
 ## CI
 
-`.github/workflows/ci.yml` + `ci-macos-vz.yml` are **path-gated** by
+`.github/workflows/ci.yml` is the **single** CI workflow (Linux + macOS/VZ + the e2e
+stack all live here — there is no separate macOS workflow), **path-gated** by
 `.github/scripts/detect-rebake-lanes.py` (a cargo-dep-closure detector): only the lanes a
 change can affect run (orchestrator-only → only orchestrator; web-only → only web;
-a coordinator-crate change → Rust lanes + firecracker). `bake-images.yml` bakes only the
-changed images. A CI-workflow or detector change re-runs everything.
+a coordinator-crate change → Rust lanes incl. macOS/VZ + firecracker + e2e). `bake-images.yml`
+bakes only the changed images. A CI-workflow or detector change re-runs everything.
 
-**The only required status checks are the aggregators `CI Gate` and `CI (macOS) Gate`** —
-they always run, `needs:` every lane, and pass iff each lane succeeded-or-skipped. When you
-add a new lane, add it to the gate's `needs:` (and give it a detector flag) — **never add an
-individual lane as a required check**, or a path-skipped lane will wedge the merge queue.
-`.github/**` is outside `just check`: validate workflow YAML (`yaml.safe_load` / actionlint)
-and prefer `run: |` block scalars. Keep the `merge_group` trigger in any required workflow.
+**The only required status check is the aggregator `CI Gate`** — it always runs, `needs:`
+EVERY lane (Linux, macOS, firecracker, AND the e2e stack), and passes iff each lane
+succeeded-or-skipped. When you add a new lane, add it to the gate's `needs:` (and give it a
+detector flag) — **never add an individual lane as a required check**, or a path-skipped lane
+will wedge the merge queue. `.github/**` is outside `just check`: validate workflow YAML
+(`yaml.safe_load` / actionlint) and prefer `run: |` block scalars. Keep the `merge_group`
+trigger in the required workflow.
 
 ## Conventions
 
