@@ -19,6 +19,8 @@ description = "Integration CLIs (gh, datadog-ci) + a discovery skill, glibc-link
 [versions]
 # GitHub CLI — a static Go binary (no glibc deps).
 gh = "2.62.0"
-# Datadog CI — a Node SEA standalone binary (glibc-linked; build.sh collects its
-# .so deps so the bundle runs on any glibc base, like the playwright bundle).
+# Datadog CI — a Node SEA standalone binary. Runs with the base image's own
+# glibc + libstdc++ (no bundled libs: a bundled libc/loader segfaults the SEA,
+# and a newer-glibc libstdc++ won't load on an older base). Targets a full glibc
+# base — the same constraint as the binary itself.
 datadog_ci = "2.48.0"

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ADR 0058: build the `integrations-cli` RO bundle — the shared CLI toolbox for
-# connected integrations. A self-contained, glibc-linked tree: the GitHub CLI
-# (`gh`, a static Go binary) + Datadog CI (`datadog-ci`, a Node SEA standalone)
-# + their collected `.so` deps + position-independent wrappers, plus the
-# `integrations` discovery skill and the `engrams-integrations` helper.
+# connected integrations. The GitHub CLI (`gh`, a static Go binary) + Datadog CI
+# (`datadog-ci`, a Node SEA standalone), plus the `integrations` discovery skill
+# and the `engrams-integrations` helper. The binaries run with the base image's
+# own glibc (no bundled libc/loader/libstdc++ — see the build_tree note); the
+# bundle targets a full glibc base, the same constraint as the binaries.
 #
 # Auth is brokered (ADR 0056/0057): each CLI carries only a harmless placeholder
 # token in its env; the egress proxy injects the real, capability-scoped
@@ -15,14 +16,11 @@
 # MCP server").
 #
 # Layout produced (ADR 0055: mounted at a dynamic reserved slot
-# `/opt/engram/dyn/<i>`; wrappers self-locate from $0, so it's position-
-# independent and never names a fixed mount path):
-#   tools/gh                fetched static Go binary
-#   tools/datadog-ci        fetched Node SEA standalone binary
-#   lib/                    collected .so deps (LD_LIBRARY_PATH target)
-#   bin/gh, bin/datadog-ci  wrappers: set the runtime env, exec the real tool
+# `/opt/engram/dyn/<i>`; agentd symlinks each bin/ entry onto PATH):
+#   bin/gh                    fetched static Go binary
+#   bin/datadog-ci            fetched Node SEA standalone binary (base glibc)
 #   bin/engrams-integrations  the discovery helper (committed; copied in)
-#   skills/integrations/    the SKILL.md (committed; copied in)
+#   skills/integrations/      the SKILL.md (committed; copied in)
 #
 # Usage:
 #   build.sh --stage <dir>      # produce the unpacked tree at <dir> (dev)
@@ -66,47 +64,29 @@ build_tree() {
             *) echo "unsupported arch $ARCH" >&2; exit 1 ;;
         esac
 
-        mkdir -p /out/tools /out/lib /out/bin
+        mkdir -p /out/bin
+
+        # The two CLIs go straight into bin/ and run with the base image s own
+        # glibc — NO bundled libc / loader / libstdc++. Validated on the dev-vm:
+        # gh is a static Go binary (runs anywhere); datadog-ci is a Node SEA that
+        # dynamically links the base s glibc + libstdc++ and runs fine directly,
+        # but SEGFAULTS under a bundled libc/loader (a pkg/SEA binary is
+        # loader-sensitive) and a bundled libstdc++ built against a newer glibc
+        # demands that newer glibc on the base. So we ship the binaries only;
+        # the bundle targets a full glibc base (libstdc++ present) — same
+        # realistic constraint as the binaries themselves (see manifest.toml).
 
         # 1) GitHub CLI — a static Go binary; the tarball nests it under
         #    gh_<ver>_linux_<arch>/bin/gh.
         curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz" \
             | tar -xz -C /tmp
-        cp "/tmp/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /out/tools/gh
-        chmod 0755 /out/tools/gh
+        cp "/tmp/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /out/bin/gh
+        chmod 0755 /out/bin/gh
 
         # 2) Datadog CI — a single standalone executable (Node SEA).
-        curl -fsSL -o /out/tools/datadog-ci \
+        curl -fsSL -o /out/bin/datadog-ci \
             "https://github.com/DataDog/datadog-ci/releases/download/v${DATADOG_CI_VERSION}/datadog-ci_linux-${DDCI_ARCH}"
-        chmod 0755 /out/tools/datadog-ci
-
-        # 3) Collect each tool s .so deps into /out/lib so the bundle runs on any
-        #    glibc base (gh is static → none; datadog-ci dynamically links
-        #    libc/libstdc++). Fail-soft per tool: a static binary lists nothing.
-        collect() {
-            ldd "$1" 2>/dev/null | awk "/=>/ {print \$3} /ld-linux/ {print \$1}" \
-                | grep -E "^/" | sort -u | while read -r so; do
-                    cp -nL "$so" /out/lib/ 2>/dev/null || true
-                done
-        }
-        collect /out/tools/gh
-        collect /out/tools/datadog-ci
-
-        # 4) Position-independent wrappers: resolve the bundle root from $0
-        #    (readlink -f follows the PATH symlink agentd creates), point the
-        #    loader at the collected libs, exec the real tool. agentd symlinks
-        #    these onto PATH as `gh` / `datadog-ci`.
-        for tool in gh datadog-ci; do
-            cat > "/out/bin/$tool" <<WRAP
-#!/bin/sh
-# ADR 0058 integrations-cli wrapper ($tool). Position-independent (ADR 0055):
-# the bundle mounts at a dynamic slot, so resolve the root from \$0.
-here="\$(cd -- "\$(dirname -- "\$(readlink -f -- "\$0")")/.." && pwd)"
-export LD_LIBRARY_PATH="\$here/lib:\${LD_LIBRARY_PATH:-}"
-exec "\$here/tools/$tool" "\$@"
-WRAP
-            chmod 0755 "/out/bin/$tool"
-        done
+        chmod 0755 /out/bin/datadog-ci
 
         chown -R "$HOST_UID:$HOST_GID" /out
     '
