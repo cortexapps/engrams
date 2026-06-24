@@ -153,15 +153,21 @@ export interface ParsedCapability {
   asset?: string;
 }
 
+/** One injected header backed by its own org secret (ADR 0058: a connector may
+ * inject several, e.g. Datadog's DD-API-KEY + DD-APPLICATION-KEY). */
+export interface ParsedInject {
+  header: string;
+  secretRef: string;
+  template: string;
+}
+
 export interface ParsedConnectorConfig {
   provider: string;
   credentialSource: "mint" | "inject";
   hosts: string[];
   display: { name: string; category: string; blurb: string; icon: { mono: string; color: string } };
-  /** inject only */
-  header?: string;
-  template?: string;
-  secretRef?: string;
+  /** inject only — one or more headers, each backed by an org secret. */
+  injects?: ParsedInject[];
   /** mint only */
   mintKind?: string;
   capabilities: ParsedCapability[];
@@ -230,11 +236,11 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     },
     ...(credentialSource === "inject"
       ? {
-          // A connector may inject several headers; the detail view shows the
-          // primary (first). Multi-header display is a follow-up.
-          header: cred.injects?.[0]?.header,
-          template: cred.injects?.[0]?.template ?? "{}",
-          secretRef: cred.injects?.[0]?.secretRef,
+          injects: (cred.injects ?? []).map((i) => ({
+            header: i.header ?? "",
+            secretRef: i.secretRef ?? "",
+            template: i.template ?? "{}",
+          })),
         }
       : { mintKind: cred.mint?.kind }),
     capabilities,

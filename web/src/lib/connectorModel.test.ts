@@ -116,10 +116,31 @@ describe("parseConnectorConfig", () => {
     });
     const c = parseConnectorConfig(raw, "sentry");
     expect(c.credentialSource).toBe("inject");
-    expect(c.header).toBe("Authorization");
-    expect(c.secretRef).toBe("sentry-token");
+    expect(c.injects).toEqual([
+      { header: "Authorization", template: "Bearer {}", secretRef: "sentry-token" },
+    ]);
     expect(c.display.name).toBe("Sentry");
     expect(c.display.icon.mono).toBe("SE");
+  });
+
+  test("surfaces ALL injected headers (ADR 0058 multi-credential, e.g. Datadog pup)", () => {
+    const raw = JSON.stringify({
+      provider: "datadog",
+      credential: {
+        source: "inject",
+        injects: [
+          { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" },
+          { header: "DD-APPLICATION-KEY", secretRef: "datadog-app-key" },
+        ],
+      },
+      hosts: ["api.datadoghq.com"],
+      operations: [{ grants: ["read"], match: { method: "GET", path: "/api/*" } }],
+    });
+    const c = parseConnectorConfig(raw, "datadog");
+    expect(c.injects).toEqual([
+      { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" },
+      { header: "DD-APPLICATION-KEY", secretRef: "datadog-app-key", template: "{}" },
+    ]);
   });
 
   test("malformed JSON yields an empty inject connector (no throw)", () => {
