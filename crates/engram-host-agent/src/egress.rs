@@ -140,7 +140,7 @@ pub fn register_policy(
             allow,
             policy: engram_egress_proxy::RequestPolicy {
                 methods: i.methods,
-                path_prefixes: i.path_prefixes,
+                path_globs: i.path_globs,
             },
         });
     }
@@ -155,7 +155,7 @@ pub fn register_policy(
             allow,
             policy: engram_egress_proxy::RequestPolicy {
                 methods: o.methods,
-                path_prefixes: o.path_prefixes,
+                path_globs: o.path_globs,
             },
             provider: o.provider,
             asset_kind: o.asset_kind,
@@ -210,13 +210,13 @@ mod tests {
                     allow_hosts: vec!["api.datadoghq.com".into()],
                     allow_host_patterns: vec![],
                     methods: vec!["GET".into()],
-                    path_prefixes: vec!["/api/v2/logs*".into()],
+                    path_globs: vec!["/api/v2/logs*".into()],
                 }],
                 observes: vec![EgressObserveEntry {
                     allow_hosts: vec!["api.github.com".into()],
                     allow_host_patterns: vec![],
                     methods: vec!["POST".into()],
-                    path_prefixes: vec!["/repos/*/issues".into()],
+                    path_globs: vec!["/repos/*/issues".into()],
                     provider: "github".into(),
                     asset_kind: "issue".into(),
                     surface: "asset".into(),

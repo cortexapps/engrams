@@ -2,7 +2,7 @@
 //!
 //! For an `Intercept` decision carrying inject entries, the proxy parses
 //! the HTTP/1.1 request line, the caller enforces each applicable entry's
-//! [`crate::registry::RequestPolicy`] (method + path prefix), and on a
+//! [`crate::registry::RequestPolicy`] (method + path glob), and on a
 //! match this module adds the entry's auth header — carrying the host-side
 //! secret the guest never sees. (A request to an inject-gated host whose
 //! shape matches no entry is rejected by the caller.)
@@ -172,7 +172,7 @@ mod tests {
         // the shape the orchestrator emits for read ops (e.g. datadog logs).
         let p = RequestPolicy {
             methods: vec!["GET".into()],
-            path_prefixes: vec!["/api/v2/logs*".into()],
+            path_globs: vec!["/api/v2/logs*".into()],
         };
         assert!(p.allows("GET", "/api/v2/logs/events"));
         assert!(p.allows("GET", "/api/v2/logs/events?query=x")); // query swallowed by `*`
@@ -186,7 +186,7 @@ mod tests {
         // emitting a junk asset on branch creation).
         let pulls = RequestPolicy {
             methods: vec!["POST".into()],
-            path_prefixes: vec!["/repos/*/pulls".into()],
+            path_globs: vec!["/repos/*/pulls".into()],
         };
         assert!(pulls.allows("POST", "/repos/octo/repo/pulls"));
         assert!(!pulls.allows("POST", "/repos/octo/repo/git/refs"));

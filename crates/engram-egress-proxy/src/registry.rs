@@ -79,21 +79,19 @@ pub struct InjectEntry {
 
 /// ADR 0056: the request shapes a Plane-B injection gates + applies to.
 /// Layered on top of the SNI host match. `methods` empty = any method;
-/// `path_prefixes` empty = any path.
+/// `path_globs` empty = any path.
 ///
-/// `path_prefixes` are **glob patterns** — a `*` matches any run of characters
-/// (including `/`) — matched against the whole request path. The name is
-/// historical: the orchestrator used to truncate the connector match path at the
-/// first `*` and prefix-match the literal head, so `/repos/*/pulls` collapsed to
-/// `/repos/` and the gate + observe fired on *any* `/repos/…` request (a coarse
-/// over-match — e.g. a branch-creation `POST /repos/o/r/git/refs` got the token
-/// injected and emitted a junk `pull_request` asset). It now carries the whole
-/// pattern and globs it, so `POST /repos/o/r/pulls` matches `/repos/*/pulls`
-/// while `POST /repos/o/r/git/refs` does not.
+/// `path_globs` are **glob patterns** — a `*` matches any run of characters
+/// (including `/`) — matched against the whole request path (the connector op's
+/// full `match.path`). So `POST /repos/o/r/pulls` matches `/repos/*/pulls` while
+/// `POST /repos/o/r/git/refs` does not. (These were once truncated at the first
+/// `*` and prefix-matched — a coarse over-match where `/repos/*/pulls` collapsed
+/// to `/repos/` and the gate fired on *any* `/repos/…` request; fixed in #413,
+/// renamed from `path_prefixes` to match.)
 #[derive(Clone, Debug, Default)]
 pub struct RequestPolicy {
     pub methods: Vec<String>,
-    pub path_prefixes: Vec<String>,
+    pub path_globs: Vec<String>,
 }
 
 impl RequestPolicy {
@@ -101,8 +99,7 @@ impl RequestPolicy {
     /// match is a glob over the whole path (`*` = any chars). Empty list = "any".
     pub fn allows(&self, method: &str, path: &str) -> bool {
         (self.methods.is_empty() || self.methods.iter().any(|m| m.eq_ignore_ascii_case(method)))
-            && (self.path_prefixes.is_empty()
-                || self.path_prefixes.iter().any(|p| glob_match(p, path)))
+            && (self.path_globs.is_empty() || self.path_globs.iter().any(|p| glob_match(p, path)))
     }
 }
 
@@ -321,14 +318,14 @@ mod tests {
                 allow: HostList::from_manifest(&["api.datadoghq.com".into()], &[]).unwrap(),
                 policy: RequestPolicy {
                     methods: vec!["GET".into()],
-                    path_prefixes: vec!["/api/v2/logs*".into()],
+                    path_globs: vec!["/api/v2/logs*".into()],
                 },
             }],
             observes: vec![ObserveEntry {
                 allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
                 policy: RequestPolicy {
                     methods: vec!["POST".into()],
-                    path_prefixes: vec!["/repos/*/issues".into()],
+                    path_globs: vec!["/repos/*/issues".into()],
                 },
                 provider: "github".into(),
                 asset_kind: "issue".into(),

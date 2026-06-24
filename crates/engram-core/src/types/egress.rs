@@ -69,9 +69,9 @@ pub struct EgressSecretEntry {
 /// applies. The coordinator resolves the connector's `secret_ref` to
 /// `secret` (its real value, host-side) before shipping; on an outbound
 /// request matching `allow_hosts`/`allow_host_patterns` (SNI) AND the
-/// request policy (`methods` + `path_prefixes`), the proxy adds
+/// request policy (`methods` + `path_globs`), the proxy adds
 /// `header_name: <header_template with "{}" → secret>`. The guest never
-/// holds the secret. Empty `methods`/`path_prefixes` = any.
+/// holds the secret. Empty `methods`/`path_globs` = any.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EgressInjectEntry {
     pub secret: String,
@@ -80,13 +80,13 @@ pub struct EgressInjectEntry {
     pub allow_hosts: Vec<String>,
     pub allow_host_patterns: Vec<String>,
     pub methods: Vec<String>,
-    pub path_prefixes: Vec<String>,
+    pub path_globs: Vec<String>,
 }
 
 /// ADR 0056 Phase 4: one resolved response-observation spec the host proxy
 /// applies. Carries no secret — the asset map operates on the response. On an
 /// outbound request matching `allow_hosts`/`allow_host_patterns` (SNI) AND the
-/// request policy (`methods` + `path_prefixes`), the proxy parses the response
+/// request policy (`methods` + `path_globs`), the proxy parses the response
 /// and emits an `IntegrationAsset` (`provider`/`asset_kind`/`surface`) built
 /// from `data` + `fetchable`, gated by `success_status_class`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ pub struct EgressObserveEntry {
     pub allow_hosts: Vec<String>,
     pub allow_host_patterns: Vec<String>,
     pub methods: Vec<String>,
-    pub path_prefixes: Vec<String>,
+    pub path_globs: Vec<String>,
     pub provider: String,
     pub asset_kind: String,
     pub surface: String,

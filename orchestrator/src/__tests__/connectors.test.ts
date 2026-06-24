@@ -154,7 +154,7 @@ describe("compileIntegrationPolicy", () => {
         secret_ref: "datadog-api-key",
         mint_provider: "",
         methods: ["GET"],
-        path_prefixes: ["/api/v2/logs/events*"],
+        path_globs: ["/api/v2/logs/events*"],
       },
     ]);
   });
@@ -276,7 +276,7 @@ describe("compileIntegrationPolicy — observes", () => {
       {
         hosts: ["api.github.com"],
         methods: ["POST"],
-        path_prefixes: ["/repos/*/issues"],
+        path_globs: ["/repos/*/issues"],
         provider: "github",
         asset_kind: "issue",
         surface: "asset",

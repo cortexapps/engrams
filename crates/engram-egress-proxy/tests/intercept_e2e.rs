@@ -86,7 +86,7 @@ fn inject_entry(secret: &str, methods: &[&str], paths: &[&str]) -> InjectEntry {
         allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
         policy: RequestPolicy {
             methods: methods.iter().map(|s| s.to_string()).collect(),
-            path_prefixes: paths.iter().map(|s| s.to_string()).collect(),
+            path_globs: paths.iter().map(|s| s.to_string()).collect(),
         },
     }
 }
@@ -527,7 +527,7 @@ async fn observes_response_and_emits_asset() {
         allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
         policy: RequestPolicy {
             methods: vec!["POST".into()],
-            path_prefixes: vec!["/repos/*/issues".into()],
+            path_globs: vec!["/repos/*/issues".into()],
         },
         provider: "github".into(),
         asset_kind: "issue".into(),
@@ -630,7 +630,7 @@ async fn failed_status_emits_no_asset() {
         allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
         policy: RequestPolicy {
             methods: vec!["POST".into()],
-            path_prefixes: vec!["/repos/*/issues".into()],
+            path_globs: vec!["/repos/*/issues".into()],
         },
         provider: "github".into(),
         asset_kind: "issue".into(),
