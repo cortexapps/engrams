@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// Server-side integration invocation, sessionless (the "IntegrationOp" seam).
+// The coordinator is the only tier that can unseal org secrets + run the mint
+// engine, so — exactly like MintService.RunConnectorTest — the orchestrator (which
+// owns the connector catalog) builds a fully-resolved spec and the coordinator
+// executes it. The orchestrator composes two modes from one connector.
+//
+// RunIntegrationOp: the coordinator makes the authenticated HTTPS call, so the
+// credential never leaves the coordinator (no SDK).
+//
+// ResolveIntegrationCredential: the coordinator returns the resolved credential to
+// the orchestrator so an off-the-shelf SDK (e.g. @slack/web-api) can run in-process.
+// The token crosses to the orchestrator tier — a trusted first-party backend — but
+// NEVER to a guest VM. Bearer-gated and audit-logged at the coordinator.
+//
+// Admin authz lives at the orchestrator (the caller); this surface is bearer-authed
+// machine-to-machine like the rest of app-gRPC.
+service IntegrationOpService {
+  // Make one authenticated HTTPS request against the connector's host with the
+  // resolved credential. Redirects are NOT followed (a cross-host 30x would leak
+  // the injected credential). Returns the upstream status + (size-capped) body.
+  rpc RunIntegrationOp(RunIntegrationOpRequest) returns (RunIntegrationOpResponse);
+  // Resolve a connector's credential to its raw material so the orchestrator can
+  // drive an off-the-shelf SDK. Returns a typed ResolvedCredential.
+  rpc ResolveIntegrationCredential(ResolveIntegrationCredentialRequest)
+      returns (ResolveIntegrationCredentialResponse);
+}
+
+// One header a connector injects, resolved from an org secret coordinator-side.
+// Mirrors the inject half of MintService.ConnectorTestInject (minus drafts — these
+// ops always run against the stored credential).
+message OpInject {
+  string header = 1;      // header name (default Authorization)
+  string template = 2;    // "Bearer {}" / "{}" — {} is substituted with the secret
+  string secret_ref = 3;  // org secret to resolve
+}
+
+// How to resolve a connector's credential. Built by the orchestrator from the
+// connector's `credential` block; the coordinator is connector-agnostic.
+message CredentialSpec {
+  string source = 1;             // "inject" | "mint"
+  repeated OpInject injects = 2; // inject source: one or more headers
+  string mint_provider = 3;      // mint source: provider id for the mint engine
+}
+
+message RunIntegrationOpRequest {
+  string provider = 1;       // for audit/logging only
+  string host = 2;           // e.g. "slack.com" — the connector's host
+  string method = 3;         // "GET" | "POST" | ...
+  string path = 4;           // "/api/chat.postMessage" (may carry a query string)
+  bytes body = 5;            // request body (empty for GET)
+  string content_type = 6;   // e.g. "application/json"; ignored when body is empty
+  CredentialSpec credential = 7;
+}
+
+message RunIntegrationOpResponse {
+  uint32 status = 1;          // upstream HTTP status code
+  bytes body = 2;             // response body, capped (see `truncated`)
+  string content_type = 3;    // upstream Content-Type, if any
+  bool truncated = 4;         // body exceeded the cap and was cut
+}
+
+message ResolveIntegrationCredentialRequest {
+  string provider = 1;        // for audit/logging + mint resolution
+  CredentialSpec credential = 2;
+}
+
+// The raw credential material, shaped so a single-token SDK gets a string and a
+// multi-field SDK gets a map. Mirrors `engram_core::traits::ScopedCredential`
+// (bearer/basic/aws_sts) plus a generic multi-header case for inject connectors.
+message ResolvedCredential {
+  oneof cred {
+    BearerCred bearer = 1;   // inject w/ a single secret, or mint -> Bearer
+    BasicCred basic = 2;     // mint -> Basic
+    HeadersCred headers = 3; // inject w/ multiple secrets (e.g. Datadog's two keys)
+    AwsStsCred aws_sts = 4;  // mint -> AWS STS (SigV4 SDKs)
+  }
+  // RFC3339 expiry, or "" for a static credential (no expiry).
+  string expires_at = 10;
+}
+
+message BearerCred {
+  string token = 1;          // the raw token (NOT "Bearer <token>")
+}
+
+message BasicCred {
+  string username = 1;
+  string password = 2;
+}
+
+message HeadersCred {
+  // header name -> raw secret value (un-templated; the SDK adapter maps these onto
+  // its constructor, e.g. {"DD-API-KEY": "...", "DD-APPLICATION-KEY": "..."}).
+  map<string, string> values = 1;
+}
+
+message AwsStsCred {
+  string access_key_id = 1;
+  string secret_access_key = 2;
+  string session_token = 3;
+}
+
+message ResolveIntegrationCredentialResponse {
+  ResolvedCredential credential = 1;
+}
