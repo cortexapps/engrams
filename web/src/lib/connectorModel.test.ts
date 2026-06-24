@@ -109,7 +109,7 @@ describe("parseConnectorConfig", () => {
       provider: "sentry",
       credential: {
         source: "inject",
-        inject: { header: "Authorization", template: "Bearer {}", secretRef: "sentry-token" },
+        injects: [{ header: "Authorization", template: "Bearer {}", secretRef: "sentry-token" }],
       },
       hosts: ["sentry.io"],
       operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/issues/" } }],

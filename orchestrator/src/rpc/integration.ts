@@ -338,10 +338,13 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
               provider: req.provider,
               host,
               source: "inject",
-              header: c.credential.inject.header,
-              template: c.credential.inject.template ?? "{}",
-              secretRef: c.credential.inject.secretRef,
-              // inject has a single secret; the web sends it under any key.
+              // A connector may inject several headers; the credential-test UI
+              // probes the PRIMARY (first) one. `injects` is non-empty
+              // (parseConnector enforces it). Testing every header is a follow-up.
+              header: c.credential.injects[0]!.header,
+              template: c.credential.injects[0]!.template ?? "{}",
+              secretRef: c.credential.injects[0]!.secretRef,
+              // the web sends the single drafted secret under any key.
               draftSecret: Object.values(draft)[0] ?? "",
             };
       const { ok, message } = await mint.runConnectorTest(spec);

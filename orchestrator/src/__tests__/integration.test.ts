@@ -125,7 +125,7 @@ function fakeStore(seed: ConnectorRow[] = []): { store: ConnectorStore; rec: Rec
 const SENTRY = JSON.stringify({
   provider: "sentry",
   protocol: "http",
-  credential: { source: "inject", inject: { header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" } },
+  credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
   hosts: ["sentry.io"],
   operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
 });
@@ -264,10 +264,10 @@ describe("IntegrationService — connector status (redesign)", () => {
   });
 
   test("inject connected ⇔ secretRef present; mint connected ⇔ all required fields present", async () => {
-    const s = await spawn(adminDeps(["datadog-api-key", "github_app.app_id", "github_app.private_key_pem"]));
+    const s = await spawn(adminDeps(["datadog-api-key", "datadog-app-key", "github_app.app_id", "github_app.private_key_pem"]));
     try {
       const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
-      expect(by.get("datadog")?.status).toBe("connected"); // inject secretRef present
+      expect(by.get("datadog")?.status).toBe("connected"); // both inject secretRefs present
       expect(by.get("github")?.status).toBe("connected"); // both mint fields present
     } finally {
       await s.close();
