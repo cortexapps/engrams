@@ -20,3 +20,19 @@ export const runIntegrationOp = IntegrationOpService.method.runIntegrationOp;
  * @generated from rpc engram.app.v1.IntegrationOpService.ResolveIntegrationCredential
  */
 export const resolveIntegrationCredential = IntegrationOpService.method.resolveIntegrationCredential;
+
+/**
+ * OAuth 2.0 authorization-code acquisition (e.g. Slack "Add to Slack"). The
+ * orchestrator owns the browser redirect + CSRF state; the coordinator — the
+ * only tier that can read/write org secrets — builds the authorize URL from the
+ * stored client id, and (on callback) runs the code->token exchange and writes
+ * the obtained access token to the org store.
+ *
+ * @generated from rpc engram.app.v1.IntegrationOpService.BeginIntegrationOauth
+ */
+export const beginIntegrationOauth = IntegrationOpService.method.beginIntegrationOauth;
+
+/**
+ * @generated from rpc engram.app.v1.IntegrationOpService.CompleteIntegrationOauth
+ */
+export const completeIntegrationOauth = IntegrationOpService.method.completeIntegrationOauth;
