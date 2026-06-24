@@ -18,7 +18,7 @@
   "test": { "path": "/api/v1/dashboard" },
   "operations": [
     {
-      "grants": ["read"],
+      "grants": ["observability:read"],
       "match": { "method": "GET", "path": "/api/*" }
     }
   ],
