@@ -66,6 +66,7 @@ import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import type { ImagesClient } from "./profiles.ts";
 import {
   compileIntegrationPolicy,
+  compileCliIntegrations,
   policyHasContent,
   loadRegistry,
   type CustomConnectorSource,
@@ -421,6 +422,16 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           );
         }
       }
+      // ADR 0058: CLI integrations. Resolve the registry once (reused by the
+      // policy compile below), then merge each enabled CLI's dummy env (so the
+      // tool stops gating on local auth — the real credential is injected
+      // host-side by the egress proxy, never in the guest) + the enabled-CLI
+      // catalog the in-guest `engrams integrations` helper reads. Profile
+      // envVars still override (applied last).
+      const registry = await loadRegistry(connectors);
+      const cliPlan = compileCliIntegrations(profile.capabilities, registry);
+      for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
+      if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
       for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v; // profile overrides
       const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
@@ -439,19 +450,23 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       // the profile's network allow-list + injected secrets, which the
       // coordinator sources the egress policy from. Shipped whenever it carries
       // anything (caps OR secrets OR a non-trivial network).
-      const policy = compileIntegrationPolicy(profile.capabilities, await loadRegistry(connectors), {
+      const policy = compileIntegrationPolicy(profile.capabilities, registry, {
         network: profile.network,
         secrets: profile.secrets,
       });
       const integrationPolicyJson = policyHasContent(policy)
         ? JSON.stringify(policy)
         : undefined;
+      // ADR 0058: enabling a bundled CLI integration adds the shared
+      // integrations-cli bundle to the session's selected skills (one dyn_* slot
+      // for all CLIs), unioned with the profile's own skills.
+      const selectedSkills = [...new Set([...profile.skills, ...cliPlan.bundles])];
       const created = await sessionsClient.createSession({
         imageUri: image.imageUri,
         mode: "agent",
         ...(req.prompt != null ? { prompt: req.prompt } : {}),
         ...(harnessEnv != null ? { harnessEnv } : {}),
-        ...(profile.skills.length > 0 ? { selectedSkills: profile.skills } : {}),
+        ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
         ...(profile.capabilities.length > 0 ? { capabilities: profile.capabilities } : {}),
         ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
       });
