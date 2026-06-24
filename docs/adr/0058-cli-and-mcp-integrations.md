@@ -1,6 +1,12 @@
 # ADR 0058: CLIs and MCP servers as first-class integration tooling
 
-Status: 2026-06-24 — **Proposed.** P1 in progress on `adr-0058-p1-cli-integrations`.
+Status: 2026-06-24 — **P1 Accepted** (shipped + prod-validated). CLI integrations are live:
+`gh` (#416) and Datadog `pup` (#417, replacing `datadog-ci`) are both proven end-to-end in a
+prod Firecracker session — the CLI carries only a dummy placeholder; the proxy injects the
+real credential host-side. The multi-credential connector UI (#418), an honest TestConnection
+probe (#419), and the granted-power-opens-egress fix (#420) followed. **P2–P4 deferred** — see
+[Phasing](#phasing-each-phase--one-pr-on-its-own-worktree-linear-stack) and the **P3/P4 pickup
+notes** below, which pin the details a cold pickup would otherwise have to re-derive.
 
 Builds on **ADR 0057** (profiles as the unified session-policy object + the runtime-managed
 connector catalog), **ADR 0056** (generic integrations — the interceptor gate/inject/observe
@@ -190,6 +196,42 @@ documented fallback if a single bundle ever grows unwieldy.
   `/settings/integrations` gains the MCP facet form.
 - **P4 — stdio MCP.** session_env key delivery; server binaries via `npx` or the CLI bundle.
 
+### P3/P4 pickup notes (what the phasing leaves to a spike)
+
+The design above is settled; three implementation details are deliberately un-pinned because
+they're harness-version-coupled or postdate authoring. A P3 implementer should resolve these
+**first** — ideally with a short spike against the pinned `claude` CLI version — before writing
+the `mcp` facet + compile code:
+
+1. **The `--mcp-config` file format + the headless pre-approval flag — the real risk, and the
+   one thing not derivable from this repo.** `build_claude_argv` already accepts the flag, but
+   the JSON schema `claude` expects is not captured here and drifts with the CLI. Verify against
+   the pinned version, but expect: an object `{ "mcpServers": { "<name>": { … } } }` where an
+   **http** server is `{ "type": "http", "url": "https://…" }` (no token — the proxy injects
+   `Authorization`) and a **stdio** server is `{ "command": "…", "args": […], "env": { … } }`.
+   The *second* unknown is headless tool approval: `--mcp-config` dodges the cwd-`.mcp.json`
+   *approval prompt*, but the MCP tools still need pre-approval or they block the unattended
+   loop — confirm whether that's `--permission-mode`, a `settings.json` key
+   (`enableAllProjectMcpServers` / `enabledMcpjsonServers`), or the existing hook-bridge
+   permission path. **Spike this against the live harness before committing to a shape.**
+
+2. **The wire path: a new `harness_env` var + an agentd writer, mirroring P1 — no new wire
+   field.** P1 needed *zero* `CreateSessionRequest`/coordinator change: the enabled-CLI set
+   rides `ENGRAM_CLI_INTEGRATIONS` and the bundle's `requires_env` gate. P3 follows the same
+   shape — a `compileMcpIntegrations` (peer of `compileCliIntegrations` in
+   `connectors/registry.ts`) emits the enabled MCP set, `tasks.ts` sets it as one more
+   `harness_env` var, and **agentd** reads it to write the `--mcp-config` file into the guest at
+   session start (agentd already owns `session_env` and the harness spawn). Keep it wire-free
+   unless the spike forces otherwise.
+
+3. **Egress reachability is already solved — just declare `hosts` on the connector.** This ADR
+   predates **#420** (`fix(adr-0057): a granted integration power opens egress to its
+   connector's hosts`): `compileIntegrationPolicy` now unions every granted connector's `hosts`
+   into the session's egress allow-list. So a remote-MCP connector that lists its server host in
+   `hosts` gets DNS/egress reachability *and* the `Authorization` inject for free — no separate
+   network-policy step. Without #420, P3 would have rediscovered the same silent "could not
+   resolve host" the `pup` e2e hit (the inject opens the credential, not the route).
+
 ## P1 implementation notes (divergences from the plan)
 
 P1 shipped on `adr-0058-p1-cli-integrations`. What landed, and where it simplified the design:
@@ -233,6 +275,19 @@ P1 shipped on `adr-0058-p1-cli-integrations`. What landed, and where it simplifi
   constraint the binaries carry themselves (consistent with the playwright bundle being
   glibc-only). Bundling a matched-glibc libstdc++ for true any-base portability is a documented
   follow-up if a libstdc++-less base ever selects a CLI integration.
+
+- **Post-P1 follow-ons (all merged + prod-validated).** (1) `datadog-ci` → **`pup`** (#417), the
+  official Datadog agent CLI — a glibc Rust binary that sidesteps the Node-SEA libc fragility
+  the dev-vm hit, and the connector model gained **N injected headers per connector** (`pup`
+  needs `DD-API-KEY` *and* `DD-APPLICATION-KEY`). (2) The web gained a **multi-credential**
+  connect/rotate/author flow (#418). (3) **TestConnection** now probes *every* injected header
+  on an **honest path** (`test.path`, default `/`) — Datadog's `/` 307-redirects to a public
+  page, so the old probe passed vacuously; it now hits `/api/v1/dashboard`, which needs both
+  keys (#419). That PR also renamed the coarse Datadog grant `read` → `observability:read` so it
+  humanizes as "Read observability". (4) The **full prod FC e2e** ran: in a real `demo-claude`
+  session, `gh` (mint token) and `pup` (two static keys) both authenticate against the live API
+  while the guest holds only `x-engrams-managed` dummies — surfacing and fixing the egress-allow
+  gap in #420 (see P3/P4 pickup note 3).
 
 **Deferred (documented, not dropped):** `in-guest-token` + the `request-signing`/SigV4 arm
 (P2); MCP facet + `--mcp-config` + headless approval (P3/P4); `binSource: uploaded`/`npx` (the
