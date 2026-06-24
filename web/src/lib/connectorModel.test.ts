@@ -109,17 +109,38 @@ describe("parseConnectorConfig", () => {
       provider: "sentry",
       credential: {
         source: "inject",
-        inject: { header: "Authorization", template: "Bearer {}", secretRef: "sentry-token" },
+        injects: [{ header: "Authorization", template: "Bearer {}", secretRef: "sentry-token" }],
       },
       hosts: ["sentry.io"],
       operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/issues/" } }],
     });
     const c = parseConnectorConfig(raw, "sentry");
     expect(c.credentialSource).toBe("inject");
-    expect(c.header).toBe("Authorization");
-    expect(c.secretRef).toBe("sentry-token");
+    expect(c.injects).toEqual([
+      { header: "Authorization", template: "Bearer {}", secretRef: "sentry-token" },
+    ]);
     expect(c.display.name).toBe("Sentry");
     expect(c.display.icon.mono).toBe("SE");
+  });
+
+  test("surfaces ALL injected headers (ADR 0058 multi-credential, e.g. Datadog pup)", () => {
+    const raw = JSON.stringify({
+      provider: "datadog",
+      credential: {
+        source: "inject",
+        injects: [
+          { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" },
+          { header: "DD-APPLICATION-KEY", secretRef: "datadog-app-key" },
+        ],
+      },
+      hosts: ["api.datadoghq.com"],
+      operations: [{ grants: ["read"], match: { method: "GET", path: "/api/*" } }],
+    });
+    const c = parseConnectorConfig(raw, "datadog");
+    expect(c.injects).toEqual([
+      { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" },
+      { header: "DD-APPLICATION-KEY", secretRef: "datadog-app-key", template: "{}" },
+    ]);
   });
 
   test("malformed JSON yields an empty inject connector (no throw)", () => {
@@ -127,5 +148,22 @@ describe("parseConnectorConfig", () => {
     expect(c.credentialSource).toBe("inject");
     expect(c.capabilities).toEqual([]);
     expect(c.hosts).toEqual([]);
+  });
+
+  test("ADR 0058: parses an uploaded cli facet", () => {
+    const raw = JSON.stringify({
+      provider: "acme",
+      credential: { source: "inject", injects: [{ header: "X-Acme", secretRef: "acme-token" }] },
+      hosts: ["api.acme.io"],
+      operations: [{ grants: ["read"], match: { method: "GET", path: "/api/*" } }],
+      cli: { bins: ["acme"], binSource: "uploaded", bundle: "acme-cli", doc: "Use acme." },
+    });
+    const c = parseConnectorConfig(raw, "acme");
+    expect(c.cli).toEqual({ bins: ["acme"], binSource: "uploaded", bundle: "acme-cli" });
+  });
+
+  test("ADR 0058: a connector without a cli facet leaves it undefined", () => {
+    const raw = JSON.stringify({ provider: "x", hosts: ["h"], operations: [] });
+    expect(parseConnectorConfig(raw, "x").cli).toBeUndefined();
   });
 });

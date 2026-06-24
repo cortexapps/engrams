@@ -125,7 +125,7 @@ function fakeStore(seed: ConnectorRow[] = []): { store: ConnectorStore; rec: Rec
 const SENTRY = JSON.stringify({
   provider: "sentry",
   protocol: "http",
-  credential: { source: "inject", inject: { header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" } },
+  credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
   hosts: ["sentry.io"],
   operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
 });
@@ -264,10 +264,10 @@ describe("IntegrationService — connector status (redesign)", () => {
   });
 
   test("inject connected ⇔ secretRef present; mint connected ⇔ all required fields present", async () => {
-    const s = await spawn(adminDeps(["datadog-api-key", "github_app.app_id", "github_app.private_key_pem"]));
+    const s = await spawn(adminDeps(["datadog-api-key", "datadog-app-key", "github_app.app_id", "github_app.private_key_pem"]));
     try {
       const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
-      expect(by.get("datadog")?.status).toBe("connected"); // inject secretRef present
+      expect(by.get("datadog")?.status).toBe("connected"); // both inject secretRefs present
       expect(by.get("github")?.status).toBe("connected"); // both mint fields present
     } finally {
       await s.close();
@@ -481,7 +481,7 @@ describe("TestConnector", () => {
     }
   });
 
-  test("builds the inject spec (header/template/secretRef + draft) from the registry", async () => {
+  test("builds the inject spec with ALL headers, drafts keyed by secret ref (ADR 0058)", async () => {
     let captured: Record<string, unknown> | undefined;
     const s = await spawn({
       getSession: makeGetSession("a", "admin"),
@@ -492,16 +492,29 @@ describe("TestConnector", () => {
       }),
     });
     try {
-      const r = await s.client.testConnector({ provider: "datadog", draftValues: { credential: "dd-key" } });
+      const r = await s.client.testConnector({
+        provider: "datadog",
+        draftValues: { "datadog-api-key": "dd-key", "datadog-app-key": "dd-app" },
+      });
       expect(r.ok).toBe(true);
       expect(r.message).toContain("datadoghq");
+      // ADR 0058: EVERY injected header is probed; drafts keyed by org-secret ref.
+      // The probe targets the connector's `test.path` (Datadog's `/` 307s to a
+      // public page, so the test must hit an endpoint that needs both keys).
       expect(captured).toMatchObject({
         provider: "datadog",
         host: "api.datadoghq.com",
         source: "inject",
-        header: "DD-API-KEY",
-        secretRef: "datadog-api-key",
-        draftSecret: "dd-key",
+        testPath: "/api/v1/dashboard",
+        injects: [
+          { header: "DD-API-KEY", template: "{}", secretRef: "datadog-api-key", draftSecret: "dd-key" },
+          {
+            header: "DD-APPLICATION-KEY",
+            template: "{}",
+            secretRef: "datadog-app-key",
+            draftSecret: "dd-app",
+          },
+        ],
       });
     } finally {
       await s.close();

@@ -71,7 +71,7 @@ const CONNECTORS: Connector[] = [
     configJson: JSON.stringify({
       credential: {
         source: "inject",
-        inject: { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" },
+        injects: [{ header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" }],
       },
     }),
     builtin: true,
@@ -208,7 +208,7 @@ describe("IntegrationsPanel (marketplace)", () => {
     expect(cfg.provider).toBe("sentry");
     expect(cfg.hosts).toEqual(["sentry.io"]);
     expect(cfg.credential.source).toBe("inject");
-    expect(cfg.credential.inject.secretRef).toBe("sentry-token");
+    expect(cfg.credential.injects[0].secretRef).toBe("sentry-token");
     expect(cfg.operations[0].grants).toEqual(["issues:read"]);
     expect(puts).toContainEqual({ name: "sentry-token", value: "sk-live-abc" });
   });

@@ -78,6 +78,8 @@ export function registerMountCatalog(router: ConnectRouter, deps?: MountCatalogD
         description: req.description,
         owner: user.id,
         payloadTar: req.payloadTar,
+        // ADR 0058 uploaded-binary arm: PATH binaries the bundle declares.
+        bins: req.bins,
       });
       return { skill: resp.skill };
     },

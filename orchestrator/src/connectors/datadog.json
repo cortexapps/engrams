@@ -4,29 +4,27 @@
   "display": {
     "name": "Datadog",
     "category": "Observability",
-    "blurb": "Query logs and metrics during a run. The API key is brokered — substituted at the egress proxy, never seen by the agent.",
+    "blurb": "Query Datadog during a run via the `pup` agent CLI. Both keys are brokered — injected at the egress proxy, never seen by the agent.",
     "icon": { "mono": "DD", "color": "#632ca6" }
   },
   "credential": {
     "source": "inject",
-    "inject": { "header": "DD-API-KEY", "secretRef": "datadog-api-key", "template": "{}" }
+    "injects": [
+      { "header": "DD-API-KEY", "secretRef": "datadog-api-key" },
+      { "header": "DD-APPLICATION-KEY", "secretRef": "datadog-app-key" }
+    ]
   },
   "hosts": ["api.datadoghq.com"],
+  "test": { "path": "/api/v1/dashboard" },
   "operations": [
     {
-      "grants": ["logs:read"],
-      "match": { "method": "GET", "path": "/api/v2/logs/events*" },
-      "asset": {
-        "kind": "query_result",
-        "surface": "action",
-        "success": { "statusClass": "2xx" },
-        "data": { "count": "$.resp.meta.page.total_count" }
-      }
+      "grants": ["observability:read"],
+      "match": { "method": "GET", "path": "/api/*" }
     }
   ],
   "cli": {
-    "bins": ["datadog-ci"],
-    "dummyEnv": { "DD_API_KEY": "x-engrams-managed" },
-    "doc": "Use `datadog-ci` to interact with Datadog from this session. Authentication is automatic — `DD_API_KEY` is a managed placeholder the egress proxy replaces with the real API key on requests to api.datadoghq.com. Do NOT set a real key. Only the operations your profile enabled (e.g. `logs:read`) are brokered; commands that need a Datadog *application* key are not wired in this version."
+    "bins": ["pup"],
+    "dummyEnv": { "DD_API_KEY": "x-engrams-managed", "DD_APP_KEY": "x-engrams-managed" },
+    "doc": "Use `pup` (the official Datadog CLI for agents) to query Datadog from this session — logs, metrics, monitors, dashboards, and more (200+ commands across 33+ products). Authentication is automatic: `DD_API_KEY` and `DD_APP_KEY` are managed placeholders the egress proxy replaces with the real keys on requests to api.datadoghq.com. Do NOT run `pup auth login` or set real keys. This profile grants read access (GET) to the Datadog API; run `pup --help` to explore commands."
   }
 }

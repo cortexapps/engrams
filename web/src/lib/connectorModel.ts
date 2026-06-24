@@ -153,18 +153,45 @@ export interface ParsedCapability {
   asset?: string;
 }
 
+/** One injected header backed by its own org secret (ADR 0058: a connector may
+ * inject several, e.g. Datadog's DD-API-KEY + DD-APPLICATION-KEY). */
+export interface ParsedInject {
+  header: string;
+  secretRef: string;
+  template: string;
+}
+
+/** ADR 0058: the optional CLI facet a connector drives (display posture). */
+export interface ParsedCli {
+  /** PATH command names this connector contributes. */
+  bins: string[];
+  /** `bundled` (shared bundle), `uploaded` (admin-uploaded catalog bundle), `npx`. */
+  binSource: "bundled" | "uploaded" | "npx";
+  /** uploaded only: the mount_catalog bundle carrying the binary. */
+  bundle?: string;
+}
+
+/** OAuth acquisition facet — the app-credential org secrets the "Add to X" flow
+ * seeds before redirecting (the access token itself is obtained server-side). */
+export interface ParsedOauth {
+  clientIdRef: string;
+  clientSecretRef: string;
+}
+
 export interface ParsedConnectorConfig {
   provider: string;
   credentialSource: "mint" | "inject";
   hosts: string[];
   display: { name: string; category: string; blurb: string; icon: { mono: string; color: string } };
-  /** inject only */
-  header?: string;
-  template?: string;
-  secretRef?: string;
+  /** inject only — one or more headers, each backed by an org secret. */
+  injects?: ParsedInject[];
   /** mint only */
   mintKind?: string;
+  /** present when the connector is connected via an OAuth flow (e.g. Slack). */
+  oauth?: ParsedOauth;
   capabilities: ParsedCapability[];
+  /** ADR 0058: the CLI this connector drives, if any. */
+  cli?: ParsedCli;
 }
 
 interface RawOp {
@@ -187,10 +214,15 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
   }
   const cred = (raw.credential ?? {}) as {
     source?: string;
-    inject?: Record<string, string>;
+    injects?: Array<Record<string, string>>;
     mint?: { kind?: string };
   };
   const credentialSource: "mint" | "inject" = cred.source === "mint" ? "mint" : "inject";
+  const oauthRaw = raw.oauth as { clientIdRef?: string; clientSecretRef?: string } | undefined;
+  const oauth =
+    oauthRaw?.clientIdRef && oauthRaw?.clientSecretRef
+      ? { clientIdRef: oauthRaw.clientIdRef, clientSecretRef: oauthRaw.clientSecretRef }
+      : undefined;
   const d = (raw.display ?? {}) as {
     name?: string;
     category?: string;
@@ -215,6 +247,17 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     }
   }
 
+  const rawCli = raw.cli as Record<string, unknown> | undefined;
+  const cli: ParsedCli | undefined =
+    rawCli && Array.isArray(rawCli.bins)
+      ? {
+          bins: (rawCli.bins as unknown[]).filter((b): b is string => typeof b === "string"),
+          binSource:
+            rawCli.binSource === "uploaded" || rawCli.binSource === "npx" ? rawCli.binSource : "bundled",
+          ...(typeof rawCli.bundle === "string" ? { bundle: rawCli.bundle } : {}),
+        }
+      : undefined;
+
   return {
     provider,
     credentialSource,
@@ -230,11 +273,15 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     },
     ...(credentialSource === "inject"
       ? {
-          header: cred.inject?.header,
-          template: cred.inject?.template ?? "{}",
-          secretRef: cred.inject?.secretRef,
+          injects: (cred.injects ?? []).map((i) => ({
+            header: i.header ?? "",
+            secretRef: i.secretRef ?? "",
+            template: i.template ?? "{}",
+          })),
         }
       : { mintKind: cred.mint?.kind }),
+    ...(oauth ? { oauth } : {}),
     capabilities,
+    ...(cli ? { cli } : {}),
   };
 }

@@ -1093,7 +1093,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      profiles: makeFakeProfiles({ capabilities: ["github:issues:write", "datadog:logs:read"] }),
+      profiles: makeFakeProfiles({ capabilities: ["github:issues:write", "datadog:observability:read"] }),
       images: fakeImages(),
       db: okDb(),
     });
@@ -1102,7 +1102,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
       expect(fakeSessions.createReqs[0]?.capabilities).toEqual([
         "github:issues:write",
-        "datadog:logs:read",
+        "datadog:observability:read",
       ]);
     } finally {
       await srv.close();
@@ -1114,7 +1114,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      profiles: makeFakeProfiles({ capabilities: ["datadog:logs:read"] }),
+      profiles: makeFakeProfiles({ capabilities: ["datadog:observability:read"] }),
       images: fakeImages(),
       db: okDb(),
     });
@@ -1124,8 +1124,8 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
       expect(json).toBeDefined();
       const policy = JSON.parse(json!);
-      // datadog logs:read is inject-source AND declares a query_result asset, so
-      // it compiles to both an inject and an observe (ADR 0056 Phase 4c).
+      // ADR 0058: the datadog connector (pup) injects BOTH DD-API-KEY and
+      // DD-APPLICATION-KEY; its read op carries no asset, so no observe.
       expect(policy.injects).toEqual([
         {
           hosts: ["api.datadoghq.com"],
@@ -1134,12 +1134,19 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
           secret_ref: "datadog-api-key",
           mint_provider: "",
           methods: ["GET"],
-          path_globs: ["/api/v2/logs/events*"],
+          path_globs: ["/api/*"],
+        },
+        {
+          hosts: ["api.datadoghq.com"],
+          header_name: "DD-APPLICATION-KEY",
+          header_template: "{}",
+          secret_ref: "datadog-app-key",
+          mint_provider: "",
+          methods: ["GET"],
+          path_globs: ["/api/*"],
         },
       ]);
-      expect(policy.observes).toHaveLength(1);
-      expect(policy.observes[0].provider).toBe("datadog");
-      expect(policy.observes[0].asset_kind).toBe("query_result");
+      expect(policy.observes).toEqual([]);
     } finally {
       await srv.close();
     }

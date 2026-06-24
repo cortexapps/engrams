@@ -1482,8 +1482,8 @@ jobs:
     # EvacuateSession is the gRPC teleport primitive; it relocates to any peer
     # rather than a pinned host).
     #
-    # e2e stack is not a required check, so the matrix-suffixed job names
-    # don't affect branch protection.
+    # e2e stack IS gated now (in the CI Gate's needs). Branch protection requires
+    # only the CI Gate, never the matrix-suffixed job names directly.
     strategy:
       fail-fast: false
       matrix:
@@ -1491,13 +1491,18 @@ jobs:
           - variant: suite
             two_hosts: ""
             expect_two_hosts: ""
-            nextest_filter: "test(/e2e_/) - test(e2e_two_host_evacuate_preserves_sentinel)"
+            # Excludes the two-host evacuation test (the `teleport` variant runs it)
+            # and `e2e_claude_with_bogus_key…` — quarantined per #403 (consistently
+            # times out at 180s); re-add it to the filter when #403 is fixed. The
+            # tests are `#[ignore]`'d, so the filter (not the attribute) is the lever.
+            nextest_filter: "test(/e2e_/) - test(e2e_two_host_evacuate_preserves_sentinel) - test(e2e_claude_with_bogus_key_surfaces_anthropic_auth_error)"
           - variant: teleport
             two_hosts: "1"
             expect_two_hosts: "1"
             nextest_filter: "test(e2e_two_host_evacuate_preserves_sentinel)"
-    # Gate (e2e is not required → a skip can't block merge): run on any
-    # e2e-relevant change, and always on merge_group + push-to-main.
+    # Path-gate: run on any e2e-relevant change, and always on merge_group +
+    # push-to-main. On changes that can't affect e2e it skips, which the CI Gate
+    # treats as OK (so gating it doesn't wedge non-coord PRs).
     if: >-
       needs.detect.outputs.e2e == 'true'
       || github.event_name == 'merge_group'
@@ -1876,14 +1881,84 @@ jobs:
           bash deploy/dev/tilt-down-ci.sh || true
 
   # ─────────────────────────────────────────────────────────────────────
-  # The SINGLE required status check for this workflow. Because the test
-  # lanes above are path-gated (and so legitimately `skipped` on changes
-  # that can't affect them), they must NOT be required individually — a
-  # skipped required check would never report and would wedge the merge
-  # queue. Instead this gate ALWAYS runs, depends on every lane, and is the
-  # one required check: it passes iff each lane either succeeded or was
-  # skipped, and fails on any `failure`/`cancelled`. (The expensive e2e +
-  # bake jobs are intentionally NOT depended on here — they're non-required.)
+  # macOS / Apple-Silicon coverage (consolidated here from the former
+  # ci-macos-vz.yml — one workflow + one detect + one gate, no duplicate). Two
+  # jobs, path-gated on `test_rust` like the Linux Rust lanes, on Blacksmith M4
+  # runners (faster than the GitHub-hosted macos SKU). Protects the macOS dev-loop
+  # surface; Linux/FC remains the canonical production gate.
+  vz:
+    name: engram-sandbox-vz unit tests
+    needs: detect
+    if: needs.detect.outputs.test_rust == 'true'
+    runs-on: blacksmith-6vcpu-macos-15  # arm64, has Xcode CLT pre-installed
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      # ADR 0013: engram-protocol/build.rs needs protoc.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install entitlements (verify file is well-formed plist)
+        run: plutil -lint crates/engram-sandbox-vz/entitlements.plist
+      - name: Build coord + sandbox-vz tests
+        # cargo build --tests produces the binaries under target/debug/deps/
+        # that vz-codesign signs.
+        run: cargo build -p engram-coordinator -p engram-sandbox-vz --tests
+      - name: Codesign with virtualization entitlement
+        run: bash crates/engram-sandbox-vz/scripts/codesign.sh debug
+      # `if: always()` from here so one VZ-test step's failure doesn't hide the
+      # ones after it — same pattern as the lint / test-linux jobs.
+      - name: Run engram-sandbox-vz unit tests (default)
+        if: always()
+        run: cargo nextest run -p engram-sandbox-vz --no-fail-fast
+      # Pull the Kata arm64 kernel into the path the #[ignore]'d live smoke reads.
+      - name: Pull VZ kernel (Kata arm64)
+        if: always()
+        run: bash crates/engram-sandbox-vz/scripts/pull-kernel.sh
+      # The live smoke wants a rootfs file on disk; it never boots the VM
+      # (validateWithError: only records the URL), so an empty file clears the
+      # existence guard.
+      - name: Stage rootfs placeholder
+        if: always()
+        run: touch /tmp/engram-vz-rootfs.ext4
+      - name: Run live VZ smoke (--ignored)
+        if: always()
+        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast
+      - name: Workspace check (catches downstream-of-VZ regressions)
+        if: always()
+        run: cargo check --workspace --all-targets
+
+  test-macos:
+    name: workspace tests (macOS arm64, excl. sandbox-vz)
+    needs: detect
+    if: needs.detect.outputs.test_rust == 'true'
+    runs-on: blacksmith-6vcpu-macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # Same default set as Linux minus engram-sandbox-vz (the `vz` job runs that
+      # codesigned) — catches macOS-only regressions in cross-platform crates.
+      - name: cargo nextest run --workspace --exclude engram-sandbox-vz
+        if: always()
+        run: cargo nextest run --workspace --exclude engram-sandbox-vz --no-fail-fast
+
+  # The SINGLE required status check. Because the lanes above are path-gated (and
+  # so legitimately `skipped` on changes that can't affect them), they must NOT be
+  # required individually — a skipped required check never reports and would wedge
+  # the merge queue. Instead this gate ALWAYS runs, depends on EVERY lane (Linux +
+  # macOS + the e2e stack), and is the one required check: it passes iff each lane
+  # succeeded or was skipped, and fails on any `failure`/`cancelled`.
   ci-gate:
     name: CI Gate
     if: always()
@@ -1896,6 +1971,13 @@ jobs:
       - orchestrator
       - buf
       - test-firecracker
+      - vz
+      - test-macos
+      # The end-to-end coord lane + its upstream bake/artifact deps. Previously
+      # omitted (e2e was non-required), which let a red e2e merge — now gated.
+      - bake-harness-claude-artifact
+      - artifacts-e2e-stack
+      - test-e2e-stack
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check lane results

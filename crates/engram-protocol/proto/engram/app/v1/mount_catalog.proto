@@ -58,8 +58,17 @@ message RegisterSkillRequest {
   // (NOT the filename), unpacks archives budgeted against decompression bombs,
   // and treats anything else as the SKILL.md itself. An archive must contain a
   // top-level SKILL.md. Server-capped on both the compressed bytes and the
-  // decompressed total (markdown skills are KiB; the 4 MiB gRPC default is ample).
+  // decompressed total. The MountCatalogService server raises its decode cap above
+  // the gRPC 4 MiB default to admit binary uploads (see `bins`).
   bytes payload_tar = 4;
+  // ADR 0058 (uploaded-binary arm): PATH binaries this bundle contributes, each a
+  // path WITHIN the uploaded skill dir (e.g. "bin/mytool"). Each must resolve to a
+  // regular file in the archive; the packer marks it executable and folds it into
+  // the generated mount.json as `skills/<name>/<bin>`, so the guest's activate()
+  // symlinks it onto PATH (basename = the command name). Empty = a markdown/file
+  // skill (today's behaviour, unchanged). This is what makes a custom connector's
+  // `binSource:"uploaded"` CLI reach PATH.
+  repeated string bins = 5;
 }
 
 message RegisterSkillResponse {

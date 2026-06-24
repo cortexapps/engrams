@@ -1,6 +1,16 @@
 # ADR 0058: CLIs and MCP servers as first-class integration tooling
 
-Status: 2026-06-24 — **Proposed.** P1 in progress on `adr-0058-p1-cli-integrations`.
+Status: 2026-06-24 — **P1 Accepted** (shipped + prod-validated). CLI integrations are live:
+`gh` (#416) and Datadog `pup` (#417, replacing `datadog-ci`) are both proven end-to-end in a
+prod Firecracker session — the CLI carries only a dummy placeholder; the proxy injects the
+real credential host-side. The multi-credential connector UI (#418), an honest TestConnection
+probe (#419), and the granted-power-opens-egress fix (#420) followed. **P2–P4 deferred** — see
+[Phasing](#phasing-each-phase--one-pr-on-its-own-worktree-linear-stack) and the **P3/P4 pickup
+notes** below, which pin the details a cold pickup would otherwise have to re-derive. The
+**uploaded-binary arm** (`binSource:"uploaded"` — custom-connector tooling parity) is also
+**shipped + prod-validated** (UB1–UB4: #422 / #423 / #424; a real uploaded static binary ran
+on PATH in a prod FC session) — see the [Uploaded CLI binaries](#uploaded-cli-binaries--the-binsource-uploaded-arm-custom-connector-parity)
+section below. Still **deferred:** P2 (`in-guest-token` + SigV4) and P3/P4 (MCP).
 
 Builds on **ADR 0057** (profiles as the unified session-policy object + the runtime-managed
 connector catalog), **ADR 0056** (generic integrations — the interceptor gate/inject/observe
@@ -190,6 +200,42 @@ documented fallback if a single bundle ever grows unwieldy.
   `/settings/integrations` gains the MCP facet form.
 - **P4 — stdio MCP.** session_env key delivery; server binaries via `npx` or the CLI bundle.
 
+### P3/P4 pickup notes (what the phasing leaves to a spike)
+
+The design above is settled; three implementation details are deliberately un-pinned because
+they're harness-version-coupled or postdate authoring. A P3 implementer should resolve these
+**first** — ideally with a short spike against the pinned `claude` CLI version — before writing
+the `mcp` facet + compile code:
+
+1. **The `--mcp-config` file format + the headless pre-approval flag — the real risk, and the
+   one thing not derivable from this repo.** `build_claude_argv` already accepts the flag, but
+   the JSON schema `claude` expects is not captured here and drifts with the CLI. Verify against
+   the pinned version, but expect: an object `{ "mcpServers": { "<name>": { … } } }` where an
+   **http** server is `{ "type": "http", "url": "https://…" }` (no token — the proxy injects
+   `Authorization`) and a **stdio** server is `{ "command": "…", "args": […], "env": { … } }`.
+   The *second* unknown is headless tool approval: `--mcp-config` dodges the cwd-`.mcp.json`
+   *approval prompt*, but the MCP tools still need pre-approval or they block the unattended
+   loop — confirm whether that's `--permission-mode`, a `settings.json` key
+   (`enableAllProjectMcpServers` / `enabledMcpjsonServers`), or the existing hook-bridge
+   permission path. **Spike this against the live harness before committing to a shape.**
+
+2. **The wire path: a new `harness_env` var + an agentd writer, mirroring P1 — no new wire
+   field.** P1 needed *zero* `CreateSessionRequest`/coordinator change: the enabled-CLI set
+   rides `ENGRAM_CLI_INTEGRATIONS` and the bundle's `requires_env` gate. P3 follows the same
+   shape — a `compileMcpIntegrations` (peer of `compileCliIntegrations` in
+   `connectors/registry.ts`) emits the enabled MCP set, `tasks.ts` sets it as one more
+   `harness_env` var, and **agentd** reads it to write the `--mcp-config` file into the guest at
+   session start (agentd already owns `session_env` and the harness spawn). Keep it wire-free
+   unless the spike forces otherwise.
+
+3. **Egress reachability is already solved — just declare `hosts` on the connector.** This ADR
+   predates **#420** (`fix(adr-0057): a granted integration power opens egress to its
+   connector's hosts`): `compileIntegrationPolicy` now unions every granted connector's `hosts`
+   into the session's egress allow-list. So a remote-MCP connector that lists its server host in
+   `hosts` gets DNS/egress reachability *and* the `Authorization` inject for free — no separate
+   network-policy step. Without #420, P3 would have rediscovered the same silent "could not
+   resolve host" the `pup` e2e hit (the inject opens the credential, not the route).
+
 ## P1 implementation notes (divergences from the plan)
 
 P1 shipped on `adr-0058-p1-cli-integrations`. What landed, and where it simplified the design:
@@ -234,6 +280,19 @@ P1 shipped on `adr-0058-p1-cli-integrations`. What landed, and where it simplifi
   glibc-only). Bundling a matched-glibc libstdc++ for true any-base portability is a documented
   follow-up if a libstdc++-less base ever selects a CLI integration.
 
+- **Post-P1 follow-ons (all merged + prod-validated).** (1) `datadog-ci` → **`pup`** (#417), the
+  official Datadog agent CLI — a glibc Rust binary that sidesteps the Node-SEA libc fragility
+  the dev-vm hit, and the connector model gained **N injected headers per connector** (`pup`
+  needs `DD-API-KEY` *and* `DD-APPLICATION-KEY`). (2) The web gained a **multi-credential**
+  connect/rotate/author flow (#418). (3) **TestConnection** now probes *every* injected header
+  on an **honest path** (`test.path`, default `/`) — Datadog's `/` 307-redirects to a public
+  page, so the old probe passed vacuously; it now hits `/api/v1/dashboard`, which needs both
+  keys (#419). That PR also renamed the coarse Datadog grant `read` → `observability:read` so it
+  humanizes as "Read observability". (4) The **full prod FC e2e** ran: in a real `demo-claude`
+  session, `gh` (mint token) and `pup` (two static keys) both authenticate against the live API
+  while the guest holds only `x-engrams-managed` dummies — surfacing and fixing the egress-allow
+  gap in #420 (see P3/P4 pickup note 3).
+
 **Deferred (documented, not dropped):** `in-guest-token` + the `request-signing`/SigV4 arm
 (P2); MCP facet + `--mcp-config` + headless approval (P3/P4); `binSource: uploaded`/`npx` (the
 ADR 0055 P2 binary-upload + runtime-npx paths). **Pre-merge:** the full FC-session e2e
@@ -242,6 +301,98 @@ CLI execution are dev-vm-validated, the orchestrator compile/wire + `activate()`
 the `inject.rs` overwrite are unit-tested, so this is the integration of validated pieces.
 **Post-merge:** the engrams-internal host re-bake + image re-enable to stage the bundle on the
 prod fleet.
+
+## Uploaded CLI binaries — the `binSource: "uploaded"` arm (custom-connector parity)
+
+P1 made CLIs first-class for *built-in* connectors; a custom connector reaches the same parity
+only for tools already in the baked bundle (`gh`, `pup`). The remaining gap is **binary
+provenance for a novel tool** — the deferred `binSource: "uploaded"`. This section is its design.
+(Remote/stdio **MCP** is the other half of custom parity and stays tracked under P3/P4.)
+
+**The machinery already exists — the gap is one hardcoded field.** The ADR 0055 P2
+`mount_catalog` upload path is *not* markdown-gated by code, and everything downstream of the
+upload is binary-agnostic: `skill_pack.rs` accepts arbitrary tar/zip (rejecting only
+symlinks/hardlinks/devices), content-addresses + packs a deterministic squashfs, and writes a
+`mount_catalog` row; catalog rows UNION straight into the bundle pin set so hosts auto-stage
+`<sha>.squashfs` on the next heartbeat (no `current.json`/node-assets change — catalog names
+resolve via the table); and `resolve_selected_skills` → `patch_drive` → `activate()` are fully
+generic — `activate()` symlinks *any* mounted `mount.json`'s declared `bins` onto
+`/usr/local/bin`. The sole blocker: the pack-time manifest is hardcoded to
+`MountManifest::single_skill(name)` with **empty `bins`**, so an uploaded binary stages and
+mounts but never lands on PATH. **Zero host-agent / Firecracker / guest-activation change** — only
+the upload contract, the connector compile, and the authoring UI move.
+
+Decisions:
+
+- **The upload declares its bins.** `RegisterSkillRequest` gains `repeated string bins`;
+  `pack_skill` validates each is a regular file *inside* the archive (no traversal/symlink) and
+  marks it executable, then folds them into the generated `mount.json` — with **no
+  `requires_env`** (an uploaded bundle is mounted only when a connector referencing it is granted,
+  so `selected_skills` membership *is* the gate). Empty `bins` = today's markdown behaviour,
+  byte-for-byte. Bins ride the existing `mount_catalog.mount_json` column — **no migration**.
+- **Raise the size ceiling for binary bundles.** The markdown-era caps
+  (`MAX_SKILL_UNPACKED_BYTES = 16 MiB` / 2 MiB compressed) are too small (`gh` alone is ~30 MB).
+  Raise to a binary-appropriate ceiling (~128 MiB unpacked / ~64 MiB compressed, tuned against
+  `gh`/`kubectl`/`aws`-class binaries), keep the file-count cap, keep the caps enforced.
+  squashfs + content-address dedup means re-using a binary across connectors costs one
+  fleet-wide copy.
+- **The connector references the uploaded bundle by name (Model A).** The `cli` facet gains
+  `binSource: "uploaded"` (lift the `parseCli` rejection) + `bundle: "<mount_catalog name>"`;
+  `compileCliIntegrations` adds `cli.bundle` to `selected_skills` for a granted uploaded-CLI
+  connector instead of the shared `INTEGRATIONS_CLI_BUNDLE`. Everything else (dummy env, the
+  discovery doc, the inject rail, the #420 host-open) is unchanged. Reference-by-name keeps the
+  binary a content-addressed catalog artifact with its own lifecycle — one uploaded bundle can
+  back several connectors — while the UI may *present* it as one inline "upload + reference" step.
+  (Rejected — Model B, embedding the binary in the connector row: couples a content-addressed
+  artifact to one connector and duplicates the catalog's storage/GC.)
+- **Trust is unchanged.** Uploads are admin-only (`registerSkill` checks the role) and connectors
+  validate at the same `parseConnector` boundary; the binary runs in an **isolated microVM**,
+  content-addressed with an `owner` + soft-delete/GC (0055 P2). The glibc-base constraint (above)
+  carries over — an uploaded dynamically-linked binary runs against the base image's libc;
+  static/musl binaries are safest. Not a new trust tier — the one skills/bundles already occupy.
+
+Phasing (its own linear stack, peer of the P-series above):
+
+- **UB1 — upload-declares-bins** (foundation, connector-agnostic): proto `bins` + `pack_skill`
+  validation + `MountManifest` bins builder + the cap raise. Verifiable via `selected_skills`
+  alone — dev-vm FC: upload a tiny binary, select it, confirm it's on PATH, before any connector
+  wiring exists.
+- **UB2 — connector wiring**: `parseCli` accepts `uploaded` + `cli.bundle`;
+  `compileCliIntegrations` routes the bundle into `selected_skills`; unit tests + an end-to-end
+  custom-connector resolve.
+- **UB3 — authoring UI**: `CustomConnectorModal` gains the `cli` section (missing today) + the
+  inline binary-upload affordance.
+- **UB4 — prod e2e + Accepted-for-uploaded**: upload a real CLI, author a custom connector, run
+  it against a live API in a prod FC session (mirroring the `gh`/`pup` proofs).
+
+**What landed (UB1–UB4 — shipped + prod-validated).** The whole arm is on main and proven in a
+real Firecracker session:
+
+- **UB1** (#422) — `RegisterSkillRequest.bins`; `pack_skill` validates each declared bin is a
+  regular file in the archive (rejects ghosts + traversal), chmods it 0755, folds it into the
+  generated `mount.json` as `skills/<name>/<bin>`; caps raised to 64 MiB / 256 MiB with the
+  `MountCatalogService` decode cap → 80 MiB. Zero host/Firecracker/guest change — the only gap
+  was that the pack-time manifest hardcoded empty `bins`.
+- **UB2** (#423) — `parseCli` accepts `binSource:"uploaded"` + a `cli.bundle` reference;
+  `compileCliIntegrations` routes the catalog bundle into `selected_skills` (alongside the shared
+  integrations bundle, now mounted for any enabled CLI so the discovery helper is present).
+- **UB3** (#424) — `CustomConnectorModal` gains the CLI section + an inline binary-upload flow;
+  `connectorModel.ts` parses the `cli` facet. UX note: the upload takes a prepared tar/zip
+  carrying `bin/<tool>` + a top-level SKILL.md; a client-side tar-wrapper for a raw binary is a
+  documented follow-up.
+- **UB4 — prod e2e (passed).** Uploaded a real 2.3 MB static binary (a renamed `jq`) via the
+  catalog `RegisterSkill(bins)`, selected it on a `demo-claude` session, exec'd it: it landed on
+  PATH at `/usr/local/bin/e2e-cli → /opt/engram/dyn/0/skills/e2e-uploaded-cli/bin/e2e-cli` (the
+  patch_drive'd slot — proving it's the upload; there is no base-image `jq`), executed
+  (`jq-1.7.1`), and ran a real filter. Validates the full chain — `pack_skill` (bins manifest) →
+  content-address → pin set → host materialize → `resolve_selected_skills` → patch_drive →
+  `activate()` PATH symlink → execute — in real Firecracker. The driven e2e hit the coord surface
+  directly (`selected_skills` = exactly what UB2's compile emits); UB2's compile + UB3's authoring
+  are unit-tested.
+
+**Commit chain:** UB1 #422 · UB2 #423 · UB3 #424. CI-integrity follow-on surfaced by this work:
+#425 folded the former macOS workflow into `ci.yml` and made the e2e stack actually gate
+(quarantining the #403 flake) — the `CI Gate` had silently not been blocking on e2e.
 
 ## Consequences and risks
 
@@ -253,8 +404,10 @@ prod fleet.
   into the FC-host image — a host-image roll, like adding any bundle (ADR 0035/0055).
 - **`parseConnector` gains surface**: `cli`/`mcp` facets can open egress + inject org secrets
   + add PATH binaries — validated at the same admin-trust level as today's connector hosts.
-- **Custom-connector binary provenance** is a real dependency, not a gap: novel custom CLI
-  binaries wait on the ADR 0055 P2 binary-upload deferral; bundled CLIs and all MCP work now.
+- **Custom-connector binary provenance** is addressed by the `binSource: "uploaded"` arm
+  (above), which lifts the ADR 0055 P2 binary-upload deferral: novel custom CLI binaries upload
+  to the catalog and ride the existing stage/mount/activate path. Bundled CLIs work now; remote/
+  stdio MCP (P3/P4) needs no binary at all.
 - **SigV4 / non-HTTP** (`aws`, ssh, DB wire protocols) genuinely cannot ride host-side
   overwrite — handled by the open strategy (P2+), not by pretending they work in P1.
 - **MCP harness-coupling + headless approval** are real constraints; MCP stays opt-in and

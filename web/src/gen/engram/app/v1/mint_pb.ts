@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/mint.proto.
  */
 export const file_engram_app_v1_mint: GenFile = /*@__PURE__*/
-  fileDesc("ChhlbmdyYW0vYXBwL3YxL21pbnQucHJvdG8SDWVuZ3JhbS5hcHAudjEidgoTTWludEZpZWxkRGVzY3JpcHRvchIMCgRuYW1lGAEgASgJEg0KBWxhYmVsGAIgASgJEjAKCmZpZWxkX2tpbmQYAyABKA4yHC5lbmdyYW0uYXBwLnYxLk1pbnRGaWVsZEtpbmQSEAoIcmVxdWlyZWQYBCABKAgidAoITWludEtpbmQSDAoEa2luZBgBIAEoCRIQCghwcm92aWRlchgCIAEoCRIUCgxkaXNwbGF5X25hbWUYAyABKAkSMgoGZmllbGRzGAQgAygLMiIuZW5ncmFtLmFwcC52MS5NaW50RmllbGREZXNjcmlwdG9yIhYKFExpc3RNaW50S2luZHNSZXF1ZXN0IkQKFUxpc3RNaW50S2luZHNSZXNwb25zZRIrCgptaW50X2tpbmRzGAEgAygLMhcuZW5ncmFtLmFwcC52MS5NaW50S2luZCKmAgoXUnVuQ29ubmVjdG9yVGVzdFJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSDAoEaG9zdBgCIAEoCRIOCgZzb3VyY2UYAyABKAkSDgoGaGVhZGVyGAQgASgJEhAKCHRlbXBsYXRlGAUgASgJEhIKCnNlY3JldF9yZWYYBiABKAkSFAoMZHJhZnRfc2VjcmV0GAcgASgJEgwKBGtpbmQYCCABKAkSTQoMZHJhZnRfZmllbGRzGAkgAygLMjcuZW5ncmFtLmFwcC52MS5SdW5Db25uZWN0b3JUZXN0UmVxdWVzdC5EcmFmdEZpZWxkc0VudHJ5GjIKEERyYWZ0RmllbGRzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASI3ChhSdW5Db25uZWN0b3JUZXN0UmVzcG9uc2USCgoCb2sYASABKAgSDwoHbWVzc2FnZRgCIAEoCSpvCg1NaW50RmllbGRLaW5kEh8KG01JTlRfRklFTERfS0lORF9VTlNQRUNJRklFRBAAEhoKFk1JTlRfRklFTERfS0lORF9DT05GSUcQARIhCh1NSU5UX0ZJRUxEX0tJTkRfU0VBTEVEX1NFQ1JFVBACMs4BCgtNaW50U2VydmljZRJaCg1MaXN0TWludEtpbmRzEiMuZW5ncmFtLmFwcC52MS5MaXN0TWludEtpbmRzUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuTGlzdE1pbnRLaW5kc1Jlc3BvbnNlEmMKEFJ1bkNvbm5lY3RvclRlc3QSJi5lbmdyYW0uYXBwLnYxLlJ1bkNvbm5lY3RvclRlc3RSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5SdW5Db25uZWN0b3JUZXN0UmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("ChhlbmdyYW0vYXBwL3YxL21pbnQucHJvdG8SDWVuZ3JhbS5hcHAudjEidgoTTWludEZpZWxkRGVzY3JpcHRvchIMCgRuYW1lGAEgASgJEg0KBWxhYmVsGAIgASgJEjAKCmZpZWxkX2tpbmQYAyABKA4yHC5lbmdyYW0uYXBwLnYxLk1pbnRGaWVsZEtpbmQSEAoIcmVxdWlyZWQYBCABKAgidAoITWludEtpbmQSDAoEa2luZBgBIAEoCRIQCghwcm92aWRlchgCIAEoCRIUCgxkaXNwbGF5X25hbWUYAyABKAkSMgoGZmllbGRzGAQgAygLMiIuZW5ncmFtLmFwcC52MS5NaW50RmllbGREZXNjcmlwdG9yIhYKFExpc3RNaW50S2luZHNSZXF1ZXN0IkQKFUxpc3RNaW50S2luZHNSZXNwb25zZRIrCgptaW50X2tpbmRzGAEgAygLMhcuZW5ncmFtLmFwcC52MS5NaW50S2luZCJhChNDb25uZWN0b3JUZXN0SW5qZWN0Eg4KBmhlYWRlchgBIAEoCRIQCgh0ZW1wbGF0ZRgCIAEoCRISCgpzZWNyZXRfcmVmGAMgASgJEhQKDGRyYWZ0X3NlY3JldBgEIAEoCSK6AgoXUnVuQ29ubmVjdG9yVGVzdFJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSDAoEaG9zdBgCIAEoCRIOCgZzb3VyY2UYAyABKAkSMwoHaW5qZWN0cxgKIAMoCzIiLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yVGVzdEluamVjdBIMCgRraW5kGAggASgJEk0KDGRyYWZ0X2ZpZWxkcxgJIAMoCzI3LmVuZ3JhbS5hcHAudjEuUnVuQ29ubmVjdG9yVGVzdFJlcXVlc3QuRHJhZnRGaWVsZHNFbnRyeRIRCgl0ZXN0X3BhdGgYCyABKAkaMgoQRHJhZnRGaWVsZHNFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBSgQIBBAFSgQIBRAGSgQIBhAHSgQIBxAIIjcKGFJ1bkNvbm5lY3RvclRlc3RSZXNwb25zZRIKCgJvaxgBIAEoCBIPCgdtZXNzYWdlGAIgASgJKm8KDU1pbnRGaWVsZEtpbmQSHwobTUlOVF9GSUVMRF9LSU5EX1VOU1BFQ0lGSUVEEAASGgoWTUlOVF9GSUVMRF9LSU5EX0NPTkZJRxABEiEKHU1JTlRfRklFTERfS0lORF9TRUFMRURfU0VDUkVUEAIyzgEKC01pbnRTZXJ2aWNlEloKDUxpc3RNaW50S2luZHMSIy5lbmdyYW0uYXBwLnYxLkxpc3RNaW50S2luZHNSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5MaXN0TWludEtpbmRzUmVzcG9uc2USYwoQUnVuQ29ubmVjdG9yVGVzdBImLmVuZ3JhbS5hcHAudjEuUnVuQ29ubmVjdG9yVGVzdFJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLlJ1bkNvbm5lY3RvclRlc3RSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * One field an admin supplies to configure a mint kind. `name` is also the org
@@ -119,7 +119,49 @@ export const ListMintKindsResponseSchema: GenMessage<ListMintKindsResponse> = /*
  * A resolved connector test spec, built by the orchestrator from the connector
  * registry. Carries the inject header/template/secret_ref OR the mint kind, plus
  * an optional draft (the about-to-be-saved credential, tested before sealing).
+ * ADR 0058: one injected header for the connector test. A connector may inject
+ * several (e.g. Datadog's DD-API-KEY + DD-APPLICATION-KEY); the test sends them all.
  *
+ * @generated from message engram.app.v1.ConnectorTestInject
+ */
+export type ConnectorTestInject = Message<"engram.app.v1.ConnectorTestInject"> & {
+  /**
+   * header name (default Authorization)
+   *
+   * @generated from field: string header = 1;
+   */
+  header: string;
+
+  /**
+   * "Bearer {}" / "{}"
+   *
+   * @generated from field: string template = 2;
+   */
+  template: string;
+
+  /**
+   * org secret to resolve when no draft is given
+   *
+   * @generated from field: string secret_ref = 3;
+   */
+  secretRef: string;
+
+  /**
+   * test this value instead of the stored secret_ref
+   *
+   * @generated from field: string draft_secret = 4;
+   */
+  draftSecret: string;
+};
+
+/**
+ * Describes the message engram.app.v1.ConnectorTestInject.
+ * Use `create(ConnectorTestInjectSchema)` to create a new message.
+ */
+export const ConnectorTestInjectSchema: GenMessage<ConnectorTestInject> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_mint, 4);
+
+/**
  * @generated from message engram.app.v1.RunConnectorTestRequest
  */
 export type RunConnectorTestRequest = Message<"engram.app.v1.RunConnectorTestRequest"> & {
@@ -145,34 +187,11 @@ export type RunConnectorTestRequest = Message<"engram.app.v1.RunConnectorTestReq
   source: string;
 
   /**
-   * inject:
+   * inject: one or more headers, each resolved (draft or stored) + sent on the probe.
    *
-   * header name (default Authorization)
-   *
-   * @generated from field: string header = 4;
+   * @generated from field: repeated engram.app.v1.ConnectorTestInject injects = 10;
    */
-  header: string;
-
-  /**
-   * "Bearer {}" / "{}"
-   *
-   * @generated from field: string template = 5;
-   */
-  template: string;
-
-  /**
-   * org secret to resolve when no draft is given
-   *
-   * @generated from field: string secret_ref = 6;
-   */
-  secretRef: string;
-
-  /**
-   * test this value instead of the stored secret_ref
-   *
-   * @generated from field: string draft_secret = 7;
-   */
-  draftSecret: string;
+  injects: ConnectorTestInject[];
 
   /**
    * mint:
@@ -189,6 +208,16 @@ export type RunConnectorTestRequest = Message<"engram.app.v1.RunConnectorTestReq
    * @generated from field: map<string, string> draft_fields = 9;
    */
   draftFields: { [key: string]: string };
+
+  /**
+   * ADR 0058: the path the probe GETs (`https://{host}{test_path}`), default `/`.
+   * A connector whose root doesn't exercise auth (Datadog's `/` 307-redirects to a
+   * public page, so any credential "passes") points this at an endpoint that
+   * 401/403s without a valid credential AND needs every injected header.
+   *
+   * @generated from field: string test_path = 11;
+   */
+  testPath: string;
 };
 
 /**
@@ -196,7 +225,7 @@ export type RunConnectorTestRequest = Message<"engram.app.v1.RunConnectorTestReq
  * Use `create(RunConnectorTestRequestSchema)` to create a new message.
  */
 export const RunConnectorTestRequestSchema: GenMessage<RunConnectorTestRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_mint, 4);
+  messageDesc(file_engram_app_v1_mint, 5);
 
 /**
  * @generated from message engram.app.v1.RunConnectorTestResponse
@@ -222,7 +251,7 @@ export type RunConnectorTestResponse = Message<"engram.app.v1.RunConnectorTestRe
  * Use `create(RunConnectorTestResponseSchema)` to create a new message.
  */
 export const RunConnectorTestResponseSchema: GenMessage<RunConnectorTestResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_mint, 5);
+  messageDesc(file_engram_app_v1_mint, 6);
 
 /**
  * The input kind of a mint-config field — drives the form widget + whether the

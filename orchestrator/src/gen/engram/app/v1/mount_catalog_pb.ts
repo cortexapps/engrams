@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/mount_catalog.proto.
  */
 export const file_engram_app_v1_mount_catalog: GenFile = /*@__PURE__*/
-  fileDesc("CiFlbmdyYW0vYXBwL3YxL21vdW50X2NhdGFsb2cucHJvdG8SDWVuZ3JhbS5hcHAudjEihAEKDENhdGFsb2dTa2lsbBIKCgJpZBgBIAEoCRINCgVvd25lchgCIAEoCRIMCgRuYW1lGAMgASgJEhMKC2Rlc2NyaXB0aW9uGAQgASgJEg4KBnNoYTI1NhgFIAEoCRISCgpzaXplX2J5dGVzGAYgASgDEhIKCmNyZWF0ZWRfYXQYByABKAkiXQoUUmVnaXN0ZXJTa2lsbFJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRINCgVvd25lchgDIAEoCRITCgtwYXlsb2FkX3RhchgEIAEoDCJDChVSZWdpc3RlclNraWxsUmVzcG9uc2USKgoFc2tpbGwYASABKAsyGy5lbmdyYW0uYXBwLnYxLkNhdGFsb2dTa2lsbCITChFMaXN0U2tpbGxzUmVxdWVzdCJBChJMaXN0U2tpbGxzUmVzcG9uc2USKwoGc2tpbGxzGAEgAygLMhsuZW5ncmFtLmFwcC52MS5DYXRhbG9nU2tpbGwiHwoPR2V0U2tpbGxSZXF1ZXN0EgwKBG5hbWUYASABKAkiPgoQR2V0U2tpbGxSZXNwb25zZRIqCgVza2lsbBgBIAEoCzIbLmVuZ3JhbS5hcHAudjEuQ2F0YWxvZ1NraWxsIiIKEkRlbGV0ZVNraWxsUmVxdWVzdBIMCgRuYW1lGAEgASgJIiYKE0RlbGV0ZVNraWxsUmVzcG9uc2USDwoHZGVsZXRlZBgBIAEoCDLnAgoTTW91bnRDYXRhbG9nU2VydmljZRJaCg1SZWdpc3RlclNraWxsEiMuZW5ncmFtLmFwcC52MS5SZWdpc3RlclNraWxsUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuUmVnaXN0ZXJTa2lsbFJlc3BvbnNlElEKCkxpc3RTa2lsbHMSIC5lbmdyYW0uYXBwLnYxLkxpc3RTa2lsbHNSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5MaXN0U2tpbGxzUmVzcG9uc2USSwoIR2V0U2tpbGwSHi5lbmdyYW0uYXBwLnYxLkdldFNraWxsUmVxdWVzdBofLmVuZ3JhbS5hcHAudjEuR2V0U2tpbGxSZXNwb25zZRJUCgtEZWxldGVTa2lsbBIhLmVuZ3JhbS5hcHAudjEuRGVsZXRlU2tpbGxSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5EZWxldGVTa2lsbFJlc3BvbnNlYgZwcm90bzM");
+  fileDesc("CiFlbmdyYW0vYXBwL3YxL21vdW50X2NhdGFsb2cucHJvdG8SDWVuZ3JhbS5hcHAudjEihAEKDENhdGFsb2dTa2lsbBIKCgJpZBgBIAEoCRINCgVvd25lchgCIAEoCRIMCgRuYW1lGAMgASgJEhMKC2Rlc2NyaXB0aW9uGAQgASgJEg4KBnNoYTI1NhgFIAEoCRISCgpzaXplX2J5dGVzGAYgASgDEhIKCmNyZWF0ZWRfYXQYByABKAkiawoUUmVnaXN0ZXJTa2lsbFJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRINCgVvd25lchgDIAEoCRITCgtwYXlsb2FkX3RhchgEIAEoDBIMCgRiaW5zGAUgAygJIkMKFVJlZ2lzdGVyU2tpbGxSZXNwb25zZRIqCgVza2lsbBgBIAEoCzIbLmVuZ3JhbS5hcHAudjEuQ2F0YWxvZ1NraWxsIhMKEUxpc3RTa2lsbHNSZXF1ZXN0IkEKEkxpc3RTa2lsbHNSZXNwb25zZRIrCgZza2lsbHMYASADKAsyGy5lbmdyYW0uYXBwLnYxLkNhdGFsb2dTa2lsbCIfCg9HZXRTa2lsbFJlcXVlc3QSDAoEbmFtZRgBIAEoCSI+ChBHZXRTa2lsbFJlc3BvbnNlEioKBXNraWxsGAEgASgLMhsuZW5ncmFtLmFwcC52MS5DYXRhbG9nU2tpbGwiIgoSRGVsZXRlU2tpbGxSZXF1ZXN0EgwKBG5hbWUYASABKAkiJgoTRGVsZXRlU2tpbGxSZXNwb25zZRIPCgdkZWxldGVkGAEgASgIMucCChNNb3VudENhdGFsb2dTZXJ2aWNlEloKDVJlZ2lzdGVyU2tpbGwSIy5lbmdyYW0uYXBwLnYxLlJlZ2lzdGVyU2tpbGxSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5SZWdpc3RlclNraWxsUmVzcG9uc2USUQoKTGlzdFNraWxscxIgLmVuZ3JhbS5hcHAudjEuTGlzdFNraWxsc1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkxpc3RTa2lsbHNSZXNwb25zZRJLCghHZXRTa2lsbBIeLmVuZ3JhbS5hcHAudjEuR2V0U2tpbGxSZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5HZXRTa2lsbFJlc3BvbnNlElQKC0RlbGV0ZVNraWxsEiEuZW5ncmFtLmFwcC52MS5EZWxldGVTa2lsbFJlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkRlbGV0ZVNraWxsUmVzcG9uc2ViBnByb3RvMw");
 
 /**
  * One catalog skill — mirrors engram_core::types::CatalogSkill (the internal
@@ -110,11 +110,25 @@ export type RegisterSkillRequest = Message<"engram.app.v1.RegisterSkillRequest">
    * (NOT the filename), unpacks archives budgeted against decompression bombs,
    * and treats anything else as the SKILL.md itself. An archive must contain a
    * top-level SKILL.md. Server-capped on both the compressed bytes and the
-   * decompressed total (markdown skills are KiB; the 4 MiB gRPC default is ample).
+   * decompressed total. The MountCatalogService server raises its decode cap above
+   * the gRPC 4 MiB default to admit binary uploads (see `bins`).
    *
    * @generated from field: bytes payload_tar = 4;
    */
   payloadTar: Uint8Array;
+
+  /**
+   * ADR 0058 (uploaded-binary arm): PATH binaries this bundle contributes, each a
+   * path WITHIN the uploaded skill dir (e.g. "bin/mytool"). Each must resolve to a
+   * regular file in the archive; the packer marks it executable and folds it into
+   * the generated mount.json as `skills/<name>/<bin>`, so the guest's activate()
+   * symlinks it onto PATH (basename = the command name). Empty = a markdown/file
+   * skill (today's behaviour, unchanged). This is what makes a custom connector's
+   * `binSource:"uploaded"` CLI reach PATH.
+   *
+   * @generated from field: repeated string bins = 5;
+   */
+  bins: string[];
 };
 
 /**

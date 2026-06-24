@@ -57,21 +57,25 @@ export function ReplaceCredentialSheet({
         (k) => k.provider === view.provider || k.kind === cfg?.mintKind,
       )
     : undefined;
+  const injects = cfg?.injects ?? [];
 
   const [values, setValues] = useState<Record<string, string>>({});
-  const [injectSecret, setInjectSecret] = useState("");
+  // ADR 0058: one entry per injected header, keyed by its org-secret ref.
+  const [injectSecrets, setInjectSecrets] = useState<Record<string, string>>({});
   const [testState, setTestState] = useState<"idle" | "ok" | "fail">("idle");
   const [testMessage, setTestMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const canSave = isMint
     ? Object.values(values).some((v) => v.trim().length > 0)
-    : injectSecret.trim().length > 0;
+    : Object.values(injectSecrets).some((v) => v.trim().length > 0);
   const pending = setMint.isPending || putSecret.isPending;
 
   const runTest = async () => {
     setTestState("idle");
-    const draftValues = isMint ? values : { credential: injectSecret };
+    // ADR 0058: send every entered secret keyed by its org-secret ref, so the
+    // test probes ALL the connector's headers (the orchestrator maps each by ref).
+    const draftValues = isMint ? values : injectSecrets;
     try {
       const r = await test.mutateAsync({ provider: view.provider, draftValues });
       setTestState(r.ok ? "ok" : "fail");
@@ -90,8 +94,11 @@ export function ReplaceCredentialSheet({
         // Blank fields are skipped server-side (leave existing unchanged).
         await setMint.mutateAsync({ provider: view.provider, kind: mintKind.kind, values });
       } else {
-        if (!cfg?.secretRef) throw new Error("connector has no secret ref");
-        await putSecret.mutateAsync({ name: cfg.secretRef, value: injectSecret });
+        // Blank fields are skipped — leave that secret unchanged.
+        for (const inj of injects) {
+          const v = injectSecrets[inj.secretRef];
+          if (v && v.trim().length > 0) await putSecret.mutateAsync({ name: inj.secretRef, value: v });
+        }
       }
       toast.success(`${view.name} credential replaced — sealed in the org secret store`);
       onReplaced();
@@ -112,7 +119,7 @@ export function ReplaceCredentialSheet({
             <div className="text-xs text-muted-foreground">
               {isMint
                 ? "Rotate the minted credentials"
-                : `Rotate the org secret · ${cfg?.secretRef ?? ""}`}
+                : `Rotate the org secret${injects.length > 1 ? "s" : ""} · ${injects.map((i) => i.secretRef).join(", ")}`}
             </div>
           </div>
         </header>
@@ -157,15 +164,24 @@ export function ReplaceCredentialSheet({
               </label>
             ))
           ) : (
-            <label className="flex flex-col gap-1.5">
-              <span className="flex items-baseline gap-2">
-                <Text variant="label">{view.name} credential</Text>
-                <span className="text-[0.68rem] text-muted-foreground">
-                  •••• set · leave blank to keep
+            injects.map((inj) => (
+              <label key={inj.secretRef} className="flex flex-col gap-1.5">
+                <span className="flex items-baseline gap-2">
+                  <Text variant="label">{inj.header}</Text>
+                  <code className="font-mono text-[0.62rem] text-muted-foreground">
+                    {inj.secretRef}
+                  </code>
+                  <span className="text-[0.68rem] text-muted-foreground">
+                    •••• set · leave blank to keep
+                  </span>
                 </span>
-              </span>
-              <SecretField value={injectSecret} onChange={setInjectSecret} placeholder="••••••" />
-            </label>
+                <SecretField
+                  value={injectSecrets[inj.secretRef] ?? ""}
+                  onChange={(v) => setInjectSecrets((s) => ({ ...s, [inj.secretRef]: v }))}
+                  placeholder="••••••"
+                />
+              </label>
+            ))
           )}
 
           {view.usedBy > 0 && (

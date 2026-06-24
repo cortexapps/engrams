@@ -1,0 +1,116 @@
+#!/bin/sh
+# engrams Slack CLI — a thin wrapper over the Slack Web API.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `SLACK_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped bot token on
+# every request to slack.com (and strips any token you supply). There is NOTHING
+# to log in to — do not set a real token or run any `login`.
+#
+# Each subcommand needs the matching power on your profile (slack:chat:write,
+# slack:channels:read, slack:users:read, slack:files:write); calls to a path your
+# profile didn't grant are denied at the network boundary, not authenticated.
+set -eu
+
+API="https://slack.com/api"
+TOKEN="${SLACK_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Slack CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  slack post <channel> <text...>          Post a message (chat.postMessage)
+  slack dm <user-id> <text...>            DM a user by ID (chat.postMessage)
+  slack channels [field=value ...]        List conversations (conversations.list)
+  slack users [field=value ...]           List members (users.list)
+  slack upload <channel> <file> [title]   Upload a file (files.upload)
+  slack whoami                            Show the bot identity (auth.test)
+  slack api <method> [field=value ...]    Raw call: POST https://slack.com/api/<method>
+
+<channel> is a channel ID (e.g. C0123456789) or #name. The bot must be in the
+channel, or the app needs the chat:write.public scope. Slack replies with JSON
+{"ok":true,...} or {"ok":false,"error":"..."} (always HTTP 200).
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# api <method> [curl-args...] — POST to a Slack Web API method with brokered auth.
+api() {
+    method="$1"
+    shift
+    curl -sS -X POST "$API/$method" -H "Authorization: Bearer $TOKEN" "$@" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+post)
+    ch="${1:?usage: slack post <channel> <text...>}"
+    shift
+    api chat.postMessage --data-urlencode "channel=$ch" --data-urlencode "text=$*"
+    ;;
+dm)
+    user="${1:?usage: slack dm <user-id> <text...>}"
+    shift
+    api chat.postMessage --data-urlencode "channel=$user" --data-urlencode "text=$*"
+    ;;
+channels)
+    # Translate each field=value into a --data-urlencode pair (POSIX-safe, no arrays).
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    api conversations.list "$@"
+    ;;
+users)
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    api users.list "$@"
+    ;;
+upload)
+    ch="${1:?usage: slack upload <channel> <file> [title]}"
+    file="${2:?usage: slack upload <channel> <file> [title]}"
+    title="${3:-}"
+    if [ -n "$title" ]; then
+        api files.upload -F "channels=$ch" -F "file=@$file" -F "title=$title"
+    else
+        api files.upload -F "channels=$ch" -F "file=@$file"
+    fi
+    ;;
+whoami)
+    api auth.test
+    ;;
+api)
+    method="${1:?usage: slack api <method> [field=value ...]}"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    api "$method" "$@"
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "slack: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

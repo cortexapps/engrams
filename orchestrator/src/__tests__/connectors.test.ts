@@ -30,7 +30,7 @@ import {
 const datadogRaw = {
   provider: "datadog",
   protocol: "http",
-  credential: { source: "inject", inject: { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" } },
+  credential: { source: "inject", injects: [{ header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" }] },
   hosts: ["api.datadoghq.com"],
   operations: [
     { grants: ["logs:read"], match: { method: "GET", path: "/api/v2/logs/events*" } },
@@ -57,8 +57,8 @@ describe("parseConnector", () => {
     expect(c.provider).toBe("datadog");
     expect(c.credential.source).toBe("inject");
     if (c.credential.source === "inject") {
-      expect(c.credential.inject.header).toBe("DD-API-KEY");
-      expect(c.credential.inject.secretRef).toBe("datadog-api-key");
+      expect(c.credential.injects[0]!.header).toBe("DD-API-KEY");
+      expect(c.credential.injects[0]!.secretRef).toBe("datadog-api-key");
     }
   });
 
@@ -71,9 +71,27 @@ describe("parseConnector", () => {
     expect(() => parseConnector({ ...datadogRaw, protocol: "grpc" }, "x")).toThrow(/protocol/);
   });
 
+  test("accepts an optional test probe path (ADR 0058)", () => {
+    const c = parseConnector({ ...datadogRaw, test: { path: "/api/v1/dashboard" } }, "datadog");
+    expect(c.test?.path).toBe("/api/v1/dashboard");
+  });
+
+  test("a connector without a test facet leaves it undefined (default `/` coord-side)", () => {
+    expect(parseConnector(datadogRaw, "datadog").test).toBeUndefined();
+  });
+
+  test("rejects a test path that does not start with /", () => {
+    expect(() => parseConnector({ ...datadogRaw, test: { path: "api/v1/dashboard" } }, "x")).toThrow(/test.path/);
+  });
+
   test("rejects inject without a header", () => {
-    const bad = { ...datadogRaw, credential: { source: "inject", inject: { secretRef: "r" } } };
+    const bad = { ...datadogRaw, credential: { source: "inject", injects: [{ secretRef: "r" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/header/);
+  });
+
+  test("rejects an inject credential with an empty injects array", () => {
+    const bad = { ...datadogRaw, credential: { source: "inject", injects: [] } };
+    expect(() => parseConnector(bad, "x")).toThrow(/non-empty array/);
   });
 
   test("rejects a mint without a kind", () => {
@@ -243,6 +261,23 @@ describe("compileIntegrationPolicy", () => {
       ),
     ).toBe(true);
   });
+
+  test("ADR 0057: a granted power opens egress to its connector's hosts", () => {
+    // No profile-typed allow-list — the host must come from the granted cap, or
+    // the agent gets a DNS "could not resolve host" despite injection being wired.
+    const policy = compileIntegrationPolicy(["datadog:logs:read"], reg);
+    expect(policy.network.allow_hosts).toEqual(["api.datadoghq.com"]);
+    // A cap whose host can be reached is itself policy content.
+    expect(policyHasContent(policy)).toBe(true);
+  });
+
+  test("ADR 0057: granted-power hosts union with the profile's hand-typed allow-list (deduped, admin first)", () => {
+    const policy = compileIntegrationPolicy(["datadog:logs:read", "github:issues:write"], reg, {
+      // `api.datadoghq.com` is typed AND granted — must appear once, not twice.
+      network: { default: "deny", allowHosts: ["sentry.io", "api.datadoghq.com"] },
+    });
+    expect(policy.network.allow_hosts).toEqual(["sentry.io", "api.datadoghq.com", "api.github.com"]);
+  });
 });
 
 // A mint connector whose op carries an asset spec (the GitHub-issue shape).
@@ -308,17 +343,11 @@ describe("on-disk registry", () => {
     expect(reg.get("github")!.credential.source).toBe("mint");
   });
 
-  test("the shipped datadog connector compiles a logs:read inject", () => {
-    const policy = compileIntegrationPolicy(["datadog:logs:read"]);
-    expect(policy.injects).toHaveLength(1);
-    expect(policy.injects[0]!.header_name).toBe("DD-API-KEY");
-  });
-
-  test("the shipped datadog logs:read also compiles a query_result observe", () => {
-    const policy = compileIntegrationPolicy(["datadog:logs:read"]);
-    expect(policy.observes).toHaveLength(1);
-    expect(policy.observes[0]!.provider).toBe("datadog");
-    expect(policy.observes[0]!.asset_kind).toBe("query_result");
+  test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {
+    const policy = compileIntegrationPolicy(["datadog:observability:read"]);
+    expect(policy.injects).toHaveLength(2);
+    expect(policy.injects.map((i) => i.header_name).sort()).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
+    expect(policy.injects.map((i) => i.secret_ref).sort()).toEqual(["datadog-api-key", "datadog-app-key"]);
   });
 
   test("the shipped github issues:write compiles a minted inject + an issue observe", () => {
@@ -340,7 +369,7 @@ describe("parseConnector — admin-trust hardening", () => {
   const sentryRaw = {
     provider: "sentry",
     protocol: "http",
-    credential: { source: "inject", inject: { header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" } },
+    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
     hosts: ["sentry.io"],
     operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
   };
@@ -364,22 +393,22 @@ describe("parseConnector — admin-trust hardening", () => {
   });
 
   test("rejects an invalid HTTP header name", () => {
-    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Bad Header", secretRef: "r", template: "{}" } } };
+    const bad = { ...sentryRaw, credential: { source: "inject", injects: [{ header: "Bad Header", secretRef: "r", template: "{}" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/header name/);
   });
 
   test("rejects an inject template missing the {} placeholder", () => {
-    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "r", template: "Bearer" } } };
+    const bad = { ...sentryRaw, credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "r", template: "Bearer" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/placeholder/);
   });
 
   test("rejects an inject template with a newline (header injection)", () => {
-    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "r", template: "Bearer {}\r\nX: y" } } };
+    const bad = { ...sentryRaw, credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "r", template: "Bearer {}\r\nX: y" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/newline/);
   });
 
   test("rejects a secretRef with whitespace", () => {
-    const bad = { ...sentryRaw, credential: { source: "inject", inject: { header: "Authorization", secretRef: "a b", template: "{}" } } };
+    const bad = { ...sentryRaw, credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "a b", template: "{}" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/secretRef/);
   });
 
@@ -401,7 +430,7 @@ describe("loadRegistry", () => {
   const sentryRaw = {
     provider: "sentry",
     protocol: "http",
-    credential: { source: "inject", inject: { header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" } },
+    credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "sentry-token", template: "Bearer {}" }] },
     hosts: ["sentry.io"],
     operations: [{ grants: ["issues:read"], match: { method: "GET", path: "/api/0/projects/*/issues/" } }],
   };
@@ -581,19 +610,25 @@ describe("cli facet (ADR 0058)", () => {
   const datadogCli = {
     ...datadogRaw,
     cli: {
-      bins: ["datadog-ci"],
+      bins: ["pup"],
       dummyEnv: { DD_API_KEY: "x-engrams-managed", DD_APP_KEY: "x-engrams-managed" },
-      doc: "Use `datadog-ci` to query logs.",
+      doc: "Use `pup` to query Datadog.",
     },
   };
   const githubCli = {
     ...githubRaw,
     cli: { bins: ["gh"], dummyEnv: { GH_TOKEN: "x-engrams-managed" }, doc: "Use `gh` for PRs and issues." },
   };
+  // ADR 0058 UB2: a connector whose CLI is an admin-uploaded binary (mount_catalog
+  // bundle "acme-cli"), not a bundled one.
+  const uploadedCli = {
+    ...datadogRaw,
+    cli: { bins: ["acme"], binSource: "uploaded", bundle: "acme-cli", doc: "Use `acme` to query Acme." },
+  };
 
   test("parses a valid cli facet, defaulting binSource + credentialDelivery", () => {
     const c = parseConnector(datadogCli, "datadog");
-    expect(c.cli?.bins).toEqual(["datadog-ci"]);
+    expect(c.cli?.bins).toEqual(["pup"]);
     expect(c.cli?.binSource).toBe("bundled"); // defaulted
     expect(c.cli?.credentialDelivery).toBe("inject"); // defaulted
     expect(c.cli?.dummyEnv).toEqual({ DD_API_KEY: "x-engrams-managed", DD_APP_KEY: "x-engrams-managed" });
@@ -608,8 +643,22 @@ describe("cli facet (ADR 0058)", () => {
   test("rejects a path-traversal dummy file", () => {
     expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], dummyFiles: [{ path: "~/../etc/x", contents: "" }], doc: "x" } }, "x")).toThrow(/\.\./);
   });
-  test("rejects an unimplemented binSource (P1 stages only bundled)", () => {
+  test("rejects an npx binSource (still a later arm)", () => {
     expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], binSource: "npx", doc: "x" } }, "x")).toThrow(/not yet implemented/);
+  });
+  test("UB2: accepts an uploaded binSource with a catalog bundle", () => {
+    const c = parseConnector(uploadedCli, "datadog");
+    expect(c.cli?.binSource).toBe("uploaded");
+    expect(c.cli?.bundle).toBe("acme-cli");
+  });
+  test("UB2: rejects uploaded without a bundle", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["acme"], binSource: "uploaded", doc: "x" } }, "x")).toThrow(/cli.bundle.*required/);
+  });
+  test("UB2: rejects a bundle on a non-uploaded binSource", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], bundle: "acme-cli", doc: "x" } }, "x")).toThrow(/only valid when/);
+  });
+  test("UB2: rejects a malformed bundle name", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["acme"], binSource: "uploaded", bundle: "Bad Name", doc: "x" } }, "x")).toThrow(/cli.bundle/);
   });
   test("rejects an unwired credentialDelivery (would ship an unauthenticated CLI)", () => {
     expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], credentialDelivery: "request-signing", doc: "x" } }, "x")).toThrow(/not yet wired/);
@@ -630,6 +679,42 @@ describe("cli facet (ADR 0058)", () => {
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
   });
 
+  test("the built-in slack seed ships the slack CLI + an auth.test gate", () => {
+    const slack = connectorRegistry().get("slack")!;
+    expect(slack.cli?.bins).toEqual(["slack"]);
+    expect(slack.cli?.binSource).toBe("bundled");
+    expect(slack.cli?.dummyEnv).toEqual({ SLACK_TOKEN: "x-engrams-managed" });
+    // `slack whoami` hits /api/auth.test — gated so the token is injected there too.
+    expect(slack.operations.some((o) => o.match?.path === "/api/auth.test")).toBe(true);
+  });
+
+  test("granting a slack power enables the slack CLI + the shared bundle", () => {
+    const plan = compileCliIntegrations(["slack:chat:write"], connectorRegistry());
+    const slack = plan.enabled.find((e) => e.provider === "slack");
+    expect(slack?.bins).toEqual(["slack"]);
+    expect(plan.dummyEnv.SLACK_TOKEN).toBe("x-engrams-managed");
+    expect(plan.bundles).toContain(INTEGRATIONS_CLI_BUNDLE);
+  });
+
+  test("UB2: an uploaded CLI routes BOTH the shared bundle and its own catalog bundle", () => {
+    const plan = compileCliIntegrations(["datadog:logs:read"], registryOf(uploadedCli));
+    expect(plan.enabled.map((e) => e.provider)).toEqual(["datadog"]);
+    expect(plan.enabled[0]!.bins).toEqual(["acme"]);
+    // The shared discovery bundle (helper + SKILL.md) AND the uploaded binary's
+    // own catalog bundle both ride selected_skills (deduped, one slot each).
+    expect(plan.bundles.sort()).toEqual([INTEGRATIONS_CLI_BUNDLE, "acme-cli"].sort());
+  });
+
+  test("UB2: one uploaded bundle backing two granted connectors mounts once", () => {
+    const other = {
+      ...githubRaw,
+      cli: { bins: ["acme2"], binSource: "uploaded", bundle: "acme-cli", doc: "Acme via GitHub host." },
+    };
+    const plan = compileCliIntegrations(["datadog:logs:read", "github:issues:write"], registryOf(uploadedCli, other));
+    // acme-cli appears once despite backing two connectors; integrations-cli once.
+    expect(plan.bundles.sort()).toEqual([INTEGRATIONS_CLI_BUNDLE, "acme-cli"].sort());
+  });
+
   test("no cli facet, or an ungranted capability, yields no CLI + no bundle", () => {
     // datadog (no cli facet) granted; github cli present but not granted.
     const plan = compileCliIntegrations(["datadog:logs:read"], registryOf(datadogRaw, githubCli));
@@ -641,10 +726,12 @@ describe("cli facet (ADR 0058)", () => {
   });
 
   test("the on-disk github + datadog connectors expose their cli facet", () => {
-    const plan = compileCliIntegrations(["github:pulls:write", "datadog:logs:read"], connectorRegistry());
+    const plan = compileCliIntegrations(["github:pulls:write", "datadog:observability:read"], connectorRegistry());
     expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
     expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");
+    expect(plan.dummyEnv.DD_APP_KEY).toBe("x-engrams-managed");
+    expect(plan.enabled.find((e) => e.provider === "datadog")?.bins).toEqual(["pup"]);
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
     // gh's doc carries the PR-open guidance.
     expect(plan.enabled.find((e) => e.provider === "github")?.doc).toMatch(/gh pr create/);

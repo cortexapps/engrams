@@ -64,12 +64,12 @@ export interface RunConnectorTestSpec {
   provider: string;
   host: string;
   source: string;
-  header?: string;
-  template?: string;
-  secretRef?: string;
-  draftSecret?: string;
+  /** inject source: every header the connector injects (ADR 0058). */
+  injects?: Array<{ header: string; template: string; secretRef: string; draftSecret: string }>;
   kind?: string;
   draftFields?: Record<string, string>;
+  /** ADR 0058: probe path (`https://{host}{testPath}`); default `/` coord-side. */
+  testPath?: string;
 }
 /** The slice of the coordinator MintService this service reads/calls. */
 export interface MintAccess {
@@ -331,18 +331,34 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       const host = c.hosts[0];
       if (!host) throw new ConnectError(`connector "${req.provider}" has no host`, Code.InvalidArgument);
       const draft = req.draftValues ?? {};
+      // ADR 0058: an honest probe path (default `/` coord-side). Datadog's `/`
+      // 307-redirects to a public page so any credential "passes" — it points
+      // `test.path` at an endpoint that 401/403s without every injected header.
+      const testPath = c.test?.path;
       const spec: RunConnectorTestSpec =
         c.credential.source === "mint"
-          ? { provider: req.provider, host, source: "mint", kind: c.credential.mint.kind, draftFields: draft }
+          ? {
+              provider: req.provider,
+              host,
+              source: "mint",
+              kind: c.credential.mint.kind,
+              draftFields: draft,
+              ...(testPath ? { testPath } : {}),
+            }
           : {
               provider: req.provider,
               host,
               source: "inject",
-              header: c.credential.inject.header,
-              template: c.credential.inject.template ?? "{}",
-              secretRef: c.credential.inject.secretRef,
-              // inject has a single secret; the web sends it under any key.
-              draftSecret: Object.values(draft)[0] ?? "",
+              // ADR 0058: probe EVERY injected header. The web sends the drafted
+              // values keyed by org-secret ref (`draft[secretRef]`); a header with
+              // no draft falls back to its stored secret coordinator-side.
+              injects: c.credential.injects.map((inj) => ({
+                header: inj.header,
+                template: inj.template ?? "{}",
+                secretRef: inj.secretRef,
+                draftSecret: draft[inj.secretRef] ?? "",
+              })),
+              ...(testPath ? { testPath } : {}),
             };
       const { ok, message } = await mint.runConnectorTest(spec);
       return { ok, message };

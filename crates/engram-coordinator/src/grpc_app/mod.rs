@@ -14,6 +14,7 @@ pub mod auth;
 mod convert;
 mod fleet;
 mod image;
+mod integration_op;
 mod mint;
 mod mount_catalog;
 mod org_secret;
@@ -29,6 +30,7 @@ use tonic::Status;
 
 pub use fleet::AppFleetService;
 pub use image::AppImageService;
+pub use integration_op::AppIntegrationOpService;
 pub use mint::AppMintService;
 pub use mount_catalog::AppMountCatalogService;
 pub use org_secret::AppOrgSecretService;
@@ -165,14 +167,18 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
                 auth: auth.clone(),
             },
         ))
-        // ADR 0055 P2: the org-shared user-uploaded skill catalog.
+        // ADR 0055 P2: the org-shared user-uploaded skill catalog. ADR 0058
+        // uploaded-binary arm: raise the decode cap above tonic's 4 MiB default so
+        // a CLI-binary upload (`skill_pack` caps it at MAX_SKILL_UPLOAD_BYTES) is
+        // admitted on the wire — the binding limit for `RegisterSkill.payload_tar`.
         .add_service(
             app::mount_catalog_service_server::MountCatalogServiceServer::new(
                 AppMountCatalogService {
                     state: state.clone(),
                     auth: auth.clone(),
                 },
-            ),
+            )
+            .max_decoding_message_size(80 * 1024 * 1024),
         )
         // ADR 0057 C3: the read-only mint-kind registry (Plane-A form metadata).
         .add_service(app::mint_service_server::MintServiceServer::new(
@@ -181,6 +187,16 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
                 auth: auth.clone(),
             },
         ))
+        // Server-side, sessionless integration invocation (the "IntegrationOp" seam):
+        // RunIntegrationOp (coordinator executes) + ResolveIntegrationCredential (Mode B).
+        .add_service(
+            app::integration_op_service_server::IntegrationOpServiceServer::new(
+                AppIntegrationOpService {
+                    state: state.clone(),
+                    auth: auth.clone(),
+                },
+            ),
+        )
         // ADR 0057: the admin-managed, KEK-sealed org secret store.
         .add_service(app::org_secret_service_server::OrgSecretServiceServer::new(
             AppOrgSecretService { state, auth },
@@ -392,6 +408,7 @@ mod convention {
         ("mount_catalog.rs", include_str!("mount_catalog.rs")),
         ("org_secret.rs", include_str!("org_secret.rs")),
         ("mint.rs", include_str!("mint.rs")),
+        ("integration_op.rs", include_str!("integration_op.rs")),
     ];
 
     /// Files under `src/grpc_app/` that are deliberately NOT listed in

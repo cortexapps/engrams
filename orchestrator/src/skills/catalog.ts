@@ -49,6 +49,8 @@ export interface MountCatalogClient {
     description: string;
     owner: string;
     payloadTar: Uint8Array;
+    // ADR 0058 uploaded-binary arm: PATH binaries the bundle declares.
+    bins: string[];
   }): Promise<{ skill?: SkillRow }>;
   deleteSkill(req: { name: string }): Promise<{ deleted: boolean }>;
 }

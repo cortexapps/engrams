@@ -33,10 +33,19 @@ import { join } from "node:path";
 // Connector types (the static JSON shape)
 // ---------------------------------------------------------------------------
 
-/** `{}` is replaced by the resolved secret value host-side (e.g. `"Bearer {}"`). */
+/** One injected auth header. `{}` in `template` is replaced by the resolved
+ * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`). */
+export interface InjectHeader {
+  header: string;
+  secretRef: string;
+  template?: string;
+}
+/** ADR 0058: a connector may inject ONE OR MORE headers. Most need one (e.g.
+ * Datadog's `DD-API-KEY`); some need several (Datadog `pup` needs `DD-API-KEY`
+ * AND `DD-APPLICATION-KEY`). Each header resolves its own org secret host-side. */
 export interface InjectCredential {
   source: "inject";
-  inject: { header: string; secretRef: string; template?: string };
+  injects: InjectHeader[];
 }
 export interface MintCredential {
   source: "mint";
@@ -136,10 +145,17 @@ export interface CliFacet {
   bins: string[];
   /**
    * Where the binary comes from: `bundled` (in the admin-baked integrations
-   * bundle — the only P1 source), `uploaded` (a novel binary via the ADR 0055 P2
-   * upload path — deferred), or `npx` (runtime-fetched through the egress proxy).
+   * bundle), `uploaded` (a novel binary an admin uploaded to the mount_catalog —
+   * ADR 0058 uploaded-binary arm; names its catalog bundle in {@link bundle}), or
+   * `npx` (runtime-fetched through the egress proxy — a later arm, still rejected).
    */
   binSource: "bundled" | "uploaded" | "npx";
+  /** ADR 0058 uploaded-binary arm: for `binSource:"uploaded"`, the mount_catalog
+   * bundle name carrying this connector's binary (the upload's registered name);
+   * `compileCliIntegrations` unions it into the session's `selected_skills`.
+   * Required when `uploaded`, unused otherwise (a bundled CLI's binary lives in the
+   * shared integrations bundle). */
+  bundle?: string;
   /** Fixed harmless env values agentd sets so the CLI stops gating on local auth
    * state (e.g. `{ "GH_TOKEN": "x-engrams-managed" }`). NEVER a real secret. */
   dummyEnv?: Record<string, string>;
@@ -149,6 +165,45 @@ export interface CliFacet {
   credentialDelivery: CredentialDelivery;
   /** How-to text folded into the per-session discovery skill. */
   doc: string;
+}
+
+/** ADR 0058: the "Test connection" probe target. The coordinator GETs
+ * `https://{hosts[0]}{path}` with the resolved credential; absent → `/`. A
+ * connector whose root doesn't exercise auth (Datadog's `/` 307-redirects to a
+ * public page, so any value "passes") points this at an endpoint that 401/403s
+ * without a valid credential AND requires every injected header — so a partial or
+ * wrong credential fails the test honestly. */
+export interface ConnectorTest {
+  /** Probe path, must start with `/` (e.g. `/api/v1/dashboard`). */
+  path: string;
+}
+
+/**
+ * OAuth 2.0 authorization-code acquisition (the "Add to Slack" button). The
+ * credential the connector injects (`credential.injects[*].secretRef`) is NOT
+ * entered by hand — it's obtained by an admin consenting to an OAuth flow and
+ * written to the org secret store as `tokenSecretRef`. The app's own credentials
+ * (`clientIdRef` / `clientSecretRef`) are admin-entered org secrets (BYO app). The
+ * coordinator (the only tier that can read org secrets) builds the authorize URL +
+ * runs the code→token exchange; the orchestrator owns the browser redirect.
+ *
+ * `authorizeUrl` / `tokenUrl` hosts must be within the connector's `hosts` (the
+ * same egress-trust boundary) so an admin-authored connector can't exfil the
+ * client secret to an arbitrary host.
+ */
+export interface OauthFacet {
+  authorizeUrl: string;
+  tokenUrl: string;
+  scopes: string[];
+  /** Org secret holding the OAuth app's client id (public, but admin-managed). */
+  clientIdRef: string;
+  /** Org secret holding the OAuth app's client secret. */
+  clientSecretRef: string;
+  /** Org secret the obtained access token is written to (the injected credential). */
+  tokenSecretRef: string;
+  /** Top-level field of the token response holding the access token (e.g.
+   * `access_token`; a leading `$.` is tolerated). */
+  tokenResponsePath: string;
 }
 
 export interface Connector {
@@ -162,6 +217,10 @@ export interface Connector {
   display: ConnectorDisplay;
   /** ADR 0058: optional CLI facet — the provider is drivable through a CLI. */
   cli?: CliFacet;
+  /** ADR 0058: optional probe path for "Test connection" (default `/`). */
+  test?: ConnectorTest;
+  /** Optional OAuth authorization-code acquisition (e.g. Slack "Add to Slack"). */
+  oauth?: OauthFacet;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +354,7 @@ function asStringArray(where: string, field: string, v: unknown): string[] {
 const MAX_HOSTS = 50;
 const MAX_OPERATIONS = 200;
 const MAX_GRANTS = 50;
+const MAX_INJECTS = 10;
 /** RFC 7230 header field-name token (no spaces, colons, or CR/LF). */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 /** Provider id: a lowercase identifier (matches the built-ins). */
@@ -448,11 +508,25 @@ function parseCli(where: string, raw: unknown): CliFacet {
       fail(where, `"cli.binSource" must be "bundled" | "uploaded" | "npx" (got ${JSON.stringify(o.binSource)})`);
     }
     binSource = o.binSource;
-    // P1 only stages the admin-baked bundle; uploaded/npx are designed-for but
-    // not yet wired (ADR 0058: uploaded waits on ADR 0055 P2 binary uploads).
-    if (binSource !== "bundled") {
-      fail(where, `"cli.binSource" "${binSource}" is not yet implemented (ADR 0058 P1 stages only "bundled" CLIs)`);
+    // `uploaded` rides the ADR 0055 P2 catalog (UB1: an admin-uploaded binary
+    // bundle); `npx` (runtime fetch) is designed-for but still not wired.
+    if (binSource === "npx") {
+      fail(where, `"cli.binSource" "npx" is not yet implemented (ADR 0058: runtime npx is a later arm)`);
     }
+  }
+
+  let bundle: string | undefined;
+  if (o.bundle !== undefined) {
+    if (typeof o.bundle !== "string" || !/^[a-z0-9_-]{1,64}$/.test(o.bundle)) {
+      fail(where, '"cli.bundle" must be a mount_catalog bundle name (lowercase alphanumerics, dash, underscore; 1–64 chars)');
+    }
+    bundle = o.bundle;
+  }
+  if (binSource === "uploaded" && !bundle) {
+    fail(where, '"cli.bundle" is required when "cli.binSource" is "uploaded" (the mount_catalog bundle carrying the binary)');
+  }
+  if (binSource !== "uploaded" && bundle !== undefined) {
+    fail(where, '"cli.bundle" is only valid when "cli.binSource" is "uploaded"');
   }
 
   let dummyEnv: Record<string, string> | undefined;
@@ -507,10 +581,65 @@ function parseCli(where: string, raw: unknown): CliFacet {
   return {
     bins,
     binSource,
+    ...(bundle ? { bundle } : {}),
     ...(dummyEnv ? { dummyEnv } : {}),
     ...(dummyFiles ? { dummyFiles } : {}),
     credentialDelivery,
     doc: o.doc,
+  };
+}
+
+const MAX_OAUTH_SCOPES = 50;
+/** An org-secret ref: non-empty, no whitespace (matches the inject secretRef rule). */
+const SECRET_REF_RE = /^\S+$/;
+
+/** Validate the OAuth acquisition facet (admin-trust boundary). `hosts` is the
+ * connector's host allow-list — the authorize/token URLs must resolve to one of
+ * them, so an admin-authored connector can't ship the client secret elsewhere. */
+function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
+  if (typeof raw !== "object" || raw === null) fail(where, '"oauth" must be an object');
+  const o = raw as Record<string, unknown>;
+
+  const httpsUrlOnHost = (field: string, v: unknown): string => {
+    if (typeof v !== "string" || !v) fail(where, `"oauth.${field}" must be a non-empty string`);
+    if (/[\s\r\n]/.test(v as string)) fail(where, `"oauth.${field}" must not contain whitespace`);
+    let url: URL;
+    try {
+      url = new URL(v as string);
+    } catch {
+      return fail(where, `"oauth.${field}" must be a valid URL`);
+    }
+    if (url.protocol !== "https:") fail(where, `"oauth.${field}" must be an https URL`);
+    if (!hosts.includes(url.host)) {
+      fail(where, `"oauth.${field}" host "${url.host}" must be one of the connector's hosts (${hosts.join(", ")})`);
+    }
+    return v as string;
+  };
+
+  const authorizeUrl = httpsUrlOnHost("authorizeUrl", o.authorizeUrl);
+  const tokenUrl = httpsUrlOnHost("tokenUrl", o.tokenUrl);
+
+  const scopes = asStringArray(`${where} oauth`, "scopes", o.scopes);
+  if (scopes.length > MAX_OAUTH_SCOPES) fail(where, `"oauth.scopes" has ${scopes.length} entries (max ${MAX_OAUTH_SCOPES})`);
+  for (const s of scopes) {
+    if (/[\s\r\n]/.test(s)) fail(where, `"oauth.scopes" entry "${s}" must not contain whitespace`);
+  }
+
+  const secretRef = (field: string, v: unknown): string => {
+    if (typeof v !== "string" || !SECRET_REF_RE.test(v)) {
+      fail(where, `"oauth.${field}" must be a non-empty string with no whitespace`);
+    }
+    return v as string;
+  };
+
+  return {
+    authorizeUrl,
+    tokenUrl,
+    scopes,
+    clientIdRef: secretRef("clientIdRef", o.clientIdRef),
+    clientSecretRef: secretRef("clientSecretRef", o.clientSecretRef),
+    tokenSecretRef: secretRef("tokenSecretRef", o.tokenSecretRef),
+    tokenResponsePath: secretRef("tokenResponsePath", o.tokenResponsePath),
   };
 }
 
@@ -527,18 +656,26 @@ export function parseConnector(raw: unknown, where: string): Connector {
   if (typeof cred !== "object" || cred === null) fail(where, '"credential" must be an object');
   let credential: Credential;
   if (cred.source === "inject") {
-    const inj = cred.inject as Record<string, unknown> | undefined;
-    if (typeof inj !== "object" || inj === null) fail(where, '"credential.inject" must be an object');
-    if (typeof inj.header !== "string" || !inj.header) fail(where, '"credential.inject.header" must be a non-empty string');
-    if (!HEADER_NAME_RE.test(inj.header)) fail(where, `"credential.inject.header" "${inj.header}" is not a valid HTTP header name`);
-    if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(where, '"credential.inject.secretRef" must be a non-empty string');
-    if (/\s/.test(inj.secretRef)) fail(where, '"credential.inject.secretRef" must not contain whitespace');
-    if (inj.template !== undefined) {
-      if (typeof inj.template !== "string") fail(where, '"credential.inject.template" must be a string');
-      if (/[\r\n]/.test(inj.template)) fail(where, '"credential.inject.template" must not contain newlines');
-      if (!inj.template.includes("{}")) fail(where, '"credential.inject.template" must contain the "{}" value placeholder');
+    if (!Array.isArray(cred.injects) || cred.injects.length === 0) {
+      fail(where, '"credential.injects" must be a non-empty array of {header, secretRef, template?}');
     }
-    credential = { source: "inject", inject: { header: inj.header, secretRef: inj.secretRef, ...(typeof inj.template === "string" ? { template: inj.template } : {}) } };
+    if (cred.injects.length > MAX_INJECTS) fail(where, `"credential.injects" has ${cred.injects.length} entries (max ${MAX_INJECTS})`);
+    const injects: InjectHeader[] = cred.injects.map((raw, i): InjectHeader => {
+      const iw = `${where} credential.injects[${i}]`;
+      if (typeof raw !== "object" || raw === null) fail(iw, "must be an object");
+      const inj = raw as Record<string, unknown>;
+      if (typeof inj.header !== "string" || !inj.header) fail(iw, '"header" must be a non-empty string');
+      if (!HEADER_NAME_RE.test(inj.header)) fail(iw, `"header" "${inj.header}" is not a valid HTTP header name`);
+      if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(iw, '"secretRef" must be a non-empty string');
+      if (/\s/.test(inj.secretRef)) fail(iw, '"secretRef" must not contain whitespace');
+      if (inj.template !== undefined) {
+        if (typeof inj.template !== "string") fail(iw, '"template" must be a string');
+        if (/[\r\n]/.test(inj.template)) fail(iw, '"template" must not contain newlines');
+        if (!inj.template.includes("{}")) fail(iw, '"template" must contain the "{}" value placeholder');
+      }
+      return { header: inj.header, secretRef: inj.secretRef, ...(typeof inj.template === "string" ? { template: inj.template } : {}) };
+    });
+    credential = { source: "inject", injects };
   } else if (cred.source === "mint") {
     const mint = cred.mint as Record<string, unknown> | undefined;
     if (typeof mint !== "object" || mint === null) fail(where, '"credential.mint" must be an object');
@@ -589,7 +726,29 @@ export function parseConnector(raw: unknown, where: string): Connector {
   const display = parseDisplay(where, o.display, o.provider);
   const cli = o.cli !== undefined ? parseCli(where, o.cli) : undefined;
 
-  return { provider: o.provider, protocol: "http", credential, hosts, operations, display, ...(cli ? { cli } : {}) };
+  let test: ConnectorTest | undefined;
+  if (o.test !== undefined) {
+    if (typeof o.test !== "object" || o.test === null) fail(where, '"test" must be an object');
+    const t = o.test as Record<string, unknown>;
+    if (typeof t.path !== "string" || !t.path.startsWith("/")) {
+      fail(where, '"test.path" must be a string starting with "/"');
+    }
+    test = { path: t.path };
+  }
+
+  const oauth = o.oauth !== undefined ? parseOauth(where, o.oauth, hosts) : undefined;
+
+  return {
+    provider: o.provider,
+    protocol: "http",
+    credential,
+    hosts,
+    operations,
+    display,
+    ...(cli ? { cli } : {}),
+    ...(test ? { test } : {}),
+    ...(oauth ? { oauth } : {}),
+  };
 }
 
 /** Build the provider→connector map; throws on a duplicate provider. */
@@ -734,6 +893,9 @@ export function compileIntegrationPolicy(
   const observes: IntegrationObserveJson[] = [];
   const seenInject = new Set<string>();
   const seenObserve = new Set<string>();
+  // ADR 0057: hosts opened by a granted power (folded into the egress allow-list
+  // below — you must be able to REACH a host you inject a credential onto).
+  const grantedHosts = new Set<string>();
   for (const capStr of capabilities) {
     const cap = parseCapability(capStr);
     if (!cap) continue;
@@ -741,6 +903,7 @@ export function compileIntegrationPolicy(
     if (!connector) continue;
     for (const op of connector.operations) {
       if (!op.grants.includes(cap.action)) continue;
+      for (const h of connector.hosts) grantedHosts.add(h);
       const methods = op.match?.method ? [op.match.method.toUpperCase()] : [];
       // Emit the connector match path as a whole glob (the proxy globs `*` over
       // the full request path). Previously this was truncated at the first `*`
@@ -749,20 +912,23 @@ export function compileIntegrationPolicy(
       const path_globs = op.match?.path ? [op.match.path] : [];
 
       if (connector.credential.source === "inject") {
-        const inj = connector.credential.inject;
-        const entry: IntegrationInjectJson = {
-          hosts: connector.hosts,
-          header_name: inj.header,
-          header_template: inj.template ?? "{}",
-          secret_ref: inj.secretRef,
-          mint_provider: "",
-          methods,
-          path_globs,
-        };
-        const key = JSON.stringify(entry);
-        if (!seenInject.has(key)) {
-          seenInject.add(key);
-          injects.push(entry);
+        // One egress inject per declared header (most connectors have one; e.g.
+        // Datadog `pup` injects DD-API-KEY AND DD-APPLICATION-KEY).
+        for (const inj of connector.credential.injects) {
+          const entry: IntegrationInjectJson = {
+            hosts: connector.hosts,
+            header_name: inj.header,
+            header_template: inj.template ?? "{}",
+            secret_ref: inj.secretRef,
+            mint_provider: "",
+            methods,
+            path_globs,
+          };
+          const key = JSON.stringify(entry);
+          if (!seenInject.has(key)) {
+            seenInject.add(key);
+            injects.push(entry);
+          }
         }
       }
 
@@ -816,7 +982,13 @@ export function compileIntegrationPolicy(
   // here (the secret VALUES are resolved host-side from `secret_ref`).
   const network: IntegrationNetworkJson = {
     default: inputs?.network?.default === "allow" ? "allow" : "deny",
-    allow_hosts: inputs?.network?.allowHosts ?? [],
+    // ADR 0057: union the profile's hand-typed allow-list with every granted
+    // connector's hosts (deduped, admin entries first). Granting a power opens
+    // its host's egress — matching what the profile UI already shows as "hosts
+    // opened by granted powers" (`derivedHosts`). Without this, a profile that
+    // grants a capability but doesn't *also* re-type the host gets a DNS "could
+    // not resolve host" at runtime despite the credential injection being wired.
+    allow_hosts: [...new Set([...(inputs?.network?.allowHosts ?? []), ...grantedHosts])],
     allow_host_patterns: inputs?.network?.allowHostPatterns ?? [],
   };
   const secrets: IntegrationSecretJson[] = (inputs?.secrets ?? []).map((s) => ({
@@ -890,18 +1062,22 @@ export function compileCliIntegrations(
   const dummyEnv: Record<string, string> = {};
   const dummyFiles: CliDummyFile[] = [];
   const enabled: EnabledCli[] = [];
-  let needsBundle = false;
+  // Dedup'd mount bundles (a `dyn_*` slot each): the shared integrations bundle
+  // once (any CLI enables it — it carries the discovery helper + SKILL.md), plus
+  // each uploaded connector's own catalog bundle (the binary itself).
+  const bundles = new Set<string>();
 
   for (const provider of [...grantedProviders].sort()) {
     const cli = registry.get(provider)!.cli;
     if (!cli) continue;
     enabled.push({ provider, displayName: registry.get(provider)!.display.name, bins: cli.bins, doc: cli.doc });
-    if (cli.binSource === "bundled") needsBundle = true;
+    bundles.add(INTEGRATIONS_CLI_BUNDLE);
+    if (cli.binSource === "uploaded" && cli.bundle) bundles.add(cli.bundle);
     for (const [k, v] of Object.entries(cli.dummyEnv ?? {})) dummyEnv[k] = v;
     for (const f of cli.dummyFiles ?? []) dummyFiles.push(f);
   }
 
-  return { dummyEnv, dummyFiles, enabled, bundles: needsBundle ? [INTEGRATIONS_CLI_BUNDLE] : [] };
+  return { dummyEnv, dummyFiles, enabled, bundles: [...bundles] };
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +1101,8 @@ export function connectorStatus(
   requiredMintSecretNames: ReadonlyArray<string> = [],
 ): ConnectorStatus {
   if (connector.credential.source === "inject") {
-    return orgSecretNames.has(connector.credential.inject.secretRef) ? "connected" : "available";
+    // Connected ⇔ every injected header's secret is present in the org store.
+    return connector.credential.injects.every((i) => orgSecretNames.has(i.secretRef)) ? "connected" : "available";
   }
   if (requiredMintSecretNames.length === 0) return "available";
   return requiredMintSecretNames.every((n) => orgSecretNames.has(n)) ? "connected" : "available";

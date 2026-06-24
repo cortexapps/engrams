@@ -27,6 +27,7 @@ pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_detect_backstop;
 pub mod idle_evictor;
+pub mod integration_ops;
 pub mod integrations;
 pub mod live_migration;
 pub mod metrics;
