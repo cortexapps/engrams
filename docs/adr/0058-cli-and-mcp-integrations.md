@@ -6,7 +6,10 @@ prod Firecracker session — the CLI carries only a dummy placeholder; the proxy
 real credential host-side. The multi-credential connector UI (#418), an honest TestConnection
 probe (#419), and the granted-power-opens-egress fix (#420) followed. **P2–P4 deferred** — see
 [Phasing](#phasing-each-phase--one-pr-on-its-own-worktree-linear-stack) and the **P3/P4 pickup
-notes** below, which pin the details a cold pickup would otherwise have to re-derive.
+notes** below, which pin the details a cold pickup would otherwise have to re-derive. The
+**uploaded-binary arm** (`binSource:"uploaded"` — custom-connector tooling parity) is now in
+flight; its design is the [Uploaded CLI binaries](#uploaded-cli-binaries--the-binsource-uploaded-arm-custom-connector-parity)
+section below.
 
 Builds on **ADR 0057** (profiles as the unified session-policy object + the runtime-managed
 connector catalog), **ADR 0056** (generic integrations — the interceptor gate/inject/observe
@@ -298,6 +301,69 @@ the `inject.rs` overwrite are unit-tested, so this is the integration of validat
 **Post-merge:** the engrams-internal host re-bake + image re-enable to stage the bundle on the
 prod fleet.
 
+## Uploaded CLI binaries — the `binSource: "uploaded"` arm (custom-connector parity)
+
+P1 made CLIs first-class for *built-in* connectors; a custom connector reaches the same parity
+only for tools already in the baked bundle (`gh`, `pup`). The remaining gap is **binary
+provenance for a novel tool** — the deferred `binSource: "uploaded"`. This section is its design.
+(Remote/stdio **MCP** is the other half of custom parity and stays tracked under P3/P4.)
+
+**The machinery already exists — the gap is one hardcoded field.** The ADR 0055 P2
+`mount_catalog` upload path is *not* markdown-gated by code, and everything downstream of the
+upload is binary-agnostic: `skill_pack.rs` accepts arbitrary tar/zip (rejecting only
+symlinks/hardlinks/devices), content-addresses + packs a deterministic squashfs, and writes a
+`mount_catalog` row; catalog rows UNION straight into the bundle pin set so hosts auto-stage
+`<sha>.squashfs` on the next heartbeat (no `current.json`/node-assets change — catalog names
+resolve via the table); and `resolve_selected_skills` → `patch_drive` → `activate()` are fully
+generic — `activate()` symlinks *any* mounted `mount.json`'s declared `bins` onto
+`/usr/local/bin`. The sole blocker: the pack-time manifest is hardcoded to
+`MountManifest::single_skill(name)` with **empty `bins`**, so an uploaded binary stages and
+mounts but never lands on PATH. **Zero host-agent / Firecracker / guest-activation change** — only
+the upload contract, the connector compile, and the authoring UI move.
+
+Decisions:
+
+- **The upload declares its bins.** `RegisterSkillRequest` gains `repeated string bins`;
+  `pack_skill` validates each is a regular file *inside* the archive (no traversal/symlink) and
+  marks it executable, then folds them into the generated `mount.json` — with **no
+  `requires_env`** (an uploaded bundle is mounted only when a connector referencing it is granted,
+  so `selected_skills` membership *is* the gate). Empty `bins` = today's markdown behaviour,
+  byte-for-byte. Bins ride the existing `mount_catalog.mount_json` column — **no migration**.
+- **Raise the size ceiling for binary bundles.** The markdown-era caps
+  (`MAX_SKILL_UNPACKED_BYTES = 16 MiB` / 2 MiB compressed) are too small (`gh` alone is ~30 MB).
+  Raise to a binary-appropriate ceiling (~128 MiB unpacked / ~64 MiB compressed, tuned against
+  `gh`/`kubectl`/`aws`-class binaries), keep the file-count cap, keep the caps enforced.
+  squashfs + content-address dedup means re-using a binary across connectors costs one
+  fleet-wide copy.
+- **The connector references the uploaded bundle by name (Model A).** The `cli` facet gains
+  `binSource: "uploaded"` (lift the `parseCli` rejection) + `bundle: "<mount_catalog name>"`;
+  `compileCliIntegrations` adds `cli.bundle` to `selected_skills` for a granted uploaded-CLI
+  connector instead of the shared `INTEGRATIONS_CLI_BUNDLE`. Everything else (dummy env, the
+  discovery doc, the inject rail, the #420 host-open) is unchanged. Reference-by-name keeps the
+  binary a content-addressed catalog artifact with its own lifecycle — one uploaded bundle can
+  back several connectors — while the UI may *present* it as one inline "upload + reference" step.
+  (Rejected — Model B, embedding the binary in the connector row: couples a content-addressed
+  artifact to one connector and duplicates the catalog's storage/GC.)
+- **Trust is unchanged.** Uploads are admin-only (`registerSkill` checks the role) and connectors
+  validate at the same `parseConnector` boundary; the binary runs in an **isolated microVM**,
+  content-addressed with an `owner` + soft-delete/GC (0055 P2). The glibc-base constraint (above)
+  carries over — an uploaded dynamically-linked binary runs against the base image's libc;
+  static/musl binaries are safest. Not a new trust tier — the one skills/bundles already occupy.
+
+Phasing (its own linear stack, peer of the P-series above):
+
+- **UB1 — upload-declares-bins** (foundation, connector-agnostic): proto `bins` + `pack_skill`
+  validation + `MountManifest` bins builder + the cap raise. Verifiable via `selected_skills`
+  alone — dev-vm FC: upload a tiny binary, select it, confirm it's on PATH, before any connector
+  wiring exists.
+- **UB2 — connector wiring**: `parseCli` accepts `uploaded` + `cli.bundle`;
+  `compileCliIntegrations` routes the bundle into `selected_skills`; unit tests + an end-to-end
+  custom-connector resolve.
+- **UB3 — authoring UI**: `CustomConnectorModal` gains the `cli` section (missing today) + the
+  inline binary-upload affordance.
+- **UB4 — prod e2e + Accepted-for-uploaded**: upload a real CLI, author a custom connector, run
+  it against a live API in a prod FC session (mirroring the `gh`/`pup` proofs).
+
 ## Consequences and risks
 
 - **No host/coordinator/proxy change in P1**: the inject-overwrite path already ships and
@@ -308,8 +374,10 @@ prod fleet.
   into the FC-host image — a host-image roll, like adding any bundle (ADR 0035/0055).
 - **`parseConnector` gains surface**: `cli`/`mcp` facets can open egress + inject org secrets
   + add PATH binaries — validated at the same admin-trust level as today's connector hosts.
-- **Custom-connector binary provenance** is a real dependency, not a gap: novel custom CLI
-  binaries wait on the ADR 0055 P2 binary-upload deferral; bundled CLIs and all MCP work now.
+- **Custom-connector binary provenance** is addressed by the `binSource: "uploaded"` arm
+  (above), which lifts the ADR 0055 P2 binary-upload deferral: novel custom CLI binaries upload
+  to the catalog and ride the existing stage/mount/activate path. Bundled CLIs work now; remote/
+  stdio MCP (P3/P4) needs no binary at all.
 - **SigV4 / non-HTTP** (`aws`, ssh, DB wire protocols) genuinely cannot ride host-side
   overwrite — handled by the open strategy (P2+), not by pretending they work in P1.
 - **MCP harness-coupling + headless approval** are real constraints; MCP stays opt-in and
