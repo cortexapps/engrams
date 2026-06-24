@@ -1,56 +1,31 @@
-import { Link, useNavigate } from "@tanstack/react-router";
-import { Rocket } from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import { Plus } from "lucide-react";
 import { useTasksAsSessionList } from "../../hooks/useTasks";
-import { useAuth } from "../../auth/AuthProvider";
-import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { NewSessionDialog } from "../../components/NewSessionDialog";
 import { PageHeading } from "../../components/page-heading";
 import { SessionsList } from "./sessions-list";
 
+// The full "My tasks" table — the dense, filterable history that backs the
+// start screen's "See all". Starting a task now lives on the composer at
+// /sessions; this page's "New task" is just a link back to it.
 export function MySessions() {
-  const { principal } = useAuth();
   const { data: sessions, isPending, error } = useTasksAsSessionList();
-  const navigate = useNavigate();
-  const showTokenNudge = !principal.is_admin && !principal.has_claude_token;
+  const newTask = (
+    <Button asChild>
+      <Link to="/sessions">
+        <Plus className="size-4" />
+        New task
+      </Link>
+    </Button>
+  );
 
   return (
     <div className="flex-1 space-y-6 overflow-auto p-4 md:p-6">
       <PageHeading
-        title="Tasks"
+        title="My tasks"
         description="Bounded units of agent work: launch, watch, resume."
-        actions={
-          <div className="flex items-center gap-2">
-            <Button asChild variant="outline">
-              <Link to="/launch">
-                <Rocket className="size-4" />
-                Launch
-              </Link>
-            </Button>
-            <NewSessionDialog
-              triggerTestId="new-session"
-              onCreated={(id) => navigate({ to: "/sessions/$id", params: { id } })}
-            />
-          </div>
-        }
+        actions={newTask}
       />
-
-      {showTokenNudge && (
-        <Card>
-          <CardContent className="flex items-center justify-between gap-4 py-3">
-            <span className="text-sm">
-              No Claude Code token saved yet — built-in Claude tasks need one.
-            </span>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => navigate({ to: "/settings/tokens" })}
-            >
-              Add token
-            </Button>
-          </CardContent>
-        </Card>
-      )}
 
       <SessionsList
         sessions={sessions ?? []}
@@ -58,9 +33,7 @@ export function MySessions() {
         error={error}
         showOwner={false}
         emptyText="No tasks yet. Start one to launch a sandbox and hand an agent a task."
-        emptyAction={
-          <NewSessionDialog onCreated={(id) => navigate({ to: "/sessions/$id", params: { id } })} />
-        }
+        emptyAction={newTask}
       />
     </div>
   );

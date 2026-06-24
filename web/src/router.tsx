@@ -25,6 +25,7 @@ import type { AuthState } from "./auth/AuthProvider";
 import { RootLayout } from "./pages/RootLayout";
 import { Login } from "./pages/Login";
 import { SessionsLayout } from "./pages/sessions/SessionsLayout";
+import { StartScreen } from "./pages/sessions/StartScreen";
 import { MySessions } from "./pages/sessions/MySessions";
 import { AllSessions } from "./pages/sessions/AllSessions";
 import { SessionDetail } from "./pages/SessionDetail";
@@ -43,7 +44,6 @@ import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
-import { LaunchPage } from "./pages/LaunchPage";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -109,22 +109,23 @@ const indexRoute = createRoute({
   },
 });
 
-// /launch — the full-page new-session picker (redesign §H).
-const launchRoute = createRoute({
-  getParentRoute: () => appLayoutRoute,
-  path: "/launch",
-  component: LaunchPage,
-});
-
 // /sessions layout route (second sidebar) ----------------------------------
 const sessionsLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
   path: "/sessions",
   component: SessionsLayout,
 });
-const mySessionsRoute = createRoute({
+// The landing IS the composer-first start screen (the one canonical create
+// surface). The full "My tasks" table moves to /sessions/list, reachable from
+// the rail footer and the start screen's "See all".
+const startScreenRoute = createRoute({
   getParentRoute: () => sessionsLayoutRoute,
   path: "/",
+  component: StartScreen,
+});
+const mySessionsRoute = createRoute({
+  getParentRoute: () => sessionsLayoutRoute,
+  path: "list",
   component: MySessions,
 });
 const allSessionsRoute = createRoute({
@@ -248,8 +249,12 @@ export const routeTree = rootRoute.addChildren([
   // Authenticated app shell — all authenticated routes nested here
   appLayoutRoute.addChildren([
     indexRoute,
-    launchRoute,
-    sessionsLayoutRoute.addChildren([mySessionsRoute, allSessionsRoute, sessionDetailRoute]),
+    sessionsLayoutRoute.addChildren([
+      startScreenRoute,
+      mySessionsRoute,
+      allSessionsRoute,
+      sessionDetailRoute,
+    ]),
     operatorLayoutRoute.addChildren([
       operatorIndexRoute,
       operatorFleetRoute,

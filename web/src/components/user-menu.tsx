@@ -11,11 +11,17 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar";
+import {
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  useSidebar,
+} from "@/components/ui/sidebar";
 
 export function UserMenu() {
   const { principal } = useAuth();
   const navigate = useNavigate();
+  const { isMobile, state } = useSidebar();
   const label = principal.display_name || principal.email;
   const initial = label.charAt(0).toUpperCase();
 
@@ -35,7 +41,15 @@ export function UserMenu() {
               <ChevronsUpDown className="ml-auto size-4" />
             </SidebarMenuButton>
           </DropdownMenuTrigger>
-          <DropdownMenuContent side="right" align="end" className="min-w-56">
+          <DropdownMenuContent
+            // Expanded rail: anchor the menu directly above the avatar, matching
+            // its width (the standard bottom-of-sidebar account menu). Only the
+            // icon-collapsed spine flies out to the right; mobile drops down.
+            side={isMobile ? "bottom" : state === "collapsed" ? "right" : "top"}
+            align="end"
+            sideOffset={4}
+            className="w-(--radix-dropdown-menu-trigger-width) min-w-56"
+          >
             <DropdownMenuLabel className="font-normal">
               <div className="grid text-sm">
                 <span className="font-medium">{label}</span>

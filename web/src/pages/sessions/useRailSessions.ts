@@ -47,10 +47,10 @@ const fromSession = (s: Session): RailRow => ({
   profile: null,
 });
 
-// Stable order so the 1s refetch never reorders rows under the cursor: by
-// lifecycle bucket (active → idle → archived), then most-recently-active. The
-// full sessions list (SessionsList) shares this exact comparator, so the rail
-// reads as a capped preview of the same order.
+// Most-recently-active first (status-agnostic); the stable sort keeps rows that
+// share a timestamp from jittering under the 1s refetch. The full sessions list
+// (SessionsList) shares this exact comparator, so the rail reads as a capped
+// preview of the same order.
 function sortForRail(rows: SessionListItem[]): SessionListItem[] {
   return [...rows].sort(compareSessions);
 }
@@ -69,10 +69,11 @@ export interface RailSessions {
 export function useRailSessions(): RailSessions {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
 
-  // `/sessions/<id>` → the open session; `/sessions/all` is the fleet list, not
-  // a detail.
+  // `/sessions/<id>` → the open session; `/sessions/all` (fleet list) and
+  // `/sessions/list` (my-tasks table) are section pages, not a detail — treating
+  // either as a session id would poll GetSession({ sessionId: "list" }) on a loop.
   const seg = pathname.startsWith("/sessions/") ? pathname.split("/")[2] : undefined;
-  const openId = seg && seg !== "all" ? seg : undefined;
+  const openId = seg && seg !== "all" && seg !== "list" ? seg : undefined;
 
   // ADR 0051 Task 28: use TaskService-backed list instead of REST /sessions.
   const { data, isPending, error } = useTasksAsSessionList();

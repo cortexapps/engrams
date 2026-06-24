@@ -17,8 +17,8 @@ import {
 import { ProfileChip } from "../../components/profiles/ProfileChip";
 
 // The sessions list reads as a workspace switcher, not a data grid: a flat list
-// of rich rows ordered running-first (the same order as the rail), each row a
-// single focusable link into that workspace. A status telltale (the glyph)
+// of rich rows ordered most-recently-active first (the same order as the rail),
+// each row a single focusable link into that workspace. A status telltale (the glyph)
 // leads, the session id carries identity — the slot a human-readable name will
 // take over later — and the image/status/age trail as quiet metadata. Live /
 // Archived / All tabs keep terminal history out of the default working set.
