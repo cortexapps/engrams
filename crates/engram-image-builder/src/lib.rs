@@ -701,7 +701,7 @@ impl<D: DockerRunner, P: Ext4Packer> Builder<D, P> {
             }
         }
 
-        // ADR 0027: the share-file / create-pull-request skill glue is no
+        // ADR 0027: the share-file skill + the git forge glue is no
         // longer baked into the rootfs. It now lives in the fleet-wide
         // `skills` RO bundle the FC host mounts, and agentd activates the
         // right subset per session at SpawnHarness (gated on the forge

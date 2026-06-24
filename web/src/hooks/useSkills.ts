@@ -29,7 +29,7 @@ export const BUILTIN_SKILLS: { name: string; label: string; description: string 
   {
     name: "skills",
     label: "Built-in skills",
-    description: "share-file, create-pull-request, and the git credential wiring.",
+    description: "share-file and the git credential wiring.",
   },
   {
     name: "playwright",

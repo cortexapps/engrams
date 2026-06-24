@@ -364,10 +364,9 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
 #[tokio::test]
 async fn build_does_not_bake_forge_glue_for_git_images() {
     // ADR 0027: a `[git]` binding no longer makes the baker plant forge
-    // glue (askpass / gitconfig / create-pull-request skill). The skills
-    // bundle carries the wrappers + SKILL.md; agentd writes /etc/gitconfig
-    // and symlinks the create-pull-request skill per-session when a forge
-    // token is present. The baked rootfs stays clean.
+    // glue (askpass / gitconfig). The skills bundle carries the wrappers +
+    // SKILL.md; agentd writes /etc/gitconfig and wires the askpass per-session
+    // when a forge token is present. The baked rootfs stays clean.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
     write_source_repo(

@@ -155,7 +155,8 @@ impl HarnessSupervisor {
         //
         // The forge broker token rides `req.env` (per-spawn extras), NOT
         // `session_env` (coord keeps it out of the cached env), so gate on
-        // the union — otherwise `create-pull-request` would never wire.
+        // the union — otherwise the forge-gated askpass/gitconfig (and any
+        // `requires_env` skill) would never wire.
         let mut gate_env = req.session_env.clone();
         gate_env.extend(req.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         let report = engram_session_bundles::activate(std::path::Path::new("/"), &gate_env);

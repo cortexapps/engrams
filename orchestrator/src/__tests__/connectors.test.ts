@@ -646,7 +646,7 @@ describe("cli facet (ADR 0058)", () => {
     expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
-    // gh's doc folds the create-pull-request guidance.
+    // gh's doc carries the PR-open guidance.
     expect(plan.enabled.find((e) => e.provider === "github")?.doc).toMatch(/gh pr create/);
   });
 });

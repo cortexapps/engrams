@@ -11,8 +11,9 @@
 //! `skills`/`browser` probe (and, before that, the bake-time injectors).
 //!
 //! Gating that depends on session state stays, now declared in `mount.json`:
-//! - a skill with `requires_env` (e.g. `ENGRAM_FORGE_TOKEN` for
-//!   `create-pull-request`) is wired only when that env key is present;
+//! - a skill with `requires_env` (e.g. the ADR 0058 `integrations` discovery
+//!   skill requires `ENGRAM_CLI_INTEGRATIONS`) is wired only when that env key
+//!   is present;
 //! - `/etc/gitconfig` gets a `[user]` block whenever an initiator is known
 //!   (ADR 0031 committer attribution, every session), and the askpass +
 //!   credential blocks only for a forge-bound session whose mounted skills
@@ -36,8 +37,8 @@ const FORGE_TOKEN_ENV: &str = "ENGRAM_FORGE_TOKEN";
 /// What `activate` wired up, for logging + tests.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ActivationReport {
-    /// Skills that were activated (e.g. `"share-file"`,
-    /// `"create-pull-request"`, `"show-your-work"`).
+    /// Skills that were activated (e.g. `"share-file"`, `"integrations"`,
+    /// `"show-your-work"`).
     pub activated: Vec<String>,
     /// Non-fatal problems (bundle absent/garbled, symlink failed). The caller
     /// logs these; none of them fail the session.
@@ -281,16 +282,13 @@ mod tests {
         for bin in ["engram-share", "git-askpass"] {
             std::fs::write(b.join("bin").join(bin), "#!/bin/sh\n").unwrap();
         }
-        for s in ["share-file", "create-pull-request"] {
-            std::fs::create_dir_all(b.join("skills").join(s)).unwrap();
-            std::fs::write(b.join("skills").join(s).join("SKILL.md"), "---\n").unwrap();
-        }
+        std::fs::create_dir_all(b.join("skills/share-file")).unwrap();
+        std::fs::write(b.join("skills/share-file/SKILL.md"), "---\n").unwrap();
         std::fs::write(
             b.join("mount.json"),
             r#"{"kind":"skill",
                 "skills":[
-                  {"name":"share-file","bins":["bin/engram-share"]},
-                  {"name":"create-pull-request","requires_env":"ENGRAM_FORGE_TOKEN"}
+                  {"name":"share-file","bins":["bin/engram-share"]}
                 ],
                 "provides_askpass":"bin/git-askpass"}"#,
         )
@@ -346,9 +344,6 @@ mod tests {
         stage_sentinel_slot(dir.path(), 1);
         let report = activate(dir.path(), &env(&[]));
         assert!(report.activated.contains(&"share-file".to_string()));
-        assert!(!report
-            .activated
-            .contains(&"create-pull-request".to_string()));
         let l = Layout::under(dir.path());
         assert!(l.claude_skills.is_symlink());
         assert!(l.agents_skills.join("share-file").is_symlink());
@@ -357,19 +352,15 @@ mod tests {
     }
 
     #[test]
-    fn forge_token_wires_pr_and_gitconfig() {
+    fn forge_token_wires_gitconfig_askpass() {
         let dir = tempfile::tempdir().unwrap();
         stage_skills_slot(dir.path(), 0);
         let report = activate(dir.path(), &env(&[("ENGRAM_FORGE_TOKEN", "tok")]));
-        assert!(report
-            .activated
-            .contains(&"create-pull-request".to_string()));
+        // ADR 0058: the baked PR skill is retired. Git push stays brokered via
+        // the skills bundle's askpass + gitconfig (gated on ENGRAM_FORGE_TOKEN);
+        // PRs now open via `gh` from the integrations-cli bundle, not a skill.
         assert!(report.activated.contains(&"gitconfig".to_string()));
         let l = Layout::under(dir.path());
-        // create-pull-request is markdown-only now (ADR 0056 P3 retired its
-        // engram-pr bin); it wires as a skill dir + the gitconfig askpass, and
-        // opens PRs via `gh` on PATH — no skill-provided bin on PATH.
-        assert!(l.agents_skills.join("create-pull-request").is_symlink());
         let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
         assert!(gc.contains("bin/git-askpass"));
         assert!(gc.contains("x-access-token"));
@@ -430,16 +421,14 @@ mod tests {
     }
 
     #[test]
-    fn create_pr_skipped_when_only_browser_selected_and_forge_present() {
+    fn browser_only_with_forge_token_still_wires_show_your_work() {
         // A profile that selected only the browser skill (not the skills
-        // bundle) + a forge token: create-pull-request simply isn't mounted, so
-        // it isn't wired — no failure, show-your-work still works.
+        // bundle) + a forge token: no `provides_askpass` bundle is mounted, so
+        // there's nothing forge-gated to wire — show-your-work still works, no
+        // failure. (The retired PR skill used to be the forge-gated entry here.)
         let dir = tempfile::tempdir().unwrap();
         stage_browser_slot(dir.path(), 0);
         let report = activate(dir.path(), &env(&[("ENGRAM_FORGE_TOKEN", "tok")]));
-        assert!(!report
-            .activated
-            .contains(&"create-pull-request".to_string()));
         assert!(report.activated.contains(&"show-your-work".to_string()));
     }
 

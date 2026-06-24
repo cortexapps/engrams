@@ -25,7 +25,7 @@ pub struct SkillEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bins: Vec<String>,
     /// Gate: skip this skill unless this env key is present in `session_env`
-    /// (e.g. `create-pull-request` requires `ENGRAM_FORGE_TOKEN`).
+    /// (e.g. the ADR 0058 `integrations` skill requires `ENGRAM_CLI_INTEGRATIONS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_env: Option<String>,
 }
@@ -90,8 +90,8 @@ mod tests {
           "kind": "skill",
           "skills": [
             { "name": "share-file", "bins": ["bin/engram-share"] },
-            { "name": "create-pull-request",
-              "requires_env": "ENGRAM_FORGE_TOKEN" }
+            { "name": "integrations", "bins": ["bin/engrams-integrations"],
+              "requires_env": "ENGRAM_CLI_INTEGRATIONS" }
           ],
           "provides_askpass": "bin/git-askpass"
         }"#;
@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(m.skills.len(), 2);
         assert_eq!(
             m.skills[1].requires_env.as_deref(),
-            Some("ENGRAM_FORGE_TOKEN")
+            Some("ENGRAM_CLI_INTEGRATIONS")
         );
         assert_eq!(m.provides_askpass.as_deref(), Some("bin/git-askpass"));
         assert!(!m.is_sentinel());
