@@ -9,6 +9,7 @@ import artifactsRoute from "./routes/artifacts.ts";
 import connectorLogoRoute from "./routes/connector-logo.ts";
 import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
+import integrationOpRoute from "./routes/integration-op.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
@@ -45,6 +46,8 @@ app.route("/", connectorLogoRoute);
 app.route("/", meRoute);
 // ADR 0051 Task 28: admin REST proxy (pause/resume session — no gRPC equiv yet).
 app.route("/", adminRoute);
+// Admin trigger for the IntegrationOp seam (sessionless integration calls).
+app.route("/", integrationOpRoute);
 
 // ADR 0051 Task 21: Shell WebSocket route.
 const { app: shellApp, injectUpgrade } = makeShellRoute();
