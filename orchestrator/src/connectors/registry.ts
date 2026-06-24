@@ -178,6 +178,34 @@ export interface ConnectorTest {
   path: string;
 }
 
+/**
+ * OAuth 2.0 authorization-code acquisition (the "Add to Slack" button). The
+ * credential the connector injects (`credential.injects[*].secretRef`) is NOT
+ * entered by hand — it's obtained by an admin consenting to an OAuth flow and
+ * written to the org secret store as `tokenSecretRef`. The app's own credentials
+ * (`clientIdRef` / `clientSecretRef`) are admin-entered org secrets (BYO app). The
+ * coordinator (the only tier that can read org secrets) builds the authorize URL +
+ * runs the code→token exchange; the orchestrator owns the browser redirect.
+ *
+ * `authorizeUrl` / `tokenUrl` hosts must be within the connector's `hosts` (the
+ * same egress-trust boundary) so an admin-authored connector can't exfil the
+ * client secret to an arbitrary host.
+ */
+export interface OauthFacet {
+  authorizeUrl: string;
+  tokenUrl: string;
+  scopes: string[];
+  /** Org secret holding the OAuth app's client id (public, but admin-managed). */
+  clientIdRef: string;
+  /** Org secret holding the OAuth app's client secret. */
+  clientSecretRef: string;
+  /** Org secret the obtained access token is written to (the injected credential). */
+  tokenSecretRef: string;
+  /** Top-level field of the token response holding the access token (e.g.
+   * `access_token`; a leading `$.` is tolerated). */
+  tokenResponsePath: string;
+}
+
 export interface Connector {
   provider: string;
   /** Only `"http"` is implemented; other values are rejected at load. */
@@ -191,6 +219,8 @@ export interface Connector {
   cli?: CliFacet;
   /** ADR 0058: optional probe path for "Test connection" (default `/`). */
   test?: ConnectorTest;
+  /** Optional OAuth authorization-code acquisition (e.g. Slack "Add to Slack"). */
+  oauth?: OauthFacet;
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +589,60 @@ function parseCli(where: string, raw: unknown): CliFacet {
   };
 }
 
+const MAX_OAUTH_SCOPES = 50;
+/** An org-secret ref: non-empty, no whitespace (matches the inject secretRef rule). */
+const SECRET_REF_RE = /^\S+$/;
+
+/** Validate the OAuth acquisition facet (admin-trust boundary). `hosts` is the
+ * connector's host allow-list — the authorize/token URLs must resolve to one of
+ * them, so an admin-authored connector can't ship the client secret elsewhere. */
+function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
+  if (typeof raw !== "object" || raw === null) fail(where, '"oauth" must be an object');
+  const o = raw as Record<string, unknown>;
+
+  const httpsUrlOnHost = (field: string, v: unknown): string => {
+    if (typeof v !== "string" || !v) fail(where, `"oauth.${field}" must be a non-empty string`);
+    if (/[\s\r\n]/.test(v as string)) fail(where, `"oauth.${field}" must not contain whitespace`);
+    let url: URL;
+    try {
+      url = new URL(v as string);
+    } catch {
+      return fail(where, `"oauth.${field}" must be a valid URL`);
+    }
+    if (url.protocol !== "https:") fail(where, `"oauth.${field}" must be an https URL`);
+    if (!hosts.includes(url.host)) {
+      fail(where, `"oauth.${field}" host "${url.host}" must be one of the connector's hosts (${hosts.join(", ")})`);
+    }
+    return v as string;
+  };
+
+  const authorizeUrl = httpsUrlOnHost("authorizeUrl", o.authorizeUrl);
+  const tokenUrl = httpsUrlOnHost("tokenUrl", o.tokenUrl);
+
+  const scopes = asStringArray(`${where} oauth`, "scopes", o.scopes);
+  if (scopes.length > MAX_OAUTH_SCOPES) fail(where, `"oauth.scopes" has ${scopes.length} entries (max ${MAX_OAUTH_SCOPES})`);
+  for (const s of scopes) {
+    if (/[\s\r\n]/.test(s)) fail(where, `"oauth.scopes" entry "${s}" must not contain whitespace`);
+  }
+
+  const secretRef = (field: string, v: unknown): string => {
+    if (typeof v !== "string" || !SECRET_REF_RE.test(v)) {
+      fail(where, `"oauth.${field}" must be a non-empty string with no whitespace`);
+    }
+    return v as string;
+  };
+
+  return {
+    authorizeUrl,
+    tokenUrl,
+    scopes,
+    clientIdRef: secretRef("clientIdRef", o.clientIdRef),
+    clientSecretRef: secretRef("clientSecretRef", o.clientSecretRef),
+    tokenSecretRef: secretRef("tokenSecretRef", o.tokenSecretRef),
+    tokenResponsePath: secretRef("tokenResponsePath", o.tokenResponsePath),
+  };
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
 export function parseConnector(raw: unknown, where: string): Connector {
   if (typeof raw !== "object" || raw === null) fail(where, "must be a JSON object");
@@ -652,6 +736,8 @@ export function parseConnector(raw: unknown, where: string): Connector {
     test = { path: t.path };
   }
 
+  const oauth = o.oauth !== undefined ? parseOauth(where, o.oauth, hosts) : undefined;
+
   return {
     provider: o.provider,
     protocol: "http",
@@ -661,6 +747,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
     display,
     ...(cli ? { cli } : {}),
     ...(test ? { test } : {}),
+    ...(oauth ? { oauth } : {}),
   };
 }
 
