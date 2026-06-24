@@ -64,22 +64,25 @@ export function ConnectSheet({
         (k) => k.provider === view.provider || k.kind === cfg?.mintKind,
       )
     : undefined;
+  const injects = cfg?.injects ?? [];
 
   const [step, setStep] = useState(0);
   const [values, setValues] = useState<Record<string, string>>({});
-  const [injectSecret, setInjectSecret] = useState("");
+  // ADR 0058: one entry per injected header, keyed by its org-secret ref.
+  const [injectSecrets, setInjectSecrets] = useState<Record<string, string>>({});
   const [testState, setTestState] = useState<"idle" | "ok" | "fail">("idle");
   const [testMessage, setTestMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const filled = isMint
     ? (mintKind?.fields ?? []).filter((f) => f.required).every((f) => (values[f.name] ?? "").trim())
-    : injectSecret.trim().length > 0;
+    : injects.length > 0 && injects.every((i) => (injectSecrets[i.secretRef] ?? "").trim().length > 0);
   const pending = setMint.isPending || putSecret.isPending;
 
   const runTest = async () => {
     setTestState("idle");
-    const draftValues = isMint ? values : { credential: injectSecret };
+    // The test probes the primary (first) header (orchestrator runConnectorTest).
+    const draftValues = isMint ? values : { credential: injectSecrets[injects[0]?.secretRef ?? ""] ?? "" };
     try {
       const r = await test.mutateAsync({ provider: view.provider, draftValues });
       setTestState(r.ok ? "ok" : "fail");
@@ -97,8 +100,10 @@ export function ConnectSheet({
         if (!mintKind) throw new Error("no mint kind for this provider");
         await setMint.mutateAsync({ provider: view.provider, kind: mintKind.kind, values });
       } else {
-        if (!cfg?.secretRef) throw new Error("connector has no secret ref");
-        await putSecret.mutateAsync({ name: cfg.secretRef, value: injectSecret });
+        if (injects.length === 0) throw new Error("connector has no inject credential");
+        for (const inj of injects) {
+          await putSecret.mutateAsync({ name: inj.secretRef, value: injectSecrets[inj.secretRef] ?? "" });
+        }
       }
       toast.success(`${view.name} connected — ${view.capabilities.length} powers now grantable`);
       onConnected(view.provider);
@@ -196,14 +201,21 @@ export function ConnectSheet({
                   </label>
                 ))
               ) : (
-                <label className="flex flex-col gap-1.5">
-                  <Text variant="label">{view.name} credential</Text>
-                  <SecretField
-                    value={injectSecret}
-                    onChange={setInjectSecret}
-                    placeholder="••••••"
-                  />
-                </label>
+                injects.map((inj) => (
+                  <label key={inj.secretRef} className="flex flex-col gap-1.5">
+                    <span className="flex items-baseline gap-2">
+                      <Text variant="label">{inj.header}</Text>
+                      <code className="font-mono text-[0.62rem] text-muted-foreground">
+                        {inj.secretRef}
+                      </code>
+                    </span>
+                    <SecretField
+                      value={injectSecrets[inj.secretRef] ?? ""}
+                      onChange={(v) => setInjectSecrets((s) => ({ ...s, [inj.secretRef]: v }))}
+                      placeholder="••••••"
+                    />
+                  </label>
+                ))
               )}
 
               <p className="flex gap-2 text-[0.74rem] text-muted-foreground">
@@ -213,7 +225,13 @@ export function ConnectSheet({
                 ) : (
                   <span>
                     Sealed in the org secret store as{" "}
-                    <code className="font-mono">{cfg?.secretRef}</code>.
+                    {injects.map((inj, i) => (
+                      <span key={inj.secretRef}>
+                        {i > 0 ? ", " : ""}
+                        <code className="font-mono">{inj.secretRef}</code>
+                      </span>
+                    ))}
+                    .
                   </span>
                 )}
               </p>

@@ -197,8 +197,12 @@ function DetailBody({ view }: { view: ConnectorView }) {
                 ))}
               </div>
             ) : (
-              <div className="mt-1.5 font-mono text-xs text-muted-foreground">
-                org secret · {cfg?.secretRef} · header {cfg?.header}: {cfg?.template}
+              <div className="mt-1.5 flex flex-col gap-0.5 font-mono text-xs text-muted-foreground">
+                {(cfg?.injects ?? []).map((inj) => (
+                  <div key={inj.secretRef}>
+                    org secret · {inj.secretRef} · header {inj.header}: {inj.template}
+                  </div>
+                ))}
               </div>
             )}
           </div>

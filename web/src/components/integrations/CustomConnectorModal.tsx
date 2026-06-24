@@ -72,6 +72,31 @@ interface OpRow {
   path: string;
 }
 const newOp = (): OpRow => ({ id: nextOpId++, grant: "", method: "GET", path: "" });
+
+// ADR 0058: a connector may inject several headers, each backed by its own org
+// secret (most APIs need one; some, e.g. Datadog, need DD-API-KEY + DD-APPLICATION-KEY).
+let nextCredId = 1;
+interface CredRow {
+  id: number;
+  header: string;
+  template: string;
+  secretRef: string;
+  credVal: string;
+}
+const newCred = (): CredRow => ({
+  id: nextCredId++,
+  header: "Authorization",
+  template: "Bearer {}",
+  secretRef: "",
+  credVal: "",
+});
+/** A safe default org-secret name from a header (`DD-API-KEY` → `dd-api-key`). */
+const sanitizeRef = (s: string) =>
+  s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
 const splitList = (t: string) =>
   t
     .split(/[\s,]+/)
@@ -86,10 +111,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   const [name, setName] = useState("");
   const [category, setCategory] = useState(CATEGORIES[1]!);
   const [hosts, setHosts] = useState("");
-  const [header, setHeader] = useState("Authorization");
-  const [template, setTemplate] = useState("Bearer {}");
-  const [secretRef, setSecretRef] = useState("");
-  const [credVal, setCredVal] = useState("");
+  const [creds, setCreds] = useState<CredRow[]>([newCred()]);
   const [ops, setOps] = useState<OpRow[]>([newOp()]);
   const [mono, setMono] = useState("");
   const [color, setColor] = useState(PALETTE[0]!);
@@ -104,17 +126,32 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   const autoMono = defaultIconMono(name.trim() || "?");
   const monogram = (mono.trim() || autoMono).slice(0, 2).toUpperCase();
   const logoUrl = useMemo(() => (logo ? URL.createObjectURL(logo) : undefined), [logo]);
-  const valid = Boolean(name.trim() && hosts.trim() && ops.some((o) => o.grant.trim()));
+  const valid = Boolean(
+    name.trim() && hosts.trim() && ops.some((o) => o.grant.trim()) && creds.some((c) => c.header.trim()),
+  );
   const pending = upsert.isPending || putSecret.isPending || uploadLogo.isPending;
+  const updateCred = (id: number, patch: Partial<CredRow>) =>
+    setCreds((r) => r.map((c) => (c.id === id ? { ...c, ...patch } : c)));
 
   const save = async () => {
     setError(null);
-    const ref = secretRef.trim() || `${provider}-token`;
+    // Each header gets its own org secret. A blank name defaults to
+    // `${provider}-token` for a single header, else `${provider}-<header>`.
+    const single = creds.filter((c) => c.header.trim()).length === 1;
+    const resolved = creds
+      .filter((c) => c.header.trim())
+      .map((c) => ({
+        ...c,
+        ref: c.secretRef.trim() || (single ? `${provider}-token` : `${provider}-${sanitizeRef(c.header)}`),
+      }));
     const connector = {
       provider,
       protocol: "http",
       display: { name: name.trim(), category, icon: { mono: monogram, color } },
-      credential: { source: "inject", injects: [{ header: header.trim(), secretRef: ref, template }] },
+      credential: {
+        source: "inject",
+        injects: resolved.map((c) => ({ header: c.header.trim(), secretRef: c.ref, template: c.template })),
+      },
       hosts: splitList(hosts),
       operations: ops
         .filter((o) => o.grant.trim())
@@ -127,7 +164,9 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
     };
     try {
       await upsert.mutateAsync({ configJson: JSON.stringify(connector) });
-      if (credVal.trim()) await putSecret.mutateAsync({ name: ref, value: credVal });
+      for (const c of resolved) {
+        if (c.credVal.trim()) await putSecret.mutateAsync({ name: c.ref, value: c.credVal });
+      }
       if (logo) {
         const data = new Uint8Array(await logo.arrayBuffer());
         await uploadLogo.mutateAsync({ provider, data, mediaType: logo.type });
@@ -264,37 +303,76 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
             />
           </label>
 
-          <div className="grid grid-cols-2 gap-3">
-            <label className="flex flex-col gap-1.5">
-              <Text variant="label">Header</Text>
-              <Input
-                className="font-mono"
-                value={header}
-                onChange={(e) => setHeader(e.target.value)}
-              />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <Text variant="label">Template</Text>
-              <Input
-                className="font-mono"
-                value={template}
-                onChange={(e) => setTemplate(e.target.value)}
-              />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <Text variant="label">Org-secret name</Text>
-              <Input
-                className="font-mono"
-                placeholder={`${provider}-token`}
-                spellCheck={false}
-                value={secretRef}
-                onChange={(e) => setSecretRef(e.target.value)}
-              />
-            </label>
-            <label className="flex flex-col gap-1.5">
-              <Text variant="label">Credential value</Text>
-              <SecretField value={credVal} onChange={setCredVal} placeholder="•••••" />
-            </label>
+          {/* credential headers — one or more, each backed by its own org secret */}
+          <div className="flex flex-col gap-2">
+            <Text variant="label">Credential header(s)</Text>
+            <p className="text-[0.74rem] leading-relaxed text-muted-foreground">
+              Each header is injected at the egress proxy from its own org secret. Most APIs need
+              one; some (e.g. Datadog) need several.
+            </p>
+            {creds.map((c) => (
+              <div
+                key={c.id}
+                className="relative grid grid-cols-2 gap-3 rounded-md border bg-card/40 p-3"
+              >
+                <label className="flex flex-col gap-1.5">
+                  <Text variant="label">Header</Text>
+                  <Input
+                    className="font-mono"
+                    value={c.header}
+                    onChange={(e) => updateCred(c.id, { header: e.target.value })}
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <Text variant="label">Template</Text>
+                  <Input
+                    className="font-mono"
+                    value={c.template}
+                    onChange={(e) => updateCred(c.id, { template: e.target.value })}
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <Text variant="label">Org-secret name</Text>
+                  <Input
+                    className="font-mono"
+                    placeholder={`${provider}-token`}
+                    spellCheck={false}
+                    value={c.secretRef}
+                    onChange={(e) => updateCred(c.id, { secretRef: e.target.value })}
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <Text variant="label">Credential value</Text>
+                  <SecretField
+                    value={c.credVal}
+                    onChange={(v) => updateCred(c.id, { credVal: v })}
+                    placeholder="•••••"
+                  />
+                </label>
+                {creds.length > 1 && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    aria-label="remove header"
+                    className="absolute right-1 top-1 size-7 p-0"
+                    onClick={() => setCreds((r) => r.filter((x) => x.id !== c.id))}
+                  >
+                    <XIcon className="size-3.5" />
+                  </Button>
+                )}
+              </div>
+            ))}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="self-start"
+              onClick={() => setCreds((r) => [...r, newCred()])}
+            >
+              <PlusIcon className="size-3.5" />
+              Header
+            </Button>
           </div>
 
           {/* operations */}
