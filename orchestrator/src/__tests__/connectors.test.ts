@@ -14,6 +14,8 @@ import {
   parseCapability,
   grantsCapability,
   compileIntegrationPolicy,
+  compileCliIntegrations,
+  INTEGRATIONS_CLI_BUNDLE,
   policyHasContent,
   connectorRegistry,
   loadRegistry,
@@ -572,5 +574,79 @@ describe("buildProviderCatalog", () => {
       asset: "pull_request",
     });
     expect(gh.display.icon.mono).toBe("GH");
+  });
+});
+
+describe("cli facet (ADR 0058)", () => {
+  const datadogCli = {
+    ...datadogRaw,
+    cli: {
+      bins: ["datadog-ci"],
+      dummyEnv: { DD_API_KEY: "x-engrams-managed", DD_APP_KEY: "x-engrams-managed" },
+      doc: "Use `datadog-ci` to query logs.",
+    },
+  };
+  const githubCli = {
+    ...githubRaw,
+    cli: { bins: ["gh"], dummyEnv: { GH_TOKEN: "x-engrams-managed" }, doc: "Use `gh` for PRs and issues." },
+  };
+
+  test("parses a valid cli facet, defaulting binSource + credentialDelivery", () => {
+    const c = parseConnector(datadogCli, "datadog");
+    expect(c.cli?.bins).toEqual(["datadog-ci"]);
+    expect(c.cli?.binSource).toBe("bundled"); // defaulted
+    expect(c.cli?.credentialDelivery).toBe("inject"); // defaulted
+    expect(c.cli?.dummyEnv).toEqual({ DD_API_KEY: "x-engrams-managed", DD_APP_KEY: "x-engrams-managed" });
+  });
+
+  test("rejects a non-basename bin", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["bad/bin"], doc: "x" } }, "x")).toThrow(/bare command name/);
+  });
+  test("rejects an invalid env var name", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], dummyEnv: { "1BAD": "v" }, doc: "x" } }, "x")).toThrow(/env var name/);
+  });
+  test("rejects a path-traversal dummy file", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], dummyFiles: [{ path: "~/../etc/x", contents: "" }], doc: "x" } }, "x")).toThrow(/\.\./);
+  });
+  test("rejects an unimplemented binSource (P1 stages only bundled)", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], binSource: "npx", doc: "x" } }, "x")).toThrow(/not yet implemented/);
+  });
+  test("rejects an unwired credentialDelivery (would ship an unauthenticated CLI)", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], credentialDelivery: "request-signing", doc: "x" } }, "x")).toThrow(/not yet wired/);
+  });
+  test("requires a non-empty doc", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"] } }, "x")).toThrow(/cli.doc/);
+  });
+
+  test("compile enables granted CLIs, merges dummy env (sorted), needs the bundle", () => {
+    const r = registryOf(datadogCli, githubCli);
+    const plan = compileCliIntegrations(["datadog:logs:read", "github:issues:write"], r);
+    expect(plan.enabled.map((e) => e.provider)).toEqual(["datadog", "github"]); // sorted
+    expect(plan.dummyEnv).toEqual({
+      DD_API_KEY: "x-engrams-managed",
+      DD_APP_KEY: "x-engrams-managed",
+      GH_TOKEN: "x-engrams-managed",
+    });
+    expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
+  });
+
+  test("no cli facet, or an ungranted capability, yields no CLI + no bundle", () => {
+    // datadog (no cli facet) granted; github cli present but not granted.
+    const plan = compileCliIntegrations(["datadog:logs:read"], registryOf(datadogRaw, githubCli));
+    expect(plan.enabled).toEqual([]);
+    expect(plan.bundles).toEqual([]);
+    // github cli present but the capability isn't one it grants.
+    const plan2 = compileCliIntegrations(["github:nonexistent:write"], registryOf(githubCli));
+    expect(plan2.enabled).toEqual([]);
+  });
+
+  test("the on-disk github + datadog connectors expose their cli facet", () => {
+    const plan = compileCliIntegrations(["github:pulls:write", "datadog:logs:read"], connectorRegistry());
+    expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
+    expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
+    expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");
+    expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
+    // gh's doc carries the PR-open guidance.
+    expect(plan.enabled.find((e) => e.provider === "github")?.doc).toMatch(/gh pr create/);
   });
 });

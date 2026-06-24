@@ -90,6 +90,67 @@ export interface ConnectorDisplay {
   icon: ConnectorIcon;
 }
 
+/**
+ * ADR 0058 §2: how the real credential reaches the upstream request. An **open
+ * strategy**, deliberately not a boolean — P1 wires only `inject`, but the type
+ * admits the rest so a future request-signing (SigV4) arm slots in without
+ * reworking call sites. Orthogonal to {@link Credential} `source`: `inject` leans
+ * on the existing host-side header injection whether the value is a static org
+ * secret (inject source) or a per-session minted token (mint source).
+ *
+ *   - `inject`          — host-side header overwrite (P1). The CLI carries a
+ *                         harmless dummy; the proxy supplies the real header.
+ *   - `substitute`      — broker placeholder swap (already shipped; body/query).
+ *   - `in-guest-token`  — mint a short-lived token, materialize it in-guest (P2),
+ *                         for CLIs that refuse a dummy.
+ *   - `request-signing` — re-sign host-side or deliver a signing key in-guest
+ *                         (future; AWS SigV4 et al.). The door §2 keeps open.
+ */
+export type CredentialDelivery = "inject" | "substitute" | "in-guest-token" | "request-signing";
+
+/** Delivery strategies actually wired in P1. The others are valid types but a
+ * connector declaring them is rejected at parse until their phase lands (so we
+ * never ship a silently-unauthenticated CLI). */
+export const IMPLEMENTED_DELIVERIES: ReadonlySet<CredentialDelivery> = new Set<CredentialDelivery>([
+  "inject",
+  "substitute",
+]);
+
+/** A stub config file agentd writes into the guest so a CLI's local auth gate is
+ * satisfied. NEVER a real secret — the real credential is supplied host-side by
+ * the egress proxy. */
+export interface CliDummyFile {
+  /** Guest path; `~`-relative or absolute under the home tree (no `..`). */
+  path: string;
+  /** Verbatim contents (a harmless placeholder). */
+  contents: string;
+}
+
+/**
+ * ADR 0058 §3: the CLI facet — makes a connector's provider drivable through a
+ * native CLI in the shared integrations bundle. Present on built-in *and* custom
+ * connectors (validated by {@link parseConnector}).
+ */
+export interface CliFacet {
+  /** PATH command names this connector contributes (basenames of bundle bins). */
+  bins: string[];
+  /**
+   * Where the binary comes from: `bundled` (in the admin-baked integrations
+   * bundle — the only P1 source), `uploaded` (a novel binary via the ADR 0055 P2
+   * upload path — deferred), or `npx` (runtime-fetched through the egress proxy).
+   */
+  binSource: "bundled" | "uploaded" | "npx";
+  /** Fixed harmless env values agentd sets so the CLI stops gating on local auth
+   * state (e.g. `{ "GH_TOKEN": "x-engrams-managed" }`). NEVER a real secret. */
+  dummyEnv?: Record<string, string>;
+  /** Stub config files agentd writes for the same purpose. */
+  dummyFiles?: CliDummyFile[];
+  /** How the real credential reaches upstream. Defaults to `inject`. */
+  credentialDelivery: CredentialDelivery;
+  /** How-to text folded into the per-session discovery skill. */
+  doc: string;
+}
+
 export interface Connector {
   provider: string;
   /** Only `"http"` is implemented; other values are rejected at load. */
@@ -99,6 +160,8 @@ export interface Connector {
   operations: Operation[];
   /** Always defaulted from `provider` when absent (see {@link parseConnector}). */
   display: ConnectorDisplay;
+  /** ADR 0058: optional CLI facet — the provider is drivable through a CLI. */
+  cli?: CliFacet;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +300,17 @@ const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 /** Provider id: a lowercase identifier (matches the built-ins). */
 const PROVIDER_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
+// --- CLI facet bounds (ADR 0058) -------------------------------------------
+const MAX_CLI_BINS = 50;
+const MAX_CLI_ENV = 50;
+const MAX_CLI_FILES = 20;
+const MAX_CLI_FILE_BYTES = 64 * 1024;
+const MAX_CLI_DOC_BYTES = 8 * 1024;
+/** A PATH command name: a bare basename, no slash/whitespace/control chars. */
+const CLI_BIN_RE = /^[A-Za-z0-9._-]+$/;
+/** POSIX-ish env var name. */
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
  * Reject a host that isn't a bare hostname — optionally a single leading-label
  * wildcard (`*.example.com`). No scheme/port/path/whitespace, no bare-TLD or
@@ -350,6 +424,96 @@ function parseDisplay(where: string, raw: unknown, provider: string): ConnectorD
   return { name, category, blurb, icon };
 }
 
+/**
+ * Validate the optional `cli` facet (ADR 0058). Admin-trust boundary: a CLI facet
+ * adds PATH binaries + env + stub files to a session, so it is bounds- and
+ * shape-checked like `hosts`/`operations`. `dummyEnv`/`dummyFiles` are placeholders
+ * the egress proxy makes real host-side — they must never carry a real secret, but
+ * that is a soundness property of the author, not something we can detect here; we
+ * only enforce shape + safety (no `..` traversal, no CRLF, size caps).
+ */
+function parseCli(where: string, raw: unknown): CliFacet {
+  if (typeof raw !== "object" || raw === null) fail(where, '"cli" must be an object');
+  const o = raw as Record<string, unknown>;
+
+  const bins = asStringArray(where, "cli.bins", o.bins);
+  if (bins.length > MAX_CLI_BINS) fail(where, `"cli.bins" has ${bins.length} entries (max ${MAX_CLI_BINS})`);
+  for (const b of bins) {
+    if (!CLI_BIN_RE.test(b)) fail(where, `"cli.bins" entry "${b}" must be a bare command name ([A-Za-z0-9._-]+)`);
+  }
+
+  let binSource: CliFacet["binSource"] = "bundled";
+  if (o.binSource !== undefined) {
+    if (o.binSource !== "bundled" && o.binSource !== "uploaded" && o.binSource !== "npx") {
+      fail(where, `"cli.binSource" must be "bundled" | "uploaded" | "npx" (got ${JSON.stringify(o.binSource)})`);
+    }
+    binSource = o.binSource;
+    // P1 only stages the admin-baked bundle; uploaded/npx are designed-for but
+    // not yet wired (ADR 0058: uploaded waits on ADR 0055 P2 binary uploads).
+    if (binSource !== "bundled") {
+      fail(where, `"cli.binSource" "${binSource}" is not yet implemented (ADR 0058 P1 stages only "bundled" CLIs)`);
+    }
+  }
+
+  let dummyEnv: Record<string, string> | undefined;
+  if (o.dummyEnv !== undefined) {
+    if (typeof o.dummyEnv !== "object" || o.dummyEnv === null || Array.isArray(o.dummyEnv)) {
+      fail(where, '"cli.dummyEnv" must be an object of string→string');
+    }
+    const ents = Object.entries(o.dummyEnv as Record<string, unknown>);
+    if (ents.length > MAX_CLI_ENV) fail(where, `"cli.dummyEnv" has ${ents.length} keys (max ${MAX_CLI_ENV})`);
+    const out: Record<string, string> = {};
+    for (const [k, v] of ents) {
+      if (!ENV_NAME_RE.test(k)) fail(where, `"cli.dummyEnv" key "${k}" is not a valid env var name`);
+      if (typeof v !== "string") fail(where, `"cli.dummyEnv.${k}" must be a string`);
+      if (/[\r\n\0]/.test(v)) fail(where, `"cli.dummyEnv.${k}" must not contain newlines or NUL`);
+      out[k] = v;
+    }
+    dummyEnv = out;
+  }
+
+  let dummyFiles: CliDummyFile[] | undefined;
+  if (o.dummyFiles !== undefined) {
+    if (!Array.isArray(o.dummyFiles)) fail(where, '"cli.dummyFiles" must be an array');
+    if (o.dummyFiles.length > MAX_CLI_FILES) fail(where, `"cli.dummyFiles" has ${o.dummyFiles.length} entries (max ${MAX_CLI_FILES})`);
+    dummyFiles = o.dummyFiles.map((rawF, i): CliDummyFile => {
+      const fWhere = `${where} cli.dummyFiles[${i}]`;
+      if (typeof rawF !== "object" || rawF === null) fail(fWhere, "must be an object");
+      const f = rawF as Record<string, unknown>;
+      if (typeof f.path !== "string" || !f.path) fail(fWhere, '"path" must be a non-empty string');
+      if (f.path.includes("..") || /[\r\n\0]/.test(f.path)) fail(fWhere, '"path" must not contain ".." or control chars');
+      if (!f.path.startsWith("~/") && !f.path.startsWith("/")) fail(fWhere, '"path" must be absolute or "~/"-relative');
+      if (typeof f.contents !== "string") fail(fWhere, '"contents" must be a string');
+      if (Buffer.byteLength(f.contents, "utf8") > MAX_CLI_FILE_BYTES) fail(fWhere, `"contents" exceeds ${MAX_CLI_FILE_BYTES} bytes`);
+      return { path: f.path, contents: f.contents };
+    });
+  }
+
+  let credentialDelivery: CredentialDelivery = "inject";
+  if (o.credentialDelivery !== undefined) {
+    const d = o.credentialDelivery;
+    if (d !== "inject" && d !== "substitute" && d !== "in-guest-token" && d !== "request-signing") {
+      fail(where, `"cli.credentialDelivery" must be one of inject|substitute|in-guest-token|request-signing (got ${JSON.stringify(d)})`);
+    }
+    if (!IMPLEMENTED_DELIVERIES.has(d)) {
+      fail(where, `"cli.credentialDelivery" "${d}" is a designed-for strategy not yet wired (ADR 0058 P1 implements "inject"); using it would ship an unauthenticated CLI`);
+    }
+    credentialDelivery = d;
+  }
+
+  if (typeof o.doc !== "string" || !o.doc.trim()) fail(where, '"cli.doc" must be a non-empty string');
+  if (Buffer.byteLength(o.doc, "utf8") > MAX_CLI_DOC_BYTES) fail(where, `"cli.doc" exceeds ${MAX_CLI_DOC_BYTES} bytes`);
+
+  return {
+    bins,
+    binSource,
+    ...(dummyEnv ? { dummyEnv } : {}),
+    ...(dummyFiles ? { dummyFiles } : {}),
+    credentialDelivery,
+    doc: o.doc,
+  };
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
 export function parseConnector(raw: unknown, where: string): Connector {
   if (typeof raw !== "object" || raw === null) fail(where, "must be a JSON object");
@@ -423,8 +587,9 @@ export function parseConnector(raw: unknown, where: string): Connector {
   });
 
   const display = parseDisplay(where, o.display, o.provider);
+  const cli = o.cli !== undefined ? parseCli(where, o.cli) : undefined;
 
-  return { provider: o.provider, protocol: "http", credential, hosts, operations, display };
+  return { provider: o.provider, protocol: "http", credential, hosts, operations, display, ...(cli ? { cli } : {}) };
 }
 
 /** Build the provider→connector map; throws on a duplicate provider. */
@@ -662,6 +827,81 @@ export function compileIntegrationPolicy(
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
   return { injects, observes, network, secrets };
+}
+
+// ---------------------------------------------------------------------------
+// CLI integration plan (ADR 0058) — the per-session CLI artifact
+// ---------------------------------------------------------------------------
+
+/** The shared integrations CLI bundle (a dynamic-mount skill name) that carries
+ * every `binSource: "bundled"` CLI. Enabling any bundled-CLI integration adds this
+ * one bundle to the session's selected skills — one `dyn_*` slot for all CLIs. */
+export const INTEGRATIONS_CLI_BUNDLE = "integrations-cli";
+
+/** One enabled CLI provider — the input the per-session discovery skill renders. */
+export interface EnabledCli {
+  provider: string;
+  displayName: string;
+  bins: string[];
+  doc: string;
+}
+
+/** The per-session CLI artifact compiled from a profile's capabilities. */
+export interface CliIntegrationPlan {
+  /** Harmless dummy env agentd sets so each CLI's local auth gate passes — the
+   * real credential is supplied host-side by the egress proxy. Merged across
+   * providers (last writer wins on a key collision; authors avoid clashing). */
+  dummyEnv: Record<string, string>;
+  /** Stub config files agentd writes for the same purpose. */
+  dummyFiles: CliDummyFile[];
+  /** Enabled CLI providers, sorted by provider (the discovery-skill input). */
+  enabled: EnabledCli[];
+  /** Dynamic-mount bundle names this plan requires (the shared integrations CLI
+   * bundle, if any bundled CLI is enabled). The orchestrator unions these into the
+   * session's selected skills. */
+  bundles: string[];
+}
+
+/**
+ * Compile a profile's bound capabilities → the per-session {@link CliIntegrationPlan}.
+ *
+ * A connector's CLI is *enabled* iff the profile holds ≥1 capability the connector
+ * actually grants (same gating as {@link compileIntegrationPolicy} — a granted
+ * `provider:action`). For each enabled CLI we collect its dummy env/files (so the
+ * tool stops gating on local auth), its bins + doc (for discovery), and flag the
+ * shared bundle. Auth itself is unchanged: the proxy already injects the real
+ * header (static *or* minted) for the connector's hosts.
+ */
+export function compileCliIntegrations(
+  capabilities: string[],
+  registry: Map<string, Connector> = connectorRegistry(),
+): CliIntegrationPlan {
+  const grantedProviders = new Set<string>();
+  for (const capStr of capabilities) {
+    const cap = parseCapability(capStr);
+    if (!cap) continue;
+    const connector = registry.get(cap.provider);
+    if (!connector) continue;
+    if (connector.operations.some((op) => op.grants.includes(cap.action))) {
+      grantedProviders.add(cap.provider);
+    }
+  }
+
+  const dummyEnv: Record<string, string> = {};
+  const dummyFiles: CliDummyFile[] = [];
+  const enabled: EnabledCli[] = [];
+  let needsBundle = false;
+
+  for (const provider of [...grantedProviders].sort()) {
+    const cli = registry.get(provider)!.cli;
+    if (!cli) continue;
+    enabled.push({ provider, displayName: registry.get(provider)!.display.name, bins: cli.bins, doc: cli.doc });
+    if (cli.binSource === "bundled") needsBundle = true;
+    for (const [k, v] of Object.entries(cli.dummyEnv ?? {})) dummyEnv[k] = v;
+    for (const f of cli.dummyFiles ?? []) dummyFiles.push(f);
+  }
+
+  return { dummyEnv, dummyFiles, enabled, bundles: needsBundle ? [INTEGRATIONS_CLI_BUNDLE] : [] };
 }
 
 // ---------------------------------------------------------------------------

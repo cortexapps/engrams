@@ -23,5 +23,10 @@
         "data": { "count": "$.resp.meta.page.total_count" }
       }
     }
-  ]
+  ],
+  "cli": {
+    "bins": ["datadog-ci"],
+    "dummyEnv": { "DD_API_KEY": "x-engrams-managed" },
+    "doc": "Use `datadog-ci` to interact with Datadog from this session. Authentication is automatic — `DD_API_KEY` is a managed placeholder the egress proxy replaces with the real API key on requests to api.datadoghq.com. Do NOT set a real key. Only the operations your profile enabled (e.g. `logs:read`) are brokered; commands that need a Datadog *application* key are not wired in this version."
+  }
 }

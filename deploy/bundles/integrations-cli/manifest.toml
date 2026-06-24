@@ -1,0 +1,26 @@
+# ADR 0058: pinned versions for the `integrations-cli` RO bundle — the shared
+# CLI toolbox for connected integrations. build.sh reads GH_VERSION /
+# DATADOG_CI_VERSION from the environment, defaulting to these. Bump here + in
+# build.sh's defaults together; a bundle roll (new content-addressed squashfs
+# staged on the fleet) ships fleet-wide via an FC-host re-bake — no session-image
+# re-bake.
+#
+# ADR 0058: this is a profile-selected skill, added to a session's selected_skills
+# by the orchestrator whenever the profile enables ≥1 connector with a bundled
+# `cli` facet. At session create the coordinator resolves the "integrations-cli"
+# name to its staged content sha, assigns a reserved slot, and `patch_drive`s it
+# into a dynamic mount (`/opt/engram/dyn/<i>`). The in-squashfs `mount.json`
+# declares the `integrations` discovery skill + the CLI wrapper bins agentd
+# symlinks onto PATH. Auth is brokered: each CLI carries a harmless placeholder
+# and the egress proxy injects the real credential host-side (ADR 0056/0057).
+name = "integrations-cli"
+description = "Integration CLIs (gh, datadog-ci) + a discovery skill, glibc-linked, self-contained."
+
+[versions]
+# GitHub CLI — a static Go binary (no glibc deps).
+gh = "2.62.0"
+# Datadog CI — a Node SEA standalone binary. Runs with the base image's own
+# glibc + libstdc++ (no bundled libs: a bundled libc/loader segfaults the SEA,
+# and a newer-glibc libstdc++ won't load on an older base). Targets a full glibc
+# base — the same constraint as the binary itself.
+datadog_ci = "2.48.0"

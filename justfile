@@ -229,6 +229,8 @@ bundles:
     deploy/bundles/skills/build.sh --stage var/bundles/skills
     deploy/bundles/playwright/build.sh --stage var/bundles/playwright \
         || echo "playwright bundle skipped (needs Docker) — dev sessions get skills only"
+    deploy/bundles/integrations-cli/build.sh --stage var/bundles/integrations-cli \
+        || echo "integrations-cli bundle skipped (needs Docker) — dev sessions get no integration CLIs"
 
 # ADR 0035/0055: build + stage the squashfs bundles CONTENT-ADDRESSED
 # (<sha256>.squashfs + current.json stamp) under var/shared/, the
@@ -243,10 +245,10 @@ bundles-squashfs:
     mkdir -p var/shared
     stamp="{"
     sep=""
-    # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/playwright
-    # are catalog skills swapped in per session. Files are content-keyed
-    # (<sha>.squashfs); the stamp maps logical name -> sha.
-    for name in sentinel skills playwright; do
+    # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/playwright/
+    # integrations-cli are catalog skills swapped in per session. Files are
+    # content-keyed (<sha>.squashfs); the stamp maps logical name -> sha.
+    for name in sentinel skills playwright integrations-cli; do
         tmp="var/shared/.$name.build.squashfs"
         if ! "deploy/bundles/$name/build.sh" "$tmp"; then
             echo "$name bundle build failed; skipping (sessions degrade gracefully)" >&2

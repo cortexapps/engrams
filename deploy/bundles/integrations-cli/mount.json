@@ -1,0 +1,10 @@
+{
+  "kind": "skill",
+  "skills": [
+    {
+      "name": "integrations",
+      "bins": ["bin/engrams-integrations", "bin/gh", "bin/datadog-ci"],
+      "requires_env": "ENGRAM_CLI_INTEGRATIONS"
+    }
+  ]
+}

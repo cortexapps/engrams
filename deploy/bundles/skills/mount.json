@@ -1,11 +1,7 @@
 {
   "kind": "skill",
   "skills": [
-    { "name": "share-file", "bins": ["bin/engram-share"] },
-    {
-      "name": "create-pull-request",
-      "requires_env": "ENGRAM_FORGE_TOKEN"
-    }
+    { "name": "share-file", "bins": ["bin/engram-share"] }
   ],
   "provides_askpass": "bin/git-askpass"
 }
