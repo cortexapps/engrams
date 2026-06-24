@@ -619,6 +619,12 @@ describe("cli facet (ADR 0058)", () => {
     ...githubRaw,
     cli: { bins: ["gh"], dummyEnv: { GH_TOKEN: "x-engrams-managed" }, doc: "Use `gh` for PRs and issues." },
   };
+  // ADR 0058 UB2: a connector whose CLI is an admin-uploaded binary (mount_catalog
+  // bundle "acme-cli"), not a bundled one.
+  const uploadedCli = {
+    ...datadogRaw,
+    cli: { bins: ["acme"], binSource: "uploaded", bundle: "acme-cli", doc: "Use `acme` to query Acme." },
+  };
 
   test("parses a valid cli facet, defaulting binSource + credentialDelivery", () => {
     const c = parseConnector(datadogCli, "datadog");
@@ -637,8 +643,22 @@ describe("cli facet (ADR 0058)", () => {
   test("rejects a path-traversal dummy file", () => {
     expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], dummyFiles: [{ path: "~/../etc/x", contents: "" }], doc: "x" } }, "x")).toThrow(/\.\./);
   });
-  test("rejects an unimplemented binSource (P1 stages only bundled)", () => {
+  test("rejects an npx binSource (still a later arm)", () => {
     expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], binSource: "npx", doc: "x" } }, "x")).toThrow(/not yet implemented/);
+  });
+  test("UB2: accepts an uploaded binSource with a catalog bundle", () => {
+    const c = parseConnector(uploadedCli, "datadog");
+    expect(c.cli?.binSource).toBe("uploaded");
+    expect(c.cli?.bundle).toBe("acme-cli");
+  });
+  test("UB2: rejects uploaded without a bundle", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["acme"], binSource: "uploaded", doc: "x" } }, "x")).toThrow(/cli.bundle.*required/);
+  });
+  test("UB2: rejects a bundle on a non-uploaded binSource", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], bundle: "acme-cli", doc: "x" } }, "x")).toThrow(/only valid when/);
+  });
+  test("UB2: rejects a malformed bundle name", () => {
+    expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["acme"], binSource: "uploaded", bundle: "Bad Name", doc: "x" } }, "x")).toThrow(/cli.bundle/);
   });
   test("rejects an unwired credentialDelivery (would ship an unauthenticated CLI)", () => {
     expect(() => parseConnector({ ...datadogRaw, cli: { bins: ["dd"], credentialDelivery: "request-signing", doc: "x" } }, "x")).toThrow(/not yet wired/);
@@ -657,6 +677,25 @@ describe("cli facet (ADR 0058)", () => {
       GH_TOKEN: "x-engrams-managed",
     });
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
+  });
+
+  test("UB2: an uploaded CLI routes BOTH the shared bundle and its own catalog bundle", () => {
+    const plan = compileCliIntegrations(["datadog:logs:read"], registryOf(uploadedCli));
+    expect(plan.enabled.map((e) => e.provider)).toEqual(["datadog"]);
+    expect(plan.enabled[0]!.bins).toEqual(["acme"]);
+    // The shared discovery bundle (helper + SKILL.md) AND the uploaded binary's
+    // own catalog bundle both ride selected_skills (deduped, one slot each).
+    expect(plan.bundles.sort()).toEqual([INTEGRATIONS_CLI_BUNDLE, "acme-cli"].sort());
+  });
+
+  test("UB2: one uploaded bundle backing two granted connectors mounts once", () => {
+    const other = {
+      ...githubRaw,
+      cli: { bins: ["acme2"], binSource: "uploaded", bundle: "acme-cli", doc: "Acme via GitHub host." },
+    };
+    const plan = compileCliIntegrations(["datadog:logs:read", "github:issues:write"], registryOf(uploadedCli, other));
+    // acme-cli appears once despite backing two connectors; integrations-cli once.
+    expect(plan.bundles.sort()).toEqual([INTEGRATIONS_CLI_BUNDLE, "acme-cli"].sort());
   });
 
   test("no cli facet, or an ungranted capability, yields no CLI + no bundle", () => {

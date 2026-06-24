@@ -145,10 +145,17 @@ export interface CliFacet {
   bins: string[];
   /**
    * Where the binary comes from: `bundled` (in the admin-baked integrations
-   * bundle — the only P1 source), `uploaded` (a novel binary via the ADR 0055 P2
-   * upload path — deferred), or `npx` (runtime-fetched through the egress proxy).
+   * bundle), `uploaded` (a novel binary an admin uploaded to the mount_catalog —
+   * ADR 0058 uploaded-binary arm; names its catalog bundle in {@link bundle}), or
+   * `npx` (runtime-fetched through the egress proxy — a later arm, still rejected).
    */
   binSource: "bundled" | "uploaded" | "npx";
+  /** ADR 0058 uploaded-binary arm: for `binSource:"uploaded"`, the mount_catalog
+   * bundle name carrying this connector's binary (the upload's registered name);
+   * `compileCliIntegrations` unions it into the session's `selected_skills`.
+   * Required when `uploaded`, unused otherwise (a bundled CLI's binary lives in the
+   * shared integrations bundle). */
+  bundle?: string;
   /** Fixed harmless env values agentd sets so the CLI stops gating on local auth
    * state (e.g. `{ "GH_TOKEN": "x-engrams-managed" }`). NEVER a real secret. */
   dummyEnv?: Record<string, string>;
@@ -471,11 +478,25 @@ function parseCli(where: string, raw: unknown): CliFacet {
       fail(where, `"cli.binSource" must be "bundled" | "uploaded" | "npx" (got ${JSON.stringify(o.binSource)})`);
     }
     binSource = o.binSource;
-    // P1 only stages the admin-baked bundle; uploaded/npx are designed-for but
-    // not yet wired (ADR 0058: uploaded waits on ADR 0055 P2 binary uploads).
-    if (binSource !== "bundled") {
-      fail(where, `"cli.binSource" "${binSource}" is not yet implemented (ADR 0058 P1 stages only "bundled" CLIs)`);
+    // `uploaded` rides the ADR 0055 P2 catalog (UB1: an admin-uploaded binary
+    // bundle); `npx` (runtime fetch) is designed-for but still not wired.
+    if (binSource === "npx") {
+      fail(where, `"cli.binSource" "npx" is not yet implemented (ADR 0058: runtime npx is a later arm)`);
     }
+  }
+
+  let bundle: string | undefined;
+  if (o.bundle !== undefined) {
+    if (typeof o.bundle !== "string" || !/^[a-z0-9_-]{1,64}$/.test(o.bundle)) {
+      fail(where, '"cli.bundle" must be a mount_catalog bundle name (lowercase alphanumerics, dash, underscore; 1–64 chars)');
+    }
+    bundle = o.bundle;
+  }
+  if (binSource === "uploaded" && !bundle) {
+    fail(where, '"cli.bundle" is required when "cli.binSource" is "uploaded" (the mount_catalog bundle carrying the binary)');
+  }
+  if (binSource !== "uploaded" && bundle !== undefined) {
+    fail(where, '"cli.bundle" is only valid when "cli.binSource" is "uploaded"');
   }
 
   let dummyEnv: Record<string, string> | undefined;
@@ -530,6 +551,7 @@ function parseCli(where: string, raw: unknown): CliFacet {
   return {
     bins,
     binSource,
+    ...(bundle ? { bundle } : {}),
     ...(dummyEnv ? { dummyEnv } : {}),
     ...(dummyFiles ? { dummyFiles } : {}),
     credentialDelivery,
@@ -953,18 +975,22 @@ export function compileCliIntegrations(
   const dummyEnv: Record<string, string> = {};
   const dummyFiles: CliDummyFile[] = [];
   const enabled: EnabledCli[] = [];
-  let needsBundle = false;
+  // Dedup'd mount bundles (a `dyn_*` slot each): the shared integrations bundle
+  // once (any CLI enables it — it carries the discovery helper + SKILL.md), plus
+  // each uploaded connector's own catalog bundle (the binary itself).
+  const bundles = new Set<string>();
 
   for (const provider of [...grantedProviders].sort()) {
     const cli = registry.get(provider)!.cli;
     if (!cli) continue;
     enabled.push({ provider, displayName: registry.get(provider)!.display.name, bins: cli.bins, doc: cli.doc });
-    if (cli.binSource === "bundled") needsBundle = true;
+    bundles.add(INTEGRATIONS_CLI_BUNDLE);
+    if (cli.binSource === "uploaded" && cli.bundle) bundles.add(cli.bundle);
     for (const [k, v] of Object.entries(cli.dummyEnv ?? {})) dummyEnv[k] = v;
     for (const f of cli.dummyFiles ?? []) dummyFiles.push(f);
   }
 
-  return { dummyEnv, dummyFiles, enabled, bundles: needsBundle ? [INTEGRATIONS_CLI_BUNDLE] : [] };
+  return { dummyEnv, dummyFiles, enabled, bundles: [...bundles] };
 }
 
 // ---------------------------------------------------------------------------
