@@ -71,6 +71,19 @@ describe("parseConnector", () => {
     expect(() => parseConnector({ ...datadogRaw, protocol: "grpc" }, "x")).toThrow(/protocol/);
   });
 
+  test("accepts an optional test probe path (ADR 0058)", () => {
+    const c = parseConnector({ ...datadogRaw, test: { path: "/api/v1/dashboard" } }, "datadog");
+    expect(c.test?.path).toBe("/api/v1/dashboard");
+  });
+
+  test("a connector without a test facet leaves it undefined (default `/` coord-side)", () => {
+    expect(parseConnector(datadogRaw, "datadog").test).toBeUndefined();
+  });
+
+  test("rejects a test path that does not start with /", () => {
+    expect(() => parseConnector({ ...datadogRaw, test: { path: "api/v1/dashboard" } }, "x")).toThrow(/test.path/);
+  });
+
   test("rejects inject without a header", () => {
     const bad = { ...datadogRaw, credential: { source: "inject", injects: [{ secretRef: "r" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/header/);

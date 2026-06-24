@@ -68,6 +68,8 @@ export interface RunConnectorTestSpec {
   injects?: Array<{ header: string; template: string; secretRef: string; draftSecret: string }>;
   kind?: string;
   draftFields?: Record<string, string>;
+  /** ADR 0058: probe path (`https://{host}{testPath}`); default `/` coord-side. */
+  testPath?: string;
 }
 /** The slice of the coordinator MintService this service reads/calls. */
 export interface MintAccess {
@@ -329,9 +331,20 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       const host = c.hosts[0];
       if (!host) throw new ConnectError(`connector "${req.provider}" has no host`, Code.InvalidArgument);
       const draft = req.draftValues ?? {};
+      // ADR 0058: an honest probe path (default `/` coord-side). Datadog's `/`
+      // 307-redirects to a public page so any credential "passes" — it points
+      // `test.path` at an endpoint that 401/403s without every injected header.
+      const testPath = c.test?.path;
       const spec: RunConnectorTestSpec =
         c.credential.source === "mint"
-          ? { provider: req.provider, host, source: "mint", kind: c.credential.mint.kind, draftFields: draft }
+          ? {
+              provider: req.provider,
+              host,
+              source: "mint",
+              kind: c.credential.mint.kind,
+              draftFields: draft,
+              ...(testPath ? { testPath } : {}),
+            }
           : {
               provider: req.provider,
               host,
@@ -345,6 +358,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
                 secretRef: inj.secretRef,
                 draftSecret: draft[inj.secretRef] ?? "",
               })),
+              ...(testPath ? { testPath } : {}),
             };
       const { ok, message } = await mint.runConnectorTest(spec);
       return { ok, message };

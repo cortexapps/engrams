@@ -160,6 +160,17 @@ export interface CliFacet {
   doc: string;
 }
 
+/** ADR 0058: the "Test connection" probe target. The coordinator GETs
+ * `https://{hosts[0]}{path}` with the resolved credential; absent → `/`. A
+ * connector whose root doesn't exercise auth (Datadog's `/` 307-redirects to a
+ * public page, so any value "passes") points this at an endpoint that 401/403s
+ * without a valid credential AND requires every injected header — so a partial or
+ * wrong credential fails the test honestly. */
+export interface ConnectorTest {
+  /** Probe path, must start with `/` (e.g. `/api/v1/dashboard`). */
+  path: string;
+}
+
 export interface Connector {
   provider: string;
   /** Only `"http"` is implemented; other values are rejected at load. */
@@ -171,6 +182,8 @@ export interface Connector {
   display: ConnectorDisplay;
   /** ADR 0058: optional CLI facet — the provider is drivable through a CLI. */
   cli?: CliFacet;
+  /** ADR 0058: optional probe path for "Test connection" (default `/`). */
+  test?: ConnectorTest;
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +620,26 @@ export function parseConnector(raw: unknown, where: string): Connector {
   const display = parseDisplay(where, o.display, o.provider);
   const cli = o.cli !== undefined ? parseCli(where, o.cli) : undefined;
 
-  return { provider: o.provider, protocol: "http", credential, hosts, operations, display, ...(cli ? { cli } : {}) };
+  let test: ConnectorTest | undefined;
+  if (o.test !== undefined) {
+    if (typeof o.test !== "object" || o.test === null) fail(where, '"test" must be an object');
+    const t = o.test as Record<string, unknown>;
+    if (typeof t.path !== "string" || !t.path.startsWith("/")) {
+      fail(where, '"test.path" must be a string starting with "/"');
+    }
+    test = { path: t.path };
+  }
+
+  return {
+    provider: o.provider,
+    protocol: "http",
+    credential,
+    hosts,
+    operations,
+    display,
+    ...(cli ? { cli } : {}),
+    ...(test ? { test } : {}),
+  };
 }
 
 /** Build the provider→connector map; throws on a duplicate provider. */

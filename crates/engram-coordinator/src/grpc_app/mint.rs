@@ -77,7 +77,16 @@ impl app::mint_service_server::MintService for AppMintService {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .map_err(|e| format!("http client: {e}"))?;
-            let url = format!("https://{}/", spec.host);
+            // ADR 0058: probe `test_path` (default `/`). Some hosts' root doesn't
+            // exercise auth (Datadog `/` 307-redirects to a public page), so the
+            // connector points this at an endpoint that 401/403s without a valid,
+            // complete credential.
+            let path = if spec.test_path.is_empty() {
+                "/"
+            } else {
+                spec.test_path.as_str()
+            };
+            let url = format!("https://{}{}", spec.host, path);
 
             let request = if spec.source == "mint" {
                 // Build the engine from the draft fields, or resolve it from the

@@ -15,6 +15,7 @@
     ]
   },
   "hosts": ["api.datadoghq.com"],
+  "test": { "path": "/api/v1/dashboard" },
   "operations": [
     {
       "grants": ["read"],
