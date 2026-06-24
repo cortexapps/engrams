@@ -448,7 +448,7 @@ pub(crate) fn build_observe_entries(
             allow_hosts: o.hosts.clone(),
             allow_host_patterns: Vec::new(),
             methods: o.methods.clone(),
-            path_prefixes: o.path_prefixes.clone(),
+            path_globs: o.path_globs.clone(),
             provider: o.provider.clone(),
             asset_kind: o.asset_kind.clone(),
             surface: o.surface.clone(),
@@ -511,7 +511,7 @@ pub(crate) async fn resolve_inject_entries(
                     allow_hosts: inj.hosts.clone(),
                     allow_host_patterns: Vec::new(),
                     methods: inj.methods.clone(),
-                    path_prefixes: inj.path_prefixes.clone(),
+                    path_globs: inj.path_globs.clone(),
                 },
                 None => continue, // mint_inject_header logged the reason
             }
@@ -546,7 +546,7 @@ pub(crate) async fn resolve_inject_entries(
                 allow_hosts: inj.hosts.clone(),
                 allow_host_patterns: Vec::new(),
                 methods: inj.methods.clone(),
-                path_prefixes: inj.path_prefixes.clone(),
+                path_globs: inj.path_globs.clone(),
             }
         };
         out.push(entry);

@@ -73,7 +73,7 @@ pub struct IntegrationSecret {
 }
 
 /// One Plane-B injection: on an outbound request to `hosts` matching the
-/// request policy (`methods` + `path_prefixes`), the proxy injects
+/// request policy (`methods` + `path_globs`), the proxy injects
 /// `header_name: <header_template with "{}" → the resolved secret>`. The
 /// `secret_ref` is resolved by the coordinator's `SecretStore` host-side.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,15 +99,15 @@ pub struct IntegrationInject {
     #[serde(default)]
     pub methods: Vec<String>,
     /// Glob patterns (a `*` matches any run of chars, incl. `/`) matched against
-    /// the whole request path — e.g. `/repos/*/pulls`. Empty = any path. The name
-    /// is historical: these used to be literal prefixes (see the egress proxy's
-    /// `RequestPolicy`). Carries the connector op's full `match.path`.
+    /// the whole request path — e.g. `/repos/*/pulls`. Empty = any path. Carries
+    /// the connector op's full `match.path`; matched by the egress proxy's
+    /// `RequestPolicy`.
     #[serde(default)]
-    pub path_prefixes: Vec<String>,
+    pub path_globs: Vec<String>,
 }
 
 /// One response-observation spec. On an outbound request to `hosts` matching
-/// `methods` + `path_prefixes` (path globs — see `IntegrationInject`), the proxy
+/// `methods` + `path_globs` (path globs — see `IntegrationInject`), the proxy
 /// parses the response and emits an
 /// `IntegrationAsset` (`provider`/`asset_kind`/`surface`) built from the `data`
 /// extractor map + optional `fetchable` URL extractor, gated by `success`.
@@ -118,7 +118,7 @@ pub struct IntegrationObserve {
     #[serde(default)]
     pub methods: Vec<String>,
     #[serde(default)]
-    pub path_prefixes: Vec<String>,
+    pub path_globs: Vec<String>,
     pub provider: String,
     pub asset_kind: String,
     /// `"action"` (transient) | `"asset"` (durable). Opaque to the proxy; the
@@ -166,7 +166,7 @@ mod tests {
                 secret_ref: "datadog-api-key".into(),
                 mint_provider: String::new(),
                 methods: vec!["GET".into()],
-                path_prefixes: vec!["/api/v2/logs*".into()],
+                path_globs: vec!["/api/v2/logs*".into()],
             }],
             observes: vec![],
             ..Default::default()
@@ -177,11 +177,11 @@ mod tests {
 
     #[test]
     fn defaults_fill_missing_request_policy() {
-        // A connector that gates only by host omits methods/path_prefixes.
+        // A connector that gates only by host omits methods/path_globs.
         let json = r#"{"injects":[{"hosts":["h"],"header_name":"X","header_template":"{}","secret_ref":"r"}]}"#;
         let p = IntegrationPolicy::parse(json).unwrap().unwrap();
         assert!(p.injects[0].methods.is_empty());
-        assert!(p.injects[0].path_prefixes.is_empty());
+        assert!(p.injects[0].path_globs.is_empty());
     }
 
     #[test]
@@ -191,7 +191,7 @@ mod tests {
             observes: vec![IntegrationObserve {
                 hosts: vec!["api.github.com".into()],
                 methods: vec!["POST".into()],
-                path_prefixes: vec!["/repos/*/issues".into()],
+                path_globs: vec!["/repos/*/issues".into()],
                 provider: "github".into(),
                 asset_kind: "issue".into(),
                 surface: "asset".into(),

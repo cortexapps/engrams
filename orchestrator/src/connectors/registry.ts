@@ -121,13 +121,13 @@ export interface IntegrationInjectJson {
    */
   mint_provider: string;
   methods: string[];
-  path_prefixes: string[];
+  path_globs: string[];
 }
 /** One response-observation spec, snake_case to match the Rust serde shape. */
 export interface IntegrationObserveJson {
   hosts: string[];
   methods: string[];
-  path_prefixes: string[];
+  path_globs: string[];
   provider: string;
   asset_kind: string;
   surface: string;
@@ -581,7 +581,7 @@ export function compileIntegrationPolicy(
       // the full request path). Previously this was truncated at the first `*`
       // and prefix-matched, which over-matched siblings — e.g. `/repos/*/pulls`
       // collapsed to `/repos/` and fired the gate/observe on `/repos/o/r/git/refs`.
-      const path_prefixes = op.match?.path ? [op.match.path] : [];
+      const path_globs = op.match?.path ? [op.match.path] : [];
 
       if (connector.credential.source === "inject") {
         const inj = connector.credential.inject;
@@ -592,7 +592,7 @@ export function compileIntegrationPolicy(
           secret_ref: inj.secretRef,
           mint_provider: "",
           methods,
-          path_prefixes,
+          path_globs,
         };
         const key = JSON.stringify(entry);
         if (!seenInject.has(key)) {
@@ -614,7 +614,7 @@ export function compileIntegrationPolicy(
           secret_ref: "",
           mint_provider: connector.provider,
           methods,
-          path_prefixes,
+          path_globs,
         };
         const key = JSON.stringify(entry);
         if (!seenInject.has(key)) {
@@ -630,7 +630,7 @@ export function compileIntegrationPolicy(
         const entry: IntegrationObserveJson = {
           hosts: connector.hosts,
           methods,
-          path_prefixes,
+          path_globs,
           provider: connector.provider,
           asset_kind: a.kind,
           surface: a.surface,

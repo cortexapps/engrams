@@ -302,9 +302,9 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
             <Text variant="label">Operations</Text>
             <p className="text-[0.74rem] leading-relaxed text-muted-foreground">
               The <strong>action slug</strong> is the capability a profile grants; the{" "}
-              <strong>method + path</strong> become the proxy's gate (the path prefix up to the
-              first <code className="font-mono">*</code>). Read/write and the label are derived for
-              display — not stored.
+              <strong>method + path</strong> become the proxy's gate (the path is matched as a glob
+              — <code className="font-mono">*</code> matches any characters). Read/write and the
+              label are derived for display — not stored.
             </p>
             {ops.map((o) => {
               const g = o.grant.trim();
