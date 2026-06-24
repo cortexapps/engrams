@@ -31,8 +31,19 @@
     {
       "grants": ["files:write"],
       "match": { "path": "/api/files.*" }
+    },
+    {
+      "grants": ["chat:write", "channels:read", "users:read", "files:write"],
+      "match": { "path": "/api/auth.test" }
     }
   ],
+  "cli": {
+    "bins": ["slack"],
+    "binSource": "bundled",
+    "dummyEnv": { "SLACK_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `slack` to interact with Slack from this session — post messages, list channels/users, upload files. Authentication is automatic: the egress proxy injects the workspace bot token on requests to slack.com; `SLACK_TOKEN` is a managed placeholder. Do NOT set a real token or run any login.\n\nPost a message: `slack post <channel> <text>` — channel is an ID like C0123456789 or #name; the bot must be in the channel (or the app needs the chat:write.public scope). Requires the `chat:write` power.\nList channels: `slack channels` (requires `channels:read`). List users: `slack users` (requires `users:read`).\nUpload a file: `slack upload <channel> <path> [title]` (requires `files:write`).\nIdentity check: `slack whoami`. Any other Web API method: `slack api <method> field=value …` (e.g. `slack api chat.postMessage channel=C0123456789 text=hi`). Slack replies with JSON {\"ok\":true,…} or {\"ok\":false,\"error\":…}."
+  },
   "oauth": {
     "authorizeUrl": "https://slack.com/oauth/v2/authorize",
     "tokenUrl": "https://slack.com/api/oauth.v2.access",

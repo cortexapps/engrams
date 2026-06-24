@@ -3,7 +3,7 @@
   "skills": [
     {
       "name": "integrations",
-      "bins": ["bin/engrams-integrations", "bin/gh", "bin/pup"],
+      "bins": ["bin/engrams-integrations", "bin/gh", "bin/pup", "bin/slack"],
       "requires_env": "ENGRAM_CLI_INTEGRATIONS"
     }
   ]
