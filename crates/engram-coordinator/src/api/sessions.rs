@@ -1582,45 +1582,53 @@ pub(crate) async fn inject_forge_env(
     session_id: SessionId,
     env: &mut HashMap<String, String>,
 ) {
-    // ADR 0057 D2: forge env is injected when the github mint engine resolves AND
-    // the session holds a `github:*` capability. The manifest `[git]` block is
-    // retired — git binding now rides the profile's capabilities (ADR 0056). The
-    // engine "resolves" from the composed SecretStore (org store or boot-env
-    // fallback), checked async (ADR 0057 C2).
-    let github_ready = state
-        .integrations
-        .resolve("github", &state.services.secrets)
-        .await
-        .is_some();
-    if !github_ready {
-        return;
-    }
+    // ADR 0056 P2: forge env is injected when the session holds a capability for a
+    // provider that (a) resolves a mint engine AND (b) declares a git-forge host
+    // (`Integration::git_forge_host`). De-hardcodes the old `"github"` literal — any
+    // git-forge integration (github today; gitlab/gitea later) gets the askpass env.
+    // The manifest `[git]` block is retired — git binding rides the profile's caps.
     let caps = state
         .services
         .meta
         .get_session_capabilities(session_id)
         .await
         .unwrap_or_default();
-    let github_caps: Vec<_> = caps.iter().filter(|c| c.provider == "github").collect();
-    if github_caps.is_empty() {
+    // The session's bound caps that belong to a git-forge provider.
+    let mut git_caps: Vec<&engram_core::types::Capability> = Vec::new();
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for provider in caps.iter().map(|c| c.provider.as_str()) {
+        if !seen.insert(provider) {
+            continue;
+        }
+        let is_git_forge = state
+            .integrations
+            .resolve(provider, &state.services.secrets)
+            .await
+            .and_then(|e| e.git_forge_host())
+            .is_some();
+        if is_git_forge {
+            git_caps.extend(caps.iter().filter(|c| c.provider == provider));
+        }
+    }
+    if git_caps.is_empty() {
         return;
     }
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {
-        // A github-capable session with no broker token means the in-guest
+        // A git-forge-capable session with no broker token means the in-guest
         // gitconfig gets no credential helper and every git op fails with
         // "could not read Username". This used to be silent (the mint FK-failed
         // before the session row existed); it must never be quiet again.
         tracing::error!(
             %session_id,
-            "github-capable session got no broker token; git credentials will be UNAVAILABLE in-guest",
+            "git-forge-capable session got no broker token; git credentials will be UNAVAILABLE in-guest",
         );
         return;
     };
     env.insert("ENGRAM_FORGE_TOKEN".into(), token);
-    // Owner hint: the org segment of the first capability that scopes a resource
-    // (`github:contents:write@owner/repo` → `owner`). Omitted otherwise — the
-    // single-installation App resolves the installation without it.
-    if let Some(owner) = github_caps.iter().find_map(|c| {
+    // Owner hint: the org segment of the first git-forge capability that scopes a
+    // resource (`github:contents:write@owner/repo` → `owner`). Omitted otherwise —
+    // the single-installation App resolves the installation without it.
+    if let Some(owner) = git_caps.iter().find_map(|c| {
         c.resource
             .as_deref()
             .and_then(|r| r.split('/').next())
