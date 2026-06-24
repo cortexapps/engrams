@@ -113,6 +113,17 @@ pub trait Integration: Send + Sync {
     fn inject_header(&self, cred: &ScopedCredential) -> Option<InjectHeader> {
         default_inject_header(cred)
     }
+
+    /// ADR 0056 P2: if this provider is a **git forge**, the host its remotes
+    /// live at (e.g. `github.com`). git clone/push speaks a credential-*helper*
+    /// protocol, not a header-injectable HTTP API — the one delivery the egress
+    /// interceptor can't do — so a git-forge provider keeps the askpass seam. This
+    /// declaration is what makes that seam GENERIC: the guest's askpass helper and
+    /// the coordinator's forge-env injection key off this host, not a literal
+    /// `"github"`. `None` for non-git providers (the default).
+    fn git_forge_host(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A complete request-auth header — `name: value`, value already rendered (the

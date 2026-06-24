@@ -384,6 +384,12 @@ impl Integration for GitHubApp {
         engram_core::traits::default_inject_header(cred)
     }
 
+    /// github is a git forge served at `github.com`; its clone/push needs the
+    /// askpass credential-helper seam (ADR 0056 P2). De-hardcodes the forge wiring.
+    fn git_forge_host(&self) -> Option<String> {
+        Some(GITHUB_HOST.to_string())
+    }
+
     /// The one mediated action today: open a pull request (`pulls:write`).
     /// `args` = `{repo, head_branch, base_branch, title, body, draft}`; the
     /// reply carries `{url, id, number, state}` the coordinator emits as an
