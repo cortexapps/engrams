@@ -238,6 +238,14 @@ rejects an unimplemented `protocol` until its parser lands.
 
 ### 4. Assets: observed at the interceptor by default; mediated only as a hybrid exception
 
+> **Update (P3c):** the **mediated hybrid seam below was ultimately retired.** Its
+> only user — PR-open — proved to work as a plain egress-*observed* side effect
+> (`gh pr create` rides the inject plane; the proxy observes the response, P3b), so
+> `Integration::perform_action` and the `ForgeOp::CreatePullRequest` wire op were
+> removed in P3c. The "observed (default)" path below is now the *only* path; the
+> mediated exception is documented here as the design rationale that led there. See
+> the P3 entry under [Phasing](#phasing).
+
 Retire `SessionEvent::PullRequestOpened` into one generic event (`FileShared` /
 artifacts, ADR 0026, are **not** integration-related and stay as-is; the
 `FetchableRef::Artifact` handle remains so a future asset *can* point at the
@@ -589,5 +597,23 @@ git-askpass primitive (a future gitlab/gitea integration reuses it unchanged).
   token out of the guest.)
 - **P2** — generic git-askpass: trait-declared git-remote delivery; de-hardcode
   github; `forge-credential` scoped to that primitive.
-- **P3** — retire `forge-credential` for API + move PR-open to inject+observe; update
-  the `create-pull-request` skill to a plain authenticated `POST /pulls`.
+- **P3** — retire `forge-credential` for API + move PR-open to inject+observe.
+  Landed in three steps:
+  - **P3a** (#409) — egress inject *overwrites* an existing same-name header, so a
+    guest-supplied `Authorization` can't shadow the brokered token (needed once `gh`
+    rides the inject plane with its own placeholder token).
+  - **P3b** (#412) — the `create-pull-request` skill opens PRs with `gh pr create`
+    (a placeholder `GH_TOKEN`; the proxy substitutes the scoped token on the wire to
+    `api.github.com` and observes the response to emit the `pull_request` asset).
+    Chose `gh` over a hand-rolled `POST /pulls` so the guest uses the idiomatic tool.
+  - **P3c** — retire the now-dead server-mediated PR-open plumbing: the `engram-pr`
+    bin, the `engram-agentd forge-pull-request` op, the coordinator
+    `op_create_pull_request` + `POST /sessions/:id/pull-request` route, the
+    `Integration::perform_action` seam (+ both impls), and the
+    `ForgeOp::CreatePullRequest` / `ForgeResponse::PullRequest` wire variants. PR-open
+    is now purely an egress-*observed* side effect, never a server-performed one — so
+    the §4 "hybrid mediated action" exception is gone; the only forge-bridge op left is
+    the git clone/push credential the interceptor can't header-inject. Removing the
+    middle `ForgeResponse::PullRequest` shifts `Error`'s bincode index 2→1 (a wire
+    break gated on session images re-baking with the new agentd; `Credential` stays at
+    index 0 so git push keeps working on not-yet-rebaked images).

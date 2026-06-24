@@ -6,7 +6,7 @@
 //! produced session directory contains everything a harness discovers:
 //! the `~/.claude/skills` tree (share-file always; create-pull-request when
 //! a forge token is present; show-your-work when the playwright bundle is
-//! present), and the `engram-share`/`engram-pr`/`playwright-cli` wrappers on
+//! present), and the `engram-share`/`playwright-cli` wrappers on
 //! PATH + `/etc/gitconfig`. This is the cross-cutting check that the engine
 //! actually lands skills in sessions — the per-unit behavior is covered by
 //! `engram-session-bundles` tests.
@@ -36,7 +36,6 @@ fn write_exec(path: &Path, body: &str) {
 /// Build fake skills + playwright bundle trees mirroring `deploy/bundles/*`.
 fn stage_fake_bundles(skills: &Path, browser: &Path) {
     write_exec(&skills.join("bin/engram-share"), "#!/bin/sh\n");
-    write_exec(&skills.join("bin/engram-pr"), "#!/bin/sh\n");
     write_exec(&skills.join("bin/git-askpass"), "#!/bin/sh\n");
     std::fs::create_dir_all(skills.join("skills/share-file")).unwrap();
     std::fs::write(skills.join("skills/share-file/SKILL.md"), "---\n").unwrap();
@@ -44,7 +43,7 @@ fn stage_fake_bundles(skills: &Path, browser: &Path) {
     std::fs::write(skills.join("skills/create-pull-request/SKILL.md"), "---\n").unwrap();
     std::fs::write(
         skills.join("mount.json"),
-        r#"{"kind":"skill","skills":[{"name":"share-file","bins":["bin/engram-share"]},{"name":"create-pull-request","bins":["bin/engram-pr"],"requires_env":"ENGRAM_FORGE_TOKEN"}],"provides_askpass":"bin/git-askpass"}"#,
+        r#"{"kind":"skill","skills":[{"name":"share-file","bins":["bin/engram-share"]},{"name":"create-pull-request","requires_env":"ENGRAM_FORGE_TOKEN"}],"provides_askpass":"bin/git-askpass"}"#,
     )
     .unwrap();
 
@@ -123,9 +122,9 @@ async fn generated_session_has_skills_and_browser_tooling() {
         "show-your-work not wired despite playwright bundle present",
     );
 
-    // Wrappers on PATH + git wiring.
+    // Wrappers on PATH + git wiring. (create-pull-request is markdown-only now —
+    // ADR 0056 P3 retired its engram-pr bin; it opens PRs via `gh` on PATH.)
     assert!(cwd.join("usr/local/bin/engram-share").is_symlink());
-    assert!(cwd.join("usr/local/bin/engram-pr").is_symlink());
     let gitconfig = std::fs::read_to_string(cwd.join("etc/gitconfig")).expect("gitconfig written");
     assert!(
         gitconfig.contains("git-askpass"),

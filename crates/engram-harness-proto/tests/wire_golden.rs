@@ -421,18 +421,8 @@ fn forge_op_golden_and_variant_indices() {
         host: "github.com".into(),
         owner: Some("cortexapps".into()),
     };
-    let create_pr = ForgeOp::CreatePullRequest {
-        repo: "cortexapps/engrams".into(),
-        head_branch: "feat/x".into(),
-        base_branch: "main".into(),
-        title: "Add x".into(),
-        body: String::new(),
-        draft: false,
-    };
     assert_golden("forge_op_fetch_credential", &fetch);
-    assert_golden("forge_op_create_pull_request", &create_pr);
     assert_variant_index(&fetch, 0, "ForgeOp::FetchCredential");
-    assert_variant_index(&create_pr, 1, "ForgeOp::CreatePullRequest");
 }
 
 #[test]
@@ -441,20 +431,16 @@ fn forge_response_golden_and_variant_indices() {
         username: "x-access-token".into(),
         password: "ghs_x".into(),
     };
-    let pr = ForgeResponse::PullRequest {
-        url: "https://github.com/cortexapps/engrams/pull/1".into(),
-        id: 1,
-        state: "open".into(),
-    };
     let err = ForgeResponse::Error {
         message: "nope".into(),
     };
     assert_golden("forge_response_credential", &cred);
-    assert_golden("forge_response_pull_request", &pr);
     assert_golden("forge_response_error", &err);
     assert_variant_index(&cred, 0, "ForgeResponse::Credential");
-    assert_variant_index(&pr, 1, "ForgeResponse::PullRequest");
-    assert_variant_index(&err, 2, "ForgeResponse::Error");
+    // ADR 0056 P3 removed `PullRequest` (was index 1); `Error` shifts 2 → 1.
+    // A wire break the host↔harness golden is designed to flag — intentional,
+    // gated on session images re-baking with the new agentd.
+    assert_variant_index(&err, 1, "ForgeResponse::Error");
 }
 
 #[test]
@@ -589,31 +575,12 @@ fn regen_golden() {
             owner: Some("cortexapps".into()),
         },
     );
-    write(
-        "forge_op_create_pull_request",
-        &ForgeOp::CreatePullRequest {
-            repo: "cortexapps/engrams".into(),
-            head_branch: "feat/x".into(),
-            base_branch: "main".into(),
-            title: "Add x".into(),
-            body: String::new(),
-            draft: false,
-        },
-    );
 
     write(
         "forge_response_credential",
         &ForgeResponse::Credential {
             username: "x-access-token".into(),
             password: "ghs_x".into(),
-        },
-    );
-    write(
-        "forge_response_pull_request",
-        &ForgeResponse::PullRequest {
-            url: "https://github.com/cortexapps/engrams/pull/1".into(),
-            id: 1,
-            state: "open".into(),
         },
     );
     write(

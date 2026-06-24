@@ -17,8 +17,8 @@ skills it carries + their PATH wrapper bins + any `requires_env` gate, an
 optional `provides_askpass`). Wrappers are **position-independent** — they
 self-locate their runtime from `$0`, never a fixed mount path.
 
-- **`skills/`** — the built-in skill wrappers (`engram-share`, `engram-pr`,
-  `git-askpass`) + their `SKILL.md`. The unpacked tree *is* this directory.
+- **`skills/`** — the built-in skill wrappers (`engram-share`, `git-askpass`)
+  + their `SKILL.md`. The unpacked tree *is* this directory.
   Selected by name `skills`.
 - **`playwright/`** — chromium-headless-shell + Node + Microsoft's
   `@playwright/cli` + all `.so` deps + a `playwright-cli` wrapper + the

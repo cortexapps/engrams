@@ -6,7 +6,6 @@ use std::sync::OnceLock;
 
 use engram_core::error::IntegrationError;
 use engram_core::traits::{CredentialHint, Integration, ScopedCredential};
-use engram_core::types::Capability;
 use engram_git_github::GitHubApp;
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
@@ -26,10 +25,6 @@ fn test_key() -> &'static str {
             .expect("encode pkcs8 pem")
             .to_string()
     })
-}
-
-fn pulls_cap() -> Capability {
-    Capability::parse("github:pulls:write").unwrap()
 }
 
 async fn mount_installation(server: &MockServer, times: u64) {
@@ -100,68 +95,6 @@ async fn mint_rejects_a_served_host_it_does_not_own() {
     assert!(
         err.to_string().contains("does not serve host"),
         "expected a served-host rejection, got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn creates_pull_request() {
-    let server = MockServer::start().await;
-    mount_installation(&server, 1).await;
-    mount_token(&server, 1).await;
-    Mock::given(method("POST"))
-        .and(path("/repos/cortexapps/engrams/pulls"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-            "html_url": "https://github.com/cortexapps/engrams/pull/7",
-            "number": 7,
-            "state": "open",
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let app = GitHubApp::new("123", test_key())
-        .unwrap()
-        .with_base_url(server.uri());
-    let args = serde_json::json!({
-        "repo": "cortexapps/engrams",
-        "head_branch": "feat/x",
-        "base_branch": "main",
-        "title": "Add x",
-        "body": "does x",
-        "draft": false,
-    });
-    let reply = app.perform_action(&pulls_cap(), &args).await.unwrap();
-    assert_eq!(reply["url"], "https://github.com/cortexapps/engrams/pull/7");
-    assert_eq!(reply["id"], 7);
-    assert_eq!(reply["state"], "open");
-}
-
-#[tokio::test]
-async fn maps_422_to_rejected() {
-    let server = MockServer::start().await;
-    mount_installation(&server, 1).await;
-    mount_token(&server, 1).await;
-    Mock::given(method("POST"))
-        .and(path("/repos/cortexapps/engrams/pulls"))
-        .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
-            "message": "A pull request already exists for cortexapps:feat/x.",
-        })))
-        .mount(&server)
-        .await;
-
-    let app = GitHubApp::new("123", test_key())
-        .unwrap()
-        .with_base_url(server.uri());
-    let args = serde_json::json!({
-        "repo": "cortexapps/engrams",
-        "head_branch": "feat/x",
-        "base_branch": "main",
-        "title": "dup",
-    });
-    let err = app.perform_action(&pulls_cap(), &args).await.unwrap_err();
-    assert!(
-        matches!(err, IntegrationError::Rejected(_)),
-        "expected Rejected, got {err:?}"
     );
 }
 

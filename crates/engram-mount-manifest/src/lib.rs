@@ -90,7 +90,7 @@ mod tests {
           "kind": "skill",
           "skills": [
             { "name": "share-file", "bins": ["bin/engram-share"] },
-            { "name": "create-pull-request", "bins": ["bin/engram-pr"],
+            { "name": "create-pull-request",
               "requires_env": "ENGRAM_FORGE_TOKEN" }
           ],
           "provides_askpass": "bin/git-askpass"

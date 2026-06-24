@@ -278,7 +278,7 @@ mod tests {
     fn stage_skills_slot(root: &Path, n: usize) {
         let b = root.join(format!("opt/engram/dyn/{n}"));
         std::fs::create_dir_all(b.join("bin")).unwrap();
-        for bin in ["engram-share", "engram-pr", "git-askpass"] {
+        for bin in ["engram-share", "git-askpass"] {
             std::fs::write(b.join("bin").join(bin), "#!/bin/sh\n").unwrap();
         }
         for s in ["share-file", "create-pull-request"] {
@@ -290,7 +290,7 @@ mod tests {
             r#"{"kind":"skill",
                 "skills":[
                   {"name":"share-file","bins":["bin/engram-share"]},
-                  {"name":"create-pull-request","bins":["bin/engram-pr"],"requires_env":"ENGRAM_FORGE_TOKEN"}
+                  {"name":"create-pull-request","requires_env":"ENGRAM_FORGE_TOKEN"}
                 ],
                 "provides_askpass":"bin/git-askpass"}"#,
         )
@@ -353,7 +353,6 @@ mod tests {
         assert!(l.claude_skills.is_symlink());
         assert!(l.agents_skills.join("share-file").is_symlink());
         assert!(l.usr_local_bin.join("engram-share").is_symlink());
-        assert!(!l.usr_local_bin.join("engram-pr").exists());
         assert!(!l.etc_gitconfig.exists());
     }
 
@@ -367,8 +366,10 @@ mod tests {
             .contains(&"create-pull-request".to_string()));
         assert!(report.activated.contains(&"gitconfig".to_string()));
         let l = Layout::under(dir.path());
+        // create-pull-request is markdown-only now (ADR 0056 P3 retired its
+        // engram-pr bin); it wires as a skill dir + the gitconfig askpass, and
+        // opens PRs via `gh` on PATH — no skill-provided bin on PATH.
         assert!(l.agents_skills.join("create-pull-request").is_symlink());
-        assert!(l.usr_local_bin.join("engram-pr").is_symlink());
         let gc = std::fs::read_to_string(&l.etc_gitconfig).unwrap();
         assert!(gc.contains("bin/git-askpass"));
         assert!(gc.contains("x-access-token"));

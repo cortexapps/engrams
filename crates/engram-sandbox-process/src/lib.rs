@@ -582,7 +582,7 @@ async fn spawn_agent(
     // bundle-activated skills. In the guest HOME=/root and the skill
     // wrappers live on /usr/local/bin; here both are rooted under the
     // sandbox cwd. Default HOME (don't clobber an explicit one) and
-    // prepend the cwd-local bin dir so `engram-share`/`engram-pr` resolve.
+    // prepend the cwd-local bin dir so `engram-share`/`git-askpass` resolve.
     env.entry("HOME".into())
         .or_insert_with(|| cwd.join("root").to_string_lossy().into_owned());
     let local_bin = cwd.join("usr/local/bin");

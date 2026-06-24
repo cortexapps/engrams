@@ -27,13 +27,13 @@ use engram_agentd::serve_connection;
 
 fn main() -> ExitCode {
     // ADR 0023: in-guest forge client mode. `engram-agentd
-    // forge-credential` (GIT_ASKPASS) / `forge-pull-request` (engram-pr)
-    // dial the host's forge vsock port and exit, rather than running the
-    // exec server. Intercept before telemetry/runtime setup.
+    // forge-credential` (GIT_ASKPASS) dials the host's forge vsock port and
+    // exits, rather than running the exec server. Intercept before
+    // telemetry/runtime setup. (ADR 0056 P3 retired `forge-pull-request`.)
     {
         let mut argv = std::env::args().skip(1);
         if let Some(sub) = argv.next() {
-            if sub == "forge-credential" || sub == "forge-pull-request" {
+            if sub == "forge-credential" {
                 return engram_agentd::forge::run(&sub, argv.collect());
             }
             // ADR 0026: in-guest artifact share. `engram-share` runs

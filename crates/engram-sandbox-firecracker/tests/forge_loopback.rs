@@ -120,13 +120,12 @@ async fn forge_credential_round_trips_over_vsock() {
                     return;
                 }
             };
+            // ADR 0056 P3c: `ForgeOp` is single-variant now (PR-open retired),
+            // so this match is exhaustive without a fallback arm.
             let resp = match req.op {
                 ForgeOp::FetchCredential { .. } => ForgeResponse::Credential {
                     username: "x-access-token".into(),
                     password: format!("ghs_canned_{}", req.broker_token),
-                },
-                other => ForgeResponse::Error {
-                    message: format!("unexpected op: {other:?}"),
                 },
             };
             let _ = write_msg(&mut stream, &resp).await;
