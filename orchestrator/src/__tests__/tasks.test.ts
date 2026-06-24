@@ -1093,7 +1093,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      profiles: makeFakeProfiles({ capabilities: ["github:issues:write", "datadog:read"] }),
+      profiles: makeFakeProfiles({ capabilities: ["github:issues:write", "datadog:observability:read"] }),
       images: fakeImages(),
       db: okDb(),
     });
@@ -1102,7 +1102,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
       expect(fakeSessions.createReqs[0]?.capabilities).toEqual([
         "github:issues:write",
-        "datadog:read",
+        "datadog:observability:read",
       ]);
     } finally {
       await srv.close();
@@ -1114,7 +1114,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      profiles: makeFakeProfiles({ capabilities: ["datadog:read"] }),
+      profiles: makeFakeProfiles({ capabilities: ["datadog:observability:read"] }),
       images: fakeImages(),
       db: okDb(),
     });

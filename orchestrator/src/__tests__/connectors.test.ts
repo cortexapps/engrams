@@ -71,6 +71,19 @@ describe("parseConnector", () => {
     expect(() => parseConnector({ ...datadogRaw, protocol: "grpc" }, "x")).toThrow(/protocol/);
   });
 
+  test("accepts an optional test probe path (ADR 0058)", () => {
+    const c = parseConnector({ ...datadogRaw, test: { path: "/api/v1/dashboard" } }, "datadog");
+    expect(c.test?.path).toBe("/api/v1/dashboard");
+  });
+
+  test("a connector without a test facet leaves it undefined (default `/` coord-side)", () => {
+    expect(parseConnector(datadogRaw, "datadog").test).toBeUndefined();
+  });
+
+  test("rejects a test path that does not start with /", () => {
+    expect(() => parseConnector({ ...datadogRaw, test: { path: "api/v1/dashboard" } }, "x")).toThrow(/test.path/);
+  });
+
   test("rejects inject without a header", () => {
     const bad = { ...datadogRaw, credential: { source: "inject", injects: [{ secretRef: "r" }] } };
     expect(() => parseConnector(bad, "x")).toThrow(/header/);
@@ -314,7 +327,7 @@ describe("on-disk registry", () => {
   });
 
   test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {
-    const policy = compileIntegrationPolicy(["datadog:read"]);
+    const policy = compileIntegrationPolicy(["datadog:observability:read"]);
     expect(policy.injects).toHaveLength(2);
     expect(policy.injects.map((i) => i.header_name).sort()).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
     expect(policy.injects.map((i) => i.secret_ref).sort()).toEqual(["datadog-api-key", "datadog-app-key"]);
@@ -640,7 +653,7 @@ describe("cli facet (ADR 0058)", () => {
   });
 
   test("the on-disk github + datadog connectors expose their cli facet", () => {
-    const plan = compileCliIntegrations(["github:pulls:write", "datadog:read"], connectorRegistry());
+    const plan = compileCliIntegrations(["github:pulls:write", "datadog:observability:read"], connectorRegistry());
     expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
     expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");

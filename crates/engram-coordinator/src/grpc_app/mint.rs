@@ -77,7 +77,16 @@ impl app::mint_service_server::MintService for AppMintService {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .map_err(|e| format!("http client: {e}"))?;
-            let url = format!("https://{}/", spec.host);
+            // ADR 0058: probe `test_path` (default `/`). Some hosts' root doesn't
+            // exercise auth (Datadog `/` 307-redirects to a public page), so the
+            // connector points this at an endpoint that 401/403s without a valid,
+            // complete credential.
+            let path = if spec.test_path.is_empty() {
+                "/"
+            } else {
+                spec.test_path.as_str()
+            };
+            let url = format!("https://{}{}", spec.host, path);
 
             let request = if spec.source == "mint" {
                 // Build the engine from the draft fields, or resolve it from the
@@ -126,38 +135,49 @@ impl app::mint_service_server::MintService for AppMintService {
                     }
                 }
             } else {
-                // inject: use the draft value, else resolve the stored org secret.
-                let value = if !spec.draft_secret.is_empty() {
-                    spec.draft_secret.clone()
-                } else {
-                    let ctx = SecretContext {
-                        repo: "",
-                        image_tag: "",
+                // inject: add EVERY declared header, each using its draft value or
+                // the stored org secret (ADR 0058: a connector may inject several,
+                // e.g. Datadog's DD-API-KEY + DD-APPLICATION-KEY — the probe only
+                // passes if they ALL authenticate).
+                if spec.injects.is_empty() {
+                    return Err("connector has no inject credential".to_string());
+                }
+                let mut builder = http.get(&url);
+                for inj in &spec.injects {
+                    let value = if !inj.draft_secret.is_empty() {
+                        inj.draft_secret.clone()
+                    } else {
+                        let ctx = SecretContext {
+                            repo: "",
+                            image_tag: "",
+                        };
+                        let schema = SecretSchema {
+                            required: true,
+                            ..Default::default()
+                        };
+                        state
+                            .services
+                            .secrets
+                            .get(&ctx, &inj.secret_ref, &schema)
+                            .await
+                            .map_err(|e| format!("could not resolve org secret: {e}"))?
+                            .ok_or_else(|| {
+                                format!("org secret \"{}\" is not set", inj.secret_ref)
+                            })?
                     };
-                    let schema = SecretSchema {
-                        required: true,
-                        ..Default::default()
+                    let header_name = if inj.header.is_empty() {
+                        "Authorization"
+                    } else {
+                        &inj.header
                     };
-                    state
-                        .services
-                        .secrets
-                        .get(&ctx, &spec.secret_ref, &schema)
-                        .await
-                        .map_err(|e| format!("could not resolve org secret: {e}"))?
-                        .ok_or_else(|| format!("org secret \"{}\" is not set", spec.secret_ref))?
-                };
-                let header_name = if spec.header.is_empty() {
-                    "Authorization"
-                } else {
-                    &spec.header
-                };
-                let template = if spec.template.is_empty() {
-                    "{}"
-                } else {
-                    &spec.template
-                };
-                http.get(&url)
-                    .header(header_name, template.replace("{}", &value))
+                    let template = if inj.template.is_empty() {
+                        "{}"
+                    } else {
+                        &inj.template
+                    };
+                    builder = builder.header(header_name, template.replace("{}", &value));
+                }
+                builder
             };
 
             let resp = request

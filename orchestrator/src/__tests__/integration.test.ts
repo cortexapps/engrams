@@ -481,7 +481,7 @@ describe("TestConnector", () => {
     }
   });
 
-  test("builds the inject spec (header/template/secretRef + draft) from the registry", async () => {
+  test("builds the inject spec with ALL headers, drafts keyed by secret ref (ADR 0058)", async () => {
     let captured: Record<string, unknown> | undefined;
     const s = await spawn({
       getSession: makeGetSession("a", "admin"),
@@ -492,16 +492,29 @@ describe("TestConnector", () => {
       }),
     });
     try {
-      const r = await s.client.testConnector({ provider: "datadog", draftValues: { credential: "dd-key" } });
+      const r = await s.client.testConnector({
+        provider: "datadog",
+        draftValues: { "datadog-api-key": "dd-key", "datadog-app-key": "dd-app" },
+      });
       expect(r.ok).toBe(true);
       expect(r.message).toContain("datadoghq");
+      // ADR 0058: EVERY injected header is probed; drafts keyed by org-secret ref.
+      // The probe targets the connector's `test.path` (Datadog's `/` 307s to a
+      // public page, so the test must hit an endpoint that needs both keys).
       expect(captured).toMatchObject({
         provider: "datadog",
         host: "api.datadoghq.com",
         source: "inject",
-        header: "DD-API-KEY",
-        secretRef: "datadog-api-key",
-        draftSecret: "dd-key",
+        testPath: "/api/v1/dashboard",
+        injects: [
+          { header: "DD-API-KEY", template: "{}", secretRef: "datadog-api-key", draftSecret: "dd-key" },
+          {
+            header: "DD-APPLICATION-KEY",
+            template: "{}",
+            secretRef: "datadog-app-key",
+            draftSecret: "dd-app",
+          },
+        ],
       });
     } finally {
       await s.close();

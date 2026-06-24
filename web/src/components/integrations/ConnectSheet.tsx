@@ -81,8 +81,9 @@ export function ConnectSheet({
 
   const runTest = async () => {
     setTestState("idle");
-    // The test probes the primary (first) header (orchestrator runConnectorTest).
-    const draftValues = isMint ? values : { credential: injectSecrets[injects[0]?.secretRef ?? ""] ?? "" };
+    // ADR 0058: send every entered secret keyed by its org-secret ref, so the
+    // test probes ALL the connector's headers (the orchestrator maps each by ref).
+    const draftValues = isMint ? values : injectSecrets;
     try {
       const r = await test.mutateAsync({ provider: view.provider, draftValues });
       setTestState(r.ok ? "ok" : "fail");

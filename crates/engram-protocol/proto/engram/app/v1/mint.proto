@@ -54,20 +54,34 @@ message ListMintKindsResponse {
 // A resolved connector test spec, built by the orchestrator from the connector
 // registry. Carries the inject header/template/secret_ref OR the mint kind, plus
 // an optional draft (the about-to-be-saved credential, tested before sealing).
+// ADR 0058: one injected header for the connector test. A connector may inject
+// several (e.g. Datadog's DD-API-KEY + DD-APPLICATION-KEY); the test sends them all.
+message ConnectorTestInject {
+  string header = 1;        // header name (default Authorization)
+  string template = 2;      // "Bearer {}" / "{}"
+  string secret_ref = 3;    // org secret to resolve when no draft is given
+  string draft_secret = 4;  // test this value instead of the stored secret_ref
+}
+
 message RunConnectorTestRequest {
   string provider = 1;      // "github" / "datadog"
   string host = 2;          // hosts[0], e.g. "api.github.com"
   string source = 3;        // "inject" | "mint"
 
-  // inject:
-  string header = 4;        // header name (default Authorization)
-  string template = 5;      // "Bearer {}" / "{}"
-  string secret_ref = 6;    // org secret to resolve when no draft is given
-  string draft_secret = 7;  // test this value instead of the stored secret_ref
+  // inject: one or more headers, each resolved (draft or stored) + sent on the probe.
+  repeated ConnectorTestInject injects = 10;
 
   // mint:
   string kind = 8;                   // mint kind id (e.g. github_app)
   map<string, string> draft_fields = 9; // build the engine from these instead of the stored secrets
+
+  // ADR 0058: the path the probe GETs (`https://{host}{test_path}`), default `/`.
+  // A connector whose root doesn't exercise auth (Datadog's `/` 307-redirects to a
+  // public page, so any credential "passes") points this at an endpoint that
+  // 401/403s without a valid credential AND needs every injected header.
+  string test_path = 11;
+
+  reserved 4, 5, 6, 7;  // ADR 0058: were single header/template/secret_ref/draft_secret
 }
 
 message RunConnectorTestResponse {
