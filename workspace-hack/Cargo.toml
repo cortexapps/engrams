@@ -46,7 +46,9 @@ libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 nix = { version = "0.31", default-features = false, features = ["fs", "sched", "signal", "uio"] }
-num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
+num-bigint = { version = "0.4" }
+num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
+num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 phf_shared = { version = "0.11" }
@@ -96,6 +98,7 @@ chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
 digest = { version = "0.10", features = ["mac", "oid", "std"] }
+displaydoc = { version = "0.2" }
 either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
 form_urlencoded = { version = "1" }
@@ -108,7 +111,7 @@ getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-f
 idna = { version = "1" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
-num-traits = { version = "0.2", default-features = false, features = ["i128", "libm", "std"] }
+num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 phf_shared = { version = "0.11" }

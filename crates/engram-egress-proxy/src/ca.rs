@@ -26,14 +26,15 @@ const CA_ORGANIZATION: &str = "Engram";
 /// in-memory issuer cert on each restart), and the PEM bytes the
 /// harness substrate stamps into the guest trust store.
 ///
-/// Reload note: rcgen 0.13 has no round-trip from PEM back to
-/// `CertificateParams`, so on restart we rebuild params from
-/// constants and re-self-sign with the persisted KeyPair. The
-/// resulting cert is *not* byte-identical to the one on disk, but
-/// the leaves it signs still validate against the on-disk PEM
-/// because trust validation only requires the issuer's
-/// SubjectPublicKeyInfo (the key) to match — and the key IS
-/// persisted. Operators bake the persisted cert into the trust
+/// Reload note: on restart we re-self-sign the issuer with the persisted
+/// KeyPair. The resulting cert is *not* byte-identical to the one on disk, but
+/// its leaves still validate against the delivered cert provided **both the
+/// issuer's subject DN and its public key match** the delivered cert. X.509
+/// path-building keys on the issuer DN ↔ trusted-CA subject DN; a matching key
+/// alone is not enough. So `from_pem` parses params (DN included) from the loaded
+/// cert via `CertificateParams::from_ca_cert_pem` rather than rebuilding them from
+/// constants — otherwise a deployed CA whose DN differs from the constants signs
+/// leaves no guest can verify. Operators bake the persisted cert into the trust
 /// store; the in-memory cert is only used to sign new leaves.
 pub struct Ca {
     pub key_pair: KeyPair,
@@ -74,11 +75,21 @@ impl Ca {
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, CaError> {
         let key_pair =
             KeyPair::from_pem(key_pem).map_err(|e| CaError::Rcgen(format!("parse ca key: {e}")))?;
-        // rcgen 0.13 has no Cert→Params round-trip, so we rebuild
-        // params from constants. Validity in the rebuilt params is
-        // independent of the persisted cert; what matters is that
-        // the SubjectPublicKeyInfo (= key_pair) matches.
-        let params = build_params();
+        // Parse params — crucially the distinguished name — FROM the loaded cert,
+        // so the issuer we re-self-sign to mint leaves (see `cert_mint`) carries
+        // the SAME subject DN as the cert delivered to + trusted by guests.
+        //
+        // Rebuilding params from hardcoded constants instead silently broke TLS
+        // validation once a *deployed* CA's DN diverged from the constant (the
+        // `Engram`→`Engrams` rename: the secret's CN became `Engrams Egress Proxy
+        // CA` with no Organization, while the constant stayed `CN=Engram, O=Engram`).
+        // X.509 path-building matches a leaf's ISSUER DN to the trusted CA's SUBJECT
+        // DN — a matching public key is necessary but NOT sufficient — so leaves
+        // signed under the constant DN failed `unable to get local issuer certificate`
+        // against the delivered cert. (rcgen 0.13.2 *does* support this round-trip
+        // via `from_ca_cert_pem`; the old "no round-trip" note was stale.)
+        let params = CertificateParams::from_ca_cert_pem(cert_pem)
+            .map_err(|e| CaError::Rcgen(format!("parse ca cert params: {e}")))?;
         Ok(Self {
             key_pair,
             params,
@@ -329,6 +340,36 @@ mod tests {
         // KeyPair doesn't expose equality, but `serialize_pem`
         // round-trips deterministically.
         assert_eq!(from_env.key_pair.serialize_pem(), key_pem);
+    }
+
+    #[test]
+    fn from_pem_signs_with_the_loaded_cert_dn_not_the_constants() {
+        // A deployed CA whose DN differs from build_params()'s constants — mimics
+        // the `Engram`→`Engrams` secret rename (CN only, no Organization). The
+        // issuer we re-self-sign to mint leaves must carry THIS DN, so leaves
+        // validate against the delivered cert — NOT the hardcoded constant DN.
+        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.distinguished_name = {
+            let mut dn = DistinguishedName::new();
+            dn.push(DnType::CommonName, "Engrams Egress Proxy CA");
+            dn
+        };
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let kp = KeyPair::generate().unwrap();
+        let cert_pem = p.self_signed(&kp).unwrap().pem();
+        let key_pem = kp.serialize_pem();
+
+        let ca = Ca::from_pem(&cert_pem, &key_pem).unwrap();
+        let loaded = CertificateParams::from_ca_cert_pem(&cert_pem).unwrap();
+        assert_eq!(
+            ca.params.distinguished_name, loaded.distinguished_name,
+            "issuer DN must come from the loaded cert, not the constants"
+        );
+        assert_ne!(
+            ca.params.distinguished_name,
+            build_params().distinguished_name,
+            "regression guard: issuer DN must NOT be the hardcoded constants"
+        );
     }
 
     #[test]
