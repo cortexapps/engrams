@@ -30,6 +30,13 @@ pub fn request_line(prefix: &[u8]) -> Option<(String, String)> {
 /// inserting right after the first CRLF is always valid and leaves
 /// `Content-Length` / the body untouched. Entries are assumed already
 /// gated by the caller (their `RequestPolicy` allowed this request).
+///
+/// ADR 0056 P3 (overwrite semantics): any existing request header whose name
+/// matches one we're about to inject is **stripped first**, so the brokered
+/// credential always wins — no duplicate `Authorization`, and a guest-supplied
+/// header can't shadow the injected one. This matters now that a mint provider's
+/// token rides this plane (P1) and the guest may issue authenticated API calls
+/// itself (e.g. `gh` / curl with its own header).
 pub fn inject_headers(prefix: Vec<u8>, entries: &[&InjectEntry]) -> Vec<u8> {
     if entries.is_empty() {
         return prefix;
@@ -38,6 +45,9 @@ pub fn inject_headers(prefix: Vec<u8>, entries: &[&InjectEntry]) -> Vec<u8> {
         return prefix; // no request line (defensive) — leave unchanged
     };
     let insert_at = end + 2; // just past the CRLF terminating the request line
+                             // Drop any existing header line whose name we're about to inject. The request
+                             // line is untouched, so `insert_at` is stable across the strip.
+    let prefix = strip_named_headers(&prefix, insert_at, entries);
     let mut out = Vec::with_capacity(prefix.len() + 96 * entries.len());
     out.extend_from_slice(&prefix[..insert_at]);
     for e in entries {
@@ -47,6 +57,41 @@ pub fn inject_headers(prefix: Vec<u8>, entries: &[&InjectEntry]) -> Vec<u8> {
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(&prefix[insert_at..]);
+    out
+}
+
+/// Rebuild the request with any header line whose name (case-insensitively)
+/// matches an inject entry removed. Walks the header block line-by-line from
+/// `insert_at` and copies the empty line + body verbatim. Defensive on a
+/// malformed/partial prefix: copies the remainder unchanged.
+fn strip_named_headers(prefix: &[u8], insert_at: usize, entries: &[&InjectEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len());
+    out.extend_from_slice(&prefix[..insert_at]);
+    let mut i = insert_at;
+    loop {
+        let Some(rel) = prefix[i..].windows(2).position(|w| w == b"\r\n") else {
+            out.extend_from_slice(&prefix[i..]); // no CRLF left — copy verbatim
+            break;
+        };
+        let line_end = i + rel; // index of the `\r`
+        let line = &prefix[i..line_end];
+        if line.is_empty() {
+            // Empty line = end of headers; copy it and the body verbatim.
+            out.extend_from_slice(&prefix[i..]);
+            break;
+        }
+        let name = match line.iter().position(|&b| b == b':') {
+            Some(c) => &line[..c],
+            None => line, // headerless line (shouldn't happen) — keep it
+        };
+        let drop = entries
+            .iter()
+            .any(|e| e.header_name.as_bytes().eq_ignore_ascii_case(name));
+        if !drop {
+            out.extend_from_slice(&prefix[i..line_end + 2]); // keep, incl. CRLF
+        }
+        i = line_end + 2;
+    }
     out
 }
 
@@ -91,6 +136,24 @@ mod tests {
         assert!(s.starts_with("POST /q HTTP/1.1\r\nDD-API-KEY: dd-secret\r\nHost:"));
         // Body + Content-Length untouched.
         assert!(s.ends_with("\r\n\r\n{}"));
+    }
+
+    #[test]
+    fn overwrites_an_existing_same_name_header() {
+        // ADR 0056 P3: a guest-supplied (lowercase) Authorization is stripped;
+        // the brokered one wins — exactly one Authorization, no duplicate.
+        let req = b"GET /repos/x HTTP/1.1\r\nHost: api.github.com\r\n\
+                    authorization: Bearer guest\r\nAccept: */*\r\n\r\n"
+            .to_vec();
+        let e = entry("Authorization", "Bearer {}", "brokered");
+        let out = inject_headers(req, &[&e]);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert_eq!(s.to_ascii_lowercase().matches("authorization:").count(), 1);
+        assert!(s.contains("Authorization: Bearer brokered"));
+        assert!(!s.contains("Bearer guest"));
+        // Untouched headers survive.
+        assert!(s.contains("Host: api.github.com"));
+        assert!(s.contains("Accept: */*"));
     }
 
     #[test]
