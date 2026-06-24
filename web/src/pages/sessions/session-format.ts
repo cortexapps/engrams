@@ -37,15 +37,15 @@ export function lifecycleOf(s: SessionState): Lifecycle {
   return "ARCHIVED";
 }
 
-// Display order for the workspace list AND the rail: running first, then
-// resumable, then archived; ties broken by most-recently-active. Both surfaces
-// share this so the list reads as the full version of the rail.
-const LIFECYCLE_ORDER: Lifecycle[] = ["ACTIVE", "IDLE — RESUMABLE", "ARCHIVED"];
-type Sortable = { status: SessionState; last_active_at: string };
+// Display order for the workspace list AND the rail: most-recently-active first,
+// status-agnostic — a "Recent" list reads newest → oldest, the least surprising
+// default. Running sessions keep bumping last_active_at as they work, so in-flight
+// work naturally floats to the top without a separate status pin; idle/archived
+// rows sink as their activity recedes. Array.prototype.sort is stable, so rows
+// sharing a timestamp keep their source order (no jitter under the 1s poll). Both
+// surfaces share this comparator, so the list reads as the full version of the rail.
+type Sortable = { last_active_at: string };
 export function compareSessions(a: Sortable, b: Sortable): number {
-  const la = LIFECYCLE_ORDER.indexOf(lifecycleOf(a.status));
-  const lb = LIFECYCLE_ORDER.indexOf(lifecycleOf(b.status));
-  if (la !== lb) return la - lb;
   return new Date(b.last_active_at).getTime() - new Date(a.last_active_at).getTime();
 }
 

@@ -11,7 +11,8 @@
  * the rest of the app does.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useWindowHeight } from "@react-hook/window-size";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { useMutation, createConnectQueryKey } from "@connectrpc/connect-query";
@@ -179,6 +180,26 @@ export function StartScreen() {
     composerRef.current?.focus();
   }, [focusNonce]);
 
+  // Vertically center the whole section on the page — computed in JS against the
+  // viewport, not flex `justify-center`, so a growing composer extends DOWNWARD
+  // from a fixed top instead of dragging the section up the page. Recomputes on
+  // mount, on viewport-height change (useWindowHeight), and when the data-driven
+  // resting height changes (profiles / recent) — but NEVER on a keystroke.
+  // offsetHeight excludes the margin we set, so the measurement isn't circular;
+  // clamp at 0 so a section taller than the viewport just top-anchors and scrolls.
+  // wait: 1 — all but eliminate the hook's 100ms debounce so the section
+  // re-centers in lockstep with a drag-resize instead of lagging behind it.
+  const windowHeight = useWindowHeight({ wait: 1 });
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sectionRef = useRef<HTMLDivElement>(null);
+  const [topPad, setTopPad] = useState(0);
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    const section = sectionRef.current;
+    if (!scroll || !section) return;
+    setTopPad(Math.max(0, (scroll.clientHeight - section.offsetHeight) / 2));
+  }, [windowHeight, profilesPending, profiles.length, recent.length]);
+
   const onComposerKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
@@ -202,12 +223,13 @@ export function StartScreen() {
   const noProfiles = !profilesPending && !profilesError && profiles.length === 0;
 
   return (
-    <div className="flex-1 overflow-auto">
-      <div className="mx-auto flex min-h-full w-full max-w-2xl flex-col px-4">
-        {/* The composer floats in the vertical center of the space above the
-            recent list (which sits at the foot); on a short viewport the column
-            outgrows it and scrolls instead of clipping. */}
-        <div className="flex flex-1 flex-col justify-center gap-5 py-10">
+    <div ref={scrollRef} className="flex-1 overflow-auto">
+      <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col px-4 pb-12">
+        {/* topPad vertically centers the section at the initial paint / on resize
+            (see the useWindowHeight effect). It's a fixed margin, not flex
+            centering, so a growing composer extends DOWNWARD from here instead of
+            re-centering and dragging the heading up the page. */}
+        <div ref={sectionRef} style={{ marginTop: topPad }} className="flex flex-col gap-5">
           <Text as="h1" variant="display" className="text-balance">
             Start a task
           </Text>
@@ -239,7 +261,7 @@ export function StartScreen() {
               rows={3}
               aria-label="Task"
               placeholder="Fix the flaky billing-gateway integration test and open a PR."
-              className="max-h-64 min-h-[5.25rem] resize-none border-0 bg-transparent px-4 pt-3.5 pb-1 text-[0.95rem] leading-relaxed shadow-none focus-visible:ring-0 md:text-[0.95rem] dark:bg-transparent"
+              className="max-h-[calc(10lh+1.125rem)] min-h-[5.25rem] resize-none overflow-y-auto border-0 bg-transparent px-4 pt-3.5 pb-1 text-[0.95rem] leading-relaxed shadow-none focus-visible:ring-0 md:text-[0.95rem] dark:bg-transparent"
             />
             <div className="flex items-center gap-2 px-2.5 pt-1 pb-2.5">
               <ProfileSwitcher

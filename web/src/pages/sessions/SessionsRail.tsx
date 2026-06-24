@@ -48,7 +48,10 @@ export function SessionsRail() {
 
   return (
     <>
-      <SidebarHeader className="gap-2 px-3 pt-3">
+      {/* px-2 matches the standard p-2 inset of the content group + footer, so
+          the New task row, the recent rows, and the footer links are all the
+          same width; pt-3 only adds a little breathing room at the rail top. */}
+      <SidebarHeader className="gap-2 px-2 pt-3">
         {/* "New task" is now a destination, not a dialog: it leads to the start
             screen (the canonical create surface). Lighter than the old lime CTA
             — the composer there is the real "go" — but it still reads as the

@@ -47,10 +47,10 @@ const fromSession = (s: Session): RailRow => ({
   profile: null,
 });
 
-// Stable order so the 1s refetch never reorders rows under the cursor: by
-// lifecycle bucket (active → idle → archived), then most-recently-active. The
-// full sessions list (SessionsList) shares this exact comparator, so the rail
-// reads as a capped preview of the same order.
+// Most-recently-active first (status-agnostic); the stable sort keeps rows that
+// share a timestamp from jittering under the 1s refetch. The full sessions list
+// (SessionsList) shares this exact comparator, so the rail reads as a capped
+// preview of the same order.
 function sortForRail(rows: SessionListItem[]): SessionListItem[] {
   return [...rows].sort(compareSessions);
 }
