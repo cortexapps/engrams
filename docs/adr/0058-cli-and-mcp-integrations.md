@@ -7,9 +7,10 @@ real credential host-side. The multi-credential connector UI (#418), an honest T
 probe (#419), and the granted-power-opens-egress fix (#420) followed. **P2–P4 deferred** — see
 [Phasing](#phasing-each-phase--one-pr-on-its-own-worktree-linear-stack) and the **P3/P4 pickup
 notes** below, which pin the details a cold pickup would otherwise have to re-derive. The
-**uploaded-binary arm** (`binSource:"uploaded"` — custom-connector tooling parity) is now in
-flight; its design is the [Uploaded CLI binaries](#uploaded-cli-binaries--the-binsource-uploaded-arm-custom-connector-parity)
-section below.
+**uploaded-binary arm** (`binSource:"uploaded"` — custom-connector tooling parity) is also
+**shipped + prod-validated** (UB1–UB4: #422 / #423 / #424; a real uploaded static binary ran
+on PATH in a prod FC session) — see the [Uploaded CLI binaries](#uploaded-cli-binaries--the-binsource-uploaded-arm-custom-connector-parity)
+section below. Still **deferred:** P2 (`in-guest-token` + SigV4) and P3/P4 (MCP).
 
 Builds on **ADR 0057** (profiles as the unified session-policy object + the runtime-managed
 connector catalog), **ADR 0056** (generic integrations — the interceptor gate/inject/observe
@@ -363,6 +364,35 @@ Phasing (its own linear stack, peer of the P-series above):
   inline binary-upload affordance.
 - **UB4 — prod e2e + Accepted-for-uploaded**: upload a real CLI, author a custom connector, run
   it against a live API in a prod FC session (mirroring the `gh`/`pup` proofs).
+
+**What landed (UB1–UB4 — shipped + prod-validated).** The whole arm is on main and proven in a
+real Firecracker session:
+
+- **UB1** (#422) — `RegisterSkillRequest.bins`; `pack_skill` validates each declared bin is a
+  regular file in the archive (rejects ghosts + traversal), chmods it 0755, folds it into the
+  generated `mount.json` as `skills/<name>/<bin>`; caps raised to 64 MiB / 256 MiB with the
+  `MountCatalogService` decode cap → 80 MiB. Zero host/Firecracker/guest change — the only gap
+  was that the pack-time manifest hardcoded empty `bins`.
+- **UB2** (#423) — `parseCli` accepts `binSource:"uploaded"` + a `cli.bundle` reference;
+  `compileCliIntegrations` routes the catalog bundle into `selected_skills` (alongside the shared
+  integrations bundle, now mounted for any enabled CLI so the discovery helper is present).
+- **UB3** (#424) — `CustomConnectorModal` gains the CLI section + an inline binary-upload flow;
+  `connectorModel.ts` parses the `cli` facet. UX note: the upload takes a prepared tar/zip
+  carrying `bin/<tool>` + a top-level SKILL.md; a client-side tar-wrapper for a raw binary is a
+  documented follow-up.
+- **UB4 — prod e2e (passed).** Uploaded a real 2.3 MB static binary (a renamed `jq`) via the
+  catalog `RegisterSkill(bins)`, selected it on a `demo-claude` session, exec'd it: it landed on
+  PATH at `/usr/local/bin/e2e-cli → /opt/engram/dyn/0/skills/e2e-uploaded-cli/bin/e2e-cli` (the
+  patch_drive'd slot — proving it's the upload; there is no base-image `jq`), executed
+  (`jq-1.7.1`), and ran a real filter. Validates the full chain — `pack_skill` (bins manifest) →
+  content-address → pin set → host materialize → `resolve_selected_skills` → patch_drive →
+  `activate()` PATH symlink → execute — in real Firecracker. The driven e2e hit the coord surface
+  directly (`selected_skills` = exactly what UB2's compile emits); UB2's compile + UB3's authoring
+  are unit-tested.
+
+**Commit chain:** UB1 #422 · UB2 #423 · UB3 #424. CI-integrity follow-on surfaced by this work:
+#425 folded the former macOS workflow into `ci.yml` and made the e2e stack actually gate
+(quarantining the #403 flake) — the `CI Gate` had silently not been blocking on e2e.
 
 ## Consequences and risks
 
