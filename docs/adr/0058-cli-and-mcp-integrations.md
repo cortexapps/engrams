@@ -81,18 +81,28 @@ secondary, opt-in path** — for integrations that are MCP-only or materially be
   skills: `create-pull-request`'s bespoke wrapper + skill and `share-file` collapse into
   CLIs-in-the-bundle + lines in the one discovery doc. `gh` reuses the GitHub installation
   token already minted for git, retiring the bespoke `engram-pr` flow.
-- **Per-session discovery filtering.** The bundle is a fixed superset, but the agent must be
-  told only about CLIs whose integration is actually authenticated. The static `SKILL.md`
-  inside the content-addressed squashfs can't be per-session, so the **render is the seam**:
-  agentd writes a generated fragment into the discovery path from `session_env` (which
-  integrations are on), plus a small `engrams integrations` helper that lists what's wired.
+- **Per-session discovery filtering reuses the `requires_env` gate — no per-session render,
+  no message.** This is exactly how `create-pull-request` already works: its `mount.json`
+  entry is `{ name, requires_env: "ENGRAM_FORGE_TOKEN" }`, and `activate()` wires it only when
+  that env var is present. The CLI bundle does the same — each CLI's wiring gates on its
+  integration's `dummyEnv` var (`gh` on `GH_TOKEN`, `datadog-ci` on `DD_API_KEY`), so the
+  agent sees only the enabled CLIs. The static discovery `SKILL.md` points at a small
+  `engrams integrations` helper that reads the enabled-CLI catalog (provider/doc/bins) from
+  **one env var** the orchestrator sets — so custom-connector docs surface too, still purely
+  via `session_env`. Everything rides the two channels that already flow on `CreateSession`
+  (`selected_skills` + `env_vars`); there is **no `CreateSessionRequest` change**.
 
 ### 2. The credential-delivery model is an open strategy, not a boolean
 
 Model "how the real credential reaches the upstream request" as a **typed, open strategy on
-the connector** (mirrored in `registry.ts` and `engram-core`), with the host-side egress
-pipeline **dispatching on it**. P1 implements one arm; the seam admits the rest without
-touching call sites. This is the explicit "don't close the SigV4 door" requirement.
+the connector** (in `registry.ts`). This is the explicit "don't close the SigV4 door"
+requirement — but the door is held open *at the contract*, not by plumbing a dead enum
+through Rust. **P1's `inject` arm needs no host or coordinator change**: the egress proxy
+already injects credentials generically (static org secrets *and* per-session minted tokens,
+via the `mint_provider` path), so `inject` is purely an orchestrator-side compile decision
+(emit the `dummyEnv` + select the bundle). A future non-inject arm (`in-guest-token`,
+`request-signing`) is where real host work — and a host-side dispatch site — lands; until
+then the strategy stays where the decision is made.
 
 - **`inject`** *(P1, no proxy-logic change)* — host-side header overwrite. The CLI carries a
   **fixed dummy** (`GH_TOKEN=x-engrams-managed`, or a stub config file agentd writes like
@@ -161,13 +171,16 @@ documented fallback if a single bundle ever grows unwieldy.
 
 ## Phasing (each phase = one PR on its own worktree; linear stack)
 
-- **P1 — CLI bundle + discovery skill + dummy-cred `inject` + the strategy seam.**
-  `deploy/bundles/` integrations CLI recipe; `cli` facet on the connector model (built-in +
-  custom, validated by `parseConnector`); the open `credentialDelivery` strategy with **only**
-  the `inject` arm wired through orchestrator → coordinator → host dispatch; `dummyEnv` →
-  session env; per-session discovery-skill render + `engrams integrations` helper; migrate
-  `create-pull-request`/`share-file` into the bundle (`gh` on the existing GitHub mint token).
-  Validate the inject-overwrite path end-to-end on dev-vm FC. **No proxy-logic change.**
+- **P1 — CLI bundle + discovery skill + dummy-cred `inject`.**
+  `deploy/bundles/integrations-cli` recipe (binaries + a discovery `SKILL.md` + an `engrams
+  integrations` helper + `mount.json`); `cli` facet on the connector model (built-in + custom,
+  validated by `parseConnector`); the open `credentialDelivery` strategy as an orchestrator
+  compile concept (`inject` only; others parse-rejected). `compileCliIntegrations` →
+  `tasks.ts` unions the bundle into `selected_skills` and merges `dummyEnv` into `env_vars`;
+  the enabled-CLI catalog rides one more env var. Migrate `create-pull-request`/`share-file`
+  into the bundle (`gh` on the existing GitHub mint token). **No `CreateSessionRequest` /
+  coordinator / proxy change** — it rides the same mount + env-gate path `create-pull-request`
+  uses. Validate the inject-overwrite path end-to-end on dev-vm FC.
 - **P2 — `in-guest-token` + the SigV4 door.** Generalize the broker/askpass seam to
   mint+materialize a short-lived credential in-guest for the `in-guest-token` strategy. Land
   the `request-signing`/`sigv4` strategy *shape* (variant + dispatch arm) even if a concrete
@@ -179,8 +192,10 @@ documented fallback if a single bundle ever grows unwieldy.
 
 ## Consequences and risks
 
-- **No proxy-logic change in P1**: the inject-overwrite path already ships; P1's only host
-  change is the dispatch enum (one arm). Lower blast radius than the framing suggests.
+- **No host/coordinator/proxy change in P1**: the inject-overwrite path already ships and
+  already covers both static + minted credentials; CLIs ride the same mount + `requires_env`
+  gate `create-pull-request` uses. P1 is an orchestrator + bundle + docs change. Much lower
+  blast radius than the original framing suggested.
 - **CLI bundle re-bake**: the integrations bundle is a new `deploy/bundles/` recipe staged
   into the FC-host image — a host-image roll, like adding any bundle (ADR 0035/0055).
 - **`parseConnector` gains surface**: `cli`/`mcp` facets can open egress + inject org secrets
