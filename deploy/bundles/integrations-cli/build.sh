@@ -97,6 +97,11 @@ build_tree() {
     # bundles.
     cp "$here/bin/engrams-integrations" "$dest/bin/engrams-integrations"
     chmod 0755 "$dest/bin/engrams-integrations"
+    # The Slack CLI is a committed POSIX-sh + curl wrapper (no fetched binary):
+    # auth is brokered, so it just calls the Slack Web API and the proxy injects
+    # the bot token host-side.
+    cp "$here/bin/slack" "$dest/bin/slack"
+    chmod 0755 "$dest/bin/slack"
     mkdir -p "$dest/skills"
     cp -R "$here/skills/." "$dest/skills/"
 }
