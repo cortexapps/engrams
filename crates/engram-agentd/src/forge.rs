@@ -2,12 +2,16 @@
 //!
 //! Invoked as a subcommand of the baked `engram-agentd` binary — the
 //! dogfood image's `GIT_ASKPASS` helper runs `engram-agentd
-//! forge-credential`, and `engram-pr` runs `engram-agentd
-//! forge-pull-request`. We dial the host on `FORGE_VSOCK_PORT`, send a
+//! forge-credential`. We dial the host on `FORGE_VSOCK_PORT`, send a
 //! [`ForgeRequest`] authenticated by the per-session broker token
 //! (`ENGRAM_FORGE_TOKEN`), read one [`ForgeResponse`], and print the
 //! result. The real credential never persists in the guest — it's
 //! fetched fresh per git op, so token expiry is invisible here.
+//!
+//! ADR 0056 P3 retired the `engram-pr` / `forge-pull-request` op: PRs open
+//! over the egress inject+observe plane (`gh pr create`) now, so the only
+//! op left here is the git-clone/push credential the interceptor can't
+//! deliver.
 
 use std::process::ExitCode;
 
@@ -16,10 +20,9 @@ use engram_harness_proto::{
     read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse, FORGE_VSOCK_PORT,
 };
 
-/// Entry from `main`: `sub` is `forge-credential` or
-/// `forge-pull-request`; `rest` is the remaining argv. Builds a small
-/// runtime and runs one request. On success prints the result to stdout
-/// (the password for a credential; the PR URL for a change request).
+/// Entry from `main`: `sub` is `forge-credential`; `rest` is the
+/// remaining argv. Builds a small runtime and runs one request. On
+/// success prints the git credential password to stdout.
 pub fn run(sub: &str, rest: Vec<String>) -> ExitCode {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -52,14 +55,6 @@ async fn run_inner(sub: &str, rest: &[String]) -> Result<String, String> {
             host: flag(rest, "--host").unwrap_or_else(|| "github.com".to_string()),
             owner: flag(rest, "--owner").or_else(|| non_empty_env("ENGRAM_FORGE_OWNER")),
         },
-        "forge-pull-request" => ForgeOp::CreatePullRequest {
-            repo: req_flag(rest, "--repo")?,
-            head_branch: req_flag(rest, "--head")?,
-            base_branch: flag(rest, "--base").unwrap_or_else(|| "main".to_string()),
-            title: req_flag(rest, "--title")?,
-            body: flag(rest, "--body").unwrap_or_default(),
-            draft: rest.iter().any(|a| a == "--draft"),
-        },
         other => return Err(format!("unknown forge subcommand: {other}")),
     };
 
@@ -83,7 +78,6 @@ async fn run_inner(sub: &str, rest: &[String]) -> Result<String, String> {
         // GIT_ASKPASS prints the password; the username comes from git
         // config (`credential.<host>.username = x-access-token`).
         ForgeResponse::Credential { password, .. } => Ok(password),
-        ForgeResponse::PullRequest { url, .. } => Ok(format!("{url}\n")),
         ForgeResponse::Error { message } => Err(message),
     }
 }
@@ -107,24 +101,18 @@ fn flag(argv: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
-fn req_flag(argv: &[String], name: &str) -> Result<String, String> {
-    flag(argv, name).ok_or_else(|| format!("missing required flag {name}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn flag_parses_value_and_presence() {
-        let argv: Vec<String> = ["--repo", "o/n", "--draft"]
+        let argv: Vec<String> = ["--host", "github.com", "--owner", "cortexapps"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(flag(&argv, "--repo").as_deref(), Some("o/n"));
+        assert_eq!(flag(&argv, "--host").as_deref(), Some("github.com"));
+        assert_eq!(flag(&argv, "--owner").as_deref(), Some("cortexapps"));
         assert!(flag(&argv, "--missing").is_none());
-        assert!(argv.iter().any(|a| a == "--draft"));
-        assert!(req_flag(&argv, "--repo").is_ok());
-        assert!(req_flag(&argv, "--title").is_err());
     }
 }

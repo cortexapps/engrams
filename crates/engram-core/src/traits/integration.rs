@@ -3,21 +3,23 @@
 //!
 //! An [`Integration`] is a *platform-side* authority living in the coordinator.
 //! It holds the long-lived provider credential (e.g. a GitHub App private key)
-//! and exposes the two irreducible per-provider operations that can't be pure
+//! and exposes the irreducible per-provider operation that can't be pure
 //! connector config (ADR 0056 §6):
 //!
-//! 1. [`Integration::mint_credential`] — credential source = **mint** (Plane A):
-//!    mint a short-lived credential scoped to EXACTLY the session's bound
-//!    capabilities. Inject-source providers don't mint (they are connector
-//!    config); the default errors `Unsupported`.
-//! 2. [`Integration::perform_action`] — the **hybrid mediated** action seam
-//!    (§4): a server-performed effect for the rare pre-effect cases (opening a
-//!    PR). Most side effects are *observed* at the interceptor instead; the
-//!    default errors `Unsupported`.
+//! - [`Integration::mint_credential`] — credential source = **mint** (Plane A):
+//!   mint a short-lived credential scoped to EXACTLY the session's bound
+//!   capabilities. Inject-source providers don't mint (they are connector
+//!   config); the default errors `Unsupported`.
+//!
+//! Plus two thin per-provider declarations the egress + forge seams key off:
+//! [`Integration::inject_header`] (how a minted credential becomes a request
+//! header) and [`Integration::git_forge_host`] (the git remote host, if any).
 //!
 //! Gating, credential injection, and asset observation all live in the egress
 //! interceptor + connector config — NOT here. This trait is only the bespoke,
-//! security-critical residue.
+//! security-critical residue. (ADR 0056 P3 retired the `perform_action`
+//! mediated-effect seam: PR-open is an egress-observed side effect now, not a
+//! server-performed one.)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,18 +86,6 @@ pub trait Integration: Send + Sync {
         _caps: &[Capability],
         _hint: &CredentialHint,
     ) -> Result<ScopedCredential, IntegrationError> {
-        Err(IntegrationError::Unsupported)
-    }
-
-    /// Hybrid mediated action (§4): a server-performed effect (e.g. open a PR).
-    /// `args`/reply are JSON; the coordinator emits any resulting
-    /// `IntegrationAsset` from the reply. Most actions are observed at the
-    /// interceptor, not mediated here — default `Unsupported`.
-    async fn perform_action(
-        &self,
-        _cap: &Capability,
-        _args: &serde_json::Value,
-    ) -> Result<serde_json::Value, IntegrationError> {
         Err(IntegrationError::Unsupported)
     }
 

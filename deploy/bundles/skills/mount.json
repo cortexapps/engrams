@@ -4,7 +4,6 @@
     { "name": "share-file", "bins": ["bin/engram-share"] },
     {
       "name": "create-pull-request",
-      "bins": ["bin/engram-pr"],
       "requires_env": "ENGRAM_FORGE_TOKEN"
     }
   ],

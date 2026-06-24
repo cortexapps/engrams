@@ -642,42 +642,6 @@ async fn forge_git_credential_gated_by_broker_token() {
 }
 
 #[tokio::test]
-async fn forge_create_pull_request_opens_and_records() {
-    let (app, sid, forge) = build_forge_app().await;
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(format!("/api/v1/sessions/{sid}/pull-request"))
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer broker-tok-123")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "repo": "cortexapps/engrams",
-                        "head_branch": "feat/x",
-                        "base_branch": "main",
-                        "title": "Add x",
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp.into_body()).await;
-    assert!(
-        v["url"].as_str().unwrap().contains("cortexapps/engrams"),
-        "unexpected PR url: {v:?}"
-    );
-
-    let recorded = forge.recorded_pull_requests();
-    assert_eq!(recorded.len(), 1, "forge should have recorded one PR");
-    assert_eq!(recorded[0]["repo"], "cortexapps/engrams");
-    assert_eq!(recorded[0]["title"], "Add x");
-}
-
-#[tokio::test]
 async fn forge_forward_runs_the_core_for_split_hosts() {
     // ADR 0023 split-mode forwarding: an FC host can't run the forge sink
     // locally, so it POSTs the in-guest ForgeRequest (with its broker

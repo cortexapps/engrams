@@ -31,28 +31,6 @@ const GITHUB_API: &str = "https://api.github.com";
 const GITHUB_HOST: &str = "github.com";
 const API_VERSION: &str = "2022-11-28";
 
-/// A repository identified by `owner/name`. Internal to this provider now
-/// (ADR 0056 Phase 5b retired the cross-crate `RepoRef`).
-struct RepoRef {
-    owner: String,
-    name: String,
-}
-
-impl RepoRef {
-    fn parse(slug: &str) -> Result<Self, IntegrationError> {
-        let mut parts = slug.split('/');
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty() => Ok(Self {
-                owner: owner.to_string(),
-                name: name.to_string(),
-            }),
-            _ => Err(IntegrationError::InvalidSpec(format!(
-                "repo must be `owner/name`, got `{slug}`"
-            ))),
-        }
-    }
-}
-
 /// ADR 0056 (Plane A): compute the GitHub App `permissions` object from the
 /// session's bound `github:` capabilities. A capability action is
 /// `<resource>:<level>` (e.g. `contents:write`, `pulls:write`); the App
@@ -388,78 +366,6 @@ impl Integration for GitHubApp {
     /// askpass credential-helper seam (ADR 0056 P2). De-hardcodes the forge wiring.
     fn git_forge_host(&self) -> Option<String> {
         Some(GITHUB_HOST.to_string())
-    }
-
-    /// The one mediated action today: open a pull request (`pulls:write`).
-    /// `args` = `{repo, head_branch, base_branch, title, body, draft}`; the
-    /// reply carries `{url, id, number, state}` the coordinator emits as an
-    /// `IntegrationAsset`.
-    async fn perform_action(
-        &self,
-        cap: &Capability,
-        args: &serde_json::Value,
-    ) -> Result<serde_json::Value, IntegrationError> {
-        if cap.action != "pulls:write" {
-            return Err(IntegrationError::Unsupported);
-        }
-        #[derive(Deserialize)]
-        struct PrArgs {
-            repo: String,
-            head_branch: String,
-            base_branch: String,
-            #[serde(default)]
-            title: String,
-            #[serde(default)]
-            body: String,
-            #[serde(default)]
-            draft: bool,
-        }
-        let a: PrArgs = serde_json::from_value(args.clone())
-            .map_err(|e| IntegrationError::InvalidSpec(format!("pull request args: {e}")))?;
-        let repo = RepoRef::parse(&a.repo)?;
-        // PR creation uses the provider default scopes (empty caps) — the same
-        // scopes the forge minted before ADR 0056's capability scoping.
-        let cred = self.mint_basic(&[], Some(&repo.owner)).await?;
-        let ScopedCredential::Basic { password, .. } = &cred else {
-            return Err(IntegrationError::Protocol(
-                "github mint returned a non-basic credential".into(),
-            ));
-        };
-        let url = format!("{}/repos/{}/{}/pulls", self.base_url, repo.owner, repo.name);
-        let body = serde_json::json!({
-            "title": a.title,
-            "head": a.head_branch,
-            "base": a.base_branch,
-            "body": a.body,
-            "draft": a.draft,
-        });
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(password)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| IntegrationError::Backend(Box::new(e)))?;
-        let resp = ensure_ok(resp, "create pull request").await?;
-        #[derive(Deserialize)]
-        struct PrResp {
-            html_url: String,
-            number: u64,
-            state: String,
-        }
-        let pr: PrResp = resp
-            .json()
-            .await
-            .map_err(|e| IntegrationError::Protocol(format!("pull request json: {e}")))?;
-        Ok(serde_json::json!({
-            "url": pr.html_url,
-            "id": pr.number,
-            "number": pr.number,
-            "state": pr.state,
-        }))
     }
 }
 

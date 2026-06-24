@@ -344,7 +344,6 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
     // fleet-wide `skills` RO bundle, activated per-session by agentd (see
     // `engram-session-bundles`). The rootfs must be clean of all of it.
     assert!(!outcome.rootfs_path.join("opt/engram/git-askpass").exists());
-    assert!(!outcome.rootfs_path.join("usr/local/bin/engram-pr").exists());
     assert!(
         !outcome
             .rootfs_path
@@ -365,10 +364,10 @@ async fn build_runs_orchestration_and_writes_manifest_plus_rootfs() {
 #[tokio::test]
 async fn build_does_not_bake_forge_glue_for_git_images() {
     // ADR 0027: a `[git]` binding no longer makes the baker plant forge
-    // glue (askpass / engram-pr / gitconfig / create-pull-request skill).
-    // The skills bundle carries the wrappers + SKILL.md; agentd writes
-    // /etc/gitconfig and symlinks the create-pull-request skill per-session
-    // when a forge token is present. The baked rootfs stays clean.
+    // glue (askpass / gitconfig / create-pull-request skill). The skills
+    // bundle carries the wrappers + SKILL.md; agentd writes /etc/gitconfig
+    // and symlinks the create-pull-request skill per-session when a forge
+    // token is present. The baked rootfs stays clean.
     let src = tempfile::tempdir().unwrap();
     let images = tempfile::tempdir().unwrap();
     write_source_repo(
@@ -388,10 +387,6 @@ async fn build_does_not_bake_forge_glue_for_git_images() {
     assert!(
         !rootfs.join("opt/engram/git-askpass").exists(),
         "ADR 0027: git-askpass must NOT be baked"
-    );
-    assert!(
-        !rootfs.join("usr/local/bin/engram-pr").exists(),
-        "ADR 0027: engram-pr must NOT be baked"
     );
     assert!(
         !rootfs.join("etc/gitconfig").exists(),

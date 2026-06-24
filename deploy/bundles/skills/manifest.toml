@@ -12,4 +12,4 @@
 # agentd-written `/etc/gitconfig` references (by its resolved slot path). The
 # guest mount path is dynamic, not fixed here.
 name = "skills"
-description = "Built-in skill helpers: engram-share / engram-pr / git-askpass + SKILL.md."
+description = "Built-in skill helpers: engram-share / git-askpass + SKILL.md."

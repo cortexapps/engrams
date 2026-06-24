@@ -528,11 +528,15 @@ pub struct CheckpointAck {
 // ---- Forge bridge (ADR 0023) -------------------------------------------
 //
 // A *separate* guest→host channel from the harness one above: the
-// in-guest `GIT_ASKPASS` / `engram-pr` helpers dial the host on
-// `FORGE_VSOCK_PORT`, send one [`ForgeRequest`], read one
-// [`ForgeResponse`], and close. The host validates the per-session
-// broker token, forwards to the coordinator's `GitForge`, and replies.
-// Same 4-byte-length + bincode framing (`read_msg`/`write_msg`).
+// in-guest `GIT_ASKPASS` helper dials the host on `FORGE_VSOCK_PORT`,
+// sends one [`ForgeRequest`], reads one [`ForgeResponse`], and closes.
+// The host validates the per-session broker token, mints a fresh git
+// credential via the provider [`Integration`], and replies. Same
+// 4-byte-length + bincode framing (`read_msg`/`write_msg`).
+//
+// ADR 0056 P3 folded API access + PR-open onto the egress inject+observe
+// plane, so this bridge now carries ONLY the git-clone/push credential
+// (the one delivery the interceptor can't header-inject).
 
 /// Vsock port the in-guest forge helper dials (guest→host). Distinct
 /// from the harness channel (1026), agentd exec (1024), and agentd
@@ -549,23 +553,14 @@ pub struct ForgeRequest {
     pub op: ForgeOp,
 }
 
-/// The forge operation requested. Mirrors the coord's HTTP forge
-/// endpoints so the vsock bridge and the loopback path share semantics.
+/// The forge operation requested. An enum for extensibility — ADR 0056 P3
+/// retired the PR-open op (PRs open via the egress inject+observe plane now),
+/// leaving the one credential op the interceptor can't deliver.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ForgeOp {
     /// Mint a fresh git credential for `host` (optionally scoping the
     /// installation to `owner`). The reply is [`ForgeResponse::Credential`].
     FetchCredential { host: String, owner: Option<String> },
-    /// Open a change request (PR/MR). The reply is
-    /// [`ForgeResponse::PullRequest`].
-    CreatePullRequest {
-        repo: String,
-        head_branch: String,
-        base_branch: String,
-        title: String,
-        body: String,
-        draft: bool,
-    },
 }
 
 /// The host's reply to a [`ForgeRequest`].
@@ -574,11 +569,6 @@ pub enum ForgeResponse {
     Credential {
         username: String,
         password: String,
-    },
-    PullRequest {
-        url: String,
-        id: u64,
-        state: String,
     },
     /// Auth failure, unknown session, no forge configured, or a
     /// provider error — `message` is safe to surface to the guest.
@@ -893,26 +883,9 @@ mod tests {
                 owner: Some("cortexapps".into()),
             },
         });
-        round_trip(ForgeRequest {
-            session_id: SessionId::new(),
-            broker_token: "tok".into(),
-            op: ForgeOp::CreatePullRequest {
-                repo: "cortexapps/engrams".into(),
-                head_branch: "feat/x".into(),
-                base_branch: "main".into(),
-                title: "Add x".into(),
-                body: String::new(),
-                draft: false,
-            },
-        });
         round_trip(ForgeResponse::Credential {
             username: "x-access-token".into(),
             password: "ghs_x".into(),
-        });
-        round_trip(ForgeResponse::PullRequest {
-            url: "https://github.com/cortexapps/engrams/pull/1".into(),
-            id: 1,
-            state: "open".into(),
         });
         round_trip(ForgeResponse::Error {
             message: "nope".into(),

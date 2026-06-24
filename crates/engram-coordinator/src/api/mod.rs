@@ -94,12 +94,8 @@ pub fn router(state: SharedState) -> Router {
     // the per-session credential-broker token (not the deployment
     // bearer), so these live OUTSIDE the `internal` bearer layer — the
     // in-guest helper holds only its session-scoped token.
-    let forge_seam = Router::new()
-        .route("/sessions/:id/git-credential", get(forge::git_credential))
-        .route(
-            "/sessions/:id/pull-request",
-            post(forge::create_pull_request),
-        );
+    let forge_seam =
+        Router::new().route("/sessions/:id/git-credential", get(forge::git_credential));
 
     // `/healthz` + `/readyz` stay at root so k8s + the GCP LB health
     // checks don't have to know the `/api/v1` prefix.

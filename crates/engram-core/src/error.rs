@@ -267,13 +267,13 @@ pub enum IntegrationError {
     NotFound(String),
     /// Backend returned an unexpected response shape.
     Protocol(String),
-    /// The action was rejected by the provider (e.g. head == base, a PR
-    /// already exists for this branch pair, base is protected).
+    /// The provider rejected the request semantically (HTTP 422) — e.g. a
+    /// mint scoped to a permission the installation doesn't grant.
     Rejected(String),
     /// The request args / resource reference was malformed.
     InvalidSpec(String),
     /// The integration does not implement this operation (e.g. an
-    /// inject-source provider has no `perform_action`).
+    /// inject-source provider has no `mint_credential`).
     Unsupported,
 }
 
