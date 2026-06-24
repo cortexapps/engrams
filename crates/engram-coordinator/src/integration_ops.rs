@@ -202,6 +202,101 @@ async fn mint_scoped(state: &SharedState, provider: &str) -> Result<ScopedCreden
         .map_err(|e| format!("could not mint a token: {e}"))
 }
 
+/// Build a full OAuth authorize URL from the stored client id + the orchestrator's
+/// redirect/state. The coordinator is the only tier that can read the client-id org
+/// secret, so the URL is assembled here.
+pub async fn begin_integration_oauth(
+    state: &SharedState,
+    req: app::BeginIntegrationOauthRequest,
+) -> Result<String, String> {
+    let client_id = resolve_secret(state, &req.client_id_ref).await?;
+    let mut url = reqwest::Url::parse(&req.authorize_url)
+        .map_err(|e| format!("invalid authorize_url: {e}"))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("client_id", &client_id);
+        q.append_pair("redirect_uri", &req.redirect_uri);
+        q.append_pair("state", &req.state);
+        if !req.scopes.is_empty() {
+            // Slack bot scopes are comma-delimited (the common form for OAuth v2).
+            // A provider needing space-delimited scopes would add a facet field.
+            q.append_pair("scope", &req.scopes.join(","));
+        }
+    }
+    Ok(url.to_string())
+}
+
+/// Exchange an authorization code for an access token and write it to the org
+/// store. Reads the client id + secret (org secrets); the token never returns to
+/// the caller. A provider that 200s with an error body (Slack: `{"ok":false}`) is
+/// caught by the missing/empty token field.
+pub async fn complete_integration_oauth(
+    state: &SharedState,
+    req: app::CompleteIntegrationOauthRequest,
+) -> Result<(bool, String), String> {
+    let client_id = resolve_secret(state, &req.client_id_ref).await?;
+    let client_secret = resolve_secret(state, &req.client_secret_ref).await?;
+    let http = reqwest::Client::builder()
+        .user_agent("engram-integration-oauth")
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let form = [
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
+        ("code", req.code.as_str()),
+        ("redirect_uri", req.redirect_uri.as_str()),
+        ("grant_type", "authorization_code"),
+    ];
+    let resp = http
+        .post(&req.token_url)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("token exchange request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("token response was not JSON: {e}"))?;
+    // Provider-agnostic extraction: the configured top-level field (a leading
+    // "$." is tolerated).
+    let field = req.token_response_path.trim_start_matches("$.");
+    let token = json.get(field).and_then(|v| v.as_str()).unwrap_or("");
+    if token.is_empty() {
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no access token in response");
+        return Ok((
+            false,
+            format!("OAuth exchange failed (HTTP {status}): {err}"),
+        ));
+    }
+    let sealed = crate::org_secrets::seal_org_secret(
+        &*state.services.kek,
+        &req.token_secret_ref,
+        token.as_bytes(),
+    )
+    .await
+    .map_err(|e| format!("seal token: {e}"))?;
+    state
+        .services
+        .meta
+        .upsert_org_secret(sealed)
+        .await
+        .map_err(|e| format!("store token: {e}"))?;
+    tracing::info!(
+        provider = %req.provider,
+        secret = %req.token_secret_ref,
+        "OAuth access token acquired and stored"
+    );
+    Ok((
+        true,
+        format!("Connected {} — access token stored", req.provider),
+    ))
+}
+
 /// Resolve one org secret by name (KEK-unseal via the composed SecretStore).
 async fn resolve_secret(state: &SharedState, name: &str) -> Result<String, String> {
     let ctx = SecretContext {
