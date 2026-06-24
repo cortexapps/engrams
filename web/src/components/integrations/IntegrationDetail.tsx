@@ -6,7 +6,7 @@
  * TestConnector RPC.
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { toast } from "sonner";
 import {
@@ -43,6 +43,20 @@ export function IntegrationDetail() {
   const { provider } = useParams({ strict: false }) as { provider?: string };
   const { views, isLoading } = useConnectorViews();
   const view = views.find((v) => v.provider === provider);
+
+  // Surface the OAuth callback outcome (the "Add to {provider}" redirect lands
+  // back here with ?connected=1 / ?error=…), then strip the one-shot flag.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("connected") === "1") {
+      toast.success("Connected — workspace token stored");
+    } else if (params.get("error")) {
+      toast.error(`Connection failed: ${params.get("error")}`);
+    } else {
+      return;
+    }
+    window.history.replaceState({}, "", window.location.pathname);
+  }, []);
 
   if (isLoading) return <p className="py-6 text-sm text-muted-foreground">Loading…</p>;
   if (!view) {
