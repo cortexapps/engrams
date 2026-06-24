@@ -784,6 +784,9 @@ export function compileIntegrationPolicy(
   const observes: IntegrationObserveJson[] = [];
   const seenInject = new Set<string>();
   const seenObserve = new Set<string>();
+  // ADR 0057: hosts opened by a granted power (folded into the egress allow-list
+  // below — you must be able to REACH a host you inject a credential onto).
+  const grantedHosts = new Set<string>();
   for (const capStr of capabilities) {
     const cap = parseCapability(capStr);
     if (!cap) continue;
@@ -791,6 +794,7 @@ export function compileIntegrationPolicy(
     if (!connector) continue;
     for (const op of connector.operations) {
       if (!op.grants.includes(cap.action)) continue;
+      for (const h of connector.hosts) grantedHosts.add(h);
       const methods = op.match?.method ? [op.match.method.toUpperCase()] : [];
       // Emit the connector match path as a whole glob (the proxy globs `*` over
       // the full request path). Previously this was truncated at the first `*`
@@ -869,7 +873,13 @@ export function compileIntegrationPolicy(
   // here (the secret VALUES are resolved host-side from `secret_ref`).
   const network: IntegrationNetworkJson = {
     default: inputs?.network?.default === "allow" ? "allow" : "deny",
-    allow_hosts: inputs?.network?.allowHosts ?? [],
+    // ADR 0057: union the profile's hand-typed allow-list with every granted
+    // connector's hosts (deduped, admin entries first). Granting a power opens
+    // its host's egress — matching what the profile UI already shows as "hosts
+    // opened by granted powers" (`derivedHosts`). Without this, a profile that
+    // grants a capability but doesn't *also* re-type the host gets a DNS "could
+    // not resolve host" at runtime despite the credential injection being wired.
+    allow_hosts: [...new Set([...(inputs?.network?.allowHosts ?? []), ...grantedHosts])],
     allow_host_patterns: inputs?.network?.allowHostPatterns ?? [],
   };
   const secrets: IntegrationSecretJson[] = (inputs?.secrets ?? []).map((s) => ({

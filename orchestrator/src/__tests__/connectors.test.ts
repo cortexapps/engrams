@@ -261,6 +261,23 @@ describe("compileIntegrationPolicy", () => {
       ),
     ).toBe(true);
   });
+
+  test("ADR 0057: a granted power opens egress to its connector's hosts", () => {
+    // No profile-typed allow-list — the host must come from the granted cap, or
+    // the agent gets a DNS "could not resolve host" despite injection being wired.
+    const policy = compileIntegrationPolicy(["datadog:logs:read"], reg);
+    expect(policy.network.allow_hosts).toEqual(["api.datadoghq.com"]);
+    // A cap whose host can be reached is itself policy content.
+    expect(policyHasContent(policy)).toBe(true);
+  });
+
+  test("ADR 0057: granted-power hosts union with the profile's hand-typed allow-list (deduped, admin first)", () => {
+    const policy = compileIntegrationPolicy(["datadog:logs:read", "github:issues:write"], reg, {
+      // `api.datadoghq.com` is typed AND granted — must appear once, not twice.
+      network: { default: "deny", allowHosts: ["sentry.io", "api.datadoghq.com"] },
+    });
+    expect(policy.network.allow_hosts).toEqual(["sentry.io", "api.datadoghq.com", "api.github.com"]);
+  });
 });
 
 // A mint connector whose op carries an asset spec (the GitHub-issue shape).
