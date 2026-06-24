@@ -70,8 +70,8 @@ fi
 
 file "$OUT/vmlinux" | grep -q "ELF 64-bit" || { echo "kernel is not an ELF binary:" >&2; file "$OUT/vmlinux" >&2; exit 1; }
 
-# ── RO session bundles (ADR 0027 → 0055) ────────────────────────────────────
-# The sentinel + skills + playwright squashfs bundles + the current.json stamp
+# ── RO session bundles (ADR 0027 → 0055 → 0058) ─────────────────────────────
+# The sentinel + skills + playwright + integrations-cli squashfs bundles + the current.json stamp
 # (logical name -> sha256). The host-agent reads these from
 # /var/lib/engram/shared at startup; the engram-host-fleet init container copies
 # them out of this image. ADR 0055: skills are profile-selected per session — the
@@ -104,9 +104,12 @@ stage_bundle() {  # stage_bundle <name>; echoes the staged sha256 on stdout
 sentinel_sha="$(stage_bundle sentinel)"
 skills_sha="$(stage_bundle skills)"
 playwright_sha="$(stage_bundle playwright)"
+# ADR 0058: the integration CLI toolbox (gh + datadog-ci), profile-selected
+# when a connector with a bundled `cli` facet is enabled.
+integrations_cli_sha="$(stage_bundle integrations-cli)"
 # Stamp: logical name -> sha256, matching AuxRoDrive::CURRENT_STAMP / read_stamp().
-printf '{"sentinel":"%s","skills":"%s","playwright":"%s"}\n' \
-  "$sentinel_sha" "$skills_sha" "$playwright_sha" \
+printf '{"sentinel":"%s","skills":"%s","playwright":"%s","integrations-cli":"%s"}\n' \
+  "$sentinel_sha" "$skills_sha" "$playwright_sha" "$integrations_cli_sha" \
   > "$BUNDLES_OUT/current.json"
 
 echo "==> staged into ${OUT}:"

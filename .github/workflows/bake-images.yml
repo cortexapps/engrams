@@ -670,6 +670,9 @@ jobs:
           # playwright: glibc Docker build (chromium-headless-shell + node +
           # @playwright/mcp + deps), then squashfs.
           deploy/bundles/playwright/build.sh dist/playwright.squashfs
+          # integrations-cli (ADR 0058): glibc Docker build (gh + datadog-ci +
+          # deps), then squashfs.
+          deploy/bundles/integrations-cli/build.sh dist/integrations-cli.squashfs
           ls -l dist/
 
       - name: Log in to GHCR
@@ -688,7 +691,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
-          for name in sentinel skills playwright; do
+          for name in sentinel skills playwright integrations-cli; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
             # `oras pull <repo>:<sha>` drops <name>.squashfs into cwd verbatim.
             oras push "$REPO:$SHA" \

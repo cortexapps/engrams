@@ -642,7 +642,7 @@ fn env_iter<'a>(env: &'a HashMap<String, String>) -> impl Iterator<Item = (&'a s
 /// lands with the rest of the ADR 0055 catalog; today it stages the known
 /// built-in bundles at their canonical guest mounts.
 async fn stage_aux_bundles(cwd: &Path) {
-    const DEV_BUNDLES: &[&str] = &["skills", "playwright"];
+    const DEV_BUNDLES: &[&str] = &["skills", "playwright", "integrations-cli"];
     // Sequential slot index, mirroring the production init-shim's
     // /opt/engram/dyn/<i> mounting so the shared `activate()` finds the bundles.
     // A skipped (absent) bundle doesn't consume an index.
