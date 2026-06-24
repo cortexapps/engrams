@@ -221,11 +221,27 @@ P1 shipped on `adr-0058-p1-cli-integrations`. What landed, and where it simplifi
   `docs` simplify · `feat` tasks.ts wiring · `feat` bundle+connector-facets · `refactor`
   retire create-pull-request · `ci` build/publish/stage the bundle.
 
+- **Bundle build dev-vm-validated; `gh`/`datadog-ci` run; two recipe bugs fixed.** Building +
+  running the squashfs on the KVM dev-vm surfaced (1) `collect()` tripping `set -e`/`pipefail`
+  on `gh` (a *static* Go binary makes `ldd` exit non-zero), and (2) `datadog-ci` (a Node SEA)
+  segfaulting under a bundled libc/loader, plus a bundled libstdc++ (built against glibc 2.36)
+  refusing to load on an older base. **Resolution: ship the binaries directly with no bundled
+  libs/loader/wrappers** — `gh` is static; `datadog-ci` runs against the **base image's own
+  glibc + libstdc++**. Validated: `gh` 2.62.0 + `datadog-ci` v2.48.0 both run, the helper
+  renders, 48 MB squashfs. **Constraint this imposes:** the bundle targets a *full glibc base*
+  (libstdc++ present) — a slim glibc image must `apt-get install libstdc++6`, the same
+  constraint the binaries carry themselves (consistent with the playwright bundle being
+  glibc-only). Bundling a matched-glibc libstdc++ for true any-base portability is a documented
+  follow-up if a libstdc++-less base ever selects a CLI integration.
+
 **Deferred (documented, not dropped):** `in-guest-token` + the `request-signing`/SigV4 arm
 (P2); MCP facet + `--mcp-config` + headless approval (P3/P4); `binSource: uploaded`/`npx` (the
-ADR 0055 P2 binary-upload + runtime-npx paths). **Pre-merge:** dev-vm FC validation of the
-bundle build + the `gh`-with-dummy-token path; **post-merge:** the engrams-internal host
-re-bake + image re-enable to stage the bundle on the prod fleet.
+ADR 0055 P2 binary-upload + runtime-npx paths). **Pre-merge:** the full FC-session e2e
+(`gh`-with-dummy-token through a live egress-injected GitHub App token) — the bundle build +
+CLI execution are dev-vm-validated, the orchestrator compile/wire + `activate()` mount-wire +
+the `inject.rs` overwrite are unit-tested, so this is the integration of validated pieces.
+**Post-merge:** the engrams-internal host re-bake + image re-enable to stage the bundle on the
+prod fleet.
 
 ## Consequences and risks
 
