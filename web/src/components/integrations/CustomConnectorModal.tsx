@@ -39,6 +39,7 @@ import {
 } from "@/components/ui/select";
 import { Text } from "@/components/ui/text";
 import { useUpsertConnector, useUploadConnectorLogo } from "@/hooks/useIntegrations";
+import { useUploadSkill } from "@/hooks/useSkills";
 import { usePutOrgSecret } from "@/hooks/useOrgSecrets";
 import { accessOf, defaultIconMono, humanizeAction } from "@/lib/connectorModel";
 import { ProviderTile } from "./ProviderTile";
@@ -102,6 +103,20 @@ const splitList = (t: string) =>
     .split(/[\s,]+/)
     .map((s) => s.trim())
     .filter(Boolean);
+
+/** Parse "KEY=value" lines into a dummyEnv map (blank lines skipped). */
+const parseEnvLines = (t: string): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const line of t.split(/\r?\n/)) {
+    const s = line.trim();
+    const eq = s.indexOf("=");
+    if (eq <= 0) continue;
+    out[s.slice(0, eq).trim()] = s.slice(eq + 1).trim();
+  }
+  return out;
+};
+/** PATH command name from a bin path (`bin/mytool` → `mytool`). */
+const basename = (p: string) => p.split("/").pop() ?? p;
 export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
   const upsert = useUpsertConnector();
@@ -118,6 +133,18 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   const [logo, setLogo] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // ADR 0058 UB3: optional CLI facet. `uploaded` registers a mount_catalog bundle
+  // (an admin-prepared archive + a declared bin) and references it; `bundled`
+  // reuses a tool already in the shared integrations bundle.
+  const uploadSkill = useUploadSkill();
+  const [cliOn, setCliOn] = useState(false);
+  const [cliSource, setCliSource] = useState<"uploaded" | "bundled">("uploaded");
+  const [cliBins, setCliBins] = useState(""); // uploaded: archive paths (bin/tool); bundled: command names
+  const [cliDoc, setCliDoc] = useState("");
+  const [cliEnv, setCliEnv] = useState(""); // KEY=value lines
+  const [cliFile, setCliFile] = useState<File | null>(null);
+  const [cliBundle, setCliBundle] = useState("");
+
   const provider =
     name
       .trim()
@@ -126,10 +153,20 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   const autoMono = defaultIconMono(name.trim() || "?");
   const monogram = (mono.trim() || autoMono).slice(0, 2).toUpperCase();
   const logoUrl = useMemo(() => (logo ? URL.createObjectURL(logo) : undefined), [logo]);
+  const cliValid =
+    !cliOn ||
+    (splitList(cliBins).length > 0 &&
+      cliDoc.trim().length > 0 &&
+      (cliSource === "bundled" || cliFile !== null));
   const valid = Boolean(
-    name.trim() && hosts.trim() && ops.some((o) => o.grant.trim()) && creds.some((c) => c.header.trim()),
+    name.trim() &&
+      hosts.trim() &&
+      ops.some((o) => o.grant.trim()) &&
+      creds.some((c) => c.header.trim()) &&
+      cliValid,
   );
-  const pending = upsert.isPending || putSecret.isPending || uploadLogo.isPending;
+  const pending =
+    upsert.isPending || putSecret.isPending || uploadLogo.isPending || uploadSkill.isPending;
   const updateCred = (id: number, patch: Partial<CredRow>) =>
     setCreds((r) => r.map((c) => (c.id === id ? { ...c, ...patch } : c)));
 
@@ -144,25 +181,54 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
         ...c,
         ref: c.secretRef.trim() || (single ? `${provider}-token` : `${provider}-${sanitizeRef(c.header)}`),
       }));
-    const connector = {
-      provider,
-      protocol: "http",
-      display: { name: name.trim(), category, icon: { mono: monogram, color } },
-      credential: {
-        source: "inject",
-        injects: resolved.map((c) => ({ header: c.header.trim(), secretRef: c.ref, template: c.template })),
-      },
-      hosts: splitList(hosts),
-      operations: ops
-        .filter((o) => o.grant.trim())
-        .map((o) => {
-          const match: Record<string, string> = {};
-          if (o.method.trim()) match.method = o.method.trim();
-          if (o.path.trim()) match.path = o.path.trim();
-          return { grants: [o.grant.trim()], ...(Object.keys(match).length ? { match } : {}) };
-        }),
-    };
+    const operations = ops
+      .filter((o) => o.grant.trim())
+      .map((o) => {
+        const match: Record<string, string> = {};
+        if (o.method.trim()) match.method = o.method.trim();
+        if (o.path.trim()) match.path = o.path.trim();
+        return { grants: [o.grant.trim()], ...(Object.keys(match).length ? { match } : {}) };
+      });
     try {
+      // ADR 0058 UB3: register the uploaded binary bundle first (content-addressed,
+      // fleet-staged), then reference it from the connector's cli facet.
+      let cli: Record<string, unknown> | undefined;
+      if (cliOn) {
+        const binEntries = splitList(cliBins);
+        const env = parseEnvLines(cliEnv);
+        const envPart = Object.keys(env).length ? { dummyEnv: env } : {};
+        if (cliSource === "uploaded") {
+          const bundleName = cliBundle.trim() || `${provider}-cli`;
+          const bytes = new Uint8Array(await cliFile!.arrayBuffer());
+          await uploadSkill.mutateAsync({
+            name: bundleName,
+            description: `${name.trim()} CLI`,
+            payloadTar: bytes,
+            bins: binEntries,
+          });
+          cli = {
+            bins: binEntries.map(basename),
+            binSource: "uploaded",
+            bundle: bundleName,
+            ...envPart,
+            doc: cliDoc.trim(),
+          };
+        } else {
+          cli = { bins: binEntries, binSource: "bundled", ...envPart, doc: cliDoc.trim() };
+        }
+      }
+      const connector = {
+        provider,
+        protocol: "http",
+        display: { name: name.trim(), category, icon: { mono: monogram, color } },
+        credential: {
+          source: "inject",
+          injects: resolved.map((c) => ({ header: c.header.trim(), secretRef: c.ref, template: c.template })),
+        },
+        hosts: splitList(hosts),
+        operations,
+        ...(cli ? { cli } : {}),
+      };
       await upsert.mutateAsync({ configJson: JSON.stringify(connector) });
       for (const c of resolved) {
         if (c.credVal.trim()) await putSecret.mutateAsync({ name: c.ref, value: c.credVal });
@@ -471,6 +537,107 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
               <PlusIcon className="size-3.5" />
               Operation
             </Button>
+          </div>
+
+          {/* CLI tool (ADR 0058 uploaded-binary arm) */}
+          <div className="flex flex-col gap-2">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                className="size-3.5"
+                checked={cliOn}
+                onChange={(e) => setCliOn(e.target.checked)}
+              />
+              <Text variant="label">Drive a CLI (optional)</Text>
+            </label>
+            <p className="text-[0.74rem] leading-relaxed text-muted-foreground">
+              Give the agent a command-line tool for this integration. Auth is brokered — the CLI
+              runs with a harmless placeholder; the proxy injects the real credential on the hosts
+              above. The binary is staged read-only into sessions that grant a power.
+            </p>
+            {cliOn && (
+              <div className="flex flex-col gap-3 rounded-md border p-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="flex flex-col gap-1.5">
+                    <Text variant="label">Binary source</Text>
+                    <Select
+                      value={cliSource}
+                      onValueChange={(v) => setCliSource(v as "uploaded" | "bundled")}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="uploaded">Upload a binary bundle</SelectItem>
+                        <SelectItem value="bundled">Reuse a built-in tool</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </label>
+                  <label className="flex flex-col gap-1.5">
+                    <Text variant="label">
+                      {cliSource === "uploaded" ? "Binary path(s) in the archive" : "Command name(s)"}
+                    </Text>
+                    <Input
+                      className="font-mono text-xs"
+                      spellCheck={false}
+                      placeholder={cliSource === "uploaded" ? "bin/mytool" : "gh"}
+                      value={cliBins}
+                      onChange={(e) => setCliBins(e.target.value)}
+                    />
+                  </label>
+                </div>
+                {cliSource === "uploaded" && (
+                  <>
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="flex flex-col gap-1.5">
+                        <Text variant="label">Bundle name</Text>
+                        <Input
+                          className="font-mono text-xs"
+                          spellCheck={false}
+                          placeholder={`${provider}-cli`}
+                          value={cliBundle}
+                          onChange={(e) => setCliBundle(e.target.value)}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1.5">
+                        <Text variant="label">Archive (.tar / .tar.gz / .zip)</Text>
+                        <input
+                          type="file"
+                          accept=".tar,.gz,.tgz,.zip"
+                          className="text-xs file:mr-2 file:rounded file:border file:bg-secondary file:px-2 file:py-1"
+                          onChange={(e) => setCliFile(e.target.files?.[0] ?? null)}
+                        />
+                      </label>
+                    </div>
+                    <p className="text-[0.72rem] leading-relaxed text-muted-foreground">
+                      The archive must contain your executable at the path(s) above plus a top-level{" "}
+                      <code className="font-mono">SKILL.md</code> describing the tool. It's
+                      content-addressed and staged fleet-wide; the binary runs against the base
+                      image's libc (statically-linked is safest).
+                    </p>
+                  </>
+                )}
+                <label className="flex flex-col gap-1.5">
+                  <Text variant="label">Placeholder env (KEY=value per line)</Text>
+                  <textarea
+                    className="min-h-[3rem] rounded-md border bg-transparent px-3 py-2 font-mono text-xs"
+                    placeholder="GH_TOKEN=x-engrams-managed"
+                    spellCheck={false}
+                    value={cliEnv}
+                    onChange={(e) => setCliEnv(e.target.value)}
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <Text variant="label">How-to (shown to the agent)</Text>
+                  <textarea
+                    className="min-h-[4rem] rounded-md border bg-transparent px-3 py-2 text-xs"
+                    placeholder="Use `mytool` to query… Authentication is automatic — do NOT log in."
+                    value={cliDoc}
+                    onChange={(e) => setCliDoc(e.target.value)}
+                  />
+                </label>
+              </div>
+            )}
           </div>
 
           {/* appears-as */}
