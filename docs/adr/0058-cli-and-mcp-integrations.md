@@ -190,6 +190,43 @@ documented fallback if a single bundle ever grows unwieldy.
   `/settings/integrations` gains the MCP facet form.
 - **P4 — stdio MCP.** session_env key delivery; server binaries via `npx` or the CLI bundle.
 
+## P1 implementation notes (divergences from the plan)
+
+P1 shipped on `adr-0058-p1-cli-integrations`. What landed, and where it simplified the design:
+
+- **Zero new wire / host / coordinator change** (the big simplification, from tracing the
+  existing skill mechanism). The CLI bundle + discovery reach the session exactly like
+  `create-pull-request` did: `selected_skills` + `env_vars` + `activate()`'s `requires_env`
+  gate. `compileCliIntegrations` (`connectors/registry.ts`) → `tasks.ts` unions the
+  `integrations-cli` bundle into `selected_skills` and merges `dummyEnv` into the harness env.
+  The proxy already injects both static (Datadog) and minted (GitHub) credentials, so the
+  dummy placeholder is the *only* new in-guest artifact.
+- **Discovery rides one env var + a helper, not a per-session render.** The orchestrator sets
+  `ENGRAM_CLI_INTEGRATIONS` to the JSON catalog of enabled connectors' `cli` facets
+  (`{provider, displayName, bins, doc}`); the bundle's `engrams-integrations` helper prints it
+  (jq → python3 → raw fallback). The discovery `SKILL.md` is static + generic; per-connector
+  how-to lives in the connector's `cli.doc` (so custom connectors surface theirs too). The
+  `integrations` skill `requires_env: ENGRAM_CLI_INTEGRATIONS`, so it only wires when ≥1 CLI is
+  enabled.
+- **`credentialDelivery` is an orchestrator-only typed concept.** `inject`/`substitute` are
+  implemented; `in-guest-token`/`request-signing` are valid types but `parseConnector`
+  rejects them ("not yet wired") so no silently-unauthenticated CLI ships — the SigV4 door is
+  open at the contract, not via dead Rust.
+- **`dummyFiles` is modeled but unused by the built-ins** (`gh`/`datadog-ci` are satisfied by
+  `dummyEnv`); it's a connector-authoring option for config-file-only CLIs.
+- **`create-pull-request` fully retired** — replaced by `gh` from the bundle (its PR/issue
+  guidance moved to `github.json`'s `cli.doc`); every code reference swept. Git push stays
+  brokered via the skills bundle's askpass/gitconfig.
+- **Commit chain:** `docs(adr-0058)` (Proposed) · `feat` cli-facet+credentialDelivery ·
+  `docs` simplify · `feat` tasks.ts wiring · `feat` bundle+connector-facets · `refactor`
+  retire create-pull-request · `ci` build/publish/stage the bundle.
+
+**Deferred (documented, not dropped):** `in-guest-token` + the `request-signing`/SigV4 arm
+(P2); MCP facet + `--mcp-config` + headless approval (P3/P4); `binSource: uploaded`/`npx` (the
+ADR 0055 P2 binary-upload + runtime-npx paths). **Pre-merge:** dev-vm FC validation of the
+bundle build + the `gh`-with-dummy-token path; **post-merge:** the engrams-internal host
+re-bake + image re-enable to stage the bundle on the prod fleet.
+
 ## Consequences and risks
 
 - **No host/coordinator/proxy change in P1**: the inject-overwrite path already ships and
