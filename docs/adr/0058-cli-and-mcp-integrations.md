@@ -10,7 +10,10 @@ notes** below, which pin the details a cold pickup would otherwise have to re-de
 **uploaded-binary arm** (`binSource:"uploaded"` — custom-connector tooling parity) is also
 **shipped + prod-validated** (UB1–UB4: #422 / #423 / #424; a real uploaded static binary ran
 on PATH in a prod FC session) — see the [Uploaded CLI binaries](#uploaded-cli-binaries--the-binsource-uploaded-arm-custom-connector-parity)
-section below. Still **deferred:** P2 (`in-guest-token` + SigV4) and P3/P4 (MCP).
+section below. **P3 (remote HTTP MCP) is in progress** — http-only; see the [P3
+implementation notes](#p3-implementation-notes-remote-http-mcp--scope--divergences). Still
+**deferred:** P2 (`in-guest-token` + SigV4). **P4 (stdio MCP) is out of scope** for the
+integrations surface — an integration is an HTTP API (see the P3 notes for why).
 
 Builds on **ADR 0057** (profiles as the unified session-policy object + the runtime-managed
 connector catalog), **ADR 0056** (generic integrations — the interceptor gate/inject/observe
@@ -167,7 +170,7 @@ fully-runtime integration story.
   token in the guest). Headless **tool pre-approval** must be wired
   (`enableAllProjectMcpServers` / the hook-bridge permission machinery) so MCP tools don't
   block the unattended loop.
-- **stdio MCP** — key via `session_env`; server binary `npx`-fetched at runtime or shipped in
+- **stdio MCP** *(P4 — **now out of scope**, see the [P3 implementation notes](#p3-implementation-notes-remote-http-mcp--scope--divergences))* — key via `session_env`; server binary `npx`-fetched at runtime or shipped in
   the CLI bundle. The machine-user-friendly path for GitHub/Sentry/PagerDuty/Postgres/Datadog
   stdio servers.
 
@@ -301,6 +304,93 @@ CLI execution are dev-vm-validated, the orchestrator compile/wire + `activate()`
 the `inject.rs` overwrite are unit-tested, so this is the integration of validated pieces.
 **Post-merge:** the engrams-internal host re-bake + image re-enable to stage the bundle on the
 prod fleet.
+
+## P3 implementation notes (remote HTTP MCP — scope + divergences)
+
+P3 ships **remote HTTP MCP only**. The `mcp` facet narrows to `{ transport: "http"; url }`;
+`parseConnector` rejects `transport: "stdio"` as not-yet-wired. **P4 (stdio) is out of scope
+for the integrations surface** — an integration is an HTTP API, best served by a *remote* MCP
+server over the existing inject rail. stdio's distinctive value (databases, local/non-HTTP
+tooling, in-guest binary delivery + in-guest secrets — the last couples to P2) doesn't serve
+HTTP-API integrations. Revisit only if a must-have integration ships stdio-only with no HTTP
+endpoint.
+
+Resolutions to the three P3/P4 pickup-note unknowns (from reading the harness + the Claude
+Code docs against the pinned `claude` 2.1.x; the dev-stack run is the P3 verification step):
+
+1. **Headless tool pre-approval is already solved — pickup-note 1's "real risk" is moot.** The
+   ADR-0054 hook-bridge (`engram-harness-claude`, the `hook_bridge` mod) returns
+   `permissionDecision: "allow"` for **every** tool whose `tool_name` is not `AskUserQuestion`,
+   and `write_hook_settings` registers its `PreToolUse` matcher as `*`. MCP tools surface as
+   `mcp__<server>__<tool>` and auto-allow exactly like Bash/Edit — no `enableAllProjectMcpServers`
+   / `--permission-mode` / `--allowedTools` needed. `--mcp-config` (vs a cwd `.mcp.json`) also
+   dodges the "trust this server?" prompt. Config schema:
+   `{ "mcpServers": { "<name>": { "type": "http", "url": "…" } } }` with **no `headers`** — the
+   proxy injects `Authorization`. (A 401/403 would trip the CLI's *own* OAuth fallback, so
+   reliable host-side injection is load-bearing — note 3.)
+
+2. **The harness writes the config, not agentd (divergence from pickup-note 2).** The
+   `--mcp-config` file is a claude-launch artifact exactly like the `--settings` file the
+   harness already writes itself (`write_hook_settings` → `HOOK_SETTINGS_FILE`). So the harness
+   reads `ENGRAM_MCP_INTEGRATIONS` (set by `compileMcpIntegrations` → `tasks.ts`, one more
+   `harness_env` var — **no `CreateSessionRequest` change**) and writes
+   `/workspace/.engram/claude-mcp.json`; `build_claude_argv` appends `--mcp-config` when the
+   file exists. Keeping both claude-launch files in the harness (rather than splitting
+   agentd/harness) is the simpler seam.
+
+3. **Auth + egress need no new compile logic — an operation with no `match` injects on all MCP
+   traffic.** The egress proxy treats empty `methods`/`path_globs` as "any method / any path"
+   (`RequestPolicy::allows`, `engram-egress-proxy/src/registry.rs`). So an mcp connector with
+   `hosts: ["<mcp-host>"]`, a `credential.inject` bearer, and one coarse operation with **no
+   `match`** injects `Authorization` on every JSON-RPC request to its host (POST/GET/DELETE, any
+   path) via the existing `compileIntegrationPolicy` per-operation emission + the #420
+   hosts-union. No "auto-gate" special case was needed. `compileMcpIntegrations` (peer of
+   `compileCliIntegrations`) only enumerates the enabled `{ name, url }` set for the harness env.
+
+**Flagship connector:** the existing `github.json` gains an `mcp` facet (no new integration) —
+GitHub's remote MCP server at `https://api.githubcopilot.com/mcp/`, reusing the connector's
+minted GitHub App token (rendered `Authorization: Bearer <token>` host-side by
+`engram-git-github`'s `inject_header`). A coarse `mcp:use` capability enables it, gated to
+`/mcp*` so the minted token injects on MCP traffic without broadening the connector's scoped
+`api.github.com` operations. (Sentry was the original pick, but its remote MCP is OAuth-only —
+no static bearer — as of 2026; GitHub's accepts a bearer and needs no new credential. Token-type
+note: GitHub *documents* a PAT bearer; the App installation token is the same `Bearer` scheme,
+and confirming the MCP endpoint accepts it is the spike's key check.)
+
+### The identity seam: machine vs. user (future direction)
+
+Static-bearer/minted MCP authenticates the session as a **machine / org identity** — one
+credential the platform holds, injected host-side. This is the right foundation: it's the
+universal lowest common denominator (works with *any* MCP server, not just OAuth/EMA-capable
+ones), it *is* the machine-identity shape, and it's the common case (most engrams sessions run
+with no employee context). Two future axes, both of which **the inject rail already absorbs with
+zero guest/harness change** — only the coordinator's credential *resolution* grows arms, keyed
+on whether the session carries a user context:
+
+- **Machine identity (most sessions).** Today: a static org secret or a minted app token (the
+  GitHub App mint reused above). The standardized future is OAuth **client-credentials** /
+  workload-identity-federation — nascent in MCP (SEP-1933 is an early, unprioritized proposal as
+  of 2026), so static/minted bearer is both the pragmatic start and close to where it lands.
+- **User identity (session acts as a specific employee).** The naive form is per-user-per-server
+  OAuth (the org-scoped `OauthFacet` extended per-user). The better future is
+  **Enterprise-Managed Authorization** (MCP SEP-990, stable 2026): the enterprise IdP brokers
+  access via an ID-JAG token exchange (central policy + revocation). engrams is naturally placed
+  to **broker-and-inject** EMA host-side — the coordinator (which already holds the user's IdP
+  identity, ADR 0031) does the ID-JAG → access-token exchange and injects the result, so the
+  guest stays token-less and EMA-unaware. EMA covers only the user axis and only for servers that
+  implement it; per-server OAuth stays the fallback.
+
+We deliberately **don't pin a contract field** for this now — the standards are still moving
+(EMA vs. per-server OAuth vs. client-credentials). The seam is the inject rail plus the
+coordinator's `resolve_inject_entries` (which already holds the session, hence `user_id`);
+adding an identity arm later is a localized coordinator change, its own ADR when built.
+
+**Coarse-gating caveat.** Every MCP call is an opaque `POST /mcp`, so the egress proxy cannot
+sub-gate individual MCP tool calls the way it gates a CLI's `GET /repos/*/issues` — granting an
+MCP server grants *all* its tools. This is a connection-time / per-action gap (cf. the
+per-action-authorization critique of EMA) and a standing reason ADR 0027 keeps CLIs first-class
+and MCP opt-in. Per-tool gating would need execution-time policy; the harness `PreToolUse` hook
+(which already sees `mcp__<server>__<tool>`) is the natural future lever.
 
 ## Uploaded CLI binaries — the `binSource: "uploaded"` arm (custom-connector parity)
 
