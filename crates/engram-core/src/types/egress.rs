@@ -81,6 +81,15 @@ pub struct EgressInjectEntry {
     pub allow_host_patterns: Vec<String>,
     pub methods: Vec<String>,
     pub path_globs: Vec<String>,
+    /// ADR 0059: GraphQL operation type (`"query"` | `"mutation"` |
+    /// `"subscription"`) for body-parsed gating; empty = a REST inject. Paired
+    /// with `graphql_field`. `#[serde(default)]` so policies persisted before this
+    /// field (re-read on resume) still decode.
+    #[serde(default)]
+    pub graphql_operation: String,
+    /// ADR 0059: the GraphQL top-level field this inject authorizes; empty = REST.
+    #[serde(default)]
+    pub graphql_field: String,
 }
 
 /// ADR 0056 Phase 4: one resolved response-observation spec the host proxy
@@ -99,6 +108,19 @@ pub struct EgressObserveEntry {
     pub asset_kind: String,
     pub surface: String,
     pub success_status_class: Option<String>,
+    /// ADR 0059: GraphQL success rule — emit only when the response has no
+    /// non-empty top-level `errors` (plus HTTP 2xx). Takes precedence over
+    /// `success_status_class` for a GraphQL observe. `#[serde(default)]` for
+    /// resume-safety.
+    #[serde(default)]
+    pub success_no_graphql_errors: bool,
+    /// ADR 0059: GraphQL operation type for body-parsed firing; empty = a REST
+    /// observe. Paired with `graphql_field`.
+    #[serde(default)]
+    pub graphql_operation: String,
+    /// ADR 0059: the GraphQL top-level field this observe fires on; empty = REST.
+    #[serde(default)]
+    pub graphql_field: String,
     pub data: Vec<(String, String)>,
     pub fetchable: Option<String>,
 }

@@ -218,7 +218,9 @@ fn session_egress_policy() -> SessionEgressPolicy {
         // ADR 0056: injects (Phase 3b) + observes (Phase 4b) ride
         // SessionEgressPolicy. Empty here — the golden pins their length
         // prefixes so a field reorder/removal is caught. WIRE_VERSION was
-        // bumped for these additions (see wire.rs).
+        // bumped for these additions (see wire.rs). ADR 0059 (v5) added GraphQL
+        // fields to the inject/observe *entry* types; the golden is byte-identical
+        // because an empty Vec encodes to a length prefix only (no element bytes).
         injects: vec![],
         observes: vec![],
         secret_mode: SecretMode::Broker,
@@ -324,7 +326,7 @@ fn wire_version_pinned() {
     // signal that a payload shape changed; pin it so a payload change
     // without a bump (or vice-versa) is a conscious decision.
     assert_eq!(
-        WIRE_VERSION, 4,
+        WIRE_VERSION, 5,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

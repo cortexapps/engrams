@@ -453,6 +453,11 @@ pub(crate) fn build_observe_entries(
             asset_kind: o.asset_kind.clone(),
             surface: o.surface.clone(),
             success_status_class: o.success_status_class.clone(),
+            // ADR 0059: GraphQL observe gating/success ride straight through (no
+            // secret to resolve — the asset map is pure).
+            success_no_graphql_errors: o.success_no_graphql_errors,
+            graphql_operation: o.graphql_operation.clone(),
+            graphql_field: o.graphql_field.clone(),
             data: o.data.clone(),
             fetchable: o.fetchable.clone(),
         })
@@ -512,6 +517,10 @@ pub(crate) async fn resolve_inject_entries(
                     allow_host_patterns: Vec::new(),
                     methods: inj.methods.clone(),
                     path_globs: inj.path_globs.clone(),
+                    // ADR 0059: the same minted token authorizes REST + GraphQL on
+                    // the provider's host; the GraphQL matcher rides through.
+                    graphql_operation: inj.graphql_operation.clone(),
+                    graphql_field: inj.graphql_field.clone(),
                 },
                 None => continue, // mint_inject_header logged the reason
             }
@@ -547,6 +556,9 @@ pub(crate) async fn resolve_inject_entries(
                 allow_host_patterns: Vec::new(),
                 methods: inj.methods.clone(),
                 path_globs: inj.path_globs.clone(),
+                // ADR 0059: a static-token connector can also gate GraphQL ops.
+                graphql_operation: inj.graphql_operation.clone(),
+                graphql_field: inj.graphql_field.clone(),
             }
         };
         out.push(entry);

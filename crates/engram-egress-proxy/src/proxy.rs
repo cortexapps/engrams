@@ -275,6 +275,17 @@ async fn handle(
                     );
                     Ok(())
                 }
+                // ADR 0059: a GraphQL request to a gated endpoint whose operation
+                // isn't permitted (or whose body was unparseable / over-cap) — close
+                // it (nothing reached upstream), same disposition as a REST reject.
+                Err(intercept::InterceptError::GraphqlRejected { reason }) => {
+                    tracing::info!(
+                        session_id = %session.session_id,
+                        sni = %sni, reason,
+                        "egress rejected — graphql operation not permitted by integration policy",
+                    );
+                    Ok(())
+                }
                 Err(e) => Err(HandleError::Intercept(e)),
             }
         }

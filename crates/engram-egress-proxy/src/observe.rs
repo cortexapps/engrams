@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 
 use engram_core::SessionId;
 
-use crate::registry::ObserveEntry;
+use crate::registry::{ObserveEntry, SuccessRule};
 
 /// A built asset, ready to ship to the coordinator. `surface` is opaque here
 /// ("action" | "asset"); the coordinator maps it to its `AssetSurface`.
@@ -190,6 +190,16 @@ fn dechunk(mut input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// ADR 0059: does a GraphQL response carry a non-empty top-level `errors` array?
+/// Absent/empty `errors` → the operation succeeded. A body we couldn't parse
+/// returns `false` (we can't prove failure); the coarse-emit path then still
+/// records the side effect, preserving the side-effect ⟹ event invariant.
+fn has_graphql_errors(body: Option<&Value>) -> bool {
+    body.and_then(|b| b.get("errors"))
+        .and_then(|e| e.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+
 /// Evaluate one extractor path against the response. Supports `$.status`,
 /// `$.req.method`, `$.req.path`, `$.resp` (whole body), and `$.resp.<dotted>`
 /// (nested object keys). Returns `None` if the path doesn't resolve.
@@ -240,6 +250,15 @@ pub fn evaluate(
                 return None;
             }
             let body_json: Option<Value> = serde_json::from_slice(&resp.body).ok();
+            // ADR 0059: GraphQL success also requires no top-level `errors`. A 200
+            // carrying a non-empty `errors` array means the operation failed — no
+            // asset (mirrors the REST 422 path). An unparseable body can't be
+            // checked, so it falls through to the coarse-emit below.
+            if entry.success == SuccessRule::NoGraphqlErrors
+                && has_graphql_errors(body_json.as_ref())
+            {
+                return None;
+            }
             for (field, path) in &entry.data {
                 if let Some(v) = extract(path, resp.status, method, req_path, body_json.as_ref()) {
                     data.insert(field.clone(), v);
@@ -285,6 +304,7 @@ mod tests {
             policy: RequestPolicy {
                 methods: vec!["POST".into()],
                 path_globs: vec!["/repos/*/issues".into()],
+                graphql: None,
             },
             provider: "github".into(),
             asset_kind: "issue".into(),

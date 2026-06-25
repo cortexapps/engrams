@@ -1136,6 +1136,8 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
           mint_provider: "",
           methods: ["GET"],
           path_globs: ["/api/v1/slo*"],
+          graphql_operation: "",
+          graphql_field: "",
         },
         {
           hosts: ["api.datadoghq.com"],
@@ -1145,6 +1147,8 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
           mint_provider: "",
           methods: ["GET"],
           path_globs: ["/api/v1/slo*"],
+          graphql_operation: "",
+          graphql_field: "",
         },
       ]);
       expect(policy.observes).toEqual([]);
@@ -1169,13 +1173,17 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       expect(json).toBeDefined();
       const policy = JSON.parse(json!);
       // mint now rides the inject plane (ADR 0056 amendment): minted injects +
-      // an observe. issues:write activates several gated ops (each a minted
-      // inject); the issue observe rides only the create op's asset.
+      // observes. issues:write activates several gated ops — REST endpoints AND
+      // GraphQL mutations (ADR 0059); each a minted inject. The issue asset is
+      // observed on both the REST create and the GraphQL createIssue mutation.
       expect(policy.injects.length).toBeGreaterThan(0);
       expect(policy.injects.every((i: { mint_provider: string }) => i.mint_provider === "github")).toBe(true);
-      expect(policy.observes).toHaveLength(1);
-      expect(policy.observes[0].provider).toBe("github");
-      expect(policy.observes[0].asset_kind).toBe("issue");
+      expect(policy.observes.length).toBeGreaterThan(0);
+      expect(
+        policy.observes.every(
+          (o: { provider: string; asset_kind: string }) => o.provider === "github" && o.asset_kind === "issue",
+        ),
+      ).toBe(true);
     } finally {
       await srv.close();
     }

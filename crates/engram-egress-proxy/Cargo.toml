@@ -27,6 +27,7 @@ sha2.workspace = true
 tls-parser.workspace = true
 nom.workspace = true
 socket2.workspace = true
+async-graphql-parser.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
