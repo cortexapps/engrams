@@ -1,0 +1,91 @@
+/**
+ * The per-source communication seam (ADR 0059 §Communication policy, P1.4).
+ *
+ * "Where does this go" is CODE, not config. The thread workflow (the
+ * framework) owns event classification, identity, session create/resume, the
+ * recv/drain loop, and outbound replay-dedupe (DBOS step checkpoints). A
+ * `CommunicationPolicy` owns ONLY the provider mechanics — how an ack, a
+ * question, an asset, a summary, or a failure is rendered on the source, and
+ * how a thread's new messages are gathered into a prompt. Slack is the only
+ * impl for v1 (P2); Linear/Jira/cron are designed-for (§Future).
+ *
+ * This module is framework-side and DBOS-free: the interface, the pure
+ * event-routing decision the workflow makes per event, and a fake for tests.
+ */
+
+import type { CuratedEvent } from "../control-plane/session-events.ts";
+import type { SourceMention } from "./thread-inbox.ts";
+
+/** A started session, as the thread workflow needs to reference it. */
+export interface StartedSession {
+  id: string;
+  webUrl: string;
+}
+
+/**
+ * The provider seam. Every method is invoked by the framework as a checkpointed
+ * DBOS step, so a completed effect is never re-run on replay. `onUserQuestion`
+ * returns a provider message ref (e.g. a Slack `ts`) the framework holds in
+ * workflow-local state to later update via `onAnswered`.
+ */
+export interface CommunicationPolicy {
+  /** Constant flavor appended to the agent's system prompt at session create
+   *  (ADR 0059 Decision 8) — NOT connector config. */
+  readonly systemPromptAppend: string;
+
+  /** The trigger was picked up (Slack: 👀 on the mention). */
+  onPickup(m: SourceMention): Promise<void>;
+  /** The session started (Slack: ✅ + a link message). */
+  onStarted(m: SourceMention, session: StartedSession): Promise<void>;
+  /** Render an `AskUserQuestion`; return the provider message ref. */
+  onUserQuestion(m: SourceMention, ev: CuratedEvent): Promise<string>;
+  /** A question was answered; `ref` is the value `onUserQuestion` returned. */
+  onAnswered(m: SourceMention, ev: CuratedEvent, ref: string | undefined): Promise<void>;
+  /** Render an asset (a PR `integration_asset` or a `file_shared` artifact). */
+  onAsset(m: SourceMention, ev: CuratedEvent): Promise<void>;
+  /** The session completed successfully — always posts a closing summary. */
+  onComplete(m: SourceMention): Promise<void>;
+  /** A failure (identity, create, or terminal-failure) — ❌ + actionable text. */
+  onFail(m: SourceMention, message: string): Promise<void>;
+  /** Gather thread messages after `since` (null = the whole thread) into a
+   *  prompt; `maxTs` is the newest message seen, the next `since`. */
+  gatherThreadContext(m: SourceMention, since: string | null): Promise<{ prompt: string; maxTs: string }>;
+}
+
+/** The effect a curated session event maps to — the framework's per-event
+ *  classification, consumed by the thread workflow's dispatch. */
+export type SessionEffect =
+  | { kind: "question"; toolCallId: string | undefined }
+  | { kind: "answered"; toolCallId: string | undefined }
+  | { kind: "asset" }
+  | { kind: "ignore" };
+
+/**
+ * Decide which policy method a curated session event drives. Pure. Curated
+ * kinds that render no thread effect (`run_started`/`run_completed`) map to
+ * `ignore` — `run_completed` is NOT terminal (Invariant 2); the closing
+ * summary is driven by `session_terminal`, not here.
+ */
+export function routeSessionEvent(ev: CuratedEvent): SessionEffect {
+  switch (ev.kind) {
+    case "user_question":
+      return { kind: "question", toolCallId: parseToolCallId(ev.payloadJson) };
+    case "question_answered":
+      return { kind: "answered", toolCallId: parseToolCallId(ev.payloadJson) };
+    case "integration_asset":
+    case "file_shared":
+      return { kind: "asset" };
+    default:
+      return { kind: "ignore" };
+  }
+}
+
+/** Extract the `tool_call_id` correlation token from a question payload. */
+function parseToolCallId(payloadJson: string): string | undefined {
+  try {
+    const id: unknown = (JSON.parse(payloadJson) as { tool_call_id?: unknown })?.tool_call_id;
+    return typeof id === "string" ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
