@@ -320,6 +320,65 @@ describe("IAP bridge — missing/invalid assertion → 401", () => {
 
     expect(nextCalled).toBe(true);
   });
+
+  // ADR 0060: Slack webhooks bypass IAP at the GCLB (no-IAP backend) AND must
+  // bypass this in-process bridge, since they carry no assertion/cookie and
+  // self-verify the Slack signing secret. Without the PUBLIC_PATHS exemption
+  // the fail-closed path would 401 them before the handler's signature check.
+  test("Slack events webhook bypasses the bridge with no assertion (IAP active)", async () => {
+    let nextCalled = false;
+    const { req, res, statusCode, getSetCookie } = makeReqRes({
+      url: "/api/v1/integrations/slack/events",
+    });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+    expect(statusCode()).toBe(200);
+    expect(getSetCookie()).toBeUndefined();
+  });
+
+  test("Slack interactivity webhook bypasses the bridge with no assertion (IAP active)", async () => {
+    let nextCalled = false;
+    const { req, res, statusCode } = makeReqRes({
+      url: "/api/v1/integrations/slack/interactivity",
+    });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+    expect(statusCode()).toBe(200);
+  });
+
+  test("Slack webhook with query string is still exempt", async () => {
+    let nextCalled = false;
+    const { req, res } = makeReqRes({
+      url: "/api/v1/integrations/slack/events?foo=bar",
+    });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(true);
+  });
+
+  // A non-exempt path under the same prefix must still fail closed — the
+  // exemption is exact-match, not a prefix, so it can't be widened by a
+  // crafted sub-path.
+  test("non-exempt path under /api/v1/integrations/slack still 401s", async () => {
+    let nextCalled = false;
+    const { req, res, statusCode } = makeReqRes({
+      url: "/api/v1/integrations/slack/events/extra",
+    });
+    await iapBridge(req, res, () => {
+      nextCalled = true;
+    });
+
+    expect(nextCalled).toBe(false);
+    expect(statusCode()).toBe(401);
+  });
 });
 
 // ---------------------------------------------------------------------------

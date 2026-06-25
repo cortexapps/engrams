@@ -36,9 +36,20 @@ spec:
             pathType: {{ .pathType | default "Prefix" }}
             backend:
               service:
+                # Defaults to the web nginx Service (the IAP-protected
+                # surface). A path may set `service:` to retarget that path
+                # at a different backend — e.g. the Slack webhooks point at
+                # the orchestrator, whose own Service carries a no-IAP
+                # BackendConfig so those exact paths bypass IAP (see
+                # values-iap.yaml.example). `tpl` so the value can reference
+                # chart helpers like the orchestrator fullname.
+                {{- if .service }}
+                name: {{ tpl .service $ }}
+                {{- else }}
                 name: {{ include "engram.web.fullname" $ }}
+                {{- end }}
                 port:
-                  name: http
+                  name: {{ .portName | default "http" }}
           {{- end }}
     {{- end }}
 {{- end -}}
