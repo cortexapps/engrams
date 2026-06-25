@@ -1,0 +1,163 @@
+#!/bin/sh
+# engrams SendGrid CLI — a thin wrapper over the SendGrid v3 REST API.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `SENDGRID_API_KEY`
+# placeholder; the egress proxy injects the real, capability-scoped API key
+# (Authorization: Bearer …) on every request to api.sendgrid.com (and strips any
+# token you supply). There is NOTHING to log in to — do not set a real key.
+#
+# Each subcommand needs the matching power on your profile (sendgrid:mail:send,
+# sendgrid:templates:read, sendgrid:contacts:read, sendgrid:contacts:write,
+# sendgrid:lists:read, sendgrid:suppressions:read, sendgrid:suppressions:write,
+# sendgrid:stats:read); a call to a path your profile didn't grant is denied at
+# the network boundary, not authenticated.
+set -eu
+
+API="https://api.sendgrid.com"
+TOKEN="${SENDGRID_API_KEY:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams SendGrid CLI — auth is brokered by the platform (no key to set).
+
+Usage:
+  sendgrid send <to> <from> <subject> <text...>   Send a plain-text email (mail/send)
+  sendgrid templates [field=value ...]            List dynamic templates
+  sendgrid contacts [field=value ...]             List marketing contacts
+  sendgrid contact-search <sql>                   Search contacts by SGQL query
+  sendgrid upsert-contact <json>                  Add/update contacts (PUT marketing/contacts)
+  sendgrid lists [field=value ...]                List marketing lists
+  sendgrid bounces [field=value ...]              List bounce suppressions
+  sendgrid stats [field=value ...]                Global email stats (needs start_date=YYYY-MM-DD)
+  sendgrid scopes                                 Show the API key's granted scopes
+  sendgrid get <path> [field=value ...]           Raw GET of any /v3 path with query params
+  sendgrid api <METHOD> <path> [json-body]        Raw call with an optional JSON body
+
+Paths may be given with or without the leading /v3. Responses are JSON.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# Normalize a path: ensure a single leading slash and a /v3 prefix.
+norm_path() {
+    p="$1"
+    case "$p" in
+        /*) : ;;
+        *) p="/$p" ;;
+    esac
+    case "$p" in
+        /v3/*) : ;;
+        /v3) : ;;
+        *) p="/v3$p" ;;
+    esac
+    printf '%s' "$p"
+}
+
+# req <METHOD> <path> [curl-args...] — call the v3 API with brokered auth.
+req() {
+    method="$1"
+    path="$2"
+    shift 2
+    curl -sS -X "$method" "$API$(norm_path "$path")" \
+        -H "Authorization: Bearer $TOKEN" \
+        "$@" | pretty
+}
+
+# Build a query string from field=value args into $REPLY (POSIX-safe, no arrays).
+# Sets a global QUERY ("" if no args).
+build_query() {
+    QUERY=""
+    sep="?"
+    for kv in "$@"; do
+        QUERY="${QUERY}${sep}${kv}"
+        sep="&"
+    done
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+send)
+    to="${1:?usage: sendgrid send <to> <from> <subject> <text...>}"
+    from="${2:?usage: sendgrid send <to> <from> <subject> <text...>}"
+    subject="${3:?usage: sendgrid send <to> <from> <subject> <text...>}"
+    shift 3
+    body="$*"
+    # Build the v3 mail/send JSON. jq (when present) handles escaping safely.
+    if command -v jq >/dev/null 2>&1; then
+        payload=$(jq -n \
+            --arg to "$to" --arg from "$from" --arg subject "$subject" --arg body "$body" \
+            '{personalizations:[{to:[{email:$to}]}],from:{email:$from},subject:$subject,content:[{type:"text/plain",value:$body}]}')
+    else
+        payload="{\"personalizations\":[{\"to\":[{\"email\":\"$to\"}]}],\"from\":{\"email\":\"$from\"},\"subject\":\"$subject\",\"content\":[{\"type\":\"text/plain\",\"value\":\"$body\"}]}"
+    fi
+    req POST /v3/mail/send -H "Content-Type: application/json" --data "$payload"
+    ;;
+templates)
+    # Default to dynamic generations if the caller passed no filters.
+    if [ "$#" -eq 0 ]; then set -- "generations=dynamic"; fi
+    build_query "$@"
+    req GET "/v3/templates${QUERY}"
+    ;;
+contacts)
+    build_query "$@"
+    req GET "/v3/marketing/contacts${QUERY}"
+    ;;
+contact-search)
+    sql="${1:?usage: sendgrid contact-search <sql>}"
+    if command -v jq >/dev/null 2>&1; then
+        payload=$(jq -n --arg q "$sql" '{query:$q}')
+    else
+        payload="{\"query\":\"$sql\"}"
+    fi
+    req POST /v3/marketing/contacts/search -H "Content-Type: application/json" --data "$payload"
+    ;;
+upsert-contact)
+    json="${1:?usage: sendgrid upsert-contact <json>}"
+    req PUT /v3/marketing/contacts -H "Content-Type: application/json" --data "$json"
+    ;;
+lists)
+    build_query "$@"
+    req GET "/v3/marketing/lists${QUERY}"
+    ;;
+bounces)
+    build_query "$@"
+    req GET "/v3/suppression/bounces${QUERY}"
+    ;;
+stats)
+    build_query "$@"
+    req GET "/v3/stats${QUERY}"
+    ;;
+scopes)
+    req GET /v3/scopes
+    ;;
+get)
+    path="${1:?usage: sendgrid get <path> [field=value ...]}"
+    shift
+    build_query "$@"
+    req GET "$(norm_path "$path")${QUERY}"
+    ;;
+api)
+    method="${1:?usage: sendgrid api <METHOD> <path> [json-body]}"
+    path="${2:?usage: sendgrid api <METHOD> <path> [json-body]}"
+    json="${3:-}"
+    if [ -n "$json" ]; then
+        req "$method" "$path" -H "Content-Type: application/json" --data "$json"
+    else
+        req "$method" "$path"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "sendgrid: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

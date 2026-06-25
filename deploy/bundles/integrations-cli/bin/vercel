@@ -1,0 +1,134 @@
+#!/bin/sh
+# engrams Vercel CLI — a thin wrapper over the Vercel REST API (api.vercel.com).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `VERCEL_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped access token
+# (Authorization: Bearer …) on every request to api.vercel.com (and strips any
+# token you supply). There is NOTHING to log in to — do not set a real token or
+# run any `login`. This is NOT the official `vercel` deploy CLI; it is a REST
+# wrapper for inspecting an account from inside a session.
+#
+# Each subcommand needs the matching power on your profile (vercel:user:read,
+# vercel:projects:read, vercel:projects:write, vercel:deployments:read,
+# vercel:deployments:write, vercel:domains:read, vercel:teams:read); calls to a
+# path/method your profile didn't grant are denied at the network boundary, not
+# authenticated.
+set -eu
+
+API="https://api.vercel.com"
+TOKEN="${VERCEL_TOKEN:-x-engrams-managed}"
+AUTH="Authorization: Bearer $TOKEN"
+
+usage() {
+    cat <<'EOF'
+engrams Vercel CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  vercel whoami                              Current user (GET /v2/user)
+  vercel projects [key=value ...]            List projects (GET /v10/projects)
+  vercel env <projectIdOrName> [key=value]   Project env vars (GET /v10/projects/<id>/env)
+  vercel deployments [key=value ...]         List deployments (GET /v7/deployments)
+  vercel deployment <idOrUrl> [key=value]    One deployment (GET /v13/deployments/<id>)
+  vercel logs <idOrUrl> [key=value ...]      Build logs (GET /v3/deployments/<id>/events)
+  vercel domains [key=value ...]             List domains (GET /v5/domains)
+  vercel teams [key=value ...]               List teams (GET /v2/teams)
+  vercel get <path> [key=value ...]          Raw GET: GET https://api.vercel.com<path> ?key=value
+  vercel api <METHOD> <path> [json-body]     Raw call with a JSON body (POST/PATCH/DELETE/…)
+
+Add `team=<teamId>` (or `--team <teamId>`) to any GET to act on a team scope —
+it is sent as the `?teamId=` query param. Vercel replies with JSON; errors come
+back as {"error":{"code":"…","message":"…"}} with a 4xx/5xx status.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# api <METHOD> <path> [curl-args...] — raw call to the Vercel API with brokered auth.
+api() {
+    method="$1"
+    path="$2"
+    shift 2
+    curl -sS -X "$method" "$API$path" -H "$AUTH" "$@" | pretty
+}
+
+# get_q <path> [key=value ...] — GET <path> with key=value pairs as query params.
+# A bare `team=<id>` is rewritten to the API's `teamId=<id>` param for convenience.
+get_q() {
+    qpath="$1"
+    shift
+    # Build a newline-delimited "--data-urlencode\n<kv>\n…" list, rewriting team=.
+    flags=$(for kv in "$@"; do
+        kv=$(printf '%s' "$kv" | sed 's/^team=/teamId=/')
+        printf '%s\n%s\n' '--data-urlencode' "$kv"
+    done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    curl -sS --get "$API$qpath" -H "$AUTH" "$@" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    get_q /v2/user "$@"
+    ;;
+projects)
+    get_q /v10/projects "$@"
+    ;;
+env)
+    proj="${1:?usage: vercel env <projectIdOrName> [key=value ...]}"
+    shift
+    get_q "/v10/projects/$proj/env" "$@"
+    ;;
+deployments)
+    get_q /v7/deployments "$@"
+    ;;
+deployment)
+    id="${1:?usage: vercel deployment <idOrUrl> [key=value ...]}"
+    shift
+    get_q "/v13/deployments/$id" "$@"
+    ;;
+logs)
+    id="${1:?usage: vercel logs <idOrUrl> [key=value ...]}"
+    shift
+    get_q "/v3/deployments/$id/events" "$@"
+    ;;
+domains)
+    get_q /v5/domains "$@"
+    ;;
+teams)
+    get_q /v2/teams "$@"
+    ;;
+get)
+    path="${1:?usage: vercel get <path> [key=value ...]}"
+    shift
+    get_q "$path" "$@"
+    ;;
+api)
+    method="${1:?usage: vercel api <METHOD> <path> [json-body]}"
+    path="${2:?usage: vercel api <METHOD> <path> [json-body]}"
+    shift 2
+    body="${1:-}"
+    if [ -n "$body" ]; then
+        api "$method" "$path" -H "Content-Type: application/json" --data "$body"
+    else
+        api "$method" "$path"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "vercel: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

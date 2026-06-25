@@ -1,0 +1,176 @@
+#!/bin/sh
+# engrams CircleCI CLI — a thin wrapper over the CircleCI API v2.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `CIRCLECI_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped personal API
+# token in the `Circle-Token` header on every request to circleci.com (and strips
+# any token you supply). There is NOTHING to log in to — do not set a real token
+# or run any `login`.
+#
+# Each subcommand needs the matching power on your profile (circleci:pipelines:read,
+# circleci:pipelines:write, circleci:workflows:read, circleci:workflows:write,
+# circleci:jobs:read, circleci:jobs:write, circleci:projects:read,
+# circleci:insights:read); calls to a path your profile didn't grant are denied at
+# the network boundary, not authenticated.
+#
+# Projects are addressed by a slug <vcs>/<org>/<repo>, where <vcs> is `gh`
+# (GitHub) or `bb` (Bitbucket), e.g. gh/acme/widgets.
+set -eu
+
+API="https://circleci.com/api/v2"
+TOKEN="${CIRCLECI_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams CircleCI CLI — auth is brokered by the platform (no token to set).
+
+Project slug: <vcs>/<org>/<repo>  (vcs = gh | bb), e.g. gh/acme/widgets.
+
+Usage:
+  circle whoami                              Current user (GET /me)
+  circle project <slug>                      Project details
+  circle pipelines <slug>                    List a project's pipelines
+  circle pipeline <pipeline-id>              Show one pipeline
+  circle pipeline-workflows <pipeline-id>    List a pipeline's workflows
+  circle trigger <slug> [k=v ...]            Trigger a new pipeline (POST)
+  circle workflow <workflow-id>              Show one workflow
+  circle workflow-jobs <workflow-id>         List a workflow's jobs
+  circle cancel-workflow <workflow-id>       Cancel a workflow (POST)
+  circle rerun-workflow <workflow-id> [k=v]  Rerun a workflow (POST)
+  circle job <slug> <job-number>             Job details
+  circle artifacts <slug> <job-number>       List job artifacts
+  circle cancel-job <slug> <job-number>      Cancel a job (POST)
+  circle insights <slug>                     Workflow metrics
+  circle get <path>                          Raw GET, path relative to /api/v2
+  circle api <METHOD> <path> [k=v ...]       Raw call; k=v become a JSON body
+
+Each subcommand needs the matching power on your profile; ungranted paths are
+denied at the network boundary, not authenticated.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# req <METHOD> <path> [curl-args...] — call the API with brokered auth. <path> is
+# relative to /api/v2 (leading slash optional).
+req() {
+    m="$1"
+    path="$2"
+    shift 2
+    case "$path" in
+    /*) url="$API$path" ;;
+    *) url="$API/$path" ;;
+    esac
+    curl -sS -X "$m" "$url" -H "Circle-Token: $TOKEN" -H "Accept: application/json" "$@" | pretty
+}
+
+# Build a JSON object body from field=value args (POSIX-safe, no arrays).
+# Strings only — sufficient for branch/tag and simple parameters.
+json_body() {
+    first=1
+    printf '{'
+    for kv in "$@"; do
+        k=${kv%%=*}
+        v=${kv#*=}
+        # Escape backslashes and double quotes for JSON string literals.
+        v=$(printf '%s' "$v" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        [ "$first" -eq 1 ] || printf ','
+        printf '"%s":"%s"' "$k" "$v"
+        first=0
+    done
+    printf '}'
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    req GET me
+    ;;
+project)
+    slug="${1:?usage: circle project <slug>}"
+    req GET "project/$slug"
+    ;;
+pipelines)
+    slug="${1:?usage: circle pipelines <slug>}"
+    req GET "project/$slug/pipeline"
+    ;;
+pipeline)
+    id="${1:?usage: circle pipeline <pipeline-id>}"
+    req GET "pipeline/$id"
+    ;;
+pipeline-workflows)
+    id="${1:?usage: circle pipeline-workflows <pipeline-id>}"
+    req GET "pipeline/$id/workflow"
+    ;;
+trigger)
+    slug="${1:?usage: circle trigger <slug> [k=v ...]}"
+    shift
+    body=$(json_body "$@")
+    req POST "project/$slug/pipeline" -H "Content-Type: application/json" --data "$body"
+    ;;
+workflow)
+    id="${1:?usage: circle workflow <workflow-id>}"
+    req GET "workflow/$id"
+    ;;
+workflow-jobs)
+    id="${1:?usage: circle workflow-jobs <workflow-id>}"
+    req GET "workflow/$id/job"
+    ;;
+cancel-workflow)
+    id="${1:?usage: circle cancel-workflow <workflow-id>}"
+    req POST "workflow/$id/cancel"
+    ;;
+rerun-workflow)
+    id="${1:?usage: circle rerun-workflow <workflow-id> [k=v ...]}"
+    shift
+    body=$(json_body "$@")
+    req POST "workflow/$id/rerun" -H "Content-Type: application/json" --data "$body"
+    ;;
+job)
+    slug="${1:?usage: circle job <slug> <job-number>}"
+    num="${2:?usage: circle job <slug> <job-number>}"
+    req GET "project/$slug/job/$num"
+    ;;
+artifacts)
+    slug="${1:?usage: circle artifacts <slug> <job-number>}"
+    num="${2:?usage: circle artifacts <slug> <job-number>}"
+    req GET "project/$slug/$num/artifacts"
+    ;;
+cancel-job)
+    slug="${1:?usage: circle cancel-job <slug> <job-number>}"
+    num="${2:?usage: circle cancel-job <slug> <job-number>}"
+    req POST "project/$slug/job/$num/cancel"
+    ;;
+insights)
+    slug="${1:?usage: circle insights <slug>}"
+    req GET "insights/$slug/workflows"
+    ;;
+get)
+    path="${1:?usage: circle get <path>}"
+    req GET "$path"
+    ;;
+api)
+    m="${1:?usage: circle api <METHOD> <path> [k=v ...]}"
+    path="${2:?usage: circle api <METHOD> <path> [k=v ...]}"
+    shift 2
+    if [ "$#" -gt 0 ]; then
+        body=$(json_body "$@")
+        req "$m" "$path" -H "Content-Type: application/json" --data "$body"
+    else
+        req "$m" "$path"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "circle: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

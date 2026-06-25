@@ -1,0 +1,131 @@
+#!/bin/sh
+# engrams New Relic CLI — a thin wrapper over NerdGraph (GraphQL) + the REST v2 API.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `NEW_RELIC_API_KEY`
+# placeholder; the egress proxy injects the real, capability-scoped user API key
+# in the `Api-Key` header on every request to api.newrelic.com (and strips any
+# key you supply). There is NOTHING to log in to — do not set a real key or run
+# any `login`.
+#
+# Each subcommand needs the matching power on your profile:
+#   - `newrelic graphql` / `nrql` / `whoami`  -> new_relic:nerdgraph:query
+#   - `newrelic apps`                          -> new_relic:applications:read
+#   - `newrelic transactions`                  -> new_relic:transactions:read
+#   - `newrelic policies`                      -> new_relic:alerts:read
+#   - `newrelic users`                         -> new_relic:users:read
+# Calls to a path your profile didn't grant are denied at the network boundary,
+# not authenticated.
+set -eu
+
+GRAPHQL="https://api.newrelic.com/graphql"
+REST="https://api.newrelic.com/v2"
+KEY="${NEW_RELIC_API_KEY:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams New Relic CLI — auth is brokered by the platform (no key to set).
+
+NerdGraph (GraphQL) — the primary API, a single POST endpoint; one coarse power
+(new_relic:nerdgraph:query) grants all of it:
+  newrelic graphql '<query>'                Run an arbitrary GraphQL query/mutation
+  newrelic nrql <accountId> '<NRQL>'        Run an NRQL query via NerdGraph
+  newrelic whoami                           Show the authenticated user (actor.user)
+
+REST v2 helpers (each GET is its own power):
+  newrelic apps [field=value ...]           List APM applications  (applications:read)
+  newrelic transactions [field=value ...]   List key transactions  (transactions:read)
+  newrelic policies [field=value ...]       List alert policies    (alerts:read)
+  newrelic users [field=value ...]          List account users     (users:read)
+  newrelic rest <path> [field=value ...]    Raw REST v2 GET; <path> is relative to
+                                            /v2/ (e.g. `rest alerts_conditions.json
+                                            policy_id=123`). Power depends on the
+                                            resource you hit.
+
+NerdGraph always replies HTTP 200 with a JSON body; errors arrive in the
+`errors` array. REST v2 returns conventional status codes.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# graphql_query <query-string> — POST a GraphQL document to NerdGraph with brokered auth.
+graphql_query() {
+    q="$1"
+    # Build the JSON request body with jq when available (robust escaping);
+    # fall back to a minimal manual escape of backslashes and double quotes.
+    if command -v jq >/dev/null 2>&1; then
+        body=$(jq -n --arg q "$q" '{query: $q}')
+    else
+        esc=$(printf '%s' "$q" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g')
+        body="{\"query\":\"$esc\"}"
+    fi
+    curl -sS -X POST "$GRAPHQL" \
+        -H "Api-Key: $KEY" \
+        -H "Content-Type: application/json" \
+        --data "$body" | pretty
+}
+
+# rest_get <path> [field=value ...] — GET a REST v2 resource with brokered auth.
+rest_get() {
+    path="$1"
+    shift
+    set -- "$@"
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    # -G moves --data-urlencode pairs into the query string for a GET.
+    curl -sS -G "$REST/$path" -H "Api-Key: $KEY" "$@" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+graphql)
+    q="${1:?usage: newrelic graphql '<query>'}"
+    graphql_query "$q"
+    ;;
+nrql)
+    acct="${1:?usage: newrelic nrql <accountId> '<NRQL>'}"
+    nrql="${2:?usage: newrelic nrql <accountId> '<NRQL>'}"
+    # Embed the NRQL inside an actor.account.nrql GraphQL query. Escape any
+    # double quotes in the NRQL so the GraphQL string literal stays valid.
+    nrql_esc=$(printf '%s' "$nrql" | sed 's/"/\\"/g')
+    graphql_query "{ actor { account(id: $acct) { nrql(query: \"$nrql_esc\") { results } } } }"
+    ;;
+whoami)
+    graphql_query "{ actor { user { id name email } } }"
+    ;;
+apps)
+    rest_get "applications.json" "$@"
+    ;;
+transactions)
+    rest_get "key_transactions.json" "$@"
+    ;;
+policies)
+    rest_get "alerts_policies.json" "$@"
+    ;;
+users)
+    rest_get "users.json" "$@"
+    ;;
+rest)
+    path="${1:?usage: newrelic rest <path> [field=value ...]}"
+    shift
+    rest_get "$path" "$@"
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "newrelic: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

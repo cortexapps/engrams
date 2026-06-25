@@ -1,0 +1,171 @@
+#!/bin/sh
+# engrams HubSpot CLI — a thin wrapper over the HubSpot CRM v3 REST API.
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `HUBSPOT_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped private app
+# access token on every request to api.hubapi.com (and strips any token you
+# supply). There is NOTHING to log in to — do not set a real token or run any
+# `login`.
+#
+# Each subcommand needs the matching power on your profile (hubspot:contacts:read,
+# hubspot:contacts:write, hubspot:companies:read, …, hubspot:owners:read,
+# hubspot:properties:read); calls to a path your profile didn't grant are denied
+# at the network boundary, not authenticated.
+set -eu
+
+API="https://api.hubapi.com"
+TOKEN="${HUBSPOT_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams HubSpot CLI — auth is brokered by the platform (no token to set).
+
+<object> is one of: contacts | companies | deals | tickets
+
+Usage:
+  hubspot list <object> [field=value ...]       List records (GET /crm/v3/objects/<object>)
+  hubspot get <object> <id> [field=value ...]   Get one record by id
+  hubspot search <object> <prop> <op> <value>   Filtered search (POST .../search)
+  hubspot create <object> prop=value [...]       Create a record (POST)
+  hubspot update <object> <id> prop=value [...]  Update a record (PATCH)
+  hubspot owners [email=foo@bar.com]            List owners (GET /crm/v3/owners)
+  hubspot properties <object>                   List property metadata (GET /crm/v3/properties/<object>)
+  hubspot whoami                                Account details (GET /account-info/v3/details)
+  hubspot api <METHOD> <path> [field=value ...] Raw call. GET/HEAD → query params; else JSON body.
+
+search <op> is a HubSpot filter operator: EQ NEQ GT GTE LT LTE BETWEEN IN NOT_IN
+HAS_PROPERTY NOT_HAS_PROPERTY CONTAINS_TOKEN NOT_CONTAINS_TOKEN.
+HubSpot replies with JSON; errors look like
+{"status":"error","message":"...","category":"..."} with a 4xx/5xx status.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# query <path> [field=value ...] — GET, turning field=value into --data-urlencode.
+query() {
+    path="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    curl -sS -G "$API$path" -H "Authorization: Bearer $TOKEN" "$@" | pretty
+}
+
+# Build a JSON object {"properties":{...}} from prop=value pairs (POSIX, no jq dep).
+# Escapes backslash and double-quote in keys and values.
+json_props() {
+    out=""
+    for kv in "$@"; do
+        k=${kv%%=*}
+        v=${kv#*=}
+        k=$(printf '%s' "$k" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        v=$(printf '%s' "$v" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ -n "$out" ]; then out="$out,"; fi
+        out="$out\"$k\":\"$v\""
+    done
+    printf '{"properties":{%s}}' "$out"
+}
+
+# post_json <path> <json-body>
+post_json() {
+    curl -sS -X POST "$API$1" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$2" | pretty
+}
+
+# patch_json <path> <json-body>
+patch_json() {
+    curl -sS -X PATCH "$API$1" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$2" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+list)
+    obj="${1:?usage: hubspot list <object> [field=value ...]}"
+    shift
+    query "/crm/v3/objects/$obj" "$@"
+    ;;
+get)
+    obj="${1:?usage: hubspot get <object> <id> [field=value ...]}"
+    id="${2:?usage: hubspot get <object> <id> [field=value ...]}"
+    shift 2
+    query "/crm/v3/objects/$obj/$id" "$@"
+    ;;
+search)
+    obj="${1:?usage: hubspot search <object> <prop> <op> <value>}"
+    prop="${2:?usage: hubspot search <object> <prop> <op> <value>}"
+    op="${3:?usage: hubspot search <object> <prop> <op> <value>}"
+    val="${4:?usage: hubspot search <object> <prop> <op> <value>}"
+    # Escape the value for JSON.
+    ev=$(printf '%s' "$val" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    body="{\"filterGroups\":[{\"filters\":[{\"propertyName\":\"$prop\",\"operator\":\"$op\",\"value\":\"$ev\"}]}]}"
+    post_json "/crm/v3/objects/$obj/search" "$body"
+    ;;
+create)
+    obj="${1:?usage: hubspot create <object> prop=value [...]}"
+    shift
+    [ "$#" -gt 0 ] || { echo "hubspot create: need at least one prop=value" >&2; exit 2; }
+    post_json "/crm/v3/objects/$obj" "$(json_props "$@")"
+    ;;
+update)
+    obj="${1:?usage: hubspot update <object> <id> prop=value [...]}"
+    id="${2:?usage: hubspot update <object> <id> prop=value [...]}"
+    shift 2
+    [ "$#" -gt 0 ] || { echo "hubspot update: need at least one prop=value" >&2; exit 2; }
+    patch_json "/crm/v3/objects/$obj/$id" "$(json_props "$@")"
+    ;;
+owners)
+    query "/crm/v3/owners" "$@"
+    ;;
+properties)
+    obj="${1:?usage: hubspot properties <object>}"
+    shift
+    query "/crm/v3/properties/$obj" "$@"
+    ;;
+whoami)
+    query "/account-info/v3/details"
+    ;;
+api)
+    m="${1:?usage: hubspot api <METHOD> <path> [field=value ...]}"
+    path="${2:?usage: hubspot api <METHOD> <path> [field=value ...]}"
+    shift 2
+    M=$(printf '%s' "$m" | tr 'a-z' 'A-Z')
+    case "$M" in
+    GET | HEAD)
+        query "$path" "$@"
+        ;;
+    *)
+        if [ "$#" -gt 0 ]; then
+            curl -sS -X "$M" "$API$path" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "$(json_props "$@")" | pretty
+        else
+            curl -sS -X "$M" "$API$path" -H "Authorization: Bearer $TOKEN" | pretty
+        fi
+        ;;
+    esac
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "hubspot: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

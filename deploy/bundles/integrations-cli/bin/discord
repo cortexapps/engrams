@@ -1,0 +1,169 @@
+#!/bin/sh
+# engrams Discord CLI — a thin wrapper over the Discord REST API (v10).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `DISCORD_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped bot token
+# (`Authorization: Bot <token>`) on every request to discord.com (and strips any
+# token you supply). There is NOTHING to log in to — do not set a real token or
+# run any `login`.
+#
+# Each subcommand needs the matching power on your profile (discord:messages:read,
+# discord:messages:write, discord:channels:read, discord:guilds:read,
+# discord:users:read, discord:dms:write); a call to a path your profile didn't
+# grant is denied at the network boundary, not authenticated.
+#
+# Channel/guild/user IDs are non-secret snowflake args you pass on the command line.
+set -eu
+
+API="https://discord.com/api/v10"
+TOKEN="${DISCORD_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Discord CLI (REST v10) — auth is brokered by the platform (no token to set).
+
+Usage:
+  discord whoami                                Show the bot identity (GET /users/@me)
+  discord messages <channel-id> [limit]         List recent messages (default limit 50)
+  discord post <channel-id> <text...>           Post a message
+  discord edit <channel-id> <message-id> <txt>  Edit a message
+  discord delete <channel-id> <message-id>      Delete a message
+  discord channel <channel-id>                  Fetch a channel
+  discord guild <guild-id>                       Fetch a guild
+  discord members <guild-id> [limit]            List guild members (default limit 100)
+  discord dm <user-id> <text...>                Open a DM channel and post to it
+  discord get <path>                             Raw GET under /api/v10 (e.g. /users/@me)
+  discord api <METHOD> <path> [json-body]        Raw call under /api/v10
+
+IDs are snowflakes (e.g. 80351110224678912). Discord returns JSON on success and
+{"message":"...","code":...} on error.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# req <METHOD> <path> [curl-args...] — call the API with brokered auth.
+req() {
+    method="$1"
+    path="$2"
+    shift 2
+    curl -sS -X "$method" "$API$path" \
+        -H "Authorization: Bot $TOKEN" \
+        -H "User-Agent: engrams-discord-cli (https://github.com/cortexapps/engrams, 1.0)" \
+        "$@" | pretty
+}
+
+# req_json <METHOD> <path> <json-body> — call with a JSON body.
+req_json() {
+    method="$1"
+    path="$2"
+    body="$3"
+    req "$method" "$path" -H "Content-Type: application/json" --data "$body"
+}
+
+# json_escape <text> — wrap a plain string into a JSON string literal.
+json_escape() {
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$1" | jq -Rs .
+    else
+        # Minimal fallback: escape backslash and double-quote, collapse newlines.
+        esc=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        printf '"%s"' "$esc"
+    fi
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    req GET /users/@me
+    ;;
+messages)
+    ch="${1:?usage: discord messages <channel-id> [limit]}"
+    limit="${2:-50}"
+    req GET "/channels/$ch/messages?limit=$limit"
+    ;;
+post)
+    ch="${1:?usage: discord post <channel-id> <text...>}"
+    shift
+    content=$(json_escape "$*")
+    req_json POST "/channels/$ch/messages" "{\"content\":$content}"
+    ;;
+edit)
+    ch="${1:?usage: discord edit <channel-id> <message-id> <text...>}"
+    msg="${2:?usage: discord edit <channel-id> <message-id> <text...>}"
+    shift 2
+    content=$(json_escape "$*")
+    req_json PATCH "/channels/$ch/messages/$msg" "{\"content\":$content}"
+    ;;
+delete)
+    ch="${1:?usage: discord delete <channel-id> <message-id>}"
+    msg="${2:?usage: discord delete <channel-id> <message-id>}"
+    req DELETE "/channels/$ch/messages/$msg"
+    ;;
+channel)
+    ch="${1:?usage: discord channel <channel-id>}"
+    req GET "/channels/$ch"
+    ;;
+guild)
+    g="${1:?usage: discord guild <guild-id>}"
+    req GET "/guilds/$g"
+    ;;
+members)
+    g="${1:?usage: discord members <guild-id> [limit]}"
+    limit="${2:-100}"
+    req GET "/guilds/$g/members?limit=$limit"
+    ;;
+dm)
+    user="${1:?usage: discord dm <user-id> <text...>}"
+    shift
+    recipient=$(json_escape "$user")
+    dm_ch=$(req_json POST /users/@me/channels "{\"recipient_id\":$recipient}")
+    if command -v jq >/dev/null 2>&1; then
+        ch=$(printf '%s' "$dm_ch" | jq -r '.id // empty')
+    else
+        ch=$(printf '%s' "$dm_ch" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' | head -n 1)
+    fi
+    if [ -z "$ch" ]; then
+        echo "discord: could not open DM channel" >&2
+        printf '%s\n' "$dm_ch" >&2
+        exit 1
+    fi
+    content=$(json_escape "$*")
+    req_json POST "/channels/$ch/messages" "{\"content\":$content}"
+    ;;
+get)
+    path="${1:?usage: discord get <path>}"
+    case "$path" in
+    /*) : ;;
+    *) path="/$path" ;;
+    esac
+    req GET "$path"
+    ;;
+api)
+    method="${1:?usage: discord api <METHOD> <path> [json-body]}"
+    path="${2:?usage: discord api <METHOD> <path> [json-body]}"
+    body="${3:-}"
+    case "$path" in
+    /*) : ;;
+    *) path="/$path" ;;
+    esac
+    if [ -n "$body" ]; then
+        req_json "$method" "$path" "$body"
+    else
+        req "$method" "$path"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "discord: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

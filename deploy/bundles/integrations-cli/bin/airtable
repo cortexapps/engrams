@@ -1,0 +1,162 @@
+#!/bin/sh
+# engrams Airtable CLI — a thin wrapper over the Airtable Web API (v0).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `AIRTABLE_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped personal
+# access token on every request to api.airtable.com (and strips any token you
+# supply). There is NOTHING to log in to — do not set a real token.
+#
+# Each subcommand needs the matching power on your profile (airtable:bases:read,
+# airtable:schema:read, airtable:records:read, airtable:records:write,
+# airtable:comments:read, airtable:comments:write); calls to a path/method your
+# profile didn't grant are denied at the network boundary, not authenticated.
+#
+# Base ids (appXXXXXXXXXXXXXX) and table names/ids (Tasks / tblXXXXXXXXXXXXXX)
+# are NON-secret arguments. The PAT is scoped to specific bases at creation.
+set -eu
+
+API="https://api.airtable.com/v0"
+TOKEN="${AIRTABLE_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Airtable CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  airtable whoami                                 Token owner + scopes (meta/whoami)
+  airtable bases                                  List accessible bases (meta/bases)
+  airtable schema <baseId>                        List tables/fields/views (meta/bases/<baseId>/tables)
+  airtable list <baseId> <table> [field=value …]  List records (e.g. maxRecords=10, view=Grid)
+  airtable get <baseId> <table> <recordId>        Fetch one record
+  airtable create <baseId> <table> <json>         Create records: {"records":[{"fields":{…}}]}
+  airtable update <baseId> <table> <json>         PATCH records: {"records":[{"id":"rec…","fields":{…}}]}
+  airtable delete <baseId> <table> <recordId>     Delete one record
+  airtable comments <baseId> <table> <recordId>   List a record's comments
+  airtable comment <baseId> <table> <recordId> <text…>   Add a comment
+  airtable get-raw <path>                          GET an arbitrary /v0 path
+  airtable api <METHOD> <path> [<json>]            Any method; JSON body as application/json
+
+<baseId> is like appXXXXXXXXXXXXXX; <table> is a table name or tblXXXXXXXXXXXXXX.
+Responses are JSON; success is HTTP 200, failures return {"error":{…}} with a 4xx.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# req <METHOD> <path> [curl-args...] — call the Airtable API with brokered auth.
+# <path> is appended to the /v0 base.
+req() {
+    method="$1"
+    path="$2"
+    shift 2
+    curl -sS -X "$method" "$API$path" -H "Authorization: Bearer $TOKEN" "$@" | pretty
+}
+
+# get_q <path> [field=value...] — GET with each field=value as a query param.
+get_q() {
+    path="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    # -G folds the --data-urlencode pairs into the query string on a GET.
+    req GET "$path" -G "$@"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    req GET "/meta/whoami"
+    ;;
+bases)
+    get_q "/meta/bases" "$@"
+    ;;
+schema)
+    base="${1:?usage: airtable schema <baseId>}"
+    req GET "/meta/bases/$base/tables"
+    ;;
+list)
+    base="${1:?usage: airtable list <baseId> <table> [field=value …]}"
+    table="${2:?usage: airtable list <baseId> <table> [field=value …]}"
+    shift 2
+    get_q "/$base/$table" "$@"
+    ;;
+get)
+    base="${1:?usage: airtable get <baseId> <table> <recordId>}"
+    table="${2:?usage: airtable get <baseId> <table> <recordId>}"
+    rec="${3:?usage: airtable get <baseId> <table> <recordId>}"
+    req GET "/$base/$table/$rec"
+    ;;
+create)
+    base="${1:?usage: airtable create <baseId> <table> <json>}"
+    table="${2:?usage: airtable create <baseId> <table> <json>}"
+    body="${3:?usage: airtable create <baseId> <table> <json>}"
+    req POST "/$base/$table" -H "Content-Type: application/json" --data "$body"
+    ;;
+update)
+    base="${1:?usage: airtable update <baseId> <table> <json>}"
+    table="${2:?usage: airtable update <baseId> <table> <json>}"
+    body="${3:?usage: airtable update <baseId> <table> <json>}"
+    req PATCH "/$base/$table" -H "Content-Type: application/json" --data "$body"
+    ;;
+delete)
+    base="${1:?usage: airtable delete <baseId> <table> <recordId>}"
+    table="${2:?usage: airtable delete <baseId> <table> <recordId>}"
+    rec="${3:?usage: airtable delete <baseId> <table> <recordId>}"
+    req DELETE "/$base/$table/$rec"
+    ;;
+comments)
+    base="${1:?usage: airtable comments <baseId> <table> <recordId>}"
+    table="${2:?usage: airtable comments <baseId> <table> <recordId>}"
+    rec="${3:?usage: airtable comments <baseId> <table> <recordId>}"
+    req GET "/$base/$table/$rec/comments"
+    ;;
+comment)
+    base="${1:?usage: airtable comment <baseId> <table> <recordId> <text…>}"
+    table="${2:?usage: airtable comment <baseId> <table> <recordId> <text…>}"
+    rec="${3:?usage: airtable comment <baseId> <table> <recordId> <text…>}"
+    shift 3
+    text="$*"
+    [ -n "$text" ] || { echo "airtable: comment text is required" >&2; exit 2; }
+    # Build the JSON body via jq when available (safe escaping); else a naive fallback.
+    if command -v jq >/dev/null 2>&1; then
+        body=$(jq -n --arg t "$text" '{text: $t}')
+    else
+        body="{\"text\":\"$text\"}"
+    fi
+    req POST "/$base/$table/$rec/comments" -H "Content-Type: application/json" --data "$body"
+    ;;
+get-raw)
+    path="${1:?usage: airtable get-raw <path>}"
+    case "$path" in /*) ;; *) path="/$path" ;; esac
+    req GET "$path"
+    ;;
+api)
+    method="${1:?usage: airtable api <METHOD> <path> [<json>]}"
+    path="${2:?usage: airtable api <METHOD> <path> [<json>]}"
+    body="${3:-}"
+    case "$path" in /*) ;; *) path="/$path" ;; esac
+    if [ -n "$body" ]; then
+        req "$method" "$path" -H "Content-Type: application/json" --data "$body"
+    else
+        req "$method" "$path"
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "airtable: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

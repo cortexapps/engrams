@@ -1,0 +1,164 @@
+#!/bin/sh
+# engrams Figma CLI — a thin wrapper over the Figma REST API (v1).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `FIGMA_TOKEN`
+# placeholder; the egress proxy injects the real, capability-scoped personal
+# access token in the `X-Figma-Token` header on every request to api.figma.com
+# (and strips any token you supply). There is NOTHING to log in to — do not set
+# a real token or run any `login`.
+#
+# Each subcommand needs the matching power on your profile (figma:me:read,
+# figma:files:read, figma:images:read, figma:comments:read, figma:comments:write,
+# figma:projects:read, figma:components:read); calls to a path your profile
+# didn't grant are denied at the network boundary, not authenticated.
+set -eu
+
+API="https://api.figma.com"
+TOKEN="${FIGMA_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<'EOF'
+engrams Figma CLI — auth is brokered by the platform (no token to set).
+
+Usage:
+  figma whoami                              Current user (GET /v1/me)
+  figma file <file-key> [field=value ...]   File document JSON (GET /v1/files/<key>)
+  figma meta <file-key>                     File metadata (GET /v1/files/<key>/meta)
+  figma nodes <file-key> ids=1:2,1:3        Specific nodes (GET /v1/files/<key>/nodes)
+  figma versions <file-key>                 Version history (GET /v1/files/<key>/versions)
+  figma images <file-key> ids=1:2 [k=v ...] Render exports (GET /v1/images/<key>)
+  figma comments <file-key>                 List comments (GET /v1/files/<key>/comments)
+  figma comment <file-key> <text...>        Add a comment (POST /v1/files/<key>/comments)
+  figma projects <team-id>                  Team projects (GET /v1/teams/<id>/projects)
+  figma project-files <project-id>          Files in a project (GET /v1/projects/<id>/files)
+  figma components <team-id>                 Team components (GET /v1/teams/<id>/components)
+  figma styles <team-id>                    Team styles (GET /v1/teams/<id>/styles)
+  figma component <key>                     A component (GET /v1/components/<key>)
+  figma style <key>                         A style (GET /v1/styles/<key>)
+  figma get <path> [field=value ...]        Raw GET: https://api.figma.com<path>
+
+<file-key> is the id from a Figma file URL (figma.com/file/<KEY>/... or
+figma.com/design/<KEY>/...). Figma replies with JSON; on error it returns an
+{"status":...,"err":"..."} body with a 4xx/5xx status.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# get <path> [curl-args...] — GET a Figma API path with brokered auth. With
+# curl -G, any `--data-urlencode field=value` args fold into the query string.
+get() {
+    path="$1"
+    shift
+    curl -sS -G "$API$path" -H "X-Figma-Token: $TOKEN" "$@" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+whoami)
+    get /v1/me
+    ;;
+file)
+    key="${1:?usage: figma file <file-key> [field=value ...]}"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS; IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    get "/v1/files/$key" "$@"
+    ;;
+meta)
+    key="${1:?usage: figma meta <file-key>}"
+    get "/v1/files/$key/meta"
+    ;;
+nodes)
+    key="${1:?usage: figma nodes <file-key> ids=1:2,1:3}"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS; IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    get "/v1/files/$key/nodes" "$@"
+    ;;
+versions)
+    key="${1:?usage: figma versions <file-key>}"
+    get "/v1/files/$key/versions"
+    ;;
+images)
+    key="${1:?usage: figma images <file-key> ids=1:2 [field=value ...]}"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS; IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    get "/v1/images/$key" "$@"
+    ;;
+comments)
+    key="${1:?usage: figma comments <file-key>}"
+    get "/v1/files/$key/comments"
+    ;;
+comment)
+    key="${1:?usage: figma comment <file-key> <text...>}"
+    shift
+    text="$*"
+    curl -sS -X POST "$API/v1/files/$key/comments" \
+        -H "X-Figma-Token: $TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$(printf '{"message":%s}' "$(printf '%s' "$text" | sed 's/\\/\\\\/g; s/"/\\"/g')")" \
+        | pretty
+    ;;
+projects)
+    team="${1:?usage: figma projects <team-id>}"
+    get "/v1/teams/$team/projects"
+    ;;
+project-files)
+    proj="${1:?usage: figma project-files <project-id>}"
+    get "/v1/projects/$proj/files"
+    ;;
+components)
+    team="${1:?usage: figma components <team-id>}"
+    get "/v1/teams/$team/components"
+    ;;
+styles)
+    team="${1:?usage: figma styles <team-id>}"
+    get "/v1/teams/$team/styles"
+    ;;
+component)
+    key="${1:?usage: figma component <key>}"
+    get "/v1/components/$key"
+    ;;
+style)
+    key="${1:?usage: figma style <key>}"
+    get "/v1/styles/$key"
+    ;;
+get)
+    path="${1:?usage: figma get <path> [field=value ...]}"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS; IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    get "$path" "$@"
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "figma: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac
