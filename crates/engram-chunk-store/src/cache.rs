@@ -18,7 +18,7 @@
 //!   end up uncached, so every read falls through to GCS — a prod
 //!   cold-recovery resume spent ~92 s page-faulting from GCS this way).
 //! - **LRU eviction**: when the cache filesystem is fuller than the
-//!   free-space floor (default: keep ~10% free) — or, if an absolute
+//!   free-space floor (default: keep ~20% free) — or, if an absolute
 //!   ceiling is configured, when total cached bytes exceed it — the
 //!   oldest-accessed chunks get unlinked. "Oldest" is by modification
 //!   time on the cache file, which Linux + macOS both update on
@@ -78,7 +78,7 @@ use crate::manifest::ChunkHash;
 /// - an **absolute byte ceiling** ([`Self::budget_bytes`]) — an operator
 ///   knob; and
 /// - a **dynamic free-space floor** — keep the cache filesystem at/under
-///   ~90% full, re-probed via `statvfs(2)` every sweep so the cache
+///   ~80% full, re-probed via `statvfs(2)` every sweep so the cache
 ///   yields disk to snapshots/checkpoints sharing the mount.
 ///
 /// The floor is *not* a field here on purpose: this struct is
@@ -107,16 +107,26 @@ pub struct ChunkCacheConfig {
 }
 
 /// Default value for [`ChunkCacheConfig::budget_bytes`]: no absolute
-/// byte ceiling, so the dynamic free-space floor governs (fill to ~90%
+/// byte ceiling, so the dynamic free-space floor governs (fill to ~80%
 /// of whatever disk backs the cache, then LRU-evict). The 200 GiB fixed
 /// budget this replaces never tripped on the ~98 GiB FC host — the disk
 /// filled first (the prod incident).
 pub const NO_CEILING: u64 = u64::MAX;
 
-/// Default free-space floor: keep 10% of the cache filesystem free
-/// (i.e. evict to hold the mount at/under ~90% full). Re-checked via
+/// Default free-space floor: keep 20% of the cache filesystem free
+/// (i.e. evict to hold the mount at/under ~80% full). Re-checked via
 /// `statvfs(2)` on every sweep.
-pub const DEFAULT_FREE_FLOOR_PCT: f64 = 0.10;
+///
+/// Why 20% and not 10% (ADR 0060): the cache lives on a hostPath that
+/// *persists across pod restarts*, and on the K8s host fleet (ADR 0044)
+/// the kubelet's default hard-eviction threshold is `nodefs.available
+/// < 10%`. A 10% floor lets the persistent cache grow right up to that
+/// line, leaving no room for an incoming pod's node-assets staging
+/// (a fresh `emptyDir` on the *same* filesystem) during a DaemonSet
+/// roll — the kubelet then evicts the new pod for ephemeral-storage and
+/// wedges the roll. A 20% floor holds the disk a clear ~10 points under
+/// the kubelet line so a roll's staging always fits.
+pub const DEFAULT_FREE_FLOOR_PCT: f64 = 0.20;
 
 /// Env var: optional absolute eviction ceiling in bytes. Plain integer
 /// bytes — no suffix parsing — to stay consistent with the other
@@ -139,7 +149,7 @@ impl ChunkCacheConfig {
     /// Sensible default: no absolute byte ceiling ([`NO_CEILING`]); the
     /// [`DEFAULT_FREE_FLOOR_PCT`] free-space floor (resolved in
     /// [`ChunkCache::new`]) governs. On a typical host this means "fill
-    /// to ~90% of whatever disk backs the cache, then LRU-evict."
+    /// to ~80% of whatever disk backs the cache, then LRU-evict."
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -353,10 +363,13 @@ impl ChunkCache {
 
     /// Test/explicit constructor that sets the free-space floor directly,
     /// bypassing env resolution. Used by unit tests that need a
-    /// deterministic floor (real test filesystems are huge, so the
-    /// default 10% floor never trips). Not part of the public surface.
+    /// deterministic floor independent of the host disk's fill level —
+    /// a near-full dev/CI disk would otherwise trip the default
+    /// free-space floor and evict just-populated chunks, making
+    /// retention assertions flaky. `pub(crate)` so sibling-module tests
+    /// (e.g. `file.rs`) can pin it too. Not part of the public surface.
     #[cfg(test)]
-    fn new_with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
+    pub(crate) fn new_with_floor(config: ChunkCacheConfig, free_floor_pct: f64) -> Self {
         Self {
             inner: Arc::new(CacheInner {
                 config,
