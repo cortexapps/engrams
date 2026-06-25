@@ -24,7 +24,7 @@
  */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import { readSessionEventsBounded, type ListEventsFn } from "../control-plane/session-events.ts";
+import { readSessionEventsBounded } from "../control-plane/session-events.ts";
 import { THREAD_TOPIC, type ThreadInbox } from "./thread-inbox.ts";
 
 /** Workflow input. `after`/`epoch` are set only on a self-restart (the cursor
@@ -36,17 +36,6 @@ export interface IngestInput {
   epoch?: number;
 }
 
-/**
- * Test seam: a DBOS workflow input must be serializable, so it can't carry a
- * closure. The fake event source is injected module-side (mirrors the
- * coordinator-RPC default inside `readSessionEventsBounded`). `undefined` =
- * production (the real `ListSessionEvents` RPC).
- */
-let testListEvents: ListEventsFn | undefined;
-export function __setIngestEventSourceForTests(fn?: ListEventsFn): void {
-  testListEvents = fn;
-}
-
 /** Poll cadence when a bounded read returned no new curated content (tail). */
 const POLL_INTERVAL_MS = 1_000;
 /** Self-restart after this many iterations to bound `operation_outputs`. */
@@ -55,11 +44,10 @@ const RESTART_AFTER_ITERATIONS = 500;
 /**
  * One bounded read of the log, as a checkpointed step: non-deterministic
  * (reads external state) by design, so its result is recorded once and
- * returned verbatim on replay. The injected test source (if any) is read here.
+ * returned verbatim on replay.
  */
 const readPage = DBOS.registerStep(
-  (sessionId: string, after: bigint) =>
-    readSessionEventsBounded(sessionId, after, testListEvents),
+  (sessionId: string, after: bigint) => readSessionEventsBounded(sessionId, after),
   { name: "ingest-read-page" },
 );
 
