@@ -4,20 +4,101 @@
   "display": {
     "name": "GitHub",
     "category": "Source control",
-    "blurb": "Read code, open pull requests and issues — scoped to a per-session GitHub App token.",
+    "blurb": "Read code, open pull requests and issues, and drive GitHub Actions (workflow runs, artifacts, secrets, variables) — scoped to a per-session GitHub App installation token whose permissions are minted from the granted powers.",
     "icon": { "mono": "GH", "color": "#1f2328" }
   },
   "credential": { "source": "mint", "mint": { "kind": "github_app" } },
   "hosts": ["api.github.com"],
   "operations": [
     {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/repos/*/languages" }
+    },
+    {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/repos/*/topics" }
+    },
+    {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/repos/*/contributors*" }
+    },
+    {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/repos/*/collaborators*" }
+    },
+    {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/user/repos*" }
+    },
+    {
+      "grants": ["metadata:read"],
+      "match": { "method": "GET", "path": "/orgs/*/repos*" }
+    },
+
+    {
       "grants": ["contents:read"],
       "match": { "method": "GET", "path": "/repos/*/contents/*" }
+    },
+    {
+      "grants": ["contents:read"],
+      "match": { "method": "GET", "path": "/repos/*/readme*" }
+    },
+    {
+      "grants": ["contents:read"],
+      "match": { "method": "GET", "path": "/repos/*/branches*" }
+    },
+    {
+      "grants": ["contents:read"],
+      "match": { "method": "GET", "path": "/repos/*/commits*" }
+    },
+    {
+      "grants": ["contents:read"],
+      "match": { "method": "GET", "path": "/repos/*/tags*" }
+    },
+    {
+      "grants": ["contents:read"],
+      "match": { "method": "GET", "path": "/repos/*/git/*" }
+    },
+    {
+      "grants": ["contents:read"],
+      "match": { "method": "GET", "path": "/repos/*/releases*" }
     },
     {
       "grants": ["contents:write"],
       "match": { "method": "PUT", "path": "/repos/*/contents/*" }
     },
+    {
+      "grants": ["contents:write"],
+      "match": { "method": "DELETE", "path": "/repos/*/contents/*" }
+    },
+    {
+      "grants": ["contents:write"],
+      "match": { "method": "POST", "path": "/repos/*/git/*" }
+    },
+    {
+      "grants": ["contents:write"],
+      "match": { "method": "PATCH", "path": "/repos/*/git/*" }
+    },
+    {
+      "grants": ["contents:write"],
+      "match": { "method": "POST", "path": "/repos/*/merges" }
+    },
+    {
+      "grants": ["contents:write"],
+      "match": { "method": "POST", "path": "/repos/*/releases" },
+      "asset": {
+        "kind": "release",
+        "surface": "asset",
+        "success": { "statusClass": "2xx" },
+        "data": { "id": "$.resp.id", "tag": "$.resp.tag_name" },
+        "fetchable": { "external": "$.resp.html_url" }
+      }
+    },
+    {
+      "grants": ["contents:write"],
+      "match": { "method": "PATCH", "path": "/repos/*/releases/*" }
+    },
+
     {
       "grants": ["pulls:read"],
       "match": { "method": "GET", "path": "/repos/*/pulls*" }
@@ -34,8 +115,37 @@
       }
     },
     {
+      "grants": ["pulls:write"],
+      "match": { "method": "PATCH", "path": "/repos/*/pulls/*" }
+    },
+    {
+      "grants": ["pulls:write"],
+      "match": { "method": "PUT", "path": "/repos/*/pulls/*/merge" }
+    },
+    {
+      "grants": ["pulls:write"],
+      "match": { "method": "POST", "path": "/repos/*/pulls/*/reviews" }
+    },
+    {
+      "grants": ["pulls:write"],
+      "match": { "method": "POST", "path": "/repos/*/pulls/*/requested_reviewers" }
+    },
+    {
+      "grants": ["pulls:write"],
+      "match": { "method": "POST", "path": "/repos/*/pulls/*/comments" }
+    },
+
+    {
       "grants": ["issues:read"],
       "match": { "method": "GET", "path": "/repos/*/issues*" }
+    },
+    {
+      "grants": ["issues:read"],
+      "match": { "method": "GET", "path": "/repos/*/labels*" }
+    },
+    {
+      "grants": ["issues:read"],
+      "match": { "method": "GET", "path": "/repos/*/milestones*" }
     },
     {
       "grants": ["issues:write"],
@@ -47,11 +157,123 @@
         "data": { "number": "$.resp.number", "title": "$.resp.title" },
         "fetchable": { "external": "$.resp.html_url" }
       }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "PATCH", "path": "/repos/*/issues/*" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "POST", "path": "/repos/*/issues/*/comments" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "POST", "path": "/repos/*/issues/*/labels" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "POST", "path": "/repos/*/labels" }
+    },
+    {
+      "grants": ["issues:write"],
+      "match": { "method": "POST", "path": "/repos/*/milestones" }
+    },
+
+    {
+      "grants": ["actions:read"],
+      "match": { "method": "GET", "path": "/repos/*/actions/*" }
+    },
+    {
+      "grants": ["actions:write"],
+      "match": { "method": "POST", "path": "/repos/*/actions/*" }
+    },
+    {
+      "grants": ["actions:write"],
+      "match": { "method": "PUT", "path": "/repos/*/actions/*" }
+    },
+    {
+      "grants": ["actions:write"],
+      "match": { "method": "DELETE", "path": "/repos/*/actions/*" }
+    },
+    {
+      "grants": ["secrets:read"],
+      "match": { "method": "GET", "path": "/repos/*/actions/secrets*" }
+    },
+    {
+      "grants": ["secrets:write"],
+      "match": { "method": "PUT", "path": "/repos/*/actions/secrets/*" }
+    },
+    {
+      "grants": ["secrets:write"],
+      "match": { "method": "DELETE", "path": "/repos/*/actions/secrets/*" }
+    },
+    {
+      "grants": ["variables:read"],
+      "match": { "method": "GET", "path": "/repos/*/actions/variables*" }
+    },
+    {
+      "grants": ["variables:write"],
+      "match": { "method": "POST", "path": "/repos/*/actions/variables*" }
+    },
+    {
+      "grants": ["variables:write"],
+      "match": { "method": "PATCH", "path": "/repos/*/actions/variables/*" }
+    },
+    {
+      "grants": ["variables:write"],
+      "match": { "method": "DELETE", "path": "/repos/*/actions/variables/*" }
+    },
+
+    {
+      "grants": ["checks:read"],
+      "match": { "method": "GET", "path": "/repos/*/commits/*/check-runs*" }
+    },
+    {
+      "grants": ["checks:read"],
+      "match": { "method": "GET", "path": "/repos/*/commits/*/check-suites*" }
+    },
+    {
+      "grants": ["checks:read"],
+      "match": { "method": "GET", "path": "/repos/*/check-runs/*" }
+    },
+    {
+      "grants": ["checks:read"],
+      "match": { "method": "GET", "path": "/repos/*/check-suites/*" }
+    },
+    {
+      "grants": ["checks:write"],
+      "match": { "method": "POST", "path": "/repos/*/check-runs" }
+    },
+    {
+      "grants": ["checks:write"],
+      "match": { "method": "PATCH", "path": "/repos/*/check-runs/*" }
+    },
+
+    {
+      "grants": ["statuses:read"],
+      "match": { "method": "GET", "path": "/repos/*/commits/*/status" }
+    },
+    {
+      "grants": ["statuses:read"],
+      "match": { "method": "GET", "path": "/repos/*/commits/*/statuses*" }
+    },
+    {
+      "grants": ["statuses:write"],
+      "match": { "method": "POST", "path": "/repos/*/statuses/*" }
+    },
+
+    {
+      "grants": ["deployments:read"],
+      "match": { "method": "GET", "path": "/repos/*/deployments*" }
+    },
+    {
+      "grants": ["deployments:write"],
+      "match": { "method": "POST", "path": "/repos/*/deployments*" }
     }
   ],
   "cli": {
     "bins": ["gh"],
     "dummyEnv": { "GH_TOKEN": "x-engrams-managed" },
-    "doc": "Use `gh` to open pull requests and issues from this session. Authentication is automatic — `GH_TOKEN` is a managed placeholder the egress proxy replaces with a short-lived, capability-scoped GitHub App token on every request to api.github.com. Do NOT run `gh auth login` or set a real token.\n\nOpen a PR:\n1. Re-anchor on the live base (the baked checkout may be stale): `git fetch origin && git checkout -b my-feature origin/main`.\n2. Commit + push — git auth is brokered via GIT_ASKPASS, nothing to configure: `git add -A && git commit -m \"...\" && git push -u origin my-feature`.\n3. `gh pr create --base main --title \"...\" --body \"...\"` (add `--draft` for a draft). Requires the `pulls:write` capability.\n\nIssues: `gh issue create --title \"...\" --body \"...\"` (requires `issues:write`). Images in a PR body must be absolute URLs anchored to a commit SHA — relative repo paths do not render."
+    "doc": "Use `gh` to drive GitHub from this session — code, pull requests, issues, and GitHub Actions. Authentication is automatic: `GH_TOKEN` is a managed placeholder the egress proxy replaces with a short-lived, capability-scoped GitHub App installation token on every request to api.github.com. The token's GitHub App permissions are MINTED from the powers your profile granted (e.g. `actions:write` → the App's `actions: write` permission), so a call your profile didn't grant fails as a 403 from GitHub, not a leak. Do NOT run `gh auth login` or set a real token.\n\nOpen a PR:\n1. Re-anchor on the live base (the baked checkout may be stale): `git fetch origin && git checkout -b my-feature origin/main`.\n2. Commit + push — git auth is brokered via GIT_ASKPASS, nothing to configure: `git add -A && git commit -m \"...\" && git push -u origin my-feature`.\n3. `gh pr create --base main --title \"...\" --body \"...\"` (add `--draft` for a draft). Requires `pulls:write`. Review/merge: `gh pr review`, `gh pr merge` (pulls:write); `gh pr checks` needs `checks:read`.\n\nIssues: `gh issue create/list/view/comment` (issues:read / issues:write). Labels & milestones ride the `issues` powers.\n\nGitHub Actions (CI/CD):\n- Runs: `gh run list`, `gh run view <id> --log`, `gh run watch <id>` need `actions:read`; `gh run rerun <id>`, `gh run cancel <id>` need `actions:write`.\n- Workflows: `gh workflow list/view` (actions:read); `gh workflow run <file> -f key=val` to dispatch (actions:write).\n- Artifacts & caches: list/download artifacts and `gh cache list` need `actions:read`; `gh cache delete` / deleting artifacts need `actions:write`.\n- Secrets: `gh secret list` needs `secrets:read`; `gh secret set NAME` / `gh secret delete NAME` need `secrets:write` (values are write-only — GitHub never returns them).\n- Variables: `gh variable list` needs `variables:read`; `gh variable set/delete` need `variables:write`.\n\nReleases: `gh release list/view/download` (contents:read); `gh release create` / asset upload (contents:write). Repo contents, branches, commits, tags, and the Git data API ride `contents:*`; repo/metadata listings ride `metadata:read`. Commit statuses: read via `statuses:read`, set via `statuses:write`. Deployments: `deployments:read` / `deployments:write`.\n\nRaw passthrough for anything else: `gh api repos/{owner}/{repo}/actions/runs` (GET) or `gh api --method POST repos/{owner}/{repo}/issues -f title=...`. Images in a PR body must be absolute URLs anchored to a commit SHA — relative repo paths do not render."
   }
 }

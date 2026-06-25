@@ -344,16 +344,23 @@ describe("on-disk registry", () => {
   });
 
   test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {
-    const policy = compileIntegrationPolicy(["datadog:observability:read"]);
-    expect(policy.injects).toHaveLength(2);
-    expect(policy.injects.map((i) => i.header_name).sort()).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
-    expect(policy.injects.map((i) => i.secret_ref).sort()).toEqual(["datadog-api-key", "datadog-app-key"]);
+    const policy = compileIntegrationPolicy(["datadog:metrics:read"]);
+    // metrics:read activates several ops (query, metric metadata, v2 query); each
+    // emits one inject per header (DD-API-KEY + DD-APPLICATION-KEY) gated to that
+    // op's path — so assert on the unique header/secret SET, not the entry count.
+    const headers = [...new Set(policy.injects.map((i) => i.header_name))].sort();
+    expect(headers).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
+    const refs = [...new Set(policy.injects.map((i) => i.secret_ref))].sort();
+    expect(refs).toEqual(["datadog-api-key", "datadog-app-key"]);
   });
 
   test("the shipped github issues:write compiles a minted inject + an issue observe", () => {
     const policy = compileIntegrationPolicy(["github:issues:write"]);
-    expect(policy.injects).toHaveLength(1);
-    expect(policy.injects[0]!.mint_provider).toBe("github");
+    // issues:write activates several gated ops (create, edit, comment, label, …);
+    // each emits a minted inject for github. The issue observe rides only the
+    // create op's asset, so there is exactly one.
+    expect(policy.injects.length).toBeGreaterThan(0);
+    expect(policy.injects.every((i) => i.mint_provider === "github")).toBe(true);
     expect(policy.observes).toHaveLength(1);
     expect(policy.observes[0]!.provider).toBe("github");
     expect(policy.observes[0]!.asset_kind).toBe("issue");
@@ -728,7 +735,7 @@ describe("cli facet (ADR 0058)", () => {
   });
 
   test("the on-disk github + datadog connectors expose their cli facet", () => {
-    const plan = compileCliIntegrations(["github:pulls:write", "datadog:observability:read"], connectorRegistry());
+    const plan = compileCliIntegrations(["github:pulls:write", "datadog:metrics:read"], connectorRegistry());
     expect(plan.enabled.map((e) => e.provider).sort()).toEqual(["datadog", "github"]);
     expect(plan.dummyEnv.GH_TOKEN).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");

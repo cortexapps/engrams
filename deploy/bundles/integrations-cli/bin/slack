@@ -20,10 +20,15 @@ engrams Slack CLI — auth is brokered by the platform (no token to set).
 
 Usage:
   slack post <channel> <text...>          Post a message (chat.postMessage)
+  slack reply <channel> <thread-ts> <text...>   Reply in a thread (chat.postMessage thread_ts)
   slack dm <user-id> <text...>            DM a user by ID (chat.postMessage)
   slack channels [field=value ...]        List conversations (conversations.list)
+  slack history <channel> [field=value]   List recent messages (conversations.history)
+  slack replies <channel> <ts>            List a thread's replies (conversations.replies)
   slack users [field=value ...]           List members (users.list)
   slack upload <channel> <file> [title]   Upload a file (files.upload)
+  slack react <channel> <ts> <emoji>      Add a reaction (reactions.add)
+  slack pin <channel> <ts>                Pin a message (pins.add)
   slack whoami                            Show the bot identity (auth.test)
   slack api <method> [field=value ...]    Raw call: POST https://slack.com/api/<method>
 
@@ -54,6 +59,12 @@ post)
     shift
     api chat.postMessage --data-urlencode "channel=$ch" --data-urlencode "text=$*"
     ;;
+reply)
+    ch="${1:?usage: slack reply <channel> <thread-ts> <text...>}"
+    thread="${2:?usage: slack reply <channel> <thread-ts> <text...>}"
+    shift 2
+    api chat.postMessage --data-urlencode "channel=$ch" --data-urlencode "thread_ts=$thread" --data-urlencode "text=$*"
+    ;;
 dm)
     user="${1:?usage: slack dm <user-id> <text...>}"
     shift
@@ -79,6 +90,34 @@ users)
     set -- $flags
     IFS=$OLD_IFS
     api users.list "$@"
+    ;;
+history)
+    ch="${1:?usage: slack history <channel> [field=value ...]}"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    api conversations.history --data-urlencode "channel=$ch" "$@"
+    ;;
+replies)
+    ch="${1:?usage: slack replies <channel> <ts>}"
+    ts="${2:?usage: slack replies <channel> <ts>}"
+    api conversations.replies --data-urlencode "channel=$ch" --data-urlencode "ts=$ts"
+    ;;
+react)
+    ch="${1:?usage: slack react <channel> <ts> <emoji>}"
+    ts="${2:?usage: slack react <channel> <ts> <emoji>}"
+    name="${3:?usage: slack react <channel> <ts> <emoji>}"
+    api reactions.add --data-urlencode "channel=$ch" --data-urlencode "timestamp=$ts" --data-urlencode "name=$name"
+    ;;
+pin)
+    ch="${1:?usage: slack pin <channel> <ts>}"
+    ts="${2:?usage: slack pin <channel> <ts>}"
+    api pins.add --data-urlencode "channel=$ch" --data-urlencode "timestamp=$ts"
     ;;
 upload)
     ch="${1:?usage: slack upload <channel> <file> [title]}"
