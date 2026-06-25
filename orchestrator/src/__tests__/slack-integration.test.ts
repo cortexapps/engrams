@@ -8,7 +8,7 @@ import { create } from "@bufbuild/protobuf";
 
 import { parseConnector, connectorRegistry, invalidateRegistry } from "../connectors/registry.ts";
 import { makeIntegrationOauthRoute } from "../routes/integration-oauth.ts";
-import { getSlackClient } from "../integrations/slack.ts";
+import { getSlackClient, SLACK_SIGNING_SECRET_REF } from "../integrations/slack.ts";
 import { invalidateIntegrationClient } from "../integrations/clients.ts";
 import {
   ResolveIntegrationCredentialResponseSchema,
@@ -63,6 +63,23 @@ describe("oauth facet parse", () => {
   test("rejects a missing secret ref", () => {
     const { clientSecretRef: _omit, ...partial } = oauth;
     expect(() => parseConnector({ ...base, oauth: partial }, "x")).toThrow(/clientSecretRef/);
+  });
+
+  test("the built-in slack seed declares the signing-secret ref (ADR 0059 triggers)", () => {
+    // The webhook verifier (getSlackSigningSecret) reads this ref; the connect UI
+    // seals it. Both MUST agree on the name — guard against drift here.
+    const slack = connectorRegistry().get("slack");
+    expect(slack?.oauth?.signingSecretRef).toBe(SLACK_SIGNING_SECRET_REF);
+  });
+
+  test("parses an optional signingSecretRef on the oauth facet", () => {
+    const c = parseConnector({ ...base, oauth: { ...oauth, signingSecretRef: "slack.signing_secret" } }, "x");
+    expect(c.oauth?.signingSecretRef).toBe("slack.signing_secret");
+  });
+
+  test("leaves signingSecretRef undefined when the facet omits it (optional)", () => {
+    const c = parseConnector({ ...base, oauth }, "x");
+    expect(c.oauth?.signingSecretRef).toBeUndefined();
   });
 });
 

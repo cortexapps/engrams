@@ -32,6 +32,7 @@ export function OAuthConnectSheet({
   const putSecret = usePutOrgSecret();
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
+  const [signingSecret, setSigningSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<"url" | "manifest" | null>(null);
@@ -54,6 +55,12 @@ export function OAuthConnectSheet({
     try {
       await putSecret.mutateAsync({ name: oauth.clientIdRef, value: clientId.trim() });
       await putSecret.mutateAsync({ name: oauth.clientSecretRef, value: clientSecret.trim() });
+      // The webhook-signing secret (e.g. Slack triggers) is optional — the OAuth token
+      // exchange doesn't need it, only the inbound webhook verifier does. Seal it when
+      // the facet declares a ref AND the admin provided one.
+      if (oauth.signingSecretRef && signingSecret.trim()) {
+        await putSecret.mutateAsync({ name: oauth.signingSecretRef, value: signingSecret.trim() });
+      }
       // Leave the SPA for the provider's consent screen; the callback redirects back.
       window.location.href = `/api/v1/integrations/${encodeURIComponent(view.provider)}/oauth/authorize`;
     } catch (e) {
@@ -153,6 +160,22 @@ export function OAuthConnectSheet({
             </span>
             <SecretField value={clientSecret} onChange={setClientSecret} placeholder="••••••" />
           </label>
+
+          {oauth.signingSecretRef && (
+            <label className="flex flex-col gap-1.5">
+              <span className="flex items-baseline gap-2">
+                <Text variant="label">Signing secret</Text>
+                <code className="font-mono text-[0.62rem] text-muted-foreground">
+                  {oauth.signingSecretRef}
+                </code>
+              </span>
+              <SecretField value={signingSecret} onChange={setSigningSecret} placeholder="••••••" />
+              <span className="text-[0.72rem] text-muted-foreground">
+                Optional — needed only to receive {view.name} events (e.g. @mention triggers). Find
+                it under your app's Basic Information → App Credentials.
+              </span>
+            </label>
+          )}
 
           <p className="flex gap-2 text-[0.74rem] text-muted-foreground">
             <InfoIcon className="mt-0.5 size-3.5 shrink-0" />

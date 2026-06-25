@@ -179,6 +179,7 @@ describe("parseConnectorConfig", () => {
       oauth: {
         clientIdRef: "slack.client_id",
         clientSecretRef: "slack.client_secret",
+        signingSecretRef: "slack.signing_secret",
         scopes: ["chat:write", "app_mentions:read"],
       },
     });
@@ -186,17 +187,20 @@ describe("parseConnectorConfig", () => {
     expect(c.oauth).toEqual({
       clientIdRef: "slack.client_id",
       clientSecretRef: "slack.client_secret",
+      signingSecretRef: "slack.signing_secret",
       scopes: ["chat:write", "app_mentions:read"],
     });
   });
 
-  test("an OAuth facet without scopes yields an empty scope list (no throw)", () => {
+  test("an OAuth facet without scopes yields an empty scope list + no signing ref (no throw)", () => {
     const raw = JSON.stringify({
       provider: "x",
       hosts: ["h"],
       operations: [],
       oauth: { clientIdRef: "x.client_id", clientSecretRef: "x.client_secret" },
     });
-    expect(parseConnectorConfig(raw, "x").oauth?.scopes).toEqual([]);
+    const c = parseConnectorConfig(raw, "x");
+    expect(c.oauth?.scopes).toEqual([]);
+    expect(c.oauth?.signingSecretRef).toBeUndefined();
   });
 });

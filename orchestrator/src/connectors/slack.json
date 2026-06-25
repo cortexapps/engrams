@@ -50,6 +50,7 @@
     "scopes": ["chat:write", "channels:read", "groups:read", "users:read", "files:write", "files:read", "app_mentions:read", "channels:history", "groups:history", "reactions:write", "users:read.email"],
     "clientIdRef": "slack.client_id",
     "clientSecretRef": "slack.client_secret",
+    "signingSecretRef": "slack.signing_secret",
     "tokenSecretRef": "slack.bot_token",
     "tokenResponsePath": "access_token"
   }
