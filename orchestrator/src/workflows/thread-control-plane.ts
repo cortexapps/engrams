@@ -104,7 +104,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
           sessionId: created.sessionId,
           profileId: profile.id,
           ownerUserId: input.ownerUserId,
-          source: {},
+          source: input.source,
         });
       } catch (err) {
         // Compensate: drop the orphan session so a retry starts clean.

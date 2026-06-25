@@ -42,6 +42,8 @@ export interface CreateSessionInput {
   ownerUserId: string;
   prompt: string;
   appendSystemPrompt: string;
+  /** The trigger ref recorded on the persisted task (operator-visible). */
+  source: Record<string, unknown>;
 }
 
 export interface ThreadControlPlane {
@@ -128,6 +130,12 @@ async function slackThreadWorkflowImpl(): Promise<void> {
           ownerUserId: userId,
           prompt: ctx0.prompt,
           appendSystemPrompt: pol.systemPromptAppend,
+          source: {
+            provider: "slack",
+            team: m.team,
+            channel: m.channel,
+            threadRoot: m.threadRoot,
+          },
         }),
       { name: "createSession" },
     );

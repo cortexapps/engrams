@@ -43,7 +43,9 @@ const fakeImages = (): ImagesClient =>
 describe("makeThreadControlPlane", () => {
   test("createSession injects ENGRAM_APPEND_SYSTEM_PROMPT + persists a slack_thread task", async () => {
     let createdReq: { harnessEnv?: Record<string, string> } | undefined;
-    let persisted: { type: string; ownerUserId: string; sessionId: string } | undefined;
+    let persisted:
+      | { type: string; ownerUserId: string; sessionId: string; source: Record<string, unknown> }
+      | undefined;
 
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
@@ -61,7 +63,12 @@ describe("makeThreadControlPlane", () => {
         deleteSession: async () => {},
       },
       persistTask: async (args) => {
-        persisted = { type: args.type, ownerUserId: args.ownerUserId, sessionId: args.sessionId };
+        persisted = {
+          type: args.type,
+          ownerUserId: args.ownerUserId,
+          sessionId: args.sessionId,
+          source: args.source,
+        };
       },
     });
 
@@ -70,10 +77,16 @@ describe("makeThreadControlPlane", () => {
       ownerUserId: "user-1",
       prompt: "hello",
       appendSystemPrompt: "You were triggered from Slack.",
+      source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
     });
 
     expect(createdReq?.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe("You were triggered from Slack.");
-    expect(persisted).toEqual({ type: "slack_thread", ownerUserId: "user-1", sessionId: "sess-1" });
+    expect(persisted).toEqual({
+      type: "slack_thread",
+      ownerUserId: "user-1",
+      sessionId: "sess-1",
+      source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
+    });
     expect(started.id).toBe("sess-1");
     expect(started.webUrl).toContain("/sessions/sess-1");
   });

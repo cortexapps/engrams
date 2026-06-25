@@ -40,7 +40,7 @@ const bytea = customType<{ data: Buffer }>({
 
 export const task = pgTable("task", {
   id: text("id").primaryKey(), // nanoid/uuid
-  type: text("type").notNull(), // 'chat' only for now
+  type: text("type").notNull(), // 'chat' (UI) | 'slack_thread' (ADR 0059 trigger)
   title: text("title"),
   status: text("status").notNull().default("open"), // open|working|awaiting_review|done|failed
   createdByUserId: text("created_by_user_id"), // better-auth user id; null = automation (future)
