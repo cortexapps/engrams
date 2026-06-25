@@ -51,7 +51,10 @@ slot into the same framework but are **out of scope** here.
   UI) → post PRs/artifacts/media → post a closing summary; clear ❌ + message on
   failure. Follow-up `@mention`s feed fresh thread context into the live session.
 - A generic, optional **`append_system_prompt`** on session create, mapped per
-  harness (Claude → `--append-system-prompt`), configured **per trigger source**.
+  harness (Claude → `--append-system-prompt`), set by the **triggering workflow**
+  (a constant on its `CommunicationPolicy`, **not** connector config).
+- A **default profile** (`is_default` on the profile model) so a trigger — which has
+  no UI to pick one — launches with the org's designated profile.
 - A reverse-channel design that is **minimal for v1** yet additively extensible to
   the future fanout cases (§Future).
 
@@ -61,9 +64,9 @@ slot into the same framework but are **out of scope** here.
   exists (`orchestrator/src/connectors/slack.json`, ADR 0056–0058): an `oauth` facet
   ("Add to Slack", `routes/integration-oauth.ts`), a KEK-sealed `slack.bot_token`
   org secret, and an in-process authenticated client via `getSlackClient()`
-  (`integrations/slack.ts`). This ADR **extends** that connector (adds scopes + a
-  `trigger` facet) rather than building a parallel layer. The only out-of-band step
-  is Slack-app-dashboard config (Event + Interactivity Request URLs, client creds).
+  (`integrations/slack.ts`). This ADR **extends** that connector (adds scopes) rather
+  than building a parallel layer. The only out-of-band step is Slack-app-dashboard
+  config (Event + Interactivity Request URLs, client creds).
 - An identity-linking subsystem — replaced by a single email-match seam.
 - Linear / Jira / cron adapters — designed-for, not built.
 - Branch fanout, CI repair swarms, multi-agent workrooms, fork/checkpoint
@@ -99,7 +102,10 @@ slot into the same framework but are **out of scope** here.
    link message at session start.
 7. **`onComplete` always posts a closing summary** + marks the task done.
 8. **`append_system_prompt`** is a new optional `CreateSessionRequest` field (#11),
-   delivered to the harness and mapped per-CLI, configured per trigger source.
+   delivered to the harness and mapped per-CLI. Its value is a **constant the
+   triggering `CommunicationPolicy` provides** (Slack's is fixed in code), passed at
+   session create — **not** read from connector config (one connector can back many
+   triggers, so per-connector trigger config would not generalize).
 9. **Prompt delivery is idempotent via a deterministic `prompt_id` — no coordinator
    change.** A DBOS step replay can re-issue `SendPrompt` (steps are at-least-once
    across the service boundary). This is already covered downstream: the host→guest
@@ -111,6 +117,11 @@ slot into the same framework but are **out of scope** here.
    guest boot cleared the set; closeable later with additive coordinator dedup on
    `(session_id, prompt_id)`, **not built now**. Session-creation replay is ignored
    on purpose: a stray VM idle-evicts cheaply, so create needs no idempotency key.
+10. **A triggered session launches with the org's default profile.** A trigger has
+    no UI to pick a profile, so the session uses the profile flagged `is_default` (a
+    new **at-most-one** flag on the orchestrator's profile model). No default set →
+    ❌ + an actionable message; don't start. (Replaces the cut per-connector
+    `defaultProfileId`.)
 
 ## The boundary principle
 
@@ -177,10 +188,11 @@ SlackThreadWorkflow():
   await step(() => reactAdd(m.channel, m.ts, "eyes"))            // 👀 picked up (very top)
   user = await step(() => resolveEngramsUser("slack", m.user))
   if !user: { await fail(m, `You don't have a user in engrams — go to ${ENGRAMS_URL} to log in first.`); return }
-  cfg     = await step(() => getTriggerConfig("slack", m.team))   // default profile + system_prompt_append
+  profile = await step(() => getDefaultProfile())                 // the org's is_default profile
+  if !profile: { await fail(m, `No default profile is configured — set one in ${ENGRAMS_URL} first.`); return }
   prompt  = await step(() => gatherThreadContext(m.channel, m.threadRoot, oldest=null))   // full thread
-  try:    session = await step(() => createSession({profile: cfg.default_profile_id,
-                                     append_system_prompt: cfg.system_prompt_append, prompt}))
+  try:    session = await step(() => createSession({profile: profile.id,
+                                     append_system_prompt: policy.systemPromptAppend, prompt}))
   catch:  { await fail(m, "Couldn't start a session for this request."); return }
   await step(() => reactAdd(m.channel, m.ts, "white_check_mark")) // ✅ session started
   await step(() => persistTask({type:"slack_thread", source, owner:user, workflow_run_id:self}))
@@ -249,6 +261,7 @@ onAsset(asset)              // integration_asset(pull_request) | file_shared(med
 onComplete(summary)         // always posts (Decision 7)
 onFail(reason, message)     // ❌ + actionable message
 mapInbound(sourceEvent)     // → follow-up SendPrompt | question answer
+systemPromptAppend          // constant flavor for append_system_prompt at create (Decision 8)
 ```
 The framework owns event classification, identity, session create/resume, the
 recv/drain loop, and outbound-effect replay-dedupe (DBOS step checkpoints). The
@@ -450,12 +463,33 @@ there; be concise.").
   sole caller `:1315`) gains a parameter and appends `--append-system-prompt
   <value>` when set. **This is a call-site signature change, not a one-line flag
   add.** Other harnesses map the same field to their own mechanism.
-- **Config:** value is per-trigger-source (`system_prompt_append` from
-  `getTriggerConfig`), composed at create time; composes *with* the profile.
+- **Value source:** a **constant on the triggering `CommunicationPolicy`**
+  (`systemPromptAppend` — Slack's is fixed in code), passed at create time; composes
+  *with* the profile. **Not** connector config: one connector can back many triggers,
+  so per-connector trigger config would not generalize.
 - **Caveat:** the harness is `cfg(target_os = "linux")` — invisible to macOS
   clippy, 0 tests under macOS nextest. Verify via `cargo clippy --target
   aarch64-unknown-linux-musl -p engram-harness-claude` and `just test-linux
   engram-harness-claude`.
+
+## Default profile (`is_default`, orchestrator-only, net-new)
+
+A trigger has no UI to pick a profile, so a triggered session launches with the
+org's **default profile**. Profiles are orchestrator-owned (ADR 0052; the control
+plane never learns about them), so this is a purely orchestrator-side addition — no
+coordinator or proto change on the control-plane side.
+
+- **Schema:** `profile.is_default boolean not null default false` via a **new
+  migration** (applied migrations are checksum-immutable). **At most one** active
+  default: setting a profile default clears the prior in the same transaction; a
+  soft-deleted default simply leaves none.
+- **Proto (orchestrator `profile.proto`):** `Profile.is_default = 15`,
+  `CreateProfileRequest.is_default = 11`, `UpdateProfileRequest.is_default = 12`.
+- **Store:** `ProfileStore.getDefault(): Promise<ProfileRow | null>` (active only);
+  the set/clear-others invariant is enforced inside `create`/`update`.
+- **Trigger use:** `SlackThreadWorkflow` resolves it via `getDefaultProfile()`; none
+  configured → ❌ + an actionable message, don't start.
+- **UI:** a single-select "default" toggle on the profile editor.
 
 ## Coordinator change: `ListSessionEvents`
 
@@ -540,12 +574,13 @@ rebuild it.
   (the `email` field on `users.info`, required *in addition to* `users:read`).
   `im:history`/`mpim:history` are **not** needed — the surface is `app_mention` in
   channels, not DMs.
-- **Trigger config = a new `trigger` facet on the connector** (`{ defaultProfileId,
-  systemPromptAppend }`), consistent with the existing credential/oauth/cli facets
-  and admin-authorable through the same IntegrationService CRUD. (Resolves open Q.)
+- **No trigger config on the connector.** The two former per-trigger inputs live
+  off the connector now: the profile is the org default (`is_default`), and the
+  system-prompt flavor is a constant on the Slack `CommunicationPolicy`. A connector
+  can back many triggers, so a per-connector `trigger` facet would not generalize.
 - **Single-workspace for v1.** The connector resolves one `slack.bot_token`. Multi-
-  workspace (per-`team_id` token, keyed `getTriggerConfig("slack", team)`) is a real
-  future extension — the OAuth `tokenSecretRef` is a single ref today.
+  workspace (a per-`team_id` token) is a real future extension — the OAuth
+  `tokenSecretRef` is a single ref today.
 
 ## Security & authz
 
@@ -631,13 +666,14 @@ when a second consumer actually exists; the present design precludes none of it.
   skeleton with the recv/drain loop, the workflow-local `questionTs` map, and
   `continue-as-new` (threading the map through); tests for crash/restart, duplicate
   sends, cursor reconstruction, terminal exit.
-- **P2 — Slack adapter.** Extend the `slack` connector (add the five scopes + a
-  `trigger` facet); the `/api/v1/integrations/slack/{events,interactivity}` endpoints
-  (verify/ack/dedupe); the communication policy via `getSlackClient()` (👀/✅/❌
-  reactions, link, Block Kit questions, asset posts, closing summary); `@mention`
-  context gathering + `SendPrompt` follow-ups; identity seam.
+- **P2 — Slack adapter.** Extend the `slack` connector (add the five scopes); the
+  profile `is_default` flag (migration + proto + store `getDefault` + UI toggle) and
+  `getDefaultProfile()`; the `/api/v1/integrations/slack/{events,interactivity}`
+  endpoints (verify/ack/dedupe); the communication policy via `getSlackClient()`
+  (👀/✅/❌ reactions, link, Block Kit questions, asset posts, closing summary);
+  `@mention` context gathering + `SendPrompt` follow-ups; identity seam.
 - **P3 — `append_system_prompt`.** Proto #11 → coordinator persistence + replay →
-  harness flag; per-trigger config; Linux-target verification.
+  harness flag; value = the Slack policy constant; Linux-target verification.
 
 Each phase is its own PR, the ADR updated between phases per repo convention.
 
@@ -645,8 +681,8 @@ Each phase is its own PR, the ADR updated between phases per repo convention.
 
 - **More source adapters:** Linear/Jira (comment-based policy; HMAC webhooks) and
   cron (`@DBOS.scheduled`). Each is a `CommunicationPolicy` impl + an ingest path.
-- **Profile classifier:** today the trigger uses the source's `default_profile_id`;
-  later an automatic classifier picks per-thread.
+- **Profile classifier:** today the trigger uses the org default profile
+  (`is_default`); later an automatic classifier picks per-thread.
 - **Branch fanout / CI swarms / workrooms.** When a task needs ≥2 session
   consumers, re-introduce the inbox + a `consumer_name`-keyed subscription/cursor
   (the exact tables cut above) plus control-plane `CreateCheckpoint`/`ForkSession`.
