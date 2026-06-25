@@ -18,6 +18,11 @@
 import type { ModalView, KnownBlock } from "@slack/types";
 
 import type { SourceAnswer } from "../workflows/thread-inbox.ts";
+import type {
+  AssetSummary,
+  ClosingSummary,
+  StartedSession,
+} from "../workflows/communication-policy.ts";
 
 /** Inline single-select option button (one per option). */
 export const ACTION_ANSWER = "auq_answer";
@@ -202,3 +207,131 @@ export function buildAnswerModal(
 }
 
 const truncate = (s: string, n: number): string => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+
+// ── Outbound rendering: the question message, its resolution, the closing
+//    summary. The button values produced here are exactly what
+//    `parseInteractivity` reads back, which is why both live in this module.
+
+/** One AskUserQuestion question, parsed from the `user_question` payload. */
+export interface ParsedQuestion {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: string[];
+}
+export interface ParsedUserQuestion {
+  toolCallId: string;
+  questions: ParsedQuestion[];
+}
+
+/** The slice of a `user_question` payload we read (option descriptions dropped). */
+interface RawUserQuestion {
+  tool_call_id?: unknown;
+  questions?: {
+    question?: unknown;
+    header?: unknown;
+    multiSelect?: unknown;
+    options?: { label?: unknown }[];
+  }[];
+}
+
+/** Parse a `user_question` event payload into the rendering shape, or null if
+ *  it lacks a tool_call_id or any question. Pure; never throws. */
+export function parseUserQuestion(payloadJson: string): ParsedUserQuestion | null {
+  let p: RawUserQuestion;
+  try {
+    p = JSON.parse(payloadJson) as RawUserQuestion;
+  } catch {
+    return null;
+  }
+  if (typeof p.tool_call_id !== "string" || !Array.isArray(p.questions) || p.questions.length === 0) {
+    return null;
+  }
+  const questions: ParsedQuestion[] = p.questions.map((q) => ({
+    question: typeof q.question === "string" ? q.question : "",
+    header: typeof q.header === "string" ? q.header : "",
+    multiSelect: q.multiSelect === true,
+    options: Array.isArray(q.options)
+      ? q.options.map((o) => (typeof o.label === "string" ? o.label : "")).filter(Boolean)
+      : [],
+  }));
+  return { toolCallId: p.tool_call_id, questions };
+}
+
+const section = (text: string): KnownBlock => ({ type: "section", text: { type: "mrkdwn", text } });
+
+/**
+ * Build the posted question message. A single single-select question gets
+ * inline one-click option buttons; anything richer (multi-select, or >1
+ * question) gets one "Answer…" button that opens the atomic-submit modal. Every
+ * interactive element carries the thread route so the answer routes back with
+ * no dependence on Slack's payload shape.
+ */
+export function buildQuestionBlocks(route: ThreadRoute, parsed: ParsedUserQuestion): KnownBlock[] {
+  const { toolCallId: t, questions } = parsed;
+  const blocks: KnownBlock[] = questions.map((q) =>
+    section(q.header ? `*${q.header}*\n${q.question}` : q.question),
+  );
+
+  const inline = questions.length === 1 && !questions[0].multiSelect;
+  if (inline) {
+    const q = questions[0];
+    blocks.push({
+      type: "actions",
+      elements: q.options.map((label) => ({
+        type: "button",
+        action_id: ACTION_ANSWER,
+        text: { type: "plain_text", text: truncate(label, 75) },
+        value: JSON.stringify({ t, q: q.question, a: label, r: route }),
+      })),
+    });
+  } else {
+    const qs: CompactQuestion[] = questions.map((q) => ({
+      q: q.question,
+      h: q.header,
+      m: q.multiSelect,
+      o: q.options,
+    }));
+    blocks.push({
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          action_id: ACTION_OPEN,
+          text: { type: "plain_text", text: "Answer…" },
+          value: JSON.stringify({ t, qs, r: route }),
+        },
+      ],
+    });
+  }
+  return blocks;
+}
+
+/** The resolved question message (replaces the live one via chat.update). */
+export function buildAnsweredBlocks(answers: Record<string, string[]>): KnownBlock[] {
+  const lines = Object.entries(answers).map(
+    ([question, labels]) => `✓ *${question}*: ${labels.join(", ")}`,
+  );
+  return [section(lines.join("\n") || "✓ Answered")];
+}
+
+/** A one-line render of a single asset for the live `onAsset` post, or null for
+ *  a transient action that isn't worth a thread message. */
+export function buildAssetLine(asset: AssetSummary): string {
+  return asset.url ? `🔗 <${asset.url}|${asset.label}>` : `📎 ${asset.label}`;
+}
+
+/** The closing summary: the session's final assistant message, a recap of the
+ *  durable assets it produced, and a link back to the session. */
+export function buildClosingBlocks(session: StartedSession, summary: ClosingSummary): KnownBlock[] {
+  const blocks: KnownBlock[] = [section("*✅ Session complete*")];
+  if (summary.lastMessage) blocks.push(section(truncate(summary.lastMessage, 2900)));
+  if (summary.assets.length) {
+    const lines = summary.assets.map(
+      (a) => `• ${a.url ? `<${a.url}|${a.label}>` : a.label}`,
+    );
+    blocks.push(section(lines.join("\n")));
+  }
+  blocks.push(section(`<${session.webUrl}|View session>`));
+  return blocks;
+}

@@ -11,13 +11,25 @@
 import { expect, test, describe } from "bun:test";
 import {
   parseInteractivity,
+  parseUserQuestion,
   buildAnswerModal,
+  buildQuestionBlocks,
+  buildAnsweredBlocks,
+  buildClosingBlocks,
   ACTION_ANSWER,
   ACTION_OPEN,
   CALLBACK_SUBMIT,
   MODAL_ACTION,
   type CompactQuestion,
 } from "../integrations/slack-blocks.ts";
+
+/** Find the first actions block and return its button elements. */
+function buttons(blocks: unknown[]) {
+  const actions = blocks.find((b) => (b as { type?: string }).type === "actions") as
+    | { elements: { action_id: string; value: string }[] }
+    | undefined;
+  return actions?.elements ?? [];
+}
 
 const ROUTE = { team: "T1", channel: "C1", threadRoot: "100.0" };
 
@@ -111,6 +123,95 @@ describe("parseInteractivity()", () => {
   test("malformed JSON → ignore (never throws)", () => {
     expect(parseInteractivity("not json")).toEqual({ kind: "ignore" });
     expect(parseInteractivity(blockAction(ACTION_ANSWER, "{bad"))).toEqual({ kind: "ignore" });
+  });
+});
+
+describe("parseUserQuestion()", () => {
+  test("maps a user_question payload to tool_call_id + questions", () => {
+    const payload = JSON.stringify({
+      run_id: "r",
+      tool_call_id: "tc",
+      questions: [
+        { question: "Pick one", header: "Pick", multiSelect: false, options: [{ label: "A", description: "" }] },
+      ],
+    });
+    expect(parseUserQuestion(payload)).toEqual({
+      toolCallId: "tc",
+      questions: [{ question: "Pick one", header: "Pick", multiSelect: false, options: ["A"] }],
+    });
+  });
+
+  test("malformed payload → null (never throws)", () => {
+    expect(parseUserQuestion("not json")).toBeNull();
+    expect(parseUserQuestion(JSON.stringify({ tool_call_id: "tc" }))).toBeNull();
+  });
+});
+
+describe("buildQuestionBlocks()", () => {
+  const parsed = (multiSelect: boolean, n = 1) => ({
+    toolCallId: "tc",
+    questions: Array.from({ length: n }, (_, i) => ({
+      question: `Q${i}`,
+      header: `H${i}`,
+      multiSelect,
+      options: ["yes", "no"],
+    })),
+  });
+
+  test("a single single-select question → inline option buttons carrying the route", () => {
+    const blocks = buildQuestionBlocks(ROUTE, parsed(false));
+    const els = buttons(blocks);
+    expect(els.map((e) => e.action_id)).toEqual([ACTION_ANSWER, ACTION_ANSWER]);
+    expect(JSON.parse(els[0].value)).toEqual({ t: "tc", q: "Q0", a: "yes", r: ROUTE });
+  });
+
+  test("a multi-select question → a single 'Answer…' (open modal) button", () => {
+    const els = buttons(buildQuestionBlocks(ROUTE, parsed(true)));
+    expect(els).toHaveLength(1);
+    expect(els[0].action_id).toBe(ACTION_OPEN);
+    const v = JSON.parse(els[0].value);
+    expect(v.t).toBe("tc");
+    expect(v.r).toEqual(ROUTE);
+    expect(v.qs[0]).toEqual({ q: "Q0", h: "H0", m: true, o: ["yes", "no"] });
+  });
+
+  test("more than one question → the modal path even when single-select", () => {
+    const els = buttons(buildQuestionBlocks(ROUTE, parsed(false, 2)));
+    expect(els).toHaveLength(1);
+    expect(els[0].action_id).toBe(ACTION_OPEN);
+  });
+});
+
+describe("buildAnsweredBlocks()", () => {
+  test("renders the resolved question → selected labels", () => {
+    const blocks = buildAnsweredBlocks({ "Pick one": ["A"], Colors: ["red", "blue"] });
+    const text = JSON.stringify(blocks);
+    expect(text).toContain("Pick one");
+    expect(text).toContain("A");
+    expect(text).toContain("red, blue");
+  });
+});
+
+describe("buildClosingBlocks()", () => {
+  const session = { id: "s1", webUrl: "https://engrams.dev/sessions/s1" };
+
+  test("includes the last assistant message, asset links, and the session link", () => {
+    const blocks = buildClosingBlocks(session, {
+      lastMessage: "All done — shipped it.",
+      assets: [{ label: "PR #1: Fix", url: "https://gh/pr/1" }, { label: "screenshot.png" }],
+    });
+    const text = JSON.stringify(blocks);
+    expect(text).toContain("All done — shipped it.");
+    expect(text).toContain("https://gh/pr/1");
+    expect(text).toContain("PR #1: Fix");
+    expect(text).toContain("screenshot.png");
+    expect(text).toContain("https://engrams.dev/sessions/s1");
+  });
+
+  test("still renders a done line + session link with no message and no assets", () => {
+    const blocks = buildClosingBlocks(session, { lastMessage: null, assets: [] });
+    expect(JSON.stringify(blocks)).toContain("https://engrams.dev/sessions/s1");
+    expect(blocks.length).toBeGreaterThan(0);
   });
 });
 
