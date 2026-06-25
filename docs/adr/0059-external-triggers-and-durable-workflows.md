@@ -1,8 +1,52 @@
 # ADR 0059: External triggers and durable background-agent workflows (Slack-first)
 
-Status: 2026-06-24 — **Proposed.** Substrate simplified after an adversarial design
+Status: 2026-06-25 — **Accepted.** Substrate simplified after an adversarial design
 review (see §Design review): the reverse channel is DBOS-native (2 workflows, zero
-new tables), not the 5-table pump the exploration note sketched.
+new tables), not the 5-table pump the exploration note sketched. Shipped Slack-first
+end to end (events + interactivity, full AskUserQuestion round-trip, enriched closing
+summary), unit-tested per tier; the DBOS-engine integration / live-Slack e2e is
+deferred by an explicit testing-strategy decision (fast unit tests now).
+
+**Commit chain.**
+- P0 (DBOS foundation): `d5bd3603` embed engine, `407b4888` CI Postgres service.
+- P1 (reverse channel): `2a2dd231` `ListSessionEvents` RPC, `005ef13a` its authz,
+  `74b9c857` bounded reader+curation, `6253d901` ingest pump, `399c9479` single-topic
+  mailbox, `6b34268b` thread workflow + `CommunicationPolicy` seam, `37be7d13` defer
+  engine integration tests.
+- P2 (Slack adapter): `990a4f77` trigger scopes, `f82b7901` `is_default`, `e159a9e2`
+  its web toggle, `15eb707c` identity seam, `a1b20eb4` harness `--append-system-prompt`,
+  `3a72cf5e`+`7b43ab40` `compileSessionCreateInput` + real `ThreadControlPlane`,
+  `1492b5d7` events endpoint, `fcbdeeea` closing-summary enrichment, `5baac59a`
+  interactivity + Block Kit answer contract, `5f335c49` Slack policy + rendering,
+  `34e691e5` wire into the orchestrator, `16a7ae13` task `source` traceability.
+
+**Divergences from the sketch (all deliberate).**
+1. **`append_system_prompt` rides `harness_env`, not a proto field.** Decision 8's
+   `CreateSessionRequest.append_system_prompt = 11` was dropped: the orchestrator
+   sets `ENGRAM_APPEND_SYSTEM_PROMPT` in the existing `harness_env` map (already
+   injected, persisted, and replayed by the coordinator — ADR 0051 Drip A), and the
+   harness turns it into `--append-system-prompt`. **Zero coordinator/proto change**;
+   P3 collapses into P2. (Superseded text below.)
+2. **Slack request verification uses the SDK, not hand-rolled crypto.** Both webhooks
+   verify with `@slack/bolt`'s standalone `isValidSlackRequest` (still v0 HMAC + the
+   5-min staleness window) against a `slack.signing_secret` **org secret** — resolved
+   coordinator-side via the credential path (the only orchestrator secret-read seam),
+   not a bespoke env var. "verifyHmac" in the pseudocode below is that call.
+3. **No `continue-as-new` in DBOS — the pump self-restarts.** `SessionIngestWorkflow`
+   starts a fresh deterministic `ingest:<sid>#<epoch+1>` to bound `operation_outputs`;
+   `recv` is single-topic, so the "one recv over {session ∪ trigger} events" is one
+   `THREAD_TOPIC` with a tagged-union message. Workflow-local state (`questionTs`,
+   the asset recap) is rebuilt deterministically on replay — no table, no hand-off.
+4. **Closing summary is enriched** (Open question 1, resolved): the session's last
+   assistant message + a recap of the durable assets it produced + a session link.
+   The reader surfaces the last assistant `agent_message` per page (no extra RPC; the
+   pump already walks the log) and rides it on `session_terminal`.
+5. **The `slack_thread` task is persisted server-side** by the `ThreadControlPlane`,
+   bypassing the chat-only `CreateTask` RPC (P2.11 needs no RPC change), and records
+   the trigger ref (team/channel/threadRoot) on `task.source` for operability.
+6. **`botUserId` is unset at wiring time** (follow-up): the Slack policy strips all
+   `<@…>` mentions from gathered prompts rather than only the bot's — resolving it via
+   `auth.test()` at startup is a cheap later refinement.
 
 Builds on ADR 0051 (the TypeScript orchestration tier — tasks, auth, the
 control-plane boundary), ADR 0052 (the persistent streaming Claude harness +
@@ -101,11 +145,13 @@ slot into the same framework but are **out of scope** here.
    ✅ when the session starts → ❌ + an actionable message on any failure. Plus one
    link message at session start.
 7. **`onComplete` always posts a closing summary** + marks the task done.
-8. **`append_system_prompt`** is a new optional `CreateSessionRequest` field (#11),
-   delivered to the harness and mapped per-CLI. Its value is a **constant the
-   triggering `CommunicationPolicy` provides** (Slack's is fixed in code), passed at
-   session create — **not** read from connector config (one connector can back many
-   triggers, so per-connector trigger config would not generalize).
+8. **`append_system_prompt` rides `harness_env`** (see Divergence 1 — supersedes the
+   original "new `CreateSessionRequest` field #11"). Its value is a **constant the
+   triggering `CommunicationPolicy` provides** (Slack's is fixed in code): the
+   orchestrator folds it into `harness_env` as `ENGRAM_APPEND_SYSTEM_PROMPT` at
+   session create, and the harness maps that to `--append-system-prompt`. **Not** read
+   from connector config (one connector can back many triggers, so per-connector
+   trigger config would not generalize).
 9. **Prompt delivery is idempotent via a deterministic `prompt_id` — no coordinator
    change.** A DBOS step replay can re-issue `SendPrompt` (steps are at-least-once
    across the service boundary). This is already covered downstream: the host→guest
@@ -319,7 +365,7 @@ The concrete handlers. Every outbound call is wrapped in a DBOS `step()`, so a
 completed post returns its checkpoint on replay instead of re-firing. The one piece
 of cross-event state — the question message's `ts`, needed later for `chat.update` —
 lives in a workflow-local `questionTs` Map (`tool_call_id → ts`), reconstructed
-deterministically on replay and carried across `continue-as-new`.
+deterministically on replay from the checkpointed `onUserQuestion` step outputs.
 
 **`dispatch(event)` — runs per curated session event inside `SlackThreadWorkflow`:**
 ```js
@@ -423,7 +469,7 @@ three things a table would:
   workflow that crashes and replays does not re-post what already went out.
 - **`provider_ref`.** The question message's `ts` is just a step return value. The
   thread workflow holds the live map (`tool_call_id → ts`) in workflow-local state,
-  reconstructed deterministically on replay and threaded through `continue-as-new` —
+  reconstructed deterministically on replay from the checkpointed step outputs —
   no durable row needed to find the message later for `chat.update`.
 - **Retries.** Steps opt into `retriesAllowed` + backoff natively for transient
   Slack 5xx.
@@ -447,30 +493,32 @@ a semantic key to dedupe — that only arises under branch-fanout (a non-goal).
   re-introduces a small effects table **at that point, not now** — the same
   "additive when a real need exists" rule applied to the cut 5-table substrate.
 
-## `append_system_prompt` (cross-tier, net-new)
+## `append_system_prompt` (via `harness_env` — no proto/coordinator change)
 
-A generic, optional addition so triggers can flavor the agent's system prompt
-(Slack: "You were triggered from a Slack thread; a human may answer your questions
-there; be concise.").
+A generic way for triggers to flavor the agent's system prompt (Slack: "You are
+running inside an engrams session triggered from a Slack thread; keep replies
+concise; ask via AskUserQuestion; the user can't see your terminal").
 
-- **Proto:** `CreateSessionRequest.append_system_prompt = 11` (fields 1–10 taken;
-  4 reserved). Optional.
-- **Coordinator:** thread it through `grpc_app/convert.rs` →
-  `api/sessions::create_session_core`; **persist it** so it replays on resume —
-  this is **net-new persistence** (there is no session-prompt storage today),
-  mirroring the `harness_env`→`session_secrets` replay discipline.
-- **Harness:** `engram-harness-claude` `build_claude_argv` (`src/main.rs:2132`,
-  sole caller `:1315`) gains a parameter and appends `--append-system-prompt
-  <value>` when set. **This is a call-site signature change, not a one-line flag
-  add.** Other harnesses map the same field to their own mechanism.
+**Decision (final): ride the existing `harness_env` channel** rather than add a
+proto field. The coordinator already injects `harness_env` into the guest launch
+env *and* persists it to `session_secrets` for replay-on-resume (ADR 0051 Drip A),
+so the replay/persistence the sketch wanted is **already built** — for free.
+
+- **Orchestrator:** `compileSessionCreateInput` takes an optional `extraHarnessEnv`;
+  the `ThreadControlPlane` folds the policy's constant in as
+  `harness_env.ENGRAM_APPEND_SYSTEM_PROMPT`. No proto, no coordinator code.
+- **Harness:** `engram-harness-claude` `build_claude_argv` gains an
+  `append_system_prompt: Option<&str>` param and appends `--append-system-prompt
+  <value>` when non-empty; the call site reads
+  `std::env::var("ENGRAM_APPEND_SYSTEM_PROMPT")`. Other harnesses map the same env
+  var to their own mechanism.
 - **Value source:** a **constant on the triggering `CommunicationPolicy`**
   (`systemPromptAppend` — Slack's is fixed in code), passed at create time; composes
   *with* the profile. **Not** connector config: one connector can back many triggers,
   so per-connector trigger config would not generalize.
 - **Caveat:** the harness is `cfg(target_os = "linux")` — invisible to macOS
-  clippy, 0 tests under macOS nextest. Verify via `cargo clippy --target
-  aarch64-unknown-linux-musl -p engram-harness-claude` and `just test-linux
-  engram-harness-claude`.
+  clippy, 0 tests under macOS nextest. Verified via `just test-linux
+  engram-harness-claude` (and `cargo clippy --target aarch64-unknown-linux-musl`).
 
 ## Default profile (`is_default`, orchestrator-only, net-new)
 
@@ -516,7 +564,9 @@ entirely orchestrator-side, reusing the harness's existing ADR-0052 dedupe.
   suspended in PG, not a pinned thread.
 - **`operation_outputs` growth:** a long session means many `SessionIngestWorkflow`
   steps; bounded reads keep step count proportional to *event activity*, and the
-  ingest workflow `continue-as-new`s (carrying `after`) to bound its history.
+  ingest workflow **self-restarts** (starts a fresh `ingest:<sid>#<epoch+1>` carrying
+  `after` + the last-seen assistant message) to bound its history — DBOS has no
+  `continue-as-new`, so a deterministic successor id makes the restart idempotent.
 - **Versioning:** workflows tagged with an app version; a deploy leaves old-version
   in-flight workflows dormant unless a blue-green old-version worker drains them or
   `DBOS.patch()` branches logic in place.
@@ -658,24 +708,24 @@ when a second consumer actually exists; the present design precludes none of it.
 
 ## Phasing
 
-- **P0 — DBOS foundation.** Add `@dbos-inc/dbos-sdk` (un-bundled), `dbos` schema,
-  `launch`/`shutdown`, a trivial workflow + a crash/restart recovery test (with a
-  Postgres service in the orchestrator CI lane).
-- **P1 — Reverse channel.** No orchestrator migration. The `ListSessionEvents`
-  coordinator RPC (Rust lane test); `SlackThreadWorkflow` + `SessionIngestWorkflow`
-  skeleton with the recv/drain loop, the workflow-local `questionTs` map, and
-  `continue-as-new` (threading the map through); tests for crash/restart, duplicate
-  sends, cursor reconstruction, terminal exit.
-- **P2 — Slack adapter.** Extend the `slack` connector (add the five scopes); the
-  profile `is_default` flag (migration + proto + store `getDefault` + UI toggle) and
+- **P0 — DBOS foundation (done).** Added `@dbos-inc/dbos-sdk` (un-bundled), `dbos`
+  schema, `launch`/`shutdown`, a Postgres service in the orchestrator CI lane.
+- **P1 — Reverse channel (done).** No orchestrator migration. The `ListSessionEvents`
+  coordinator RPC (Rust lane test) + its passthrough authz; `SlackThreadWorkflow` +
+  `SessionIngestWorkflow` with the recv/drain loop, the workflow-local `questionTs`
+  map rebuilt on replay, and **self-restart** (DBOS has no `continue-as-new`); reader
+  + curation unit-tested (terminal detection, cursor, last-assistant-message).
+- **P2 — Slack adapter (done).** Extended the `slack` connector (five scopes); the
+  profile `is_default` flag (migration + proto + store `getDefault` + web toggle) and
   `getDefaultProfile()`; the `/api/v1/integrations/slack/{events,interactivity}`
-  endpoints (verify/ack/dedupe); the communication policy via `getSlackClient()`
-  (👀/✅/❌ reactions, link, Block Kit questions, asset posts, closing summary);
-  `@mention` context gathering + `SendPrompt` follow-ups; identity seam.
-- **P3 — `append_system_prompt`.** Proto #11 → coordinator persistence + replay →
-  harness flag; value = the Slack policy constant; Linux-target verification.
+  endpoints (SDK `isValidSlackRequest` / ack / dedupe); the communication policy via
+  `getSlackClient()` (👀/✅/❌ reactions, link, Block Kit questions + answer modal,
+  asset posts, enriched closing summary); `@mention` context gathering + `SendPrompt`
+  follow-ups; identity seam; `append_system_prompt` via `harness_env` (folds in the
+  old P3 — no proto/coordinator change).
 
-Each phase is its own PR, the ADR updated between phases per repo convention.
+Each phase is its own PR, the ADR updated between phases per repo convention. The
+DBOS-engine integration / live-Slack e2e is deferred (fast unit tests now).
 
 ## Future (designed-for, not built)
 
@@ -688,11 +738,13 @@ Each phase is its own PR, the ADR updated between phases per repo convention.
   (the exact tables cut above) plus control-plane `CreateCheckpoint`/`ForkSession`.
   Additive — the present 2-workflow design does not block it.
 
-## Open questions
+## Open questions (resolved)
 
-1. Closing-summary composition — templated (status + asset links) vs. enriched by
-   the session's last assistant message?
-2. Should both reactions persist (👀 + ✅) or swap to a single ✅? (Default: persist.)
+1. Closing-summary composition — **resolved: enriched.** It posts the session's last
+   assistant message + a recap of the durable assets produced + a session link
+   (Divergence 4).
+2. Should both reactions persist (👀 + ✅) or swap to a single ✅? **Resolved: both
+   persist** (👀 on pickup → ✅ on start), per the default.
 
 ## References
 
@@ -702,8 +754,9 @@ Each phase is its own PR, the ADR updated between phases per repo convention.
 - ADR 0051 §4 (anticipated webhook→workflow→session→publish), ADR 0054
   (`user_question`/`question_answered` + `AnswerQuestion`), ADR 0056/0057
   (integration assets + profile policy), ADR 0034 (idle-eviction + resume).
-- DBOS TypeScript: workflows/steps, `send`/`recv`, `continue-as-new`, scheduled
-  workflows, workflow IDs as idempotency keys (docs.dbos.dev/typescript).
+- DBOS TypeScript: workflows/steps, single-topic `send`/`recv`, scheduled
+  workflows, workflow IDs as idempotency keys (docs.dbos.dev/typescript). Note: no
+  `continue-as-new` — bound history via a deterministic self-restart.
 - Slack: `app_mention`, `conversations.replies`, request signing + 3s ack +
   retry/`event_id`, `reactions.add`, Block Kit `block_actions` + `views.open`,
   `users.info` (docs.slack.dev).
