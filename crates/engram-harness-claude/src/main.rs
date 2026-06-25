@@ -1312,7 +1312,11 @@ mod adapter {
         question_outstanding: &hook_server::QuestionOutstanding,
     ) -> SessionOutcome {
         let resume_id = read_claude_session_id().await;
-        let argv = build_claude_argv(&resume_id);
+        // ADR 0059: ENGRAM_APPEND_SYSTEM_PROMPT (carried via harness_env) flavors
+        // the agent's system prompt. Read per spawn — it is constant for the
+        // process, and a respawn must re-apply it.
+        let append_system_prompt = std::env::var("ENGRAM_APPEND_SYSTEM_PROMPT").ok();
+        let argv = build_claude_argv(&resume_id, append_system_prompt.as_deref());
         tracing::info!(
             ?argv,
             resume = resume_id.is_some(),
@@ -2129,7 +2133,10 @@ mod adapter {
     /// messages (one per turn); `--output-format stream-json --verbose`
     /// gives us the per-turn `result` terminator on stdout. No trailing
     /// prompt arg — prompts are written to stdin via `write_user_message`.
-    fn build_claude_argv(resume_id: &Option<String>) -> Vec<String> {
+    fn build_claude_argv(
+        resume_id: &Option<String>,
+        append_system_prompt: Option<&str>,
+    ) -> Vec<String> {
         let mut argv = vec![
             "--print".to_string(),
             "--input-format".into(),
@@ -2155,6 +2162,15 @@ mod adapter {
         if let Some(id) = resume_id {
             argv.push("--resume".into());
             argv.push(id.clone());
+        }
+        // ADR 0059: an external trigger (e.g. Slack) flavors the agent's system
+        // prompt via ENGRAM_APPEND_SYSTEM_PROMPT (carried through harness_env).
+        // Empty = unset (skip the flag).
+        if let Some(p) = append_system_prompt {
+            if !p.is_empty() {
+                argv.push("--append-system-prompt".into());
+                argv.push(p.to_string());
+            }
         }
         argv
     }
@@ -2742,6 +2758,33 @@ mod adapter {
         use engram_harness_proto::{Answers, Question, QuestionOption};
         use std::pin::Pin;
         use std::task::{Context, Poll};
+
+        // ADR 0059: an external trigger flavors the agent's system prompt via
+        // ENGRAM_APPEND_SYSTEM_PROMPT (rides harness_env). build_claude_argv
+        // turns a set value into `--append-system-prompt <value>`.
+        #[test]
+        fn argv_carries_append_system_prompt_when_set() {
+            let argv = build_claude_argv(&None, Some("You were triggered from a Slack thread."));
+            let pos = argv
+                .iter()
+                .position(|a| a == "--append-system-prompt")
+                .expect("flag present when set");
+            assert_eq!(
+                argv.get(pos + 1).map(String::as_str),
+                Some("You were triggered from a Slack thread."),
+            );
+        }
+
+        #[test]
+        fn argv_omits_append_system_prompt_when_absent_or_empty() {
+            for v in [None, Some("")] {
+                let argv = build_claude_argv(&None, v);
+                assert!(
+                    !argv.iter().any(|a| a == "--append-system-prompt"),
+                    "flag must be absent for {v:?}",
+                );
+            }
+        }
 
         /// A writer whose every write fails — stands in for a host
         /// connection that dropped underneath the pump.
